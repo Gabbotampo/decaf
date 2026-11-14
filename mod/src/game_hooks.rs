@@ -185,6 +185,9 @@ pub(crate) struct Tally {
     pub ran: usize,
     pub failed: usize,
     pub skipped: usize,
+    /// Firings not run because a player they hand over is not on the bridge's list with an
+    /// entity id and that life: the object would not be the event tier's (#246's review).
+    pub unlisted: usize,
     /// Failure reasons, first line, with counts (at most 16 kept).
     pub failures: BTreeMap<String, usize>,
 }
@@ -197,6 +200,7 @@ impl Tally {
             "ran": self.ran,
             "failed": self.failed,
             "skipped": self.skipped,
+            "unlisted": self.unlisted,
             "failures": self.failures,
         })
     }
@@ -227,29 +231,58 @@ pub(crate) enum Arg {
 }
 
 /// A player as the bridge counts them: their session, life and entity id (`State::players`),
-/// so the handle is the event tier's object for them.
-pub(crate) fn player(state: &State, uuid: u128, life_back: u32) -> GameObject {
-    let listed: Option<&FacadePlayer> = state.players.iter().find(|p| p.uuid == uuid);
-    let mut object = GameObject::player(uuid, listed.map_or("", |p| p.name.as_str()));
-    if let Some(listed) = listed {
-        if let Some(life) = listed.life.checked_sub(life_back) {
-            object = object.with_incarnation(listed.session, life);
-        }
-        if let Some(id) = listed.entity_id {
-            object = object.with_entity_id(id);
-        }
-        if let Some(level) = &listed.level {
-            object = object.with_dimension(level);
-        }
-    }
-    object
+/// so the handle is the event tier's object for them. `None` when the player is not listed, has
+/// no entity id, or has no life `life_back` lives ago: such an object would be a second key
+/// for the same `ServerPlayer`, so the firing is not run (`Tally::unlisted`).
+pub(crate) fn player(state: &State, uuid: u128, life_back: u32) -> Option<GameObject> {
+    player_of(state.players.iter().find(|p| p.uuid == uuid)?, life_back)
 }
 
-/// An entity by id: the listed player of that id, else a living entity of `kind`.
+/// [`player`] from the bridge's entry for them (a leaver's last entry too).
+pub(crate) fn player_of(listed: &FacadePlayer, life_back: u32) -> Option<GameObject> {
+    let uuid = listed.uuid;
+    let life = listed.life.checked_sub(life_back)?;
+    let mut object = GameObject::player(uuid, &listed.name)
+        .with_incarnation(listed.session, life)
+        .with_entity_id(listed.entity_id?);
+    if let Some(level) = &listed.level {
+        object = object.with_dimension(level);
+    }
+    Some(object)
+}
+
+/// An entity by id: the listed player of that id (the same object as by UUID), else a living
+/// entity of `kind`.
 pub(crate) fn entity(state: &State, id: i32, kind: &str) -> GameObject {
-    match state.players.iter().find(|p| p.entity_id == Some(id)) {
-        Some(listed) => player(state, listed.uuid, 0),
-        None => GameObject::entity(id, kind, true),
+    state
+        .players
+        .iter()
+        .find(|p| p.entity_id == Some(id))
+        .and_then(|listed| player(state, listed.uuid, 0))
+        .unwrap_or_else(|| GameObject::entity(id, kind, true))
+}
+
+/// Count a firing of `site` that was not run because a player it hands over is not listed
+/// (`player` answered `None`), on every jar with callbacks there.
+pub(crate) fn unlisted(state: &mut State, site: &str) {
+    for loaded in &mut state.jars {
+        if !loaded.hooks.entries(site).is_empty() {
+            loaded.row.game_hooks.unlisted += 1;
+            log::debug!(
+                "{LOG}: {}: {site} not fired: a player it hands over is not listed",
+                loaded.row.id
+            );
+        }
+    }
+}
+
+/// Drop what every jar's callbacks kept on `object` (its `@Unique` fields, its initialised
+/// Mixins): a player's previous life after a respawn, a player who left. Java's object is
+/// gone; a later object is a new one.
+pub(crate) fn forget(state: &mut State, object: &GameObject) {
+    let marker = object.marker();
+    for loaded in &mut state.jars {
+        loaded.hook_state.forget_object(&marker);
     }
 }
 
@@ -476,7 +509,7 @@ mod tests {
                 session: 1,
                 life,
             }];
-            let player = player(state, uuid, 0);
+            let player = player(state, uuid, 0).expect("listed with an id and a life");
             let source =
                 GameObject::opaque("net/minecraft/world/damagesource/DamageSource", "lava");
             fire(
@@ -490,10 +523,16 @@ mod tests {
         die(&mut state, 0);
         die(&mut state, 0);
         die(&mut state, 1);
+        // A forgotten object (a previous life, a player who left) keeps nothing: the same key
+        // would be a new `ServerPlayer`, whose field starts again.
+        die(&mut state, 1);
+        let gone = player(&state, uuid, 0).unwrap();
+        forget(&mut state, &gone);
+        die(&mut state, 1);
         let loaded = &mut state.jars[0];
         assert_eq!(
             (loaded.row.game_hooks.ran, loaded.row.game_hooks.failed),
-            (3, 0)
+            (5, 0)
         );
         assert_eq!(
             loaded.host.take_stdout().lines().collect::<Vec<_>>(),
@@ -501,8 +540,21 @@ mod tests {
                 "01234567-89ab-cdef-0011-223344556677 1",
                 "01234567-89ab-cdef-0011-223344556677 2",
                 "01234567-89ab-cdef-0011-223344556677 1",
+                "01234567-89ab-cdef-0011-223344556677 2",
+                "01234567-89ab-cdef-0011-223344556677 1",
             ]
         );
+
+        // A player with no entity id, or no life that far back, is no object the event tier
+        // has: no firing, counted on the jar with callbacks at the site.
+        state.players[0].entity_id = None;
+        assert!(player(&state, uuid, 0).is_none());
+        state.players[0].entity_id = Some(7);
+        assert!(player(&state, uuid, 2).is_none());
+        assert!(player(&state, 0xff, 0).is_none());
+        unlisted(&mut state, "player_died");
+        unlisted(&mut state, "player_tick");
+        assert_eq!(state.jars[0].row.game_hooks.unlisted, 1);
     }
 
     /// Every site the runtime knows is either bound to a pinned hook at its moment or listed as
