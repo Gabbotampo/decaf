@@ -170,6 +170,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod server_values;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
 mod reference_identity;
@@ -192,6 +193,7 @@ mod tim_sort;
 mod tree_map;
 mod type_switch;
 mod value_class;
+mod vanilla_blocks;
 mod vanilla_registries;
 pub mod verdict;
 mod watch_service;
@@ -11448,7 +11450,7 @@ fn host_text(value: &Value) -> String {
 /// [`host_ref::Nested`] for [`host_text`]'s callers, which can neither run
 /// jar code nor count (a facade's JSON, a diagnostic): a held value prints
 /// as [`value_text`] does, a marker as itself. Answers nothing else.
-struct MarkerText;
+pub(crate) struct MarkerText;
 
 impl host_ref::Nested for MarkerText {
     fn hash(&mut self, _value: &Value) -> Result<Option<i32>, NativeError> {
