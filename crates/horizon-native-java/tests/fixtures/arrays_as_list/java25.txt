@@ -7,3 +7,4 @@ subLists=bBB[B, c],[B, C]C,UOE[a, B, C][B, C],UOE,UOE,UOE,ok,IndexOutOfBoundsExc
 jarEquals=UOE:remove21,false,UOE:remove2,false,UOE:remove2,T1
 live=aqc,z,abw,abw,r[r, b],ArrayIndexOutOfBoundsException:Index 5 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index 3 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index -1 out of bounds for length 3
 afterCollections=[h, I, j][I, j]IUOEjava.util.Arrays$ArrayList
+afterIteratorCollections=1Z

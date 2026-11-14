@@ -184,6 +184,22 @@ public final class Probe {
         return "held";
     }
 
+    static String[] heldArray;
+    static java.util.Iterator<String> heldIterator;
+
+    /** Keep an array and an iterator over a view of it: the view itself is held by nothing else. */
+    public static String holdIterator() {
+        heldArray = new String[] {"1", "2"};
+        heldIterator = Arrays.asList(heldArray).iterator();
+        return "held";
+    }
+
+    /** The iterator still reads the array (`ArrayItr`): a write after collections shows. */
+    public static String afterIteratorCollections() {
+        heldArray[1] = "Z";
+        return heldIterator.next() + heldIterator.next();
+    }
+
     /** Garbage: enough objects for collections to run between calls. */
     public static String garbage() {
         int sum = 0;
@@ -214,5 +230,10 @@ public final class Probe {
             garbage();
         }
         System.out.println("afterCollections=" + afterCollections());
+        holdIterator();
+        for (int i = 0; i < 40; i++) {
+            garbage();
+        }
+        System.out.println("afterIteratorCollections=" + afterIteratorCollections());
     }
 }

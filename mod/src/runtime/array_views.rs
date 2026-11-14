@@ -140,9 +140,18 @@ impl StdHost {
         self.array_views.views.get(marker).map(|view| &view.array)
     }
 
-    /// Every view and window.
+    /// Every view and window, and every iterator over one.
     pub(crate) fn array_view_markers(&self) -> impl Iterator<Item = &String> {
-        self.array_views.views.keys()
+        self.array_views
+            .views
+            .keys()
+            .chain(self.array_views.iterators.keys())
+    }
+
+    /// The view an iterator over one reads (an edge for the collector: the
+    /// iterator follows the view's array while it lives).
+    pub(crate) fn array_view_of_iterator(&self, marker: &str) -> Option<&String> {
+        self.array_views.iterators.get(marker)
     }
 
     pub(crate) fn has_array_views_of(&self, array: &str) -> bool {

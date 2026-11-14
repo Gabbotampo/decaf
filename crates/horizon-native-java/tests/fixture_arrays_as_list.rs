@@ -114,3 +114,38 @@ fn a_held_view_keeps_its_array_through_collections() {
         host.unknown_host_calls()
     );
 }
+
+/// An iterator over a view, held without the view, keeps following the
+/// array through collections (#247 re-check: the collector freed the view,
+/// and the iterator stopped seeing the array's writes): its view is an edge
+/// from it. Java 25's answer, nothing counted.
+#[test]
+fn a_held_iterator_keeps_its_view_through_collections() {
+    let fixture =
+        javac_fixture::Fixture::build("arrays-as-list-iterator", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let mut call = |method: &str| match fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        method,
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    ) {
+        Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+        other => format!("{other:?}"),
+    };
+    assert_eq!(call("holdIterator"), "held");
+    for _ in 0..40 {
+        call("garbage");
+    }
+    assert_eq!(
+        call("afterIteratorCollections"),
+        expected("afterIteratorCollections")
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
