@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{MethodRef, StdHost, Value, collection_value, component_value};
+use crate::{MethodRef, StdHost, Value, component_value};
 
 use super::{ClientSnapshot, flag, int_arg, marker};
 

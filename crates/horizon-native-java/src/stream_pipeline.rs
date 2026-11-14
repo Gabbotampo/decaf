@@ -1274,7 +1274,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 None => crate::empty_optional(),
             },
             Terminal::Fold(_, _, value) | Terminal::Container(_, value) => value,
-            Terminal::ToMap(state) => self.finish_to_map(state)?,
+            Terminal::ToMap(state) => self.finish_to_map(*state)?,
             Terminal::Collect(_)
             | Terminal::Forward(..)
             | Terminal::Supply(..)

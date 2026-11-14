@@ -19913,7 +19913,7 @@ fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
 /// target's own class when it is a concrete JDK collection, else its default
 /// (`ArrayList`, `LinkedHashSet`; for a map `LinkedTreeMap`, which no model
 /// holds, so `LinkedHashMap` stands in: the same insertion order).
-fn gson_collection_class(class: &str, kind: &str) -> &str {
+fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
     const CONCRETE: &[&str] = &[
         "java/util/ArrayList",
         "java/util/LinkedList",
@@ -24976,7 +24976,7 @@ impl<H: Host> Runtime<'_, H> {
         let values = self.stream_output(receiver, &r.name)?;
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // `Stream.toList()`: an unmodifiable `ListN` that allows `null`.
-            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values),
+            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values)?,
             ("toArray", "()[Ljava/lang/Object;") => {
                 self.new_array_value("[Ljava/lang/Object;", values)
             }
@@ -24988,7 +24988,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match builtin {
                     // `ArrayList::new`, `List::add`: a list of its own.
-                    host_collector::Builtin::List => self.new_array_list(values),
+                    host_collector::Builtin::List => self.new_array_list(values)?,
                     builtin @ (host_collector::Builtin::UnmodifiableList
                     | host_collector::Builtin::ImmutableList) => {
                         if values.contains(&Value::Ref(None)) {

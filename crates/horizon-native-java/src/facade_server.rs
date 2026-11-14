@@ -61,8 +61,7 @@ use std::{
 };
 
 use crate::{
-    MethodRef, NativeError, Value, collection_value, expect_ref, identifier_parse, path_join,
-    path_value, stable_hash,
+    MethodRef, NativeError, Value, expect_ref, identifier_parse, path_join, path_value, stable_hash,
 };
 
 pub use crate::game_rules::GameRuleValue;
