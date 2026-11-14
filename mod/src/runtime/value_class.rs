@@ -355,6 +355,11 @@ mod tests {
             "java/util/ArrayList#neutral0",
             "java/util/ImmutableCollections$ListN#immutable3",
             "java/util/ReverseOrderListView$Rand#reversed0",
+            // Spelled like the old collection literals (#156 P14d2): a
+            // collection is a handle.
+            "list/4",
+            "set/ra,rb",
+            "map/rk,rv",
             // Spelled like a class (#156 P13c): a `Class` is a handle.
             "java/lang/String",
             "demo/Probe$Foo",
@@ -367,7 +372,6 @@ mod tests {
         }
         for marker in [
             "java/util/ArrayList#weird0",
-            "list/4",
             "registry/minecraft:item",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",

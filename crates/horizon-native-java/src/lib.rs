@@ -36297,7 +36297,13 @@ mandatory = true
             host.invoke_instance(
                 &indexed_add_all,
                 &list,
-                &[Value::Int(1), Value::Ref(Some("list/rmarker".into()))],
+                &[
+                    Value::Int(1),
+                    host.new_collection(
+                        "java/util/ArrayList",
+                        vec![Value::Ref(Some("marker".into()))]
+                    ),
+                ],
             )
             .unwrap(),
             Value::Int(1)
