@@ -36291,24 +36291,18 @@ mandatory = true
             host.invoke_instance(&add_all, &list, &[source]).unwrap(),
             Value::Int(1)
         );
+        let inserted = host.new_collection(
+            "java/util/ArrayList",
+            vec![Value::Ref(Some("marker".into()))],
+        );
         let indexed_add_all = MethodRef {
             owner: "java/util/ArrayList".into(),
             name: "addAll".into(),
             descriptor: "(ILjava/util/Collection;)Z".into(),
         };
         assert_eq!(
-            host.invoke_instance(
-                &indexed_add_all,
-                &list,
-                &[
-                    Value::Int(1),
-                    host.new_collection(
-                        "java/util/ArrayList",
-                        vec![Value::Ref(Some("marker".into()))]
-                    ),
-                ],
-            )
-            .unwrap(),
+            host.invoke_instance(&indexed_add_all, &list, &[Value::Int(1), inserted],)
+                .unwrap(),
             Value::Int(1)
         );
         let get = MethodRef {
