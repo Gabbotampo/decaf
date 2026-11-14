@@ -356,8 +356,10 @@ impl StdHost {
         push(self.hash_tables.get(marker), out);
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
-        // An `Arrays.asList` view's array, which its `get`/`set` work on.
+        // An `Arrays.asList` view's array, which its `get`/`set` work on, and
+        // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
+        push(self.array_view_of_iterator(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
