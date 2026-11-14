@@ -1087,9 +1087,12 @@ impl StdHost {
             ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
                 format!("{}{}", items::ITEM, items::constant_id(name)),
             ))),
-            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => Some(Ok(
-                marker(format!("{}{}", items::BLOCK, items::constant_id(name))),
-            )),
+            // The id 26.3 registers for the constant (`vanilla_blocks.rs`); a
+            // constant 26.3 lacks is no block (#239's review B2).
+            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => {
+                crate::runtime::vanilla_blocks::field_id(name)
+                    .map(|id| Ok(marker(format!("{}{id}", items::BLOCK))))
+            }
             ("net/minecraft/world/effect/MobEffects", name) if frame.is_some() => {
                 Some(Ok(marker(format!(
                     "{}{}",
