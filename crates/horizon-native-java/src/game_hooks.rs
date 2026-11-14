@@ -1026,10 +1026,249 @@ fn is_fabric_event_invoker(value: &Value) -> bool {
 }
 
 impl<H: Host> Host for GameHookHost<'_, H> {
-    // A callback's `System.out` lines go to the jar's console, as an entrypoint's do (they were
-    // dropped here: the trait's default writes nowhere).
+    // Every member the bootstrap host answers is forwarded to it, so a callback's collections,
+    // hash tables, iterators, console and counted operands behave as an entrypoint's do (#246's
+    // review: the trait defaults answered silently here, a respawned player's two lives were two
+    // `HashSet` entries, a player printed as `null`). The members below these forwards are this
+    // tier's own: game objects, `@Shadow` members and the calls only the hook point answers.
+    fn neoforge_attachments(
+        &mut self,
+    ) -> Option<(
+        &mut neoforge_attachments::AttachmentState,
+        &mut BTreeMap<String, usize>,
+    )> {
+        self.inner.neoforge_attachments()
+    }
+
+    fn clone_original_of(&self, text: &str) -> Option<u128> {
+        self.inner.clone_original_of(text)
+    }
+
+    fn neoforge_bus(
+        &mut self,
+    ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
+        self.inner.neoforge_bus()
+    }
+
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        self.inner.neoforge_imc()
+    }
+
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        self.inner.unknown_operand_call(r)
+    }
+
+    fn modelled_to_string(&mut self, value: &Value) -> Option<String> {
+        self.inner.modelled_to_string(value)
+    }
+
+    fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
+        self.inner.mutable_collection_entries(value)
+    }
+
+    fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        self.inner.replace_mutable_collection(value, values)
+    }
+
+    fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
+        self.inner.unmodifiable_view_source(marker)
+    }
+
+    fn has_mutable_collection(&self, marker: &str) -> bool {
+        self.inner.has_mutable_collection(marker)
+    }
+
+    fn collection_generation(&self, marker: &str) -> Option<u64> {
+        self.inner.collection_generation(marker)
+    }
+
+    fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
+        self.inner.collection_slice(marker)
+    }
+
+    fn collection_vec_mut(&mut self, marker: &str) -> Option<&mut Vec<Value>> {
+        self.inner.collection_vec_mut(marker)
+    }
+
+    fn take_hash_table(&mut self, marker: &str) -> Option<hash_table::HashTable> {
+        self.inner.take_hash_table(marker)
+    }
+
+    fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
+        self.inner.store_hash_table(marker, table)
+    }
+
+    fn collection_comparator(&self, marker: &str) -> Option<Value> {
+        self.inner.collection_comparator(marker)
+    }
+
+    fn set_collection_comparator(&mut self, marker: &str, comparator: Value) {
+        self.inner.set_collection_comparator(marker, comparator)
+    }
+
+    fn take_red_black_tree(&mut self, marker: &str) -> Option<tree_map::RedBlackTree> {
+        self.inner.take_red_black_tree(marker)
+    }
+
+    fn store_red_black_tree(&mut self, marker: &str, tree: tree_map::RedBlackTree) {
+        self.inner.store_red_black_tree(marker, tree)
+    }
+
+    fn take_probe_table(&mut self, marker: &str) -> Option<immutable_collections::ProbeTable> {
+        self.inner.take_probe_table(marker)
+    }
+
+    fn store_probe_table(&mut self, marker: &str, table: immutable_collections::ProbeTable) {
+        self.inner.store_probe_table(marker, table)
+    }
+
+    fn note_view_copy(&mut self, marker: &str, source: &str) {
+        self.inner.note_view_copy(marker, source)
+    }
+
+    fn is_view_copy(&self, marker: &str) -> bool {
+        self.inner.is_view_copy(marker)
+    }
+
+    fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        self.inner.iterator_guard(marker)
+    }
+
+    fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
+        self.inner.store_iterator_guard(marker, guard)
+    }
+
+    fn iterator_cursor(&self, marker: &str) -> Option<usize> {
+        self.inner.iterator_cursor(marker)
+    }
+
+    fn view_copy_source(&self, marker: &str) -> Option<String> {
+        self.inner.view_copy_source(marker)
+    }
+
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.inner.note_view_kind(marker, kind)
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.inner.view_copy_kind(marker)
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        self.inner.view_copies_of(source)
+    }
+
+    fn synchronized_wrapped(&self, value: &Value) -> Option<Value> {
+        self.inner.synchronized_wrapped(value)
+    }
+
+    fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
+        self.inner.mod_stamp(marker)
+    }
+
+    fn store_mod_stamp(&mut self, marker: &str, stamp: mod_count::ModStamp) {
+        self.inner.store_mod_stamp(marker, stamp)
+    }
+
+    fn sub_list_link(&self, marker: &str) -> Option<mod_count::SubListLink> {
+        self.inner.sub_list_link(marker)
+    }
+
+    fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
+        self.inner.store_sub_list_link(marker, link)
+    }
+
+    fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        self.inner.sub_lists_of(parent)
+    }
+
+    fn new_list_iterator(&mut self, state: host_list_iterator::ListIter) -> Option<String> {
+        self.inner.new_list_iterator(state)
+    }
+
+    fn list_iterator(&self, marker: &str) -> Option<host_list_iterator::ListIter> {
+        self.inner.list_iterator(marker)
+    }
+
+    fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
+        self.inner.store_list_iterator(marker, state)
+    }
+
+    fn sub_lists_of_any(&self) -> usize {
+        self.inner.sub_lists_of_any()
+    }
+
+    fn deque_layout(&self, marker: &str) -> Option<array_deque::DequeLayout> {
+        self.inner.deque_layout(marker)
+    }
+
+    fn store_deque_layout(&mut self, marker: &str, layout: Option<array_deque::DequeLayout>) {
+        self.inner.store_deque_layout(marker, layout)
+    }
+
+    fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
+        self.inner.host_iterator(marker)
+    }
+
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        self.inner.host_iterator_next(marker)
+    }
+
+    fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
+        self.inner.set_host_iterator_cursor(marker, cursor)
+    }
+
     fn write_console(&mut self, text: &str) {
-        self.inner.write_console(text);
+        self.inner.write_console(text)
+    }
+
+    fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
+        self.inner.resource_stream_bytes(marker, limit)
+    }
+
+    fn note_content_builder(&mut self, event: ContentBuilderEvent) {
+        self.inner.note_content_builder(event)
+    }
+
+    fn platform_class_present(&self, name: &str) -> bool {
+        self.inner.platform_class_present(name)
+    }
+
+    fn unmodifiable_list(&mut self, values: Vec<Value>) -> Option<Value> {
+        self.inner.unmodifiable_list(values)
+    }
+
+    fn factory_collection(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner.factory_collection(owner, name, kind, values)
+    }
+
+    // A `@Shadow` field is the game object's own: refused (`get_static`); any other instance
+    // field is the bootstrap host's.
+    fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if self
+            .model
+            .shadow_fields
+            .contains(&format!("{}#{}{}", r.owner, r.name, r.descriptor))
+        {
+            return self.get_static(r);
+        }
+        self.inner.get_field(receiver, r)
+    }
+
+    /// What the firing describes `key` as (its vanilla hierarchy and the interfaces the jar's
+    /// Mixins add to it): `Some(true)` where the description names `wanted`, never a proof of
+    /// `false` (a description lists no vanilla interface), so anything else is counted.
+    fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+        self.context.object(key)?;
+        self.host_instance_of(key, wanted).then_some(true)
     }
 
     fn empty_iterator(&mut self) -> Value {
@@ -1128,6 +1367,11 @@ impl<H: Host> Host for GameHookHost<'_, H> {
                     r.owner, r.name, r.descriptor
                 ))
             });
+        }
+        // A cast or `instanceof` the description cannot settle is counted by the bootstrap
+        // host, never a refusal that ends the firing (#246's review).
+        if is_game_class(&r.owner) && matches!(r.name.as_str(), "<checkcast>" | "<instanceof>") {
+            return self.inner.invoke(r, args);
         }
         if is_game_class(&r.owner) && !is_value_constructor(r) {
             return Err(NativeError::Metadata(format!(
@@ -1256,6 +1500,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn store_persistent_heap(&mut self, heap: JavaHeap) -> Result<(), NativeError> {
         self.inner.store_persistent_heap(heap)
+    }
+
+    fn object_collected(&self, key: &str) -> bool {
+        self.inner.object_collected(key)
+    }
+
+    fn pause_collections(&mut self, paused: bool) {
+        self.inner.pause_collections(paused);
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -1669,10 +1921,23 @@ impl NativeJar {
                 state.fields = game;
             }
             state.arrays.clear();
+            // Every value a game object's field holds, of any kind (an
+            // `Optional` names its object in its key), through the heap's
+            // one root text (#226 review).
+            // What the firing hands the game (each callback's result and the
+            // value a target returns) is a root of this store too; the game
+            // retains what it keeps longer (`StdHost::retain`).
+            let returned_value = returned
+                .as_ref()
+                .and_then(|returned| returned.as_ref().ok())
+                .cloned()
+                .flatten();
             let roots = state
                 .fields
                 .values()
-                .filter_map(|value| crate::game_object::text(value).cloned())
+                .chain(&results)
+                .chain(returned_value.as_ref())
+                .filter_map(|value| crate::heap::value_text(value).map(str::to_owned))
                 .collect();
             let persistence = runtime.persist_class_state();
             let heap = runtime.persist_resident_heap_with(roots);

@@ -468,6 +468,12 @@ pub enum HostKind {
     Enumeration,
     /// A list's `listIterator()`: key `list-iterator/<n>`.
     ListIterator,
+    /// `System.out`/`System.err`: key `system-out`/`system-err`
+    /// (`host_service.rs`).
+    StdStream,
+    /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
+    /// (`host_service.rs`).
+    LoaderSingleton,
 }
 
 /// How a kind's Java class follows from its key.
@@ -584,6 +590,12 @@ pub(crate) trait ClassHierarchy {
     /// Whether `class` is an interface; `None` when unknown.
     fn is_interface(&self, class: &str) -> Option<bool> {
         crate::jdk_closure::class(class).map(|row| row.is_interface)
+    }
+
+    /// What the host's own description of the object keyed `key` says about `wanted` (a
+    /// game-hook firing's objects, `game_hooks.rs`); `None` when it describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
     }
 }
 
@@ -751,6 +763,11 @@ pub(crate) fn instance_of_class(
             .iter()
             .any(|class| hierarchy.is_instance(class, wanted) == Some(true))
     {
+        return Some(true);
+    }
+    // The host's description of this very object (a hook firing's `LivingEntity`, a
+    // `DedicatedServer`, a Mixin-added interface): a `yes` it names.
+    if hierarchy.described_instance_of(handle.key(), wanted) == Some(true) {
         return Some(true);
     }
     // The object is a `declared`; `wanted` is final and provably not one, so
@@ -1921,6 +1938,27 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::host_iterator::ITERATOR_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StdStream,
+        tag: "stds",
+        // A `PrintStream`; in the game vanilla's `LoggedPrintStream`
+        // (`host_service.rs`), so the exact class is not known.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::std_stream_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::LoaderSingleton,
+        tag: "ldrs",
+        // The loader's own class, which the runtime does not model.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::loader_singleton_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
     },
 ];
 

@@ -158,7 +158,9 @@ impl StdHost {
                 "net/neoforged/fml/config/ConfigTracker",
                 "INSTANCE",
                 "Lnet/neoforged/fml/config/ConfigTracker;",
-            ) => Some(Value::Ref(Some("fml-config-tracker".into()))),
+            ) => Some(crate::host_service::loader_singleton(
+                "net/neoforged/fml/config/ConfigTracker",
+            )),
             (
                 "net/neoforged/fml/config/ConfigTracker",
                 "configsByMod" | "fileMap",
@@ -199,9 +201,9 @@ impl StdHost {
             ("net/neoforged/fml/loading/FMLEnvironment", "isProduction", "()Z") => {
                 Some(Value::Int(1))
             }
-            ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => {
-                Some(Value::Ref(Some("neoforge-mod-list".into())))
-            }
+            ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => Some(
+                crate::host_service::loader_singleton("net/neoforged/fml/ModList"),
+            ),
             // `ModConfig.Type.valueOf(name)`: the constant, or `Enum.valueOf`'s
             // `IllegalArgumentException` for a name 12.0.12 does not declare.
             (
@@ -223,7 +225,9 @@ impl StdHost {
                 "net/neoforged/fml/loading/FMLLoader",
                 "getCurrent",
                 "()Lnet/neoforged/fml/loading/FMLLoader;",
-            ) => Some(Value::Ref(Some("fml-loader".into()))),
+            ) => Some(crate::host_service::loader_singleton(
+                "net/neoforged/fml/loading/FMLLoader",
+            )),
             (
                 "net/neoforged/neoforge/registries/DeferredRegister",
                 "createDataComponents",
@@ -277,7 +281,8 @@ impl StdHost {
         }
         let marker = match receiver {
             Value::Ref(Some(marker)) => marker.as_str(),
-            _ => return None,
+            // A loader singleton (`ModList.get()`...): its class.
+            _ => crate::host_service::loader_key(receiver)?,
         };
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/neoforged/api/distmarker/Dist", "isClient", "()Z") => {
@@ -308,7 +313,9 @@ impl StdHost {
                 "net/neoforged/fml/loading/FMLLoader",
                 "getLoadingModList",
                 "()Lnet/neoforged/fml/loading/LoadingModList;",
-            ) => Some(Value::Ref(Some("fml-loading-mod-list".into()))),
+            ) => Some(crate::host_service::loader_singleton(
+                "net/neoforged/fml/loading/LoadingModList",
+            )),
             (
                 "net/neoforged/fml/loading/FMLLoader",
                 "getDist",

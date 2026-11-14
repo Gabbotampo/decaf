@@ -104,6 +104,7 @@ mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
 mod host_registry;
+mod host_service;
 mod host_services;
 mod host_type_token;
 mod host_watch;
@@ -1491,6 +1492,13 @@ pub struct MixinExecutionReport {
 #[derive(Debug, Default)]
 struct CallbackInfos {
     states: BTreeMap<String, CallbackInfoState>,
+    /// What every call of this execution received or returned (the target's
+    /// receiver, arguments and result, each callback's): the execution's
+    /// Rust code holds them between its calls (a RETURN injection hands the
+    /// target's result to its callbacks and to the embedder), so every store
+    /// inside the execution keeps them (#226 re-check 3). An execution owns
+    /// its table and makes a bounded number of calls.
+    held: BTreeSet<String>,
 }
 
 /// The state behind one injection point's callback-info object.
@@ -1508,6 +1516,16 @@ struct CallbackInfoState {
 impl CallbackInfos {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep what one call of this execution received or returned for the
+    /// rest of the execution ([`Self::held`]).
+    fn hold<'v>(&mut self, values: impl IntoIterator<Item = &'v Value>) {
+        for value in values {
+            if let Some(text) = heap::value_text(value) {
+                self.held.insert(text.to_owned());
+            }
+        }
     }
 
     fn state(&self, marker: &str) -> Result<&CallbackInfoState, NativeError> {
@@ -2227,9 +2245,16 @@ pub struct EventDispatch {
     pub event: Value,
 }
 
+/// The interpreter's view of the world outside the jar.
+///
+/// A default never answers a Java value silently: a host that does not model a call (or a
+/// field) errors with [`NativeError::UnknownHostCall`], and a real host counts what it does
+/// not model (`StdHost::unknown_host_call`). Defaults answering `None`/`false` mean "this host
+/// keeps no such state", which the caller turns into a counted path of its own (#246's review:
+/// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
-    fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::Ref(None))
+    fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
     /// The NeoForge attachment state and the unknown-call table it counts refusals in
     /// (`neoforge_attachments.rs`). A host that keeps neither answers `None`, and the attachment
@@ -2270,15 +2295,20 @@ pub trait Host {
         let _ = receiver;
         self.get_static(r)
     }
+    /// What this host's own description of the object keyed `key` says about `wanted`
+    /// (`ClassHierarchy::described_instance_of`); `None` for a host that describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
-    /// (`jar_operands.rs`).
+    /// (`jar_operands.rs`). A host that counts nothing errors instead.
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// The chat components this host changed in place (`host_component.rs`
@@ -2700,6 +2730,16 @@ pub trait Host {
         Ok(())
     }
 
+    /// Whether the resident heap collected the object `key` (`class#n`), so
+    /// a read of its fields is a missed root, never its fields' defaults.
+    fn object_collected(&self, _key: &str) -> bool {
+        false
+    }
+
+    /// Hold off (`true`) or allow again the resident heap's collections:
+    /// while a run may still be rolled back, nothing is freed.
+    fn pause_collections(&mut self, _paused: bool) {}
+
     /// Run a jar method somewhere else before its body runs.
     ///
     /// A game-hook callback calls members of a Mixin class on a game object
@@ -3083,6 +3123,14 @@ pub struct StdHost {
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
     heap: heap::JavaHeap,
+    /// Values the embedder holds between invocations (`StdHost::retain`),
+    /// with their hold counts: roots of the heap's collections.
+    retained: BTreeMap<String, usize>,
+    /// The jar objects collections freed (`heap::FreedObjects`).
+    freed_objects: heap::FreedObjects,
+    /// No collection runs (`Host::pause_collections`): a run that may be
+    /// rolled back is in progress.
+    collections_paused: bool,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
     /// The threads the jar made and started (`parked_threads.rs`).
@@ -3219,6 +3267,9 @@ impl StdHost {
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
+            retained: BTreeMap::new(),
+            freed_objects: heap::FreedObjects::default(),
+            collections_paused: false,
             unknown_host_calls: BTreeMap::new(),
             threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
@@ -5258,10 +5309,10 @@ impl Host for StdHost {
             // text lands in the same in-memory sink a modelled writer uses.
             // A mod's `println` then runs instead of dereferencing a null.
             ("java/lang/System", "out", "Ljava/io/PrintStream;") => {
-                Ok(Value::Ref(Some("system-out".into())))
+                Ok(host_service::std_stream(false))
             }
             ("java/lang/System", "err", "Ljava/io/PrintStream;") => {
-                Ok(Value::Ref(Some("system-err".into())))
+                Ok(host_service::std_stream(true))
             }
             // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
             // timers and ids against; a neutral `0` would silently truncate
@@ -6512,9 +6563,9 @@ impl Host for StdHost {
             ) => Ok(Value::Ref(Some(
                 "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
             ))),
-            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
-                Ok(Value::Ref(Some("neoforge-mod-list".into())))
-            }
+            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => Ok(
+                host_service::loader_singleton("net/minecraftforge/fml/ModList"),
+            ),
             // A block's property builder normally comes from a static
             // factory rather than `new`. Give it a bounded marker so the
             // chain is observable; a copy variant keeps only the settings the
@@ -7065,6 +7116,7 @@ impl Host for StdHost {
         // An iterator-family handle reads its host table by its key (`host_iterator.rs`).
         let receiver_marker = expect_ref(receiver)
             .or_else(|| host_iterator::marker(receiver))
+            .or_else(|| host_service::stream_marker(receiver))
             .cloned();
         if let Some(marker) = callback_text(receiver)
             && let Some(value) = functional_composition_marker(r, &marker, args)
@@ -10219,6 +10271,14 @@ impl Host for StdHost {
     fn store_persistent_heap(&mut self, heap: JavaHeap) -> Result<(), NativeError> {
         self.store_resident_heap(heap)
     }
+
+    fn object_collected(&self, key: &str) -> bool {
+        self.freed_objects.holds_key(key)
+    }
+
+    fn pause_collections(&mut self, paused: bool) {
+        self.collections_paused = paused;
+    }
 }
 
 fn expect_int(r: &MethodRef, value: &Value) -> Result<i32, NativeError> {
@@ -12478,6 +12538,26 @@ fn object_text(host: &mut StdHost, value: &Value) -> String {
             marker.clone()
         }),
         other => value_text(other),
+    }
+}
+
+impl<H: Host> Runtime<'_, H> {
+    /// Refuse a field access on an object the resident heap collected: its
+    /// fields are gone, so the access is a missed root, never its fields'
+    /// defaults (#226 review). Checked where no field row exists, which is
+    /// every access to a collected object.
+    pub(crate) fn refuse_collected(
+        &self,
+        receiver: &Value,
+        field: &MethodRef,
+    ) -> Result<(), NativeError> {
+        match jar_object::object_key(receiver) {
+            Some(key) if self.host.object_collected(key) => Err(NativeError::Metadata(format!(
+                "the jar's object {key} was collected while still reachable (a missed heap root); field {}#{}",
+                field.owner, field.name
+            ))),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -17190,6 +17270,10 @@ impl NativeJar {
         // The callback sees the objects its entrypoint built, and the next
         // callback sees what this one changed (`heap.rs`).
         let resident = runtime.adopt_resident_heap();
+        // What the embedder handed over, and below what it gets back: it may
+        // hold either until this call's store ends (`StdHost::retain` for
+        // longer).
+        let mut crossing: Vec<Value> = receiver.iter().chain(args).cloned().collect();
         let result = runtime.invoke(
             &target.owner,
             &target.name,
@@ -17200,7 +17284,8 @@ impl NativeJar {
         // A failed run keeps what it wrote before failing, as a JVM would.
         let persistence = runtime.persist_class_state();
         if resident {
-            runtime.persist_resident_heap()?;
+            crossing.extend(result.as_ref().ok().cloned());
+            runtime.persist_resident_heap_crossing(&crossing)?;
         }
         persistence?;
         result
@@ -17345,11 +17430,42 @@ impl NativeJar {
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
+        // What the embedder handed over and what it gets back, and everything
+        // the execution this call belongs to holds between its calls: what
+        // its earlier calls received and returned, a `CallbackInfoReturnable`'s
+        // result and override, the hook tables' entries and results. All of it
+        // stays a root through this store (#226 re-check 3); the embedder may
+        // hold what crossed until the execution's last store ends
+        // (`StdHost::retain` for longer).
+        runtime.callback_infos.hold(receiver.iter().chain(args));
         let result = runtime.invoke(&class_name, method, descriptor, receiver, args);
         // A failed run keeps what it wrote before failing, as a JVM would.
         let persistence = runtime.persist_class_state();
         if resident {
-            runtime.persist_resident_heap()?;
+            runtime.callback_infos.hold(result.as_ref().ok());
+            // Each table's whole `Debug` text, scanned for markers like the
+            // host's opaque state (`heap.rs`): keeping too much, never too
+            // little, whatever a table holds.
+            let mut roots = vec![format!("{:?}", runtime.callback_infos)];
+            roots.extend(
+                runtime
+                    .invoke_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            roots.extend(
+                runtime
+                    .anchor_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            roots.extend(
+                runtime
+                    .modify_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            runtime.persist_resident_heap_with(roots)?;
         }
         persistence?;
         result
@@ -23029,7 +23145,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let receiver_marker = receiver.and_then(expect_ref).cloned();
+        let receiver_marker = receiver
+            .and_then(|receiver| {
+                expect_ref(receiver).or_else(|| host_service::stream_marker(receiver))
+            })
+            .cloned();
         match r.owner.as_str() {
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
@@ -24134,9 +24254,16 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                        let target = args.last().and_then(expect_ref).ok_or_else(|| {
-                            NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
-                        })?;
+                        let target = args
+                            .last()
+                            .and_then(|arg| {
+                                expect_ref(arg).or_else(|| host_service::stream_marker(arg))
+                            })
+                            .ok_or_else(|| {
+                                NativeError::Metadata(
+                                    "Gson.toJson needs an Appendable receiver".into(),
+                                )
+                            })?;
                         if let Some(key) = self.io_sink_key(target) {
                             self.io_writers.entry(key).or_default().push_str(&text);
                             return Ok(Some(Value::Void));
@@ -25973,11 +26100,16 @@ impl<H: Host> Runtime<'_, H> {
                                 .and_then(|key| self.fields.get(&key).cloned())
                             {
                                 Some(value) => value,
-                                // JVMS §2.3: a jar field nothing wrote yet.
+                                // JVMS §2.3: a jar field nothing wrote yet,
+                                // unless the heap collected the object.
                                 None if self.reads_unwritten_jar_field(&r, &receiver) => {
+                                    self.refuse_collected(&receiver, &r)?;
                                     Value::default_for(&r.descriptor)
                                 }
-                                None => self.host.get_field(&receiver, &r)?,
+                                None => {
+                                    self.refuse_collected(&receiver, &r)?;
+                                    self.host.get_field(&receiver, &r)?
+                                }
                             }
                         }
                         AnchorOutcome::Suppress => Value::default_for(&r.descriptor),
@@ -26013,6 +26145,9 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal
                         && let Some(key) = instance_field_key(&receiver, &r)
                     {
+                        if !self.fields.contains_key(&key) {
+                            self.refuse_collected(&receiver, &r)?;
+                        }
                         self.fields.insert(key, value);
                     }
                 }
@@ -31879,6 +32014,23 @@ modId="minecraft"
                 .unwrap(),
             Value::Int(-1)
         );
+        // Two equal texts of unknown identity: `==` keeps the value answer and
+        // is counted, so a host that counts nothing refuses it.
+        assert!(matches!(
+            jar.invoke_method_with_args(
+                "demo.Math",
+                "same",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                None,
+                &[
+                    Value::Ref(Some("same".into())),
+                    Value::Ref(Some("same".into()))
+                ],
+                &mut NullHost,
+            ),
+            Err(NativeError::UnknownHostCall(_))
+        ));
+        let mut counting = StdHost::new();
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo.Math",
@@ -31889,10 +32041,17 @@ modId="minecraft"
                     Value::Ref(Some("same".into())),
                     Value::Ref(Some("same".into()))
                 ],
-                &mut host,
+                &mut counting,
             )
             .unwrap(),
             Value::Int(1)
+        );
+        assert_eq!(
+            counting.unknown_host_calls(),
+            [(
+                "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+                1
+            )]
         );
         assert_eq!(
             jar.invoke_method_with_args(
@@ -37139,7 +37298,10 @@ mandatory = true
         // `ModList.get()` is an `invokestatic`, which reaches the host's
         // `invoke`, not `get_static`.
         let list = host.invoke(&get, &[]).unwrap();
-        assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
+        assert_eq!(
+            list,
+            host_service::loader_singleton("net/neoforged/fml/ModList")
+        );
         let loaded = MethodRef {
             owner: "net/neoforged/fml/ModList".into(),
             name: "isLoaded".into(),
@@ -37225,7 +37387,10 @@ mandatory = true
                 &[],
             )
             .unwrap();
-        assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
+        assert_eq!(
+            list,
+            host_service::loader_singleton("net/minecraftforge/fml/ModList")
+        );
         let container = host
             .invoke_instance(
                 &MethodRef {

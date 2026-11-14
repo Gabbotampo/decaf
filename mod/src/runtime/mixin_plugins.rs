@@ -233,11 +233,23 @@ impl NativeJar {
             if let Some(heap) = &heap {
                 let _ = host.store_persistent_heap(heap.clone());
             }
-            let session = self.plugin_session(config, plugin, index, &configs, side, host);
+            // Nothing is collected while the session may still be rolled
+            // back: a collection would free (and prune host rows of) objects
+            // the restored statics name again (#226 review). The session is
+            // bounded by its budget.
+            let session = {
+                let mut paused = PausedCollections::new(host);
+                self.plugin_session(config, plugin, index, &configs, side, &mut *paused)
+            };
             if session.report.refused.is_some() {
                 let _ = host.store_persistent_class_state(fields, initialized);
-                if let Some(heap) = heap {
-                    let _ = host.take_persistent_heap();
+                if let Some(mut heap) = heap {
+                    // Keys are never handed out twice: the restored heap goes
+                    // on from the numbers the session reached.
+                    if let Some(session_heap) = host.take_persistent_heap() {
+                        heap.next_object = heap.next_object.max(session_heap.next_object);
+                        heap.next_array = heap.next_array.max(session_heap.next_array);
+                    }
                     let _ = host.store_persistent_heap(heap);
                 }
             }
@@ -560,6 +572,37 @@ impl StdHost {
             ("ordinal", "()I") => Some(Ok(Value::Int(ordinal as i32))),
             _ => None,
         }
+    }
+}
+
+/// The host with its collections paused for as long as this lives, resumed
+/// when it drops, a panicking session included (a mod's `catch_unwind` keeps
+/// the host, which must not stay paused for its life, #226 re-check 3).
+struct PausedCollections<'h, H: Host + ?Sized>(&'h mut H);
+
+impl<'h, H: Host + ?Sized> PausedCollections<'h, H> {
+    fn new(host: &'h mut H) -> Self {
+        host.pause_collections(true);
+        Self(host)
+    }
+}
+
+impl<H: Host + ?Sized> Drop for PausedCollections<'_, H> {
+    fn drop(&mut self) {
+        self.0.pause_collections(false);
+    }
+}
+
+impl<H: Host + ?Sized> std::ops::Deref for PausedCollections<'_, H> {
+    type Target = H;
+    fn deref(&self) -> &H {
+        self.0
+    }
+}
+
+impl<H: Host + ?Sized> std::ops::DerefMut for PausedCollections<'_, H> {
+    fn deref_mut(&mut self) -> &mut H {
+        self.0
     }
 }
 
