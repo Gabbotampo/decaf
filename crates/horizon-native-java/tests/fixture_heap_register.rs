@@ -2,7 +2,8 @@
 //!
 //! The view (one `UnmodifiableSet` per register, in the host's per-object view cache) and the
 //! set it reads stay, with their holders, through three rounds of calls that each make well past
-//! a collection's worth of garbage: the same object, the same holders, Java's text.
+//! a collection's worth of garbage: the same object, the same holders, Java's text. Views made
+//! after the collection freed two temporary ones take new keys, never a held view's (#249).
 //!
 //! `fixtures/heap_register/demo/HeapRegister.java` runs unchanged on both sides; its `main` on
 //! Java 25, against the real 26.3 server jar and NeoForge 26.3.0.101, printed `java25.txt`. The
@@ -80,6 +81,7 @@ fn a_held_get_entries_view_survives_collections() {
     let fixture = javac_fixture::Fixture::build("heap-register", &sources);
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(call(&fixture, &mut host, "setup"), expected("setup"));
+    assert_eq!(call(&fixture, &mut host, "drop"), expected("drop"));
     assert_eq!(call(&fixture, &mut host, "check"), expected("check"));
     let mark = host.call_log_mark();
     let mut freed = 0;
@@ -96,6 +98,9 @@ fn a_held_get_entries_view_survives_collections() {
         );
     }
     assert!(freed > 0, "no collection ran");
+    // New views and a new register after the temporaries were collected: the held view, its
+    // holder and the plain view read what they did, never another view's set (#243 review B1).
+    assert_eq!(call(&fixture, &mut host, "after"), expected("after"));
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",
