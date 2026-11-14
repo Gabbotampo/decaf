@@ -1,0 +1,4 @@
+list=java.lang.String|TTFFFFF|TTTH|1T|StringT|list/a,b|<list/a,b>8|CCECCECCE
+set=java.lang.String|TTFFFFF|TTTH|1T|StringT|set/x|<set/x>5|CCECCECCE
+map=java.lang.String|TTFFFFF|TTTH|1T|StringT|map/k=v|<map/k=v>7|CCECCECCE
+bare=java.lang.String|TTFFFFF|TTTH|1T|StringT|list|<list>4|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|set|<set>3|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|map|<map>3|CCECCECCE
