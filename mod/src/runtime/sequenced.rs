@@ -219,8 +219,9 @@ impl StdHost {
         let view_marker = crate::runtime::jar_object::collection_key_for(
             view,
             crate::runtime::jar_object::CollectionFamily::Reversed,
-            self.reversed_views.len(),
+            self.next_reversed_view,
         );
+        self.next_reversed_view += 1;
         self.reversed_views
             .insert(view_marker.clone(), (marker.to_owned(), modifiable));
         // A view of its own (#156 P14c): `list.reversed() == list.reversed()`

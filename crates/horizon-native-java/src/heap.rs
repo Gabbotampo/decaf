@@ -1354,6 +1354,8 @@ mod tests {
             "imc",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
+            "next_unmodifiable_collection",
+            "next_reversed_view",
             "properties",
             "environment",
             "resources",
