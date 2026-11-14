@@ -137,8 +137,20 @@ pub(crate) fn value(marker: &str) -> Option<Value> {
 pub(crate) fn text(value: &Value) -> Option<&String> {
     match value {
         Value::Host(handle) if is_game_kind(handle.kind()) => Some(handle.key_text()),
+        // Every `BlockPos`, `LevelResource` and `GameRule` is a handle (#156
+        // P16c): text spelling one is a jar's `String`, never read as one.
+        Value::Ref(Some(text)) if is_handle_only_text(text) => None,
         other => crate::runtime::expect_ref(other),
     }
+}
+
+/// Whether `text` spells a family every object of which is a handle, so the
+/// text is a `String` (P16c's families; `value_class::RETIRED_PREFIXES`).
+fn is_handle_only_text(text: &str) -> bool {
+    use crate::runtime::server_values::{BLOCK_POS, GAME_RULE, LEVEL_RESOURCE};
+    [BLOCK_POS, LEVEL_RESOURCE, GAME_RULE]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 /// A client value of the game (#156 P16d): the handle of a `client/…` or
@@ -152,11 +164,14 @@ pub(crate) fn client_value(marker: String) -> Value {
     Value::Ref(Some(marker))
 }
 
-/// A server-side value of the game (#156 P16b): the handle of a `game/…`
-/// marker. Text of any other family stays the text it was: its producers
-/// move with P16c (values and registry objects) and P16d (the client).
+/// A server-side value of the game: the handle of a `game/…` marker (#156
+/// P16b), a `BlockPos`, a `LevelResource` or a `GameRule` (P16c). Text of
+/// any other family stays the text it was.
 pub(crate) fn server_value(marker: String) -> Value {
-    if marker.starts_with("game/")
+    use crate::runtime::server_values::{BLOCK_POS, GAME_RULE, LEVEL_RESOURCE};
+    if ["game/", BLOCK_POS, LEVEL_RESOURCE, GAME_RULE]
+        .iter()
+        .any(|prefix| marker.starts_with(prefix))
         && let Some(value) = value(&marker)
     {
         return value;
@@ -432,25 +447,52 @@ pub(crate) const ENTITY_METHODS: Methods = Methods {
 /// `equals`, `hashCode` and `toString` from their key (`client_values.rs`);
 /// the others compare keys, and count the rest until P16c.
 pub(crate) const VALUE_METHODS: Methods = Methods {
-    to_string: |handle, _| Ok(crate::runtime::client_values::to_string(handle.key())),
-    hash_code: |handle, _| Ok(crate::runtime::client_values::hash_code(handle.key())),
+    to_string: |handle, _| {
+        let key = handle.key();
+        Ok(crate::runtime::client_values::to_string(key).or_else(|| crate::runtime::server_values::to_string(key)))
+    },
+    hash_code: |handle, _| {
+        let key = handle.key();
+        Ok(crate::runtime::client_values::hash_code(key).or_else(|| crate::runtime::server_values::hash_code(key)))
+    },
     equals: |handle, other, _| {
         let other_key = match other {
             Value::Host(other) if other.kind() == handle.kind() => Some(other.key()),
             _ => None,
         };
-        Ok(crate::runtime::client_values::equals(handle.key(), other_key, other)
-            .unwrap_or_else(|| Some(other_key == Some(handle.key()))))
+        let key = handle.key();
+        Ok(crate::runtime::client_values::equals(key, other_key, other)
+            .or_else(|| crate::runtime::server_values::equals(key, other_key, other))
+            .unwrap_or_else(|| Some(other_key == Some(key))))
     },
+    // `Vec3i` is `Comparable`; another value's order is counted. Only a value of
+    // this kind is read as a position: another handle whose key happens to spell
+    // `block-pos/…` (a `Path`) is not one (#239's review B1).
+    compare_to: Some(|handle, other, _| {
+        Ok(match other {
+            Value::Host(other_handle) if other_handle.kind() == handle.kind() => {
+                crate::runtime::server_values::compare_to(handle.key(), other)
+            }
+            _ => None,
+        })
+    }),
     ..IDENTITY_METHODS
 };
 
 /// Whether two handles of one value key are one object: the client's
-/// constants are (`client_values::canonical`), any other value is per
-/// producer.
+/// constants and `LevelResource`'s are (`client_values::canonical`,
+/// `server_values::canonical`); any other value is per producer.
 pub(crate) fn value_canonical(key: &str) -> bool {
-    crate::runtime::client_values::canonical(key)
+    crate::runtime::client_values::canonical(key) || crate::runtime::server_values::canonical(key)
 }
+
+/// A registry entry (`Item`, `Block`, `BlockState`, `GameRule`...): identity
+/// `equals` and `hashCode` (counted); `toString` from the key where it holds
+/// the name (`server_values::to_string`), else counted.
+pub(crate) const REGISTRY_METHODS: Methods = Methods {
+    to_string: |handle, _| Ok(crate::runtime::server_values::to_string(handle.key())),
+    ..IDENTITY_METHODS
+};
 
 /// A level: identity `equals`; `ClientLevel.toString()` is `ClientLevel`
 /// (vanilla 26.3), a `ServerLevel`'s needs the world's name (counted).
@@ -462,6 +504,21 @@ pub(crate) const LEVEL_METHODS: Methods = Methods {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BlockPos.compareTo` reads only another position: a `Path` whose text
+    /// spells a position key is no position, so its order is counted (`None`),
+    /// never a silent `0` (#239's review B1; Java throws a CCE there).
+    #[test]
+    fn a_position_compares_only_with_a_position() {
+        let Some(Value::Host(a)) = value("block-pos/1,2,3") else {
+            panic!("a position is a handle");
+        };
+        let below = value("block-pos/1,1,9").expect("a position");
+        let path = crate::runtime::host_path::path_value("block-pos/1,2,3");
+        let mut nested = crate::runtime::MarkerText;
+        assert_eq!(a.compare_to(&below, &mut nested).unwrap(), Some(1));
+        assert_eq!(a.compare_to(&path, &mut nested).unwrap(), None);
+    }
 
     /// Every family names its kind; text of no game family names none.
     #[test]
