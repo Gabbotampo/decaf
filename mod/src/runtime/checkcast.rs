@@ -292,9 +292,13 @@ impl<H: Host> Runtime<'_, H> {
             // a cast of a `String` to one of their classes is as exact, but
             // for a text shaped like a class name, which the host answers for
             // an object it does not model (`net/minecraft/core/Registry`).
+            // A client class every object of which is a handle (#156 P16d,
+            // `game_object::handle_only_class`) is never text, a class-name
+            // text included.
             if let Value::Ref(Some(text)) = value
                 && crate::runtime::value_class::is_plain_string(text)
                 && (crate::runtime::jdk_closure::in_jdk_package(target)
+                    || crate::runtime::game_object::handle_only_class(target)
                     || ((target.starts_with("net/minecraft/")
                         || target.starts_with("com/mojang/brigadier/"))
                         && !crate::runtime::value_class::class_name_shaped(text)))
