@@ -1488,6 +1488,13 @@ pub struct MixinExecutionReport {
 #[derive(Debug, Default)]
 struct CallbackInfos {
     states: BTreeMap<String, CallbackInfoState>,
+    /// What every call of this execution received or returned (the target's
+    /// receiver, arguments and result, each callback's): the execution's
+    /// Rust code holds them between its calls (a RETURN injection hands the
+    /// target's result to its callbacks and to the embedder), so every store
+    /// inside the execution keeps them (#226 re-check 3). An execution owns
+    /// its table and makes a bounded number of calls.
+    held: BTreeSet<String>,
 }
 
 /// The state behind one injection point's callback-info object.
@@ -1505,6 +1512,16 @@ struct CallbackInfoState {
 impl CallbackInfos {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep what one call of this execution received or returned for the
+    /// rest of the execution ([`Self::held`]).
+    fn hold<'v>(&mut self, values: impl IntoIterator<Item = &'v Value>) {
+        for value in values {
+            if let Some(text) = heap::value_text(value) {
+                self.held.insert(text.to_owned());
+            }
+        }
     }
 
     fn state(&self, marker: &str) -> Result<&CallbackInfoState, NativeError> {
@@ -17217,16 +17234,42 @@ impl NativeJar {
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
-        // What the embedder handed over, and below what it gets back: it may
-        // hold either until this call's store ends (`StdHost::retain` for
-        // longer).
-        let mut crossing: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+        // What the embedder handed over and what it gets back, and everything
+        // the execution this call belongs to holds between its calls: what
+        // its earlier calls received and returned, a `CallbackInfoReturnable`'s
+        // result and override, the hook tables' entries and results. All of it
+        // stays a root through this store (#226 re-check 3); the embedder may
+        // hold what crossed until the execution's last store ends
+        // (`StdHost::retain` for longer).
+        runtime.callback_infos.hold(receiver.iter().chain(args));
         let result = runtime.invoke(&class_name, method, descriptor, receiver, args);
         // A failed run keeps what it wrote before failing, as a JVM would.
         let persistence = runtime.persist_class_state();
         if resident {
-            crossing.extend(result.as_ref().ok().cloned());
-            runtime.persist_resident_heap_crossing(&crossing)?;
+            runtime.callback_infos.hold(result.as_ref().ok());
+            // Each table's whole `Debug` text, scanned for markers like the
+            // host's opaque state (`heap.rs`): keeping too much, never too
+            // little, whatever a table holds.
+            let mut roots = vec![format!("{:?}", runtime.callback_infos)];
+            roots.extend(
+                runtime
+                    .invoke_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            roots.extend(
+                runtime
+                    .anchor_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            roots.extend(
+                runtime
+                    .modify_hooks
+                    .as_deref()
+                    .map(|hooks| format!("{hooks:?}")),
+            );
+            runtime.persist_resident_heap_with(roots)?;
         }
         persistence?;
         result
