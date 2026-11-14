@@ -465,8 +465,17 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
             .or_else(|| crate::runtime::server_values::equals(key, other_key, other))
             .unwrap_or_else(|| Some(other_key == Some(key))))
     },
-    // `Vec3i` is `Comparable`; another value's order is counted.
-    compare_to: Some(|handle, other, _| Ok(crate::runtime::server_values::compare_to(handle.key(), other))),
+    // `Vec3i` is `Comparable`; another value's order is counted. Only a value of
+    // this kind is read as a position: another handle whose key happens to spell
+    // `block-pos/…` (a `Path`) is not one (#239's review B1).
+    compare_to: Some(|handle, other, _| {
+        Ok(match other {
+            Value::Host(other_handle) if other_handle.kind() == handle.kind() => {
+                crate::runtime::server_values::compare_to(handle.key(), other)
+            }
+            _ => None,
+        })
+    }),
     ..IDENTITY_METHODS
 };
 
@@ -495,6 +504,21 @@ pub(crate) const LEVEL_METHODS: Methods = Methods {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BlockPos.compareTo` reads only another position: a `Path` whose text
+    /// spells a position key is no position, so its order is counted (`None`),
+    /// never a silent `0` (#239's review B1; Java throws a CCE there).
+    #[test]
+    fn a_position_compares_only_with_a_position() {
+        let Some(Value::Host(a)) = value("block-pos/1,2,3") else {
+            panic!("a position is a handle");
+        };
+        let below = value("block-pos/1,1,9").expect("a position");
+        let path = crate::runtime::host_path::path_value("block-pos/1,2,3");
+        let mut nested = crate::runtime::MarkerText;
+        assert_eq!(a.compare_to(&below, &mut nested).unwrap(), Some(1));
+        assert_eq!(a.compare_to(&path, &mut nested).unwrap(), None);
+    }
 
     /// Every family names its kind; text of no game family names none.
     #[test]

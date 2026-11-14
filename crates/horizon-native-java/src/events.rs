@@ -1369,10 +1369,12 @@ impl StdHost {
             }
             ("net/minecraft/world/level/Level", "END") => Some(dimension_key("minecraft:the_end")),
             // `Blocks.STONE` and the other block constants answer in a firing,
-            // with the block id the callback's `BlockState` names.
-            ("net/minecraft/world/level/block/Blocks", name) if self.game_event.is_some() => Some(
-                block_marker(&format!("minecraft:{}", name.to_ascii_lowercase())),
-            ),
+            // with the id 26.3 registers for the constant (`vanilla_blocks.rs`:
+            // `POTTED_AZALEA` is `potted_azalea_bush`). A constant 26.3 lacks is
+            // no block (#239's review B2).
+            ("net/minecraft/world/level/block/Blocks", name) if self.game_event.is_some() => {
+                crate::vanilla_blocks::field_id(name).map(|id| block_marker(&id))
+            }
             // `handler.player`: an instance field of a host object reaches the
             // host as a static read without its receiver, and only the join
             // and disconnect firings hand a handler out.
