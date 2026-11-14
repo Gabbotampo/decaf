@@ -57,18 +57,24 @@ public final class Probe {
             + "," + uoe(() -> none.removeFirst()) + "," + uoe(() -> view.removeLast()) + "|" + view;
     }
 
-    /** `sort` and `replaceAll` through the view reach the array, and `Arrays.fill` on the array reaches the view. */
+    /** `sort` and `set` through the view reach the array, and the array's writes reach the view. */
     public static String reorder() {
         String[] array = {"c", "a", "b"};
         List<String> view = Arrays.asList(array);
         Collections.sort(view);
         String sorted = String.join("", array);
-        view.replaceAll(String::toUpperCase);
+        for (int i = 0; i < view.size(); i++) {
+            view.set(i, view.get(i).toUpperCase());
+        }
         String upper = String.join("", array);
-        Collections.reverse(view);
+        for (int i = 0, j = view.size() - 1; i < j; i++, j--) {
+            view.set(i, view.set(j, view.get(i)));
+        }
         String reversed = String.join("", array);
         String viewed = view.toString();
-        Arrays.fill(array, "f");
+        for (int i = 0; i < array.length; i++) {
+            array[i] = "f";
+        }
         return sorted + "," + upper + "," + reversed + "," + viewed + "," + String.join("", view);
     }
 

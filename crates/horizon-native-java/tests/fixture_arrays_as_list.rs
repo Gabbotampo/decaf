@@ -30,8 +30,8 @@ fn expected(method: &str) -> &'static str {
 ///   `addAll`, `removeIf`, `retainAll`, `removeAll`, `clear` throw only when
 ///   they would add or remove, else answer as having done nothing;
 ///   `removeFirst` on an empty view is `NoSuchElementException`;
-/// - `reorder`: `Collections.sort`, `replaceAll` and `Collections.reverse`
-///   through the view reach the array, `Arrays.fill` on the array the view;
+/// - `reorder`: `Collections.sort` and `set` through the view reach the
+///   array, and the array's writes reach the view;
 /// - `asAList`: its class (`Arrays$ArrayList`, `RandomAccess`), `List`
 ///   equality and hash both ways, a view inside another list and a copy see
 ///   the array as written, `indexOf`/`contains`, and `Arrays.asList()`.
