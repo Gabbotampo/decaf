@@ -102,6 +102,7 @@ mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
 mod host_path;
+mod host_recursion;
 mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
@@ -8398,8 +8399,8 @@ impl Host for StdHost {
                 // counted as in any collection's text).
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
-                    object_text(self, &key),
-                    object_text(self, &value)
+                    object_text(self, &key)?,
+                    object_text(self, &value)?
                 )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
@@ -11528,6 +11529,7 @@ impl host_ref::Nested for MarkerText {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(Some(match value {
             // An object prints its key, as its marker did.
             Value::Host(handle) if jar_object::is_object_handle(handle) => handle.key().to_owned(),
@@ -11551,6 +11553,7 @@ struct HostNested<'a>(Option<&'a mut StdHost>);
 
 impl host_ref::Nested for HostNested<'_> {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match value {
             // An object's own `hashCode` is jar code (or an identity hash).
             Value::Host(handle) if jar_object::is_object_handle(handle) => None,
@@ -11563,6 +11566,7 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match a {
             // `a == b` answers for any object; its own `equals` is jar code.
             Value::Host(handle) if jar_object::is_object_handle(handle) => (a == b).then_some(true),
@@ -11577,10 +11581,11 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match (value, self.0.as_deref_mut()) {
             // An object prints what its class's model prints, if one does.
             (Value::Host(handle), Some(host)) if jar_object::is_object_handle(handle) => {
-                host.modelled_to_string(value)
+                java_tostring::modelled_checked(host, value)?
             }
             (Value::Host(handle), None) if jar_object::is_object_handle(handle) => None,
             // A `Class` the host can name the kind of: a primitive, an array,
@@ -11590,7 +11595,7 @@ impl host_ref::Nested for HostNested<'_> {
             }
             (Value::Host(handle), _) => return handle.to_string(self),
             (Value::Ref(Some(text)), _) if value_class::is_plain_string(text) => Some(text.clone()),
-            (Value::Ref(Some(_)), Some(host)) => host.modelled_to_string(value),
+            (Value::Ref(Some(_)), Some(host)) => java_tostring::modelled_checked(host, value)?,
             (Value::Ref(Some(_)), None) => None,
             (other, _) => Some(value_text(other)),
         })
@@ -12574,18 +12579,27 @@ fn collection_text(
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
     // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
-    // `String.valueOf(element)`, and the collection itself inside it prints
-    // `(this Collection)`/`(this Map)`.
+    // `String.valueOf(element)`, and the collection itself inside it (`e == this`)
+    // prints `(this Collection)`/`(this Map)`. A collection is a handle, so `==` is
+    // its identity, not its text (#250: a list holding itself recursed until the
+    // native stack overflowed). A deeper cycle recurses, as on the JVM, until a
+    // `StackOverflowError` (`host_recursion.rs`).
+    let _level = host_recursion::enter()?;
     let mut texts = Vec::with_capacity(values.len());
     for element in &values {
-        texts.push(match element {
-            Value::Ref(Some(inner)) if *inner == marker => if is_map {
+        let itself = match element {
+            Value::Ref(Some(inner)) => *inner == marker,
+            element => object_methods::identical(element, value),
+        };
+        texts.push(if itself {
+            if is_map {
                 "(this Map)"
             } else {
                 "(this Collection)"
             }
-            .to_owned(),
-            element => object_text(host, element),
+            .to_owned()
+        } else {
+            object_text(host, element)?
         });
     }
     Ok(if is_map {
@@ -12603,33 +12617,37 @@ fn collection_text(
 /// `String.valueOf(Object)` of one value a model holds (a collection's
 /// element, an optional's payload): a box prints its value and a model
 /// object its `toString`.
-fn object_text(host: &mut StdHost, value: &Value) -> String {
-    match value {
+fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
+    Ok(match value {
         Value::Boxed(boxed) => boxed.text(),
         // A handle prints its kind's `toString`; one holding an object the
-        // host cannot print is counted, and keeps the old text.
+        // host cannot print is counted, and keeps the old text. A cycle's
+        // `StackOverflowError` is thrown, as Java's is.
         Value::Host(handle) => match handle.to_string(&mut HostNested(Some(host))) {
             Ok(Some(text)) => text,
+            Err(error) if host_recursion::is_stack_overflow(&error) => return Err(error),
             _ => {
                 let _ = host.unknown_host_call(&jar_text::object_to_string());
                 host_text(value)
             }
         },
-        Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
-            // An object no model prints (a jar object, an identity hash)
-            // is counted; the element keeps its marker in the text. A
-            // stream is counted too, and never prints its marker.
-            if stream_pipeline::is_stream_marker(marker) {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-                return stream_pipeline::STREAM_TEXT.into();
-            }
-            if crate::runtime::jar_object::packaged_object_class(value).is_some() {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-            }
-            marker.clone()
-        }),
+        Value::Ref(Some(marker)) => {
+            java_tostring::modelled_checked(host, value)?.unwrap_or_else(|| {
+                // An object no model prints (a jar object, an identity hash)
+                // is counted; the element keeps its marker in the text. A
+                // stream is counted too, and never prints its marker.
+                if stream_pipeline::is_stream_marker(marker) {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                    return stream_pipeline::STREAM_TEXT.into();
+                }
+                if crate::runtime::jar_object::packaged_object_class(value).is_some() {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                }
+                marker.clone()
+            })
+        }
         other => value_text(other),
-    }
+    })
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -25231,6 +25249,26 @@ impl<H: Host> Runtime<'_, H> {
                             message,
                             frame: frame.or_else(|| Some(format!("{class}#{method} +{}", $at))),
                         });
+                    }
+                    // A jar recursion past the thread's stack is Java's `StackOverflowError`
+                    // (#250): a handler for it (or `Error`/`Throwable`) here catches it, as on
+                    // the JVM; with none it leaves as the bound's own diagnostic.
+                    Err(error @ NativeError::CallDepthExceeded { .. }) => {
+                        if let Some(handler) = self.exception_handler(
+                            file,
+                            method,
+                            desc,
+                            $at,
+                            host_recursion::STACK_OVERFLOW,
+                        )? {
+                            let value =
+                                self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
+                            stack.clear();
+                            stack.push(value);
+                            pc = handler;
+                            continue;
+                        }
+                        return Err(error);
                     }
                     Err(error) => return Err(frame_context(error, class, method, $at)),
                 }
