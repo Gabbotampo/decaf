@@ -880,7 +880,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
-    host.mutable_collections.retain(|key, _| keep(key));
+    host.mutable_collections.retain_markers(|key| keep(key));
     host.iterators.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));

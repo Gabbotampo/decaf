@@ -212,6 +212,9 @@ enum Life {
     Opaque {
         map: String,
         stamp: ModStamp,
+        /// The map's row generation as read: every write moves it, a removal through a path
+        /// that keeps no `modCount` (Gson's) included (#221 review B6).
+        generation: u64,
         view: bool,
     },
 }
@@ -521,9 +524,11 @@ impl StdHost {
             let reading = opaque_reading(&map, view);
             let watched = source.unwrap_or_else(|| map.clone());
             let stamp = self.mod_stamp_of(&watched);
+            let generation = self.mutable_collections.generation(&watched);
             let life = Life::Opaque {
                 map: watched,
                 stamp,
+                generation,
                 view,
             };
             // One key per mapping (#221 review B4): a stored entry is one object across
@@ -542,13 +547,16 @@ impl StdHost {
                 let same = reading == OpaqueReading::Stored && known.life == life;
                 known.value = value.clone();
                 known.life = life;
-                // The stored entry while the map has had no structural change; otherwise (or
-                // for a class whose readings are not known) the same key with a fresh origin,
-                // so `==` with an earlier reading is counted.
+                // The stored entry while the map is unchanged. After any change (its node may
+                // have been removed and put again), or for a class whose readings are not known,
+                // the same key with a fresh origin, so `==` with an earlier reading is counted;
+                // that reading's handle is the one later unchanged readings get (B6).
                 if same {
                     return known.handle.clone();
                 }
-                return Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key));
+                let fresh = Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key));
+                known.handle = fresh.clone();
+                return fresh;
             }
             let entry_key = self.mint_key(OPAQUE, true);
             let handle = Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key.clone()));
@@ -777,6 +785,7 @@ impl StdHost {
                 map,
                 stamp,
                 view: true,
+                ..
             } => {
                 if self.mod_stamp_of(map) != *stamp {
                     return None;

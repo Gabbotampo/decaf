@@ -498,6 +498,23 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return self.abstract_set_equals(a, b);
                 }
+                // A Gson tree element (`JsonObject`, `JsonArray`, `JsonPrimitive`...):
+                // `JsonElement.equals` by contents (`gson_tree.rs`), wherever a collection
+                // compares its elements (a `LinkedHashMap` keyed by equal `JsonObject`s merges
+                // them, #221 review B7). One it cannot type is counted.
+                if crate::runtime::gson_tree::is_tree_element(a) {
+                    return match self.element_equals(a, b)? {
+                        Some(equal) => Ok(equal),
+                        None => {
+                            self.host.unknown_operand_call(&MethodRef {
+                                owner: "com/google/gson/JsonElement".into(),
+                                name: "equals".into(),
+                                descriptor: EQUALS.into(),
+                            })?;
+                            Ok(false)
+                        }
+                    };
+                }
                 // `File.equals`: the same path text (`UnixFileSystem.compare`).
                 if let Some(path) = self.file_path(a) {
                     return Ok(self.file_path(b) == Some(path));
