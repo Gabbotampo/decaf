@@ -2367,6 +2367,13 @@ pub trait Host {
         None
     }
 
+    /// [`Self::modelled_to_string`], with a nested walk's `StackOverflowError` thrown rather
+    /// than read as "no model" (#250): the runtime's `String.valueOf`, `Objects.toString` and
+    /// string-concatenation paths call this, so a cycle ends as Java's does.
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(self.modelled_to_string(value))
+    }
+
     /// The `(msb, lsb)` of a `new UUID(msb, lsb)` object this host saw
     /// constructed (`host_jdk_value.rs`), `None` for any other value.
     fn constructed_uuid(&self, _value: &Value) -> Option<(i64, i64)> {
@@ -3895,14 +3902,35 @@ impl StdHost {
         if jar_object::spells_key(receiver) {
             return None;
         }
-        let marker = self.synchronized_target(expect_ref(receiver)?);
-        if let Some(values) = self.view_values(marker) {
-            return Some(values);
+        // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
+        // may be another view, as deep as a jar nests them: followed in a loop, never by
+        // recursion (#250), up to `host_recursion::MAX_HOST_WALK_DEPTH` wrappers.
+        let mut marker = expect_ref(receiver)?.clone();
+        let mut reversed = false;
+        for hops in 0..host_recursion::MAX_HOST_WALK_DEPTH {
+            let target = self.synchronized_target(&marker).to_owned();
+            let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
+                source.clone()
+            } else if let Some((base, _)) = self.reversed_views.get(&target) {
+                reversed = !reversed;
+                base.clone()
+            } else {
+                let mut values = match self.mutable_collections.get(&target) {
+                    Some(values) => values.clone(),
+                    // A view over a collection the host keeps no row for (a literal).
+                    None if hops > 0 => {
+                        collection_values(&jar_object::stored_value(&target)).ok()?
+                    }
+                    None => return None,
+                };
+                if reversed {
+                    values.reverse();
+                }
+                return Some(values);
+            };
+            marker = next;
         }
-        if let Some(values) = self.reversed_view_values(marker) {
-            return Some(values);
-        }
-        self.mutable_collections.get(marker).cloned()
+        None
     }
 
     /// Answer `java.util.Properties` members from the map a collection keeps.
@@ -5236,6 +5264,10 @@ impl Host for StdHost {
         crate::runtime::java_tostring::modelled(self, value)
     }
 
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        crate::runtime::java_tostring::modelled_checked(self, value)
+    }
+
     fn constructed_uuid(&self, value: &Value) -> Option<(i64, i64)> {
         self.constructed_uuids
             .get(jar_object::object_key(value)?)
@@ -6204,7 +6236,7 @@ impl Host for StdHost {
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             ("java/lang/Math", "abs", "(I)I") => {
@@ -6330,7 +6362,7 @@ impl Host for StdHost {
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             // Chat components are a common loader/bootstrap value (mod
@@ -9624,6 +9656,9 @@ impl Host for StdHost {
                     && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
                     && let Some((left, right)) = rest.split_once('|')
                 {
+                    // One level of a composed consumer (#250): a chain as long as a jar
+                    // builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+                    let _level = host_recursion::enter()?;
                     self.invoke_instance(r, &composed_callback(left), args)?;
                     self.invoke_instance(r, &composed_callback(right), args)?;
                 }
@@ -9634,9 +9669,13 @@ impl Host for StdHost {
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
             ) => Ok(Value::Void),
-            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
-            )),
+            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
+                let truth = match expect_ref(receiver) {
+                    Some(marker) => predicate_marker_value(marker)?,
+                    None => false,
+                };
+                Ok(Value::Int(i32::from(truth)))
+            }
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
@@ -19573,21 +19612,25 @@ fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
 /// Evaluate the bounded truth surface of a predicate marker.  Java's default
 /// `Predicate` combinators are represented as markers, so they remain usable
 /// even though the interpreter does not materialize interface instances.
-fn predicate_marker_value(marker: &str) -> bool {
+///
+/// One level per combinator (#250): a chain as deep as a jar builds it ends in a
+/// `StackOverflowError`, as Java's default-method chain does.
+fn predicate_marker_value(marker: &str) -> Result<bool, NativeError> {
+    let _level = host_recursion::enter()?;
     if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
-        return !predicate_marker_value(rest);
+        return Ok(!predicate_marker_value(rest)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) && predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? && predicate_marker_value(right)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) || predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? || predicate_marker_value(right)?);
     }
-    marker.starts_with("@indy:")
+    Ok(marker.starts_with("@indy:"))
 }
 
 /// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
@@ -21043,6 +21086,9 @@ impl<H: Host> Runtime<'_, H> {
         marker: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // One level of a composed callback (`andThen`, `compose`, #250): a chain as deep as a
+        // jar builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+        let _level = host_recursion::enter()?;
         // A `Stream.Builder` handle, or a push's sink handed to a
         // spliterator, is a `Consumer` (`stream_pipeline.rs`).
         if let Some(value) = self.stream_callback(marker, args)? {
@@ -24780,6 +24826,55 @@ impl<H: Host> Runtime<'_, H> {
         Ok(None)
     }
 
+    /// Where a throw that a call at `at` raised goes: this frame's handler that catches it
+    /// (its program counter and the throwable it receives), or the error leaving the frame.
+    ///
+    /// A Java throw is delivered by its class. A jar recursion past the thread's stack
+    /// ([`NativeError::CallDepthExceeded`], `frame_bound.rs`) is Java's `StackOverflowError`
+    /// (#250): a handler for it (or `Error`/`Throwable`) catches it, as on the JVM; with none it
+    /// leaves as the bound's own diagnostic. Any other error leaves with this frame's context.
+    /// Kept out of line so `invoke_frame`, which delivers at every call site, keeps a small
+    /// frame (the jar-frame bound is measured in those frames).
+    #[inline(never)]
+    fn deliver_throw(
+        &mut self,
+        error: NativeError,
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(usize, Value), NativeError> {
+        match error {
+            NativeError::UncaughtException {
+                class: thrown,
+                message,
+                frame,
+            } => {
+                if let Some(handler) = self.exception_handler(file, method, desc, at, &thrown)? {
+                    let value = self.caught_throwable(&thrown, message, frame.as_deref());
+                    return Ok((handler, value));
+                }
+                Err(NativeError::UncaughtException {
+                    class: thrown,
+                    message,
+                    frame: frame.or_else(|| Some(format!("{class}#{method} +{at}"))),
+                })
+            }
+            error @ NativeError::CallDepthExceeded { .. } => {
+                // A table that cannot be read catches nothing: the bound's error stands.
+                if let Ok(Some(handler)) =
+                    self.exception_handler(file, method, desc, at, host_recursion::STACK_OVERFLOW)
+                {
+                    let value = self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
+                    return Ok((handler, value));
+                }
+                Err(error)
+            }
+            error => Err(frame_context(error, class, method, at)),
+        }
+    }
+
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
     fn caught_throwable(
@@ -25230,47 +25325,16 @@ impl<H: Host> Runtime<'_, H> {
             ($at:expr, $call:expr) => {
                 match $call {
                     Ok(value) => value,
-                    Err(NativeError::UncaughtException {
-                        class: thrown,
-                        message,
-                        frame,
-                    }) => {
-                        if let Some(handler) =
-                            self.exception_handler(file, method, desc, $at, &thrown)?
-                        {
-                            let value = self.caught_throwable(&thrown, message, frame.as_deref());
-                            stack.clear();
-                            stack.push(value);
-                            pc = handler;
-                            continue;
-                        }
-                        return Err(NativeError::UncaughtException {
-                            class: thrown,
-                            message,
-                            frame: frame.or_else(|| Some(format!("{class}#{method} +{}", $at))),
-                        });
+                    // One call per site: the delivery's code lives in `deliver_throw`, so a
+                    // frame of this function stays as small as the bound measured it.
+                    Err(error) => {
+                        let (handler, value) =
+                            self.deliver_throw(error, file, class, method, desc, $at)?;
+                        stack.clear();
+                        stack.push(value);
+                        pc = handler;
+                        continue;
                     }
-                    // A jar recursion past the thread's stack is Java's `StackOverflowError`
-                    // (#250): a handler for it (or `Error`/`Throwable`) here catches it, as on
-                    // the JVM; with none it leaves as the bound's own diagnostic.
-                    Err(error @ NativeError::CallDepthExceeded { .. }) => {
-                        if let Some(handler) = self.exception_handler(
-                            file,
-                            method,
-                            desc,
-                            $at,
-                            host_recursion::STACK_OVERFLOW,
-                        )? {
-                            let value =
-                                self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
-                            stack.clear();
-                            stack.push(value);
-                            pc = handler;
-                            continue;
-                        }
-                        return Err(error);
-                    }
-                    Err(error) => return Err(frame_context(error, class, method, $at)),
                 }
             };
         }
@@ -26995,7 +27059,7 @@ impl<H: Host> Runtime<'_, H> {
                         // `String` operand is already its text.
                         for (value, argument) in captured.iter_mut().zip(&arguments) {
                             if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string(value)
+                                && let Some(text) = self.host.modelled_to_string_checked(value)?
                             {
                                 *value = Value::Ref(Some(text));
                             }

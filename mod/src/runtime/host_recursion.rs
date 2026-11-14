@@ -105,4 +105,15 @@ mod tests {
         assert!(levels > 0 && levels <= MAX_HOST_WALK_DEPTH, "{levels}");
         assert_eq!(DEPTH.with(Cell::get), before);
     }
+
+    /// A composed predicate as deep as a jar builds it (`p = p.negate()` in a loop) ends in a
+    /// `StackOverflowError`, not a native overflow; a shallow one answers.
+    #[test]
+    fn a_deep_predicate_chain_is_refused() {
+        let deep = format!("{}@indy:x", "@fn:predicate.not:".repeat(200_000));
+        let error = crate::runtime::predicate_marker_value(&deep).unwrap_err();
+        assert!(is_stack_overflow(&error), "{error:?}");
+        let shallow = format!("{}@indy:x", "@fn:predicate.not:".repeat(3));
+        assert_eq!(crate::runtime::predicate_marker_value(&shallow).ok(), Some(false));
+    }
 }

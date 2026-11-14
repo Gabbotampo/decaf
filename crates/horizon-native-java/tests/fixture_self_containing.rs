@@ -5,7 +5,8 @@
 //! inside itself in `Arrays.deepToString`, and throws a catchable `StackOverflowError` where it
 //! recurses through a cycle (a deeper cycle's `toString`, `hashCode`, `equals`,
 //! `Arrays.deepHashCode`, Gson's writer, a `compareTo` that recurses). The host answers the
-//! same, and its walks never overflow the native stack (`host_recursion.rs`).
+//! same, and its walks never overflow the native stack (`host_recursion.rs`; a composed
+//! predicate as deep as a jar builds it is that module's own test).
 //!
 //! `fixtures/self_containing/demo/Probe.java` runs unchanged on both sides; its `main` on Java 25
 //! (with the 26.3 server's gson-2.14.0) printed `java25.txt`. The Gson stubs exist only for
