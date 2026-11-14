@@ -244,7 +244,32 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/io/Serializable",
     ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
+    // `Arrays$ArrayList extends AbstractList implements RandomAccess,
+    // Serializable` (`array_views.rs`).
+    const ARRAYS_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/io/Serializable",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
+    // `AbstractList$RandomAccessSubList extends SubList (extends AbstractList)
+    // implements RandomAccess`: no `Serializable`.
+    const SUB_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
     match class {
+        crate::array_views::CLASS => ARRAYS_LIST,
+        crate::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
         | "java/util/Collections$UnmodifiableRandomAccessList"
