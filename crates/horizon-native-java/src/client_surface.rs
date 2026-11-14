@@ -1024,7 +1024,7 @@ impl StdHost {
     /// categories, and the fields of the `Minecraft` and `Options` stand-ins
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
-    pub(crate) fn client_static(&self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
+    pub(crate) fn client_static(&mut self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
         if !self.client_environment() {
             return None;
         }
@@ -1112,7 +1112,16 @@ impl StdHost {
                     ))
                 })
                 .collect();
-                Some(Ok(crate::collection_value("list", &slots)))
+                // `List.of(values())`: one `ListN` for the run.
+                let made = self.shared_unmodifiable(
+                    "EquipmentSlot.VALUES",
+                    "java/util/ImmutableCollections$ListN",
+                    slots,
+                );
+                if let Some(key) = crate::expect_ref(&made) {
+                    self.jdk_list_of.insert(key.clone());
+                }
+                Some(Ok(made))
             }
             ("net/minecraft/world/item/ItemStack", "EMPTY") if frame.is_some() => {
                 Some(Ok(marker(format!("{}empty", items::STACK))))

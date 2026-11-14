@@ -282,7 +282,12 @@ fn invoke_executor<H: Host>(
         }
         ("shutdownNow", _) => {
             rt.set_executor_shutdown(&marker);
-            collection_value("list", &[])
+            // The tasks that never ran: none (each ran when submitted).
+            rt.new_host_collection(
+                "java/util/ArrayList",
+                Vec::new(),
+                (&r.owner, &r.name, &r.descriptor),
+            )?
         }
         ("isShutdown" | "isTerminated", "()Z") => {
             Value::Int(i32::from(rt.executor_shutdown(&marker)))

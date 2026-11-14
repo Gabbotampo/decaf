@@ -522,17 +522,17 @@ impl ToMap {
         }))
     }
 
-    /// The collected map.
-    pub(crate) fn finish(self) -> Value {
+    /// The collected map: the JDK collector's own `HashMap` (or supplied
+    /// map), or for Guava's `toImmutableMap` its entries in encounter order.
+    pub(crate) fn finish(self) -> Result<Value, Vec<Value>> {
         if let Some(map) = self.map {
-            return map;
+            return Ok(map);
         }
-        let flat = self
+        Err(self
             .entries
             .into_iter()
             .flat_map(|(key, value)| [key, value])
-            .collect::<Vec<_>>();
-        super::collection_value("map", &flat)
+            .collect())
     }
 }
 
@@ -616,7 +616,11 @@ impl crate::StdHost {
         } else {
             values
         };
-        Some(Ok(super::collection_value(kind, &values)))
+        // The class `List.copyOf`/`Set.copyOf`/`Map.copyOf` makes, its shared
+        // empty one included (#156 P14d2).
+        Some(Ok(
+            self.factory_unmodifiable(&r.owner, &r.name, kind, values)
+        ))
     }
 
     /// `Map.Entry.setValue` on an entry `entrySet()` handed out.
@@ -721,16 +725,7 @@ impl crate::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        let list = self.empty_collection("list");
-        match expect_ref(&list).and_then(|marker| self.mutable_collections.get_mut(marker)) {
-            Some(stored) => {
-                *stored = range;
-                Ok(list)
-            }
-            // Past the neutral-collection bound the host has no fresh mutable
-            // list to give; an immutable one still carries the elements.
-            None => Ok(super::collection_value("list", &range)),
-        }
+        Ok(self.new_collection(super::stand_in_class("list"), range))
     }
 }
 
@@ -1186,7 +1181,25 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         for element in values {
             self.accept_to_map(&mut state, element)?;
         }
-        Ok(Some(state.finish()))
+        Ok(Some(self.finish_to_map(state)?))
+    }
+
+    /// [`ToMap::finish`]: Guava's entries become its `ImmutableMap`
+    /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
+    /// none.
+    pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        match state.finish() {
+            Ok(map) => Ok(map),
+            Err(entries) => self.factory_or_count(
+                &crate::stream_pipeline::wanted(
+                    "com/google/common/collect/ImmutableMap",
+                    "toImmutableMap",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+                ),
+                "map",
+                entries,
+            ),
+        }
     }
 
     /// [`ToMap::begin`], and for `Collectors.toMap` the `HashMap::new` its

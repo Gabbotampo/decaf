@@ -365,7 +365,9 @@ impl StdHost {
                 let effects: Vec<Value> = (0..p.effects.len())
                     .map(|i| marker(format!("{EFFECT}{i}")))
                     .collect();
-                collection_value("list", &effects)
+                // `activeEffects.values()`: the game's map view, which a new
+                // list stands in for (#156 P14d2).
+                self.new_collection(crate::stand_in_class("list"), effects)
             }
             ("hasEffect", "Z") => {
                 let id = crate::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
@@ -544,7 +546,8 @@ impl StdHost {
             ("getNonEquipmentItems", _) => {
                 let stacks: Vec<Value> =
                     (0..36).map(|i| StackSlot::Inventory(i).marker()).collect();
-                collection_value("list", &stacks)
+                // The inventory's `NonNullList`, which a new list stands in for.
+                self.new_collection(crate::stand_in_class("list"), stacks)
             }
             ("getFreeSlot", "I") => Value::Int(
                 p.inventory

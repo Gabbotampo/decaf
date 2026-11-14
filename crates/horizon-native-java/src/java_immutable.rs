@@ -101,7 +101,11 @@ fn made_class(owner: &str, name: &str, kind: &str, size: usize) -> &'static str 
         ("java/util/Set", "of" | "copyOf", _) if matches!(size, 1 | 2) => {
             "java/util/ImmutableCollections$Set12"
         }
-        ("java/util/Map", "of" | "copyOf", _) if size == 1 => "java/util/ImmutableCollections$Map1",
+        ("java/util/Map", "of" | "copyOf" | "ofEntries", _) if size == 1 => {
+            "java/util/ImmutableCollections$Map1"
+        }
+        // A view over a set no jar holds (a registry's ids, #156 P14d2).
+        ("java/util/Collections", "unmodifiableSet", _) => "java/util/Collections$UnmodifiableSet",
         (_, _, "set") => "java/util/ImmutableCollections$SetN",
         (_, _, "map") => "java/util/ImmutableCollections$MapN",
         _ => "java/util/ImmutableCollections$ListN",
@@ -122,7 +126,7 @@ fn shared_empty(owner: &str, name: &str, kind: &str) -> Option<&'static str> {
             "ImmutableCollections.EMPTY_LIST"
         }
         ("java/util/Set", "of" | "copyOf", _) => "ImmutableCollections.EMPTY_SET",
-        ("java/util/Map", "of" | "copyOf", _) => "ImmutableCollections.EMPTY_MAP",
+        ("java/util/Map", "of" | "copyOf" | "ofEntries", _) => "ImmutableCollections.EMPTY_MAP",
         ("java/util/stream/Stream", "toList", _) => "ImmutableCollections.EMPTY_LIST_NULLS",
         ("java/util/Collections", "emptyList", _) => "Collections.EMPTY_LIST",
         ("java/util/Collections", "emptySet", _) => "Collections.EMPTY_SET",
@@ -298,7 +302,7 @@ impl StdHost {
     /// A new unmodifiable collection of the JDK (or Guava) class `class`
     /// holding `values`: an object of its own (#156 P14c), keyed
     /// `<class>#immutable<n>`.
-    fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
+    pub(crate) fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
         let marker = crate::jar_object::collection_key_for(
             class,
             crate::jar_object::CollectionFamily::Immutable,
