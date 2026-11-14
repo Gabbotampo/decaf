@@ -276,16 +276,6 @@ impl StdHost {
         for held in self.holders.values() {
             value(held, out);
         }
-        // Each register's `getEntries()` view and the set it reads
-        // (`host_registry.rs`): nothing else reaches that set.
-        for ((_, member), view) in &self.cached_collections {
-            if member == "getEntries"
-                && let Some(Some(set)) = self.unmodifiable_collections.get(view)
-            {
-                out.push(view);
-                out.push(set);
-            }
-        }
         for (key, held) in &self.capability_values {
             out.push(key);
             value(held, out);
@@ -1389,6 +1379,8 @@ mod tests {
             "next_fabric_event",
             "next_iterator",
             "next_neutral_collection",
+            // Registry ids the jar built (`registry_contents.rs`): names, no objects.
+            "jar_registries",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
