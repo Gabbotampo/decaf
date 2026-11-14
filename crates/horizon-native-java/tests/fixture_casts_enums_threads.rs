@@ -12,7 +12,7 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use horizon_native_java::{ExecutionReport, GameObject, NativeError, NativeJar, StdHost, Value};
+use horizon_native_java::{ExecutionReport, GameObject, NativeError, NativeJar, StdHost};
 use std::{
     fs,
     io::Write,
