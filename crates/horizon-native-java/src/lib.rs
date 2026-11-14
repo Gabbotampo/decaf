@@ -3043,6 +3043,10 @@ pub struct StdHost {
     /// namespace), by the register's marker; `None` when two registers share
     /// the marker or the namespace was not text (`host_ids.rs`).
     deferred_registers: BTreeMap<String, Option<(Value, String)>>,
+    /// The registries this jar built and registered itself
+    /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
+    /// every entry the host saw registered (`registry_contents.rs`).
+    jar_registries: BTreeSet<String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3264,6 +3268,7 @@ impl StdHost {
             packet_types: BTreeMap::new(),
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
+            jar_registries: BTreeSet::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -9644,7 +9649,8 @@ impl Host for StdHost {
             // `Registry.iterator()` walks the values registered in the
             // registry. The host holds the entries the jar registered
             // (`registry_contents`), not the game's own: the game's entries
-            // have no objects to hand out.
+            // have no objects to hand out, so walking a registry the jar did
+            // not build is counted (#182 P3), and walks the jar's own entries.
             (owner, "iterator", "()Ljava/util/Iterator;")
                 if registry_contents::is_registry_owner(owner)
                     && host_registry::registry_id(receiver).is_some() =>
@@ -9652,6 +9658,9 @@ impl Host for StdHost {
                 let id = host_registry::registry_id(receiver)
                     .unwrap_or_default()
                     .to_owned();
+                if !self.jar_registries.contains(&id) {
+                    self.unknown_host_call(r)?;
+                }
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
@@ -10114,6 +10123,7 @@ impl Host for StdHost {
                 let made = self.deferred_register_id(forge, &register, id)?;
                 // One holder object per `register` call (`host_registry.rs`).
                 let (holder, value) = self.new_holder(&register, forge, made);
+                self.add_register_entry(receiver, &holder);
                 self.registrations.push(RegistryEntry {
                     registry: register,
                     id: id.to_owned(),
@@ -10127,19 +10137,14 @@ impl Host for StdHost {
                 | "net/minecraftforge/registries/DeferredRegister",
                 "getEntries",
                 "()Ljava/util/Collection;",
-            ) => {
-                // The register's one entries view (`entriesView`), holding
-                // its holders now.
-                let register = expect_ref(receiver).map_or("", String::as_str).to_owned();
-                let holders = self.register_holders(&register);
-                Ok(self.cached_collection(
-                    receiver,
-                    "getEntries",
-                    stand_in_class("list"),
-                    true,
-                    holders,
-                ))
-            }
+            ) => match expect_ref(receiver) {
+                Some(register) => {
+                    let register = register.clone();
+                    Ok(self.register_entries(receiver, &register))
+                }
+                // No register this runtime made: what it holds is unknown.
+                None => self.unknown_host_call(r),
+            },
             // A holder's `get`/`value`/`isBound`/... are `holder_call`'s
             // (`host_registry.rs`).
             (
