@@ -145,7 +145,7 @@ fn a_fresh_maps_views_go_with_the_map() {
     let mut most = 0;
     for _ in 0..20_000 {
         assert_eq!(call(&fixture, &mut host, "demo/Rc226d", "mapTick"), "3");
-        host.rewind_call_log(mark.clone());
+        host.rewind_call_log(mark);
         most = most.max(host.cached_collection_count());
     }
     assert!(most < 10_000, "{most} cached collections");
