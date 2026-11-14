@@ -16,6 +16,11 @@ import java.util.stream.Stream;
  */
 public final class Probe {
     static final List<Object> KEPT = new ArrayList<>();
+    /**
+     * A two-entry `Map.ofEntries` in a field of its own: adding one to a list counts `List.add` (a `MapN`'s
+     * salted order, pre-existing on main), which this probe is not about.
+     */
+    static Map<String, Integer> two;
 
     static String uoe(Runnable step) {
         try {
@@ -28,7 +33,7 @@ public final class Probe {
 
     public static String setup() {
         KEPT.clear();
-        KEPT.add(Map.ofEntries(Map.entry("a", 1), Map.entry("b", 2)));
+        two = Map.ofEntries(Map.entry("a", 1), Map.entry("b", 2));
         KEPT.add(Map.ofEntries(Map.entry("c", 3)));
         KEPT.add(List.copyOf(new ArrayList<>(List.of("x", "y", "z"))));
         KEPT.add(Set.copyOf(new ArrayList<>(List.of("p", "q", "p"))));
@@ -52,14 +57,13 @@ public final class Probe {
 
     @SuppressWarnings("unchecked")
     public static String check() {
-        Map<String, Integer> two = (Map<String, Integer>) KEPT.get(0);
-        Map<String, Integer> one = (Map<String, Integer>) KEPT.get(1);
-        List<String> copy = (List<String>) KEPT.get(2);
-        Set<String> set = (Set<String>) KEPT.get(3);
-        List<Integer> toList = (List<Integer>) KEPT.get(4);
-        List<Integer> collected = (List<Integer>) KEPT.get(5);
-        List<Integer> unmodifiable = (List<Integer>) KEPT.get(6);
-        Iterator<Integer> it = (Iterator<Integer>) KEPT.get(7);
+        Map<String, Integer> one = (Map<String, Integer>) KEPT.get(0);
+        List<String> copy = (List<String>) KEPT.get(1);
+        Set<String> set = (Set<String>) KEPT.get(2);
+        List<Integer> toList = (List<Integer>) KEPT.get(3);
+        List<Integer> collected = (List<Integer>) KEPT.get(4);
+        List<Integer> unmodifiable = (List<Integer>) KEPT.get(5);
+        Iterator<Integer> it = (Iterator<Integer>) KEPT.get(6);
         collected.add(9);
         return two.get("a") + "" + two.get("b") + two.size() + two.getClass().getName() + "|" + one + one.getClass().getName()
             + "|" + copy + copy.getClass().getName() + uoe(() -> copy.add("w")) + "|" + set.size() + set.contains("p")

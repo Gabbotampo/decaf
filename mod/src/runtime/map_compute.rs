@@ -31,21 +31,8 @@ impl<H: Host> Runtime<'_, H> {
             };
             return Ok(Some(map_entry_value(key, value)));
         }
-        if r.owner == "java/util/Map"
-            && r.name == "ofEntries"
-            && r.descriptor == "([Ljava/util/Map$Entry;)Ljava/util/Map;"
-        {
-            let Some(array) = args.first() else {
-                return Ok(None);
-            };
-            let mut pairs = Vec::new();
-            for entry in self.array(array)?.clone() {
-                let (key, value) = map_entry_parts(&entry)?;
-                pairs.extend([key, value]);
-            }
-            // `Map.ofEntries`: Java's `Map1`/`MapN` (#156 P14d2).
-            return Ok(Some(self.factory_or_count(r, "map", pairs)?));
-        }
+        // `Map.ofEntries` is `immutable_collections.rs`'s (Java's `MapN` with
+        // its probe table, as `Map.of`).
         if r.name != "computeIfAbsent"
             || r.descriptor != "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;"
             || !is_map_owner(&r.owner)
