@@ -80,6 +80,8 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+#[cfg(test)]
+mod host_defaults_tests;
 mod host_entry;
 mod host_events;
 mod host_executors;
@@ -2245,9 +2247,16 @@ pub struct EventDispatch {
     pub event: Value,
 }
 
+/// The interpreter's view of the world outside the jar.
+///
+/// A default never answers a Java value silently: a host that does not model a call (or a
+/// field) errors with [`NativeError::UnknownHostCall`], and a real host counts what it does
+/// not model (`StdHost::unknown_host_call`). Defaults answering `None`/`false` mean "this host
+/// keeps no such state", which the caller turns into a counted path of its own (#246's review:
+/// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
-    fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::Ref(None))
+    fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
     /// The NeoForge attachment state and the unknown-call table it counts refusals in
     /// (`neoforge_attachments.rs`). A host that keeps neither answers `None`, and the attachment
@@ -2289,14 +2298,14 @@ pub trait Host {
         self.get_static(r)
     }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
-    /// (`jar_operands.rs`).
+    /// (`jar_operands.rs`). A host that counts nothing errors instead.
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// The chat components this host changed in place (`host_component.rs`
@@ -2505,9 +2514,10 @@ pub trait Host {
         None
     }
 
-    /// A collection's `modCount` (`mod_count.rs`).
+    /// A collection's `modCount` (`mod_count.rs`). A host that keeps none
+    /// answers [`mod_count::ModStamp::UNKEPT`], whose every check is counted.
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
-        mod_count::ModStamp::default()
+        mod_count::ModStamp::UNKEPT
     }
 
     fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
@@ -2668,13 +2678,16 @@ pub trait Host {
         false
     }
 
-    /// Message a host recorded for one bounded Throwable marker.
+    /// Message a host recorded for one bounded Throwable marker: `Some(None)`
+    /// for a throwable recorded without one (`getMessage()` is `null`), `None`
+    /// when the host recorded nothing for `marker`, so its message is not
+    /// known (a caller answering `getMessage` counts it, never `null`).
     ///
     /// The interpreter keeps objects as markers, so a host that answers
     /// `Throwable#getMessage` can report the same text an `athrow` carries.
     /// Hosts that do not model exceptions keep the default: an uncaught throw
     /// is still diagnosed, just without a message.
-    fn throwable_message(&self, _marker: &str) -> Option<String> {
+    fn throwable_message(&self, _marker: &str) -> Option<Option<String>> {
         None
     }
 
@@ -5156,8 +5169,8 @@ impl Host for StdHost {
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
     /// `athrow` diagnostic names the same message `getMessage` would return.
-    fn throwable_message(&self, marker: &str) -> Option<String> {
-        self.throwable_messages.get(marker).cloned().flatten()
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
+        self.throwable_messages.get(marker).cloned()
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
@@ -6821,6 +6834,18 @@ impl Host for StdHost {
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
+            }
+            // A throwable whose constructor this host never saw (its message
+            // and cause were not recorded): `getMessage`, `getCause` and
+            // `toString` are not known to be `null`, so they are counted.
+            if matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("getMessage", "()Ljava/lang/String;")
+                    | ("getCause", "()Ljava/lang/Throwable;")
+                    | ("toString", "()Ljava/lang/String;")
+            ) && !self.throwable_messages.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getMessage", "()Ljava/lang/String;") => {
@@ -11346,7 +11371,7 @@ fn thrown_message<H: Host>(value: &Value, host: &H) -> Option<String> {
     if !is_throwable_marker(marker) {
         return None;
     }
-    host.throwable_message(marker)
+    host.throwable_message(marker).flatten()
 }
 
 fn capability_text(value: &Value) -> String {
@@ -23512,7 +23537,12 @@ impl<H: Host> Runtime<'_, H> {
                         Some(text) => text,
                         // A jar resource opened by the host is read here, so a
                         // config loader's `getResourceAsStream` reaches Gson.
-                        None => self.host.resource_stream_text(stream).unwrap_or_default(),
+                        // A stream the host holds no text for is not empty:
+                        // the reader is left to the host, which counts it.
+                        None => match self.host.resource_stream_text(stream) {
+                            Some(text) => text,
+                            None => return Ok(None),
+                        },
                     },
                     None => String::new(),
                 };
@@ -32002,6 +32032,23 @@ modId="minecraft"
                 .unwrap(),
             Value::Int(-1)
         );
+        // Two equal texts of unknown identity: `==` keeps the value answer and
+        // is counted, so a host that counts nothing refuses it.
+        assert!(matches!(
+            jar.invoke_method_with_args(
+                "demo.Math",
+                "same",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                None,
+                &[
+                    Value::Ref(Some("same".into())),
+                    Value::Ref(Some("same".into()))
+                ],
+                &mut NullHost,
+            ),
+            Err(NativeError::UnknownHostCall(_))
+        ));
+        let mut counting = StdHost::new();
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo.Math",
@@ -32012,10 +32059,17 @@ modId="minecraft"
                     Value::Ref(Some("same".into())),
                     Value::Ref(Some("same".into()))
                 ],
-                &mut host,
+                &mut counting,
             )
             .unwrap(),
             Value::Int(1)
+        );
+        assert_eq!(
+            counting.unknown_host_calls(),
+            [(
+                "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+                1
+            )]
         );
         assert_eq!(
             jar.invoke_method_with_args(

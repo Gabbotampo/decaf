@@ -787,6 +787,9 @@ impl Host for Tracing {
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         Host::mutable_collection_values(&self.inner, value)
     }
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Host::unknown_operand_call(&mut self.inner, r)
+    }
     fn service_providers(&self, service: &str) -> Vec<String> {
         let out = Host::service_providers(&self.inner, service);
         if self.trace {
