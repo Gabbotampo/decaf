@@ -32014,6 +32014,23 @@ modId="minecraft"
                 .unwrap(),
             Value::Int(-1)
         );
+        // Two equal texts of unknown identity: `==` keeps the value answer and
+        // is counted, so a host that counts nothing refuses it.
+        assert!(matches!(
+            jar.invoke_method_with_args(
+                "demo.Math",
+                "same",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                None,
+                &[
+                    Value::Ref(Some("same".into())),
+                    Value::Ref(Some("same".into()))
+                ],
+                &mut NullHost,
+            ),
+            Err(NativeError::UnknownHostCall(_))
+        ));
+        let mut counting = StdHost::new();
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo.Math",
@@ -32024,10 +32041,17 @@ modId="minecraft"
                     Value::Ref(Some("same".into())),
                     Value::Ref(Some("same".into()))
                 ],
-                &mut host,
+                &mut counting,
             )
             .unwrap(),
             Value::Int(1)
+        );
+        assert_eq!(
+            counting.unknown_host_calls(),
+            [(
+                "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+                1
+            )]
         );
         assert_eq!(
             jar.invoke_method_with_args(
