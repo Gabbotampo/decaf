@@ -282,6 +282,11 @@ impl Entries {
             .flat_map(|state| [&state.key, &state.value])
     }
 
+    /// How many entries the host keeps.
+    pub(crate) fn len(&self) -> usize {
+        self.states.len()
+    }
+
     /// The entry keys, for the heap's collectable set.
     pub(crate) fn keys(&self) -> impl Iterator<Item = &String> {
         self.states.keys()
@@ -297,9 +302,13 @@ impl Entries {
         }
     }
 
-    /// Drop the entries the heap collected.
+    /// Drop the entries the heap collected, and every row of a map it collected.
     pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
         self.states.retain(|key, _| keep(key));
+        self.nodes.retain(|map, _| keep(map));
+        self.followed.retain(|map, _| keep(map));
+        self.lost_maps.retain(|map| keep(map));
+        self.before.retain(|map, _| keep(map));
         let states = &self.states;
         for nodes in self.nodes.values_mut() {
             nodes.retain(|_, key| states.contains_key(key));
