@@ -484,6 +484,9 @@ pub(crate) struct HolderRow {
     pub(crate) id: Option<(Value, String)>,
 }
 
+/// The view cache's member name for a register's `getEntries()` view.
+const ENTRIES: &str = "getEntries";
+
 impl crate::runtime::StdHost {
     /// Record a `DeferredRegister.register` call: its holder and its value.
     pub(crate) fn new_holder(
@@ -539,9 +542,18 @@ impl crate::runtime::StdHost {
     /// handed out ([`Self::add_register_entry`]). Here the view reads a
     /// `LinkedHashSet` of the holders, which the jar never sees: what the view
     /// answers is the key set's (#182 P2).
-    pub(crate) fn register_entries(&mut self, register: &str) -> Value {
-        if let Some((view, _)) = self.register_views.get(register) {
-            return view.clone();
+    ///
+    /// The view is the register's row in the host's one per-object view cache
+    /// (`cached_collections`, keyed by the register's identity and
+    /// `getEntries`).
+    pub(crate) fn register_entries(&mut self, receiver: &Value, register: &str) -> Value {
+        let cache = crate::runtime::cache_identity(receiver).map(|identity| (identity, ENTRIES.to_owned()));
+        if let Some(view) = cache
+            .as_ref()
+            .and_then(|cache| self.cached_collections.get(cache))
+            .filter(|view| self.unmodifiable_collections.contains_key(*view))
+        {
+            return crate::runtime::jar_object::collection(view.clone());
         }
         let source = self.empty_collection("set");
         let holders = self.register_holders(register);
@@ -553,20 +565,24 @@ impl crate::runtime::StdHost {
         let view = self
             .unmodifiable_view("set", &source)
             .expect("a new set is an object");
-        self.register_views
-            .insert(register.to_owned(), (view.clone(), source));
+        if let (Some(cache), Some(marker)) = (cache, crate::runtime::expect_ref(&view)) {
+            self.cached_collections.insert(cache, marker.clone());
+        }
         view
+    }
+
+    /// The set a register's `getEntries()` view reads, once the view exists.
+    pub(crate) fn register_entries_source(&self, receiver: &Value) -> Option<String> {
+        let view = self
+            .cached_collections
+            .get(&(crate::runtime::cache_identity(receiver)?, ENTRIES.to_owned()))?;
+        self.unmodifiable_collections.get(view)?.clone()
     }
 
     /// A `register` call's holder joins the set its register's view reads,
     /// once a view exists (before, [`Self::register_entries`] reads every row).
-    pub(crate) fn add_register_entry(&mut self, register: &str, holder: &Value) {
-        let Some(marker) = self
-            .register_views
-            .get(register)
-            .and_then(|(_, source)| crate::runtime::expect_ref(source))
-            .cloned()
-        else {
+    pub(crate) fn add_register_entry(&mut self, receiver: &Value, holder: &Value) {
+        let Some(marker) = self.register_entries_source(receiver) else {
             return;
         };
         if let Some(values) = self.mutable_collections.get_mut(&marker) {

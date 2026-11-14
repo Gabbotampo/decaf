@@ -208,10 +208,15 @@ impl StdHost {
         for held in self.holders.values() {
             value(held, out);
         }
-        // Each register's `getEntries()` view and its set (`host_registry.rs`).
-        for (view, set) in self.register_views.values() {
-            value(view, out);
-            value(set, out);
+        // Each register's `getEntries()` view and the set it reads
+        // (`host_registry.rs`): nothing else reaches that set.
+        for ((_, member), view) in &self.cached_collections {
+            if member == "getEntries"
+                && let Some(Some(set)) = self.unmodifiable_collections.get(view)
+            {
+                out.push(view);
+                out.push(set);
+            }
         }
         for (key, held) in &self.capability_values {
             out.push(key);
