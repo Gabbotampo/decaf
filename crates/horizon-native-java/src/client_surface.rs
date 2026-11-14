@@ -1224,6 +1224,18 @@ impl StdHost {
                 .map(|()| receiver.clone()),
             });
         }
+        // `NonNullList` is a `List`: the inventory's lists (host collections,
+        // #156 P14d2) answer as one.
+        if r.owner == "net/minecraft/core/NonNullList"
+            && matches!(receiver, Value::Host(handle)
+                if handle.kind() == crate::host_ref::HostKind::Collection)
+        {
+            let as_list = MethodRef {
+                owner: "java/util/List".into(),
+                ..r.clone()
+            };
+            return Some(crate::Host::invoke_instance(self, &as_list, receiver, args));
+        }
         let text = crate::game_object::text(receiver)?.clone();
         // Every `client/…` and `key-category/…` object is a handle now (#156 P16d), so a `String`
         // spelling one is just that `String`: its own members answer, never the object's (#232's
@@ -1234,14 +1246,6 @@ impl StdHost {
             return None;
         }
         let refuse = || Err(NativeError::UnknownHostCall(r.clone()));
-        // `NonNullList` is a `List`: the inventory's lists answer as one.
-        if r.owner == "net/minecraft/core/NonNullList" && text.starts_with("list") {
-            let as_list = MethodRef {
-                owner: "java/util/List".into(),
-                ..r.clone()
-            };
-            return Some(crate::Host::invoke_instance(self, &as_list, receiver, args));
-        }
         // Constructors record their arguments against the new object.
         if r.name == "<init>" {
             if r.owner == KEY_MAPPING {
@@ -2086,6 +2090,21 @@ mod tests {
             }),
             ..ClientSnapshot::default()
         })
+    }
+
+    /// The inventory's lists are host collections (#156 P14d2): a call
+    /// through `NonNullList` answers as the `List` member.
+    #[test]
+    fn a_non_null_list_call_on_an_inventory_list_answers_as_a_list() {
+        let mut host = StdHost::new();
+        host.begin_client_frame(snapshot(), &[]);
+        let list = host.new_collection("java/util/ArrayList", vec![Value::Int(1), Value::Int(2)]);
+        let size = method("net/minecraft/core/NonNullList", "size", "()I");
+        assert_eq!(
+            crate::Host::invoke_instance(&mut host, &size, &list, &[]).unwrap(),
+            Value::Int(2)
+        );
+        assert!(host.unknown_host_calls().is_empty());
     }
 
     #[test]
