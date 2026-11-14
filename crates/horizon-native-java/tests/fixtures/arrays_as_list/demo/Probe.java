@@ -173,6 +173,33 @@ public final class Probe {
             + uoe(() -> v.get(-1));
     }
 
+    static List<String> heldView;
+    static List<String> heldWindow;
+
+    /** Keep only a view and a window of a fresh array: the array itself is held by nothing else. */
+    public static String hold() {
+        String[] a = {"h", "i", "j"};
+        heldView = Arrays.asList(a);
+        heldWindow = heldView.subList(1, 3);
+        return "held";
+    }
+
+    /** Garbage: enough objects for collections to run between calls. */
+    public static String garbage() {
+        int sum = 0;
+        for (int i = 0; i < 3000; i++) {
+            int[] box = {i};
+            sum += box[0];
+        }
+        return "g" + (sum & 1);
+    }
+
+    /** The held view and window still share their array: a `set` through one shows in the other. */
+    public static String afterCollections() {
+        heldWindow.set(0, "I");
+        return heldView + "" + heldWindow + heldView.get(1) + uoe(() -> heldView.add("k")) + heldView.getClass().getName();
+    }
+
     public static void main(String[] args) {
         System.out.println("writeThrough=" + writeThrough());
         System.out.println("fixedSize=" + fixedSize());
@@ -182,5 +209,10 @@ public final class Probe {
         System.out.println("subLists=" + subLists());
         System.out.println("jarEquals=" + jarEquals());
         System.out.println("live=" + live());
+        hold();
+        for (int i = 0; i < 40; i++) {
+            garbage();
+        }
+        System.out.println("afterCollections=" + afterCollections());
     }
 }

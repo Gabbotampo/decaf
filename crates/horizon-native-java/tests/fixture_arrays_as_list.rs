@@ -82,3 +82,35 @@ fn arrays_as_list_is_a_fixed_size_view_of_its_array() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// A view and its window held only in statics keep their array through
+/// collections (#226's collector: the view's array is an edge from it): 40
+/// garbage-making calls later, a `set` through the window shows in the view,
+/// which is still fixed-size. Java 25's answer, nothing counted.
+#[test]
+fn a_held_view_keeps_its_array_through_collections() {
+    let fixture =
+        javac_fixture::Fixture::build("arrays-as-list-held", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let mut call = |method: &str| match fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        method,
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    ) {
+        Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+        other => format!("{other:?}"),
+    };
+    assert_eq!(call("hold"), "held");
+    for _ in 0..40 {
+        call("garbage");
+    }
+    assert_eq!(call("afterCollections"), expected("afterCollections"));
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}

@@ -6,3 +6,4 @@ storeCheck=ArrayStoreException:java.lang.Integer,aa1,ArrayStoreException:java.la
 subLists=bBB[B, c],[B, C]C,UOE[a, B, C][B, C],UOE,UOE,UOE,ok,IndexOutOfBoundsException:Index 5 out of bounds for length 2,[C],IllegalArgumentException:fromIndex(2) > toIndex(1),java.util.AbstractList$RandomAccessSubList,[a, B, C]3
 jarEquals=UOE:remove21,false,UOE:remove2,false,UOE:remove2,T1
 live=aqc,z,abw,abw,r[r, b],ArrayIndexOutOfBoundsException:Index 5 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index 3 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index -1 out of bounds for length 3
+afterCollections=[h, I, j][I, j]IUOEjava.util.Arrays$ArrayList
