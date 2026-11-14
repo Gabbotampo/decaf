@@ -3,3 +3,12 @@ gsonForeign=demo.Review$Foo3
 gsonSets=ac3[a, b, c]|2[b, a]java.util.LinkedHashSet
 guavaIdentity=TTTT
 guavaClasses=com.google.common.collect.RegularImmutableMap,com.google.common.collect.SingletonImmutableBiMap,com.google.common.collect.RegularImmutableMap|com.google.common.collect.ImmutableEnumSetRED BLUE ,com.google.common.collect.SingletonImmutableSet|FFF|2{a=1}
+gsonNarrow=-25536,-1,7|-56,-1|T
+gsonObjects=Boolean:true Double:2.0 String:s null ArrayList:[1.0, false] 
+gsonSorted=java.util.TreeMapa|java.util.TreeSeta|java.util.TreeSet
+gsonGuavaJson={"a":1,"b":2}{"a":1}{}{"x":1}
+guavaClassSurface=com.google.common.collect.ImmutableBiMap,com.google.common.collect.ImmutableMap,com.google.common.collect.ImmutableMap,com.google.common.collect.ImmutableSet$CachingAsList,com.google.common.collect.ImmutableSet|TTTTTF
+gsonByteOverflow=JsonSyntaxException
+gsonShortBox=java.lang.Short
+gsonFloatBox=java.lang.Float
+guavaJdkEnum=[NANOSECONDS, SECONDS]
