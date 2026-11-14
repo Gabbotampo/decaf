@@ -256,8 +256,20 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/util/AbstractList",
         "java/util/AbstractCollection",
     ];
+    // `AbstractList$RandomAccessSubList extends SubList (extends AbstractList)
+    // implements RandomAccess`: no `Serializable`.
+    const SUB_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
     match class {
         crate::runtime::array_views::CLASS => ARRAYS_LIST,
+        crate::runtime::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
         | "java/util/Collections$UnmodifiableRandomAccessList"

@@ -24,9 +24,9 @@ public final class Probe {
         try {
             return String.valueOf(step.run());
         } catch (UnsupportedOperationException e) {
-            return "UOE";
+            return e.getMessage() == null ? "UOE" : "UOE:" + e.getMessage();
         } catch (RuntimeException e) {
-            return e.getClass().getSimpleName();
+            return e.getClass().getSimpleName() + (e.getMessage() == null ? "" : ":" + e.getMessage());
         }
     }
 
@@ -90,10 +90,97 @@ public final class Probe {
             + copy + "|" + view.indexOf("z") + b(view.contains("a")) + Arrays.asList().size();
     }
 
+    /** `set` checks the value against the array's component type, as `aastore` does. */
+    public static String storeCheck() {
+        String[] s = {"a"};
+        List<Object> l = Arrays.asList((Object[]) s);
+        Object[] ints = new Integer[] {2, 1};
+        List<Object> li = Arrays.asList(ints);
+        return uoe(() -> l.set(0, 1)) + "," + s[0] + l.get(0) + s[0].length() + "," + uoe(() -> li.set(0, "s")) + ","
+            + ints[0] + "," + uoe(() -> li.set(1, 7)) + ints[1];
+    }
+
+    /** A view's `subList` is a window on the same array: `set` writes through, size changes throw. */
+    public static String subLists() {
+        String[] a = {"a", "b", "c"};
+        List<String> v = Arrays.asList(a);
+        List<String> s = v.subList(1, 3);
+        String set = uoe(() -> s.set(0, "B")) + a[1] + v.get(1) + s;
+        a[2] = "C";
+        String seen = s.toString() + s.get(1);
+        return set + "," + seen + "," + uoe(() -> { s.clear(); return "cleared"; }) + v + s + ","
+            + uoe(() -> v.subList(0, 1).add("z")) + "," + uoe(() -> v.subList(0, 2).removeIf(x -> x.equals("a")))
+            + "," + uoe(() -> s.remove(0)) + "," + uoe(() -> { v.subList(0, 0).clear(); return "ok"; }) + ","
+            + uoe(() -> s.get(5)) + "," + s.subList(1, 2) + "," + uoe(() -> v.subList(2, 1)) + ","
+            + s.getClass().getName() + "," + v + v.size();
+    }
+
+    static final class Key {
+        final int k;
+
+        Key(int k) {
+            this.k = k;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Key other && other.k == k;
+        }
+
+        @Override
+        public int hashCode() {
+            return k;
+        }
+    }
+
+    /** Elements with their own `equals`: the size stays fixed whichever path compares them. */
+    public static String jarEquals() {
+        List<Key> v = Arrays.asList(new Key(1), new Key(2));
+        return uoe(() -> v.remove(new Key(1))) + v.size() + v.get(0).k + "," + uoe(() -> v.remove(new Key(3))) + ","
+            + uoe(() -> v.removeAll(List.of(new Key(2)))) + v.size() + ","
+            + uoe(() -> v.retainAll(List.of(new Key(1), new Key(2)))) + "," + uoe(() -> v.retainAll(List.of(new Key(1))))
+            + v.size() + "," + b(v.contains(new Key(2))) + v.indexOf(new Key(2));
+    }
+
+    /** Iteration reads the array live, and out of range is the array's own exception. */
+    public static String live() {
+        String[] a = {"a", "b", "c"};
+        List<String> v = Arrays.asList(a);
+        StringBuilder sb = new StringBuilder();
+        for (String x : v) {
+            a[1] = "q";
+            sb.append(x);
+        }
+        a[1] = "b";
+        java.util.Iterator<String> it = v.iterator();
+        a[0] = "z";
+        sb.append(',').append(it.next()).append(',');
+        a[0] = "a";
+        for (String x : v) {
+            v.set(2, "w");
+            sb.append(x);
+        }
+        a[2] = "c";
+        sb.append(',');
+        v.forEach(x -> {
+            a[2] = "w";
+            sb.append(x);
+        });
+        Object[] r = {"a", "b"};
+        List<Object> rv = Arrays.asList(r);
+        java.lang.reflect.Array.set(r, 0, "r");
+        return sb + "," + rv.get(0) + rv + "," + uoe(() -> v.get(5)) + "," + uoe(() -> v.set(3, "x")) + ","
+            + uoe(() -> v.get(-1));
+    }
+
     public static void main(String[] args) {
         System.out.println("writeThrough=" + writeThrough());
         System.out.println("fixedSize=" + fixedSize());
         System.out.println("reorder=" + reorder());
         System.out.println("asAList=" + asAList());
+        System.out.println("storeCheck=" + storeCheck());
+        System.out.println("subLists=" + subLists());
+        System.out.println("jarEquals=" + jarEquals());
+        System.out.println("live=" + live());
     }
 }

@@ -34,12 +34,31 @@ fn expected(method: &str) -> &'static str {
 ///   array, and the array's writes reach the view;
 /// - `asAList`: its class (`Arrays$ArrayList`, `RandomAccess`), `List`
 ///   equality and hash both ways, a view inside another list and a copy see
-///   the array as written, `indexOf`/`contains`, and `Arrays.asList()`.
+///   the array as written, `indexOf`/`contains`, and `Arrays.asList()`;
+/// - `storeCheck`: `set` checks the value against the array's component type
+///   as `aastore` does (`ArrayStoreException`, the array untouched);
+/// - `subLists`: a view's `subList` is a window on the same array: `set`
+///   writes through both ways, size changes throw, nested windows, the
+///   window's range checks and class;
+/// - `jarEquals`: elements with their own `equals` keep the size fixed
+///   (`remove`, `removeAll`, `retainAll`, with `ArrayItr`'s "remove");
+/// - `live`: iteration and `forEach` read the array as it is when reached,
+///   reflection's `Array.set` reaches the view, and out of range is the
+///   array's `ArrayIndexOutOfBoundsException`.
 #[test]
 fn arrays_as_list_is_a_fixed_size_view_of_its_array() {
     let fixture = javac_fixture::Fixture::build("arrays-as-list", &[("demo/Probe.java", PROBE)]);
     let mut failures = Vec::new();
-    for method in ["writeThrough", "fixedSize", "reorder", "asAList"] {
+    for method in [
+        "writeThrough",
+        "fixedSize",
+        "reorder",
+        "asAList",
+        "storeCheck",
+        "subLists",
+        "jarEquals",
+        "live",
+    ] {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
         let answer = fixture.jar.invoke_method_with_args(
             "demo/Probe",

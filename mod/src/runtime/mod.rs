@@ -2731,10 +2731,23 @@ pub trait Host {
         None
     }
 
-    /// `Arrays.asList` over the array `array` holding `values`: a fixed-size
-    /// view that the runtime keeps in step with the array (`array_views.rs`),
-    /// for a host that models one.
-    fn array_view(&mut self, _array: &str, _values: Vec<Value>) -> Option<Value> {
+    /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
+    /// from `offset`) holding `values`: a fixed-size view that the runtime
+    /// keeps in step with the array (`array_views.rs`), for a host that
+    /// models one.
+    fn array_view(
+        &mut self,
+        _array: &str,
+        _offset: usize,
+        _values: Vec<Value>,
+        _window: bool,
+    ) -> Option<Value> {
+        None
+    }
+
+    /// The array `marker` views, where its part starts, how long it is, and
+    /// whether it is a `subList`; `None` for anything but a view.
+    fn array_view_of(&self, _marker: &str) -> Option<(String, usize, usize, bool)> {
         None
     }
 
@@ -2746,9 +2759,9 @@ pub trait Host {
     /// The runtime wrote the array `array`, which now holds `values`.
     fn array_written(&mut self, _array: &str, _values: &[Value]) {}
 
-    /// Each array a view was written through since its last sync, with its
-    /// elements now.
-    fn changed_array_views(&mut self) -> Vec<(String, Vec<Value>)> {
+    /// Each view written since its last sync: its array, where its part
+    /// starts, and the part now.
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
         Vec::new()
     }
 
@@ -5067,8 +5080,18 @@ impl Host for StdHost {
         Some(self.empty_collection(kind))
     }
 
-    fn array_view(&mut self, array: &str, values: Vec<Value>) -> Option<Value> {
-        Some(self.new_array_view(array, values))
+    fn array_view(
+        &mut self,
+        array: &str,
+        offset: usize,
+        values: Vec<Value>,
+        window: bool,
+    ) -> Option<Value> {
+        Some(self.new_array_view(array, offset, values, window))
+    }
+
+    fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
+        StdHost::array_view_of(self, marker)
     }
 
     fn has_array_views(&self, array: &str) -> bool {
@@ -5079,7 +5102,7 @@ impl Host for StdHost {
         StdHost::array_written(self, array, values);
     }
 
-    fn changed_array_views(&mut self) -> Vec<(String, Vec<Value>)> {
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
         StdHost::changed_array_views(self)
     }
 
@@ -7345,7 +7368,7 @@ impl Host for StdHost {
         {
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
-            if let Some(answer) = self.fixed_size_member(r, marker, args) {
+            if let Some(answer) = self.fixed_size_member(r, marker) {
                 return answer;
             }
             // `getFirst`/`removeFirst`/`reversed()`... on a list, before the
@@ -21782,8 +21805,6 @@ impl<H: Host> Runtime<'_, H> {
                 if let Some(values) = self.arrays.get_mut(key) {
                     values.fill(value);
                 }
-                let key = key.to_owned();
-                self.push_array_views(&key);
                 Ok(Some(Value::Void))
             }
             _ => Ok(None),
@@ -21862,6 +21883,9 @@ impl<H: Host> Runtime<'_, H> {
                         NativeError::Metadata(format!("array index {index} out of bounds"))
                     })?;
                 *slot = StdHost::argument(r, args, 2)?.clone();
+                // An `Arrays.asList` view of it (`array_views.rs`).
+                let marker = marker.to_owned();
+                self.push_array_views(&marker);
                 Value::Void
             }
             ("setInt", "(Ljava/lang/Object;II)V") => {
@@ -26174,6 +26198,12 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
+                    {
+                        // `Arrays.asList`'s view and its windows, before any
+                        // model (`array_views.rs`).
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_owned_class(&r, receiver.as_ref()))
                     {

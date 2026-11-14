@@ -6,24 +6,31 @@
 //! `ArrayList`, and equal to every other literal with the same text.
 //!
 //! The view is now a collection handle of class `Arrays$ArrayList`, one per
-//! call (two views of one array are two objects that share it). Its elements
-//! sit in the host's collection table like any list's, mirroring the array,
-//! which lives in the runtime during a call:
+//! call (two views of one array are two objects that share it). Its
+//! `subList` is a window on the same array (`AbstractList$RandomAccessSubList`),
+//! and a window's `subList` another. Each keeps a row in the host's
+//! collection table that mirrors its part of the array, which lives in the
+//! runtime during a call, so every host reader (`toString`, `equals`, a copy,
+//! a list holding it) sees the array as it is:
 //!
-//! - **array → views:** after the runtime writes a viewed array (`aastore`,
-//!   `System.arraycopy`, `Arrays.fill`, a `toArray(T[])` fill), it pushes the
-//!   array into every view of it ([`StdHost::array_written`]);
-//! - **view → array:** the collection table watches the views' rows. Before
-//!   the runtime reads or writes an array or makes a call, it pulls the
-//!   elements of every view written since its last sync into the array, and
-//!   from there into the array's other views
-//!   ([`StdHost::changed_array_views`]). While no view was written, this is
-//!   one counter comparison.
+//! - **array → rows:** after the runtime writes a viewed array (`aastore`,
+//!   `System.arraycopy`, `Array.set`, a `toArray(T[])` fill), it pushes the
+//!   array into every view and window of it, and into the snapshot of every
+//!   iterator over one, so iteration reads the array live as `ArrayItr` does
+//!   ([`StdHost::array_written`]);
+//! - **rows → array:** the collection table watches the rows. Before the
+//!   runtime reads or writes an array or makes a call, it pulls each row
+//!   written since its last sync into the array, then pushes the array to
+//!   the others ([`StdHost::changed_array_views`]). While no row was written,
+//!   this is one counter comparison.
 //!
-//! The structural members throw `UnsupportedOperationException` exactly where
-//! JDK 25's `AbstractList`/`AbstractCollection` reach `add` or `remove`
-//! ([`StdHost::fixed_size_member`]); `set`, `sort` and `replaceAll` change
-//! the array.
+//! A view's or window's own members run here, before any other model
+//! ([`Runtime::invoke_array_view`]): `get`/`set` on the live array with the
+//! array's bounds and store checks, `forEach` reading it live, `subList`, and
+//! every member that would change the size, through one guard that answers as
+//! JDK 25's `AbstractList`/`AbstractCollection`/`AbstractList.SubList` do. A
+//! size-changing member a model sends the host directly is counted there
+//! ([`StdHost::fixed_size_member`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,30 +39,55 @@ use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_ref};
 /// The class Java 25's `Arrays.asList` answers.
 pub(crate) const CLASS: &str = "java/util/Arrays$ArrayList";
 
+/// The class of its `subList` (`AbstractList.subList` on a `RandomAccess` list).
+pub(crate) const WINDOW_CLASS: &str = "java/util/AbstractList$RandomAccessSubList";
+
+/// One view or window: where its elements start in the array, its row's
+/// generation when it last matched the array, and whether it is a `subList`.
+#[derive(Clone, Debug)]
+struct View {
+    array: String,
+    offset: usize,
+    synced: u64,
+    window: bool,
+}
+
 /// Which arrays the host's views mirror.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArrayViews {
-    /// A view's marker → its array's key, and its row's generation when it
-    /// last matched the array.
-    views: BTreeMap<String, (String, u64)>,
-    /// An array's key → its views.
+    views: BTreeMap<String, View>,
+    /// An array's key → its views and windows.
     by_array: BTreeMap<String, BTreeSet<String>>,
     /// The collection table's watched writes at the last pull.
     pulled: u64,
 }
 
-fn unsupported() -> NativeError {
+fn throw(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
-        class: "java/lang/UnsupportedOperationException".into(),
-        message: None,
+        class: class.into(),
+        message,
         frame: None,
     }
 }
 
+fn unsupported(message: Option<&str>) -> NativeError {
+    throw(
+        "java/lang/UnsupportedOperationException",
+        message.map(str::to_owned),
+    )
+}
+
 impl StdHost {
-    /// A new view of the array `array`, holding its `values` now.
-    pub(crate) fn new_array_view(&mut self, array: &str, values: Vec<Value>) -> Value {
-        let view = self.new_collection(CLASS, values);
+    /// A new view (`window`: a `subList`) of `array` from `offset`, holding
+    /// its `values` now.
+    pub(crate) fn new_array_view(
+        &mut self,
+        array: &str,
+        offset: usize,
+        values: Vec<Value>,
+        window: bool,
+    ) -> Value {
+        let view = self.new_collection(if window { WINDOW_CLASS } else { CLASS }, values);
         if let Some(marker) = expect_ref(&view).cloned() {
             self.mutable_collections.watch(&marker);
             let synced = self.mutable_collections.generation(&marker);
@@ -64,9 +96,13 @@ impl StdHost {
                 .entry(array.to_owned())
                 .or_default()
                 .insert(marker.clone());
-            self.array_views
-                .views
-                .insert(marker, (array.to_owned(), synced));
+            let view = View {
+                array: array.to_owned(),
+                offset,
+                synced,
+                window,
+            };
+            self.array_views.views.insert(marker, view);
         }
         view
     }
@@ -86,23 +122,46 @@ impl StdHost {
         self.array_views.by_array.contains_key(array)
     }
 
+    /// The array `marker` views, where its part starts, how long it is, and
+    /// whether it is a `subList`.
+    pub(crate) fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
+        let view = self.array_views.views.get(marker)?;
+        let length = self.mutable_collections.get(marker)?.len();
+        Some((view.array.clone(), view.offset, length, view.window))
+    }
+
     /// The runtime wrote the array `array`, which now holds `values`: every
-    /// view of it holds them too (a view of another length is no view of it
-    /// any more, and is left alone).
+    /// view and window of it holds its part, and so does every iterator
+    /// over one (`ArrayItr` reads the array).
     pub(crate) fn array_written(&mut self, array: &str, values: &[Value]) {
         let Some(views) = self.array_views.by_array.get(array).cloned() else {
             return;
         };
         let current = self.array_views.pulled == self.mutable_collections.watched_writes();
-        for view in views {
-            if let Some(row) = self.mutable_collections.get_mut(&view)
-                && row.len() == values.len()
+        for marker in views {
+            let Some(offset) = self.array_views.views.get(&marker).map(|view| view.offset) else {
+                continue;
+            };
+            let mut part = None;
+            if let Some(row) = self.mutable_collections.get_mut(&marker)
+                && let Some(now) = values.get(offset..offset + row.len())
             {
-                row.clone_from_slice(values);
+                row.clone_from_slice(now);
+                part = Some(now.to_vec());
             }
-            let synced = self.mutable_collections.generation(&view);
-            if let Some(entry) = self.array_views.views.get_mut(&view) {
-                entry.1 = synced;
+            if let Some(part) = part {
+                for (iterator, source) in &self.iterator_sources {
+                    if *source == marker
+                        && let Some((snapshot, _)) = self.iterators.get_mut(iterator)
+                        && snapshot.len() == part.len()
+                    {
+                        snapshot.clone_from(&part);
+                    }
+                }
+            }
+            let synced = self.mutable_collections.generation(&marker);
+            if let Some(view) = self.array_views.views.get_mut(&marker) {
+                view.synced = synced;
             }
         }
         // What this push wrote needs no pull.
@@ -111,185 +170,69 @@ impl StdHost {
         }
     }
 
-    /// Each array one of whose views was written since it last matched it,
-    /// with that view's elements, which the array's other views now hold
-    /// too. Empty, at the cost of one comparison, while no view was written.
-    pub(crate) fn changed_array_views(&mut self) -> Vec<(String, Vec<Value>)> {
+    /// Each view or window written since it last matched its array: the
+    /// array, where the part starts, and the part now. Empty, at the cost of
+    /// one comparison, while none was written.
+    pub(crate) fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
         if self.array_views.pulled == self.mutable_collections.watched_writes() {
             return Vec::new();
         }
-        let changed: Vec<(String, String)> = self
+        let changed = self
             .array_views
             .views
             .iter()
-            .filter(|(view, (_, synced))| {
-                self.mutable_collections.contains_key(*view)
-                    && self.mutable_collections.generation(view) != *synced
+            .filter(|(marker, view)| self.mutable_collections.generation(marker) != view.synced)
+            .filter_map(|(marker, view)| {
+                let row = self.mutable_collections.get(marker)?;
+                Some((view.array.clone(), view.offset, row.clone()))
             })
-            .map(|(view, (array, _))| (view.clone(), array.clone()))
             .collect();
-        let mut pulled: Vec<(String, Vec<Value>)> = Vec::new();
-        for (view, array) in changed {
-            if pulled.iter().any(|(done, _)| *done == array) {
-                continue;
-            }
-            let Some(values) = self.mutable_collections.get(&view).cloned() else {
-                continue;
-            };
-            self.array_written(&array, &values);
-            pulled.push((array, values));
-        }
         self.array_views.pulled = self.mutable_collections.watched_writes();
-        pulled
+        changed
     }
 
-    /// A structural member of a view, answered as JDK 25's `Arrays$ArrayList`
-    /// (`AbstractList`/`AbstractCollection`) answers it: `UnsupportedOperationException`
-    /// where it would add or remove, else what it found to do (nothing). `None`
-    /// for every other member, and for a receiver that is no view.
+    /// A member a model sends the host directly that could change a view's
+    /// size or store into its array without the array's checks: counted (a
+    /// jar's own calls are answered by [`crate::runtime::Runtime::invoke_array_view`]
+    /// before any model).
     pub(crate) fn fixed_size_member(
         &mut self,
         r: &MethodRef,
         marker: &str,
-        args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         if !self.array_views.views.contains_key(marker) {
             return None;
         }
-        let size = self.mutable_collections.get(marker).map_or(0, Vec::len);
-        let found = |host: &mut Self, needles: &Value| -> Result<bool, NativeError> {
-            let mine = host
-                .mutable_collections
-                .get(marker)
-                .cloned()
-                .unwrap_or_default();
-            let theirs = crate::runtime::host_collection_values(host, needles)?;
-            Ok(mine.iter().any(|value| {
-                theirs.iter().any(|needle| {
-                    crate::runtime::same_items(std::slice::from_ref(value), std::slice::from_ref(needle))
-                })
-            }))
-        };
-        let answer = match (r.name.as_str(), r.descriptor.as_str()) {
-            // `AbstractList.add`/`add(int, E)`/`remove(int)`, and
-            // `List.addFirst`/`addLast` (`add(0, e)`/`add(e)`): always.
-            ("add", _) | ("addFirst" | "addLast", _) => Err(unsupported()),
-            ("remove", "(I)Ljava/lang/Object;") => Err(unsupported()),
-            // `List.removeFirst`/`removeLast`: an empty list throws first.
-            ("removeFirst" | "removeLast", "()Ljava/lang/Object;") => Err(if size == 0 {
-                NativeError::UncaughtException {
-                    class: "java/util/NoSuchElementException".into(),
-                    message: None,
-                    frame: None,
-                }
-            } else {
-                unsupported()
-            }),
-            // `AbstractCollection.addAll` adds each element, `AbstractList`'s
-            // `addAll(int, c)` likewise: nothing to add is `false`.
-            ("addAll", _) => {
-                let added = args.last()?;
-                match crate::runtime::host_collection_values(self, added) {
-                    Ok(values) if values.is_empty() => Ok(Value::Int(0)),
-                    Ok(_) => Err(unsupported()),
-                    Err(error) => Err(error),
-                }
-            }
-            // `AbstractList.clear` is `removeRange(0, size())`.
-            ("clear", "()V") => {
-                if size == 0 {
-                    Ok(Value::Void)
-                } else {
-                    Err(unsupported())
-                }
-            }
-            // `AbstractCollection.remove`/`removeAll`: the iterator's
-            // `remove` at the first element found.
-            ("remove", "(Ljava/lang/Object;)Z") => {
-                let needle = args.first()?.clone();
-                let mine = self
-                    .mutable_collections
-                    .get(marker)
-                    .cloned()
-                    .unwrap_or_default();
-                if mine.iter().any(|value| {
-                    crate::runtime::same_items(std::slice::from_ref(value), std::slice::from_ref(&needle))
-                }) {
-                    Err(unsupported())
-                } else {
-                    Ok(Value::Int(0))
-                }
-            }
-            ("removeAll", "(Ljava/util/Collection;)Z") => match found(self, args.first()?) {
-                Ok(true) => Err(unsupported()),
-                Ok(false) => Ok(Value::Int(0)),
-                Err(error) => Err(error),
-            },
-            // `AbstractCollection.retainAll`: at the first element `c` lacks.
-            ("retainAll", "(Ljava/util/Collection;)Z") => {
-                let mine = self
-                    .mutable_collections
-                    .get(marker)
-                    .cloned()
-                    .unwrap_or_default();
-                match crate::runtime::host_collection_values(self, args.first()?) {
-                    Ok(theirs) => {
-                        let kept = |value: &Value| {
-                            theirs.iter().any(|needle| {
-                                crate::runtime::same_items(
-                                    std::slice::from_ref(value),
-                                    std::slice::from_ref(needle),
-                                )
-                            })
-                        };
-                        if mine.iter().all(kept) {
-                            Ok(Value::Int(0))
-                        } else {
-                            Err(unsupported())
-                        }
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            // `Collection.removeIf`: each element's test in order, the
-            // iterator's `remove` at the first that passes.
-            ("removeIf", "(Ljava/util/function/Predicate;)Z") => {
-                let predicate = args.first()?.clone();
-                let test = MethodRef {
-                    owner: "java/util/function/Predicate".into(),
-                    name: "test".into(),
-                    descriptor: "(Ljava/lang/Object;)Z".into(),
-                };
-                let mine = self
-                    .mutable_collections
-                    .get(marker)
-                    .cloned()
-                    .unwrap_or_default();
-                for value in mine {
-                    match crate::runtime::Host::invoke_instance(self, &test, &predicate, &[value]) {
-                        Ok(Value::Int(0)) => {}
-                        Ok(_) => return Some(Err(unsupported())),
-                        Err(error) => return Some(Err(error)),
-                    }
-                }
-                Ok(Value::Int(0))
-            }
-            _ => return None,
-        };
-        Some(answer)
+        let writes = matches!(
+            r.name.as_str(),
+            "add"
+                | "addAll"
+                | "addFirst"
+                | "addLast"
+                | "remove"
+                | "removeAll"
+                | "retainAll"
+                | "removeIf"
+                | "removeFirst"
+                | "removeLast"
+                | "clear"
+                | "set"
+        );
+        writes.then(|| crate::runtime::Host::unknown_operand_call(self, r))
     }
 }
 
 impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
-    /// Bring every array a view was written through up to date
+    /// Bring every array a view or window was written through up to date
     /// ([`StdHost::changed_array_views`]); one comparison while none was.
     pub(crate) fn pull_array_views(&mut self) {
-        for (array, values) in self.host.changed_array_views() {
+        for (array, offset, values) in self.host.changed_array_views() {
             if let Some(slots) = self.arrays.get_mut(&array)
-                && slots.len() == values.len()
+                && let Some(part) = slots.get_mut(offset..offset + values.len())
             {
-                *slots = values;
+                part.clone_from_slice(&values);
             }
+            self.push_array_views(&array);
         }
     }
 
@@ -318,9 +261,256 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             }
         };
         let key = key.to_owned();
-        match self.host.array_view(&key, values) {
+        match self.host.array_view(&key, 0, values, false) {
             Some(view) => Ok(view),
             None => self.host.unknown_operand_call(r),
         }
+    }
+
+    /// A view's or window's own members, answered on its array (see the
+    /// module doc); `None` for any other receiver or member.
+    pub(crate) fn invoke_array_view(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some((key, offset, length, window)) = receiver
+            .and_then(expect_ref)
+            .and_then(|marker| self.host.array_view_of(marker))
+        else {
+            return Ok(None);
+        };
+        self.pull_array_views();
+        let elements = |this: &Self| -> Vec<Value> {
+            this.arrays
+                .get(&key)
+                .and_then(|array| array.get(offset..offset + length))
+                .map(<[Value]>::to_vec)
+                .unwrap_or_default()
+        };
+        // `a[i]` on a view (`ArrayIndexOutOfBoundsException`), `Objects.checkIndex`
+        // on a window; both say `Index i out of bounds for length n`.
+        let slot = |index: i32| -> Result<usize, NativeError> {
+            usize::try_from(index)
+                .ok()
+                .filter(|index| *index < length)
+                .map(|index| offset + index)
+                .ok_or_else(|| {
+                    throw(
+                        if window {
+                            "java/lang/IndexOutOfBoundsException"
+                        } else {
+                            "java/lang/ArrayIndexOutOfBoundsException"
+                        },
+                        Some(format!("Index {index} out of bounds for length {length}")),
+                    )
+                })
+        };
+        // `AbstractList.rangeCheckForAdd`, before an insertion refuses.
+        let insertion = |index: i32| -> Result<(), NativeError> {
+            if (0..=length as i64).contains(&i64::from(index)) {
+                Ok(())
+            } else {
+                Err(throw(
+                    "java/lang/IndexOutOfBoundsException",
+                    Some(format!("Index: {index}, Size: {length}")),
+                ))
+            }
+        };
+        let null = || throw("java/lang/NullPointerException", None);
+        // A view's iterator is `ArrayItr`, whose `remove` says "remove"; a
+        // window's reaches the root's `remove(int)`, which says nothing.
+        let iterator_remove = if window { None } else { Some("remove") };
+        let int = |value: &Value| crate::runtime::expect_int(r, value);
+        let answer = match (r.name.as_str(), r.descriptor.as_str(), args) {
+            ("get", "(I)Ljava/lang/Object;", [index]) => {
+                let at = slot(int(index)?)?;
+                self.arrays
+                    .get(&key)
+                    .and_then(|array| array.get(at))
+                    .cloned()
+            }
+            // `E old = a[index]; a[index] = element;`: the bounds, then the
+            // array's store check (`aastore`'s).
+            ("set", "(ILjava/lang/Object;)Ljava/lang/Object;", [index, value]) => {
+                let at = slot(int(index)?)?;
+                let array = crate::runtime::host_array::handle(key.clone());
+                self.check_array_store(&array, value)?;
+                let old = self
+                    .arrays
+                    .get_mut(&key)
+                    .and_then(|array| array.get_mut(at))
+                    .map(|element| std::mem::replace(element, value.clone()));
+                self.push_array_views(&key);
+                old
+            }
+            // `for (E e : a) action.accept(e)`: each element as it is when reached.
+            ("forEach", "(Ljava/util/function/Consumer;)V", [action]) => {
+                if *action == Value::Ref(None) {
+                    return Err(null());
+                }
+                for index in 0..length {
+                    self.pull_array_views();
+                    let element = self
+                        .arrays
+                        .get(&key)
+                        .and_then(|array| array.get(offset + index))
+                        .cloned()
+                        .unwrap_or(Value::Ref(None));
+                    self.run_functional(
+                        crate::runtime::collection_callback::ACCEPT_OBJECT,
+                        action,
+                        &[element],
+                    )?;
+                }
+                Some(Value::Void)
+            }
+            // `AbstractList.subListRangeCheck`, then a window on the same array.
+            ("subList", "(II)Ljava/util/List;", [from, to]) => {
+                let (from, to) = (int(from)?, int(to)?);
+                if from < 0 {
+                    return Err(throw(
+                        "java/lang/IndexOutOfBoundsException",
+                        Some(format!("fromIndex = {from}")),
+                    ));
+                }
+                if to as i64 > length as i64 {
+                    return Err(throw(
+                        "java/lang/IndexOutOfBoundsException",
+                        Some(format!("toIndex = {to}")),
+                    ));
+                }
+                if from > to {
+                    return Err(throw(
+                        "java/lang/IllegalArgumentException",
+                        Some(format!("fromIndex({from}) > toIndex({to})")),
+                    ));
+                }
+                let (from, to) = (from as usize, to as usize);
+                let part = elements(self)[from..to].to_vec();
+                match self.host.array_view(&key, offset + from, part, true) {
+                    Some(window) => Some(window),
+                    None => Some(self.host.unknown_operand_call(r)?),
+                }
+            }
+            _ => self.fixed_size(r, args, &elements(self), window, iterator_remove, insertion)?,
+        };
+        Ok(answer)
+    }
+
+    /// The one guard of a view's or window's size: what JDK 25 answers for a
+    /// member that would add or remove (`AbstractList`, `AbstractCollection`,
+    /// `AbstractList.SubList`). It throws `UnsupportedOperationException` at
+    /// the point Java reaches `add`/`remove`, and answers "nothing changed"
+    /// when Java finds nothing to do; a comparison it cannot make exactly is
+    /// counted. `None` for a member that changes no size.
+    fn fixed_size(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+        elements: &[Value],
+        window: bool,
+        iterator_remove: Option<&str>,
+        insertion: impl Fn(i32) -> Result<(), NativeError>,
+    ) -> Result<Option<Value>, NativeError> {
+        let null = || throw("java/lang/NullPointerException", None);
+        let empty = elements.is_empty();
+        let int = |value: &Value| crate::runtime::expect_int(r, value);
+        Ok(Some(match (r.name.as_str(), r.descriptor.as_str(), args) {
+            // `add(e)` is `add(size(), e)`; a window checks the index first.
+            ("add", "(Ljava/lang/Object;)Z", _) | ("addLast", _, _) => {
+                return Err(unsupported(None));
+            }
+            ("add", "(ILjava/lang/Object;)V", [index, _]) => {
+                if window {
+                    insertion(int(index)?)?;
+                }
+                return Err(unsupported(None));
+            }
+            ("addFirst", _, _) => return Err(unsupported(None)),
+            ("remove", "(I)Ljava/lang/Object;", [index]) => {
+                let index = int(index)?;
+                if window && !(0..elements.len() as i64).contains(&i64::from(index)) {
+                    return Err(throw(
+                        "java/lang/IndexOutOfBoundsException",
+                        Some(format!(
+                            "Index {index} out of bounds for length {}",
+                            elements.len()
+                        )),
+                    ));
+                }
+                return Err(unsupported(None));
+            }
+            // `List.removeFirst`/`removeLast`: an empty list throws first.
+            ("removeFirst" | "removeLast", "()Ljava/lang/Object;", []) => {
+                return Err(if empty {
+                    throw("java/util/NoSuchElementException", None)
+                } else {
+                    unsupported(None)
+                });
+            }
+            // Each of `c`'s elements is added: nothing to add is `false`.
+            ("addAll", "(Ljava/util/Collection;)Z", [added])
+            | ("addAll", "(ILjava/util/Collection;)Z", [_, added]) => {
+                if let [index, _] = args {
+                    insertion(int(index)?)?;
+                }
+                if *added == Value::Ref(None) {
+                    return Err(null());
+                }
+                match self.collection_elements(added) {
+                    Ok(added) if added.is_empty() => Value::Int(0),
+                    Ok(_) => return Err(unsupported(None)),
+                    Err(_) => self.host.unknown_operand_call(r)?,
+                }
+            }
+            // `removeRange(0, size())`: its iterator's `remove` per element.
+            ("clear", "()V", []) => {
+                if empty {
+                    Value::Void
+                } else {
+                    return Err(unsupported(None));
+                }
+            }
+            // The iterator's `remove` at the first `o.equals(e)`.
+            ("remove", "(Ljava/lang/Object;)Z", [needle]) => {
+                if self.abstract_list_index_of(elements, needle)? >= 0 {
+                    return Err(unsupported(iterator_remove));
+                }
+                Value::Int(0)
+            }
+            // At the first element `c` contains (`removeAll`) or lacks
+            // (`retainAll`).
+            (name @ ("removeAll" | "retainAll"), "(Ljava/util/Collection;)Z", [other]) => {
+                if *other == Value::Ref(None) {
+                    return Err(null());
+                }
+                for element in elements {
+                    match self.argument_contains(other, element)? {
+                        Some(contained) if contained == (name == "removeAll") => {
+                            return Err(unsupported(iterator_remove));
+                        }
+                        Some(_) => {}
+                        None => return self.host.unknown_operand_call(r).map(Some),
+                    }
+                }
+                Value::Int(0)
+            }
+            // Each element's test in order, the iterator's `remove` at the
+            // first that passes.
+            ("removeIf", "(Ljava/util/function/Predicate;)Z", [predicate]) => {
+                if *predicate == Value::Ref(None) {
+                    return Err(null());
+                }
+                for element in elements {
+                    if self.predicate_holds(predicate, element)? {
+                        return Err(unsupported(iterator_remove));
+                    }
+                }
+                Value::Int(0)
+            }
+            _ => return Ok(None),
+        }))
     }
 }

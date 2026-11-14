@@ -1,4 +1,8 @@
 writeThrough=xx|yyb|[x, p, q][x, p, q]|FT3
-fixedSize=UOE,UOE,UOE,false,UOE,false,UOE,false,UOE,false,UOE,cleared,UOE,NoSuchElementException,UOE|[a, b]
+fixedSize=UOE,UOE,UOE,false,UOE:remove,false,UOE,false,UOE:remove,false,UOE:remove,cleared,UOE,NoSuchElementException,UOE|[a, b]
 reorder=abc,ABC,CBA,[C, B, A],fff
 asAList=java.util.Arrays$ArrayList|TTTT|[[a, z]][a, z]|1T0
+storeCheck=ArrayStoreException:java.lang.Integer,aa1,ArrayStoreException:java.lang.String,2,17
+subLists=bBB[B, c],[B, C]C,UOE[a, B, C][B, C],UOE,UOE,UOE,ok,IndexOutOfBoundsException:Index 5 out of bounds for length 2,[C],IllegalArgumentException:fromIndex(2) > toIndex(1),java.util.AbstractList$RandomAccessSubList,[a, B, C]3
+jarEquals=UOE:remove21,false,UOE:remove2,false,UOE:remove2,T1
+live=aqc,z,abw,abw,r[r, b],ArrayIndexOutOfBoundsException:Index 5 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index 3 out of bounds for length 3,ArrayIndexOutOfBoundsException:Index -1 out of bounds for length 3
