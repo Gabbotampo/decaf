@@ -96,7 +96,18 @@ mandatory = true
     let mut host = jar.seed_host(StdHost::new());
     jar.execute("demo.NeoMod", None, "neoforge", &mut host)
         .unwrap();
-    let mod_list = Value::Ref(Some("neoforge-mod-list".into()));
+    // `ModList.get()`: the loader's one mod list, a host handle.
+    let mod_list = host
+        .invoke(
+            &MethodRef {
+                owner: "net/neoforged/fml/ModList".into(),
+                name: "get".into(),
+                descriptor: "()Lnet/neoforged/fml/ModList;".into(),
+            },
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(mod_list, Value::Host(_)), "{mod_list:?}");
     let loaded = MethodRef {
         owner: "net/neoforged/fml/ModList".into(),
         name: "isLoaded".into(),
