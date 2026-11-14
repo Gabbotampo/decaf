@@ -1026,6 +1026,12 @@ fn is_fabric_event_invoker(value: &Value) -> bool {
 }
 
 impl<H: Host> Host for GameHookHost<'_, H> {
+    // A callback's `System.out` lines go to the jar's console, as an entrypoint's do (they were
+    // dropped here: the trait's default writes nowhere).
+    fn write_console(&mut self, text: &str) {
+        self.inner.write_console(text);
+    }
+
     fn empty_iterator(&mut self) -> Value {
         self.inner.empty_iterator()
     }
