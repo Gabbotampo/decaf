@@ -363,7 +363,10 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         self.fields.insert(key, id);
                     }
-                    return Ok(Some(Value::Void));
+                    // The host records the id too, for the game calls that
+                    // take the resource (`getWorldPath`): its constructor
+                    // still reaches it.
+                    return Ok(None);
                 }
                 _ => return Ok(None),
             };
