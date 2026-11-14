@@ -74,10 +74,17 @@ public final class Probe {
         return one(spelled("li", "st")) + ";" + one(spelled("se", "t")) + ";" + one(spelled("ma", "p"));
     }
 
+    /** The literals' generation and immutable spellings (`list#3/…`, `list#i1/…`, `set#i0`). */
+    public static String hashed() {
+        return one(spelled("list#i1/", "a,b")) + ";" + one(spelled("map#i2/", "k,v")) + ";" + one(spelled("list#3/", "a"))
+            + ";" + one(spelled("set#", "i0"));
+    }
+
     public static void main(String[] args) {
         System.out.println("list=" + list());
         System.out.println("set=" + set());
         System.out.println("map=" + map());
         System.out.println("bare=" + bare());
+        System.out.println("hashed=" + hashed());
     }
 }

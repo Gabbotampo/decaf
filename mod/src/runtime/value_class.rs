@@ -59,6 +59,11 @@ const RETIRED_PREFIXES: &[&str] = &[
     "list/",
     "set/",
     "map/",
+    // Their generation (`list#3/…`) and immutable (`list#i1/…`, `set#i0`)
+    // spellings too (#255 review).
+    "list#",
+    "set#",
+    "map#",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`

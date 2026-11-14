@@ -22,7 +22,9 @@ fn expected(method: &str) -> &'static str {
         .unwrap_or_else(|| panic!("no oracle line for {method}"))
 }
 
-/// For `list/a,b`, `set/x`, `map/k=v` and the bare words, built at run time:
+/// For `list/a,b`, `set/x`, `map/k=v`, the bare words and the generation and
+/// immutable spellings (`list#i1/a,b`, `map#i2/k,v`, `list#3/a`, `set#i0`),
+/// built at run time:
 /// the class is `String`; `instanceof` is `String`'s and no collection's;
 /// `equals` both ways and `hashCode` match an equal `String`; it is a
 /// `HashMap` key and a list element as a `String`; `String.valueOf` and
@@ -33,7 +35,7 @@ fn a_string_spelled_like_a_collection_literal_is_a_string() {
     let fixture =
         javac_fixture::Fixture::build("collection-forgery", &[("demo/Probe.java", PROBE)]);
     let mut failures = Vec::new();
-    for method in ["list", "set", "map", "bare"] {
+    for method in ["list", "set", "map", "bare", "hashed"] {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
         let answer = fixture.jar.invoke_method_with_args(
             "demo/Probe",

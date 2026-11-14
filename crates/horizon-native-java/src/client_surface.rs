@@ -2099,13 +2099,24 @@ mod tests {
     fn a_non_null_list_call_on_an_inventory_list_answers_as_a_list() {
         let mut host = StdHost::new();
         host.begin_client_frame(snapshot(), &[]);
-        let list = host.new_collection("java/util/ArrayList", vec![Value::Int(1), Value::Int(2)]);
-        let size = method("net/minecraft/core/NonNullList", "size", "()I");
+        let list = host.cached_collection(
+            &marker(items::INVENTORY),
+            "items",
+            NON_NULL_LIST,
+            true,
+            vec![Value::Int(1), Value::Int(2)],
+        );
+        let size = method(NON_NULL_LIST, "size", "()I");
         assert_eq!(
             crate::Host::invoke_instance(&mut host, &size, &list, &[]).unwrap(),
             Value::Int(2)
         );
         assert!(host.unknown_host_calls().is_empty());
+        // A mutator follows `NonNullList`'s own rules (no `null`, a fixed
+        // size): counted.
+        let add = method(NON_NULL_LIST, "add", "(Ljava/lang/Object;)Z");
+        crate::Host::invoke_instance(&mut host, &add, &list, &[Value::Int(3)]).unwrap();
+        assert_eq!(host.unknown_host_calls().len(), 1);
     }
 
     #[test]

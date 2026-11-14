@@ -12507,9 +12507,6 @@ fn not_a_collection(value: &Value) -> Result<Vec<Value>, NativeError> {
     )))
 }
 
-/// The class a host collection marker was constructed as
-/// (`java/util/ArrayList#3`, `java/util/ArrayList#neutral0`), or the kind of
-/// an encoded value (`set/...` is `set`).
 /// Whether `value` is the host-made object of one of `classes`, `Collections`' empty
 /// collections (`java_immutable.rs` makes each once, as `Collections.EMPTY_*`).
 fn is_collections_empty(value: &Value, classes: &[&str]) -> bool {
