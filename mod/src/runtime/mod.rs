@@ -81,6 +81,7 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+mod host_deferred_register;
 mod host_entry;
 mod host_events;
 mod host_executors;
@@ -3066,9 +3067,13 @@ pub struct StdHost {
     /// marker. A constructor answers `void`, so this is where the id lives.
     identifier_objects: BTreeMap<String, String>,
     /// What each `DeferredRegister.create` was made from (registry key,
-    /// namespace), by the register's marker; `None` when two registers share
-    /// the marker or the namespace was not text (`host_ids.rs`).
+    /// namespace), by the register handle's key; `None` when the namespace
+    /// was not text (`host_ids.rs`).
     deferred_registers: BTreeMap<String, Option<(Value, String)>>,
+    /// The registries this jar built and registered itself
+    /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
+    /// every entry the host saw registered (`registry_contents.rs`).
+    jar_registries: BTreeSet<String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3290,6 +3295,7 @@ impl StdHost {
             packet_types: BTreeMap::new(),
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
+            jar_registries: BTreeSet::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -5675,12 +5681,13 @@ impl Host for StdHost {
                     Some(key) => key.clone(),
                     None => Value::Ref(None),
                 };
-                self.record_deferred_register(
+                // A new register per call (#182 P1).
+                Ok(self.new_deferred_register(
+                    owner,
                     &marker,
                     &registry_key,
                     args.get(1).and_then(expect_ref),
-                );
-                Ok(Value::Ref(Some(marker)))
+                ))
             }
             ("net/fabricmc/fabric/api/event/EventFactory", "createArrayBacked", descriptor)
                 if descriptor.ends_with("Lnet/fabricmc/fabric/api/event/Event;") =>
@@ -7463,6 +7470,15 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // The game's `NonNullList` (an inventory's list): its own rules
+            // (no `null`, a fixed size for `withSize`) are not modelled, so a
+            // mutator is counted (#255 review).
+            if jar_object::collection_key(marker).is_some_and(|_| {
+                jar_object::collection_class(marker) == client_surface::NON_NULL_LIST
+            }) && java_immutable::is_mutator(&r.name)
+            {
+                return self.unknown_host_call(r);
+            }
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
             if let Some(answer) = self.fixed_size_member(r, marker) {
@@ -9685,7 +9701,8 @@ impl Host for StdHost {
             // `Registry.iterator()` walks the values registered in the
             // registry. The host holds the entries the jar registered
             // (`registry_contents`), not the game's own: the game's entries
-            // have no objects to hand out.
+            // have no objects to hand out, so walking a registry the jar did
+            // not build is counted (#182 P3), and walks the jar's own entries.
             (owner, "iterator", "()Ljava/util/Iterator;")
                 if registry_contents::is_registry_owner(owner)
                     && host_registry::registry_id(receiver).is_some() =>
@@ -9693,6 +9710,9 @@ impl Host for StdHost {
                 let id = host_registry::registry_id(receiver)
                     .unwrap_or_default()
                     .to_owned();
+                if !self.jar_registries.contains(&id) {
+                    self.unknown_host_call(r)?;
+                }
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
@@ -10146,17 +10166,22 @@ impl Host for StdHost {
                     .first()
                     .and_then(expect_ref)
                     .map_or("entry", String::as_str);
-                let register = expect_ref(receiver)
-                    .map_or("deferred-register/registry/default", String::as_str)
-                    .to_owned();
+                // Only a register this runtime made (a `String` spelled like
+                // its text is none): anything else is counted.
+                let Some((register, text)) = host_deferred_register::parts(receiver)
+                    .map(|(key, text)| (key.to_owned(), text.to_owned()))
+                else {
+                    return self.unknown_host_call(r);
+                };
                 // `Identifier.fromNamespaceAndPath(namespace, name)` (Forge:
                 // `new ResourceLocation(modid, name)`): bad text throws here.
                 let forge = r.owner.starts_with("net/minecraftforge/");
                 let made = self.deferred_register_id(forge, &register, id)?;
                 // One holder object per `register` call (`host_registry.rs`).
                 let (holder, value) = self.new_holder(&register, forge, made);
+                self.add_register_entry(receiver, &holder);
                 self.registrations.push(RegistryEntry {
-                    registry: register,
+                    registry: text,
                     id: id.to_owned(),
                     value,
                     declaration: None,
@@ -10168,19 +10193,14 @@ impl Host for StdHost {
                 | "net/minecraftforge/registries/DeferredRegister",
                 "getEntries",
                 "()Ljava/util/Collection;",
-            ) => {
-                // The register's one entries view (`entriesView`), holding
-                // its holders now.
-                let register = expect_ref(receiver).map_or("", String::as_str).to_owned();
-                let holders = self.register_holders(&register);
-                Ok(self.cached_collection(
-                    receiver,
-                    "getEntries",
-                    stand_in_class("list"),
-                    true,
-                    holders,
-                ))
-            }
+            ) => match host_deferred_register::parts(receiver) {
+                Some((register, _)) => {
+                    let register = register.to_owned();
+                    Ok(self.register_entries(receiver, &register))
+                }
+                // No register this runtime made: what it holds is unknown.
+                None => self.unknown_host_call(r),
+            },
             // A holder's `get`/`value`/`isBound`/... are `holder_call`'s
             // (`host_registry.rs`).
             (
@@ -19915,6 +19935,12 @@ fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
     if CONCRETE.contains(&class) {
         return class;
     }
+    // `ConstructorConstructor`'s sorted defaults (#253 review).
+    match class {
+        "java/util/SortedSet" | "java/util/NavigableSet" => return "java/util/TreeSet",
+        "java/util/SortedMap" | "java/util/NavigableMap" => return "java/util/TreeMap",
+        _ => {}
+    }
     match kind {
         "set" => "java/util/LinkedHashSet",
         "map" => "java/util/LinkedHashMap",
@@ -20029,22 +20055,33 @@ impl<H: Host> Runtime<'_, H> {
         Ok(match (descriptor, json) {
             (_, Json::Null) if descriptor.len() == 1 => None,
             (_, Json::Null) => Some(Value::Ref(None)),
-            ("Ljava/lang/Object;", _) => Some(self.gson_json_value(json, "java/lang/Object")?),
+            // `ObjectTypeAdapter` (#253 review).
+            ("Ljava/lang/Object;", _) => self.gson_object_adapter(json)?,
             // `TypeAdapters.STRING`: a string, an integer's text, a boolean's.
             ("Ljava/lang/String;", Json::String(text)) => Some(Value::Ref(Some(text.clone()))),
             ("Ljava/lang/String;", Json::Number(number)) if number.is_i64() || number.is_u64() => {
                 Some(Value::Ref(Some(number.to_string())))
             }
             ("Ljava/lang/String;", Json::Bool(flag)) => Some(Value::Ref(Some(flag.to_string()))),
-            (
-                "I" | "S" | "B" | "Ljava/lang/Integer;" | "Ljava/lang/Short;" | "Ljava/lang/Byte;",
-                _,
-            ) => integer(json)
+            // `TypeAdapters.INTEGER`/`LONG`: `nextInt`/`nextLong`.
+            ("I" | "Ljava/lang/Integer;", _) => integer(json)
                 .and_then(|n| i32::try_from(n).ok())
                 .map(Value::Int),
             ("J" | "Ljava/lang/Long;", _) => integer(json).map(Value::Long),
-            ("D" | "F" | "Ljava/lang/Double;" | "Ljava/lang/Float;", Json::Number(number)) => {
-                number.as_f64().map(Value::Float)
+            // `TypeAdapters.SHORT`/`BYTE`: `nextInt`, a `JsonSyntaxException`
+            // past 65535 or 255 (or below the type's minimum), then the
+            // narrowing cast. Their boxes are classes no value here carries:
+            // counted.
+            ("S", _) => integer(json)
+                .filter(|n| (i64::from(i16::MIN)..=65535).contains(n))
+                .map(|n| Value::Int(i32::from(n as i16))),
+            ("B", _) => integer(json)
+                .filter(|n| (i64::from(i8::MIN)..=255).contains(n))
+                .map(|n| Value::Int(i32::from(n as i8))),
+            // `nextDouble`, and for a `float` its narrowing.
+            ("D" | "Ljava/lang/Double;", Json::Number(number)) => number.as_f64().map(Value::Float),
+            ("F", Json::Number(number)) => {
+                number.as_f64().map(|n| Value::Float(f64::from(n as f32)))
             }
             ("Z", Json::Bool(flag)) => Some(Value::Int(i32::from(*flag))),
             ("Ljava/lang/Boolean;", Json::Bool(flag)) => Some(boolean_value(*flag)),
@@ -20059,6 +20096,33 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             _ => None,
+        })
+    }
+
+    /// Gson's `ObjectTypeAdapter` (`ToNumberPolicy.DOUBLE`): a string, a
+    /// `Double`, a `Boolean`, `null`, an `ArrayList` of the same; `None` for
+    /// an object, which it reads as a `LinkedTreeMap` no model holds.
+    fn gson_object_adapter(
+        &mut self,
+        json: &serde_json::Value,
+    ) -> Result<Option<Value>, NativeError> {
+        use serde_json::Value as Json;
+        Ok(match json {
+            Json::Null => Some(Value::Ref(None)),
+            Json::String(text) => Some(Value::Ref(Some(text.clone()))),
+            Json::Bool(flag) => Some(boolean_value(*flag)),
+            Json::Number(number) => number.as_f64().map(Value::Float),
+            Json::Array(values) => {
+                let mut elements = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(element) = self.gson_object_adapter(value)? else {
+                        return Ok(None);
+                    };
+                    elements.push(element);
+                }
+                Some(self.new_host_collection("java/util/ArrayList", elements, GSON_FROM_JSON)?)
+            }
+            Json::Object(_) => None,
         })
     }
 
@@ -21860,6 +21924,13 @@ impl<H: Host> Runtime<'_, H> {
         if target.starts_with('[') {
             return Assignable::Known(false);
         }
+        // A Guava immutable class the host makes: its whole chain is known
+        // (#253 review).
+        if self.class(source).is_none()
+            && let Some(answer) = crate::runtime::java_immutable::guava_assignable(target, source)
+        {
+            return Assignable::Known(answer);
+        }
         // A host kind's class (`getClass()` of a handle): its row, unless
         // the run holds that class file (a jar's own copy wins).
         if self.class(source).is_none()
@@ -22443,6 +22514,12 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?.replace('.', "/");
             if class == "java/lang/Object" || host_class::is_primitive(&class) {
                 return Ok(Some(Value::Ref(None)));
+            }
+            // A Guava immutable class the host makes: Guava's own superclass.
+            if self.class(&class).is_none()
+                && let Some(parent) = crate::runtime::java_immutable::guava_superclass(&class)
+            {
+                return Ok(Some(host_class::class_value(parent)));
             }
             // A host kind's class: its row knows its supertypes, not which
             // one is the direct superclass. Counted.

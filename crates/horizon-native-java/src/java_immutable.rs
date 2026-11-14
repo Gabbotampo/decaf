@@ -212,6 +212,102 @@ pub(crate) fn member_class_names(name: &str) -> Option<(String, String)> {
     })
 }
 
+/// Guava 33.6.0's direct superclass (`javap`) of an immutable class the
+/// host makes, and of its abstract ancestors, up to the JDK class Guava
+/// leaves at; `None` for any other class.
+pub(crate) fn guava_superclass(class: &str) -> Option<&'static str> {
+    Some(match class {
+        "com/google/common/collect/RegularImmutableMap" => "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/SingletonImmutableBiMap"
+        | "com/google/common/collect/RegularImmutableBiMap" => {
+            "com/google/common/collect/ImmutableBiMap"
+        }
+        "com/google/common/collect/ImmutableBiMap" => "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/ImmutableMap" => "java/lang/Object",
+        "com/google/common/collect/RegularImmutableSet" => {
+            "com/google/common/collect/ImmutableSet$CachingAsList"
+        }
+        "com/google/common/collect/ImmutableEnumSet"
+        | "com/google/common/collect/SingletonImmutableSet"
+        | "com/google/common/collect/ImmutableSet$CachingAsList" => {
+            "com/google/common/collect/ImmutableSet"
+        }
+        "com/google/common/collect/RegularImmutableList"
+        | "com/google/common/collect/SingletonImmutableList" => {
+            "com/google/common/collect/ImmutableList"
+        }
+        "com/google/common/collect/ImmutableSet" | "com/google/common/collect/ImmutableList" => {
+            "com/google/common/collect/ImmutableCollection"
+        }
+        "com/google/common/collect/ImmutableCollection" => "java/util/AbstractCollection",
+        _ => return None,
+    })
+}
+
+/// The interfaces those Guava classes declare directly, and Guava's `BiMap`'s.
+fn guava_interfaces(class: &str) -> &'static [&'static str] {
+    match class {
+        "com/google/common/collect/ImmutableMap" => &["java/util/Map", "java/io/Serializable"],
+        "com/google/common/collect/ImmutableBiMap" => &["com/google/common/collect/BiMap"],
+        "com/google/common/collect/BiMap" => &["java/util/Map"],
+        "com/google/common/collect/ImmutableSet" => &["java/util/Set"],
+        "com/google/common/collect/ImmutableList" => &["java/util/List", "java/util/RandomAccess"],
+        "com/google/common/collect/ImmutableCollection" => &["java/io/Serializable"],
+        _ => &[],
+    }
+}
+
+/// `target.isAssignableFrom(source)` for a Guava class [`guava_superclass`]
+/// knows: its whole chain and interfaces are known, Guava's and the JDK's
+/// (#253 review). `None` for any other source, or where the JDK's table
+/// cannot tell.
+pub(crate) fn guava_assignable(target: &str, source: &str) -> Option<bool> {
+    guava_superclass(source)?;
+    let interface_reaches = |interface: &str| -> Option<bool> {
+        let mut pending = vec![interface];
+        while let Some(current) = pending.pop() {
+            if current == target {
+                return Some(true);
+            }
+            if current.starts_with("java/") {
+                if crate::host_ref::ClassHierarchy::is_instance(
+                    &crate::host_ref::JdkHierarchy,
+                    current,
+                    target,
+                ) == Some(true)
+                {
+                    return Some(true);
+                }
+            } else {
+                pending.extend(guava_interfaces(current));
+            }
+        }
+        Some(false)
+    };
+    let mut current = source;
+    loop {
+        if current == target {
+            return Some(true);
+        }
+        for interface in guava_interfaces(current) {
+            if interface_reaches(interface) == Some(true) {
+                return Some(true);
+            }
+        }
+        match guava_superclass(current) {
+            Some(parent) => current = parent,
+            // Left Guava at a JDK class: the JDK's table decides.
+            None => {
+                return crate::host_ref::ClassHierarchy::is_instance(
+                    &crate::host_ref::JdkHierarchy,
+                    current,
+                    target,
+                );
+            }
+        }
+    }
+}
+
 /// The supertypes `instanceof` sees for one of the classes above, the
 /// family's interface first (`java_tostring` prints through it). Java 25's
 /// `jdk_closure` table holds every JDK one's whole set; Guava's are its
@@ -315,7 +411,18 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/util/AbstractList",
         "java/util/AbstractCollection",
     ];
+    // The game's `NonNullList extends AbstractList` (26.3, `javap`): no
+    // `RandomAccess`.
+    const NON_NULL_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
     match class {
+        crate::client_surface::NON_NULL_LIST => NON_NULL_LIST,
         crate::array_views::CLASS => ARRAYS_LIST,
         crate::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
@@ -360,6 +467,25 @@ impl StdHost {
         self.mutable_collections.insert(marker.clone(), values);
         self.unmodifiable_collections.insert(marker.clone(), None);
         crate::jar_object::collection(marker)
+    }
+
+    /// `Collections.unmodifiable{List,Set,Map}(source)` (`kind` `list`, `set`
+    /// or `map`): a new view reading `source` live. `None` when `source` is no
+    /// object.
+    pub(crate) fn unmodifiable_view(&mut self, kind: &str, source_value: &Value) -> Option<Value> {
+        let source = expect_ref(source_value)?.clone();
+        let source_class = crate::jar_object::object_class(source_value);
+        // A counter that never moves back: the collector shrinks the table, so its size
+        // would hand a new view a live one's key (#249).
+        let marker = crate::jar_object::collection_key_for(
+            view_class(kind, source_class),
+            crate::jar_object::CollectionFamily::Immutable,
+            self.next_unmodifiable_collection,
+        );
+        self.next_unmodifiable_collection += 1;
+        self.unmodifiable_collections
+            .insert(marker.clone(), Some(source));
+        Some(crate::jar_object::collection(marker))
     }
 
     /// What the factory `owner.name` answers for `values`: the class Java
@@ -564,18 +690,7 @@ impl StdHost {
                     "unmodifiableMap" => "map",
                     _ => return None,
                 };
-                let source_value = args.first()?;
-                let source = expect_ref(source_value)?.clone();
-                let source_class = crate::jar_object::object_class(source_value);
-                let marker = crate::jar_object::collection_key_for(
-                    view_class(kind, source_class),
-                    crate::jar_object::CollectionFamily::Immutable,
-                    self.next_unmodifiable_collection,
-                );
-                self.next_unmodifiable_collection += 1;
-                self.unmodifiable_collections
-                    .insert(marker.clone(), Some(source));
-                return Some(Ok(crate::jar_object::collection(marker)));
+                return self.unmodifiable_view(kind, args.first()?).map(Ok);
             }
             _ => return None,
         };

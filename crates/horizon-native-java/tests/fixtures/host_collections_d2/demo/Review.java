@@ -2,10 +2,15 @@ package demo;
 
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import java.util.Map;
+import java.util.NavigableSet;
+import java.util.SortedMap;
+import java.util.SortedSet;
+import java.util.concurrent.TimeUnit;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Stream;
@@ -75,11 +80,99 @@ public final class Review {
             + b(Map.copyOf(collected) == collected) + b(Set.copyOf(colors) == colors) + "|" + two.get("b") + one;
     }
 
+    /** Gson's `SHORT`/`BYTE` narrowing, and a `float` rounded as one. */
+    public static String gsonNarrow() {
+        Gson gson = new Gson();
+        short[] shorts = gson.fromJson("[40000,-1,7]", short[].class);
+        byte[] bytes = gson.fromJson("[200,-1]", byte[].class);
+        float[] floats = gson.fromJson("[0.1]", float[].class);
+        return shorts[0] + "," + shorts[1] + "," + shorts[2] + "|" + bytes[0] + "," + bytes[1] + "|" + b(floats[0] == 0.1f);
+    }
+
+    /** `ObjectTypeAdapter`: `Boolean`, `Double`, `String`, `null`, an `ArrayList` of the same. */
+    public static String gsonObjects() {
+        Object[] objects = new Gson().fromJson("[true,2,\"s\",null,[1,false]]", Object[].class);
+        StringBuilder out = new StringBuilder();
+        for (Object o : objects) {
+            out.append(o == null ? "null" : o.getClass().getSimpleName() + ":" + o).append(' ');
+        }
+        return out.toString();
+    }
+
+    /** `ConstructorConstructor`'s sorted defaults. */
+    public static String gsonSorted() {
+        Gson gson = new Gson();
+        @SuppressWarnings("unchecked")
+        SortedMap<String, Object> map = gson.fromJson("{\"b\":1,\"a\":2}", SortedMap.class);
+        @SuppressWarnings("unchecked")
+        SortedSet<String> set = gson.fromJson("[\"b\",\"a\"]", SortedSet.class);
+        @SuppressWarnings("unchecked")
+        NavigableSet<String> navigable = gson.fromJson("[\"a\"]", NavigableSet.class);
+        return map.getClass().getName() + map.firstKey() + "|" + set.getClass().getName() + set.first() + "|"
+            + navigable.getClass().getName();
+    }
+
+    /** A Guava map serializes as a JSON object. */
+    public static String gsonGuavaJson() {
+        Gson gson = new Gson();
+        Map<String, Integer> one = Stream.of("x").collect(ImmutableMap.toImmutableMap(s -> s, s -> 1));
+        return gson.toJson(ImmutableMap.of("a", 1, "b", 2)) + gson.toJson(ImmutableMap.of("a", 1))
+            + gson.toJson(ImmutableMap.of()) + gson.toJson(one);
+    }
+
+    /** Guava's classes have Guava's superclasses, and are their interfaces. */
+    public static String guavaClassSurface() {
+        Class<?> one = ImmutableMap.of("a", 1).getClass();
+        Class<?> two = ImmutableMap.of("a", 1, "b", 2).getClass();
+        Class<?> none = ImmutableMap.of().getClass();
+        Class<?> emptySet = ImmutableSet.of().getClass();
+        Class<?> colors = Sets.immutableEnumSet(Color.BLUE, Color.RED).getClass();
+        return one.getSuperclass().getName() + "," + two.getSuperclass().getName() + ","
+            + none.getSuperclass().getName() + "," + emptySet.getSuperclass().getName() + ","
+            + colors.getSuperclass().getName() + "|" + b(Map.class.isAssignableFrom(one))
+            + b(Map.class.isAssignableFrom(two)) + b(ImmutableMap.class.isAssignableFrom(one))
+            + b(Set.class.isAssignableFrom(colors)) + b(Set.class.isAssignableFrom(emptySet))
+            + b(java.util.List.class.isAssignableFrom(two));
+    }
+
+    /** Counted where a value here cannot be Java's (exact or counted, never silent). */
+    public static String gsonByteOverflow() {
+        byte[] bytes = new Gson().fromJson("[300]", byte[].class);
+        return "" + bytes[0];
+    }
+
+    public static String gsonShortBox() {
+        Short[] shorts = new Gson().fromJson("[1]", Short[].class);
+        return shorts[0].getClass().getName();
+    }
+
+    public static String gsonFloatBox() {
+        Float[] floats = new Gson().fromJson("[0.1]", Float[].class);
+        return floats[0].getClass().getName();
+    }
+
+    public static String guavaJdkEnum() {
+        return Sets.immutableEnumSet(TimeUnit.SECONDS, TimeUnit.NANOSECONDS).toString();
+    }
+
     public static void main(String[] args) {
         System.out.println("gsonArrays=" + gsonArrays());
         System.out.println("gsonForeign=" + gsonForeign());
         System.out.println("gsonSets=" + gsonSets());
         System.out.println("guavaIdentity=" + guavaIdentity());
         System.out.println("guavaClasses=" + guavaClasses());
+        System.out.println("gsonNarrow=" + gsonNarrow());
+        System.out.println("gsonObjects=" + gsonObjects());
+        System.out.println("gsonSorted=" + gsonSorted());
+        System.out.println("gsonGuavaJson=" + gsonGuavaJson());
+        System.out.println("guavaClassSurface=" + guavaClassSurface());
+        try {
+            System.out.println("gsonByteOverflow=" + gsonByteOverflow());
+        } catch (RuntimeException e) {
+            System.out.println("gsonByteOverflow=" + e.getClass().getSimpleName());
+        }
+        System.out.println("gsonShortBox=" + gsonShortBox());
+        System.out.println("gsonFloatBox=" + gsonFloatBox());
+        System.out.println("guavaJdkEnum=" + guavaJdkEnum());
     }
 }

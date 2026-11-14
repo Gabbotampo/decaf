@@ -1065,7 +1065,12 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
         let class = marker
             .split_once('#')
             .map_or(marker.as_str(), |(class, _)| class);
-        return if is_map_owner(class) {
+        // A map whichever class the host made it (Guava's
+        // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
+        // (#253 review).
+        return if is_map_owner(class)
+            || crate::java_immutable::supertypes(class).contains(&"java/util/Map")
+        {
             Some("map")
         } else {
             Some("list")

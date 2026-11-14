@@ -1,0 +1,4 @@
+setup=ok
+drop=ok
+check=true2truetrue[DeferredHolder{ResourceKey[minecraft:item / demo:x]}, DeferredHolder{ResourceKey[minecraft:item / demo:y]}]
+after=[DeferredHolder{ResourceKey[minecraft:item / demo:x]}, DeferredHolder{ResourceKey[minecraft:item / demo:y]}]truetrue[u1]|2[n1][n2]
