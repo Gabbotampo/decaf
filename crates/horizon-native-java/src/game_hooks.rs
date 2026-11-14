@@ -1260,6 +1260,16 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         {
             return self.get_static(r);
         }
+        // A game class's own field read on a game object (`player.connection`): the model
+        // holds none, so the read refuses as a `@Shadow` one does, never the bootstrap host's
+        // `null` (#248's review: cpm's `ServerPlayer.connection` read answered null, and the
+        // NPE that followed looked like cpm's own).
+        if is_game_class(&r.owner) && Self::is_game_object(receiver).is_some() {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback reads the game's field {}#{} on a game object, which is not modelled",
+                r.owner, r.name
+            )));
+        }
         self.inner.get_field(receiver, r)
     }
 

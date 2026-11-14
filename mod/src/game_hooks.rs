@@ -39,7 +39,6 @@ pub(crate) const BOUND: &[(&str, &str)] = &[
         "living_death",
         "living_death: LivingEntity.die HEAD (mobs; listen only)",
     ),
-    ("level_unload", "level_unload: ServerLevel.close TAIL"),
     (
         "server_stopping",
         "server_stopping: MinecraftServer.stopServer HEAD",
@@ -50,29 +49,33 @@ pub(crate) const BOUND: &[(&str, &str)] = &[
     ),
     (
         "java_server_tick_head",
-        "server_tick ServerTickStart: tickServer HEAD",
+        "server_tick ServerTickStart: tickServer HEAD (single player only: a dedicated server's empty pause runs HEAD every tick, Horizon fires nothing then)",
     ),
     (
         "java_server_tick_tail",
-        "server_tick ServerTickEnd: tickServer TAIL",
-    ),
-    (
-        "java_level_tick_head",
-        "level_tick_pre: ServerLevel.tick HEAD",
-    ),
-    (
-        "java_level_tick_tail",
-        "level_tick_post: ServerLevel.tick TAIL",
-    ),
-    (
-        "player_start_tracking",
-        "player_start_tracking: ServerEntity.addPairing TAIL",
+        "server_tick ServerTickEnd: tickServer TAIL (a RETURN callback, single player only: vanilla's empty pause returns early)",
     ),
     ("attack_entity", "attack_entity: Player.attack HEAD"),
 ];
 
 /// The sites the runtime knows that no pinned hook fires at exactly, and why.
 pub(crate) const UNBOUND: &[(&str, &str)] = &[
+    (
+        "level_unload",
+        "Horizon closes an idle level mid-game (vanilla closes levels only in stopServer), and a level it closed earlier gets no close at stop",
+    ),
+    (
+        "java_level_tick_head",
+        "Horizon ticks only levels with players or forced chunks; vanilla's tickChildren ticks every level each tick",
+    ),
+    (
+        "java_level_tick_tail",
+        "Horizon ticks only levels with players or forced chunks; vanilla's tickChildren ticks every level each tick",
+    ),
+    (
+        "player_start_tracking",
+        "the hook is a deferred batch after the tick (the entity may be gone), not addPairing's TAIL",
+    ),
     (
         "player_tick",
         "no player tick hook at the pin (entity_tick_* skip players)",
@@ -180,8 +183,10 @@ pub(crate) struct Tally {
     /// Callbacks registered at a bound site, and at a site this mod does not run.
     pub bound: usize,
     pub unbound: usize,
-    /// Callback runs, firings that failed (an error names the call the model refused) and
-    /// firings skipped because a cancellable callback's `cancel()` would mean something else here.
+    /// Callbacks that ran (callbacks, not firings), firings that failed (an error names the call
+    /// the model refused), and firings skipped because this run cannot give a jar's callbacks
+    /// their exact moment: a cancellable callback whose `cancel()` would mean something else
+    /// here, or a server-tick callback on a dedicated server (`exact_here`).
     pub ran: usize,
     pub failed: usize,
     pub skipped: usize,
@@ -251,15 +256,16 @@ pub(crate) fn player_of(listed: &FacadePlayer, life_back: u32) -> Option<GameObj
     Some(object)
 }
 
-/// An entity by id: the listed player of that id (the same object as by UUID), else a living
-/// entity of `kind`.
-pub(crate) fn entity(state: &State, id: i32, kind: &str) -> GameObject {
-    state
-        .players
-        .iter()
-        .find(|p| p.entity_id == Some(id))
-        .and_then(|listed| player(state, listed.uuid, 0))
-        .unwrap_or_else(|| GameObject::entity(id, kind, true))
+/// `Player.attack`'s target: a player is the listed player's object, and `None` when they are
+/// not listed (the firing is counted `unlisted`, never handed a second key for the same
+/// `ServerPlayer`); any other entity is an `Entity` whose livingness the hook does not say, so
+/// a callback's `instanceof LivingEntity` on it is counted, never answered.
+pub(crate) fn attack_target(state: &State, id: i32, kind: &str) -> Option<GameObject> {
+    if kind == "minecraft:player" {
+        let listed = state.players.iter().find(|p| p.entity_id == Some(id))?;
+        return player_of(listed, 0);
+    }
+    Some(GameObject::entity(id, kind, false))
 }
 
 /// Count a firing of `site` that was not run because a player it hands over is not listed
@@ -286,6 +292,18 @@ pub(crate) fn forget(state: &mut State, object: &GameObject) {
     }
 }
 
+/// Whether this run gives every callback in `entries` at `site` its vanilla moment. A
+/// dedicated server's empty pause (`pause-when-empty-seconds`) runs `tickServer`'s HEAD and
+/// its early RETURN every tick while Horizon fires no server tick then: there only TAIL is
+/// exact. A single player server skips `tickServer` while paused, as Horizon does.
+fn exact_here(site: &str, entries: &[crate::runtime::RegisteredGameHook], dedicated: bool) -> bool {
+    match site {
+        "java_server_tick_head" => !dedicated,
+        "java_server_tick_tail" => !dedicated || entries.iter().all(|entry| entry.anchor == "TAIL"),
+        _ => true,
+    }
+}
+
 /// What a firing of one site did across the jars.
 #[derive(Default)]
 pub(crate) struct Fired {
@@ -296,6 +314,8 @@ pub(crate) struct Fired {
 /// Run every jar's callbacks at `site`, against `receiver` and `args` (the target method's).
 /// `cancels` says whether the hook's cancel is the Mixin's: where it is not, a jar with a
 /// cancellable callback at the site is skipped, so no `cancel()` is dropped or mistranslated.
+/// Once a jar's callback cancels, the target method returns: no later jar's callback at that
+/// point runs (jars run in load order; Mixin orders them by priority across jars, a departure).
 pub(crate) fn fire(
     state: &mut State,
     site: &str,
@@ -319,7 +339,9 @@ pub(crate) fn fire(
         if entries.is_empty() {
             continue;
         }
-        if !cancels && entries.iter().any(|entry| entry.cancellable) {
+        if (!cancels && entries.iter().any(|entry| entry.cancellable))
+            || !exact_here(site, entries, dedicated)
+        {
             row.game_hooks.skipped += 1;
             continue;
         }
@@ -356,8 +378,30 @@ pub(crate) fn fire(
             Err(panic) => note_failure(row, site, &format!("panicked: {panic}")),
         }
         fired.effects.extend(context.take_effects());
+        if fired.cancelled {
+            break;
+        }
     }
     fired
+}
+
+/// Drop every object's Mixin state: the server stopped, so its levels, player list, players,
+/// mobs and connections are gone, and the next world's are new Java objects (single player
+/// keeps the jars across worlds).
+pub(crate) fn forget_world(state: &mut State) {
+    for loaded in &mut state.jars {
+        loaded.hook_state = crate::runtime::GameHookState::default();
+    }
+}
+
+/// A `DamageSource` of its own for one firing: Java makes one per hurt, never shared (#156
+/// P16b), so two deaths by `lava` are two objects.
+pub(crate) fn damage_source(state: &mut State, cause: &str) -> GameObject {
+    state.damage_sources += 1;
+    GameObject::opaque(
+        "net/minecraft/world/damagesource/DamageSource",
+        &format!("{cause}#{}", state.damage_sources),
+    )
 }
 
 fn note_failure(row: &mut crate::JarRow, site: &str, reason: &str) {
@@ -399,7 +443,8 @@ mod tests {
         ),
         (
             "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
-            "package org.spongepowered.asm.mixin.injection.callback; public class CallbackInfo {}",
+            "package org.spongepowered.asm.mixin.injection.callback; public class CallbackInfo { \
+             public void cancel() {} }",
         ),
         (
             "net/minecraft/world/damagesource/DamageSource.java",
@@ -433,12 +478,20 @@ mod tests {
     ];
 
     fn jar_bytes() -> Vec<u8> {
-        let root =
-            std::env::temp_dir().join(format!("horizon-java-mod-hooks-{}", std::process::id()));
+        jar_bytes_with("deathdemo", &[], &["DeathMixin"])
+    }
+
+    /// A Fabric jar `id` holding `demo.Main` and the Mixins `mixins`, compiled from
+    /// [`SOURCES`] and `extra` (compile-only stubs outside `demo/` are left out).
+    fn jar_bytes_with(id: &str, extra: &[(&str, &str)], mixins: &[&str]) -> Vec<u8> {
+        let root = std::env::temp_dir().join(format!(
+            "horizon-java-mod-hooks-{id}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let (src, classes) = (root.join("src"), root.join("classes"));
         let mut paths = Vec::new();
-        for (path, body) in SOURCES {
+        for (path, body) in SOURCES.iter().chain(extra) {
             let file = src.join(path);
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, body).unwrap();
@@ -460,19 +513,21 @@ mod tests {
         let options = zip::write::SimpleFileOptions::default();
         let files = [
             (
-                "fabric.mod.json",
-                r#"{"id":"deathdemo","version":"1","entrypoints":{"main":["demo.Main"]},"mixins":["deathdemo.mixins.json"]}"#,
+                "fabric.mod.json".to_owned(),
+                format!(
+                    r#"{{"id":"{id}","version":"1","entrypoints":{{"main":["demo.Main"]}},"mixins":["{id}.mixins.json"]}}"#
+                ),
             ),
             (
-                "deathdemo.mixins.json",
-                r#"{"package":"demo","mixins":["DeathMixin"]}"#,
+                format!("{id}.mixins.json"),
+                serde_json::json!({ "package": "demo", "mixins": mixins }).to_string(),
             ),
         ];
         for (path, body) in files {
             zip.start_file(path, options).unwrap();
             zip.write_all(body.as_bytes()).unwrap();
         }
-        for name in ["Main", "DeathMixin"] {
+        for name in std::iter::once(&"Main").chain(mixins) {
             let path: &Path = &classes.join(format!("demo/{name}.class"));
             zip.start_file(format!("demo/{name}.class"), options)
                 .unwrap();
@@ -575,5 +630,172 @@ mod tests {
                 "{site} is no runtime site"
             );
         }
+    }
+
+    /// Game classes for the attack and server-tick Mixins below, compile-only.
+    const GAME: &[(&str, &str)] = &[
+        (
+            "net/minecraft/world/entity/Entity.java",
+            "package net.minecraft.world.entity; public class Entity { public int getId() { return 0; } }",
+        ),
+        (
+            "net/minecraft/world/entity/LivingEntity.java",
+            "package net.minecraft.world.entity; public class LivingEntity extends Entity {}",
+        ),
+        (
+            "net/minecraft/world/entity/player/Player.java",
+            "package net.minecraft.world.entity.player; \
+             public class Player extends net.minecraft.world.entity.LivingEntity { \
+             public void attack(net.minecraft.world.entity.Entity target) {} }",
+        ),
+        (
+            "net/minecraft/server/MinecraftServer.java",
+            "package net.minecraft.server; public class MinecraftServer { \
+             public void tickServer(java.util.function.BooleanSupplier hasTime) {} }",
+        ),
+    ];
+
+    const MIXIN_IMPORTS: &str = "package demo; \
+        import net.minecraft.world.entity.*; \
+        import net.minecraft.world.entity.player.Player; \
+        import net.minecraft.server.MinecraftServer; \
+        import org.spongepowered.asm.mixin.Mixin; \
+        import org.spongepowered.asm.mixin.injection.*; \
+        import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; ";
+
+    fn load(id: &str, mixin: &str, body: &str) -> LoadedJar {
+        let path = format!("demo/{mixin}.java");
+        let source = format!("{MIXIN_IMPORTS}{body}");
+        let extra: Vec<(&str, &str)> = GAME
+            .iter()
+            .copied()
+            .chain([(path.as_str(), source.as_str())])
+            .collect();
+        let jar = Arc::new(NativeJar::from_bytes(&jar_bytes_with(id, &extra, &[mixin])).unwrap());
+        let imc = crate::runtime::neoforge_imc::ImcBus::default();
+        let Ok(loaded) = crate::load_jar(format!("{id}.jar"), jar, &[], &imc, None) else {
+            panic!("{id} did not load")
+        };
+        loaded
+    }
+
+    fn stdout(state: &mut State, jar: usize) -> Vec<String> {
+        state.jars[jar]
+            .host
+            .take_stdout()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// `Player.attack` returns once a HEAD callback cancels: a later jar's callback at that
+    /// HEAD never runs. A mob target's livingness is not in the hook, so `instanceof
+    /// LivingEntity` on it is counted (Java: `true` for a zombie), and a player target that
+    /// is not listed is no object at all (`unlisted`).
+    #[test]
+    fn a_cancel_stops_the_later_jars_and_an_unknown_target_is_counted() {
+        let mut state = State::default();
+        state.jars.push(load(
+            "attacka",
+            "CancelAttack",
+            "@Mixin(Player.class) public class CancelAttack { \
+               @Inject(method = \"attack\", at = @At(\"HEAD\"), cancellable = true) \
+               private void onAttack(Entity target, CallbackInfo ci) { \
+                 System.out.println(\"a/\" + target.getId()); \
+                 if (target.getId() == 42) ci.cancel(); } }",
+        ));
+        state.jars.push(load(
+            "attackb",
+            "SeeAttack",
+            "@Mixin(Player.class) public class SeeAttack { \
+               @Inject(method = \"attack\", at = @At(\"HEAD\")) \
+               private void onAttack(Entity target, CallbackInfo ci) { \
+                 System.out.println(\"b/\" + (target instanceof LivingEntity)); } }",
+        ));
+        let alex = 0xa1_u128;
+        state.players = vec![FacadePlayer {
+            uuid: alex,
+            name: "Alex".into(),
+            level: None,
+            entity_id: Some(7),
+            session: 1,
+            life: 0,
+        }];
+        let attacker = player(&state, alex, 0).unwrap();
+        let attack = |state: &mut State, id: i32| {
+            let target = attack_target(state, id, "minecraft:zombie").unwrap();
+            fire(
+                state,
+                "attack_entity",
+                true,
+                Some(attacker.clone()),
+                vec![Arg::Object(target)],
+            )
+        };
+        assert!(attack(&mut state, 42).cancelled);
+        assert!(!attack(&mut state, 5).cancelled);
+        assert_eq!(stdout(&mut state, 0), ["a/42", "a/5"]);
+        assert_eq!(stdout(&mut state, 1), ["b/false"]);
+        assert_eq!(state.jars[1].row.game_hooks.ran, 1);
+        let counted = state.jars[1].host.unknown_host_calls();
+        assert!(
+            counted.iter().any(|(call, _)| call
+                == "net/minecraft/world/entity/LivingEntity#<instanceof>(Ljava/lang/Object;)Z"),
+            "{counted:?}"
+        );
+        // A player target: the listed player's own object, or nothing when unlisted.
+        assert_eq!(
+            attack_target(&state, 7, "minecraft:player").map(|o| o.marker()),
+            Some(attacker.marker())
+        );
+        assert!(attack_target(&state, 9, "minecraft:player").is_none());
+    }
+
+    /// On a dedicated server Horizon fires no server tick during the empty pause, where
+    /// vanilla still runs `tickServer`'s HEAD: a HEAD callback is skipped there, a TAIL one
+    /// runs. A stopped server's Mixin state goes with it.
+    #[test]
+    fn dedicated_tick_heads_are_skipped_and_a_stop_forgets_the_world() {
+        let mut state = State::default();
+        let ticks = |at: &str, class: &str| {
+            format!(
+                "@Mixin(MinecraftServer.class) public class {class} {{ private int demo$n; \
+                   @Inject(method = \"tickServer\", at = @At(\"{at}\")) \
+                   private void onTick(java.util.function.BooleanSupplier hasTime, CallbackInfo ci) {{ \
+                     demo$n++; System.out.println(\"{at}/\" + demo$n); }} }}"
+            )
+        };
+        state
+            .jars
+            .push(load("tickhead", "TickHead", &ticks("HEAD", "TickHead")));
+        state
+            .jars
+            .push(load("ticktail", "TickTail", &ticks("TAIL", "TickTail")));
+        let tick = |state: &mut State| {
+            let server = GameObject::server(state.dedicated);
+            for site in ["java_server_tick_head", "java_server_tick_tail"] {
+                fire(
+                    state,
+                    site,
+                    true,
+                    Some(server.clone()),
+                    vec![crate::has_time_supplier()],
+                );
+            }
+        };
+        state.dedicated = true;
+        tick(&mut state);
+        assert_eq!(state.jars[0].row.game_hooks.skipped, 1);
+        assert!(stdout(&mut state, 0).is_empty());
+        assert_eq!(stdout(&mut state, 1), ["TAIL/1"]);
+        state.dedicated = false;
+        tick(&mut state);
+        assert_eq!(stdout(&mut state, 0), ["HEAD/1"]);
+        assert_eq!(stdout(&mut state, 1), ["TAIL/2"]);
+        // The next world's server is a new object: its fields start at their initialisers.
+        forget_world(&mut state);
+        tick(&mut state);
+        assert_eq!(stdout(&mut state, 0), ["HEAD/1"]);
+        assert_eq!(stdout(&mut state, 1), ["TAIL/1"]);
     }
 }

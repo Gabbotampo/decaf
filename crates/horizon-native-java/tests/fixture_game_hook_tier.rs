@@ -1342,3 +1342,80 @@ fn game_object_fields_keep_every_kind_of_handle_across_collections() {
         ]
     );
 }
+
+/// A game class's own field on a game object, read without `@Shadow`.
+const CONNECTION_MIXIN: &str = r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class ConnectionMixin {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDie(DamageSource source, CallbackInfo ci) {
+        Object connection = ((ServerPlayer) (Object) this).connection;
+        HookSink.mark("connection/" + (connection == null));
+    }
+}
+"#;
+
+/// A plain `getfield` of a game class's field on a game object refuses, as a
+/// `@Shadow` read does: the model holds no `ServerPlayer.connection`, and a
+/// `null` there was a silent wrong answer (#248's review, cpm).
+#[test]
+fn a_game_field_read_on_a_game_object_refuses() {
+    let mut sources: BTreeMap<&str, String> = CASES_GAME
+        .iter()
+        .map(|(path, body)| (*path, (*body).to_owned()))
+        .collect();
+    sources.insert(
+        "net/minecraft/server/level/ServerPlayer.java",
+        "package net.minecraft.server.level;\npublic class ServerPlayer extends net.minecraft.world.entity.player.Player { public Object connection; public void tick() {} public void die(net.minecraft.world.damagesource.DamageSource source) {} }\n".into(),
+    );
+    sources.insert("demo/ConnectionMixin.java", CONNECTION_MIXIN.into());
+    let game_classes: Vec<String> = CASES_GAME
+        .iter()
+        .map(|(path, _)| path.replace(".java", ".class"))
+        .collect();
+    let compile_only: Vec<&str> = COMPILE_ONLY
+        .iter()
+        .copied()
+        .chain(game_classes.iter().map(String::as_str))
+        .collect();
+    let fixture = Fixture::build_with("connection", sources, &["ConnectionMixin"], &compile_only);
+    let jar = fixture.load();
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let mut host = StdHost::new();
+    let mut context = GameHookContext::new();
+    let receiver = context.insert(
+        GameObject::player(0xa1, "Alice")
+            .with_incarnation(1, 0)
+            .with_entity_id(7),
+    );
+    let source = context.insert(GameObject::opaque(
+        "net/minecraft/world/damagesource/DamageSource",
+        "lava#1",
+    ));
+    let error = jar
+        .run_game_hook_in(
+            &registrations,
+            &mut GameHookState::default(),
+            &mut context,
+            "player_died",
+            Some(receiver),
+            &[source],
+            &mut host,
+            &ExecutionBudget::within(std::time::Duration::from_secs(5)),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("ServerPlayer#connection") && error.contains("not modelled"),
+        "{error}"
+    );
+    assert!(marks(&host).is_empty(), "{:?}", marks(&host));
+}

@@ -88,11 +88,10 @@ use mod_api::{
     LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
     LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
     PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerStartTrackingEvent,
-    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
-    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
-    Text,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
+    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
+    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
+    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -156,6 +155,8 @@ struct State {
     /// The player leaving in the logout firing now running: their last entry, so the
     /// runtime hands out the object earlier firings did (`EventFacade::departed`).
     departed: Vec<FacadePlayer>,
+    /// `DamageSource`s handed to game-hook firings so far: each firing's is its own object.
+    damage_sources: u64,
     /// Players a refresh dropped whose logout firing has not run yet, with their last entry.
     /// Horizon removes every player who left in one poll before the first logout hook, so the
     /// first logout's refresh drops the others too; their own firings take their entry from
@@ -559,6 +560,9 @@ impl Hooks for HorizonJava {
         self.game_hooks(Some(&mut *host), "java_server_stopped", true, |state| {
             Some((Some(GameObject::server(state.dedicated)), Vec::new()))
         });
+        // The server, its levels, players, mobs and connections are gone: the next world's
+        // are new objects, whose Mixin state starts from their constructors.
+        game_hooks::forget_world(&mut self.lock());
     }
 
     /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
@@ -775,15 +779,11 @@ impl Hooks for HorizonJava {
     /// `LevelTickEvent.Pre`).
     fn level_tick_pre(&self, host: HostSide<'_>, event: &mut LevelTickPreEvent) {
         let has_time = side_has_time(&host);
-        let server = match host {
-            HostSide::Server(host) => {
-                // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so
-                // they are refreshed from the level the hook names, before the listeners run.
-                self.refresh_level(host, event.level);
-                Some(host)
-            }
-            _ => None,
-        };
+        if let HostSide::Server(host) = host {
+            // The level's clocks are what `level.getGameTime()`/`getDayTime()` answer, so they
+            // are refreshed from the level the hook names, before the listeners run.
+            self.refresh_level(host, event.level);
+        }
         let context = EventContext {
             level: Some(event.level.dimension_id().to_owned()),
             has_time: Some(has_time),
@@ -792,12 +792,6 @@ impl Hooks for HorizonJava {
         self.fire_event(GameEvent::LevelTickStart, self.dedicated(), context, |_| {
             true
         });
-        if let Some(host) = server {
-            let level = GameObject::level(event.level.dimension_id());
-            self.game_hooks(Some(host), "java_level_tick_head", true, |_| {
-                Some((Some(level), vec![has_time_supplier()]))
-            });
-        }
     }
 
     /// A server level's tick ends (Fabric's `END_LEVEL_TICK`, NeoForge's
@@ -809,12 +803,6 @@ impl Hooks for HorizonJava {
             ..EventContext::default()
         };
         self.fire_event(GameEvent::LevelTickEnd, self.dedicated(), context, |_| true);
-        if let HostSide::Server(host) = host {
-            let level = GameObject::level(event.level.dimension_id());
-            self.game_hooks(Some(host), "java_level_tick_tail", true, |_| {
-                Some((Some(level), vec![has_time_supplier()]))
-            });
-        }
     }
 
     /// A server level opened (Fabric's `ServerLevelEvents.LOAD`, NeoForge's `LevelEvent.Load`).
@@ -876,10 +864,6 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
-        let level = GameObject::level(event.dimension);
-        self.game_hooks(Some(host), "level_unload", true, |_| {
-            Some((Some(level), Vec::new()))
-        });
     }
 
     /// A player joined (Fabric's `ServerPlayConnectionEvents.JOIN` and
@@ -908,7 +892,9 @@ impl Hooks for HorizonJava {
         // server's player list.
         let (uuid, name) = (event.player, event.name);
         self.game_hooks(Some(host), "player_logged_in", true, |state| {
-            let key = format!("{uuid:032x}");
+            // One `Connection` and one cookie per join: a relog is a new object of each.
+            let session = state.players.iter().find(|p| p.uuid == uuid)?.session;
+            let key = format!("{uuid:032x}/{session}");
             let list = GameObject::opaque("net/minecraft/server/players/PlayerList", "main");
             let connection = GameObject::opaque("net/minecraft/network/Connection", &key);
             let cookie =
@@ -1029,31 +1015,10 @@ impl Hooks for HorizonJava {
     fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
         let (uuid, cause) = (event.player, event.cause.unwrap_or("unknown").to_owned());
         self.game_hooks(Some(host), "player_died", true, |state| {
-            let source =
-                GameObject::opaque("net/minecraft/world/damagesource/DamageSource", &cause);
+            let source = game_hooks::damage_source(state, &cause);
             Some((
                 Some(game_hooks::player(state, uuid, 0)?),
                 vec![Arg::Object(source)],
-            ))
-        });
-    }
-
-    /// A client started tracking an entity (`ServerEntity.addPairing` TAIL): the game-class
-    /// callbacks bound there, on the entity's `ServerEntity` with the tracking player.
-    fn player_start_tracking(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut PlayerStartTrackingEvent<'_>,
-    ) {
-        let (uuid, entity) = (event.player, event.entity);
-        self.game_hooks(Some(host), "player_start_tracking", true, |state| {
-            let server_entity = GameObject::opaque(
-                "net/minecraft/server/level/ServerEntity",
-                &entity.to_string(),
-            );
-            Some((
-                Some(server_entity),
-                vec![Arg::Object(game_hooks::player(state, uuid, 0)?)],
             ))
         });
     }
@@ -1274,14 +1239,14 @@ impl Hooks for HorizonJava {
             |_| true,
         );
         // `Player.attack(Entity)` HEAD: a cancel there is the hook's (the blow does nothing).
+        // Fabric's `AttackEntityCallback` runs before `Player.attack` is entered: a cancel there
+        // means the method, and its HEAD callbacks, never run. (NeoForge runs the HEAD callbacks
+        // first, then `AttackEntityEvent`: a departure for NeoForge jars.)
         let mut cancelled = fired.cancelled;
-        if let Some(attacker) = self.acting_player(host) {
+        if !cancelled && let Some(attacker) = self.acting_player(host) {
             let (id, kind) = (event.entity, event.kind.to_owned());
             cancelled |= self.game_hooks(Some(host), "attack_entity", true, |state| {
-                let target = match state.players.iter().any(|p| p.entity_id == Some(id)) {
-                    true => game_hooks::entity(state, id, &kind),
-                    false => GameObject::entity(id, &kind, false),
-                };
+                let target = game_hooks::attack_target(state, id, &kind)?;
                 Some((
                     Some(game_hooks::player(state, attacker, 0)?),
                     vec![Arg::Object(target)],
@@ -1372,17 +1337,22 @@ impl Hooks for HorizonJava {
         // `LivingEntity.die(DamageSource)` HEAD, for a mob: `ServerPlayer.die` does not call it.
         // The hook's cancel keeps the mob alive, a Mixin's skips only `die`'s body: a jar with a
         // cancellable callback here is not run (`game_hooks.rs`).
-        if event.kind != "minecraft:player" {
+        // Fabric's `ALLOW_DEATH` runs in `hurtServer` before `die`: a cancel there means `die`,
+        // and its HEAD callbacks, never run. (NeoForge runs them first, then `LivingDeathEvent`:
+        // a departure for NeoForge jars.) Vanilla subclasses that work before `super.die`
+        // (Villager, Wolf, Raider...) do it after these callbacks here: a named departure.
+        if event.kind != "minecraft:player" && !fired.cancelled {
             let (id, kind) = (event.entity as i32, event.kind.to_owned());
             let damage = event.damage_type.to_owned();
-            self.game_hooks(Some(host), "living_death", false, |_| {
-                let source =
-                    GameObject::opaque("net/minecraft/world/damagesource/DamageSource", &damage);
+            self.game_hooks(Some(host), "living_death", false, |state| {
+                let source = game_hooks::damage_source(state, &damage);
                 Some((
                     Some(GameObject::entity(id, &kind, true)),
                     vec![Arg::Object(source)],
                 ))
             });
+            // The mob is gone once `die` runs: its Mixin state goes with it.
+            game_hooks::forget(&mut self.lock(), &GameObject::entity(id, &kind, true));
         }
         if fired.cancelled {
             Flow::Cancel
@@ -1668,7 +1638,7 @@ impl HorizonJava {
         host: Option<&mut dyn ServerHost>,
         site: &str,
         cancels: bool,
-        objects: impl FnOnce(&State) -> Option<(Option<GameObject>, Vec<Arg>)>,
+        objects: impl FnOnce(&mut State) -> Option<(Option<GameObject>, Vec<Arg>)>,
     ) -> bool {
         let fired = {
             let mut state = self.lock();
@@ -1680,7 +1650,7 @@ impl HorizonJava {
                 return false;
             }
             // `None`: a player the firing hands over is not listed (`game_hooks::player`).
-            let Some((receiver, args)) = objects(&state) else {
+            let Some((receiver, args)) = objects(&mut state) else {
                 game_hooks::unlisted(&mut state, site);
                 return false;
             };
