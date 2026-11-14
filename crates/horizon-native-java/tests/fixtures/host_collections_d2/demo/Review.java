@@ -64,8 +64,14 @@ public final class Review {
         Map<String, Integer> collected = Stream.of("a", "b").collect(ImmutableMap.toImmutableMap(s -> s, s -> 1));
         Set<Color> colors = Sets.immutableEnumSet(Color.BLUE, Color.RED);
         Set<Color> single = Sets.immutableEnumSet(Color.GREEN);
+        // Each member's name in iteration order (a jar enum's text in a host collection's `toString` is
+        // another matter).
+        StringBuilder order = new StringBuilder();
+        for (Color color : colors) {
+            order.append(color.name()).append(' ');
+        }
         return two.getClass().getName() + "," + one.getClass().getName() + "," + collected.getClass().getName() + "|"
-            + colors.getClass().getName() + colors + "," + single.getClass().getName() + "|" + b(Map.copyOf(two) == two)
+            + colors.getClass().getName() + order + "," + single.getClass().getName() + "|" + b(Map.copyOf(two) == two)
             + b(Map.copyOf(collected) == collected) + b(Set.copyOf(colors) == colors) + "|" + two.get("b") + one;
     }
 
