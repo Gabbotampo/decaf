@@ -306,8 +306,9 @@ impl StdHost {
         let marker = crate::runtime::jar_object::collection_key_for(
             class,
             crate::runtime::jar_object::CollectionFamily::Immutable,
-            self.unmodifiable_collections.len(),
+            self.next_unmodifiable_collection,
         );
+        self.next_unmodifiable_collection += 1;
         self.mutable_collections.insert(marker.clone(), values);
         self.unmodifiable_collections.insert(marker.clone(), None);
         crate::runtime::jar_object::collection(marker)
@@ -521,8 +522,9 @@ impl StdHost {
                 let marker = crate::runtime::jar_object::collection_key_for(
                     view_class(kind, source_class),
                     crate::runtime::jar_object::CollectionFamily::Immutable,
-                    self.unmodifiable_collections.len(),
+                    self.next_unmodifiable_collection,
                 );
+                self.next_unmodifiable_collection += 1;
                 self.unmodifiable_collections
                     .insert(marker.clone(), Some(source));
                 return Some(Ok(crate::runtime::jar_object::collection(marker)));
