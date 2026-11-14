@@ -48,6 +48,10 @@ const RETIRED_PREFIXES: &[&str] = &[
     // `client_values.rs`, `game_object::client_value`).
     "client/",
     "key-category/",
+    // `BlockPos`, `LevelResource` and `GameRule` (#156 P16c, `server_values.rs`).
+    "block-pos/",
+    "level-resource/",
+    "game-rule/",
     // Every `game/…` object is a handle (#156 P16b, P16e).
     "game/",
 ];
