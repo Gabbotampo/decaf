@@ -8245,6 +8245,11 @@ impl Host for StdHost {
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
+            // An `Arrays.asList` view's iterator reads its array live.
+            if let Some(view) = expect_ref(receiver) {
+                let view = view.clone();
+                self.note_array_view_iterator(&marker, &view);
+            }
             return Ok(host_iterator::iterator(marker));
         }
         // A host iterator over its snapshot; any other receiver (a list iterator, a jar's own)

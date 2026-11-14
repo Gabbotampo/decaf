@@ -320,7 +320,13 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(answer) = self.host_entry_equals(r, opcode, this, args)? {
             return Ok(Some(answer));
         }
-        if let Some(class) = crate::jar_object::object_class(this)
+        // A host-made collection of the same class (`Arrays.asList`'s
+        // `subList`, `array_views.rs`) keeps its state in the host's row,
+        // not in fields: the host answers it.
+        let host_made = matches!(this, Value::Host(handle)
+            if handle.kind() == crate::host_ref::HostKind::Collection);
+        if !host_made
+            && let Some(class) = crate::jar_object::object_class(this)
             && INTERNAL.iter().any(|(internal, _, _)| *internal == class)
         {
             let class = class.to_owned();

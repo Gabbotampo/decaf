@@ -60,6 +60,9 @@ pub(crate) struct ArrayViews {
     by_array: BTreeMap<String, BTreeSet<String>>,
     /// The collection table's watched writes at the last pull.
     pulled: u64,
+    /// An iterator over a view or window → that view (`ArrayItr` reads the
+    /// array, so its snapshot follows it).
+    iterators: BTreeMap<String, String>,
 }
 
 fn throw(class: &str, message: Option<String>) -> NativeError {
@@ -107,11 +110,24 @@ impl StdHost {
         view
     }
 
+    /// Note that `iterator` iterates `view`, when it is one.
+    pub(crate) fn note_array_view_iterator(&mut self, iterator: &str, view: &str) {
+        if self.array_views.views.contains_key(view) {
+            self.array_views
+                .iterators
+                .insert(iterator.to_owned(), view.to_owned());
+        }
+    }
+
     /// Forget the views whose rows a collection dropped.
     pub(crate) fn prune_array_views(&mut self) {
         let rows = &self.mutable_collections;
         let views = &mut self.array_views;
+        let iterators = &self.iterators;
         views.views.retain(|view, _| rows.contains_key(view));
+        views
+            .iterators
+            .retain(|iterator, view| iterators.contains_key(iterator) && rows.contains_key(view));
         views.by_array.retain(|_, of| {
             of.retain(|view| rows.contains_key(view));
             !of.is_empty()
@@ -150,8 +166,8 @@ impl StdHost {
                 part = Some(now.to_vec());
             }
             if let Some(part) = part {
-                for (iterator, source) in &self.iterator_sources {
-                    if *source == marker
+                for (iterator, view) in &self.array_views.iterators {
+                    if *view == marker
                         && let Some((snapshot, _)) = self.iterators.get_mut(iterator)
                         && snapshot.len() == part.len()
                     {
