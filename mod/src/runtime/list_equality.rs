@@ -109,16 +109,6 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let marker = expect_ref(value)?;
-        // The host's inline lists (`list/a,b`) come from `Arrays.asList` and
-        // the varargs factories: `AbstractList`'s bodies.
-        if marker.starts_with("list/") || marker.starts_with("list#") || marker == "list" {
-            return Some(HostList {
-                rules: ABSTRACT_LIST,
-                view: false,
-                inline: true,
-                unmodifiable: false,
-            });
-        }
         let class = self.host_collection_class(value)?;
         let rules = match class.as_str() {
             "java/util/ArrayList" => ARRAY_LIST,

@@ -1071,15 +1071,6 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
             Some("list")
         };
     }
-    match gson_collection_kind(marker) {
-        Some("map") => Some("map"),
-        Some(_) => Some("list"),
-        None => None,
-    }
-}
-
-fn gson_collection_kind(marker: &str) -> Option<&str> {
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    matches!(kind, "list" | "set" | "map").then_some(kind)
+    // A collection is a handle the host holds (#156 P14d2): no text is one.
+    None
 }

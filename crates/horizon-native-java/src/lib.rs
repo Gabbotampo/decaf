@@ -10507,12 +10507,6 @@ fn class_of_text(marker: &str) -> Option<String> {
         "java/lang/StringBuilder"
     } else if marker.starts_with("stream/") {
         "java/util/stream/Stream"
-    } else if marker == "list" || marker.starts_with("list/") {
-        "java/util/ArrayList"
-    } else if marker == "set" || marker.starts_with("set/") {
-        "java/util/LinkedHashSet"
-    } else if marker == "map" || marker.starts_with("map/") {
-        "java/util/LinkedHashMap"
     } else {
         let rest = marker.strip_prefix("enum/")?;
         return rest.rsplit_once('/').map(|(class, _)| class.to_owned());
@@ -12464,27 +12458,15 @@ fn checked_list_insert(index: i32, length: usize) -> Result<usize, NativeError> 
         })
 }
 
-/// The elements of an inline collection literal (`list/<m1>,<m2>`), parsed
-/// once into `Value`s (#156 P14d makes literals handles).
-fn collection_values(value: &Value) -> Result<Vec<Value>, NativeError> {
-    let marker = expect_string(value);
-    let (kind, values) = marker.split_once('/').unwrap_or((marker, ""));
-    // A neutral collection carries a `#<n>` generation suffix so each
-    // unmodelled call owns its own identity; the kind is what precedes it.
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    if !matches!(kind, "list" | "set" | "map") {
-        return Err(NativeError::Metadata(format!(
-            "expected a native collection marker, got {}",
-            describe_value(value)
-        )));
-    }
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-    split_capture_markers(values)?
-        .iter()
-        .map(|marker| parse_collection_value(marker))
-        .collect()
+/// A value read as a collection that is none: the host keeps every
+/// collection as a handle, and no text is one (#156 P14d2: the `list/…`,
+/// `set/…`, `map/…` literals are gone, so a `String` spelling one is a
+/// `String`).
+fn not_a_collection(value: &Value) -> Result<Vec<Value>, NativeError> {
+    Err(NativeError::Metadata(format!(
+        "expected a native collection marker, got {}",
+        describe_value(value)
+    )))
 }
 
 /// The class a host collection marker was constructed as
@@ -12504,13 +12486,12 @@ fn iterated_kind(marker: &str) -> Option<String> {
     {
         return Some(class.to_owned());
     }
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    matches!(kind, "list" | "set").then(|| kind.to_owned())
+    None
 }
 
 fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<Value>, NativeError> {
     host.mutable_values(value).map_or_else(
-        || collection_values(value).map_err(|error| host_call_context(host, error)),
+        || not_a_collection(value).map_err(|error| host_call_context(host, error)),
         Ok,
     )
 }
@@ -12519,7 +12500,7 @@ fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<Value>, N
 /// (`Stream`, Gson) that do not know the concrete host type.
 fn runtime_collection_values<H: Host>(host: &H, value: &Value) -> Result<Vec<Value>, NativeError> {
     host.mutable_collection_values(value)
-        .map_or_else(|| collection_values(value), Ok)
+        .map_or_else(|| not_a_collection(value), Ok)
 }
 
 /// Name the host call a bad collection operand reached, so a null operand
@@ -12549,10 +12530,6 @@ pub(crate) fn same_items(a: &[Value], b: &[Value]) -> bool {
             .all(|(a, b)| collection_item_marker(a) == collection_item_marker(b))
 }
 
-fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
-    parse_value_marker(value)
-}
-
 fn collection_text(
     host: &mut StdHost,
     value: &Value,
@@ -12560,11 +12537,8 @@ fn collection_text(
 ) -> Result<String, NativeError> {
     let values = host_collection_values(host, value)?;
     let marker = expect_string(value).to_owned();
-    let kind = marker.split('/').next().unwrap_or(&marker);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
     let is_map = owner_is_map
-        || kind == "map"
         || class.is_some_and(|class| {
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
@@ -21675,21 +21649,10 @@ impl<H: Host> Runtime<'_, H> {
         if wanted.starts_with('[') {
             return false;
         }
-        // Collections and optionals keep their kind in the marker prefix.
+        // A host map entry keeps its kind in the marker prefix (a collection
+        // is a handle, #156 P14d2).
         let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-        let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
         let collection_kinds: &[&str] = match kind {
-            "list" => &[
-                "java/util/List",
-                "java/util/Collection",
-                "java/lang/Iterable",
-            ],
-            "set" => &[
-                "java/util/Set",
-                "java/util/Collection",
-                "java/lang/Iterable",
-            ],
-            "map" => &["java/util/Map"],
             // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
             // one implements only `Map.Entry`.
             "map-entry" => &["java/util/Map$Entry"],

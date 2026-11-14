@@ -52,6 +52,11 @@ const RETIRED_PREFIXES: &[&str] = &[
     "block-pos/",
     "level-resource/",
     "game-rule/",
+    // Collections are handles (#156 P14d2): the `list/…`, `set/…`, `map/…`
+    // literals are gone, and a text spelled like one is a `String`.
+    "list/",
+    "set/",
+    "map/",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
