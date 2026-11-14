@@ -170,6 +170,13 @@ impl StdHost {
         self.retained.len()
     }
 
+    /// How many runs of freed allocation numbers the host remembers (so a
+    /// read through a collected object's handle is refused by name): at most
+    /// one more than the live objects, however many a jar made.
+    pub fn freed_object_ranges(&self) -> usize {
+        self.freed_objects.ranges()
+    }
+
     pub(crate) fn take_resident_heap(&mut self) -> JavaHeap {
         let live = self.heap.live;
         let heap = std::mem::take(&mut self.heap);
@@ -456,11 +463,18 @@ fn over_count_guard(heap: &JavaHeap) -> bool {
 }
 
 /// The allocation numbers of the jar objects collections freed, as ranges
-/// (`start → end`, exclusive). Keys are never reused, so a freed number stays
-/// freed; the gaps between ranges are live objects, so the ranges are as many
-/// as the live set at most. A field of a freed object read or written later
+/// (`start → end`, exclusive). A field of a freed object read or written later
 /// is a missed root, which the runtime refuses by name instead of answering
 /// the field's default (`Runtime::live_field_key`, #226 review).
+///
+/// Each collection rebuilds it as every number below the heap's next one
+/// that the collection did not find live ([`collect`]). Keys are never
+/// reused, so a number freed once stays freed, and the gaps between ranges
+/// are numbers found live: the ranges are as many as the live set at most,
+/// however many objects a jar made. Recording only the numbers that had a
+/// row split the ranges at every allocation that never got one (a
+/// `new Object()` lock), so the set grew with every such allocation
+/// (#226 re-check 3).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct FreedObjects {
     ranges: BTreeMap<usize, usize>,
@@ -474,25 +488,48 @@ impl FreedObjects {
             .is_some_and(|(_, &end)| n < end)
     }
 
-    fn insert(&mut self, n: usize) {
-        if self.contains(n) {
-            return;
+    /// Add every number below `limit` except the `live` ones (sorted or
+    /// not). A number freed before stays freed even if a live text names it
+    /// now: that is a handle a missed root kept, and reading through it stays
+    /// loud. The numbers left out are live ones, so the ranges stay as many
+    /// as the live set at most.
+    fn rebuild(&mut self, limit: usize, mut live: Vec<usize>) {
+        live.sort_unstable();
+        live.dedup();
+        let mut ranges: Vec<(usize, usize)> =
+            std::mem::take(&mut self.ranges).into_iter().collect();
+        let mut start = 0;
+        for n in live.into_iter().take_while(|&n| n < limit) {
+            if start < n {
+                ranges.push((start, n));
+            }
+            start = n + 1;
         }
-        let (mut start, mut end) = (n, n + 1);
-        if let Some((&before, &before_end)) = self.ranges.range(..n).next_back()
-            && before_end == n
-        {
-            start = before;
-            self.ranges.remove(&before);
+        if start < limit {
+            ranges.push((start, limit));
         }
-        if let Some(after_end) = self.ranges.remove(&(n + 1)) {
-            end = after_end;
+        ranges.sort_unstable();
+        for (start, end) in ranges {
+            match self.ranges.iter_mut().next_back() {
+                Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+                _ => {
+                    self.ranges.insert(start, end);
+                }
+            }
         }
-        self.ranges.insert(start, end);
     }
 
-    /// Whether the object `key` (`class#n`) was collected.
+    /// How many ranges the set keeps (bounded by the live set).
+    pub(crate) fn ranges(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Whether the object `key` (`class#n`) was collected. A key that is
+    /// never collected (a game object's) is never freed.
     pub(crate) fn holds_key(&self, key: &str) -> bool {
+        if !collectable(key) {
+            return false;
+        }
         crate::jar_object::parse_key(key)
             .and_then(|(_, number)| number.parse().ok())
             .is_some_and(|n| self.contains(n))
@@ -549,6 +586,28 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 + state.args.as_deref().map_or(0, values)
         }))
         .sum()
+}
+
+/// Note the allocation number of every `#<digits>` in `text` (`class#n`
+/// keys, embedded ones included): over-reading only keeps a number out of
+/// the freed set, which costs a diagnostic, never an answer.
+fn note_numbers(text: &str, out: &mut Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].iter().position(|&b| b == b'#') {
+        let start = at + offset + 1;
+        let end = start
+            + bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        if end > start
+            && let Ok(number) = text[start..end].parse()
+        {
+            out.push(number);
+        }
+        at = end.max(start);
+    }
 }
 
 /// The collectable markers of a heap and the distinct lengths they come in,
@@ -621,6 +680,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         return;
     }
     let mut pending = Vec::new();
+    // Every allocation number a text the trace reaches names: the objects
+    // found live, those without a row of their own included (`FreedObjects`).
+    let mut live = Vec::new();
     {
         let mut roots: Vec<&str> = extra.iter().map(String::as_str).collect();
         host.root_texts(&mut roots);
@@ -658,6 +720,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         }
         for text in roots {
             collectable.scan(text, &mut pending);
+            note_numbers(text, &mut live);
         }
     }
     // The objects any per-object table keeps a row for: only these need
@@ -703,6 +766,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         {
             if let Some(text) = value_text(value) {
                 collectable.scan(text, &mut found);
+                note_numbers(text, &mut live);
             }
         }
         // What the host keeps for this object in a table keyed by it.
@@ -711,21 +775,39 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             host.keyed_texts(&marker, &mut keyed);
             for text in &keyed {
                 collectable.scan(text, &mut found);
+                note_numbers(text, &mut live);
             }
         }
         pending.extend(found.drain(..).filter(|next| !reached.contains(next)));
     }
     let keep = |marker: &str| !collectable.markers.contains(marker) || reached.contains(marker);
-    // A freed jar object's number, so a later read of its fields is refused
-    // by name rather than answered with defaults.
+    // Every number below the heap's next one that was not found live is
+    // freed, so a later read of its fields is refused by name rather than
+    // answered with defaults. A number with no row that nothing reached is
+    // freed too: that keeps the ranges as few as the live numbers between
+    // them (#226 re-check 3), and an object with no row has nothing a stale
+    // handle could misread.
+    let mut limit = heap.next_object;
     for marker in &collectable.markers {
-        if !reached.contains(marker)
-            && let Some((_, number)) = crate::jar_object::parse_key(marker)
-            && let Ok(number) = number.parse()
+        if let Some((_, number)) = crate::jar_object::parse_key(marker)
+            && let Ok(number) = number.parse::<usize>()
         {
-            host.freed_objects.insert(number);
+            if reached.contains(marker) {
+                live.push(number);
+            }
+            limit = limit.max(number.saturating_add(1));
         }
     }
+    host.freed_objects.rebuild(limit, live);
+    // What the host keeps for an object with no row of its own (a
+    // `ResourceLocation`'s id, a `UUID`'s bits, a `Locale`'s tags) goes with
+    // it. These name no other object, so they are never edges.
+    let freed = &host.freed_objects;
+    host.identifier_objects
+        .retain(|key, _| !freed.holds_key(key));
+    host.constructed_uuids
+        .retain(|key, _| !freed.holds_key(key));
+    host.locales.retain(|key, _| !freed.holds_key(key));
     heap.fields.retain(|key, _| keep(field_receiver(key)));
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
@@ -1077,5 +1159,70 @@ mod tests {
         host.posted_events.push(Value::Int(2));
         host.rewind_call_log(mark);
         assert_eq!(host.posted_events, [Value::Int(1)]);
+    }
+
+    /// One live object between every two dead ones, whether or not the dead
+    /// ones had rows: the freed set keeps one range per live object, not per
+    /// allocation (#226 re-check 3), and a number freed once stays freed.
+    #[test]
+    fn the_freed_set_is_bounded_by_the_live_numbers() {
+        let mut freed = FreedObjects::default();
+        freed.rebuild(10, vec![3, 7]);
+        assert_eq!(freed.ranges(), 3);
+        assert!([0, 1, 2, 4, 5, 6, 8, 9].iter().all(|&n| freed.contains(n)));
+        assert!(!freed.contains(3) && !freed.contains(7) && !freed.contains(10));
+        // 100,000 more allocations, every tenth kept: ranges grow with the
+        // live set, never with the allocations.
+        let live: Vec<usize> = (10..100_010).step_by(10).collect();
+        let kept = live.len();
+        freed.rebuild(100_010, live);
+        assert!(freed.ranges() <= kept + 2, "{}", freed.ranges());
+        // All but 20 die; 4 was freed before and stays freed though a text
+        // names it now (a handle a missed root kept stays loud).
+        freed.rebuild(100_010, vec![4, 20]);
+        assert!(freed.contains(4) && freed.contains(30) && !freed.contains(20));
+        assert_eq!(freed.ranges(), 2);
+    }
+
+    /// Every `#<digits>` a text holds, embedded keys included.
+    #[test]
+    fn numbers_are_read_from_every_key_a_text_names() {
+        let mut out = Vec::new();
+        note_numbers("demo/Lock#5", &mut out);
+        note_numbers("@indy:demo/Main#lambda|demo/Cell#12|x#|#", &mut out);
+        note_numbers("HostRef { key: \"demo/A#7\" } #neutral3", &mut out);
+        assert_eq!(out, [5, 12, 7]);
+    }
+
+    /// An object with no row of its own (`new Object()` kept as a lock) is
+    /// live while a root names it, so its number is never freed; one nothing
+    /// names is freed with the rowed garbage around it, and the host's data
+    /// for it (a `UUID`'s bits) goes with it.
+    #[test]
+    fn an_object_without_rows_is_live_while_named() {
+        let (mut host, mut heap) = graph("demo/Node#1");
+        host.persistent_static_fields.insert(
+            "demo/Mod#LOCKLjava/lang/Object;".into(),
+            text("java/lang/Object#9"),
+        );
+        host.constructed_uuids
+            .insert("java/util/UUID#10".into(), (1, 2));
+        host.constructed_uuids
+            .insert("java/util/UUID#11".into(), (3, 4));
+        host.persistent_static_fields.insert(
+            "demo/Mod#IDLjava/util/UUID;".into(),
+            text("java/util/UUID#11"),
+        );
+        heap.next_object = 12;
+        collect(&mut heap, &mut host, &[]);
+        let freed = &host.freed_objects;
+        assert!(!freed.holds_key("java/lang/Object#9"));
+        assert!(!freed.holds_key("demo/Node#1") && !freed.holds_key("demo/Node#2"));
+        assert!(freed.holds_key("demo/Node#3") && freed.holds_key("demo/Node#4"));
+        assert!(freed.holds_key("java/util/UUID#10") && !freed.holds_key("java/util/UUID#11"));
+        assert_eq!(
+            host.constructed_uuids.keys().collect::<Vec<_>>(),
+            ["java/util/UUID#11"]
+        );
     }
 }

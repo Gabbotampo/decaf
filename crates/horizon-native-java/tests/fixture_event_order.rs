@@ -498,11 +498,15 @@ import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 @Mod("repeated") public final class RepeatedMod {
   public static int fired;
+  public static int seen;
   static final class Junk { int a; Junk(int a) { this.a = a; } }
+  static final class Stateless { int pick(int x) { return x & 1; } }
   public RepeatedMod() {
     NeoForge.EVENT_BUS.addListener((PlayerInteractEvent.LeftClickBlock e) -> {
       fired++;
       Junk j = new Junk(fired); j.a++;
+      Object lock = new Object();
+      synchronized (lock) { seen += new Stateless().pick(fired); }
     });
   }
 }
@@ -512,7 +516,11 @@ import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 /// firing's event (a fresh handle) and its garbage go with the next
 /// collection, and nothing is held for the embedder (#226 review: every
 /// firing's event used to stay pinned, so memory and pauses grew with
-/// uptime).
+/// uptime). Each firing also makes two objects that never get a row (a
+/// `new Object()` lock, a stateless helper): the freed numbers the host
+/// remembers stay as few as the live objects, where they used to grow by one
+/// run per firing (#226 re-check 3). Java 25 counts `fired` 5,000 and
+/// `seen` (the odd ones) 2,500.
 #[test]
 fn a_listener_fired_many_times_keeps_nothing_it_does_not_reach() {
     let root = scratch("repeated");
@@ -559,7 +567,13 @@ fn a_listener_fired_many_times_keeps_nothing_it_does_not_reach() {
         static_value(&host, "demo/RepeatedMod", "firedI"),
         Some(Value::Int(5_000))
     );
+    assert_eq!(
+        static_value(&host, "demo/RepeatedMod", "seenI"),
+        Some(Value::Int(2_500))
+    );
     assert_eq!(host.retained_count(), 0);
     assert!(most < 3_000, "{most} live fields");
+    let ranges = host.freed_object_ranges();
+    assert!(ranges < 100, "{ranges} freed ranges");
     let _ = fs::remove_dir_all(root);
 }

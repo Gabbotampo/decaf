@@ -350,3 +350,83 @@ fn a_tail_injection_overrides_the_target_value() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// What a RETURN injection's execution holds between its calls survives every
+/// store in it (#226 re-check 3). The target allocates garbage and returns a
+/// `Cell`; `AAObjSetMixin` reads it, allocates garbage and overrides it with
+/// a new `Cell`; `BBObjSeeMixin` allocates garbage and reads the override; the
+/// embedder reads the report's `target_result` back. `plain()` has one
+/// observer that only allocates. The target's result and the override lived
+/// only in the Rust-side `CallbackInfos`, so a callback's store freed them.
+/// `fixtures/mixin_return_heap/oracle` is the Java 25 run (Temurin 25.0.5,
+/// `javac --release 21`) of the woven order: one `CallbackInfoReturnable`,
+/// `System.gc()` between callbacks.
+#[test]
+fn a_return_injections_result_and_override_survive_its_callbacks_stores() {
+    let mut sources = fixture_sources();
+    for (path, body) in [
+        (
+            "demo/Target.java",
+            include_str!("fixtures/mixin_return_heap/demo/Target.java"),
+        ),
+        (
+            "demo/Cell.java",
+            include_str!("fixtures/mixin_return_heap/demo/Cell.java"),
+        ),
+        (
+            "demo/AAObjSetMixin.java",
+            include_str!("fixtures/mixin_return_heap/demo/AAObjSetMixin.java"),
+        ),
+        (
+            "demo/BBObjSeeMixin.java",
+            include_str!("fixtures/mixin_return_heap/demo/BBObjSeeMixin.java"),
+        ),
+        (
+            "demo/CPlainMixin.java",
+            include_str!("fixtures/mixin_return_heap/demo/CPlainMixin.java"),
+        ),
+    ] {
+        sources.insert(path, body);
+    }
+    let (_root, jar_path) = build_jar("heap", sources);
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let read = |host: &mut StdHost, value: Value| {
+        jar.invoke_method_with_args(
+            "demo/Target",
+            "read",
+            "(Ljava/lang/Object;)Ljava/lang/String;",
+            None,
+            &[value],
+            host,
+        )
+        .unwrap()
+    };
+
+    let mut host = StdHost::new();
+    let report = jar
+        .execute_discovered_mixins(&target("obj", "()Ljava/lang/Object;"), None, &[], &mut host)
+        .expect("the callbacks read the result and the override");
+    assert_eq!(
+        mark_order(&host),
+        ["obj-target", "saw:5actual", "see:7override"]
+    );
+    assert!(report.return_value_overridden);
+    assert_eq!(
+        read(&mut host, report.target_result),
+        Value::Ref(Some("7override".into()))
+    );
+
+    let plan = jar
+        .mixin_injection_plans()
+        .into_iter()
+        .find(|plan| plan.target.name == "plain")
+        .unwrap();
+    let mut host = StdHost::new();
+    let report = jar
+        .execute_mixin_at_return(&plan, None, &[], &mut host)
+        .unwrap();
+    assert_eq!(
+        read(&mut host, report.target_result),
+        Value::Ref(Some("6plain".into()))
+    );
+}
