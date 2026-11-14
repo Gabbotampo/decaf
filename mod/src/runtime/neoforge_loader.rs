@@ -199,9 +199,9 @@ impl StdHost {
             ("net/neoforged/fml/loading/FMLEnvironment", "isProduction", "()Z") => {
                 Some(Value::Int(1))
             }
-            ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => {
-                Some(Value::Ref(Some("neoforge-mod-list".into())))
-            }
+            ("net/neoforged/fml/ModList", "get", "()Lnet/neoforged/fml/ModList;") => Some(
+                crate::runtime::host_service::loader_singleton("net/neoforged/fml/ModList"),
+            ),
             // `ModConfig.Type.valueOf(name)`: the constant, or `Enum.valueOf`'s
             // `IllegalArgumentException` for a name 12.0.12 does not declare.
             (
@@ -223,7 +223,9 @@ impl StdHost {
                 "net/neoforged/fml/loading/FMLLoader",
                 "getCurrent",
                 "()Lnet/neoforged/fml/loading/FMLLoader;",
-            ) => Some(Value::Ref(Some("fml-loader".into()))),
+            ) => Some(crate::runtime::host_service::loader_singleton(
+                "net/neoforged/fml/loading/FMLLoader",
+            )),
             (
                 "net/neoforged/neoforge/registries/DeferredRegister",
                 "createDataComponents",
@@ -308,7 +310,9 @@ impl StdHost {
                 "net/neoforged/fml/loading/FMLLoader",
                 "getLoadingModList",
                 "()Lnet/neoforged/fml/loading/LoadingModList;",
-            ) => Some(Value::Ref(Some("fml-loading-mod-list".into()))),
+            ) => Some(crate::runtime::host_service::loader_singleton(
+                "net/neoforged/fml/loading/LoadingModList",
+            )),
             (
                 "net/neoforged/fml/loading/FMLLoader",
                 "getDist",

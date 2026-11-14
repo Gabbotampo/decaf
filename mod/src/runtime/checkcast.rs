@@ -539,7 +539,12 @@ impl<H: Host> Runtime<'_, H> {
             return false;
         }
         // `String` is final and in `java.base`, so a text `instanceof String`
-        // accepts is no jar, game or loader type (`checkcast` agrees, #167).
+        // accepts is no jar, game or loader type. `checkcast` throws for most
+        // such text (#167) but counts a class-name-shaped text and a library
+        // target, which a host stand-in may be (`RegisterEvent.getRegistry`,
+        // Fabric Loader's version); `instanceof`, a pattern, `Class.isInstance`
+        // and `Class.cast` still answer those exactly as for a `String` (a
+        // known gap, #167's review).
         if matches!(value, Value::Ref(_)) && crate::runtime::value_class::is_plain_string(marker) {
             return false;
         }

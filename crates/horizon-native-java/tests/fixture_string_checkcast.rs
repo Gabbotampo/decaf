@@ -17,33 +17,47 @@ mod javac_fixture;
 
 const ORACLE: &str = include_str!("fixtures/string_checkcast/java25.txt");
 const PROBE: &str = include_str!("fixtures/string_checkcast/demo/Probe.java");
-const ITEM_STUB: &str = "package net.minecraft.world.item; public class Item {}";
+const STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/world/item/Item.java",
+        "package net.minecraft.world.item; public class Item {}",
+    ),
+    (
+        "net/minecraft/network/chat/Style.java",
+        "package net.minecraft.network.chat; public class Style {}",
+    ),
+    (
+        "net/neoforged/fml/ModList.java",
+        "package net.neoforged.fml; public class ModList { public static ModList get() { return null; } }",
+    ),
+];
+
+fn fixture() -> javac_fixture::Fixture {
+    let mut sources = STUBS.to_vec();
+    sources.push(("demo/Probe.java", PROBE));
+    javac_fixture::Fixture::build("string-checkcast", &sources)
+}
 
 /// Every probe answers as Java 25 did, the exception's message included,
-/// with nothing counted, except a class-name-shaped text (counted).
+/// with nothing counted, except a class-name-shaped text against a jar or a
+/// game class (counted).
 #[test]
 fn a_string_casts_only_to_its_own_types() {
-    let fixture = javac_fixture::Fixture::build(
-        "string-checkcast",
-        &[
-            ("demo/Probe.java", PROBE),
-            ("net/minecraft/world/item/Item.java", ITEM_STUB),
-        ],
-    );
+    let fixture = fixture();
     let mut failures = Vec::new();
     for line in ORACLE.lines() {
         let (method, java) = line.split_once('=').unwrap();
+        // A text shaped like a class name is how the host answers an object it
+        // does not model (`RegisterEvent.getRegistry`), which a Mixin may give a
+        // jar interface: counted, the cast passing. A client class's objects
+        // are all handles (#232), so there the cast throws as for any text.
+        let counted_cast = |class: &str| {
+            let descriptor = format!("{class}#<checkcast>(Ljava/lang/Object;)L{class};");
+            ("ok|false", vec![(descriptor, 1)])
+        };
         let (expected, counted) = match method {
-            // A text shaped like a class name is how the host answers an
-            // object it does not model (`RegisterEvent.getRegistry`), which a
-            // Mixin may give a jar interface: counted, the cast passing.
-            "classNameText" => (
-                "ok|false",
-                vec![(
-                    "demo/Probe$Iface#<checkcast>(Ljava/lang/Object;)Ldemo/Probe$Iface;".to_owned(),
-                    1,
-                )],
-            ),
+            "classNameText" => counted_cast("demo/Probe$Iface"),
+            "classNameGame" => counted_cast("net/minecraft/world/item/Item"),
             _ => (java, Vec::new()),
         };
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
@@ -67,4 +81,28 @@ fn a_string_casts_only_to_its_own_types() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// NeoForge's `ModList.get()` is a host handle, never text a cast reads as a
+/// `String` (#167's review). Its runtime class is the loader's, which the
+/// runtime does not model, so a cast to a jar interface and `instanceof` it
+/// are counted (Java: a CCE naming that class, and `false`).
+#[test]
+fn a_loader_object_cast_is_counted() {
+    let fixture = fixture();
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "modListIface"), "ok|false");
+    assert_eq!(
+        host.unknown_host_calls(),
+        [
+            (
+                "demo/Probe$Iface#<checkcast>(Ljava/lang/Object;)Ldemo/Probe$Iface;".to_owned(),
+                1
+            ),
+            (
+                "demo/Probe$Iface#<instanceof>(Ljava/lang/Object;)Z".to_owned(),
+                1
+            ),
+        ]
+    );
 }

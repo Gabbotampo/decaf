@@ -468,6 +468,12 @@ pub enum HostKind {
     Enumeration,
     /// A list's `listIterator()`: key `list-iterator/<n>`.
     ListIterator,
+    /// `System.out`/`System.err`: key `system-out`/`system-err`
+    /// (`host_service.rs`).
+    StdStream,
+    /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
+    /// (`host_service.rs`).
+    LoaderSingleton,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1916,6 +1922,24 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::host_iterator::ITERATOR_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StdStream,
+        tag: "stds",
+        // `System.out`'s class is `PrintStream` itself.
+        class: ClassRule::Fixed("java/io/PrintStream"),
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::LoaderSingleton,
+        tag: "ldrs",
+        // The loader's own class, which the runtime does not model.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::loader_singleton_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
     },
 ];
 

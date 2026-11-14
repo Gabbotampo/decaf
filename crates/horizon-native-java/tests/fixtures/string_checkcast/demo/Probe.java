@@ -134,6 +134,55 @@ public final class Probe {
         return cast(() -> { Iface c = (Iface) s; }, s instanceof Iface);
     }
 
+    /** `System.out` is a `PrintStream`, never a `String` (#167's review). */
+    public static String sysOutIface() {
+        Object o = System.out;
+        return cast(() -> { Iface c = (Iface) o; }, o instanceof Iface);
+    }
+
+    public static String sysOutGame() {
+        Object o = System.out;
+        return cast(() -> { net.minecraft.world.item.Item c = (net.minecraft.world.item.Item) o; },
+            o instanceof net.minecraft.world.item.Item);
+    }
+
+    public static String sysOutPrintStream() {
+        Object o = System.out;
+        return cast(() -> { java.io.PrintStream c = (java.io.PrintStream) o; }, o instanceof java.io.PrintStream);
+    }
+
+    /** A `String` cast to a client class every object of which is a handle (#232). */
+    public static String clientClass() {
+        Object s = text();
+        return cast(() -> { net.minecraft.network.chat.Style c = (net.minecraft.network.chat.Style) s; },
+            s instanceof net.minecraft.network.chat.Style);
+    }
+
+    /** Text shaped like a class name, against that client class: still no `Style`. */
+    public static String classNameClient() {
+        StringBuilder name = new StringBuilder("net/minecraft/network/chat/");
+        Object s = name.append("Style").toString();
+        return cast(() -> { net.minecraft.network.chat.Style c = (net.minecraft.network.chat.Style) s; },
+            s instanceof net.minecraft.network.chat.Style);
+    }
+
+    /** Text shaped like a class name, against a game class the host may stand it for. */
+    public static String classNameGame() {
+        StringBuilder name = new StringBuilder("net/minecraft/world/item/");
+        Object s = name.append("Item").toString();
+        return cast(() -> { net.minecraft.world.item.Item c = (net.minecraft.world.item.Item) s; },
+            s instanceof net.minecraft.world.item.Item);
+    }
+
+    /**
+     * NeoForge's mod list, a host object (#167's review). Not in `main`: the oracle has no
+     * NeoForge, and Horizon counts the cast (the list's runtime class is the loader's).
+     */
+    public static String modListIface() {
+        Object o = net.neoforged.fml.ModList.get();
+        return cast(() -> { Iface c = (Iface) o; }, o instanceof Iface);
+    }
+
     public static void main(String[] args) {
         System.out.println("runnable=" + runnable());
         System.out.println("list=" + list());
@@ -156,5 +205,11 @@ public final class Probe {
         System.out.println("sql=" + sql());
         System.out.println("gameClass=" + gameClass());
         System.out.println("classNameText=" + classNameText());
+        System.out.println("sysOutIface=" + sysOutIface());
+        System.out.println("sysOutGame=" + sysOutGame());
+        System.out.println("sysOutPrintStream=" + sysOutPrintStream());
+        System.out.println("clientClass=" + clientClass());
+        System.out.println("classNameClient=" + classNameClient());
+        System.out.println("classNameGame=" + classNameGame());
     }
 }
