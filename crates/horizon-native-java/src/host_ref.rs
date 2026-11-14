@@ -766,8 +766,13 @@ pub(crate) fn instance_of_class(
         return Some(true);
     }
     // The host's description of this very object (a hook firing's `LivingEntity`, a
-    // `DedicatedServer`, a Mixin-added interface): a `yes` it names.
-    if hierarchy.described_instance_of(handle.key(), wanted) == Some(true) {
+    // `DedicatedServer`, a Mixin-added interface): a `yes` it names. Only a game
+    // object is described, and only by its kind and key together: another kind's key
+    // can spell a game object's (a mod version `"game/server"`), and is no game
+    // object (#246's re-check B4).
+    if crate::game_object::is_game_kind(handle.kind)
+        && hierarchy.described_instance_of(handle.key(), wanted) == Some(true)
+    {
         return Some(true);
     }
     // The object is a `declared`; `wanted` is final and provably not one, so
@@ -2281,6 +2286,30 @@ mod tests {
                 assert_eq!(HostKind::of_class(&class), None, "{class}");
             }
         }
+    }
+
+    /// A hook firing's description answers only for a game object: another
+    /// kind's key that spells a game object's (a NeoForge mod whose version
+    /// is `"game/server"`, an `ArtifactVersion`) is no `MinecraftServer`, so
+    /// its `instanceof` stays unknown (counted) where it was a silent `true`
+    /// (#246's re-check B4; Java 25: `false`).
+    #[test]
+    fn a_firings_description_answers_only_for_game_objects() {
+        struct Described;
+        impl ClassHierarchy for Described {
+            fn is_instance(&self, _class: &str, _wanted: &str) -> Option<bool> {
+                None
+            }
+            fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+                (key == "game/server" && wanted == "net/minecraft/server/MinecraftServer")
+                    .then_some(true)
+            }
+        }
+        let server = "net/minecraft/server/MinecraftServer";
+        let version = HostRef::new(HostKind::ArtifactVersion, "game/server");
+        assert_eq!(version.instance_of(server, &Described), None);
+        let game = HostRef::new(HostKind::GameSingleton, "game/server");
+        assert_eq!(game.instance_of(server, &Described), Some(true));
     }
 
     /// A kind's `instance_of` asks the hierarchy it is handed, so a family
