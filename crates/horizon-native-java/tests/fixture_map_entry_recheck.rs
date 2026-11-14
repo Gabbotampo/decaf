@@ -1,7 +1,9 @@
-//! The re-check of #221 (#156 P14e, review 5905494234): a library map's stored entry is one
-//! object across readings (B4), two equal `entrySet()` views are equal inside other collections
-//! (B5), an `IdentityHashMap` entry compares another entry's key and value by `==` (B1), and
-//! `remove(key)` after a walk detaches only that key's node (B3).
+//! The re-checks of #221 (#156 P14e, reviews 5905494234 and 5906897628): a library map's stored
+//! entry is one object across readings while the map is unchanged, and counted across a change
+//! (B4, B6), two equal
+//! `entrySet()` views are equal inside other collections (B5), an `IdentityHashMap` entry
+//! compares another entry's key and value by `==` (B1), `remove(key)` after a walk detaches only
+//! that key's node (B3), and a hash map keyed by equal `JsonObject`s keeps one key (B7).
 //!
 //! The stubs exist only for `javac`: the host models Guava's `ImmutableMap` and Gson's
 //! `JsonObject` itself.
@@ -20,6 +22,9 @@ wrappedEntries=falsetrue\n\
 viewsInCollections=true111true1true|java.lang.IllegalArgumentException:duplicate element: [a=1, b=2]|false\n\
 identityEntries=truefalsetruefalsetruefalsetruefalsetruefalse\n\
 removeAfterWalk=[a=7, b=2, c=3]|falsetrue|2b=8{a=7, b=5, c=3}\n\
+unknownReadings=false\n\
+gsonRemoveReadd=falsetruefalse\n\
+equalJsonKeys=2|32|32|{\"a\":\"b\"}{\"c\":\"d\"}[3, 2]true3\n\
 ";
 
 const IMMUTABLE_MAP_STUB: &str = "package com.google.common.collect;\n\
@@ -32,6 +37,8 @@ const JSON_ELEMENT_STUB: &str = "package com.google.gson;\npublic abstract class
 const JSON_OBJECT_STUB: &str = "package com.google.gson;\n\
 public final class JsonObject extends JsonElement {\n\
 public void addProperty(String p, Number v) { throw new AssertionError(); }\n\
+public void addProperty(String p, String v) { throw new AssertionError(); }\n\
+public JsonElement remove(String p) { throw new AssertionError(); }\n\
 public java.util.Set<java.util.Map.Entry<String, JsonElement>> entrySet() { throw new AssertionError(); }\n}\n";
 
 const PROBE: &str = r##"package demo;
@@ -90,6 +97,36 @@ public final class Probe {
         Properties p = new Properties();
         p.put("a", "1");
         return "" + (first(p) == first(p));
+    }
+
+    // B6: Gson's `LinkedTreeMap.remove` unlinks the node and `put` makes a new one: the old
+    // reading is another object than the readings after (counted), which are one object.
+    public static String gsonRemoveReadd() {
+        JsonObject o = new JsonObject();
+        o.addProperty("a", 1);
+        Object e1 = o.entrySet().iterator().next();
+        o.remove("a");
+        o.addProperty("a", 1);
+        Object e2 = o.entrySet().iterator().next();
+        Object e3 = o.entrySet().iterator().next();
+        return "" + (e1 == e2) + (e2 == e3) + (e1 == e3);
+    }
+
+    // B7: a hash map keyed by equal `JsonObject`s (`JsonElement.equals` by contents) keeps one key.
+    static JsonObject j(String k, String v) { JsonObject o = new JsonObject(); o.addProperty(k, v); return o; }
+
+    public static String equalJsonKeys() {
+        Map<JsonObject, Integer> m = new LinkedHashMap<>();
+        m.put(j("a", "b"), 1);
+        m.put(j("c", "d"), 2);
+        m.put(j("a", "b"), 3);
+        StringBuilder walked = new StringBuilder();
+        for (var e : m.entrySet()) walked.append(e.getValue());
+        StringBuilder each = new StringBuilder();
+        m.forEach((k, v) -> each.append(v));
+        StringBuilder keys = new StringBuilder();
+        for (var k : m.keySet()) keys.append(k);
+        return m.size() + "|" + walked + "|" + each + "|" + keys + m.values() + m.containsKey(j("c", "d")) + m.get(j("a", "b"));
     }
 
     // B4: `unmodifiableMap` wraps a new `UnmodifiableEntry` per `next()`.
@@ -186,6 +223,7 @@ fn entries_and_entry_views_answer_as_java_25() {
         "viewsInCollections",
         "identityEntries",
         "removeAfterWalk",
+        "equalJsonKeys",
     ] {
         let (text, unknown) = run(&fixture, method);
         assert_eq!(text, expected(method), "{method}: {unknown:?}");
@@ -201,6 +239,26 @@ fn readings_of_an_unknown_maps_entry_are_counted() {
     let (_, unknown) = run(&fixture, "unknownReadings");
     assert!(
         unknown.iter().any(|(call, _)| call.contains("if_acmp")),
+        "{unknown:?}"
+    );
+}
+
+/// Gson's `LinkedTreeMap.remove` unlinks the node and a later `put` makes a new one (Java 25:
+/// `falsetruefalse`). Any write to the members map is a change (its row's generation moves, a
+/// removal through Gson's own paths included), and this model cannot tell a replaced node from
+/// a kept one: `==` between the reading before it and each reading after is counted, and the
+/// readings after it are one object (#221 re-check 3, B6). All three were the old entry,
+/// silently.
+#[test]
+fn readings_across_a_gson_remove_and_re_put_are_counted() {
+    let fixture = fixture();
+    let (_, unknown) = run(&fixture, "gsonRemoveReadd");
+    assert_eq!(
+        unknown,
+        vec![(
+            "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+            2
+        )],
         "{unknown:?}"
     );
 }
