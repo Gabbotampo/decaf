@@ -1258,9 +1258,11 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         of: &Value,
         member: &str,
         class: &str,
+        follow: bool,
         values: Vec<Value>,
     ) -> Option<Value> {
-        self.inner.owned_collection(of, member, class, values)
+        self.inner
+            .owned_collection(of, member, class, follow, values)
     }
 
     fn array_view(

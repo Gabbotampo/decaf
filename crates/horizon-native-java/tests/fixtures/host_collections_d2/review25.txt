@@ -1,0 +1,5 @@
+gsonArrays=a11true|12|xString[]
+gsonForeign=demo.Review$Foo3
+gsonSets=ac3[a, b, c]|2[b, a]java.util.LinkedHashSet
+guavaIdentity=TTTT
+guavaClasses=com.google.common.collect.RegularImmutableMap,com.google.common.collect.SingletonImmutableBiMap,com.google.common.collect.RegularImmutableMap|com.google.common.collect.ImmutableEnumSet[RED, BLUE],com.google.common.collect.SingletonImmutableSet|FFF|2{a=1}

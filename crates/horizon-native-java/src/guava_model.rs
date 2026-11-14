@@ -128,6 +128,27 @@ impl<H: Host> Runtime<'_, H> {
                         unique.push(value);
                     }
                 }
+                // An `ImmutableEnumSet` (an `EnumSet` inside) iterates in
+                // ordinal order, each constant's own `ordinal()`.
+                if unique.len() > 1 {
+                    let mut ordered = Vec::with_capacity(unique.len());
+                    for value in unique {
+                        let ordinal = self.call_virtual(
+                            crate::jdk_call::Site::Virtual,
+                            "java/lang/Enum",
+                            "ordinal",
+                            "()I",
+                            &value,
+                            &[],
+                        )?;
+                        let Value::Int(ordinal) = ordinal else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        ordered.push((ordinal, value));
+                    }
+                    ordered.sort_by_key(|(ordinal, _)| *ordinal);
+                    unique = ordered.into_iter().map(|(_, value)| value).collect();
+                }
                 Ok(Some(self.factory_or_count(r, "set", unique)?))
             }
             "com/google/common/collect/ImmutableSet"
@@ -888,12 +909,18 @@ impl<H: Host> Runtime<'_, H> {
                         present.push(key);
                     }
                 }
-                // The multimap's key view, which a new set stands in for.
-                self.new_host_collection(
+                // `AbstractMultimap` caches its key view: one object per
+                // multimap, following it (a set stands in for its class).
+                match self.host.owned_collection(
+                    &map,
+                    "multimap.keySet",
                     crate::stand_in_class("set"),
+                    true,
                     present,
-                    (&r.owner, &r.name, &r.descriptor),
-                )?
+                ) {
+                    Some(view) => view,
+                    None => self.host.unknown_operand_call(r)?,
+                }
             }
             ("values", "()Ljava/util/Collection;") => {
                 let mut all = Vec::new();
@@ -901,12 +928,17 @@ impl<H: Host> Runtime<'_, H> {
                     let collection = self.host.invoke_instance(&get, &map, &[key])?;
                     all.extend(runtime_collection_values(&*self.host, &collection)?);
                 }
-                // The multimap's values view, which a new list stands in for.
-                self.new_host_collection(
+                // `AbstractMultimap` caches its values view likewise.
+                match self.host.owned_collection(
+                    &map,
+                    "multimap.values",
                     crate::stand_in_class("list"),
+                    true,
                     all,
-                    (&r.owner, &r.name, &r.descriptor),
-                )?
+                ) {
+                    Some(view) => view,
+                    None => self.host.unknown_operand_call(r)?,
+                }
             }
             ("asMap", "()Ljava/util/Map;") => map,
             ("clear", "()V") => {

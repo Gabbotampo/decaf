@@ -465,6 +465,13 @@ impl StdHost {
         }
     }
 
+    /// A mod's metadata collection (`V1ModMetadata`'s `authors`, `license`...
+    /// fields): the same list on every call, for the run (#156 P14d2).
+    fn metadata_collection(&mut self, id: &str, member: &str, values: Vec<Value>) -> Value {
+        let of = Value::Ref(Some(format!("fabric-mod-metadata/{id}")));
+        self.cached_collection(&of, member, crate::stand_in_class("list"), false, values)
+    }
+
     /// `java` and `minecraft` are `BuiltinModMetadata` built by the loader
     /// itself (`ModDiscoverer.createJavaMod`, `MinecraftGameProvider
     /// .getBuiltinMods`): the builder's defaults (`description` `""`,
@@ -474,13 +481,6 @@ impl StdHost {
     /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
     /// `Minecraft` and its version the game version a caller seeded (counted
     /// without one).
-    /// A mod's metadata collection (`V1ModMetadata`'s `authors`, `license`...
-    /// fields): the same list on every call, for the run (#156 P14d2).
-    fn metadata_collection(&mut self, id: &str, member: &str, values: Vec<Value>) -> Value {
-        let of = Value::Ref(Some(format!("fabric-mod-metadata/{id}")));
-        self.cached_collection(&of, member, crate::stand_in_class("list"), false, values)
-    }
-
     fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
         if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
             return Ok(text(id));

@@ -81,6 +81,26 @@ fn made_class(owner: &str, name: &str, kind: &str, size: usize) -> &'static str 
         ("java/util/Collections", "singletonList", _) => "java/util/Collections$SingletonList",
         ("java/util/Collections", "singleton", _) => "java/util/Collections$SingletonSet",
         ("java/util/Collections", "singletonMap", _) => "java/util/Collections$SingletonMap",
+        // Guava 33.6.0 (`javap`): `Sets.immutableEnumSet` is `ImmutableSet.of()`/
+        // `of(e)` for none or one element, else an `ImmutableEnumSet` in
+        // ordinal order; `ImmutableMap`'s are `SingletonImmutableBiMap` for one
+        // entry, else `RegularImmutableMap`; `ImmutableBiMap`'s likewise.
+        ("com/google/common/collect/Sets", "immutableEnumSet", _) => match size {
+            0 => "com/google/common/collect/RegularImmutableSet",
+            1 => "com/google/common/collect/SingletonImmutableSet",
+            _ => "com/google/common/collect/ImmutableEnumSet",
+        },
+        (
+            "com/google/common/collect/ImmutableMap" | "com/google/common/collect/ImmutableBiMap",
+            _,
+            _,
+        ) if size == 1 => "com/google/common/collect/SingletonImmutableBiMap",
+        ("com/google/common/collect/ImmutableMap", _, _) => {
+            "com/google/common/collect/RegularImmutableMap"
+        }
+        ("com/google/common/collect/ImmutableBiMap", _, _) => {
+            "com/google/common/collect/RegularImmutableBiMap"
+        }
         ("com/google/common/collect/ImmutableList", _, _) if size == 1 => {
             "com/google/common/collect/SingletonImmutableList"
         }
@@ -132,7 +152,10 @@ fn shared_empty(owner: &str, name: &str, kind: &str) -> Option<&'static str> {
         ("java/util/Collections", "emptySet", _) => "Collections.EMPTY_SET",
         ("java/util/Collections", "emptyMap", _) => "Collections.EMPTY_MAP",
         ("com/google/common/collect/ImmutableList", _, _) => "RegularImmutableList.EMPTY",
-        ("com/google/common/collect/ImmutableSet", _, _) => "RegularImmutableSet.EMPTY",
+        ("com/google/common/collect/ImmutableSet", _, _)
+        | ("com/google/common/collect/Sets", "immutableEnumSet", _) => "RegularImmutableSet.EMPTY",
+        ("com/google/common/collect/ImmutableMap", _, _) => "RegularImmutableMap.EMPTY",
+        ("com/google/common/collect/ImmutableBiMap", _, _) => "RegularImmutableBiMap.EMPTY",
         _ => return None,
     })
 }
@@ -247,6 +270,27 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/lang/Iterable",
         "java/io/Serializable",
     ];
+    const GUAVA_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "com/google/common/collect/ImmutableMap",
+    ];
+    const GUAVA_BI_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/BiMap",
+        "com/google/common/collect/ImmutableBiMap",
+    ];
+    const GUAVA_ENUM_SET: &[&str] = &[
+        "java/util/Set",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/io/Serializable",
+        "java/util/AbstractCollection",
+        "com/google/common/collect/ImmutableCollection",
+        "com/google/common/collect/ImmutableSet",
+    ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
     // `Arrays$ArrayList extends AbstractList implements RandomAccess,
     // Serializable` (`array_views.rs`).
@@ -294,6 +338,10 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         | "com/google/common/collect/SingletonImmutableList" => GUAVA_LIST,
         "com/google/common/collect/SingletonImmutableSet" => GUAVA_SET,
         "com/google/common/collect/RegularImmutableSet" => GUAVA_REGULAR_SET,
+        "com/google/common/collect/ImmutableEnumSet" => GUAVA_ENUM_SET,
+        "com/google/common/collect/RegularImmutableMap" => GUAVA_MAP,
+        "com/google/common/collect/SingletonImmutableBiMap"
+        | "com/google/common/collect/RegularImmutableBiMap" => GUAVA_BI_MAP,
         _ => crate::runtime::sequenced::supertypes(class),
     }
 }
