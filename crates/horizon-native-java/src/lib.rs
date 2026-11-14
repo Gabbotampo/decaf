@@ -7460,6 +7460,15 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // The game's `NonNullList` (an inventory's list): its own rules
+            // (no `null`, a fixed size for `withSize`) are not modelled, so a
+            // mutator is counted (#255 review).
+            if jar_object::collection_key(marker).is_some_and(|_| {
+                jar_object::collection_class(marker) == client_surface::NON_NULL_LIST
+            }) && java_immutable::is_mutator(&r.name)
+            {
+                return self.unknown_host_call(r);
+            }
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
             if let Some(answer) = self.fixed_size_member(r, marker) {
@@ -19938,6 +19947,12 @@ fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
     if CONCRETE.contains(&class) {
         return class;
     }
+    // `ConstructorConstructor`'s sorted defaults (#253 review).
+    match class {
+        "java/util/SortedSet" | "java/util/NavigableSet" => return "java/util/TreeSet",
+        "java/util/SortedMap" | "java/util/NavigableMap" => return "java/util/TreeMap",
+        _ => {}
+    }
     match kind {
         "set" => "java/util/LinkedHashSet",
         "map" => "java/util/LinkedHashMap",
@@ -20052,22 +20067,33 @@ impl<H: Host> Runtime<'_, H> {
         Ok(match (descriptor, json) {
             (_, Json::Null) if descriptor.len() == 1 => None,
             (_, Json::Null) => Some(Value::Ref(None)),
-            ("Ljava/lang/Object;", _) => Some(self.gson_json_value(json, "java/lang/Object")?),
+            // `ObjectTypeAdapter` (#253 review).
+            ("Ljava/lang/Object;", _) => self.gson_object_adapter(json)?,
             // `TypeAdapters.STRING`: a string, an integer's text, a boolean's.
             ("Ljava/lang/String;", Json::String(text)) => Some(Value::Ref(Some(text.clone()))),
             ("Ljava/lang/String;", Json::Number(number)) if number.is_i64() || number.is_u64() => {
                 Some(Value::Ref(Some(number.to_string())))
             }
             ("Ljava/lang/String;", Json::Bool(flag)) => Some(Value::Ref(Some(flag.to_string()))),
-            (
-                "I" | "S" | "B" | "Ljava/lang/Integer;" | "Ljava/lang/Short;" | "Ljava/lang/Byte;",
-                _,
-            ) => integer(json)
+            // `TypeAdapters.INTEGER`/`LONG`: `nextInt`/`nextLong`.
+            ("I" | "Ljava/lang/Integer;", _) => integer(json)
                 .and_then(|n| i32::try_from(n).ok())
                 .map(Value::Int),
             ("J" | "Ljava/lang/Long;", _) => integer(json).map(Value::Long),
-            ("D" | "F" | "Ljava/lang/Double;" | "Ljava/lang/Float;", Json::Number(number)) => {
-                number.as_f64().map(Value::Float)
+            // `TypeAdapters.SHORT`/`BYTE`: `nextInt`, a `JsonSyntaxException`
+            // past 65535 or 255 (or below the type's minimum), then the
+            // narrowing cast. Their boxes are classes no value here carries:
+            // counted.
+            ("S", _) => integer(json)
+                .filter(|n| (i64::from(i16::MIN)..=65535).contains(n))
+                .map(|n| Value::Int(i32::from(n as i16))),
+            ("B", _) => integer(json)
+                .filter(|n| (i64::from(i8::MIN)..=255).contains(n))
+                .map(|n| Value::Int(i32::from(n as i8))),
+            // `nextDouble`, and for a `float` its narrowing.
+            ("D" | "Ljava/lang/Double;", Json::Number(number)) => number.as_f64().map(Value::Float),
+            ("F", Json::Number(number)) => {
+                number.as_f64().map(|n| Value::Float(f64::from(n as f32)))
             }
             ("Z", Json::Bool(flag)) => Some(Value::Int(i32::from(*flag))),
             ("Ljava/lang/Boolean;", Json::Bool(flag)) => Some(boolean_value(*flag)),
@@ -20082,6 +20108,33 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             _ => None,
+        })
+    }
+
+    /// Gson's `ObjectTypeAdapter` (`ToNumberPolicy.DOUBLE`): a string, a
+    /// `Double`, a `Boolean`, `null`, an `ArrayList` of the same; `None` for
+    /// an object, which it reads as a `LinkedTreeMap` no model holds.
+    fn gson_object_adapter(
+        &mut self,
+        json: &serde_json::Value,
+    ) -> Result<Option<Value>, NativeError> {
+        use serde_json::Value as Json;
+        Ok(match json {
+            Json::Null => Some(Value::Ref(None)),
+            Json::String(text) => Some(Value::Ref(Some(text.clone()))),
+            Json::Bool(flag) => Some(boolean_value(*flag)),
+            Json::Number(number) => number.as_f64().map(Value::Float),
+            Json::Array(values) => {
+                let mut elements = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(element) = self.gson_object_adapter(value)? else {
+                        return Ok(None);
+                    };
+                    elements.push(element);
+                }
+                Some(self.new_host_collection("java/util/ArrayList", elements, GSON_FROM_JSON)?)
+            }
+            Json::Object(_) => None,
         })
     }
 
@@ -21894,6 +21947,13 @@ impl<H: Host> Runtime<'_, H> {
         if target.starts_with('[') {
             return Assignable::Known(false);
         }
+        // A Guava immutable class the host makes: its whole chain is known
+        // (#253 review).
+        if self.class(source).is_none()
+            && let Some(answer) = crate::java_immutable::guava_assignable(target, source)
+        {
+            return Assignable::Known(answer);
+        }
         // A host kind's class (`getClass()` of a handle): its row, unless
         // the run holds that class file (a jar's own copy wins).
         if self.class(source).is_none()
@@ -22477,6 +22537,12 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?.replace('.', "/");
             if class == "java/lang/Object" || host_class::is_primitive(&class) {
                 return Ok(Some(Value::Ref(None)));
+            }
+            // A Guava immutable class the host makes: Guava's own superclass.
+            if self.class(&class).is_none()
+                && let Some(parent) = crate::java_immutable::guava_superclass(&class)
+            {
+                return Ok(Some(host_class::class_value(parent)));
             }
             // A host kind's class: its row knows its supertypes, not which
             // one is the direct superclass. Counted.

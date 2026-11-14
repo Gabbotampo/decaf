@@ -55,6 +55,7 @@ use crate::runtime::{
 // submodule so the crate root's module list stays the interpreter's.
 #[path = "client_items.rs"]
 mod items;
+pub(crate) use items::NON_NULL_LIST;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]

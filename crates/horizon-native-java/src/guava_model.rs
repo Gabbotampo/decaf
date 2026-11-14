@@ -133,6 +133,21 @@ impl<H: Host> Runtime<'_, H> {
                 if unique.len() > 1 {
                     let mut ordered = Vec::with_capacity(unique.len());
                     for value in unique {
+                        // Only a jar enum's `ordinal()` is its own: a JDK
+                        // enum's (`TimeUnit`) is not modelled, so the factory
+                        // is counted (#253 review).
+                        let jar_enum = crate::jar_object::object_class(&value)
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                expect_ref(&value)
+                                    .and_then(|marker| marker.strip_prefix("enum/"))
+                                    .and_then(|rest| rest.rsplit_once('/'))
+                                    .map(|(class, _)| class.to_owned())
+                            })
+                            .is_some_and(|class| self.class(&class).is_some());
+                        if !jar_enum {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         let ordinal = self.call_virtual(
                             crate::jdk_call::Site::Virtual,
                             "java/lang/Enum",
