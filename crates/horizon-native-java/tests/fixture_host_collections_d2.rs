@@ -113,21 +113,44 @@ fn review_expected(method: &str) -> &'static str {
 ///   `ImmutableEnumSet` in ordinal order, `SingletonImmutableSet`, and
 ///   `Map.copyOf`/`Set.copyOf` of them a copy, not the argument.
 ///
-/// `gsonForeign` (a jar class's array) needs Gson's reflective adapter: Java
-/// 25's answer, or the `fromJson` counted, never an element of another type.
+/// - `gsonNarrow`: Gson's `short`/`byte` narrowing, a `float` as a float;
+/// - `gsonObjects`: `ObjectTypeAdapter`'s `Boolean`/`Double`/`ArrayList`;
+/// - `gsonSorted`: `SortedMap`/`SortedSet`/`NavigableSet` targets are a
+///   `TreeMap`/`TreeSet`;
+/// - `gsonGuavaJson`: a Guava map serializes as a JSON object;
+/// - `guavaClassSurface`: Guava's superclasses, and `isAssignableFrom`.
+///
+/// Counted, never another value: a jar class's array (Gson's reflective
+/// adapter), a `byte` past 255 (`JsonSyntaxException`), `Short[]`/`Float[]`
+/// (boxes no value here carries) and a JDK enum's ordinal order.
 #[test]
 fn guava_and_gson_collections_are_javas() {
     let mut sources = vec![("demo/Review.java", REVIEW)];
     sources.extend_from_slice(STUBS);
     let fixture = javac_fixture::Fixture::build("host-collections-d2-review", &sources);
     let mut failures = Vec::new();
-    for method in [
-        "gsonArrays",
-        "gsonSets",
-        "guavaIdentity",
-        "guavaClasses",
-        "gsonForeign",
-    ] {
+    // Each case and, where Horizon cannot hold Java's value, the call it
+    // counts instead (`None`: exact only).
+    let cases: &[(&str, Option<&str>)] = &[
+        ("gsonArrays", None),
+        ("gsonSets", None),
+        ("guavaIdentity", None),
+        ("guavaClasses", None),
+        ("gsonNarrow", None),
+        ("gsonObjects", None),
+        ("gsonSorted", None),
+        ("gsonGuavaJson", None),
+        ("guavaClassSurface", None),
+        ("gsonForeign", Some("com/google/gson/Gson#fromJson")),
+        ("gsonByteOverflow", Some("com/google/gson/Gson#fromJson")),
+        ("gsonShortBox", Some("com/google/gson/Gson#fromJson")),
+        ("gsonFloatBox", Some("com/google/gson/Gson#fromJson")),
+        (
+            "guavaJdkEnum",
+            Some("com/google/common/collect/Sets#immutableEnumSet"),
+        ),
+    ];
+    for (method, counts) in cases {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
         let answer = fixture.jar.invoke_method_with_args(
             "demo/Review",
@@ -143,10 +166,8 @@ fn guava_and_gson_collections_are_javas() {
         };
         let unknown = host.unknown_host_calls();
         let exact = text == review_expected(method) && unknown.is_empty();
-        let counted = method == "gsonForeign"
-            && unknown
-                .iter()
-                .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson"));
+        let counted =
+            counts.is_some_and(|call| unknown.iter().any(|(counted, _)| counted.starts_with(call)));
         if !(exact || counted) {
             failures.push(format!(
                 "{method}\n  java:   {}\n  native: {text}\n  unknown: {unknown:?}",
