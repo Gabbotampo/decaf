@@ -1,0 +1,11 @@
+jar_text=BlockPos{x=1, y=2, z=3},MutableBlockPos{x=1, y=2, z=3}
+jar_hash=2946,2946
+jar_xyz=1,2,3
+eq=true,true,true,true,false,false,true,false,false,false
+map=h,h,j,null,true
+set=true,false,1
+compare=-1,1,0
+tree=BlockPos{x=-1, y=-2, z=-3};BlockPos{x=3, y=1, z=0};BlockPos{x=0, y=1, z=5};BlockPos{x=1, y=2, z=3};BlockPos{x=1, y=2, z=4};
+mutated=null,null,null,1,true,MutableBlockPos{x=5, y=5, z=5}
+mut_set=MutableBlockPos{x=5, y=7, z=5},MutableBlockPos{x=1, y=-1, z=2}
+res=/data,3076010,true,true,d,data,false
