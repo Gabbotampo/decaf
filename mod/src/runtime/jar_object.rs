@@ -261,10 +261,14 @@ pub(crate) fn object_key(value: &Value) -> Option<&str> {
 /// any other reference with fields (a jar enum constant's `enum/…`). A
 /// `String` spelling a key has none.
 pub(crate) fn instance_key(value: &Value) -> Option<&str> {
-    object_key(value).or_else(|| match value {
-        Value::Ref(Some(text)) if !spells_key_text(text) => Some(text.as_str()),
-        _ => None,
-    })
+    // A game object a Mixin callback runs on keeps the Mixin's fields under
+    // its handle's key (`game_hooks.rs`, #156 P16e).
+    object_key(value)
+        .or_else(|| crate::runtime::game_object::handle_key(value))
+        .or_else(|| match value {
+            Value::Ref(Some(text)) if !spells_key_text(text) => Some(text.as_str()),
+            _ => None,
+        })
 }
 
 /// [`marker_class`] of a `Ref`'s text, `None` for a `String` that spells an

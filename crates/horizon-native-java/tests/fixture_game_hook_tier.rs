@@ -662,6 +662,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class PlayerTickMixin implements TicksAccess {
     @Shadow public abstract int getId();
     private int demo$ticks = 100;
+    private static Object demo$last;
 
     public int demo$ticks() { return demo$ticks; }
 
@@ -674,6 +675,12 @@ public abstract class PlayerTickMixin implements TicksAccess {
         if (other instanceof TicksAccess access) {
             HookSink.mark("access/" + access.demo$ticks());
         }
+        // `this` is the player itself: the same object at its next tick, a new
+        // one (`equals` by id) after a respawn.
+        if (demo$last != null) {
+            HookSink.mark("same/" + (demo$last == (Object) this) + "/" + demo$last.equals(this));
+        }
+        demo$last = this;
     }
 }
 "#;
@@ -812,15 +819,23 @@ fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
 
     // The receiver answers its UUID and id; the Mixin's initialiser ran once
     // for the object, and its field survives to the next tick; the interface
-    // the Mixin adds is implemented on the player.
-    let alice_object = || GameObject::player(alice, "Alice").with_entity_id(7);
+    // the Mixin adds is implemented on the player; `this` is the player (a
+    // game handle, #156 P16e), `==` itself at its next tick.
+    let alice_life = |life| {
+        GameObject::player(alice, "Alice")
+            .with_incarnation(1, life)
+            .with_entity_id(7)
+    };
+    let alice_object = || alice_life(0);
     tick(&mut state, &mut host, alice_object()).unwrap();
     tick(&mut state, &mut host, alice_object()).unwrap();
     // A second player is a second object with its own field.
     tick(
         &mut state,
         &mut host,
-        GameObject::player(bob, "Bob").with_entity_id(9),
+        GameObject::player(bob, "Bob")
+            .with_incarnation(1, 0)
+            .with_entity_id(9),
     )
     .unwrap();
     assert_eq!(
@@ -830,15 +845,32 @@ fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
             "access/101",
             "01234567-89ab-cdef-0011-223344556677/7/102",
             "access/102",
+            "same/true/true",
             "00000000-0000-0000-0000-0000000000ff/9/101",
             "access/101",
+            "same/false/false",
         ]
     );
 
     // A forgotten object (a player who left) starts fresh.
     state.forget_object(&alice_object().marker());
     tick(&mut state, &mut host, alice_object()).unwrap();
-    assert_eq!(marks(&host).last().map(String::as_str), Some("access/101"));
+    assert_eq!(marks(&host)[9..], ["access/101", "same/false/false"]);
+
+    // A respawn builds a new `ServerPlayer` with the old id
+    // (`PlayerList.respawn`): a new object, so the Mixin's field starts at
+    // its initialiser again, and the old life is `equals` (by id) but not
+    // `==` (Java 25 on the 26.3 classes: `respawn_eq=false`,
+    // `respawn_equals=true`, #228's oracle).
+    tick(&mut state, &mut host, alice_life(1)).unwrap();
+    assert_eq!(
+        marks(&host)[11..],
+        [
+            "01234567-89ab-cdef-0011-223344556677/7/101",
+            "access/101",
+            "same/false/true",
+        ]
+    );
 
     // The cancellable callback decides from its argument's id.
     let attack = |state: &mut GameHookState, host: &mut StdHost, target: i32| {
@@ -916,7 +948,7 @@ fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
             &mut state,
             &mut context,
             "player_tick",
-            Some(Value::Ref(Some(alice_object().marker()))),
+            Some(alice_object().value()),
             &[],
             &mut host,
             &budget,

@@ -292,8 +292,9 @@ mod tests {
         }
     }
 
+    /// A game object's handle (`game/…`), else the text (a jar object).
     fn marker(text: &str) -> Value {
-        Value::Ref(Some(text.into()))
+        crate::runtime::game_object::value(text).unwrap_or_else(|| Value::Ref(Some(text.into())))
     }
 
     fn build(state: &mut SavedDataState, object: &str, id: &str) {

@@ -48,6 +48,8 @@ const RETIRED_PREFIXES: &[&str] = &[
     // `client_values.rs`, `game_object::client_value`).
     "client/",
     "key-category/",
+    // Every `game/…` object is a handle (#156 P16b, P16e).
+    "game/",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
@@ -154,7 +156,6 @@ const MARKER_HEADS: &[&str] = &[
     "enum",
     "event",
     "file",
-    "game",
     "handler",
     "holder",
     "identifier",

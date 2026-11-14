@@ -8,9 +8,11 @@
 //!
 //! - **Identity.** The host describes each object it passes as a
 //!   [`GameObject`]: its vanilla class, entity id, UUID, name, position and the
-//!   few other facts it already knows at the hook point. The interpreter sees a
-//!   stable marker (`game/player/<uuid>`, `game/entity/<id>`, `game/server`),
-//!   so the same entity is the same object at every firing.
+//!   few other facts it already knows at the hook point. The interpreter sees
+//!   a game handle (#156 P16e, `game_object.rs`) keyed as the server's own
+//!   objects are (`game/player/<uuid>/<session>.<life>/<id>`,
+//!   `game/entity/<id>`, `game/server`), so the same entity is the same object
+//!   at every firing and in every tier, and a respawned player is a new one.
 //! - **Members.** A call on a marker answers from that description when the
 //!   member is one this module models (`getUUID`, `getId`, `getX`,
 //!   `getScoreboardName`, `level`, `getServer`...). Any other member, any
@@ -19,8 +21,8 @@
 //!   what to do; nothing answers a neutral value the game never produced.
 //! - **Mixin state.** Fields a Mixin class adds to its target (`shogi$cooldowns`)
 //!   live in a [`GameHookState`] the host keeps per jar, keyed by the object's
-//!   marker, so a value a callback stores on a player is there at the player's
-//!   next tick. The Mixin class's no-argument constructor runs once per object,
+//!   handle key, so a value a callback stores on a player is there at the
+//!   player's next tick, and gone after a respawn (a new `ServerPlayer`). The Mixin class's no-argument constructor runs once per object,
 //!   the first time a callback of that class sees it, which is where `javac`
 //!   puts the field initialisers Mixin would merge into the target.
 //!
@@ -111,6 +113,11 @@ pub struct GameObject {
     /// an empty hand is `("minecraft:air", 0)`, as vanilla's `ItemStack.EMPTY`.
     pub main_hand: Option<(String, i32)>,
     pub off_hand: Option<(String, i32)>,
+    /// A player's session (logins) and life (respawns) on this server, as
+    /// the bridge counts them (`events::FacadePlayer`): one `ServerPlayer`
+    /// object each. `None` for a player the host does not count, whose key
+    /// names no session (comparisons counted).
+    pub incarnation: Option<(u32, u32)>,
 }
 
 impl GameObject {
@@ -133,16 +140,18 @@ impl GameObject {
             address: None,
             main_hand: None,
             off_hand: None,
+            incarnation: None,
         }
     }
 
-    /// A server player, keyed by UUID so it is the same object after a
-    /// respawn, as the player's data is.
+    /// A server player. Give it [`Self::with_incarnation`] and
+    /// [`Self::with_entity_id`]: a respawn builds a new `ServerPlayer`, which
+    /// is a new object with fresh Mixin state.
     pub fn player(uuid: u128, name: &str) -> Self {
         let mut object = Self::new(
             GameObjectKind::Player,
             "net/minecraft/server/level/ServerPlayer",
-            uuid_text_of(uuid),
+            format!("{uuid:032x}"),
         );
         object.uuid = Some(uuid);
         object.name = Some(name.to_owned());
@@ -209,7 +218,7 @@ impl GameObject {
         } else {
             "net/minecraft/server/MinecraftServer"
         };
-        let mut object = Self::new(GameObjectKind::Server, class, "main".to_owned());
+        let mut object = Self::new(GameObjectKind::Server, class, String::new());
         object.dedicated = Some(dedicated);
         object
     }
@@ -231,7 +240,7 @@ impl GameObject {
         let mut object = Self::new(
             GameObjectKind::Item,
             "net/minecraft/world/item/Item",
-            id.replace([':', '/'], "_"),
+            id.to_owned(),
         );
         object.type_id = Some(id.to_owned());
         object
@@ -247,6 +256,11 @@ impl GameObject {
         )
     }
 
+    /// A player's session and life (`events::FacadePlayer`).
+    pub fn with_incarnation(mut self, session: u32, life: u32) -> Self {
+        self.incarnation = Some((session, life));
+        self
+    }
     pub fn with_entity_id(mut self, id: i32) -> Self {
         self.entity_id = Some(id);
         self
@@ -290,20 +304,37 @@ impl GameObject {
         self
     }
 
-    /// The marker the interpreter sees for this object.
+    /// The key of this object's game handle, as the server's tiers key the
+    /// same object (`game_object.rs`): a player by UUID, session, life and
+    /// id; any entity by id; an item type by registry id.
     pub fn marker(&self) -> String {
-        let kind = match self.kind {
-            GameObjectKind::Player => "player",
-            GameObjectKind::Living | GameObjectKind::Entity => "entity",
-            GameObjectKind::ItemEntity => "item",
-            GameObjectKind::ItemStack => "stack",
-            GameObjectKind::Level => "level",
-            GameObjectKind::Server => "server",
-            GameObjectKind::Profile => "profile",
-            GameObjectKind::Item => "itemtype",
-            GameObjectKind::Opaque => "opaque",
-        };
-        format!("{GAME_OBJECT_PREFIX}{kind}/{}", self.key)
+        let key = &self.key;
+        match self.kind {
+            GameObjectKind::Player => match (self.incarnation, self.entity_id) {
+                (Some((session, life)), Some(id)) => {
+                    format!("{GAME_OBJECT_PREFIX}player/{key}/{session}.{life}/{id}")
+                }
+                (Some((session, life)), None) => {
+                    format!("{GAME_OBJECT_PREFIX}player/{key}/{session}.{life}")
+                }
+                (None, _) => format!("{GAME_OBJECT_PREFIX}player/{key}"),
+            },
+            GameObjectKind::Living | GameObjectKind::Entity | GameObjectKind::ItemEntity => {
+                format!("{GAME_OBJECT_PREFIX}entity/{key}")
+            }
+            GameObjectKind::ItemStack => format!("{GAME_OBJECT_PREFIX}stack/{key}"),
+            GameObjectKind::Level => format!("{GAME_OBJECT_PREFIX}level/{key}"),
+            GameObjectKind::Server => format!("{GAME_OBJECT_PREFIX}server"),
+            GameObjectKind::Profile => format!("{GAME_OBJECT_PREFIX}profile/{key}"),
+            GameObjectKind::Item => format!("{GAME_OBJECT_PREFIX}item/{key}"),
+            GameObjectKind::Opaque => format!("{GAME_OBJECT_PREFIX}opaque/{key}"),
+        }
+    }
+
+    /// The game handle a callback receives for this object (#156 P16e).
+    pub fn value(&self) -> Value {
+        let marker = self.marker();
+        crate::game_object::value(&marker).unwrap_or(Value::Ref(Some(marker)))
     }
 
     /// The vanilla classes this object is an instance of, most specific
@@ -380,11 +411,11 @@ impl GameHookContext {
         self.server = facts;
     }
 
-    /// Add `object` and answer the value a callback receives for it.
+    /// Add `object` and answer the game handle a callback receives for it.
     pub fn insert(&mut self, object: GameObject) -> Value {
-        let marker = object.marker();
-        self.objects.insert(marker.clone(), object);
-        Value::Ref(Some(marker))
+        let value = object.value();
+        self.objects.insert(object.marker(), object);
+        value
     }
 
     /// The object a marker names in this firing.
@@ -702,15 +733,12 @@ impl<H: Host> GameHookHost<'_, H> {
         r: &MethodRef,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        // `Object`'s own members hold for every object, live or not.
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("<init>", "()V") if r.owner == "java/lang/Object" => return Ok(Value::Void),
-            ("hashCode", "()I") => return Ok(Value::Int(stable_hash(marker))),
-            ("equals", "(Ljava/lang/Object;)Z") => {
-                let other = args.first().and_then(crate::game_object::text);
-                return Ok(Value::Int(i32::from(other.is_some_and(|o| o == marker))));
-            }
-            _ => {}
+        // `Object`'s `equals`, `hashCode` and `toString` are the handle
+        // kind's (`game_object.rs`: an entity by its id), answered before here.
+        if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
+            == ("java/lang/Object", "<init>", "()V")
+        {
+            return Ok(Value::Void);
         }
         let object = self.object(marker)?;
         let fact = |value: Option<Value>| value.ok_or_else(|| unmodelled(marker, r));
@@ -725,11 +753,6 @@ impl<H: Host> GameHookHost<'_, H> {
         let player = object.kind == GameObjectKind::Player;
         let string = |text: &str| Value::Ref(Some(text.to_owned()));
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("toString", "()Ljava/lang/String;") => Ok(string(&format!(
-                "{}[{}]",
-                object.class.rsplit('/').next().unwrap_or_default(),
-                object.name.as_deref().unwrap_or(&object.key)
-            ))),
             ("getId", "()I") if entity => fact(object.entity_id.map(Value::Int)),
             // `permissions()`: the player's level's permission set.
             ("permissions", _) if player && object.uuid.is_some() => {
@@ -813,9 +836,9 @@ impl<H: Host> GameHookHost<'_, H> {
                     .objects
                     .values()
                     .find(|o| o.kind == GameObjectKind::Server)
-                    .map(GameObject::marker)
+                    .map(GameObject::value)
                     .ok_or_else(|| unmodelled(marker, r))?;
-                Ok(Value::Ref(Some(server)))
+                Ok(server)
             }
             ("isClientSide", "()Z") if object.kind == GameObjectKind::Level => Ok(Value::Int(0)),
             ("isDedicatedServer", "()Z") if object.kind == GameObjectKind::Server => {
@@ -1522,8 +1545,10 @@ impl NativeJar {
                 // constructors. A Mixin that extends a game class has no
                 // no-argument constructor to run, and its fields start at Java's
                 // defaults.
-                if let Some(Value::Ref(Some(object))) = &callback_receiver
-                    && object.starts_with(GAME_OBJECT_PREFIX)
+                if let Some(object) = callback_receiver
+                    .as_ref()
+                    .and_then(crate::game_object::text)
+                    .filter(|object| object.starts_with(GAME_OBJECT_PREFIX))
                     && initialized.insert(format!("{}|{object}", entry.callback.owner))
                     && self
                         .classes
@@ -1659,5 +1684,51 @@ impl NativeJar {
             returned: returned.transpose()?.flatten(),
             results,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{EventFacade, FacadePlayer};
+
+    /// A hook callback's player is the object the event tier hands out for
+    /// the same player (`events::player_marker`): one key, so `==` holds
+    /// across tiers, and a respawn's new life is another object.
+    #[test]
+    fn a_hook_player_is_the_event_tiers_player() {
+        let uuid = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let facade = |life| EventFacade {
+            players: vec![FacadePlayer {
+                uuid,
+                name: "Alex".into(),
+                level: None,
+                entity_id: Some(7),
+                session: 2,
+                life,
+            }],
+            ..EventFacade::default()
+        };
+        let event = crate::game_object::player_value(&facade(0), uuid);
+        let (Value::Host(hook), Value::Host(event)) = (hook_value(uuid, 0), event) else {
+            panic!("not handles")
+        };
+        assert_eq!(hook.same_object(&event), Some(true));
+        let Value::Host(respawned) = hook_value(uuid, 1) else {
+            panic!("not a handle")
+        };
+        assert_eq!(hook.same_object(&respawned), Some(false));
+        let Value::Host(event_respawned) = crate::game_object::player_value(&facade(1), uuid)
+        else {
+            panic!("not a handle")
+        };
+        assert_eq!(respawned.same_object(&event_respawned), Some(true));
+    }
+
+    fn hook_value(uuid: u128, life: u32) -> Value {
+        GameObject::player(uuid, "Alex")
+            .with_incarnation(2, life)
+            .with_entity_id(7)
+            .value()
     }
 }
