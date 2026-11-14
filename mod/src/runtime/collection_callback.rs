@@ -122,8 +122,19 @@ impl<H: Host> Runtime<'_, H> {
                 let callback = args.first().cloned().unwrap_or(Value::Ref(None));
                 let mut kept = Vec::new();
                 let mut removed = false;
+                // `Arrays.asList`'s view: the iterator's `remove` at the first
+                // element that passes refuses (`array_views.rs`).
+                let fixed_size = self.host_collection_class(receiver).as_deref()
+                    == Some(crate::runtime::array_views::CLASS);
                 for value in owned_values(&values)? {
                     let keep = !self.predicate_holds(&callback, &value)?;
+                    if fixed_size && !keep {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/UnsupportedOperationException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     removed |= !keep;
                     if keep {
                         kept.push(value);

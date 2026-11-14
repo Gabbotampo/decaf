@@ -415,6 +415,12 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             name: name.into(),
             descriptor: descriptor.into(),
         };
+        // `Arrays.asList`'s view sorts its array in place: no structural
+        // change (`array_views.rs`).
+        if self.host_collection_class(&list).as_deref() == Some(crate::array_views::CLASS) {
+            self.host.replace_mutable_collection(&list, sorted);
+            return Ok(Some(Value::Void));
+        }
         self.host
             .invoke_instance(&method("clear", "()V"), &list, &[])?;
         let add = method("add", "(Ljava/lang/Object;)Z");
