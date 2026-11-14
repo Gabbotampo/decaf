@@ -244,7 +244,32 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/io/Serializable",
     ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
+    // `Arrays$ArrayList extends AbstractList implements RandomAccess,
+    // Serializable` (`array_views.rs`).
+    const ARRAYS_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/io/Serializable",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
+    // `AbstractList$RandomAccessSubList extends SubList (extends AbstractList)
+    // implements RandomAccess`: no `Serializable`.
+    const SUB_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
     match class {
+        crate::runtime::array_views::CLASS => ARRAYS_LIST,
+        crate::runtime::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
         | "java/util/Collections$UnmodifiableRandomAccessList"
@@ -277,8 +302,9 @@ impl StdHost {
         let marker = crate::runtime::jar_object::collection_key_for(
             class,
             crate::runtime::jar_object::CollectionFamily::Immutable,
-            self.unmodifiable_collections.len(),
+            self.next_unmodifiable_collection,
         );
+        self.next_unmodifiable_collection += 1;
         self.mutable_collections.insert(marker.clone(), values);
         self.unmodifiable_collections.insert(marker.clone(), None);
         crate::runtime::jar_object::collection(marker)
@@ -492,8 +518,9 @@ impl StdHost {
                 let marker = crate::runtime::jar_object::collection_key_for(
                     view_class(kind, source_class),
                     crate::runtime::jar_object::CollectionFamily::Immutable,
-                    self.unmodifiable_collections.len(),
+                    self.next_unmodifiable_collection,
                 );
+                self.next_unmodifiable_collection += 1;
                 self.unmodifiable_collections
                     .insert(marker.clone(), Some(source));
                 return Some(Ok(crate::runtime::jar_object::collection(marker)));

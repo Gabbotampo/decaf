@@ -363,6 +363,10 @@ impl StdHost {
         push(self.hash_tables.get(marker), out);
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
+        // An `Arrays.asList` view's array, which its `get`/`set` work on, and
+        // the view an iterator over one follows.
+        push(self.array_view_array(marker), out);
+        push(self.array_view_of_iterator(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -384,6 +388,7 @@ impl StdHost {
             .chain(self.hash_tables.keys())
             .chain(self.red_black_trees.keys())
             .chain(self.probe_tables.keys())
+            .chain(self.array_view_markers())
             .map(String::as_str)
     }
 
@@ -886,6 +891,8 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
     host.prune_keyed_tables(keep);
+    // A collected `Arrays.asList` view mirrors nothing any more.
+    host.prune_array_views();
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -1308,6 +1315,7 @@ mod tests {
     #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
+            "array_views",
             "resource_streams",
             "calls",
             "invocations",
@@ -1376,6 +1384,8 @@ mod tests {
             "imc",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
+            "next_unmodifiable_collection",
+            "next_reversed_view",
             "properties",
             "environment",
             "resources",
