@@ -3141,6 +3141,13 @@ pub struct StdHost {
     /// declare a collection return, so a caller that mutates one never shares
     /// its contents with another call site.
     next_neutral_collection: usize,
+    /// The next number of an unmodifiable collection or view
+    /// (`java_immutable.rs`) and of a reversed view (`sequenced.rs`). Never
+    /// their tables' sizes: #226's collector prunes those tables, so a size
+    /// would hand a new view the number of a live one, and with it that
+    /// view's contents (#243's review).
+    next_unmodifiable_collection: usize,
+    next_reversed_view: usize,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -3275,6 +3282,8 @@ impl StdHost {
             next_fabric_event: 0,
             next_iterator: 0,
             next_neutral_collection: 0,
+            next_unmodifiable_collection: 0,
+            next_reversed_view: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
