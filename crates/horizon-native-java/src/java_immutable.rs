@@ -277,8 +277,9 @@ impl StdHost {
         let marker = crate::jar_object::collection_key_for(
             class,
             crate::jar_object::CollectionFamily::Immutable,
-            self.unmodifiable_collections.len(),
+            self.next_unmodifiable_collection,
         );
+        self.next_unmodifiable_collection += 1;
         self.mutable_collections.insert(marker.clone(), values);
         self.unmodifiable_collections.insert(marker.clone(), None);
         crate::jar_object::collection(marker)
@@ -290,11 +291,14 @@ impl StdHost {
     pub(crate) fn unmodifiable_view(&mut self, kind: &str, source_value: &Value) -> Option<Value> {
         let source = expect_ref(source_value)?.clone();
         let source_class = crate::jar_object::object_class(source_value);
+        // A counter that never moves back: the collector shrinks the table, so its size
+        // would hand a new view a live one's key (#249).
         let marker = crate::jar_object::collection_key_for(
             view_class(kind, source_class),
             crate::jar_object::CollectionFamily::Immutable,
-            self.unmodifiable_collections.len(),
+            self.next_unmodifiable_collection,
         );
+        self.next_unmodifiable_collection += 1;
         self.unmodifiable_collections
             .insert(marker.clone(), Some(source));
         Some(crate::jar_object::collection(marker))
