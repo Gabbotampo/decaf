@@ -128,7 +128,7 @@ impl<H: Host> Runtime<'_, H> {
                         unique.push(value);
                     }
                 }
-                Ok(Some(collection_value("set", &unique)))
+                Ok(Some(self.factory_or_count(r, "set", unique)?))
             }
             "com/google/common/collect/ImmutableSet"
             | "com/google/common/collect/ImmutableMap"
@@ -167,14 +167,17 @@ impl<H: Host> Runtime<'_, H> {
             | "com/google/common/collect/Multimap"
             | "com/google/common/collect/SetMultimap"
             | "com/google/common/collect/ListMultimap" => self.invoke_multimap(r, receiver, args),
-            // `Maps.newConcurrentMap()` is a mutable map. The bounded runtime
-            // is single-threaded, so the host's ordinary map marker is the
-            // same object graph; concurrency has no second thread to serve.
+            // `Maps.newConcurrentMap()` is a new `ConcurrentHashMap`. The
+            // bounded runtime is single-threaded: no second thread to serve.
             "com/google/common/collect/Maps"
                 if r.name == "newConcurrentMap"
                     && r.descriptor == "()Ljava/util/concurrent/ConcurrentMap;" =>
             {
-                Ok(Some(collection_value("map", &[])))
+                Ok(Some(self.new_host_collection(
+                    "java/util/concurrent/ConcurrentHashMap",
+                    Vec::new(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?))
             }
             "com/google/common/collect/MapMaker" => self.invoke_map_maker(r, receiver, args),
             _ => Ok(None),
@@ -213,7 +216,7 @@ impl<H: Host> Runtime<'_, H> {
                     unique.push(value);
                 }
             }
-            return Ok(Some(collection_value("set", &unique)));
+            return Ok(Some(self.factory_or_count(r, "set", unique)?));
         }
         if !values.len().is_multiple_of(2) {
             return Ok(None);
@@ -243,7 +246,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
-        Ok(Some(collection_value("map", &values)))
+        Ok(Some(self.factory_or_count(r, "map", values)?))
     }
 
     /// `Suppliers.memoize(s)` (and `memoizeWithExpiration`, whose expiry a
@@ -885,7 +888,12 @@ impl<H: Host> Runtime<'_, H> {
                         present.push(key);
                     }
                 }
-                collection_value("set", &present)
+                // The multimap's key view, which a new set stands in for.
+                self.new_host_collection(
+                    crate::runtime::stand_in_class("set"),
+                    present,
+                    (&r.owner, &r.name, &r.descriptor),
+                )?
             }
             ("values", "()Ljava/util/Collection;") => {
                 let mut all = Vec::new();
@@ -893,7 +901,12 @@ impl<H: Host> Runtime<'_, H> {
                     let collection = self.host.invoke_instance(&get, &map, &[key])?;
                     all.extend(runtime_collection_values(&*self.host, &collection)?);
                 }
-                collection_value("list", &all)
+                // The multimap's values view, which a new list stands in for.
+                self.new_host_collection(
+                    crate::runtime::stand_in_class("list"),
+                    all,
+                    (&r.owner, &r.name, &r.descriptor),
+                )?
             }
             ("asMap", "()Ljava/util/Map;") => map,
             ("clear", "()V") => {
@@ -1001,9 +1014,12 @@ impl<H: Host> Runtime<'_, H> {
                 answer()
             }
             ("makeMap", "()Ljava/util/concurrent/ConcurrentMap;") => {
-                // A concurrent map is the single-threaded runtime's map model:
-                // the same object graph, with no second thread to serve.
-                Ok(Some(collection_value("map", &[])))
+                // A new `ConcurrentHashMap` (no second thread to serve).
+                Ok(Some(self.new_host_collection(
+                    "java/util/concurrent/ConcurrentHashMap",
+                    Vec::new(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?))
             }
             ("toString", "()Ljava/lang/String;") => {
                 let mut out = String::from("MapMaker{");

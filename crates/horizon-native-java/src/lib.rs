@@ -12135,20 +12135,6 @@ fn thrown_from_supplied(value: Value) -> NativeError {
     }
 }
 
-fn collection_value(kind: &str, values: &[Value]) -> Value {
-    let values = values
-        .iter()
-        .map(value_marker)
-        .collect::<Vec<_>>()
-        .join(",");
-    Value::Ref(Some(if values.is_empty() {
-        kind.to_owned()
-    } else {
-        // No literal spells a jar object's key (`jar_object::unspell_key`).
-        jar_object::unspell_key(format!("{kind}/{values}"))
-    }))
-}
-
 fn map_entry_value(key: &Value, value: &Value) -> Value {
     Value::Ref(Some(format!(
         "map-entry/{},{}",

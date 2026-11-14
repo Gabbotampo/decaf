@@ -2758,6 +2758,27 @@ pub trait Host {
         None
     }
 
+    /// A new collection of the JDK class `class` holding `values`: an object
+    /// of its own the host keeps (`StdHost::new_collection`, #156 P14d), for a
+    /// host that models collections. `None` for one that does not: the caller
+    /// counts its call, never answering with text.
+    fn make_collection(&mut self, _class: &str, _values: Vec<Value>) -> Option<Value> {
+        None
+    }
+
+    /// The collection of `class` an object `of` keeps as its member
+    /// `member` (a field a getter answers): the same object on every call,
+    /// holding `values` when first made (`StdHost::cached_collection`).
+    fn owned_collection(
+        &mut self,
+        _of: &Value,
+        _member: &str,
+        _class: &str,
+        _values: Vec<Value>,
+    ) -> Option<Value> {
+        None
+    }
+
     /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
     /// from `offset`) holding `values`: a fixed-size view that the runtime
     /// keeps in step with the array (`array_views.rs`), for a host that
@@ -3494,7 +3515,7 @@ impl StdHost {
     /// Cached by `of`'s identity ([`cache_identity`]): a value with none (a
     /// `null`) gets a new object each time, never one shared by every such
     /// receiver.
-    fn cached_collection(
+    pub(crate) fn cached_collection(
         &mut self,
         of: &Value,
         member: &str,
@@ -5116,6 +5137,20 @@ impl Host for StdHost {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         Some(self.empty_collection(kind))
+    }
+
+    fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
+        Some(StdHost::new_collection(self, class, values))
+    }
+
+    fn owned_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        Some(self.cached_collection(of, member, class, false, values))
     }
 
     fn array_view(
@@ -6745,7 +6780,7 @@ impl Host for StdHost {
         // A Fabric mod container's origin (`mod_origin.rs`); also reached
         // through `String.valueOf`/`"" + origin`, which asks this host for the
         // object's modelled `toString`.
-        if let Some(value) = mod_origin::invoke(r, Some(receiver), args)? {
+        if let Some(value) = mod_origin::invoke(r, Some(receiver), args, self)? {
             return Ok(value);
         }
         // The command dispatcher, builders, nodes and a running command's
@@ -11637,7 +11672,7 @@ fn cache_identity(value: &Value) -> Option<String> {
 /// The class a host collection of `kind` stands in as where Java's own class
 /// is not modelled (a map's `keySet()` is a `HashMap$KeySet` on a JVM), as
 /// the text literals reported it.
-fn stand_in_class(kind: &str) -> &'static str {
+pub(crate) fn stand_in_class(kind: &str) -> &'static str {
     match kind {
         "map" => "java/util/LinkedHashMap",
         "set" => "java/util/LinkedHashSet",
@@ -12101,20 +12136,6 @@ fn thrown_from_supplied(value: Value) -> NativeError {
             frame: None,
         },
     }
-}
-
-fn collection_value(kind: &str, values: &[Value]) -> Value {
-    let values = values
-        .iter()
-        .map(value_marker)
-        .collect::<Vec<_>>()
-        .join(",");
-    Value::Ref(Some(if values.is_empty() {
-        kind.to_owned()
-    } else {
-        // No literal spells a jar object's key (`jar_object::unspell_key`).
-        jar_object::unspell_key(format!("{kind}/{values}"))
-    }))
 }
 
 fn map_entry_value(key: &Value, value: &Value) -> Value {
@@ -19827,58 +19848,6 @@ fn gson_json_depth(json: &serde_json::Value, depth: usize) -> usize {
     }
 }
 
-fn gson_json_value(json: &serde_json::Value, class: &str) -> Result<Value, NativeError> {
-    if matches!(json, serde_json::Value::Null) {
-        return Ok(Value::Ref(None));
-    }
-    if class.starts_with('[') {
-        return match json {
-            serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON array for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    if gson_list_target(class) {
-        return match json {
-            serde_json::Value::Array(values) => Ok(gson_json_collection(
-                values,
-                class,
-                if gson_set_target(class) {
-                    "set"
-                } else {
-                    "list"
-                },
-            )?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON array for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    if gson_map_target(class) {
-        return match json {
-            serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON object for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    match json {
-        serde_json::Value::Bool(value) => Ok(match class {
-            "java/lang/String" => Value::Ref(Some(value.to_string())),
-            _ => Value::Int(i32::from(*value)),
-        }),
-        serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
-        serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
-        serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
-        serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
-        serde_json::Value::Null => Ok(Value::Ref(None)),
-    }
-}
-
 fn gson_list_target(class: &str) -> bool {
     is_collection_owner(class) && !is_map_owner(class)
 }
@@ -19929,31 +19898,148 @@ fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
     }
 }
 
-fn gson_json_collection(
-    values: &[serde_json::Value],
-    class: &str,
-    kind: &str,
-) -> Result<Value, NativeError> {
-    let mut materialized = Vec::with_capacity(values.len());
-    for value in values {
-        materialized.push(gson_json_value(value, "java/lang/Object")?);
+/// The JDK class Gson 2.x builds for a collection or map target: the
+/// target's own class when it is a concrete JDK collection, else its default
+/// (`ArrayList`, `LinkedHashSet`; for a map `LinkedTreeMap`, which no model
+/// holds, so `LinkedHashMap` stands in: the same insertion order).
+fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
+    const CONCRETE: &[&str] = &[
+        "java/util/ArrayList",
+        "java/util/LinkedList",
+        "java/util/HashSet",
+        "java/util/LinkedHashSet",
+        "java/util/TreeSet",
+        "java/util/HashMap",
+        "java/util/LinkedHashMap",
+        "java/util/TreeMap",
+        "java/util/concurrent/ConcurrentHashMap",
+    ];
+    if CONCRETE.contains(&class) {
+        return class;
     }
-    // The target element type is not resolved (that needs the declared type
-    // arguments); the JSON shape still round-trips through the collection
-    // markers. Keep the array's own class visible in the error path only.
-    let _ = class;
-    Ok(collection_value(kind, &materialized))
+    match kind {
+        "set" => "java/util/LinkedHashSet",
+        "map" => "java/util/LinkedHashMap",
+        _ => "java/util/ArrayList",
+    }
 }
 
-fn gson_json_map(
-    values: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Value, NativeError> {
-    let mut materialized = Vec::with_capacity(values.len() * 2);
-    for (key, value) in values {
-        materialized.push(Value::Ref(Some(key.clone())));
-        materialized.push(gson_json_value(value, "java/lang/Object")?);
+/// The call a Gson collection is made for, counted on a host that makes none.
+const GSON_FROM_JSON: (&str, &str, &str) = (
+    "com/google/gson/Gson",
+    "fromJson",
+    "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
+);
+
+impl<H: Host> Runtime<'_, H> {
+    /// Gson's value for `json` read as `class`: a collection, map or array
+    /// is an object of its own (#156 P14d2), never text.
+    fn gson_json_value(
+        &mut self,
+        json: &serde_json::Value,
+        class: &str,
+    ) -> Result<Value, NativeError> {
+        if matches!(json, serde_json::Value::Null) {
+            return Ok(Value::Ref(None));
+        }
+        if class.starts_with('[') {
+            return match json {
+                serde_json::Value::Array(values) => self.gson_json_array(values, class),
+                other => Err(NativeError::Metadata(format!(
+                    "Gson.fromJson expected a JSON array for {class}, got {}",
+                    gson_json_kind(other)
+                ))),
+            };
+        }
+        if gson_list_target(class) {
+            return match json {
+                serde_json::Value::Array(values) => self.gson_json_collection(
+                    values,
+                    class,
+                    if gson_set_target(class) {
+                        "set"
+                    } else {
+                        "list"
+                    },
+                ),
+                other => Err(NativeError::Metadata(format!(
+                    "Gson.fromJson expected a JSON array for {class}, got {}",
+                    gson_json_kind(other)
+                ))),
+            };
+        }
+        if gson_map_target(class) {
+            return match json {
+                serde_json::Value::Object(values) => self.gson_json_map(values, class),
+                other => Err(NativeError::Metadata(format!(
+                    "Gson.fromJson expected a JSON object for {class}, got {}",
+                    gson_json_kind(other)
+                ))),
+            };
+        }
+        match json {
+            serde_json::Value::Bool(value) => Ok(match class {
+                "java/lang/String" => Value::Ref(Some(value.to_string())),
+                _ => Value::Int(i32::from(*value)),
+            }),
+            serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
+            serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
+            serde_json::Value::Array(values) => self.gson_json_collection(values, class, "list"),
+            serde_json::Value::Object(values) => self.gson_json_map(values, class),
+            serde_json::Value::Null => Ok(Value::Ref(None)),
+        }
     }
-    Ok(collection_value("map", &materialized))
+
+    /// A JSON array read as the array class `class`: an array of that class.
+    fn gson_json_array(
+        &mut self,
+        values: &[serde_json::Value],
+        class: &str,
+    ) -> Result<Value, NativeError> {
+        let mut materialized = Vec::with_capacity(values.len());
+        for value in values {
+            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
+        }
+        Ok(self.new_array_value(class, materialized))
+    }
+
+    /// A JSON array read as the collection `class` (`kind`: `list`/`set`).
+    /// The element type is not resolved (that needs the declared type
+    /// arguments): elements read as `Object`.
+    fn gson_json_collection(
+        &mut self,
+        values: &[serde_json::Value],
+        class: &str,
+        kind: &str,
+    ) -> Result<Value, NativeError> {
+        let mut materialized = Vec::with_capacity(values.len());
+        for value in values {
+            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
+        }
+        self.new_host_collection(
+            gson_collection_class(class, kind),
+            materialized,
+            GSON_FROM_JSON,
+        )
+    }
+
+    /// A JSON object read as the map `class`: its members in order.
+    fn gson_json_map(
+        &mut self,
+        values: &serde_json::Map<String, serde_json::Value>,
+        class: &str,
+    ) -> Result<Value, NativeError> {
+        let mut materialized = Vec::with_capacity(values.len() * 2);
+        for (key, value) in values {
+            materialized.push(Value::Ref(Some(key.clone())));
+            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
+        }
+        self.new_host_collection(
+            gson_collection_class(class, "map"),
+            materialized,
+            GSON_FROM_JSON,
+        )
+    }
 }
 
 fn gson_json_kind(json: &serde_json::Value) -> &'static str {
@@ -23999,7 +24085,7 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.gson_materialize(&json, &class, style)? {
             return Ok(value);
         }
-        gson_json_value(&json, &class)
+        self.gson_json_value(&json, &class)
     }
 
     /// The erased runtime type a `TypeToken` names.
@@ -24129,37 +24215,29 @@ impl<H: Host> Runtime<'_, H> {
                 },
                 _ => return Ok(None),
             },
-            "Ljava/util/List;"
+            // A collection or map field: Gson's own class for it (#156 P14d2).
+            descriptor @ ("Ljava/util/List;"
             | "Ljava/util/Collection;"
             | "Ljava/util/ArrayList;"
-            | "Ljava/util/LinkedList;" => match json {
+            | "Ljava/util/LinkedList;") => match json {
                 serde_json::Value::Array(values) => {
-                    let mut materialized = Vec::with_capacity(values.len());
-                    for value in values {
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("list", &materialized)
+                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "list")?
                 }
                 _ => return Ok(None),
             },
-            "Ljava/util/Set;" | "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;" => match json {
+            descriptor @ ("Ljava/util/Set;"
+            | "Ljava/util/HashSet;"
+            | "Ljava/util/LinkedHashSet;") => match json {
                 serde_json::Value::Array(values) => {
-                    let mut materialized = Vec::with_capacity(values.len());
-                    for value in values {
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("set", &materialized)
+                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "set")?
                 }
                 _ => return Ok(None),
             },
-            "Ljava/util/Map;" | "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" => match json {
+            descriptor @ ("Ljava/util/Map;"
+            | "Ljava/util/HashMap;"
+            | "Ljava/util/LinkedHashMap;") => match json {
                 serde_json::Value::Object(values) => {
-                    let mut materialized = Vec::with_capacity(values.len() * 2);
-                    for (key, value) in values {
-                        materialized.push(Value::Ref(Some(key.clone())));
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("map", &materialized)
+                    self.gson_json_map(values, &descriptor[1..descriptor.len() - 1])?
                 }
                 _ => return Ok(None),
             },
@@ -24887,7 +24965,7 @@ impl<H: Host> Runtime<'_, H> {
         let values = self.stream_output(receiver, &r.name)?;
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // `Stream.toList()`: an unmodifiable `ListN` that allows `null`.
-            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values),
+            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values)?,
             ("toArray", "()[Ljava/lang/Object;") => {
                 self.new_array_value("[Ljava/lang/Object;", values)
             }
@@ -24899,7 +24977,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match builtin {
                     // `ArrayList::new`, `List::add`: a list of its own.
-                    host_collector::Builtin::List => self.new_array_list(values),
+                    host_collector::Builtin::List => self.new_array_list(values)?,
                     builtin @ (host_collector::Builtin::UnmodifiableList
                     | host_collector::Builtin::ImmutableList) => {
                         if values.contains(&Value::Ref(None)) {
@@ -24915,10 +24993,10 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             ("com/google/common/collect/ImmutableList", "toImmutableList")
                         };
-                        let fallback = collection_value("list", &values);
-                        self.host
-                            .factory_collection(owner, name, "list", values)
-                            .unwrap_or(fallback)
+                        match self.host.factory_collection(owner, name, "list", values) {
+                            Some(list) => list,
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     // `HashSet::new` (`hash_bulk.rs`).
                     host_collector::Builtin::Set => self.hash_set_collect(&values)?,
@@ -24934,15 +25012,15 @@ impl<H: Host> Runtime<'_, H> {
                             });
                         }
                         let kept = self.distinct_in_order(&values)?;
-                        let fallback = collection_value("set", &kept);
-                        self.host
-                            .factory_collection(
-                                "com/google/common/collect/ImmutableSet",
-                                "toImmutableSet",
-                                "set",
-                                kept,
-                            )
-                            .unwrap_or(fallback)
+                        match self.host.factory_collection(
+                            "com/google/common/collect/ImmutableSet",
+                            "toImmutableSet",
+                            "set",
+                            kept,
+                        ) {
+                            Some(set) => set,
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     // `Set.of(toSet().toArray())` (`immutable_collections.rs`).
                     host_collector::Builtin::UnmodifiableSet => {
@@ -26574,9 +26652,10 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        mod_origin::invoke(&r, receiver.as_ref(), &args, &mut *self.host)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

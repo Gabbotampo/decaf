@@ -527,15 +527,22 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // The stream's elements through the host's iterator table, the
             // same iterator a `List.iterator()` over them answers.
-            ("iterator", "()Ljava/util/Iterator;") => self.host.invoke_instance(
-                &MethodRef {
-                    owner: "java/util/List".into(),
-                    name: "iterator".into(),
-                    descriptor: "()Ljava/util/Iterator;".into(),
-                },
-                &super::collection_value("list", values),
-                &[],
-            )?,
+            ("iterator", "()Ljava/util/Iterator;") => {
+                let list = self.new_host_collection(
+                    "java/util/ArrayList",
+                    values.to_vec(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?;
+                self.host.invoke_instance(
+                    &MethodRef {
+                        owner: "java/util/List".into(),
+                        name: "iterator".into(),
+                        descriptor: "()Ljava/util/Iterator;".into(),
+                    },
+                    &list,
+                    &[],
+                )?
+            }
             ("sum", "()I") => Value::Int(
                 values
                     .iter()

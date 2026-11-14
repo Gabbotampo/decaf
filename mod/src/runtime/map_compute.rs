@@ -43,7 +43,8 @@ impl<H: Host> Runtime<'_, H> {
                 let (key, value) = map_entry_parts(&entry)?;
                 pairs.extend([key, value]);
             }
-            return Ok(Some(collection_value("map", &pairs)));
+            // `Map.ofEntries`: Java's `Map1`/`MapN` (#156 P14d2).
+            return Ok(Some(self.factory_or_count(r, "map", pairs)?));
         }
         if r.name != "computeIfAbsent"
             || r.descriptor != "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;"
