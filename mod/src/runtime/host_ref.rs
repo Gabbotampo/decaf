@@ -1064,8 +1064,13 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::DeferredRegister,
         tag: "dreg",
-        // The class `create` made: `new DeferredRegister(..)` (26.3.0.101).
-        class: ClassRule::FromKey(crate::runtime::host_deferred_register::register_class),
+        // `create` makes exactly its class (`new DeferredRegister(..)`, 26.3.0.101), but this
+        // model has no `Class` surface for NeoForge's classes (simple name, superclass,
+        // `isAssignableFrom`), so `getClass()` stays counted (#244 review B1); `instanceof`
+        // answers from the class the key names.
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_deferred_register::declared_types,
+        },
         // A serial per `create` call: one key, one object.
         canonical: always_canonical,
         methods: &crate::runtime::host_deferred_register::REGISTER_METHODS,

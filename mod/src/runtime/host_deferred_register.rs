@@ -8,7 +8,8 @@
 //! each register is now a handle of its own ([`HostKind::DeferredRegister`]).
 //!
 //! The key is `<class>@<serial>@<text>`: the class `create` made
-//! (`DeferredRegister`, `DeferredRegister$DataComponents`, Forge's), one serial
+//! (`DeferredRegister`, `DeferredRegister$DataComponents`, Forge's; `instanceof` answers from
+//! it, while `getClass()` is counted, as this model has no `Class` surface for those classes), one serial
 //! per call, and the old text, which still names the register in the
 //! registration rows the game reads (`RegistryEntry::registry`) and in the
 //! attachment bridge (`neoforge_attachments.rs`). Only the runtime makes such a
@@ -62,6 +63,15 @@ pub(crate) fn parts(value: &Value) -> Option<(&str, &str)> {
 /// The class a register's key names.
 pub(crate) fn register_class(key: &str) -> &str {
     key.split('@').next().unwrap_or(NEOFORGE)
+}
+
+/// The types a register surely is: its class and, for `DataComponents`, `DeferredRegister`.
+pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
+    match register_class(key) {
+        DATA_COMPONENTS => &[DATA_COMPONENTS, NEOFORGE],
+        FORGE => &[FORGE],
+        _ => &[NEOFORGE],
+    }
 }
 
 /// `instanceof` a register: its class and `DataComponents`' superclass are

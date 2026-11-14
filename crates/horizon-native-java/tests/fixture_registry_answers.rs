@@ -223,18 +223,45 @@ fn run(fixture: &javac_fixture::Fixture, method: &str) -> (String, Vec<(String, 
 }
 
 /// Each `DeferredRegister.create` is a new register (`new DeferredRegister`,
-/// whose `equals` is `Object`'s) holding only what was registered through it,
-/// of the class `create` made; a `String` spelled like a register's old text
-/// is no register. Two `create` calls for one registry and namespace were one
-/// `String` sharing one entry list (#182 P1).
+/// whose `equals` is `Object`'s) holding only what was registered through it;
+/// a `String` spelled like a register's old text is no register. Two `create`
+/// calls for one registry and namespace were one `String` sharing one entry
+/// list (#182 P1).
 #[test]
 fn each_create_is_a_register_of_its_own() {
     let fixture = fixture("registry-answers-registers");
-    for method in ["registers", "registerClass", "spelledRegister"] {
+    for method in ["registers", "spelledRegister"] {
         let (text, unknown) = run(&fixture, method);
         assert_eq!(text, expected(method), "{method}: {unknown:?}");
         assert!(unknown.is_empty(), "{method}: {unknown:?}");
     }
+}
+
+/// A register's `getClass()` is counted: this model has no `Class` surface for
+/// NeoForge's register classes (Java 25: `DeferredRegister`, whose
+/// `DataComponents` subclass's simple name is `DataComponents` and superclass
+/// `DeferredRegister`), so an exact `Class` would answer its members silently
+/// wrong (#244 review B1).
+#[test]
+fn a_registers_class_is_counted() {
+    let fixture = fixture("registry-answers-register-class");
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // A counted call answers `null`: the probe's `getName()` on it then throws.
+    let _ = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "registerClass",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    let unknown = host.unknown_host_calls();
+    assert!(
+        unknown
+            .iter()
+            .any(|(call, _)| call.ends_with("#getClass()Ljava/lang/Class;")),
+        "{unknown:?}"
+    );
 }
 
 /// `getEntries()` is NeoForge's `entriesView`: one `UnmodifiableSet` per
