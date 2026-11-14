@@ -122,7 +122,12 @@ impl<H: Host> Runtime<'_, H> {
         let class = self.host_collection_class(value)?;
         let rules = match class.as_str() {
             "java/util/ArrayList" => ARRAY_LIST,
-            "java/util/LinkedList" | "java/util/Vector" | "java/util/Stack" => ABSTRACT_LIST,
+            // `Arrays.asList`'s fixed-size view (`array_views.rs`).
+            "java/util/LinkedList"
+            | "java/util/Vector"
+            | "java/util/Stack"
+            | crate::array_views::CLASS
+            | crate::array_views::WINDOW_CLASS => ABSTRACT_LIST,
             "java/util/concurrent/CopyOnWriteArrayList" => COPY_ON_WRITE,
             // The unmodifiable lists that own their elements, each the class
             // Java makes (`java_immutable.rs`). Only `List.of`/`List.copyOf`
@@ -204,6 +209,17 @@ impl<H: Host> Runtime<'_, H> {
                 }
             ),
         }
+    }
+
+    /// `AbstractCollection`'s search for `needle` in `elements` (`o == null ?
+    /// e == null : o.equals(e)`, in order), for a list whose rules are
+    /// `AbstractList`'s (`array_views.rs`).
+    pub(crate) fn abstract_list_index_of(
+        &mut self,
+        elements: &[Value],
+        needle: &Value,
+    ) -> Result<i32, NativeError> {
+        self.list_index_of(ABSTRACT_LIST, elements, needle, false)
     }
 
     /// `list.indexOf(o)` (`last` for `lastIndexOf`) under `rules`.

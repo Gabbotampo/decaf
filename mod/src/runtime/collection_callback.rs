@@ -44,7 +44,7 @@ use crate::runtime::{
 };
 
 /// `java/util/function/Consumer.accept`.
-const ACCEPT_OBJECT: (&str, &str, &str) = (
+pub(crate) const ACCEPT_OBJECT: (&str, &str, &str) = (
     "java/util/function/Consumer",
     "accept",
     "(Ljava/lang/Object;)V",

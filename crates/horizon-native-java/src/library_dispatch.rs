@@ -150,9 +150,10 @@ impl<H: Host> Runtime<'_, H> {
                 let key = self.fields.get(&format!("{registry}{KEY_FIELD}"))?;
                 let id = crate::host_ids::named_id(key)?;
                 // A `MappedRegistry` (or its defaulted subclass) the jar built:
-                // `buildAndRegister` answers the registry handle for its id
-                // (not the jar's own object: #177 review P4, filed).
-                Some(crate::fabric_registry::builder(
+                // `buildAndRegister` answers the registry handle for its id,
+                // which later `Registry.register` calls name, and counts it,
+                // because it is not the jar's own object (#182 P4).
+                Some(crate::fabric_registry::stand_in_builder(
                     crate::host_registry::built_registry(crate::host_registry::MAPPED, &id),
                 ))
             }
@@ -1108,10 +1109,9 @@ impl<H: Host> Runtime<'_, H> {
     /// `ImmutableCollections.listOf(Collection)` is
     /// `unmodifiableList(asList(c.toArray().clone()))`). The host held no
     /// `toArray` and kept the whole array as `asList`'s single element, so
-    /// the copy lost every element. `asList` answers a list holding the
-    /// array's elements at the time of the call; a later write through the
-    /// view does not reach the array (the list is a copy, not the JVM's
-    /// write-through view).
+    /// the copy lost every element. `asList` answers the JDK's fixed-size
+    /// view over the array, which writes through both ways
+    /// (`array_views.rs`).
     fn invoke_array_views(
         &mut self,
         r: &MethodRef,
@@ -1122,14 +1122,10 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "asList"
             && r.descriptor == "([Ljava/lang/Object;)Ljava/util/List;"
         {
-            let Some(array) = args
-                .first()
-                .filter(|value| self.owned_array(value).is_some())
-            else {
+            let Some(array) = args.first() else {
                 return Ok(None);
             };
-            let values = self.array(array)?.clone();
-            return Ok(Some(collection_value("list", &values)));
+            return self.as_list(r, array).map(Some);
         }
         if r.name != "toArray"
             || !is_collection_owner(&r.owner)
@@ -1194,6 +1190,10 @@ impl<H: Host> Runtime<'_, H> {
                     *slot = value.clone();
                 }
             }
+            if let Some(key) = target.as_ref().and_then(host_array::array_key) {
+                let key = key.to_owned();
+                self.push_array_views(&key);
+            }
             return Err(error);
         }
         // `toArray(T[] a)` fills `a` when it is large enough and nulls the
@@ -1210,6 +1210,10 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(after) = slots.get_mut(length) {
                 *after = Value::Ref(None);
+            }
+            if let Some(key) = host_array::array_key(&target) {
+                let key = key.to_owned();
+                self.push_array_views(&key);
             }
             return Ok(Some(target));
         }

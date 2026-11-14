@@ -179,6 +179,8 @@ impl<H: Host> Runtime<'_, H> {
             return self.host.unknown_operand_call(r).map(Some);
         };
         target[dst_pos..dst_pos + length].clone_from_slice(&slice);
+        let dst_key = dst_key.to_owned();
+        self.push_array_views(&dst_key);
         match error {
             Some(error) => Err(error),
             None => Ok(Some(Value::Void)),

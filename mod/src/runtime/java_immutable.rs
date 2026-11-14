@@ -244,7 +244,32 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/io/Serializable",
     ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
+    // `Arrays$ArrayList extends AbstractList implements RandomAccess,
+    // Serializable` (`array_views.rs`).
+    const ARRAYS_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/io/Serializable",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
+    // `AbstractList$RandomAccessSubList extends SubList (extends AbstractList)
+    // implements RandomAccess`: no `Serializable`.
+    const SUB_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/RandomAccess",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
     match class {
+        crate::runtime::array_views::CLASS => ARRAYS_LIST,
+        crate::runtime::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
         | "java/util/Collections$UnmodifiableRandomAccessList"
@@ -283,6 +308,25 @@ impl StdHost {
         self.mutable_collections.insert(marker.clone(), values);
         self.unmodifiable_collections.insert(marker.clone(), None);
         crate::runtime::jar_object::collection(marker)
+    }
+
+    /// `Collections.unmodifiable{List,Set,Map}(source)` (`kind` `list`, `set`
+    /// or `map`): a new view reading `source` live. `None` when `source` is no
+    /// object.
+    pub(crate) fn unmodifiable_view(&mut self, kind: &str, source_value: &Value) -> Option<Value> {
+        let source = expect_ref(source_value)?.clone();
+        let source_class = crate::runtime::jar_object::object_class(source_value);
+        // A counter that never moves back: the collector shrinks the table, so its size
+        // would hand a new view a live one's key (#249).
+        let marker = crate::runtime::jar_object::collection_key_for(
+            view_class(kind, source_class),
+            crate::runtime::jar_object::CollectionFamily::Immutable,
+            self.next_unmodifiable_collection,
+        );
+        self.next_unmodifiable_collection += 1;
+        self.unmodifiable_collections
+            .insert(marker.clone(), Some(source));
+        Some(crate::runtime::jar_object::collection(marker))
     }
 
     /// What the factory `owner.name` answers for `values`: the class Java
@@ -487,18 +531,7 @@ impl StdHost {
                     "unmodifiableMap" => "map",
                     _ => return None,
                 };
-                let source_value = args.first()?;
-                let source = expect_ref(source_value)?.clone();
-                let source_class = crate::runtime::jar_object::object_class(source_value);
-                let marker = crate::runtime::jar_object::collection_key_for(
-                    view_class(kind, source_class),
-                    crate::runtime::jar_object::CollectionFamily::Immutable,
-                    self.next_unmodifiable_collection,
-                );
-                self.next_unmodifiable_collection += 1;
-                self.unmodifiable_collections
-                    .insert(marker.clone(), Some(source));
-                return Some(Ok(crate::runtime::jar_object::collection(marker)));
+                return self.unmodifiable_view(kind, args.first()?).map(Ok);
             }
             _ => return None,
         };

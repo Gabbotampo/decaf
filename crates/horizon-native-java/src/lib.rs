@@ -17,6 +17,7 @@ mod annotation_values;
 mod array_copy;
 mod array_deque;
 mod array_store;
+mod array_views;
 mod attachment_codec;
 mod block_item_id;
 mod boxed;
@@ -79,6 +80,7 @@ mod host_component;
 mod host_config;
 #[cfg(test)]
 mod host_defaults_tests;
+mod host_deferred_register;
 mod host_entry;
 mod host_events;
 mod host_executors;
@@ -2294,6 +2296,11 @@ pub trait Host {
         let _ = receiver;
         self.get_static(r)
     }
+    /// What this host's own description of the object keyed `key` says about `wanted`
+    /// (`ClassHierarchy::described_instance_of`); `None` for a host that describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -2767,6 +2774,40 @@ pub trait Host {
         None
     }
 
+    /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
+    /// from `offset`) holding `values`: a fixed-size view that the runtime
+    /// keeps in step with the array (`array_views.rs`), for a host that
+    /// models one.
+    fn array_view(
+        &mut self,
+        _array: &str,
+        _offset: usize,
+        _values: Vec<Value>,
+        _window: bool,
+    ) -> Option<Value> {
+        None
+    }
+
+    /// The array `marker` views, where its part starts, how long it is, and
+    /// whether it is a `subList`; `None` for anything but a view.
+    fn array_view_of(&self, _marker: &str) -> Option<(String, usize, usize, bool)> {
+        None
+    }
+
+    /// Whether some view mirrors the array `array`.
+    fn has_array_views(&self, _array: &str) -> bool {
+        false
+    }
+
+    /// The runtime wrote the array `array`, which now holds `values`.
+    fn array_written(&mut self, _array: &str, _values: &[Value]) {}
+
+    /// Each view written since its last sync: its array, where its part
+    /// starts, and the part now.
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
+        Vec::new()
+    }
+
     /// A new unmodifiable list (`ImmutableCollections.ListN`) holding
     /// `values`, for a host that models one.
     fn unmodifiable_list(&mut self, _values: Vec<Value>) -> Option<Value> {
@@ -3006,9 +3047,13 @@ pub struct StdHost {
     /// marker. A constructor answers `void`, so this is where the id lives.
     identifier_objects: BTreeMap<String, String>,
     /// What each `DeferredRegister.create` was made from (registry key,
-    /// namespace), by the register's marker; `None` when two registers share
-    /// the marker or the namespace was not text (`host_ids.rs`).
+    /// namespace), by the register handle's key; `None` when the namespace
+    /// was not text (`host_ids.rs`).
     deferred_registers: BTreeMap<String, Option<(Value, String)>>,
+    /// The registries this jar built and registered itself
+    /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
+    /// every entry the host saw registered (`registry_contents.rs`).
+    jar_registries: BTreeSet<String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3044,6 +3089,8 @@ pub struct StdHost {
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
     cached_collections: BTreeMap<(String, String), String>,
+    /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
+    array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
     /// ones (`java_immutable.rs`); `list_equality.rs` runs their
     /// null-hostile `List12`/`ListN` rules.
@@ -3228,6 +3275,7 @@ impl StdHost {
             packet_types: BTreeMap::new(),
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
+            jar_registries: BTreeSet::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -3241,6 +3289,7 @@ impl StdHost {
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
+            array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
             synchronized_views: BTreeMap::new(),
@@ -5099,6 +5148,32 @@ impl Host for StdHost {
         Some(self.empty_collection(kind))
     }
 
+    fn array_view(
+        &mut self,
+        array: &str,
+        offset: usize,
+        values: Vec<Value>,
+        window: bool,
+    ) -> Option<Value> {
+        Some(self.new_array_view(array, offset, values, window))
+    }
+
+    fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
+        StdHost::array_view_of(self, marker)
+    }
+
+    fn has_array_views(&self, array: &str) -> bool {
+        self.has_array_views_of(array)
+    }
+
+    fn array_written(&mut self, array: &str, values: &[Value]) {
+        StdHost::array_written(self, array, values);
+    }
+
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
+        StdHost::changed_array_views(self)
+    }
+
     fn unmodifiable_list(&mut self, values: Vec<Value>) -> Option<Value> {
         Some(self.unmodifiable_values("list", values))
     }
@@ -5571,12 +5646,13 @@ impl Host for StdHost {
                     Some(key) => key.clone(),
                     None => Value::Ref(None),
                 };
-                self.record_deferred_register(
+                // A new register per call (#182 P1).
+                Ok(self.new_deferred_register(
+                    owner,
                     &marker,
                     &registry_key,
                     args.get(1).and_then(expect_ref),
-                );
-                Ok(Value::Ref(Some(marker)))
+                ))
             }
             ("net/fabricmc/fabric/api/event/EventFactory", "createArrayBacked", descriptor)
                 if descriptor.ends_with("Lnet/fabricmc/fabric/api/event/Event;") =>
@@ -5863,14 +5939,11 @@ impl Host for StdHost {
             ("java/util/OptionalDouble", "of", "(D)Ljava/util/OptionalDouble;") => Ok(
                 optional_double(expect_float(r, Self::argument(r, args, 0)?)?),
             ),
-            // Keep Arrays.asList bounded when the interpreter passes an
-            // opaque array marker. The marker is retained as the list's
-            // single value; expanding runtime-owned array storage here would
-            // cross the host boundary and defeat invocation isolation. Still
-            // a text literal: Java's `Arrays$ArrayList` is fixed-size, which
-            // no collection model enforces yet (#156 P14d2).
+            // `Arrays.asList` is a view the runtime makes over its own array
+            // (`array_views.rs`); an array it does not own has no elements
+            // to show.
             ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") => {
-                Ok(collection_value("list", args))
+                self.unknown_operand_call(r)
             }
             ("java/util/stream/Collectors", "toList", "()Ljava/util/stream/Collector;") => {
                 Ok(host_collector::collector(host_collector::Builtin::List))
@@ -7374,6 +7447,11 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // `Arrays.asList`'s fixed size, before the sequenced members
+            // (its `removeFirst` checks emptiness, then refuses).
+            if let Some(answer) = self.fixed_size_member(r, marker) {
+                return answer;
+            }
             // `getFirst`/`removeFirst`/`reversed()`... on a list, before the
             // unmodifiable check: a view's `removeFirst` checks emptiness first.
             if let Some(answer) = self.sequenced_member(r, receiver, marker, args) {
@@ -8247,6 +8325,11 @@ impl Host for StdHost {
             self.iterators.insert(marker.clone(), (values, 0));
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
+            }
+            // An `Arrays.asList` view's iterator reads its array live.
+            if let Some(view) = expect_ref(receiver) {
+                let view = view.clone();
+                self.note_array_view_iterator(&marker, &view);
             }
             return Ok(host_iterator::iterator(marker));
         }
@@ -9586,7 +9669,8 @@ impl Host for StdHost {
             // `Registry.iterator()` walks the values registered in the
             // registry. The host holds the entries the jar registered
             // (`registry_contents`), not the game's own: the game's entries
-            // have no objects to hand out.
+            // have no objects to hand out, so walking a registry the jar did
+            // not build is counted (#182 P3), and walks the jar's own entries.
             (owner, "iterator", "()Ljava/util/Iterator;")
                 if registry_contents::is_registry_owner(owner)
                     && host_registry::registry_id(receiver).is_some() =>
@@ -9594,6 +9678,9 @@ impl Host for StdHost {
                 let id = host_registry::registry_id(receiver)
                     .unwrap_or_default()
                     .to_owned();
+                if !self.jar_registries.contains(&id) {
+                    self.unknown_host_call(r)?;
+                }
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
@@ -10047,17 +10134,22 @@ impl Host for StdHost {
                     .first()
                     .and_then(expect_ref)
                     .map_or("entry", String::as_str);
-                let register = expect_ref(receiver)
-                    .map_or("deferred-register/registry/default", String::as_str)
-                    .to_owned();
+                // Only a register this runtime made (a `String` spelled like
+                // its text is none): anything else is counted.
+                let Some((register, text)) = host_deferred_register::parts(receiver)
+                    .map(|(key, text)| (key.to_owned(), text.to_owned()))
+                else {
+                    return self.unknown_host_call(r);
+                };
                 // `Identifier.fromNamespaceAndPath(namespace, name)` (Forge:
                 // `new ResourceLocation(modid, name)`): bad text throws here.
                 let forge = r.owner.starts_with("net/minecraftforge/");
                 let made = self.deferred_register_id(forge, &register, id)?;
                 // One holder object per `register` call (`host_registry.rs`).
                 let (holder, value) = self.new_holder(&register, forge, made);
+                self.add_register_entry(receiver, &holder);
                 self.registrations.push(RegistryEntry {
-                    registry: register,
+                    registry: text,
                     id: id.to_owned(),
                     value,
                     declaration: None,
@@ -10069,19 +10161,14 @@ impl Host for StdHost {
                 | "net/minecraftforge/registries/DeferredRegister",
                 "getEntries",
                 "()Ljava/util/Collection;",
-            ) => {
-                // The register's one entries view (`entriesView`), holding
-                // its holders now.
-                let register = expect_ref(receiver).map_or("", String::as_str).to_owned();
-                let holders = self.register_holders(&register);
-                Ok(self.cached_collection(
-                    receiver,
-                    "getEntries",
-                    stand_in_class("list"),
-                    true,
-                    holders,
-                ))
-            }
+            ) => match host_deferred_register::parts(receiver) {
+                Some((register, _)) => {
+                    let register = register.to_owned();
+                    Ok(self.register_entries(receiver, &register))
+                }
+                // No register this runtime made: what it holds is unknown.
+                None => self.unknown_host_call(r),
+            },
             // A holder's `get`/`value`/`isBound`/... are `holder_call`'s
             // (`host_registry.rs`).
             (
@@ -21950,6 +22037,9 @@ impl<H: Host> Runtime<'_, H> {
                         NativeError::Metadata(format!("array index {index} out of bounds"))
                     })?;
                 *slot = StdHost::argument(r, args, 2)?.clone();
+                // An `Arrays.asList` view of it (`array_views.rs`).
+                let marker = marker.to_owned();
+                self.push_array_views(&marker);
                 Value::Void
             }
             ("setInt", "(Ljava/lang/Object;II)V") => {
@@ -25864,6 +25954,7 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(self.new_array_value(&class, vec![Value::Ref(None); length]));
                 }
                 0xbe => {
+                    self.pull_array_views();
                     let array = pop(&mut stack, class, method, at)?;
                     let values = self.array(&array).map_err(|error| {
                         array_operand_error(error, "arraylength", class, method, at)
@@ -25871,6 +25962,9 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(Value::Int(values.len() as i32));
                 }
                 0x2e..=0x35 => {
+                    // An `Arrays.asList` view written since the array was
+                    // last read (`array_views.rs`).
+                    self.pull_array_views();
                     let index = pop_int(&mut stack, class, method, at)?;
                     let array = pop(&mut stack, class, method, at)?;
                     let values = self
@@ -25889,6 +25983,7 @@ impl<H: Host> Runtime<'_, H> {
                     stack.push(invoke_or_catch!(at, loaded));
                 }
                 0x4f..=0x56 => {
+                    self.pull_array_views();
                     let value = pop(&mut stack, class, method, at)?;
                     let index = pop_int(&mut stack, class, method, at)?;
                     let array = pop(&mut stack, class, method, at)?;
@@ -25918,6 +26013,10 @@ impl<H: Host> Runtime<'_, H> {
                         .and_then(|index| values.get_mut(index))
                     {
                         *slot = value;
+                    }
+                    if op == 0x53 {
+                        let marker = marker.to_owned();
+                        self.push_array_views(&marker);
                     }
                 }
                 0xc5 => {
@@ -26176,6 +26275,9 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
                 0xb6..=0xb9 => {
+                    // A call may read an array an `Arrays.asList` view was
+                    // written through (`array_views.rs`).
+                    self.pull_array_views();
                     let i = read_u16(code, &mut pc)?;
                     if op == 0xb9 {
                         // `invokeinterface` carries an argument-count byte and
@@ -26263,6 +26365,12 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
+                    {
+                        // `Arrays.asList`'s view and its windows, before any
+                        // model (`array_views.rs`).
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_owned_class(&r, receiver.as_ref()))
                     {
@@ -34802,8 +34910,12 @@ mandatory = true
         );
     }
 
+    /// `Arrays.asList` is the runtime's view of its own array
+    /// (`array_views.rs`); the host alone holds no array's elements, so it
+    /// counts the call rather than answer a one-element list holding the
+    /// array (#156 P14d2).
     #[test]
-    fn standard_host_maps_arrays_as_list_to_an_opaque_marker() {
+    fn the_host_alone_counts_arrays_as_list() {
         let mut host = StdHost::new();
         let as_list = MethodRef {
             owner: "java/util/Arrays".into(),
@@ -34811,9 +34923,13 @@ mandatory = true
             descriptor: "([Ljava/lang/Object;)Ljava/util/List;".into(),
         };
         let array = host_array::handle("[Ljava/lang/String;#0");
+        host.invoke(&as_list, std::slice::from_ref(&array)).unwrap();
         assert_eq!(
-            host.invoke(&as_list, std::slice::from_ref(&array)).unwrap(),
-            Value::Ref(Some("list/harr:[Ljava/lang/String;#0".into()))
+            host.unknown_host_calls(),
+            [(
+                "java/util/Arrays#asList([Ljava/lang/Object;)Ljava/util/List;".to_owned(),
+                1
+            )]
         );
     }
 

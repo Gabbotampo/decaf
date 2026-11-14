@@ -239,6 +239,9 @@ pub enum HostKind {
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
     /// the registry its `buildAndRegister()` answers (`fabric_registry.rs`).
     RegistryBuilder,
+    /// A NeoForge/Forge `DeferredRegister`: key its class, a serial per
+    /// `create` call and its registration text (`host_deferred_register.rs`).
+    DeferredRegister,
     /// The event a NeoForge/Forge game-event listener receives: key its class
     /// (`host_game_event.rs`).
     GameEvent,
@@ -591,6 +594,12 @@ pub(crate) trait ClassHierarchy {
     fn is_interface(&self, class: &str) -> Option<bool> {
         crate::jdk_closure::class(class).map(|row| row.is_interface)
     }
+
+    /// What the host's own description of the object keyed `key` says about `wanted` (a
+    /// game-hook firing's objects, `game_hooks.rs`); `None` when it describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -756,6 +765,16 @@ pub(crate) fn instance_of_class(
         || declared
             .iter()
             .any(|class| hierarchy.is_instance(class, wanted) == Some(true))
+    {
+        return Some(true);
+    }
+    // The host's description of this very object (a hook firing's `LivingEntity`, a
+    // `DedicatedServer`, a Mixin-added interface): a `yes` it names. Only a game
+    // object is described, and only by its kind and key together: another kind's key
+    // can spell a game object's (a mod version `"game/server"`), and is no game
+    // object (#246's re-check B4).
+    if crate::game_object::is_game_kind(handle.kind)
+        && hierarchy.described_instance_of(handle.key(), wanted) == Some(true)
     {
         return Some(true);
     }
@@ -1057,6 +1076,20 @@ const KINDS: &[KindInfo] = &[
         // `create(key)` twice is two builders for one registry.
         canonical: never_canonical,
         methods: &crate::host_registry::BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DeferredRegister,
+        tag: "dreg",
+        // `create` makes exactly its class (`new DeferredRegister(..)`, 26.3.0.101), but this
+        // model has no `Class` surface for NeoForge's classes (simple name, superclass,
+        // `isAssignableFrom`), so `getClass()` stays counted (#244 review B1); `instanceof`
+        // answers from the class the key names.
+        class: ClassRule::Unknown {
+            declared: crate::host_deferred_register::declared_types,
+        },
+        // A serial per `create` call: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::host_deferred_register::REGISTER_METHODS,
     },
     KindInfo {
         kind: HostKind::GameEvent,
@@ -2270,6 +2303,30 @@ mod tests {
                 assert_eq!(HostKind::of_class(&class), None, "{class}");
             }
         }
+    }
+
+    /// A hook firing's description answers only for a game object: another
+    /// kind's key that spells a game object's (a NeoForge mod whose version
+    /// is `"game/server"`, an `ArtifactVersion`) is no `MinecraftServer`, so
+    /// its `instanceof` stays unknown (counted) where it was a silent `true`
+    /// (#246's re-check B4; Java 25: `false`).
+    #[test]
+    fn a_firings_description_answers_only_for_game_objects() {
+        struct Described;
+        impl ClassHierarchy for Described {
+            fn is_instance(&self, _class: &str, _wanted: &str) -> Option<bool> {
+                None
+            }
+            fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+                (key == "game/server" && wanted == "net/minecraft/server/MinecraftServer")
+                    .then_some(true)
+            }
+        }
+        let server = "net/minecraft/server/MinecraftServer";
+        let version = HostRef::new(HostKind::ArtifactVersion, "game/server");
+        assert_eq!(version.instance_of(server, &Described), None);
+        let game = HostRef::new(HostKind::GameSingleton, "game/server");
+        assert_eq!(game.instance_of(server, &Described), Some(true));
     }
 
     /// A kind's `instance_of` asks the hierarchy it is handed, so a family
