@@ -89,8 +89,13 @@ pub(super) fn invoke(
             // `ModOriginImpl.getPaths()` returns its `paths` field: the same
             // list on every call (#156 P14d2).
             let paths = vec![path_value(&root_path(argument))];
-            match host.owned_collection(receiver, "getPaths", crate::stand_in_class("list"), paths)
-            {
+            match host.owned_collection(
+                receiver,
+                "getPaths",
+                crate::stand_in_class("list"),
+                false,
+                paths,
+            ) {
                 Some(list) => list,
                 None => return host.unknown_operand_call(r).map(Some),
             }

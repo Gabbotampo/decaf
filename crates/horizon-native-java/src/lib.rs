@@ -2243,9 +2243,16 @@ pub struct EventDispatch {
     pub event: Value,
 }
 
+/// The interpreter's view of the world outside the jar.
+///
+/// A default never answers a Java value silently: a host that does not model a call (or a
+/// field) errors with [`NativeError::UnknownHostCall`], and a real host counts what it does
+/// not model (`StdHost::unknown_host_call`). Defaults answering `None`/`false` mean "this host
+/// keeps no such state", which the caller turns into a counted path of its own (#246's review:
+/// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
-    fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::Ref(None))
+    fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
     /// The NeoForge attachment state and the unknown-call table it counts refusals in
     /// (`neoforge_attachments.rs`). A host that keeps neither answers `None`, and the attachment
@@ -2286,15 +2293,20 @@ pub trait Host {
         let _ = receiver;
         self.get_static(r)
     }
+    /// What this host's own description of the object keyed `key` says about `wanted`
+    /// (`ClassHierarchy::described_instance_of`); `None` for a host that describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
-    /// (`jar_operands.rs`).
+    /// (`jar_operands.rs`). A host that counts nothing errors instead.
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// The chat components this host changed in place (`host_component.rs`
@@ -2764,13 +2776,15 @@ pub trait Host {
     }
 
     /// The collection of `class` an object `of` keeps as its member
-    /// `member` (a field a getter answers): the same object on every call,
-    /// holding `values` when first made (`StdHost::cached_collection`).
+    /// `member` (a field a getter answers, a cached view): the same object on
+    /// every call (`StdHost::cached_collection`). It holds `values` when
+    /// first made, or with `follow` on every call (a view of `of`'s state).
     fn owned_collection(
         &mut self,
         _of: &Value,
         _member: &str,
         _class: &str,
+        _follow: bool,
         _values: Vec<Value>,
     ) -> Option<Value> {
         None
@@ -5154,9 +5168,10 @@ impl Host for StdHost {
         of: &Value,
         member: &str,
         class: &str,
+        follow: bool,
         values: Vec<Value>,
     ) -> Option<Value> {
-        Some(self.cached_collection(of, member, class, false, values))
+        Some(self.cached_collection(of, member, class, follow, values))
     }
 
     fn array_view(
@@ -19970,17 +19985,78 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// A JSON array read as the array class `class`: an array of that class.
+    /// A JSON array read as the array class `class`: an array of that class
+    /// whose elements are each read as its component type, as Gson's
+    /// adapters read them. An element no adapter here reads (a jar class's
+    /// object, which needs the reflective adapter) is counted, never stored
+    /// with the wrong type (#253 review).
     fn gson_json_array(
         &mut self,
         values: &[serde_json::Value],
         class: &str,
     ) -> Result<Value, NativeError> {
+        let component = &class[1..];
         let mut materialized = Vec::with_capacity(values.len());
         for value in values {
-            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
+            match self.gson_array_element(value, component)? {
+                Some(element) => materialized.push(element),
+                None => {
+                    let r = crate::stream_pipeline::wanted(
+                        GSON_FROM_JSON.0,
+                        GSON_FROM_JSON.1,
+                        GSON_FROM_JSON.2,
+                    );
+                    return self.host.unknown_operand_call(&r);
+                }
+            }
         }
         Ok(self.new_array_value(class, materialized))
+    }
+
+    /// One element of a JSON array read as the component `descriptor`, or
+    /// `None` where Gson's adapter would read something this does not model
+    /// (or throw).
+    fn gson_array_element(
+        &mut self,
+        json: &serde_json::Value,
+        descriptor: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        use serde_json::Value as Json;
+        let integer = |json: &Json| json.as_i64();
+        Ok(match (descriptor, json) {
+            (_, Json::Null) if descriptor.len() == 1 => None,
+            (_, Json::Null) => Some(Value::Ref(None)),
+            ("Ljava/lang/Object;", _) => Some(self.gson_json_value(json, "java/lang/Object")?),
+            // `TypeAdapters.STRING`: a string, an integer's text, a boolean's.
+            ("Ljava/lang/String;", Json::String(text)) => Some(Value::Ref(Some(text.clone()))),
+            ("Ljava/lang/String;", Json::Number(number)) if number.is_i64() || number.is_u64() => {
+                Some(Value::Ref(Some(number.to_string())))
+            }
+            ("Ljava/lang/String;", Json::Bool(flag)) => Some(Value::Ref(Some(flag.to_string()))),
+            (
+                "I" | "S" | "B" | "Ljava/lang/Integer;" | "Ljava/lang/Short;" | "Ljava/lang/Byte;",
+                _,
+            ) => integer(json)
+                .and_then(|n| i32::try_from(n).ok())
+                .map(Value::Int),
+            ("J" | "Ljava/lang/Long;", _) => integer(json).map(Value::Long),
+            ("D" | "F" | "Ljava/lang/Double;" | "Ljava/lang/Float;", Json::Number(number)) => {
+                number.as_f64().map(Value::Float)
+            }
+            ("Z", Json::Bool(flag)) => Some(Value::Int(i32::from(*flag))),
+            ("Ljava/lang/Boolean;", Json::Bool(flag)) => Some(boolean_value(*flag)),
+            // A nested array, or a collection or map the converters read.
+            (nested, _) if nested.starts_with('[') => Some(self.gson_json_value(json, nested)?),
+            (object, _) if object.starts_with('L') && object.ends_with(';') => {
+                let class = &object[1..object.len() - 1];
+                if gson_list_target(class) || gson_map_target(class) {
+                    Some(self.gson_json_value(json, class)?)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
     }
 
     /// A JSON array read as the collection `class` (`kind`: `list`/`set`).
@@ -19996,29 +20072,52 @@ impl<H: Host> Runtime<'_, H> {
         for value in values {
             materialized.push(self.gson_json_value(value, "java/lang/Object")?);
         }
-        self.new_host_collection(
-            gson_collection_class(class, kind),
-            materialized,
-            GSON_FROM_JSON,
-        )
+        let class = gson_collection_class(class, kind);
+        if kind == "list" {
+            return self.new_host_collection(class, materialized, GSON_FROM_JSON);
+        }
+        // A set takes each element through its own `add`, as Gson's
+        // `CollectionTypeAdapterFactory` does: a `TreeSet` sorts, every set
+        // drops a repeat (#253 review).
+        let set = self.new_host_collection(class, Vec::new(), GSON_FROM_JSON)?;
+        for element in materialized {
+            self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Set",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &set,
+                &[element],
+            )?;
+        }
+        Ok(set)
     }
 
-    /// A JSON object read as the map `class`: its members in order.
+    /// A JSON object read as the map `class`: each member through the map's
+    /// own `put`, as Gson's `MapTypeAdapterFactory` does (a `TreeMap` sorts
+    /// its keys).
     fn gson_json_map(
         &mut self,
         values: &serde_json::Map<String, serde_json::Value>,
         class: &str,
     ) -> Result<Value, NativeError> {
-        let mut materialized = Vec::with_capacity(values.len() * 2);
-        for (key, value) in values {
-            materialized.push(Value::Ref(Some(key.clone())));
-            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
-        }
-        self.new_host_collection(
+        let map = self.new_host_collection(
             gson_collection_class(class, "map"),
-            materialized,
+            Vec::new(),
             GSON_FROM_JSON,
-        )
+        )?;
+        for (key, value) in values {
+            let value = self.gson_json_value(value, "java/lang/Object")?;
+            self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Map",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &map,
+                &[Value::Ref(Some(key.clone())), value],
+            )?;
+        }
+        Ok(map)
     }
 }
 
@@ -32142,6 +32241,23 @@ modId="minecraft"
                 .unwrap(),
             Value::Int(-1)
         );
+        // Two equal texts of unknown identity: `==` keeps the value answer and
+        // is counted, so a host that counts nothing refuses it.
+        assert!(matches!(
+            jar.invoke_method_with_args(
+                "demo.Math",
+                "same",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                None,
+                &[
+                    Value::Ref(Some("same".into())),
+                    Value::Ref(Some("same".into()))
+                ],
+                &mut NullHost,
+            ),
+            Err(NativeError::UnknownHostCall(_))
+        ));
+        let mut counting = StdHost::new();
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo.Math",
@@ -32152,10 +32268,17 @@ modId="minecraft"
                     Value::Ref(Some("same".into())),
                     Value::Ref(Some("same".into()))
                 ],
-                &mut host,
+                &mut counting,
             )
             .unwrap(),
             Value::Int(1)
+        );
+        assert_eq!(
+            counting.unknown_host_calls(),
+            [(
+                "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+                1
+            )]
         );
         assert_eq!(
             jar.invoke_method_with_args(

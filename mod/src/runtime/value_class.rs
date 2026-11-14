@@ -52,6 +52,8 @@ const RETIRED_PREFIXES: &[&str] = &[
     "block-pos/",
     "level-resource/",
     "game-rule/",
+    // Every `game/…` object is a handle (#156 P16b, P16e).
+    "game/",
     // Collections are handles (#156 P14d2): the `list/…`, `set/…`, `map/…`
     // literals are gone, and a text spelled like one is a `String`.
     "list/",
@@ -163,7 +165,6 @@ const MARKER_HEADS: &[&str] = &[
     "enum",
     "event",
     "file",
-    "game",
     "handler",
     "holder",
     "identifier",

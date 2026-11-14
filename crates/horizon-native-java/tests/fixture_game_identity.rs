@@ -417,12 +417,14 @@ fn players_entities_and_damage_keep_the_servers_identity() {
         ]),
         [0, 0, 0, 2, 0, 0, 0, 2]
     );
-    // Its class is not known yet: `game/` text still reads as a marker while
-    // `game_hooks` makes it (#156 P16e; P17 drops the head). `instanceof
-    // ServerPlayer` and the pattern `switch` answer no, as Java does, but are
-    // counted; the cast passes, counted, where Java throws (`forged_cast`).
+    // Every `game/…` object is a handle since #156 P16e, so the text is a
+    // plain `String`: `instanceof ServerPlayer` and the pattern `switch`
+    // answer no, exactly, as Java does (the cast's CCE is #167's, #236).
     assert_eq!(run.ints(&["forgedInstance", "forgedSwitch"]), [0, 0]);
-    assert!(run.counted("net/minecraft/server/level/ServerPlayer#<instanceof>") > 0);
+    assert_eq!(
+        run.counted("net/minecraft/server/level/ServerPlayer#<instanceof>"),
+        0
+    );
 
     // Two firings that hurt entity 42 with `minecraft:generic`: the entity is
     // one object (`==`, `equals`, `hashCode` 42: Java's `entity_*` give

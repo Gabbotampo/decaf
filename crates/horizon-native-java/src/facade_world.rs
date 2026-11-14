@@ -370,7 +370,8 @@ mod tests {
             Arc::new(facade),
             context,
         )));
-        let player = |uuid: u128| Value::Ref(Some(format!("game/player/{uuid:032x}")));
+        let player =
+            |uuid: u128| crate::game_object::server_value(format!("game/player/{uuid:032x}"));
         let hand = |name: &str| Value::Ref(Some(format!("{HAND_ENUM}{name}")));
         let player_class = "net/minecraft/world/entity/player/Player";
         let in_hand = call(
@@ -418,7 +419,7 @@ mod tests {
         // Another player's hands were not read for this firing.
         assert!(ask(&player(0xb0b), &in_hand, &[hand("MAIN_HAND")]).is_err());
         // The level's border is the one the game gave.
-        let level = Value::Ref(Some("game/level/minecraft:overworld".into()));
+        let level = crate::game_object::server_value("game/level/minecraft:overworld".into());
         let get_border = call(
             "net/minecraft/server/level/ServerLevel",
             "getWorldBorder",
