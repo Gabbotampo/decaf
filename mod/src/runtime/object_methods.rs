@@ -540,7 +540,11 @@ impl<H: Host> Runtime<'_, H> {
     /// through the dispatch for each of `o`'s elements, a `ClassCastException` or
     /// `NullPointerException` answering `false`. Two sets with their own handles (two maps'
     /// `entrySet()` views, #221 review B5) compare by contents, as a direct `equals` does.
-    fn abstract_set_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
+    pub(crate) fn abstract_set_equals(
+        &mut self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<bool, NativeError> {
         if identical(a, b) {
             return Ok(true);
         }

@@ -128,6 +128,12 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let marker = expect_ref(value)?;
+        // A map's `keySet()`/`values()`/`entrySet()` copy stands in for the
+        // map's view (`HashMap$KeySet`): its class is the host's stand-in, and
+        // its order is the map's, so it has no table of its own (#156 P14d1).
+        if self.host.is_view_copy(marker) {
+            return None;
+        }
         let (class, _) = marker.split_once('#')?;
         let mut class = class.to_owned();
         let mut kind = table_kind_of(&class);
@@ -711,6 +717,16 @@ impl<H: Host> Runtime<'_, H> {
                 .any(|value| matches!(self.equality_of(value), Equality::Jar { .. }))
             {
                 return self.count_and_continue(r).map(Some);
+            }
+            // A `keySet()`/`entrySet()` copy is an `AbstractSet`: `equals` is `containsAll` of
+            // the other set's elements, so a map's nodes and another map's holders with equal
+            // contents are equal (`HashMap.entrySet().equals(Map.of(..).entrySet())`).
+            if let Some(other) = args.first()
+                && self.host_collection_kind(receiver) == Some(object_methods::CollectionKind::Set)
+                && self.host_collection_kind(other) == Some(object_methods::CollectionKind::Set)
+            {
+                let equal = self.abstract_set_equals(receiver, other)?;
+                return Ok(Some(Some(Value::Int(i32::from(equal)))));
             }
         }
         if !matches!(r.name.as_str(), "keySet" | "values" | "entrySet")

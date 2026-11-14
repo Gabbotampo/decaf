@@ -645,12 +645,7 @@ impl StdHost {
     /// A value written through an entry changes that entry's hash: the map's `entrySet()` view
     /// lays its table out afresh (Java's `EntrySet` looks keys up in the map, never by hash).
     fn forget_entry_view_layout(&mut self, map: &str) {
-        if let Some(view) = self
-            .entry_views
-            .get(map)
-            .and_then(crate::expect_ref)
-            .cloned()
-        {
+        if let Some(view) = self.entry_view_of(map).cloned() {
             self.hash_tables.remove(&view);
         }
     }
@@ -689,9 +684,7 @@ impl StdHost {
             .remove(&marker)
             .unwrap_or_default();
         let previous = self
-            .entry_views
-            .get(&marker)
-            .and_then(crate::expect_ref)
+            .entry_view_of(&marker)
             .and_then(|view| self.mutable_collections.get(view));
         let mut reused: Vec<Option<Value>> = Vec::with_capacity(pairs.len() / 2);
         for (at, pair) in pairs.chunks(2).enumerate() {
