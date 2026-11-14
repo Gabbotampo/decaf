@@ -1,0 +1,4 @@
+writeThrough=xx|yyb|[x, p, q][x, p, q]|FT3
+fixedSize=UOE,UOE,UOE,false,UOE,false,UOE,false,UOE,false,UOE,cleared,UOE,NoSuchElementException,UOE|[a, b]
+reorder=abc,ABC,CBA,[C, B, A],fff
+asAList=java.util.Arrays$ArrayList|TTTT|[[a, z]][a, z]|1T0
