@@ -24,8 +24,29 @@ public class Probe {
         return new java.io.InputStreamReader(in).read();
     }
     public static String record(Object value) { return new Box(value).toString(); }
+    public static String buffered() throws java.io.IOException {
+        java.io.InputStream in = new java.io.ByteArrayInputStream(new byte[] {104, 105});
+        return new java.io.BufferedReader(new java.io.InputStreamReader(in)).readLine();
+    }
+    public static String nullReader() {
+        try { new java.io.InputStreamReader((java.io.InputStream) null); return "none"; }
+        catch (NullPointerException e) { return "npe " + e.getMessage(); }
+    }
+    public static String nullBuffered() {
+        try { new java.io.BufferedReader(null); return "none"; }
+        catch (NullPointerException e) { return "npe " + e.getMessage(); }
+    }
+    public static String initializerCause() {
+        try { return String.valueOf(Bad.VALUE); }
+        catch (ExceptionInInitializerError e) { return String.valueOf(e.getCause()); }
+    }
+    public static String raisedCause() {
+        try { Object o = null; return String.valueOf(o.hashCode()); }
+        catch (NullPointerException e) { return String.valueOf(e.getCause()); }
+    }
 }
 "#;
+const BAD: &str = "package demo;\npublic class Bad { public static final int VALUE = Integer.parseInt(\"x\"); }\n";
 const OOPS: &str = "package demo;\npublic class Oops extends RuntimeException { public Oops(String m) { super(m); } }\n";
 const BOX: &str = "package demo;\npublic record Box(Object value) {}\n";
 const ITEMS: &str = "package net.minecraft.world.item;\npublic class Items { public static final Object DIAMOND = new Object(); }\n";
@@ -38,6 +59,7 @@ fn fixture() -> Fixture {
             ("demo/Probe.java", PROBE),
             ("demo/Oops.java", OOPS),
             ("demo/Box.java", BOX),
+            ("demo/Bad.java", BAD),
             ("net/minecraft/world/item/Items.java", ITEMS),
             ("lib/Lib.java", LIB),
         ],
@@ -136,5 +158,57 @@ fn a_record_never_prints_a_marker_no_model_prints() {
             &[marker]
         ),
         "java/lang/Object#toString()Ljava/lang/String;"
+    );
+}
+
+/// What a counting host answers for the review's cases (#257's review): each
+/// is Java 25's answer, or counted, never a silent other value. Java 25:
+/// `hi`; `npe null` twice (`Reader(Object lock)`'s bare NPE); the
+/// initializer error's cause is the `NumberFormatException`, which the host
+/// never held, so it is counted; a raised NPE's cause is `null`, exactly.
+#[test]
+fn readers_and_raised_causes_answer_as_java_or_count() {
+    let fixture = fixture();
+    let call = |host: &mut horizon_native_java::StdHost, method: &str| -> String {
+        match fixture.jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            host,
+        ) {
+            Ok(Value::Ref(text)) => text.unwrap_or_else(|| "null".into()),
+            other => format!("{other:?}"),
+        }
+    };
+    let counted = |host: &horizon_native_java::StdHost, needle: &str| {
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains(needle))
+    };
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let line = call(&mut host, "buffered");
+    assert!(
+        line == "hi" || counted(&host, "java/io/"),
+        "buffered: {line} {:?}",
+        host.unknown_host_calls()
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    assert_eq!(call(&mut host, "nullReader"), "npe null");
+    assert_eq!(call(&mut host, "nullBuffered"), "npe null");
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    call(&mut host, "initializerCause");
+    assert!(
+        counted(&host, "getCause"),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    assert_eq!(call(&mut host, "raisedCause"), "null");
+    assert!(
+        !counted(&host, "getCause"),
+        "{:?}",
+        host.unknown_host_calls()
     );
 }

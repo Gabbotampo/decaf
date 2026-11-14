@@ -5255,6 +5255,12 @@ impl Host for StdHost {
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
+        // A throw the runtime raised carries no cause (its `getCause()` is
+        // `null`), except the initializer error that wraps the `<clinit>`
+        // throw, whose cause this host never held: left unrecorded, counted.
+        if !marker.starts_with("java/lang/ExceptionInInitializerError#") {
+            self.throwable_causes.insert(marker.to_owned(), None);
+        }
         self.throwable_messages.insert(marker.to_owned(), message);
     }
 
@@ -6919,10 +6925,16 @@ impl Host for StdHost {
             // `toString` are not known to be `null`, so they are counted.
             if matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
-                ("getMessage", "()Ljava/lang/String;")
-                    | ("getCause", "()Ljava/lang/Throwable;")
-                    | ("toString", "()Ljava/lang/String;")
+                ("getMessage", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;")
             ) && !self.throwable_messages.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
+            }
+            // The cause is its own record: a throw the runtime raised has its
+            // message but, for an `ExceptionInInitializerError`, a cause the
+            // host never held (#257's review), so that one is counted.
+            if (r.name.as_str(), r.descriptor.as_str()) == ("getCause", "()Ljava/lang/Throwable;")
+                && !self.throwable_causes.contains_key(&marker)
             {
                 return self.unknown_host_call(r);
             }
@@ -11690,6 +11702,20 @@ fn stand_in_class(kind: &str) -> &'static str {
         "set" => "java/util/LinkedHashSet",
         _ => "java/util/ArrayList",
     }
+}
+
+/// A reader constructor's operand that is not a reader this model holds: a
+/// `null` throws `Reader(Object lock)`'s bare `NullPointerException`, any
+/// other value is left to the host (`Ok(None)`), which counts it.
+fn null_reader_operand(args: &[Value]) -> Result<Option<Value>, NativeError> {
+    if matches!(args.first(), Some(Value::Ref(None))) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(None)
 }
 
 fn value_text(value: &Value) -> String {
@@ -23640,7 +23666,9 @@ impl<H: Host> Runtime<'_, H> {
                             None => return Ok(None),
                         },
                     },
-                    None => String::new(),
+                    // `Reader(Object lock)` throws a bare NPE for a `null`
+                    // stream (#257's review); any other operand is not ours.
+                    None => return null_reader_operand(args),
                 };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
@@ -23649,11 +23677,16 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let text = args
-                    .first()
-                    .and_then(expect_ref)
-                    .and_then(|reader| self.string_readers.remove(reader))
-                    .unwrap_or_default();
+                // Only a reader this model holds the text of; a `null` reader
+                // is `Reader(lock)`'s NPE, and any other is left to the host,
+                // which counts it (#257's review: an empty reader made
+                // `readLine()` a silent `null`).
+                let Some(reader) = args.first().and_then(expect_ref) else {
+                    return null_reader_operand(args);
+                };
+                let Some(text) = self.string_readers.remove(reader) else {
+                    return Ok(None);
+                };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
