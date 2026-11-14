@@ -158,7 +158,9 @@ impl StdHost {
                 "net/neoforged/fml/config/ConfigTracker",
                 "INSTANCE",
                 "Lnet/neoforged/fml/config/ConfigTracker;",
-            ) => Some(Value::Ref(Some("fml-config-tracker".into()))),
+            ) => Some(crate::host_service::loader_singleton(
+                "net/neoforged/fml/config/ConfigTracker",
+            )),
             (
                 "net/neoforged/fml/config/ConfigTracker",
                 "configsByMod" | "fileMap",

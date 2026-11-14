@@ -5,13 +5,16 @@
 //!
 //! * [`HostKind::StdStream`]: `System.out` and `System.err`, keyed
 //!   `system-out`/`system-err` (the in-memory sink a modelled writer
-//!   appends to). Their class is exactly `java.io.PrintStream`, so
-//!   `instanceof` and casts are exact (`(PrintStream) (Object) System.out`
-//!   passes; a jar interface throws naming `PrintStream`).
+//!   appends to). In the game they are vanilla's `LoggedPrintStream`s
+//!   (`Bootstrap.bootStrap()`'s `wrapStreams`, before any mod runs), or its
+//!   `DebugLoggedPrintStream` subclass with debug logging on, so the class is
+//!   `ClassRule::Unknown` with `PrintStream` declared: `instanceof` and casts
+//!   to `PrintStream` and its supertypes are exact (`(PrintStream) (Object)
+//!   System.out` passes), anything that needs the exact class is counted.
 //! * [`HostKind::LoaderSingleton`]: NeoForge's (and legacy Forge's) `ModList`,
-//!   `FMLLoader` and `LoadingModList`, keyed by the declared class. Their
-//!   runtime class is the loader's, which the runtime does not model, so a
-//!   cast's message is counted (`ClassRule::Unknown`).
+//!   `FMLLoader`, `LoadingModList` and `ConfigTracker`, keyed by the declared
+//!   class. Their runtime class is the loader's, which the runtime does not
+//!   model, so a cast's message is counted (`ClassRule::Unknown`).
 
 use crate::runtime::Value;
 use crate::runtime::host_path::identity_equals;
@@ -38,6 +41,7 @@ const LOADER_CLASSES: &[&str] = &[
     "net/minecraftforge/fml/ModList",
     "net/neoforged/fml/loading/FMLLoader",
     "net/neoforged/fml/loading/LoadingModList",
+    "net/neoforged/fml/config/ConfigTracker",
 ];
 
 /// The loader's one object of `class` (one of [`LOADER_CLASSES`]).
@@ -53,6 +57,12 @@ pub(crate) fn loader_key(value: &Value) -> Option<&str> {
         Value::Host(handle) if handle.kind() == HostKind::LoaderSingleton => Some(handle.key()),
         _ => None,
     }
+}
+
+/// The type a standard stream surely is: a `PrintStream` (in the game,
+/// vanilla's `LoggedPrintStream` subclass).
+pub(crate) fn std_stream_types(_: &str) -> &'static [&'static str] {
+    &["java/io/PrintStream"]
 }
 
 /// The type a loader singleton surely is: its key's class.

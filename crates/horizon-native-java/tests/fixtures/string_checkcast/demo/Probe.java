@@ -183,6 +183,20 @@ public final class Probe {
         return cast(() -> { Iface c = (Iface) o; }, o instanceof Iface);
     }
 
+    /** `StringRepresentable.fromEnum` builds an `EnumCodec` (#236's re-check). Not in `main`. */
+    public static String fromEnumCodec() {
+        Object o = net.minecraft.util.StringRepresentable.fromEnum(() -> new java.lang.annotation.ElementType[0]);
+        return cast(() -> { net.minecraft.util.StringRepresentable.EnumCodec<?> c =
+            (net.minecraft.util.StringRepresentable.EnumCodec<?>) o; },
+            o instanceof net.minecraft.util.StringRepresentable.EnumCodec);
+    }
+
+    /** NeoForge's `ConfigTracker.INSTANCE`, a host object (#236's re-check). Not in `main`. */
+    public static String configTrackerIface() {
+        Object o = net.neoforged.fml.config.ConfigTracker.INSTANCE;
+        return cast(() -> { Iface c = (Iface) o; }, o instanceof Iface);
+    }
+
     public static void main(String[] args) {
         System.out.println("runnable=" + runnable());
         System.out.println("list=" + list());

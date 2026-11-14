@@ -27,6 +27,16 @@ const STUBS: &[(&str, &str)] = &[
         "package net.minecraft.network.chat; public class Style {}",
     ),
     (
+        "net/minecraft/util/StringRepresentable.java",
+        "package net.minecraft.util; public interface StringRepresentable { \
+         static <E> EnumCodec<?> fromEnum(java.util.function.Supplier<E[]> values) { return null; } \
+         class EnumCodec<E> {} }",
+    ),
+    (
+        "net/neoforged/fml/config/ConfigTracker.java",
+        "package net.neoforged.fml.config; public class ConfigTracker { public static final ConfigTracker INSTANCE = null; }",
+    ),
+    (
         "net/neoforged/fml/ModList.java",
         "package net.neoforged.fml; public class ModList { public static ModList get() { return null; } }",
     ),
@@ -51,12 +61,23 @@ fn a_string_casts_only_to_its_own_types() {
         // does not model (`RegisterEvent.getRegistry`), which a Mixin may give a
         // jar interface: counted, the cast passing. A client class's objects
         // are all handles (#232), so there the cast throws as for any text.
+        let counted_both = |class: &str| {
+            let cast = format!("{class}#<checkcast>(Ljava/lang/Object;)L{class};");
+            let test = format!("{class}#<instanceof>(Ljava/lang/Object;)Z");
+            ("ok|false", vec![(cast, 1), (test, 1)])
+        };
         let counted_cast = |class: &str| {
             let descriptor = format!("{class}#<checkcast>(Ljava/lang/Object;)L{class};");
             ("ok|false", vec![(descriptor, 1)])
         };
         let (expected, counted) = match method {
             "classNameText" => counted_cast("demo/Probe$Iface"),
+            // `System.out` is vanilla's `LoggedPrintStream` in the game
+            // (`Bootstrap.bootStrap()`), not the plain `PrintStream` of the
+            // oracle's `java -cp` run: a cast that needs its exact class is
+            // counted, as is `instanceof` a type outside `PrintStream`'s.
+            "sysOutIface" => counted_both("demo/Probe$Iface"),
+            "sysOutGame" => counted_both("net/minecraft/world/item/Item"),
             "classNameGame" => counted_cast("net/minecraft/world/item/Item"),
             _ => (java, Vec::new()),
         };
@@ -92,6 +113,35 @@ fn a_loader_object_cast_is_counted() {
     let fixture = fixture();
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     assert_eq!(fixture.text_on(&mut host, "modListIface"), "ok|false");
+    assert_eq!(
+        host.unknown_host_calls(),
+        [
+            (
+                "demo/Probe$Iface#<checkcast>(Ljava/lang/Object;)Ldemo/Probe$Iface;".to_owned(),
+                1
+            ),
+            (
+                "demo/Probe$Iface#<instanceof>(Ljava/lang/Object;)Z".to_owned(),
+                1
+            ),
+        ]
+    );
+}
+
+/// `StringRepresentable.fromEnum` answers an `EnumCodec` object, never text a
+/// cast reads as a `String` (#236's re-check): a cast to the method's own
+/// declared return type passes, as on the 26.3 game (Java 25 after
+/// `Bootstrap.bootStrap()`: `ok`, `instanceof` true). `ConfigTracker.INSTANCE`
+/// is a loader object whose class is not modelled: a cast to a jar interface
+/// is counted (Java: a CCE naming `ConfigTracker`).
+#[test]
+fn host_objects_that_were_text_cast_as_their_classes() {
+    let fixture = fixture();
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "fromEnumCodec"), "ok|true");
+    assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "configTrackerIface"), "ok|false");
     assert_eq!(
         host.unknown_host_calls(),
         [

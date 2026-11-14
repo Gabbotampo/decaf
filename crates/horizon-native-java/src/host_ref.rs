@@ -1930,8 +1930,11 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::StdStream,
         tag: "stds",
-        // `System.out`'s class is `PrintStream` itself.
-        class: ClassRule::Fixed("java/io/PrintStream"),
+        // A `PrintStream`; in the game vanilla's `LoggedPrintStream`
+        // (`host_service.rs`), so the exact class is not known.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::std_stream_types,
+        },
         canonical: always_canonical,
         methods: &crate::host_service::METHODS,
     },
