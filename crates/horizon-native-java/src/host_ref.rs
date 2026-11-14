@@ -475,6 +475,12 @@ pub enum HostKind {
     /// A `Map.Entry` of a map whose entry class the host does not model: key
     /// `java/util/Map$Entry#node<n>` (`host_map_entry.rs`).
     OpaqueMapEntry,
+    /// `System.out`/`System.err`: key `system-out`/`system-err`
+    /// (`host_service.rs`).
+    StdStream,
+    /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
+    /// (`host_service.rs`).
+    LoaderSingleton,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1954,6 +1960,27 @@ const KINDS: &[KindInfo] = &[
         // Fresh or reused per reading, by a map this model does not know.
         canonical: never_canonical,
         methods: &crate::host_map_entry::ENTRY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StdStream,
+        tag: "stds",
+        // A `PrintStream`; in the game vanilla's `LoggedPrintStream`
+        // (`host_service.rs`), so the exact class is not known.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::std_stream_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::LoaderSingleton,
+        tag: "ldrs",
+        // The loader's own class, which the runtime does not model.
+        class: ClassRule::Unknown {
+            declared: crate::host_service::loader_singleton_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_service::METHODS,
     },
 ];
 
