@@ -383,11 +383,18 @@ const RETIRED_MARKERS: &[&str] = &[
     "holder/",
     "registered/",
     "fabric-registry-builder/",
+    "deferred-register/",
 ];
 
 /// The game classes only this family's handles (or a jar's own objects) are.
 fn family_class(target: &str) -> bool {
     target == crate::fabric_registry::BUILDER
+        || [
+            crate::host_deferred_register::NEOFORGE,
+            crate::host_deferred_register::DATA_COMPONENTS,
+            crate::host_deferred_register::FORGE,
+        ]
+        .contains(&target)
         || [
             DEFAULTED_TYPES,
             DEFERRED_HOLDER_TYPES,
@@ -469,13 +476,16 @@ fn unbound_key(row: &HolderRow) -> Option<(String, String)> {
 /// What `DeferredRegister.register` recorded for one registration.
 #[derive(Clone, Debug)]
 pub(crate) struct HolderRow {
-    /// The register's marker (`deferred-register/…`).
+    /// The register's handle key (`host_deferred_register.rs`).
     pub(crate) register: String,
     /// Forge's `RegistryObject` rather than NeoForge's `DeferredHolder`.
     pub(crate) forge: bool,
     /// The registry key and validated id, when the register named them.
     pub(crate) id: Option<(Value, String)>,
 }
+
+/// The view cache's member name for a register's `getEntries()` view.
+const ENTRIES: &str = "getEntries";
 
 impl crate::StdHost {
     /// Record a `DeferredRegister.register` call: its holder and its value.
@@ -521,6 +531,63 @@ impl crate::StdHost {
                 holder(row.forge, serial, &key)
             })
             .collect()
+    }
+
+    /// `DeferredRegister.getEntries()`. NeoForge 26.3.0.101 answers its
+    /// `entriesView` field (`getfield entriesView; areturn`), which the
+    /// constructor makes once as `Collections.unmodifiableSet(entries.keySet())`
+    /// over the register's `LinkedHashMap` of holders: one object per register,
+    /// an `UnmodifiableSet` whose mutators throw, in registration order, and
+    /// live, so a `register` after `getEntries` shows in the view already
+    /// handed out ([`Self::add_register_entry`]). Here the view reads a
+    /// `LinkedHashSet` of the holders, which the jar never sees: what the view
+    /// answers is the key set's (#182 P2).
+    ///
+    /// The view is the register's row in the host's one per-object view cache
+    /// (`cached_collections`, keyed by the register's identity and
+    /// `getEntries`).
+    pub(crate) fn register_entries(&mut self, receiver: &Value, register: &str) -> Value {
+        let cache = crate::cache_identity(receiver).map(|identity| (identity, ENTRIES.to_owned()));
+        if let Some(view) = cache
+            .as_ref()
+            .and_then(|cache| self.cached_collections.get(cache))
+            .filter(|view| self.unmodifiable_collections.contains_key(*view))
+        {
+            return crate::jar_object::collection(view.clone());
+        }
+        let source = self.empty_collection("set");
+        let holders = self.register_holders(register);
+        if let Some(values) =
+            crate::expect_ref(&source).and_then(|marker| self.mutable_collections.get_mut(marker))
+        {
+            *values = holders;
+        }
+        let view = self
+            .unmodifiable_view("set", &source)
+            .expect("a new set is an object");
+        if let (Some(cache), Some(marker)) = (cache, crate::expect_ref(&view)) {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        view
+    }
+
+    /// The set a register's `getEntries()` view reads, once the view exists.
+    pub(crate) fn register_entries_source(&self, receiver: &Value) -> Option<String> {
+        let view = self
+            .cached_collections
+            .get(&(crate::cache_identity(receiver)?, ENTRIES.to_owned()))?;
+        self.unmodifiable_collections.get(view)?.clone()
+    }
+
+    /// A `register` call's holder joins the set its register's view reads,
+    /// once a view exists (before, [`Self::register_entries`] reads every row).
+    pub(crate) fn add_register_entry(&mut self, receiver: &Value, holder: &Value) {
+        let Some(marker) = self.register_entries_source(receiver) else {
+            return;
+        };
+        if let Some(values) = self.mutable_collections.get_mut(&marker) {
+            values.push(holder.clone());
+        }
     }
 
     /// The row a holder (or, with `registered`, a registered value) names.
