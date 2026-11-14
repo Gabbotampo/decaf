@@ -34674,8 +34674,12 @@ mandatory = true
         );
     }
 
+    /// `Arrays.asList` is the runtime's view of its own array
+    /// (`array_views.rs`); the host alone holds no array's elements, so it
+    /// counts the call rather than answer a one-element list holding the
+    /// array (#156 P14d2).
     #[test]
-    fn standard_host_maps_arrays_as_list_to_an_opaque_marker() {
+    fn the_host_alone_counts_arrays_as_list() {
         let mut host = StdHost::new();
         let as_list = MethodRef {
             owner: "java/util/Arrays".into(),
@@ -34683,9 +34687,13 @@ mandatory = true
             descriptor: "([Ljava/lang/Object;)Ljava/util/List;".into(),
         };
         let array = host_array::handle("[Ljava/lang/String;#0");
+        host.invoke(&as_list, std::slice::from_ref(&array)).unwrap();
         assert_eq!(
-            host.invoke(&as_list, std::slice::from_ref(&array)).unwrap(),
-            Value::Ref(Some("list/harr:[Ljava/lang/String;#0".into()))
+            host.unknown_host_calls(),
+            [(
+                "java/util/Arrays#asList([Ljava/lang/Object;)Ljava/util/List;".to_owned(),
+                1
+            )]
         );
     }
 

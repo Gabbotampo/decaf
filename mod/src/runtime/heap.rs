@@ -483,6 +483,8 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.iterators.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
+    // A collected `Arrays.asList` view mirrors nothing any more.
+    host.prune_array_views();
 }
 
 impl<H: Host> Runtime<'_, H> {

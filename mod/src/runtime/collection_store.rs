@@ -98,6 +98,7 @@ impl CollectionStore {
             self.watched_writes += 1;
         }
         self.map.retain(|marker, values| keep(marker, values));
+        self.watched.retain(|marker| self.map.contains_key(marker));
         self.generations
             .retain(|marker, _| self.map.contains_key(marker));
         self.generations.values_mut().for_each(|g| *g = next);

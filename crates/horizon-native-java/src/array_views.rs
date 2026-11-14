@@ -71,6 +71,17 @@ impl StdHost {
         view
     }
 
+    /// Forget the views whose rows a collection dropped.
+    pub(crate) fn prune_array_views(&mut self) {
+        let rows = &self.mutable_collections;
+        let views = &mut self.array_views;
+        views.views.retain(|view, _| rows.contains_key(view));
+        views.by_array.retain(|_, of| {
+            of.retain(|view| rows.contains_key(view));
+            !of.is_empty()
+        });
+    }
+
     pub(crate) fn has_array_views_of(&self, array: &str) -> bool {
         self.array_views.by_array.contains_key(array)
     }
