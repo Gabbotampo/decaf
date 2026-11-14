@@ -137,18 +137,28 @@ pub(crate) fn value(marker: &str) -> Option<Value> {
 pub(crate) fn text(value: &Value) -> Option<&String> {
     match value {
         Value::Host(handle) if is_game_kind(handle.kind()) => Some(handle.key_text()),
-        // Every `BlockPos`, `LevelResource` and `GameRule` is a handle (#156
-        // P16c): text spelling one is a jar's `String`, never read as one.
+        // Every `game/…` object (#156 P16b, P16e: the hook tier's too) and
+        // every `BlockPos`, `LevelResource` and `GameRule` (P16c) is a handle:
+        // text spelling one is a jar's `String`, never read as one.
         Value::Ref(Some(text)) if is_handle_only_text(text) => None,
         other => crate::runtime::expect_ref(other),
     }
 }
 
+/// The key of a game handle (`game/player/…`), which a Mixin's fields on its
+/// target object are kept under (`jar_object::instance_key`).
+pub(crate) fn handle_key(value: &Value) -> Option<&str> {
+    match value {
+        Value::Host(handle) if is_game_kind(handle.kind()) => Some(handle.key()),
+        _ => None,
+    }
+}
+
 /// Whether `text` spells a family every object of which is a handle, so the
-/// text is a `String` (P16c's families; `value_class::RETIRED_PREFIXES`).
+/// text is a `String` (`value_class::RETIRED_PREFIXES`).
 fn is_handle_only_text(text: &str) -> bool {
     use crate::runtime::server_values::{BLOCK_POS, GAME_RULE, LEVEL_RESOURCE};
-    [BLOCK_POS, LEVEL_RESOURCE, GAME_RULE]
+    ["game/", BLOCK_POS, LEVEL_RESOURCE, GAME_RULE]
         .iter()
         .any(|prefix| text.starts_with(prefix))
 }
@@ -355,6 +365,7 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (false, "player") => &[
             "net/minecraft/server/level/ServerPlayer",
             "net/minecraft/world/entity/player/Player",
+            "net/minecraft/world/entity/Avatar",
             "net/minecraft/world/entity/LivingEntity",
             "net/minecraft/world/entity/Entity",
         ],
@@ -576,13 +587,14 @@ mod tests {
         }
     }
 
-    /// A handle reads as the marker it replaces; text reads as it always did.
+    /// A handle reads as the marker it replaces; text spelled like a `game/`
+    /// marker is a jar's `String`, never read as the object (#156 P16e).
     #[test]
-    fn text_reads_a_handle_and_the_old_marker_alike() {
+    fn text_reads_a_handle_and_never_forged_game_text() {
         let handle = value("game/player/2a").unwrap();
         assert_eq!(text(&handle).map(String::as_str), Some("game/player/2a"));
         let marker = Value::Ref(Some("game/player/2a".into()));
-        assert_eq!(text(&marker).map(String::as_str), Some("game/player/2a"));
+        assert_eq!(text(&marker), None);
         assert_eq!(text(&Value::Int(1)), None);
         assert_eq!(value("hello"), None);
     }

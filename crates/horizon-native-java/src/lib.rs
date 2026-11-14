@@ -2244,9 +2244,16 @@ pub struct EventDispatch {
     pub event: Value,
 }
 
+/// The interpreter's view of the world outside the jar.
+///
+/// A default never answers a Java value silently: a host that does not model a call (or a
+/// field) errors with [`NativeError::UnknownHostCall`], and a real host counts what it does
+/// not model (`StdHost::unknown_host_call`). Defaults answering `None`/`false` mean "this host
+/// keeps no such state", which the caller turns into a counted path of its own (#246's review:
+/// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
-    fn get_static(&mut self, _: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::Ref(None))
+    fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
     /// The NeoForge attachment state and the unknown-call table it counts refusals in
     /// (`neoforge_attachments.rs`). A host that keeps neither answers `None`, and the attachment
@@ -2287,15 +2294,20 @@ pub trait Host {
         let _ = receiver;
         self.get_static(r)
     }
+    /// What this host's own description of the object keyed `key` says about `wanted`
+    /// (`ClassHierarchy::described_instance_of`); `None` for a host that describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
-    /// (`jar_operands.rs`).
+    /// (`jar_operands.rs`). A host that counts nothing errors instead.
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
-        Ok(Value::default_for(return_desc(&r.descriptor)))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// The chat components this host changed in place (`host_component.rs`
@@ -32162,6 +32174,23 @@ modId="minecraft"
                 .unwrap(),
             Value::Int(-1)
         );
+        // Two equal texts of unknown identity: `==` keeps the value answer and
+        // is counted, so a host that counts nothing refuses it.
+        assert!(matches!(
+            jar.invoke_method_with_args(
+                "demo.Math",
+                "same",
+                "(Ljava/lang/Object;Ljava/lang/Object;)I",
+                None,
+                &[
+                    Value::Ref(Some("same".into())),
+                    Value::Ref(Some("same".into()))
+                ],
+                &mut NullHost,
+            ),
+            Err(NativeError::UnknownHostCall(_))
+        ));
+        let mut counting = StdHost::new();
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo.Math",
@@ -32172,10 +32201,17 @@ modId="minecraft"
                     Value::Ref(Some("same".into())),
                     Value::Ref(Some("same".into()))
                 ],
-                &mut host,
+                &mut counting,
             )
             .unwrap(),
             Value::Int(1)
+        );
+        assert_eq!(
+            counting.unknown_host_calls(),
+            [(
+                "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
+                1
+            )]
         );
         assert_eq!(
             jar.invoke_method_with_args(
