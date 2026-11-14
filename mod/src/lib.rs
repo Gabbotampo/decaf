@@ -157,6 +157,9 @@ struct State {
     departed: Vec<FacadePlayer>,
     /// `DamageSource`s handed to game-hook firings so far: each firing's is its own object.
     damage_sources: u64,
+    /// Whether this server tick runs `MinecraftServer.tickServer` (its game-class callbacks):
+    /// decided at its start, read at its end.
+    tick_open: bool,
     /// Players a refresh dropped whose logout firing has not run yet, with their last entry.
     /// Horizon removes every player who left in one poll before the first logout hook, so the
     /// first logout's refresh drops the others too; their own firings take their entry from
@@ -531,7 +534,7 @@ impl Hooks for HorizonJava {
             EventContext::default(),
             |_| true,
         );
-        self.game_hooks(Some(&mut *host), "server_stopping", true, |state| {
+        self.game_hooks(Some(&mut *host), "server_stopping", |state| {
             Some((Some(GameObject::server(state.dedicated)), Vec::new()))
         });
         let state = self.lock();
@@ -557,7 +560,7 @@ impl Hooks for HorizonJava {
             EventContext::default(),
             |_| true,
         );
-        self.game_hooks(Some(&mut *host), "java_server_stopped", true, |state| {
+        self.game_hooks(Some(&mut *host), "java_server_stopped", |state| {
             Some((Some(GameObject::server(state.dedicated)), Vec::new()))
         });
         // The server, its levels, players, mobs and connections are gone: the next world's
@@ -766,8 +769,26 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
-        // `tickServer(BooleanSupplier hasTimeLeft)`: the supplier is not modelled (a call refuses).
-        self.game_hooks(Some(&mut *host), site, true, |state| {
+        // `IntegratedServer.tickServer` pauses while nobody is on the player list (and while
+        // the game is paused, when Horizon ticks nothing): `MinecraftServer.tickServer`, its
+        // HEAD and its TAIL do not run. Horizon ticks an empty integrated server, so a tick
+        // that starts with nobody listed runs neither site; the decision holds for its end, as
+        // vanilla's placement tick runs no TAIL though the host is listed by then (#248's
+        // re-check). A dedicated server always ticks into `tickServer` (`exact_here`).
+        let open = match event.phase {
+            ServerTickPhase::ServerTickStart { .. } => {
+                let open = dedicated || !host.players().server_players().is_empty();
+                self.lock().tick_open = open;
+                open
+            }
+            _ => std::mem::take(&mut self.lock().tick_open),
+        };
+        if !open {
+            return;
+        }
+        // `tickServer(BooleanSupplier hasTimeLeft)`: the supplier is not modelled (a call
+        // refuses).
+        self.game_hooks(Some(&mut *host), site, |state| {
             Some((
                 Some(GameObject::server(state.dedicated)),
                 vec![has_time_supplier()],
@@ -891,7 +912,7 @@ impl Hooks for HorizonJava {
         // `PlayerList.placeNewPlayer(Connection, ServerPlayer, CommonListenerCookie)` on the
         // server's player list.
         let (uuid, name) = (event.player, event.name);
-        self.game_hooks(Some(host), "player_logged_in", true, |state| {
+        self.game_hooks(Some(host), "player_logged_in", |state| {
             // One `Connection` and one cookie per join: a relog is a new object of each.
             let session = state.players.iter().find(|p| p.uuid == uuid)?.session;
             let key = format!("{uuid:032x}/{session}");
@@ -995,7 +1016,7 @@ impl Hooks for HorizonJava {
         );
         // `newPlayer.restoreFrom(oldPlayer, keepEverything)`: the old player is the previous life.
         let (uuid, keep) = (event.player, !event.was_death);
-        self.game_hooks(Some(host), "player_clone", true, |state| {
+        self.game_hooks(Some(host), "player_clone", |state| {
             let old = game_hooks::player(state, uuid, 1)?;
             let args = vec![
                 Arg::Object(old),
@@ -1014,7 +1035,7 @@ impl Hooks for HorizonJava {
     /// A player is about to die (`ServerPlayer.die` HEAD): the game-class callbacks bound there.
     fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
         let (uuid, cause) = (event.player, event.cause.unwrap_or("unknown").to_owned());
-        self.game_hooks(Some(host), "player_died", true, |state| {
+        self.game_hooks(Some(host), "player_died", |state| {
             let source = game_hooks::damage_source(state, &cause);
             Some((
                 Some(game_hooks::player(state, uuid, 0)?),
@@ -1089,6 +1110,13 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // A mob removed for any reason (killed, despawned, unloaded, through a portal) is gone
+        // as a Java object: its Mixin state goes with it. A player leaving a level is a
+        // dimension change, and Java keeps that `ServerPlayer`.
+        if event.kind != "minecraft:player" {
+            let mob = GameObject::entity(event.entity as i32, event.kind, true);
+            game_hooks::forget(&mut self.lock(), &mob);
+        }
     }
 
     /// A player broke the block at `pos` (Fabric's `PlayerBlockBreakEvents.BEFORE`, NeoForge's
@@ -1245,7 +1273,7 @@ impl Hooks for HorizonJava {
         let mut cancelled = fired.cancelled;
         if !cancelled && let Some(attacker) = self.acting_player(host) {
             let (id, kind) = (event.entity, event.kind.to_owned());
-            cancelled |= self.game_hooks(Some(host), "attack_entity", true, |state| {
+            cancelled |= self.game_hooks(Some(host), "attack_entity", |state| {
                 let target = game_hooks::attack_target(state, id, &kind)?;
                 Some((
                     Some(game_hooks::player(state, attacker, 0)?),
@@ -1344,15 +1372,13 @@ impl Hooks for HorizonJava {
         if event.kind != "minecraft:player" && !fired.cancelled {
             let (id, kind) = (event.entity as i32, event.kind.to_owned());
             let damage = event.damage_type.to_owned();
-            self.game_hooks(Some(host), "living_death", false, |state| {
+            self.game_hooks(Some(host), "living_death", |state| {
                 let source = game_hooks::damage_source(state, &damage);
                 Some((
                     Some(GameObject::entity(id, &kind, true)),
                     vec![Arg::Object(source)],
                 ))
             });
-            // The mob is gone once `die` runs: its Mixin state goes with it.
-            game_hooks::forget(&mut self.lock(), &GameObject::entity(id, &kind, true));
         }
         if fired.cancelled {
             Flow::Cancel
@@ -1637,7 +1663,6 @@ impl HorizonJava {
         &self,
         host: Option<&mut dyn ServerHost>,
         site: &str,
-        cancels: bool,
         objects: impl FnOnce(&mut State) -> Option<(Option<GameObject>, Vec<Arg>)>,
     ) -> bool {
         let fired = {
@@ -1654,7 +1679,7 @@ impl HorizonJava {
                 game_hooks::unlisted(&mut state, site);
                 return false;
             };
-            game_hooks::fire(&mut state, site, cancels, receiver, args)
+            game_hooks::fire(&mut state, site, receiver, args)
         };
         if let Some(host) = host {
             for effect in fired.effects {

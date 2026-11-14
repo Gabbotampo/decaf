@@ -58,6 +58,14 @@ pub(crate) const BOUND: &[(&str, &str)] = &[
     ("attack_entity", "attack_entity: Player.attack HEAD"),
 ];
 
+/// The bound sites whose hook carries a Mixin `cancel()`: `Player.attack` HEAD's cancel is the
+/// hook's (the blow does nothing). The runtime refuses a cancellable `@Inject` at a listen-only
+/// hook point when it registers it (counted `refused`), so a listen site has no cancellable
+/// callback to run; at `living_death` (a cancel hook) the hook's cancel keeps the mob alive
+/// while a Mixin's skips only `die`'s body, so a jar with a cancellable callback there is
+/// skipped and counted, never run with its `cancel()` dropped or mistranslated.
+pub(crate) const CANCELS: &[&str] = &["attack_entity"];
+
 /// The sites the runtime knows that no pinned hook fires at exactly, and why.
 pub(crate) const UNBOUND: &[(&str, &str)] = &[
     (
@@ -193,6 +201,10 @@ pub(crate) struct Tally {
     /// Firings not run because a player they hand over is not on the bridge's list with an
     /// entity id and that life: the object would not be the event tier's (#246's review).
     pub unlisted: usize,
+    /// Game-class `@Inject` plans a hook point refused when they registered (a cancellable
+    /// callback at a listen-only point, an anchor the point has no call site for): they never
+    /// run.
+    pub refused: usize,
     /// Failure reasons, first line, with counts (at most 16 kept).
     pub failures: BTreeMap<String, usize>,
 }
@@ -206,6 +218,7 @@ impl Tally {
             "failed": self.failed,
             "skipped": self.skipped,
             "unlisted": self.unlisted,
+            "refused": self.refused,
             "failures": self.failures,
         })
     }
@@ -217,6 +230,16 @@ pub(crate) fn register(
     tally: &mut Tally,
 ) -> crate::runtime::GameHookRegistrations {
     let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    tally.refused += weave
+        .skipped
+        .iter()
+        .filter(|plan| {
+            matches!(
+                plan.reason,
+                crate::runtime::MixinSkipReason::GameHookMismatch(_)
+            )
+        })
+        .count();
     let registrations = jar.register_game_hooks(&weave).unwrap_or_default();
     for hook in registrations.hooks() {
         let count = registrations.entries(hook).len();
@@ -312,18 +335,18 @@ pub(crate) struct Fired {
 }
 
 /// Run every jar's callbacks at `site`, against `receiver` and `args` (the target method's).
-/// `cancels` says whether the hook's cancel is the Mixin's: where it is not, a jar with a
-/// cancellable callback at the site is skipped, so no `cancel()` is dropped or mistranslated.
+/// Where the hook's cancel is not the Mixin's ([`CANCELS`]), a jar with a cancellable callback
+/// at the site is skipped, so no `cancel()` is dropped or mistranslated.
 /// Once a jar's callback cancels, the target method returns: no later jar's callback at that
 /// point runs (jars run in load order; Mixin orders them by priority across jars, a departure).
 pub(crate) fn fire(
     state: &mut State,
     site: &str,
-    cancels: bool,
     receiver: Option<GameObject>,
     args: Vec<Arg>,
 ) -> Fired {
     let mut fired = Fired::default();
+    let cancels = CANCELS.contains(&site);
     let facts = std::sync::Arc::clone(&state.server);
     let dedicated = state.dedicated;
     for loaded in &mut state.jars {
@@ -570,7 +593,6 @@ mod tests {
             fire(
                 state,
                 "player_died",
-                true,
                 Some(player),
                 vec![Arg::Object(source)],
             );
@@ -727,7 +749,6 @@ mod tests {
             fire(
                 state,
                 "attack_entity",
-                true,
                 Some(attacker.clone()),
                 vec![Arg::Object(target)],
             )
@@ -777,7 +798,6 @@ mod tests {
                 fire(
                     state,
                     site,
-                    true,
                     Some(server.clone()),
                     vec![crate::has_time_supplier()],
                 );
@@ -797,5 +817,48 @@ mod tests {
         tick(&mut state);
         assert_eq!(stdout(&mut state, 0), ["HEAD/1"]);
         assert_eq!(stdout(&mut state, 1), ["TAIL/1"]);
+    }
+
+    /// A cancellable `ServerPlayer.die` HEAD callback (baguettelib's, architectury's) would keep
+    /// the player alive in Java; `player_died` only hears, so the runtime refuses it when it
+    /// registers and the jar counts it `refused`: it never runs with its `cancel()` dropped
+    /// (#248's re-check). A non-cancellable one runs.
+    #[test]
+    fn a_cancel_the_hook_cannot_carry_is_refused_and_counted() {
+        let mut state = State::default();
+        let die = |cancellable: bool| {
+            format!(
+                "@Mixin(net.minecraft.server.level.ServerPlayer.class) public class Dies {{ \
+                   @Inject(method = \"die\", at = @At(\"HEAD\"), cancellable = {cancellable}) \
+                   private void onDie(net.minecraft.world.damagesource.DamageSource s, CallbackInfo ci) {{ \
+                     System.out.println(\"died\"); }} }}"
+            )
+        };
+        state.jars.push(load("keepalive", "Dies", &die(true)));
+        state.jars.push(load("listens", "Dies", &die(false)));
+        state.players = vec![FacadePlayer {
+            uuid: 0xa1,
+            name: "Alex".into(),
+            level: None,
+            entity_id: Some(7),
+            session: 1,
+            life: 0,
+        }];
+        let player = player(&state, 0xa1, 0).unwrap();
+        let source = damage_source(&mut State::default(), "lava");
+        fire(
+            &mut state,
+            "player_died",
+            Some(player),
+            vec![Arg::Object(source)],
+        );
+        let tally = |jar: &LoadedJar| {
+            let t = &jar.row.game_hooks;
+            (t.refused, t.bound, t.ran)
+        };
+        assert_eq!(tally(&state.jars[0]), (1, 0, 0));
+        assert!(stdout(&mut state, 0).is_empty());
+        assert_eq!(tally(&state.jars[1]), (0, 1, 1));
+        assert_eq!(stdout(&mut state, 1), ["died"]);
     }
 }
