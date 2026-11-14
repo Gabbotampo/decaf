@@ -46,6 +46,15 @@ pub(crate) fn loader_singleton(class: &str) -> Value {
     Value::Host(HostRef::new(HostKind::LoaderSingleton, class))
 }
 
+/// The class a loader singleton's handle is keyed by, for the loader model
+/// that reads receivers by text.
+pub(crate) fn loader_key(value: &Value) -> Option<&str> {
+    match value {
+        Value::Host(handle) if handle.kind() == HostKind::LoaderSingleton => Some(handle.key()),
+        _ => None,
+    }
+}
+
 /// The type a loader singleton surely is: its key's class.
 pub(crate) fn loader_singleton_types(key: &str) -> &'static [&'static str] {
     LOADER_CLASSES

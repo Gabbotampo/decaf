@@ -279,7 +279,8 @@ impl StdHost {
         }
         let marker = match receiver {
             Value::Ref(Some(marker)) => marker.as_str(),
-            _ => return None,
+            // A loader singleton (`ModList.get()`...): its class.
+            _ => crate::runtime::host_service::loader_key(receiver)?,
         };
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/neoforged/api/distmarker/Dist", "isClient", "()Z") => {
