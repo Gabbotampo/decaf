@@ -1056,12 +1056,17 @@ public abstract class DieMixin {
         DamageSource cast = (DamageSource) src;
         HookSink.mark("die/" + (server instanceof DedicatedServer) + "/" + (src instanceof DamageSource));
         HookSink.mark("str/" + this);
+        // Garbage enough for the heap to collect before the next firing.
+        int sum = 0;
+        for (int k = 0; k < 4000; k++) { int[] g = new int[] {k}; sum += g[0]; }
+        HookSink.mark("garbage/" + sum);
     }
 }
 "#;
 
 /// A player's two lives in fresh and kept hash tables: `equals` (by id)
-/// makes them one entry, `IdentityHashMap` two.
+/// makes them one entry, `IdentityHashMap` two. Each life's `ticks` array
+/// is its own, and survives the heap's collections.
 const COLL_MIXIN: &str = r#"package demo;
 import java.util.*;
 import net.minecraft.server.level.ServerPlayer;
@@ -1076,9 +1081,11 @@ public abstract class CollMixin {
     static final Set<Object> KEPT = new HashSet<>();
     static final Map<Object, Integer> COUNT = new HashMap<>();
     static final Map<Object, Integer> IDS = new IdentityHashMap<>();
+    private int[] ticks = new int[1];
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void onTick(CallbackInfo ci) {
+        ticks[0]++;
         Object self = this;
         COUNT.merge(self, 1, Integer::sum); IDS.merge(self, 1, Integer::sum); KEPT.add(self);
         if (prev != null) {
@@ -1087,7 +1094,7 @@ public abstract class CollMixin {
             HookSink.mark("coll/" + (prev == self) + "/" + prev.equals(self) + "/" + new HashSet<>(List.of(prev, self)).size()
                 + "/" + b.size() + "/" + hm.size() + "/" + hm.get(prev) + "/" + KEPT.contains(self));
         }
-        HookSink.mark("kept/" + KEPT.size() + "/" + COUNT.size() + "/" + COUNT.get(self) + "/" + IDS.size() + "/" + IDS.get(self));
+        HookSink.mark("kept/" + KEPT.size() + "/" + COUNT.size() + "/" + COUNT.get(self) + "/" + IDS.size() + "/" + IDS.get(self) + "/" + ticks[0]);
         prev = self;
     }
 }
@@ -1193,34 +1200,145 @@ fn hook_tier_casts_hash_tables_and_text_answer_as_java_or_count() {
         vec![alice_life(0)],
     );
     assert_eq!(marks(&host)[1..], ["pickup/3/7"]);
-    // The server the firing names is a `DedicatedServer`, the damage source a
-    // `DamageSource` (cast and `instanceof`). B3: the player's `toString`
-    // needs its level and position: counted (Java prints
-    // `ServerPlayer['Alice'/7, l='ServerLevel[<world>]', x=.., y=.., z=..]`).
-    let to_string = "java/lang/Object#toString()Ljava/lang/String;";
-    assert_eq!(counted(&host, to_string), 0);
-    fire(
-        &mut host,
-        "player_died",
-        alice_life(0),
-        vec![GameObject::opaque(
-            "net/minecraft/world/damagesource/DamageSource",
-            "lava",
-        )],
-    );
-    assert_eq!(marks(&host)[2], "die/true/true");
-    assert_eq!(counted(&host, to_string), 1);
-
     // B2: a respawn is a new object `equals` (by id) to the old life, so
     // every hash table keeps one entry and only `IdentityHashMap` two.
     fire(&mut host, "player_tick", alice_life(0), vec![]);
     fire(&mut host, "player_tick", alice_life(1), vec![]);
     assert_eq!(
-        marks(&host)[4..],
+        marks(&host)[2..],
         [
-            "kept/1/1/1/1/1",
+            "kept/1/1/1/1/1/1",
             "coll/false/true/1/1/1/2/true",
-            "kept/1/1/2/2/1",
+            "kept/1/1/2/2/1/1",
+        ]
+    );
+
+    // The server the firing names is a `DedicatedServer`, the damage source a
+    // `DamageSource` (cast and `instanceof`). B3: the player's `toString`
+    // needs its level and position: counted (Java prints
+    // `ServerPlayer['Alice'/7, l='ServerLevel[<world>]', x=.., y=.., z=..]`).
+    // Its 4,000 arrays are garbage the heap collects.
+    let to_string = "java/lang/Object#toString()Ljava/lang/String;";
+    assert_eq!(counted(&host, to_string), 0);
+    let dying = GameObject::player(0xd1e, "Carol")
+        .with_incarnation(1, 0)
+        .with_entity_id(106);
+    fire(
+        &mut host,
+        "player_died",
+        dying,
+        vec![GameObject::opaque(
+            "net/minecraft/world/damagesource/DamageSource",
+            "lava",
+        )],
+    );
+    assert_eq!(marks(&host)[5], "die/true/true");
+    assert_eq!(marks(&host)[7], "garbage/7998000");
+    assert_eq!(counted(&host, to_string), 1);
+
+    // The Mixin's array on the living player survives that collection
+    // (#226; the review's `tick alice L1 after garbage`).
+    fire(&mut host, "player_tick", alice_life(1), vec![]);
+    assert_eq!(
+        marks(&host)[8..],
+        ["coll/true/true/1/1/1/2/true", "kept/1/1/3/2/2/2"]
+    );
+}
+
+const HELD_MIXIN: &str = r#"package demo;
+import java.util.Map;
+import java.util.Optional;
+import java.util.function.Supplier;
+import net.minecraft.server.level.ServerPlayer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class HeldMixin {
+    private Object demo$obj;
+    private Optional<Object> demo$opt;
+    private Supplier<String> demo$sup;
+    private Map.Entry<String, Object> demo$entry;
+    private int demo$n;
+
+    @Inject(method = "tick", at = @At("TAIL"))
+    private void onTick(CallbackInfo ci) {
+        demo$n++;
+        if (demo$n == 1) {
+            demo$obj = new Box(1, "obj");
+            demo$opt = Optional.of(new Box(2, "opt"));
+            Box b = new Box(3, "sup");
+            demo$sup = () -> b.show();
+            demo$entry = Map.entry("k", new Box(4, "entry"));
+        }
+        for (int i = 0; i < 3000; i++) { Box g = new Box(i, "g"); }
+        HookSink.mark(demo$n + ":" + ((Box) demo$obj).show() + "," + ((Box) demo$opt.get()).show() + "," + demo$sup.get() + "," + ((Box) demo$entry.getValue()).show());
+    }
+}
+"#;
+
+const HELD_BOX: &str = r#"package demo;
+public final class Box {
+    int v; String name;
+    public Box(int v, String name) { this.v = v; this.name = name; }
+    public String show() { return v + name; }
+}
+"#;
+
+/// Objects a Mixin keeps in fields on a game object (a player) survive the
+/// heap's collections whatever holds them: a plain reference, an `Optional`
+/// (whose handle names the object in its key), a lambda's capture and a
+/// `Map.entry`. Each tick allocates 3,000 garbage objects; Java 25 (the same
+/// body run plainly, `System.gc()` between ticks) marks every field's object
+/// on every tick. The `Optional` read `0null` from the second tick while the
+/// game-hook roots kept only object handles (#226 review B2).
+#[test]
+fn game_object_fields_keep_every_kind_of_handle_across_collections() {
+    let mut sources: BTreeMap<&str, String> = RECEIVER_GAME
+        .iter()
+        .map(|(path, body)| (*path, (*body).to_owned()))
+        .collect();
+    sources.insert("demo/HeldMixin.java", HELD_MIXIN.into());
+    sources.insert("demo/Box.java", HELD_BOX.into());
+    let compile_only: Vec<&str> = COMPILE_ONLY
+        .iter()
+        .copied()
+        .chain([
+            "net/minecraft/world/entity/Entity.class",
+            "net/minecraft/world/entity/LivingEntity.class",
+            "net/minecraft/world/damagesource/DamageSource.class",
+        ])
+        .collect();
+    let fixture = Fixture::build_with("held-fields", sources, &["HeldMixin"], &compile_only);
+    let jar = fixture.load();
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    let mut host = StdHost::new();
+    let mut state = GameHookState::default();
+    let budget = ExecutionBudget::within(std::time::Duration::from_secs(60));
+    for _ in 0..3 {
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(GameObject::player(5, "Alice").with_entity_id(7));
+        jar.run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut context,
+            "player_tick",
+            Some(receiver),
+            &[],
+            &mut host,
+            &budget,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        marks(&host),
+        [
+            "1:1obj,2opt,3sup,4entry",
+            "2:1obj,2opt,3sup,4entry",
+            "3:1obj,2opt,3sup,4entry",
         ]
     );
 }
