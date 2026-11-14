@@ -12,7 +12,7 @@
 //! mutable access that changes nothing only costs the next call a
 //! reconciliation.
 
-use std::collections::{BTreeMap, HashMap, btree_map};
+use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 
 use crate::runtime::Value;
 
@@ -21,6 +21,11 @@ pub struct CollectionStore {
     map: BTreeMap<String, Vec<Value>>,
     generations: HashMap<String, u64>,
     next: u64,
+    /// The collections someone mirrors elsewhere (an `Arrays.asList` view's
+    /// array, `array_views.rs`), and how many mutable accesses reached one:
+    /// while that count stands still, no mirror needs a look.
+    watched: HashSet<String>,
+    watched_writes: u64,
 }
 
 impl std::ops::Deref for CollectionStore {
@@ -35,6 +40,9 @@ impl CollectionStore {
     fn bump(&mut self, marker: &str) -> u64 {
         self.next += 1;
         let next = self.next;
+        if !self.watched.is_empty() && self.watched.contains(marker) {
+            self.watched_writes += 1;
+        }
         match self.generations.get_mut(marker) {
             Some(generation) => *generation = next,
             None => {
@@ -72,11 +80,25 @@ impl CollectionStore {
         self.map.entry(marker)
     }
 
+    /// Watch `marker`: a mutable access to it moves [`Self::watched_writes`].
+    pub(crate) fn watch(&mut self, marker: &str) {
+        self.watched.insert(marker.to_owned());
+    }
+
+    /// How many mutable accesses reached a watched collection so far.
+    pub(crate) fn watched_writes(&self) -> u64 {
+        self.watched_writes
+    }
+
     /// Keep the collections `keep` accepts; every generation moves.
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&String, &mut Vec<Value>) -> bool) {
         self.next += 1;
         let next = self.next;
+        if !self.watched.is_empty() {
+            self.watched_writes += 1;
+        }
         self.map.retain(|marker, values| keep(marker, values));
+        self.watched.retain(|marker| self.map.contains_key(marker));
         self.generations
             .retain(|marker, _| self.map.contains_key(marker));
         self.generations.values_mut().for_each(|g| *g = next);

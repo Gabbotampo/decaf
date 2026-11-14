@@ -1241,6 +1241,32 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.empty_mutable_collection(kind)
     }
 
+    fn array_view(
+        &mut self,
+        array: &str,
+        offset: usize,
+        values: Vec<Value>,
+        window: bool,
+    ) -> Option<Value> {
+        self.inner.array_view(array, offset, values, window)
+    }
+
+    fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
+        self.inner.array_view_of(marker)
+    }
+
+    fn has_array_views(&self, array: &str) -> bool {
+        self.inner.has_array_views(array)
+    }
+
+    fn array_written(&mut self, array: &str, values: &[Value]) {
+        self.inner.array_written(array, values);
+    }
+
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
+        self.inner.changed_array_views()
+    }
+
     fn counted_unknown_calls(&self) -> usize {
         self.inner.counted_unknown_calls()
     }

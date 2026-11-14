@@ -148,16 +148,6 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(comparator));
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-        // `Arrays.asList(new T[0])`: the shared empty array has no elements,
-        // so the list is empty rather than a one-element list holding it.
-        ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;")
-            if args
-                .first()
-                .and_then(crate::host_array::array_key)
-                .is_some_and(crate::host_array::is_shared_empty) =>
-        {
-            Some(Ok(Value::Ref(Some("list".into()))))
-        }
         // `Modifier`'s predicates over the access flags reflection answers
         // (`Field.getModifiers`): config frameworks check `isPublic`/`isStatic`
         // before they read a field, and the neutral `false` made every field
@@ -1568,29 +1558,6 @@ mod tests {
                 .unwrap(),
             Value::Void
         );
-    }
-
-    #[test]
-    fn arrays_as_list_of_the_empty_array_is_an_empty_list() {
-        let as_list = method(
-            "java/util/Arrays",
-            "asList",
-            "([Ljava/lang/Object;)Ljava/util/List;",
-        );
-        assert_eq!(
-            static_call(
-                &as_list,
-                &[crate::host_array::shared_empty("[Ljava/lang/String;")]
-            )
-            .unwrap()
-            .unwrap(),
-            text("list")
-        );
-        // A runtime-owned array is the interpreter's to expand, and a string
-        // spelled like the old shared empty array is no array.
-        let owned = crate::host_array::handle(crate::host_array::key("[Ljava/lang/Object;", 0));
-        assert!(static_call(&as_list, &[owned]).is_none());
-        assert!(static_call(&as_list, &[text("array/empty")]).is_none());
     }
 
     #[test]
