@@ -105,6 +105,7 @@ mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
 mod host_registry;
+mod host_service;
 mod host_services;
 mod host_type_token;
 mod host_watch;
@@ -5264,10 +5265,10 @@ impl Host for StdHost {
             // text lands in the same in-memory sink a modelled writer uses.
             // A mod's `println` then runs instead of dereferencing a null.
             ("java/lang/System", "out", "Ljava/io/PrintStream;") => {
-                Ok(Value::Ref(Some("system-out".into())))
+                Ok(host_service::std_stream(false))
             }
             ("java/lang/System", "err", "Ljava/io/PrintStream;") => {
-                Ok(Value::Ref(Some("system-err".into())))
+                Ok(host_service::std_stream(true))
             }
             // `Long.MAX_VALUE`/`MIN_VALUE` are the long bounds a mod compares
             // timers and ids against; a neutral `0` would silently truncate
@@ -6519,9 +6520,9 @@ impl Host for StdHost {
             ) => Ok(Value::Ref(Some(
                 "net/neoforged/fml/javafmlmod/FMLJavaModLoadingContext".into(),
             ))),
-            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => {
-                Ok(Value::Ref(Some("neoforge-mod-list".into())))
-            }
+            ("net/minecraftforge/fml/ModList", "get", "()Lnet/minecraftforge/fml/ModList;") => Ok(
+                host_service::loader_singleton("net/minecraftforge/fml/ModList"),
+            ),
             // A block's property builder normally comes from a static
             // factory rather than `new`. Give it a bounded marker so the
             // chain is observable; a copy variant keeps only the settings the
@@ -7072,6 +7073,7 @@ impl Host for StdHost {
         // An iterator-family handle reads its host table by its key (`host_iterator.rs`).
         let receiver_marker = expect_ref(receiver)
             .or_else(|| host_iterator::marker(receiver))
+            .or_else(|| host_service::stream_marker(receiver))
             .cloned();
         if let Some(marker) = callback_text(receiver)
             && let Some(value) = functional_composition_marker(r, &marker, args)
@@ -23040,7 +23042,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let receiver_marker = receiver.and_then(expect_ref).cloned();
+        let receiver_marker = receiver
+            .and_then(|receiver| {
+                expect_ref(receiver).or_else(|| host_service::stream_marker(receiver))
+            })
+            .cloned();
         match r.owner.as_str() {
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
@@ -24145,9 +24151,16 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                        let target = args.last().and_then(expect_ref).ok_or_else(|| {
-                            NativeError::Metadata("Gson.toJson needs an Appendable receiver".into())
-                        })?;
+                        let target = args
+                            .last()
+                            .and_then(|arg| {
+                                expect_ref(arg).or_else(|| host_service::stream_marker(arg))
+                            })
+                            .ok_or_else(|| {
+                                NativeError::Metadata(
+                                    "Gson.toJson needs an Appendable receiver".into(),
+                                )
+                            })?;
                         if let Some(key) = self.io_sink_key(target) {
                             self.io_writers.entry(key).or_default().push_str(&text);
                             return Ok(Some(Value::Void));
@@ -37150,7 +37163,10 @@ mandatory = true
         // `ModList.get()` is an `invokestatic`, which reaches the host's
         // `invoke`, not `get_static`.
         let list = host.invoke(&get, &[]).unwrap();
-        assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
+        assert_eq!(
+            list,
+            host_service::loader_singleton("net/neoforged/fml/ModList")
+        );
         let loaded = MethodRef {
             owner: "net/neoforged/fml/ModList".into(),
             name: "isLoaded".into(),
@@ -37236,7 +37252,10 @@ mandatory = true
                 &[],
             )
             .unwrap();
-        assert_eq!(list, Value::Ref(Some("neoforge-mod-list".into())));
+        assert_eq!(
+            list,
+            host_service::loader_singleton("net/minecraftforge/fml/ModList")
+        );
         let container = host
             .invoke_instance(
                 &MethodRef {
