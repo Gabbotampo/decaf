@@ -38,7 +38,7 @@
 //! refused with an error that names it, so the callback that grew it fails
 //! instead of the server running out of memory.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{Host, NativeError, Runtime, StdHost, Value, game_hooks::GAME_OBJECT_PREFIX};
 
@@ -175,6 +175,13 @@ impl StdHost {
     /// one more than the live objects, however many a jar made.
     pub fn freed_object_ranges(&self) -> usize {
         self.freed_objects.ranges()
+    }
+
+    /// How many collections the host keeps cached for what they belong to
+    /// (a map's views, `System.getProperties()`): each lives as long as its
+    /// owner, so this follows the live set, not how many maps a jar made.
+    pub fn cached_collection_count(&self) -> usize {
+        self.cached_collections.len()
     }
 
     pub(crate) fn take_resident_heap(&mut self) -> JavaHeap {
@@ -588,6 +595,17 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
         .sum()
 }
 
+/// The object a cached collection's identity (`StdHost::cached_collection`:
+/// a handle's encoded kind and key, or a marker's text) names, when it is
+/// one a collection may free.
+fn cache_owner(identity: &str) -> Option<String> {
+    let key = match crate::host_ref::HostRef::decode(identity) {
+        Some(handle) => handle.key().to_owned(),
+        None => identity.to_owned(),
+    };
+    collectable(&key).then_some(key)
+}
+
 /// Note the allocation number of every `#<digits>` in `text` (`class#n`
 /// keys, embedded ones included): over-reading only keeps a number out of
 /// the freed set, which costs a diagnostic, never an answer.
@@ -695,6 +713,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 host.keyed_texts(key, &mut owned);
             }
         }
+        // A collection cached for something that is never collected
+        // (`System.getProperties()`, a mod container's root paths) is a root.
+        for ((identity, _), cached) in &host.cached_collections {
+            if !cache_owner(identity).is_some_and(|owner| collectable.markers.contains(&owner)) {
+                owned.push(cached.clone());
+            }
+        }
         roots.extend(owned.iter().map(String::as_str));
         let kept_values = heap
             .fields
@@ -726,6 +751,16 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     // The objects any per-object table keeps a row for: only these need
     // `keyed_texts`'s lookups as the trace reaches them.
     let keyed_keys: HashSet<String> = host.keyed_table_keys().map(str::to_owned).collect();
+    // The collections cached for an object (a map's `keySet()`/`values()`/
+    // `entrySet()`, #233): edges from it, so each lives as long as its map.
+    let mut cached_for: HashMap<String, Vec<&str>> = HashMap::new();
+    for ((identity, _), cached) in &host.cached_collections {
+        if let Some(owner) = cache_owner(identity)
+            && collectable.markers.contains(&owner)
+        {
+            cached_for.entry(owner).or_default().push(cached);
+        }
+    }
     let mut reached = BTreeSet::new();
     let mut found = Vec::new();
     while let Some(marker) = pending.pop() {
@@ -769,6 +804,10 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 note_numbers(text, &mut live);
             }
         }
+        for cached in cached_for.get(&marker).into_iter().flatten() {
+            collectable.scan(cached, &mut found);
+            note_numbers(cached, &mut live);
+        }
         // What the host keeps for this object in a table keyed by it.
         if keyed_keys.contains(&marker) {
             let mut keyed = Vec::new();
@@ -808,6 +847,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.constructed_uuids
         .retain(|key, _| !freed.holds_key(key));
     host.locales.retain(|key, _| !freed.holds_key(key));
+    // A cached collection goes with what it was cached for, and an entry
+    // whose collection went is rebuilt on its next call (#226 re-check 4:
+    // every map's views used to stay cached forever).
+    host.cached_collections.retain(|(identity, _), cached| {
+        keep(cached)
+            && cache_owner(identity).is_none_or(|owner| keep(&owner) && !freed.holds_key(&owner))
+    });
     heap.fields.retain(|key, _| keep(field_receiver(key)));
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
@@ -1223,6 +1269,138 @@ mod tests {
         assert_eq!(
             host.constructed_uuids.keys().collect::<Vec<_>>(),
             ["java/util/UUID#11"]
+        );
+    }
+
+    /// Every `StdHost` field is one the collector reads (a root, an edge, a
+    /// per-object table it prunes) or one shown to hold no allocation key
+    /// (names, bytes, counters, flags). A new field fails here until it is
+    /// classified: #233's `cached_collections` slipped past the audit, so
+    /// `System.getProperties()` lost its contents and every map's views
+    /// stayed cached (#226 re-check 4).
+    #[test]
+    fn every_host_field_is_classified_for_the_collector() {
+        const COLLECTOR_READS: &[&str] = &[
+            "resource_streams",
+            "calls",
+            "invocations",
+            "posted_events",
+            "registrations",
+            "content_builders",
+            "item_property_builders",
+            "block_property_builders",
+            "payload_registrations",
+            "payload_bytes",
+            "fabric_entrypoint_containers",
+            "constructed_entrypoints",
+            "packet_types",
+            "identifier_objects",
+            "deferred_registers",
+            "saved_data",
+            "neoforge_attachments",
+            "neoforge_bus",
+            "holders",
+            "holder_rows",
+            "mutable_collections",
+            "component_states",
+            "unmodifiable_collections",
+            "empty_collections",
+            "shared_empties",
+            "cached_collections",
+            "jdk_list_of",
+            "synchronized_views",
+            "reversed_views",
+            "hash_tables",
+            "collection_comparators",
+            "red_black_trees",
+            "probe_tables",
+            "view_copies",
+            "view_kinds",
+            "locales",
+            "constructed_uuids",
+            "levels",
+            "references",
+            "iterators",
+            "enumerations",
+            "iterator_guards",
+            "mod_stamps",
+            "sub_lists",
+            "list_iterators",
+            "deque_layouts",
+            "iterator_sources",
+            "lazy_optionals",
+            "capability_values",
+            "item_handlers",
+            "capability_requests",
+            "throwable_messages",
+            "throwable_causes",
+            "persistent_static_fields",
+            "heap",
+            "retained",
+            "freed_objects",
+            "collections_paused",
+            "threads",
+            "game_event",
+            "client",
+            "brigadier",
+            "imc",
+        ];
+        const HOLDS_NO_OBJECT: &[&str] = &[
+            "properties",
+            "environment",
+            "resources",
+            "resource_bytes",
+            "resource_marks",
+            "classes",
+            "linked_classes",
+            "service_providers",
+            "current_time_millis",
+            "mods",
+            "neoforge_mod_files",
+            "run_loader",
+            "own_loader_classes",
+            "fabric_metadata",
+            "environment_type",
+            "game_version",
+            "development_environment",
+            "console_out",
+            "inferred_declarations",
+            "declared_registrations",
+            "next_property_builder",
+            "outgoing_payloads",
+            "incoming_payloads",
+            "level_resources",
+            "holder_binding",
+            "charset_decoders",
+            "persistent_initialized_classes",
+            "unknown_host_calls",
+            "strict_unknown_host_calls",
+            "next_lazy_optional",
+            "next_fabric_event",
+            "next_iterator",
+            "next_neutral_collection",
+        ];
+        let debug = format!("{:#?}", StdHost::new());
+        let fields: BTreeSet<&str> = debug
+            .lines()
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| !line.starts_with(' '))
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .collect();
+        let classified: BTreeSet<&str> = COLLECTOR_READS
+            .iter()
+            .chain(HOLDS_NO_OBJECT)
+            .copied()
+            .collect();
+        let unclassified: Vec<_> = fields.difference(&classified).collect();
+        let stale: Vec<_> = classified.difference(&fields).collect();
+        assert!(
+            unclassified.is_empty(),
+            "unclassified host fields: {unclassified:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "classified fields the host lacks: {stale:?}"
         );
     }
 }
