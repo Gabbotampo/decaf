@@ -1031,7 +1031,12 @@ impl<H: Host> Host for GameHookHost<'_, H> {
     // review: the trait defaults answered silently here, a respawned player's two lives were two
     // `HashSet` entries, a player printed as `null`). The members below these forwards are this
     // tier's own: game objects, `@Shadow` members and the calls only the hook point answers.
-    fn neoforge_attachments(&mut self) -> Option<( &mut neoforge_attachments::AttachmentState, &mut BTreeMap<String, usize>, )> {
+    fn neoforge_attachments(
+        &mut self,
+    ) -> Option<(
+        &mut neoforge_attachments::AttachmentState,
+        &mut BTreeMap<String, usize>,
+    )> {
         self.inner.neoforge_attachments()
     }
 
@@ -1039,11 +1044,15 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.clone_original_of(text)
     }
 
-    fn neoforge_bus(&mut self) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
+    fn neoforge_bus(
+        &mut self,
+    ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
         self.inner.neoforge_bus()
     }
 
-    fn neoforge_imc(&mut self) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
         self.inner.neoforge_imc()
     }
 
@@ -1231,7 +1240,13 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.unmodifiable_list(values)
     }
 
-    fn factory_collection(&mut self, owner: &str, name: &str, kind: &str, values: Vec<Value>) -> Option<Value> {
+    fn factory_collection(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
         self.inner.factory_collection(owner, name, kind, values)
     }
 

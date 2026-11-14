@@ -957,3 +957,270 @@ fn game_hook_callbacks_see_a_modelled_receiver_and_refuse_the_rest() {
         .to_string();
     assert!(error.contains("not live"), "{error}");
 }
+
+/// Compile-only game classes for #246's cases, with vanilla's hierarchy.
+const CASES_GAME: &[(&str, &str)] = &[
+    (
+        "net/minecraft/world/entity/Entity.java",
+        "package net.minecraft.world.entity;\npublic class Entity { public int getId() { return 0; } public net.minecraft.server.MinecraftServer getServer() { return null; } }\n",
+    ),
+    (
+        "net/minecraft/world/entity/LivingEntity.java",
+        "package net.minecraft.world.entity;\npublic class LivingEntity extends Entity { public void jumpFromGround() {} public float getHealth() { return 0; } }\n",
+    ),
+    (
+        "net/minecraft/world/entity/player/Player.java",
+        "package net.minecraft.world.entity.player;\npublic class Player extends net.minecraft.world.entity.LivingEntity {}\n",
+    ),
+    (
+        "net/minecraft/server/level/ServerPlayer.java",
+        "package net.minecraft.server.level;\npublic class ServerPlayer extends net.minecraft.world.entity.player.Player { public void tick() {} public void die(net.minecraft.world.damagesource.DamageSource source) {} }\n",
+    ),
+    (
+        "net/minecraft/world/damagesource/DamageSource.java",
+        "package net.minecraft.world.damagesource;\npublic class DamageSource {}\n",
+    ),
+    (
+        "net/minecraft/server/MinecraftServer.java",
+        "package net.minecraft.server;\npublic class MinecraftServer {}\n",
+    ),
+    (
+        "net/minecraft/server/dedicated/DedicatedServer.java",
+        "package net.minecraft.server.dedicated;\npublic class DedicatedServer extends net.minecraft.server.MinecraftServer {}\n",
+    ),
+    (
+        "net/minecraft/world/entity/item/ItemEntity.java",
+        "package net.minecraft.world.entity.item;\npublic class ItemEntity extends net.minecraft.world.entity.Entity { public void playerTouch(net.minecraft.world.entity.player.Player player) {} public net.minecraft.world.item.ItemStack getItem() { return null; } }\n",
+    ),
+    (
+        "net/minecraft/world/item/ItemStack.java",
+        "package net.minecraft.world.item;\npublic class ItemStack { public int getCount() { return 0; } }\n",
+    ),
+];
+
+/// Casts and `instanceof` the firing's description answers (a mob is a
+/// `LivingEntity`), and one it cannot (is this mob a `ServerPlayer`?).
+const CAST_MIXIN: &str = r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.LivingEntity;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(LivingEntity.class)
+public abstract class CastMixin {
+    @Inject(method = "jumpFromGround", at = @At("TAIL"))
+    private void onJump(CallbackInfo ci) {
+        Object o = this;
+        HookSink.mark("health/" + ((LivingEntity) o).getHealth() + "/" + (o instanceof LivingEntity) + "/" + (o instanceof ServerPlayer));
+    }
+}
+"#;
+
+const ITEM_CAST_MIXIN: &str = r#"package demo;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ItemEntity.class)
+public abstract class ItemCastMixin {
+    @Inject(method = "playerTouch", at = @At("HEAD"))
+    private void beforePickup(Player player, CallbackInfo ci) {
+        ItemEntity self = (ItemEntity) (Object) this;
+        HookSink.mark("pickup/" + self.getItem().getCount() + "/" + player.getId());
+    }
+}
+"#;
+
+/// The server and the damage source are what the firing says they are; a
+/// player's `toString` needs its level and position, which no firing holds.
+const DIE_MIXIN: &str = r#"package demo;
+import net.minecraft.server.dedicated.DedicatedServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class DieMixin {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDie(DamageSource source, CallbackInfo ci) {
+        Object server = ((ServerPlayer) (Object) this).getServer();
+        Object src = source;
+        DamageSource cast = (DamageSource) src;
+        HookSink.mark("die/" + (server instanceof DedicatedServer) + "/" + (src instanceof DamageSource));
+        HookSink.mark("str/" + this);
+    }
+}
+"#;
+
+/// A player's two lives in fresh and kept hash tables: `equals` (by id)
+/// makes them one entry, `IdentityHashMap` two.
+const COLL_MIXIN: &str = r#"package demo;
+import java.util.*;
+import net.minecraft.server.level.ServerPlayer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class CollMixin {
+    static Object prev;
+    static final Set<Object> KEPT = new HashSet<>();
+    static final Map<Object, Integer> COUNT = new HashMap<>();
+    static final Map<Object, Integer> IDS = new IdentityHashMap<>();
+
+    @Inject(method = "tick", at = @At("TAIL"))
+    private void onTick(CallbackInfo ci) {
+        Object self = this;
+        COUNT.merge(self, 1, Integer::sum); IDS.merge(self, 1, Integer::sum); KEPT.add(self);
+        if (prev != null) {
+            HashSet<Object> b = new HashSet<>(); b.add(prev); b.add(self);
+            HashMap<Object, Integer> hm = new HashMap<>(); hm.put(prev, 1); hm.put(self, 2);
+            HookSink.mark("coll/" + (prev == self) + "/" + prev.equals(self) + "/" + new HashSet<>(List.of(prev, self)).size()
+                + "/" + b.size() + "/" + hm.size() + "/" + hm.get(prev) + "/" + KEPT.contains(self));
+        }
+        HookSink.mark("kept/" + KEPT.size() + "/" + COUNT.size() + "/" + COUNT.get(self) + "/" + IDS.size() + "/" + IDS.get(self));
+        prev = self;
+    }
+}
+"#;
+
+/// #246's review: a hook-tier cast or `instanceof` that main answered must not
+/// end the firing, the bootstrap host's hash tables must see a player's two
+/// lives as Java does, and a value no model prints is counted, never a silent
+/// `null`. Expected values: Java 25 on stand-ins with 26.3's identity
+/// (`Entity.equals`/`hashCode` by id, a respawn a new object), the review's
+/// oracle (elysium `~/ava/results/rv246/oracle-java25.txt`).
+#[test]
+fn hook_tier_casts_hash_tables_and_text_answer_as_java_or_count() {
+    let mut sources: BTreeMap<&str, String> = CASES_GAME
+        .iter()
+        .map(|(path, body)| (*path, (*body).to_owned()))
+        .collect();
+    sources.insert("demo/CastMixin.java", CAST_MIXIN.into());
+    sources.insert("demo/ItemCastMixin.java", ITEM_CAST_MIXIN.into());
+    sources.insert("demo/DieMixin.java", DIE_MIXIN.into());
+    sources.insert("demo/CollMixin.java", COLL_MIXIN.into());
+    // Every game class is compile-only: the game holds it, not the jar.
+    let game_classes: Vec<String> = CASES_GAME
+        .iter()
+        .map(|(path, _)| path.replace(".java", ".class"))
+        .collect();
+    let compile_only: Vec<&str> = COMPILE_ONLY
+        .iter()
+        .copied()
+        .chain(game_classes.iter().map(String::as_str))
+        .collect();
+    let fixture = Fixture::build_with(
+        "cases246",
+        sources,
+        &["CastMixin", "ItemCastMixin", "DieMixin", "CollMixin"],
+        &compile_only,
+    );
+    let jar = fixture.load();
+    let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+    let registrations = jar.register_game_hooks(&weave).unwrap();
+    assert_eq!(
+        registrations.hooks().collect::<Vec<_>>(),
+        [
+            "item_picked_up",
+            "living_jump",
+            "player_died",
+            "player_tick"
+        ],
+        "{:#?}",
+        weave.skipped
+    );
+    let mut host = StdHost::new();
+    let mut state = GameHookState::default();
+    let budget = ExecutionBudget::within(std::time::Duration::from_secs(5));
+    let alice = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+    let alice_life = |life| {
+        GameObject::player(alice, "Alice")
+            .with_incarnation(1, life)
+            .with_entity_id(7)
+    };
+    let mut fire = |host: &mut StdHost, hook: &str, receiver: GameObject, args: Vec<GameObject>| {
+        let mut context = GameHookContext::new();
+        context.insert(GameObject::server(true));
+        let receiver = context.insert(receiver);
+        let args: Vec<Value> = args.into_iter().map(|arg| context.insert(arg)).collect();
+        jar.run_game_hook_in(
+            &registrations,
+            &mut state,
+            &mut context,
+            hook,
+            Some(receiver),
+            &args,
+            host,
+            &budget,
+        )
+        .unwrap();
+    };
+    let counted = |host: &StdHost, call: &str| {
+        host.unknown_host_calls()
+            .into_iter()
+            .find(|(method, _)| method == call)
+            .map_or(0, |(_, count)| count)
+    };
+
+    // B1: a mob is a `LivingEntity` by the firing's own description; whether
+    // it is a `ServerPlayer` the description cannot prove, so it is counted
+    // (Java: `false`), and the firing goes on.
+    let player_instanceof =
+        "net/minecraft/server/level/ServerPlayer#<instanceof>(Ljava/lang/Object;)Z";
+    fire(
+        &mut host,
+        "living_jump",
+        GameObject::entity(3, "minecraft:zombie", true).with_health(20.0),
+        vec![],
+    );
+    assert_eq!(marks(&host), ["health/20.0/true/false"]);
+    assert_eq!(counted(&host, player_instanceof), 1);
+    // An item entity is an `ItemEntity`.
+    fire(
+        &mut host,
+        "item_picked_up",
+        GameObject::item_entity(50, "minecraft:diamond", 3),
+        vec![alice_life(0)],
+    );
+    assert_eq!(marks(&host)[1..], ["pickup/3/7"]);
+    // The server the firing names is a `DedicatedServer`, the damage source a
+    // `DamageSource` (cast and `instanceof`). B3: the player's `toString`
+    // needs its level and position: counted (Java prints
+    // `ServerPlayer['Alice'/7, l='ServerLevel[<world>]', x=.., y=.., z=..]`).
+    let to_string = "java/lang/Object#toString()Ljava/lang/String;";
+    assert_eq!(counted(&host, to_string), 0);
+    fire(
+        &mut host,
+        "player_died",
+        alice_life(0),
+        vec![GameObject::opaque(
+            "net/minecraft/world/damagesource/DamageSource",
+            "lava",
+        )],
+    );
+    assert_eq!(marks(&host)[2], "die/true/true");
+    assert_eq!(counted(&host, to_string), 1);
+
+    // B2: a respawn is a new object `equals` (by id) to the old life, so
+    // every hash table keeps one entry and only `IdentityHashMap` two.
+    fire(&mut host, "player_tick", alice_life(0), vec![]);
+    fire(&mut host, "player_tick", alice_life(1), vec![]);
+    assert_eq!(
+        marks(&host)[4..],
+        [
+            "kept/1/1/1/1/1",
+            "coll/false/true/1/1/1/2/true",
+            "kept/1/1/2/2/1",
+        ]
+    );
+}

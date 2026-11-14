@@ -591,6 +591,12 @@ pub(crate) trait ClassHierarchy {
     fn is_interface(&self, class: &str) -> Option<bool> {
         crate::runtime::jdk_closure::class(class).map(|row| row.is_interface)
     }
+
+    /// What the host's own description of the object keyed `key` says about `wanted` (a
+    /// game-hook firing's objects, `game_hooks.rs`); `None` when it describes none.
+    fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
 }
 
 /// The JDK's own hierarchy, for a caller with no runtime: a JDK class never
@@ -757,6 +763,11 @@ pub(crate) fn instance_of_class(
             .iter()
             .any(|class| hierarchy.is_instance(class, wanted) == Some(true))
     {
+        return Some(true);
+    }
+    // The host's description of this very object (a hook firing's `LivingEntity`, a
+    // `DedicatedServer`, a Mixin-added interface): a `yes` it names.
+    if hierarchy.described_instance_of(handle.key(), wanted) == Some(true) {
         return Some(true);
     }
     // The object is a `declared`; `wanted` is final and provably not one, so
