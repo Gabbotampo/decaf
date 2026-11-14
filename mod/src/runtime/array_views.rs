@@ -134,6 +134,17 @@ impl StdHost {
         });
     }
 
+    /// The array the view `marker` mirrors (an edge for the collector:
+    /// the view's `get`/`set` work on it).
+    pub(crate) fn array_view_array(&self, marker: &str) -> Option<&String> {
+        self.array_views.views.get(marker).map(|view| &view.array)
+    }
+
+    /// Every view and window.
+    pub(crate) fn array_view_markers(&self) -> impl Iterator<Item = &String> {
+        self.array_views.views.keys()
+    }
+
     pub(crate) fn has_array_views_of(&self, array: &str) -> bool {
         self.array_views.by_array.contains_key(array)
     }
