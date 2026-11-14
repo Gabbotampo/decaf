@@ -1184,7 +1184,7 @@ fn holder_calls_outside_a_server_host_or_on_another_holder_stay_counted() {
     // A receiver that is not a player stays the host's, as before: a façade entity refuses the
     // unmodelled `getData` by name.
     fixture.open();
-    let mob = text("game/entity/7");
+    let mob = crate::game_object::server_value("game/entity/7".into());
     let answer = fixture.call(
         "get",
         &format!("({PLAYER}I)Ljava/lang/Object;"),

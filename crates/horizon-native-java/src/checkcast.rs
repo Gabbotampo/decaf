@@ -879,6 +879,10 @@ impl<H: Host> Runtime<'_, H> {
 /// (`host_ref.rs`): the JDK's for a JDK class, the held classes' (and
 /// Mixins') for a jar class, `None` where the chain leaves them.
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
+    fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+        self.host.described_instance_of(key, wanted)
+    }
+
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
         if wanted == "java/lang/Object" || class == wanted {
             return Some(true);
