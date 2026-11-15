@@ -603,8 +603,6 @@ impl<H: Host> Runtime<'_, H> {
         !matches!(self.cast_verdict(value, target, None).0, Verdict::No)
     }
 
-    /// The class of a jar (or linked) object or enum constant marker, as
-    /// `checkcast` reads it; `None` for any other value.
     /// The held class of a jar object (an object handle) or of a jar enum
     /// constant (`enum/<class>/<NAME>`); `None` for any other value, a
     /// `String` spelling a class name included.
@@ -622,6 +620,8 @@ impl<H: Host> Runtime<'_, H> {
         self.class(class).is_some().then(|| class.to_owned())
     }
 
+    /// The class of a jar (or linked) object or enum constant marker, as
+    /// `checkcast` reads it; `None` for any other value.
     pub(super) fn known_object_class(&self, value: &Value) -> Option<String> {
         let marker = expect_ref(value)?;
         marker
