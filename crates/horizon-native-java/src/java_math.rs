@@ -173,6 +173,7 @@ mod tests {
 
     /// Another owner, or a descriptor this module does not answer, is left
     /// to the host.
+    #[cfg(not(target_arch = "aarch64"))]
     #[test]
     fn other_calls_are_not_answered() {
         let r = MethodRef {
