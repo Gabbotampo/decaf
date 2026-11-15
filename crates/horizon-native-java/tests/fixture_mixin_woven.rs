@@ -9,6 +9,9 @@
 //! every `Probe.mark` call cross the host boundary, where `StdHost` records the
 //! order and the arguments.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{MixinSide, MixinSkipReason, NativeJar, StdHost, Value};
 use std::{
     collections::BTreeMap,
@@ -121,7 +124,7 @@ impl Fixture {
         sources: &[(&str, &str)],
         configs: &[(&str, &str)],
     ) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-mixin-woven-{name}-{}",
             std::process::id()
         ));

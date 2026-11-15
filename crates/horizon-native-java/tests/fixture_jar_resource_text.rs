@@ -1,6 +1,9 @@
 //! A jar's bundled text resource read back as a `String` through the JDK:
 //! `readAllBytes`, then `new String(bytes, UTF_8)`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -31,7 +34,7 @@ fn build_jar(
     resources: &[(&str, &str)],
     excluded: &[&str],
 ) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-resource-text-{name}-{}",
         std::process::id()
     ));

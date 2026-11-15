@@ -1043,6 +1043,14 @@ impl<H: Host> GameHookHost<'_, H> {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         if facade_server::owns(text) {
+            // A registry's `keySet()`: a set of its own (#156 P14d2).
+            if let Some(ids) = facade_server::key_set(&self.context.server, text, r) {
+                return Some(ids.and_then(|ids| {
+                    self.inner
+                        .factory_collection("java/util/Collections", "unmodifiableSet", "set", ids)
+                        .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))
+                }));
+            }
             return Some(
                 // A Java exception vanilla throws there stays one.
                 facade_server::answer(&self.context.server, text, r, args).map_err(|error| {
@@ -1377,6 +1385,41 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.constructed_uuid(value)
     }
 
+    fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
+        self.inner.map_entry_parts(value)
+    }
+
+    fn mint_map_entry(
+        &mut self,
+        map: Option<&Value>,
+        key: &Value,
+        value: &Value,
+        made: crate::host_map_entry::EntryMade,
+    ) -> Value {
+        self.inner.mint_map_entry(map, key, value, made)
+    }
+
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: crate::host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        self.inner.mint_map_entries(map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        self.inner.unwrapped_view_entry(entry)
+    }
+
+    fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
+        self.inner.entries_before_call(marker, name, args);
+    }
+
+    fn entries_after_call(&mut self, marker: &str) {
+        self.inner.entries_after_call(marker);
+    }
+
     fn component_states(&self) -> Option<&crate::host_component::States> {
         self.inner.component_states()
     }
@@ -1655,6 +1698,22 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
+        self.inner.make_collection(class, values)
+    }
+
+    fn owned_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        follow: bool,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner
+            .owned_collection(of, member, class, follow, values)
     }
 
     fn array_view(

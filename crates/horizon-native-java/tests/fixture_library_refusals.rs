@@ -5,6 +5,9 @@
 //! what `java` prints for the same code, not values read back from the
 //! interpreter.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, ContentBuilderEvent, ExecutionBudget, Host, LinkedClassTable, MethodRef,
     NativeError, NativeJar, StdHost, Value,
@@ -502,7 +505,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-libref-{test}-{}-{unique}",
             std::process::id()
         ));

@@ -104,6 +104,7 @@ mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
 mod host_log4j_level;
+mod host_map_entry;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
@@ -204,6 +205,10 @@ mod registry_lookup;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod stream_codec;
+#[cfg(test)]
+#[path = "stream_codec_tests.rs"]
+mod stream_codec_tests;
 mod stream_pipeline;
 mod string_code_points;
 mod string_constructors;
@@ -2401,6 +2406,55 @@ pub trait Host {
         None
     }
 
+    /// The key and value of a host `Map.Entry` now (`host_map_entry.rs`); `None` for any
+    /// other value, or when the entry's contents are unknown.
+    fn map_entry_parts(&self, _value: &Value) -> Option<(Value, Value)> {
+        None
+    }
+
+    /// A host `Map.Entry`: a new holder or snapshot, or `map`'s node of `key`
+    /// (`host_map_entry.rs`). A host that keeps no entries answers one whose contents are
+    /// unknown.
+    fn mint_map_entry(
+        &mut self,
+        _map: Option<&Value>,
+        _key: &Value,
+        _value: &Value,
+        _made: host_map_entry::EntryMade,
+    ) -> Value {
+        host_map_entry::unknown_entry()
+    }
+
+    /// The entry an unmodifiable view's entry wraps (`host_map_entry.rs`, `Life::Wrapped`): what
+    /// `UnmodifiableCollection.toArray(IntFunction)` hands out, the source's own entry. `None` for
+    /// any other value.
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        let _ = entry;
+        None
+    }
+
+    /// [`Self::mint_map_entry`] over the pairs `[k, v, k, v...]` of `map`.
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        pairs
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [key, value] => Some(self.mint_map_entry(Some(map), key, value, made)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Before and after a call on the map `marker`: its entries follow it
+    /// (`host_map_entry.rs`).
+    fn entries_before_call(&mut self, _marker: &str, _name: &str, _args: &[Value]) {}
+
+    fn entries_after_call(&mut self, _marker: &str) {}
+
     /// The current elements of a mutable collection marker, when the host
     /// keeps one. Interpreter helpers that need a collection's contents run
     /// through the generic `Host` boundary, so the table is exposed here
@@ -2875,6 +2929,29 @@ pub trait Host {
         None
     }
 
+    /// A new collection of the JDK class `class` holding `values`: an object
+    /// of its own the host keeps (`StdHost::new_collection`, #156 P14d), for a
+    /// host that models collections. `None` for one that does not: the caller
+    /// counts its call, never answering with text.
+    fn make_collection(&mut self, _class: &str, _values: Vec<Value>) -> Option<Value> {
+        None
+    }
+
+    /// The collection of `class` an object `of` keeps as its member
+    /// `member` (a field a getter answers, a cached view): the same object on
+    /// every call (`StdHost::cached_collection`). It holds `values` when
+    /// first made, or with `follow` on every call (a view of `of`'s state).
+    fn owned_collection(
+        &mut self,
+        _of: &Value,
+        _member: &str,
+        _class: &str,
+        _follow: bool,
+        _values: Vec<Value>,
+    ) -> Option<Value> {
+        None
+    }
+
     /// A fresh immutable JDK collection with the exact unmodifiable class.
     fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
         None
@@ -3240,6 +3317,8 @@ pub struct StdHost {
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
     locales: BTreeMap<String, (String, String)>,
+    /// The `Map.Entry` objects the host made, by handle key (`host_map_entry.rs`).
+    map_entries: host_map_entry::Entries,
     /// The two halves of every `new UUID(msb, lsb)` a jar constructed, keyed
     /// by its object key (`host_jdk_value.rs`).
     constructed_uuids: BTreeMap<String, (i64, i64)>,
@@ -3429,6 +3508,7 @@ impl StdHost {
             view_copies: BTreeMap::new(),
             view_kinds: BTreeMap::new(),
             locales: BTreeMap::new(),
+            map_entries: host_map_entry::Entries::default(),
             constructed_uuids: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -3665,6 +3745,16 @@ impl StdHost {
         made
     }
 
+    /// The `entrySet()` view the one view cache holds for the map stored as `map`
+    /// ([`Self::cached_collection`]); `None` before the first `entrySet()` or after the heap
+    /// collected it (`host_map_entry.rs` reads its handles and resets its layout).
+    pub(crate) fn entry_view_of(&self, map: &str) -> Option<&String> {
+        let identity = cache_identity(&jar_object::stored_value(map))?;
+        self.cached_collections
+            .get(&(identity, "entrySet".to_owned()))
+            .filter(|view| self.mutable_collections.contains_key(*view))
+    }
+
     /// The one collection Java answers for `member` of `of` on every call (a
     /// map's `keySet()`, `System.getProperties()`, a mod container's root
     /// paths): the same object each time. Made by [`Self::new_collection`]
@@ -3679,7 +3769,7 @@ impl StdHost {
     /// Cached by `of`'s identity ([`cache_identity`]): a value with none (a
     /// `null`) gets a new object each time, never one shared by every such
     /// receiver.
-    fn cached_collection(
+    pub(crate) fn cached_collection(
         &mut self,
         of: &Value,
         member: &str,
@@ -4121,7 +4211,7 @@ impl StdHost {
             + self.synchronized_views.len()
             + self.reversed_views.len()
             + 1;
-        for hops in 0..hops_bound {
+        for _ in 0..hops_bound {
             let target = self.synchronized_target(&marker).to_owned();
             let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
                 source.clone()
@@ -4129,14 +4219,9 @@ impl StdHost {
                 reversed = !reversed;
                 base.clone()
             } else {
-                let mut values = match self.mutable_collections.get(&target) {
-                    Some(values) => values.clone(),
-                    // A view over a collection the host keeps no row for (a literal).
-                    None if hops > 0 => {
-                        collection_values(&jar_object::stored_value(&target)).ok()?
-                    }
-                    None => return None,
-                };
+                // A collection is a handle with a row (#156 P14d2): a view over
+                // anything else reads nothing.
+                let mut values = self.mutable_collections.get(&target)?.clone();
                 if reversed {
                     values.reverse();
                 }
@@ -5459,6 +5544,21 @@ impl Host for StdHost {
         Some(self.empty_collection_class(class))
     }
 
+    fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
+        Some(StdHost::new_collection(self, class, values))
+    }
+
+    fn owned_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        follow: bool,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        Some(self.cached_collection(of, member, class, follow, values))
+    }
+
     fn array_view(
         &mut self,
         array: &str,
@@ -5567,6 +5667,41 @@ impl Host for StdHost {
         self.constructed_uuids
             .get(jar_object::object_key(value)?)
             .copied()
+    }
+
+    fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
+        self.map_entry_now(value)
+    }
+
+    fn mint_map_entry(
+        &mut self,
+        map: Option<&Value>,
+        key: &Value,
+        value: &Value,
+        made: host_map_entry::EntryMade,
+    ) -> Value {
+        StdHost::mint_map_entry(self, map, key, value, made)
+    }
+
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        StdHost::mint_map_entries(self, map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        StdHost::view_entry_inner(self, entry)
+    }
+
+    fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
+        StdHost::entries_before_call(self, marker, name, args);
+    }
+
+    fn entries_after_call(&mut self, marker: &str) {
+        StdHost::entries_after_call(self, marker);
     }
 
     // No host marker answers `instanceof` any more: the command surface
@@ -7279,7 +7414,7 @@ impl Host for StdHost {
         // A Fabric mod container's origin (`mod_origin.rs`); also reached
         // through `String.valueOf`/`"" + origin`, which asks this host for the
         // object's modelled `toString`.
-        if let Some(value) = mod_origin::invoke(r, Some(receiver), args)? {
+        if let Some(value) = mod_origin::invoke(r, Some(receiver), args, self)? {
             return Ok(value);
         }
         // The command dispatcher, builders, nodes and a running command's
@@ -7965,6 +8100,48 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // The game's `NonNullList` (an inventory's list): its own rules
+            // (no `null`, a fixed size for `withSize`) are not modelled, so a
+            // mutator is counted (#255 review), and so is `subList`, whose
+            // `AbstractList$SubList` window would carry the same rules
+            // (#253 re-check), whatever the owner the call names.
+            if jar_object::collection_key(marker).is_some_and(|_| {
+                jar_object::collection_class(marker) == client_surface::NON_NULL_LIST
+            }) && (java_immutable::is_mutator(&r.name) || r.name == "subList")
+            {
+                return self.unknown_host_call(r);
+            }
+            // Gson's `LinkedTreeMap` (a `fromJson` read's map) orders its keys
+            // by `Comparable.compareTo`: `put` of a `null` key throws its own
+            // NPE ("key == null"), and a key that is no `String` (a
+            // comparison with the document's names) is counted (#253
+            // re-check B5). Every other write is the host's map model.
+            if jar_object::collection_key(marker)
+                .is_some_and(|_| jar_object::collection_class(marker) == gson_tree::TREE_MAP)
+                && matches!(
+                    r.name.as_str(),
+                    "put"
+                        | "putIfAbsent"
+                        | "compute"
+                        | "computeIfAbsent"
+                        | "computeIfPresent"
+                        | "merge"
+                        | "putAll"
+                )
+            {
+                match args.first() {
+                    Some(Value::Ref(None)) if matches!(r.name.as_str(), "put" | "putIfAbsent") => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("key == null".into()),
+                            frame: None,
+                        });
+                    }
+                    Some(Value::Ref(Some(key)))
+                        if r.name != "putAll" && value_class::is_plain_string(key) => {}
+                    _ => return self.unknown_host_call(r),
+                }
+            }
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
             if let Some(answer) = self.fixed_size_member(r, marker) {
@@ -8940,39 +9117,25 @@ impl Host for StdHost {
                 _ => {}
             }
         }
-        if r.owner == "java/util/Map$Entry" {
-            let (key, value) = map_entry_parts(receiver)?;
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getKey", "()Ljava/lang/Object;") => Ok(key),
-                ("getValue", "()Ljava/lang/Object;") => Ok(value),
+        // A host `Map.Entry`'s accessors, whatever class the call names
+        // (`host_map_entry.rs`); its `equals`/`hashCode`/`toString` are its row.
+        if host_map_entry::is_entry(receiver) {
+            let part = |host: &Self, first: bool| {
+                host.map_entry_now(receiver)
+                    .map(|(key, value)| if first { key } else { value })
+            };
+            let answer = match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getKey", "()Ljava/lang/Object;") => part(self, true),
+                ("getValue", "()Ljava/lang/Object;") => part(self, false),
                 ("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-                    let replacement = Self::argument(r, args, 0)?.clone();
-                    self.entry_set_value(&key, &value, replacement)
+                    let value = Self::argument(r, args, 0)?.clone();
+                    return self.map_entry_set_value(r, receiver, value);
                 }
-                ("equals", "(Ljava/lang/Object;)Z") => {
-                    let same = |a: &Value, b: &Value| boxed::canonical(a) == boxed::canonical(b);
-                    let equal = map_entry_parts(Self::argument(r, args, 0)?).is_ok_and(
-                        |(other_key, other_value)| {
-                            same(&key, &other_key) && same(&value, &other_value)
-                        },
-                    );
-                    Ok(Value::Int(equal as i32))
-                }
-                // The runtime answers it (`object_methods.rs`, `host_value_hash`):
-                // a jar key's own `hashCode` is not the host's to run.
-                ("hashCode", "()I") => self.unknown_host_call(r),
-                // JDK 25: `key + "=" + value`, each `String.valueOf`'d (a box
-                // as Java prints it; a jar object, which the host cannot run,
-                // counted as in any collection's text).
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
-                    "{}={}",
-                    object_text(self, &key)?,
-                    object_text(self, &value)?
-                )))),
-                _ => Err(NativeError::MissingMethod(format!(
-                    "{}#{}{}",
-                    r.owner, r.name, r.descriptor
-                ))),
+                _ => None,
+            };
+            return match answer {
+                Some(answer) => Ok(answer),
+                None => self.unknown_host_call(r),
             };
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
@@ -9217,17 +9380,31 @@ impl Host for StdHost {
             }
             (owner, "entrySet", "()Ljava/util/Set;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
-                let entries = values
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| {
-                        let key = pair[0].clone();
-                        let value = pair[1].clone();
-                        Ok(map_entry_value(&key, &value))
-                    })
-                    .collect::<Result<Vec<_>, NativeError>>()?;
-                Ok(self.map_view(receiver, "entrySet", "set", entries))
+                // `Map.of(..)`'s entry set makes a `KeyValueHolder` per entry; any other map
+                // hands out its nodes (`host_map_entry.rs`).
+                let made = match expect_ref(receiver)
+                    .and_then(|marker| marker.rsplit_once('#'))
+                    .map(|(class, _)| class)
+                {
+                    Some(
+                        "java/util/ImmutableCollections$MapN"
+                        | "java/util/ImmutableCollections$Map1",
+                    ) => host_map_entry::EntryMade::Holder,
+                    _ => host_map_entry::EntryMade::Node,
+                };
+                let entries = self.mint_map_entries(receiver, &values, made);
+                // The map's one `entrySet` view (#156 P14d1's per-map view cache, keyed by the
+                // map's identity): Java's maps cache it (`HashMap.entrySet` field), so every
+                // call answers the same object (#221 review B2), refreshed here from the map. It
+                // holds the entry handles themselves, so every reading of one node stays the
+                // same object. Java's `EntrySet.contains` looks the key up in the map; this
+                // view's own table is laid out afresh from its entries as they are now.
+                let set = self.map_view(receiver, "entrySet", "set", entries);
+                if let Some(marker) = expect_ref(&set) {
+                    let marker = marker.clone();
+                    self.hash_tables.remove(&marker);
+                }
+                Ok(set)
             }
             // `ConcurrentHashMap.keySet()` declares its `KeySetView`; the
             // snapshot is the same key set.
@@ -11118,12 +11295,6 @@ fn class_of_text(marker: &str) -> Option<String> {
         "java/lang/StringBuilder"
     } else if marker.starts_with("stream/") {
         "java/util/stream/Stream"
-    } else if marker == "list" || marker.starts_with("list/") {
-        "java/util/ArrayList"
-    } else if marker == "set" || marker.starts_with("set/") {
-        "java/util/LinkedHashSet"
-    } else if marker == "map" || marker.starts_with("map/") {
-        "java/util/LinkedHashMap"
     } else {
         let rest = marker.strip_prefix("enum/")?;
         return rest.rsplit_once('/').map(|(class, _)| class.to_owned());
@@ -11667,9 +11838,8 @@ fn bounded_captured_markers(values: &[Value]) -> String {
 /// One element of a collection as the collection readers hand it out: the
 /// [`value_marker`] form with its separator escapes already removed, which is
 /// what splitting an immutable `list/...` marker yields. A mutable collection
-/// answers the same form, so an element that itself holds a comma (a
-/// `map-entry/k,v` from `new ArrayList<>(map.entrySet())`) parses back whole,
-/// and a lookup compares like with like.
+/// answers the same form, so an element that itself holds a comma parses back
+/// whole, and a lookup compares like with like.
 fn collection_item_marker(value: &Value) -> String {
     match value {
         Value::Ref(Some(value)) => format!("r{value}"),
@@ -12283,6 +12453,10 @@ impl host_ref::Nested for HostNested<'_> {
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.0.as_deref()?.constructed_uuid(value)
     }
+
+    fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        self.0.as_deref()?.map_entry_now(value)
+    }
 }
 
 impl StdHost {
@@ -12349,7 +12523,7 @@ fn cache_identity(value: &Value) -> Option<String> {
 /// The class a host collection of `kind` stands in as where Java's own class
 /// is not modelled (a map's `keySet()` is a `HashMap$KeySet` on a JVM), as
 /// the text literals reported it.
-fn stand_in_class(kind: &str) -> &'static str {
+pub(crate) fn stand_in_class(kind: &str) -> &'static str {
     match kind {
         "map" => "java/util/LinkedHashMap",
         "set" => "java/util/LinkedHashSet",
@@ -12829,45 +13003,7 @@ fn thrown_from_supplied(value: Value) -> NativeError {
     }
 }
 
-fn collection_value(kind: &str, values: &[Value]) -> Value {
-    let values = values
-        .iter()
-        .map(value_marker)
-        .collect::<Vec<_>>()
-        .join(",");
-    Value::Ref(Some(if values.is_empty() {
-        kind.to_owned()
-    } else {
-        // No literal spells a jar object's key (`jar_object::unspell_key`).
-        jar_object::unspell_key(format!("{kind}/{values}"))
-    }))
-}
-
-fn map_entry_value(key: &Value, value: &Value) -> Value {
-    Value::Ref(Some(format!(
-        "map-entry/{},{}",
-        value_marker(key),
-        value_marker(value)
-    )))
-}
-
-pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
-    let marker = expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("map-entry/"))
-        .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
-    let parts = split_capture_markers(marker)?;
-    if parts.len() != 2 {
-        return Err(NativeError::Metadata(
-            "map entry marker must contain key and value".into(),
-        ));
-    }
-    Ok((
-        parse_value_marker(&parts[0])?,
-        parse_value_marker(&parts[1])?,
-    ))
-}
-
-fn is_collection_owner(owner: &str) -> bool {
+pub(crate) fn is_collection_owner(owner: &str) -> bool {
     is_list_owner(owner)
         || is_set_owner(owner)
         || is_map_owner(owner)
@@ -13175,32 +13311,17 @@ fn checked_list_insert(index: i32, length: usize) -> Result<usize, NativeError> 
         })
 }
 
-/// The elements of an inline collection literal (`list/<m1>,<m2>`), parsed
-/// once into `Value`s (#156 P14d makes literals handles).
-fn collection_values(value: &Value) -> Result<Vec<Value>, NativeError> {
-    let marker = expect_string(value);
-    let (kind, values) = marker.split_once('/').unwrap_or((marker, ""));
-    // A neutral collection carries a `#<n>` generation suffix so each
-    // unmodelled call owns its own identity; the kind is what precedes it.
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    if !matches!(kind, "list" | "set" | "map") {
-        return Err(NativeError::Metadata(format!(
-            "expected a native collection marker, got {}",
-            describe_value(value)
-        )));
-    }
-    if values.is_empty() {
-        return Ok(Vec::new());
-    }
-    split_capture_markers(values)?
-        .iter()
-        .map(|marker| parse_collection_value(marker))
-        .collect()
+/// A value read as a collection that is none: the host keeps every
+/// collection as a handle, and no text is one (#156 P14d2: the `list/…`,
+/// `set/…`, `map/…` literals are gone, so a `String` spelling one is a
+/// `String`).
+fn not_a_collection(value: &Value) -> Result<Vec<Value>, NativeError> {
+    Err(NativeError::Metadata(format!(
+        "expected a native collection marker, got {}",
+        describe_value(value)
+    )))
 }
 
-/// The class a host collection marker was constructed as
-/// (`java/util/ArrayList#3`, `java/util/ArrayList#neutral0`), or the kind of
-/// an encoded value (`set/...` is `set`).
 /// Whether `value` is the host-made object of one of `classes`, `Collections`' empty
 /// collections (`java_immutable.rs` makes each once, as `Collections.EMPTY_*`).
 fn is_collections_empty(value: &Value, classes: &[&str]) -> bool {
@@ -13215,13 +13336,12 @@ fn iterated_kind(marker: &str) -> Option<String> {
     {
         return Some(class.to_owned());
     }
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    matches!(kind, "list" | "set").then(|| kind.to_owned())
+    None
 }
 
 fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<Value>, NativeError> {
     host.mutable_values(value).map_or_else(
-        || collection_values(value).map_err(|error| host_call_context(host, error)),
+        || not_a_collection(value).map_err(|error| host_call_context(host, error)),
         Ok,
     )
 }
@@ -13230,7 +13350,7 @@ fn host_collection_values(host: &StdHost, value: &Value) -> Result<Vec<Value>, N
 /// (`Stream`, Gson) that do not know the concrete host type.
 fn runtime_collection_values<H: Host>(host: &H, value: &Value) -> Result<Vec<Value>, NativeError> {
     host.mutable_collection_values(value)
-        .map_or_else(|| collection_values(value), Ok)
+        .map_or_else(|| not_a_collection(value), Ok)
 }
 
 /// Name the host call a bad collection operand reached, so a null operand
@@ -13260,10 +13380,6 @@ pub(crate) fn same_items(a: &[Value], b: &[Value]) -> bool {
             .all(|(a, b)| collection_item_marker(a) == collection_item_marker(b))
 }
 
-fn parse_collection_value(value: &str) -> Result<Value, NativeError> {
-    parse_value_marker(value)
-}
-
 fn collection_text(
     host: &mut StdHost,
     value: &Value,
@@ -13282,11 +13398,8 @@ fn collection_text(
         return collection_text(host, &source, false);
     }
     let values = host_collection_values(host, value)?;
-    let kind = marker.split('/').next().unwrap_or(&marker);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
     let is_map = owner_is_map
-        || kind == "map"
         || class.is_some_and(|class| {
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
@@ -20817,262 +20930,6 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// Largest JSON document the bounded Gson surface accepts. Config files in
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
-/// Deepest JSON nesting `Gson.fromJson` materializes.
-const MAX_GSON_DEPTH: usize = 32;
-
-/// Parse one JSON document and materialize it for `Gson.fromJson`.
-///
-/// The target class decides between a primitive, a modelled `String`, and the
-/// collection/map markers the interpreter already understands. A document
-/// that nests past [`MAX_GSON_DEPTH`] or measures over
-/// [`MAX_GSON_JSON_BYTES`] is refused with a bounded reason, never replaced by
-/// an empty value.
-fn gson_document(text: &str) -> Result<Option<serde_json::Value>, NativeError> {
-    // Gson answers `null` for an empty document; a config file that does not
-    // exist yet is read through `Files.newBufferedReader` as an empty stream,
-    // and the caller's null check is the next step.
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    if text.len() > MAX_GSON_JSON_BYTES {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document is {} bytes; the bounded parser reads at most {MAX_GSON_JSON_BYTES}",
-            text.len()
-        )));
-    }
-    // Gson's lenient parser accepts the `//` and `/* */` comments a
-    // hand-maintained lang or config file carries; strip them outside string
-    // literals before the bounded JSON reader sees the bytes.
-    let json: serde_json::Value =
-        serde_json::from_str(&strip_json_comments(text)).map_err(|error| {
-            NativeError::Metadata(format!("Gson.fromJson rejected the document: {error}"))
-        })?;
-    let depth = gson_json_depth(&json, 0);
-    if depth > MAX_GSON_DEPTH {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document nests {depth} levels; the bounded parser reads at most {MAX_GSON_DEPTH}"
-        )));
-    }
-    Ok(Some(json))
-}
-
-/// Remove the `//` and `/* */` comments a lenient Gson read accepts.
-///
-/// The scan tracks string literals and escapes, so a `//` inside a value stays
-/// part of the value. A leading byte-order mark is dropped too: a file written
-/// by an editor that adds one is still valid to Gson.
-fn strip_json_comments(text: &str) -> String {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = characters.next() {
-        if in_string {
-            out.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            out.push(character);
-            continue;
-        }
-        if character == '/' {
-            match characters.peek() {
-                Some('/') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if next == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    characters.next();
-                    let mut previous = '\0';
-                    for next in characters.by_ref() {
-                        if previous == '*' && next == '/' {
-                            break;
-                        }
-                        previous = next;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        out.push(character);
-    }
-    out
-}
-
-fn gson_json_depth(json: &serde_json::Value, depth: usize) -> usize {
-    if depth > MAX_GSON_DEPTH {
-        return depth;
-    }
-    match json {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        serde_json::Value::Object(values) => values
-            .values()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        _ => depth,
-    }
-}
-
-fn gson_json_value(json: &serde_json::Value, class: &str) -> Result<Value, NativeError> {
-    if matches!(json, serde_json::Value::Null) {
-        return Ok(Value::Ref(None));
-    }
-    if class.starts_with('[') {
-        return match json {
-            serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON array for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    if gson_list_target(class) {
-        return match json {
-            serde_json::Value::Array(values) => Ok(gson_json_collection(
-                values,
-                class,
-                if gson_set_target(class) {
-                    "set"
-                } else {
-                    "list"
-                },
-            )?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON array for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    if gson_map_target(class) {
-        return match json {
-            serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
-            other => Err(NativeError::Metadata(format!(
-                "Gson.fromJson expected a JSON object for {class}, got {}",
-                gson_json_kind(other)
-            ))),
-        };
-    }
-    match json {
-        serde_json::Value::Bool(value) => Ok(match class {
-            "java/lang/String" => Value::Ref(Some(value.to_string())),
-            _ => Value::Int(i32::from(*value)),
-        }),
-        serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
-        serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
-        serde_json::Value::Array(values) => Ok(gson_json_collection(values, class, "list")?),
-        serde_json::Value::Object(values) => Ok(gson_json_map(values)?),
-        serde_json::Value::Null => Ok(Value::Ref(None)),
-    }
-}
-
-fn gson_list_target(class: &str) -> bool {
-    is_collection_owner(class) && !is_map_owner(class)
-}
-
-fn gson_set_target(class: &str) -> bool {
-    is_set_owner(class)
-}
-
-fn gson_map_target(class: &str) -> bool {
-    is_map_owner(class)
-}
-
-fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
-    match class {
-        "int"
-        | "java/lang/Integer"
-        | "short"
-        | "java/lang/Short"
-        | "byte"
-        | "java/lang/Byte"
-        | "char"
-        | "java/lang/Character" => number.as_i64().map_or_else(
-            || Value::Float(number.as_f64().unwrap_or(0.0)),
-            |value| Value::Int(value as i32),
-        ),
-        "long" | "java/lang/Long" => number
-            .as_i64()
-            .map_or_else(|| Value::Float(number.as_f64().unwrap_or(0.0)), Value::Long),
-        "float" | "java/lang/Float" | "double" | "java/lang/Double" => {
-            Value::Float(number.as_f64().unwrap_or(0.0))
-        }
-        _ => {
-            if let Some(value) = number.as_i64() {
-                if let Ok(value) = i32::try_from(value) {
-                    Value::Int(value)
-                } else {
-                    Value::Long(value)
-                }
-            } else if let Some(value) = number.as_u64() {
-                match i32::try_from(value) {
-                    Ok(value) => Value::Int(value),
-                    Err(_) => Value::Float(number.as_f64().unwrap_or(0.0)),
-                }
-            } else {
-                Value::Float(number.as_f64().unwrap_or(0.0))
-            }
-        }
-    }
-}
-
-fn gson_json_collection(
-    values: &[serde_json::Value],
-    class: &str,
-    kind: &str,
-) -> Result<Value, NativeError> {
-    let mut materialized = Vec::with_capacity(values.len());
-    for value in values {
-        materialized.push(gson_json_value(value, "java/lang/Object")?);
-    }
-    // The target element type is not resolved (that needs the declared type
-    // arguments); the JSON shape still round-trips through the collection
-    // markers. Keep the array's own class visible in the error path only.
-    let _ = class;
-    Ok(collection_value(kind, &materialized))
-}
-
-fn gson_json_map(
-    values: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Value, NativeError> {
-    let mut materialized = Vec::with_capacity(values.len() * 2);
-    for (key, value) in values {
-        materialized.push(Value::Ref(Some(key.clone())));
-        materialized.push(gson_json_value(value, "java/lang/Object")?);
-    }
-    Ok(collection_value("map", &materialized))
-}
-
-fn gson_json_kind(json: &serde_json::Value) -> &'static str {
-    match json {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
 
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
@@ -22708,29 +22565,8 @@ impl<H: Host> Runtime<'_, H> {
         if wanted.starts_with('[') {
             return false;
         }
-        // Collections and optionals keep their kind in the marker prefix.
-        let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-        let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-        let collection_kinds: &[&str] = match kind {
-            "list" => &[
-                "java/util/List",
-                "java/util/Collection",
-                "java/lang/Iterable",
-            ],
-            "set" => &[
-                "java/util/Set",
-                "java/util/Collection",
-                "java/lang/Iterable",
-            ],
-            "map" => &["java/util/Map"],
-            // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
-            // one implements only `Map.Entry`.
-            "map-entry" => &["java/util/Map$Entry"],
-            _ => &[],
-        };
-        if collection_kinds.contains(&wanted) {
-            return true;
-        }
+        // No text is a collection or a map entry: both are handles (#156
+        // P14d2, P14e), so a marker's prefix never makes it an instance of one.
         // An enum constant names its enum class after the prefix.
         if let Some(rest) = marker.strip_prefix("enum/")
             && let Some((class, _)) = rest.rsplit_once('/')
@@ -22847,6 +22683,13 @@ impl<H: Host> Runtime<'_, H> {
         }
         if target.starts_with('[') {
             return Assignable::Known(false);
+        }
+        // A Guava immutable class the host makes: its whole chain is known
+        // (#253 review).
+        if self.class(source).is_none()
+            && let Some(answer) = crate::java_immutable::guava_assignable(target, source)
+        {
+            return Assignable::Known(answer);
         }
         // A host kind's class (`getClass()` of a handle): its row, unless
         // the run holds that class file (a jar's own copy wins).
@@ -22971,6 +22814,14 @@ impl<H: Host> Runtime<'_, H> {
                 .map(|name| (*name).to_owned())
                 .collect(),
             (None, None) if crate::jdk_closure::in_jdk_package(&name) => return None,
+            // A Guava class the host makes, or Gson's `LinkedTreeMap`: the
+            // interfaces its class file declares.
+            (None, None) if crate::java_immutable::guava_superclass(&name).is_some() => {
+                crate::java_immutable::guava_interfaces(&name)
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            }
             (None, None) => Vec::new(),
         };
         let values = interfaces
@@ -23448,6 +23299,12 @@ impl<H: Host> Runtime<'_, H> {
             let class = reflection_class_name(receiver, r)?.replace('.', "/");
             if class == "java/lang/Object" || host_class::is_primitive(&class) {
                 return Ok(Some(Value::Ref(None)));
+            }
+            // A Guava immutable class the host makes: Guava's own superclass.
+            if self.class(&class).is_none()
+                && let Some(parent) = crate::java_immutable::guava_superclass(&class)
+            {
+                return Ok(Some(host_class::class_value(parent)));
             }
             // A host kind's class: its row knows its supertypes, not which
             // one is the direct superclass. Counted.
@@ -24178,6 +24035,9 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
         // A game codec factory whose result a class only stores.
+        if let Some(value) = stream_codec::static_call(r, args) {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_game_codec_factory(r) {
             return Ok(Some(value));
         }
@@ -25151,213 +25011,39 @@ impl<H: Host> Runtime<'_, H> {
             .unwrap_or_default()
     }
 
-    /// `Gson.fromJson` for a document whose target is the jar's own class.
-    ///
-    /// Gson's reflective adapter allocates the object without running a
-    /// constructor and sets the declared instance fields, and a config class
-    /// then reads them back through ordinary field accesses. The interpreter
-    /// does the same: the field table is keyed by the declaring class, so the
-    /// accessors the mod generates find what the document declared. A document
-    /// that names no field this class declares, or a class the runtime does not
-    /// hold, keeps the previous JSON-shaped answer.
+    /// `Gson.fromJson(text, target)` (`r`) for a target that is not one of
+    /// Gson's tree classes: Gson's answer as its adapter for the declared type
+    /// reads it (`gson_tree/typed.rs`), or the call counted where that is not
+    /// reproduced, never a JSON-shaped stand-in (#253 re-check). `target` is
+    /// `None` when the declared type itself is not known (a `TypeToken` or
+    /// `Type` the runtime cannot read).
     fn gson_from_json(
         &mut self,
+        r: &MethodRef,
         text: &str,
-        class: &str,
+        target: Option<GenericType>,
         style: &gson_model::GsonStyle,
     ) -> Result<Value, NativeError> {
-        let Some(json) = gson_document(text)? else {
-            return Ok(Value::Ref(None));
-        };
-        let class = class.replace('.', "/");
-        if let Some(value) = self.gson_materialize(&json, &class, style)? {
+        if let Some(target) = target
+            && let Some(value) = self.gson_read_text(text, &target, style)?
+        {
             return Ok(value);
         }
-        gson_json_value(&json, &class)
+        self.host.unknown_operand_call(r)
     }
 
-    /// The erased runtime type a `TypeToken` names.
-    ///
-    /// A token subclass declares its type argument in its `Signature`; when
-    /// that resolves, the token behaves like the same class literal would.
-    /// A token the model cannot read answers `Object`, which the JSON shape
-    /// still materializes into a map or a list.
-    fn type_token_class(&self, _token: &Value) -> String {
-        "java/lang/Object".into()
-    }
-
-    /// Allocate one instance of `class` and inject the document's fields.
-    fn gson_materialize(
-        &mut self,
-        json: &serde_json::Value,
-        class: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        let serde_json::Value::Object(document) = json else {
-            return Ok(None);
-        };
-        if class.starts_with("java/") || !self.has_class(class) {
-            return Ok(None);
+    /// The declared type a `TypeToken` or `Type` argument holds: Gson's
+    /// canonical type, a JDK `java.lang.reflect` type, or a `Class`.
+    fn gson_target(&self, value: &Value) -> Option<GenericType> {
+        if *value == Value::Ref(None) {
+            return None;
         }
-        let fields = self.gson_fields(class);
-        if fields.is_empty() {
-            return Ok(None);
-        }
-        self.ensure_initialized(class)?;
-        let value = self.new_object(class);
-        for (declaring, name, descriptor, access) in fields {
-            if !style.includes_field(access) {
-                continue;
-            }
-            // The naming policy names the JSON key on the way in too.
-            let Some(raw) = document.get(&style.field_name(&name)) else {
-                continue;
-            };
-            let Some(field_value) = self.gson_field_value(raw, &descriptor, style)? else {
-                return Ok(None);
-            };
-            let field = MethodRef {
-                owner: declaring,
-                name,
-                descriptor,
-            };
-            if access & 0x0008 != 0 {
-                // Gson sets a static field through reflection; the
-                // invocation's static table is the same field here.
-                self.static_fields
-                    .insert(Self::static_field_key(&field), field_value);
-            } else if let Some(key) = instance_field_key(&value, &field) {
-                self.fields.insert(key, field_value);
-            }
-        }
-        Ok(Some(value))
-    }
-
-    /// Convert one JSON value to the field descriptor it must land in.
-    ///
-    /// A shape the runtime cannot represent answers `None`, and the caller
-    /// keeps the JSON-shaped value rather than an object with masked fields.
-    fn gson_field_value(
-        &mut self,
-        json: &serde_json::Value,
-        descriptor: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        if json.is_null() {
-            return Ok(Some(Value::Ref(None)));
-        }
-        Ok(Some(match descriptor {
-            "Ljava/lang/String;" => match json {
-                serde_json::Value::String(text) => Value::Ref(Some(text.clone())),
-                serde_json::Value::Bool(flag) => Value::Ref(Some(flag.to_string())),
-                serde_json::Value::Number(number) => Value::Ref(Some(number.to_string())),
-                _ => return Ok(None),
-            },
-            "Z" => match json {
-                serde_json::Value::Bool(flag) => Value::Int(i32::from(*flag)),
-                _ => return Ok(None),
-            },
-            "B" | "S" | "I" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "J" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "F" | "D" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Boolean;" => match json {
-                serde_json::Value::Bool(flag) => boolean_value(*flag),
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Byte;" | "Ljava/lang/Short;" | "Ljava/lang/Integer;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Long;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Float;" | "Ljava/lang/Double;" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/util/List;"
-            | "Ljava/util/Collection;"
-            | "Ljava/util/ArrayList;"
-            | "Ljava/util/LinkedList;" => match json {
-                serde_json::Value::Array(values) => {
-                    let mut materialized = Vec::with_capacity(values.len());
-                    for value in values {
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("list", &materialized)
-                }
-                _ => return Ok(None),
-            },
-            "Ljava/util/Set;" | "Ljava/util/HashSet;" | "Ljava/util/LinkedHashSet;" => match json {
-                serde_json::Value::Array(values) => {
-                    let mut materialized = Vec::with_capacity(values.len());
-                    for value in values {
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("set", &materialized)
-                }
-                _ => return Ok(None),
-            },
-            "Ljava/util/Map;" | "Ljava/util/HashMap;" | "Ljava/util/LinkedHashMap;" => match json {
-                serde_json::Value::Object(values) => {
-                    let mut materialized = Vec::with_capacity(values.len() * 2);
-                    for (key, value) in values {
-                        materialized.push(Value::Ref(Some(key.clone())));
-                        materialized.push(gson_json_value(value, "java/lang/Object")?);
-                    }
-                    collection_value("map", &materialized)
-                }
-                _ => return Ok(None),
-            },
-            descriptor if descriptor.starts_with("L") && descriptor.ends_with(';') => {
-                let class = &descriptor[1..descriptor.len() - 1];
-                if !self.has_class(class) {
-                    return Ok(None);
-                }
-                match json {
-                    serde_json::Value::Object(_) => {
-                        match self.gson_materialize(json, class, style)? {
-                            Some(value) => value,
-                            None => return Ok(None),
-                        }
-                    }
-                    // A JSON string for a jar class is its enum constant name.
-                    serde_json::Value::String(name) => {
-                        Value::Ref(Some(format!("enum/{class}/{name}")))
-                    }
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        }))
+        let value = self.gson_token_type(value).unwrap_or_else(|| value.clone());
+        crate::host_gson_type::any_node(&value)
+            .or_else(|| generic_type_marker(&value))
+            .or_else(|| {
+                host_class::class_name(&value).map(|name| GenericType::Class(name.to_owned()))
+            })
     }
 
     fn gson_write_target(&mut self, target: &str, text: &str) -> Result<(), NativeError> {
@@ -25379,7 +25065,7 @@ impl<H: Host> Runtime<'_, H> {
     /// The adapter models the two calls that make a config bootstrap work:
     /// `Gson.fromJson` for primitives, `String` and JSON-shaped collections and
     /// maps, and `Gson.toJson` back to text. The parsed document is bounded by
-    /// [`MAX_GSON_JSON_BYTES`] and [`MAX_GSON_DEPTH`]; a malformed document is
+    /// [`MAX_GSON_JSON_BYTES`] and the tree parser's 255 levels; a malformed document is
     /// rejected with a named reason instead of answering `null` or an empty
     /// string. Objects of a jar's own class are not instantiated (that needs
     /// field injection the native path does not model), so their JSON shape is
@@ -25554,8 +25240,8 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, text, Some(target), &style)?))
                     }
                     ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
                         let reader = args.first().and_then(expect_ref).ok_or_else(|| {
@@ -25574,13 +25260,11 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(&text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, &text, Some(target), &style)?))
                     }
-                    // `Gson.fromJson(Reader, TypeToken)` takes the token's erased
-                    // type: a document that is an object becomes a map and an
-                    // array a list, which is what every JSON-shaped token resolves
-                    // to in the bounded adapter.
+                    // `Gson.fromJson(.., TypeToken)` reads the token's whole type
+                    // (`List<Integer>`'s elements as `Integer`, #253 re-check).
                     (
                         "fromJson",
                         "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
@@ -25605,7 +25289,7 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         } else {
                             let text = args
                                 .first()
@@ -25618,9 +25302,9 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         };
-                        Ok(Some(self.gson_from_json(&text, &class, &style)?))
+                        Ok(Some(self.gson_from_json(r, &text, class, &style)?))
                     }
                     (
                         "fromJson",
@@ -25629,16 +25313,9 @@ impl<H: Host> Runtime<'_, H> {
                         let text = args.first().map(expect_string).ok_or_else(|| {
                             NativeError::Metadata("Gson.fromJson needs a JSON string".into())
                         })?;
-                        let raw = args
-                            .get(1)
-                            .and_then(generic_type_marker)
-                            .and_then(|value| match value {
-                                GenericType::Class(name) => Some(name),
-                                GenericType::Parameterized { raw, .. } => Some(raw),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "java/lang/Object".into());
-                        Ok(Some(self.gson_from_json(text, &raw, &style)?))
+                        let text = text.to_owned();
+                        let target = args.get(1).and_then(|ty| self.gson_target(ty));
+                        Ok(Some(self.gson_from_json(r, &text, target, &style)?))
                     }
                     _ => Ok(None),
                 }
@@ -26184,7 +25861,7 @@ impl<H: Host> Runtime<'_, H> {
         let values = self.stream_output(receiver, &r.name)?;
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // `Stream.toList()`: an unmodifiable `ListN` that allows `null`.
-            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values),
+            ("toList", "()Ljava/util/List;") => self.unmodifiable_list(values)?,
             ("toArray", "()[Ljava/lang/Object;") => {
                 self.new_array_value("[Ljava/lang/Object;", values)
             }
@@ -26196,7 +25873,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match builtin {
                     // `ArrayList::new`, `List::add`: a list of its own.
-                    host_collector::Builtin::List => self.new_array_list(values),
+                    host_collector::Builtin::List => self.new_array_list(values)?,
                     builtin @ (host_collector::Builtin::UnmodifiableList
                     | host_collector::Builtin::ImmutableList) => {
                         if values.contains(&Value::Ref(None)) {
@@ -26212,10 +25889,10 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             ("com/google/common/collect/ImmutableList", "toImmutableList")
                         };
-                        let fallback = collection_value("list", &values);
-                        self.host
-                            .factory_collection(owner, name, "list", values)
-                            .unwrap_or(fallback)
+                        match self.host.factory_collection(owner, name, "list", values) {
+                            Some(list) => list,
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     // `HashSet::new` (`hash_bulk.rs`).
                     host_collector::Builtin::Set => self.hash_set_collect(&values)?,
@@ -26231,15 +25908,15 @@ impl<H: Host> Runtime<'_, H> {
                             });
                         }
                         let kept = self.distinct_in_order(&values)?;
-                        let fallback = collection_value("set", &kept);
-                        self.host
-                            .factory_collection(
-                                "com/google/common/collect/ImmutableSet",
-                                "toImmutableSet",
-                                "set",
-                                kept,
-                            )
-                            .unwrap_or(fallback)
+                        match self.host.factory_collection(
+                            "com/google/common/collect/ImmutableSet",
+                            "toImmutableSet",
+                            "set",
+                            kept,
+                        ) {
+                            Some(set) => set,
+                            None => self.host.unknown_operand_call(r)?,
+                        }
                     }
                     // `Set.of(toSet().toArray())` (`immutable_collections.rs`).
                     host_collector::Builtin::UnmodifiableSet => {
@@ -27804,6 +27481,11 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
                         value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if let Some(text) =
                         invoke_or_catch!(at, string_constructors::build(self, &r, &args))
                     {
@@ -28014,9 +27696,10 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        mod_origin::invoke(&r, receiver.as_ref(), &args, &mut *self.host)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -37715,12 +37398,11 @@ mandatory = true
             name: "hashCode".into(),
             descriptor: "()I".into(),
         };
-        // `Objects.hashCode(key) ^ Objects.hashCode(value)` is the runtime's
-        // (`object_methods.rs`): it may run a jar key's `hashCode`, so the
-        // host alone counts the call.
-        let before = host.unknown_host_call_count();
-        host.invoke_instance(&entry_hash, &entry, &[]).unwrap();
-        assert_eq!(host.unknown_host_call_count(), before + 1);
+        // `Objects.hashCode(key) ^ Objects.hashCode(value)`, both Strings here.
+        assert_eq!(
+            host.invoke_instance(&entry_hash, &entry, &[]).unwrap(),
+            Value::Int(stable_hash("key") ^ stable_hash("value"))
+        );
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
             name: "removeIf".into(),
@@ -38170,18 +37852,18 @@ mandatory = true
             host.invoke_instance(&add_all, &list, &[source]).unwrap(),
             Value::Int(1)
         );
+        let inserted = host.new_collection(
+            "java/util/ArrayList",
+            vec![Value::Ref(Some("marker".into()))],
+        );
         let indexed_add_all = MethodRef {
             owner: "java/util/ArrayList".into(),
             name: "addAll".into(),
             descriptor: "(ILjava/util/Collection;)Z".into(),
         };
         assert_eq!(
-            host.invoke_instance(
-                &indexed_add_all,
-                &list,
-                &[Value::Int(1), Value::Ref(Some("list/rmarker".into()))],
-            )
-            .unwrap(),
+            host.invoke_instance(&indexed_add_all, &list, &[Value::Int(1), inserted],)
+                .unwrap(),
             Value::Int(1)
         );
         let get = MethodRef {

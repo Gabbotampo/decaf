@@ -1,4 +1,7 @@
 //! C4 frame reads with compile-only client signatures and the real 26.3 client oracle.
+#[path = "support/scratch.rs"]
+mod scratch;
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
@@ -166,7 +169,7 @@ fn compile_stubs(include_client_api: bool) -> (PathBuf, String) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-client-frame-api-{}-{unique}",
         std::process::id()
     ));
