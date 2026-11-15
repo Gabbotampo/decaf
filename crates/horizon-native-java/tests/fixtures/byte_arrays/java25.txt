@@ -1,6 +1,6 @@
 basics=[-56, -1, 127, 44, 52]|5|200|ArrayIndexOutOfBoundsException:Index 5 out of bounds for length 5
 overlap=[0, 1, 0, 1, 2, 3, 4, 7, 8, 9]|[0, 3, 4, 5, 6, 5, 6, 7, 8, 9]
 copyErrors=ArrayStoreException:arraycopy: type mismatch: can not copy byte[] into int[]|ArrayStoreException:arraycopy: type mismatch: can not copy object array[] into byte[]|NullPointerException:null|ArrayIndexOutOfBoundsException:arraycopy: last source index 4 out of bounds for byte[3]|ArrayIndexOutOfBoundsException:arraycopy: destination index -1 out of bounds for byte[3]|ok
-arraysOps=[-56, 2, 3, 0, 0]|[2, 3]|-56,7|[-3, -3, -3, -3]|truefalse|-23960|831169
-big=4194304|-512|-56|1
-text=6|héllo|3|[0, 104, -61, -87]
+copies=[-56, 9, 3, 0, 0]|[2, 3]|[-56, 2, 3]|[7, 2, 3]|truefalse|-23960
+big=4194304|-512|-56|[0, 0, 0, 0, 0, 0, 0, 0]|4194304
+grid=3|4|-1|[5]|[0, 0, -1, 0]
