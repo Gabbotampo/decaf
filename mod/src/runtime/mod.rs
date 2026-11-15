@@ -118,6 +118,7 @@ mod iteration_guard;
 mod jar_compare;
 mod jar_object;
 mod jar_operands;
+mod jar_server_values;
 mod jar_text;
 mod jar_throwables;
 mod java_format;
@@ -26511,6 +26512,13 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jar_server_value(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A jar's own `BlockPos`/`LevelResource`: the game's
+                        // members on its fields (`jar_server_values.rs`).
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
                     {
