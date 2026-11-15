@@ -398,6 +398,11 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb9)) else {
             return self.unordered_argument(r, args);
         };
+        // SetFromMap is a live mutable view; its retain/remove operations must
+        // reach the backing map through hash collection dispatch.
+        if self.host.is_set_from_map(receiver) {
+            return Ok(None);
+        }
         if let ("equals", "(Ljava/lang/Object;)Z", [other]) =
             (r.name.as_str(), r.descriptor.as_str(), args)
             && matches!(
