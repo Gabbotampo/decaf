@@ -395,7 +395,10 @@ version = "1.0"
         payloads[0].payload_type
     );
     assert_eq!(payloads[0].codec, Value::Ref(Some("catalog:codec".into())));
-    assert!(matches!(payloads[0].handler, Value::Ref(Some(_))));
+    assert!(matches!(
+        &payloads[0].handler,
+        Value::Host(handle) if handle.kind() == horizon_native_java::HostKind::Callback
+    ));
     assert_eq!(payloads[1].direction, "playToClient");
     assert!(
         is_class(&payloads[1].payload_type, "java/lang/Object"),
@@ -406,7 +409,10 @@ version = "1.0"
         payloads[1].codec,
         Value::Ref(Some("catalog:client_codec".into()))
     );
-    assert!(matches!(payloads[1].handler, Value::Ref(Some(_))));
+    assert!(matches!(
+        &payloads[1].handler,
+        Value::Host(handle) if handle.kind() == horizon_native_java::HostKind::Callback
+    ));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -482,7 +488,11 @@ version = "1.0"
     let registration = &host.registrations()[0];
     assert_eq!(registration.registry, "minecraft:unknown");
     assert_eq!(registration.id, "catalog-register:ruby");
-    assert!(matches!(registration.value, Value::Ref(Some(_))));
+    // The supplier the jar registered: a callback handle (#156 P15a).
+    assert!(matches!(
+        &registration.value,
+        Value::Host(handle) if handle.kind() == horizon_native_java::HostKind::Callback
+    ));
 
     let _ = fs::remove_dir_all(root);
 }

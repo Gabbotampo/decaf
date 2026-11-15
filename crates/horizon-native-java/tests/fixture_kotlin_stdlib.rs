@@ -4,6 +4,7 @@
 mod javac_fixture;
 
 const PROBE: &str = include_str!("fixtures/kotlin_stdlib/demo/Probe.java");
+const LAZY_LAMBDA: &str = include_str!("fixtures/kotlin_stdlib/demo/LazyLambda.java");
 const ENUM_ENTRIES: &str = include_str!("fixtures/kotlin_stdlib/kotlin/enums/EnumEntries.java");
 const ENUM_ENTRIES_KT: &str =
     include_str!("fixtures/kotlin_stdlib/kotlin/enums/EnumEntriesKt.java");
@@ -22,6 +23,7 @@ fn fixture() -> javac_fixture::Fixture {
         "kotlin-stdlib",
         &[
             ("demo/Probe.java", PROBE),
+            ("demo/LazyLambda.java", LAZY_LAMBDA),
             ("kotlin/enums/EnumEntries.java", ENUM_ENTRIES),
             ("kotlin/enums/EnumEntriesKt.java", ENUM_ENTRIES_KT),
             ("kotlin/jvm/functions/Function0.java", FUNCTION0),
@@ -90,4 +92,29 @@ fn kotlin_stdlib_241_oracle() {
         fixture.text_on(&mut host, "lazyRetriesAfterThrow"),
         "java.lang.IllegalStateException|boom|retry|2|true"
     );
+
+    // A lambda initializer is a callback handle (#261), and so is the lambda
+    // it memoizes: what that lambda captured stays reachable through the
+    // lazy holder across a collection.
+    let java = |method: &str| {
+        include_str!("fixtures/kotlin_stdlib/java25.txt")
+            .lines()
+            .find_map(|line| line.strip_prefix(method)?.strip_prefix('='))
+            .expect("oracle method")
+    };
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let mut call = |method: &str| match fixture.jar.invoke_method_with_args(
+        "demo/LazyLambda",
+        method,
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    ) {
+        Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+        other => format!("{other:?}"),
+    };
+    assert_eq!(call("lazyLambdaHold"), java("lazyLambdaHold"));
+    assert_eq!(call("lazyLambdaUse"), java("lazyLambdaUse"));
+    assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
