@@ -165,8 +165,14 @@ fn text(value: &str) -> Value {
     Value::Ref(Some(value.to_owned()))
 }
 
-fn player(uuid: u128) -> Value {
-    text(&format!("game/player/{uuid:032x}"))
+/// The player `uuid` as the runtime hands it to a jar: a game handle (#156 P16b).
+pub(crate) fn player(uuid: u128) -> Value {
+    crate::runtime::game_object::server_value(format!("game/player/{uuid:032x}"))
+}
+
+/// A clone's original player `uuid`, as the runtime hands it to a jar.
+pub(crate) fn original_player(uuid: u128) -> Value {
+    crate::runtime::game_object::server_value(format!("game/original-player/{uuid:032x}"))
 }
 
 /// One stored value in the fake store.
@@ -481,7 +487,10 @@ fn the_registry_is_neoforges_plural_key_and_registration_waits_for_the_register_
     let bound = fixture
         .call("unbound", "()Ljava/lang/Object;", &[])
         .unwrap();
-    assert!(expect_ref(&bound).unwrap().starts_with("nf-attachment/"));
+    assert!(
+        crate::runtime::host_attachment::key_of(&bound, crate::runtime::host_ref::HostKind::AttachmentType).is_some(),
+        "{bound:?}"
+    );
 }
 
 #[test]
@@ -600,7 +609,7 @@ fn compound_copy_is_deep_and_get_compound_or_empty_answers_the_live_child() {
         .host
         .resident_heap()
         .arrays
-        .get(expect_ref(&answer).unwrap())
+        .get(crate::runtime::host_array::array_key(&answer).unwrap())
         .unwrap()
         .clone();
     let read = |fixture: &mut Fixture, value: &Value| {
@@ -637,7 +646,7 @@ fn compound_put_answers_the_previous_tag_and_refuses_null_as_the_server_jar_does
         .host
         .resident_heap()
         .arrays
-        .get(expect_ref(&answer).unwrap())
+        .get(crate::runtime::host_array::array_key(&answer).unwrap())
         .unwrap()
         .clone();
     // The oracle's first put answered null and the second the tag it replaced.
@@ -1034,7 +1043,7 @@ fn death_keeps_only_copy_on_death_types_as_new_objects() {
 /// journaled to the store, and the view ends with the batch.
 #[test]
 fn a_clones_original_keeps_the_old_players_objects() {
-    let original = text(&format!("game/original-player/{P:032x}"));
+    let original = original_player(P);
     let on_original = |fixture: &mut Fixture, name: &str, which: i32| {
         let descriptor = match name {
             "has" => format!("({PLAYER}I)Z"),
@@ -1175,7 +1184,7 @@ fn holder_calls_outside_a_server_host_or_on_another_holder_stay_counted() {
     // A receiver that is not a player stays the host's, as before: a façade entity refuses the
     // unmodelled `getData` by name.
     fixture.open();
-    let mob = text("game/entity/7");
+    let mob = crate::runtime::game_object::server_value("game/entity/7".into());
     let answer = fixture.call(
         "get",
         &format!("({PLAYER}I)Ljava/lang/Object;"),

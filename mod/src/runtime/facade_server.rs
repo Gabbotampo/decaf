@@ -106,9 +106,6 @@ const REGISTRY: &str = "game/registry/";
 const LAYERED: &str = "game/registries/layered";
 /// `MinecraftServer.getCommands()`.
 const COMMANDS: &str = "game/commands";
-/// The marker `Thread.currentThread()` answers: callbacks run on the server
-/// thread, so it is also the server's running thread.
-const THREAD: &str = "thread/main";
 const GAME_RULE: &str = "game-rule/";
 const LEVEL_RESOURCE: &str = "level-resource/";
 
@@ -134,8 +131,10 @@ const LEVEL_RESOURCES: &[(&str, &str)] = &[
     ("ROOT", "."),
 ];
 
+/// A façade value: a `game/…`, `level-resource/` or `game-rule/` marker's
+/// handle (`game_object.rs`, #156 P16b, P16c).
 fn marker(text: impl Into<String>) -> Value {
-    Value::Ref(Some(text.into()))
+    crate::runtime::game_object::server_value(text.into())
 }
 
 fn refuse(r: &MethodRef) -> Result<Value, NativeError> {
@@ -214,7 +213,7 @@ pub(crate) fn server_member(
         ) => {
             let resource = args
                 .first()
-                .and_then(expect_ref)
+                .and_then(crate::runtime::game_object::text)
                 .and_then(|text| text.strip_prefix(LEVEL_RESOURCE));
             match (&facts.world_dir, resource) {
                 (Some(dir), Some(id)) => Ok(path_value(&path_join(dir, id))),
@@ -240,7 +239,9 @@ pub(crate) fn server_member(
         ("getDataStorage", "()Lnet/minecraft/world/level/storage/SavedDataStorage;") => {
             Ok(marker(crate::runtime::facade_saved_data::STORAGE))
         }
-        ("getRunningThread", "()Ljava/lang/Thread;") => Ok(marker(THREAD)),
+        // `Thread.currentThread()`: callbacks run on the server thread, so it
+        // is also the server's running thread.
+        ("getRunningThread", "()Ljava/lang/Thread;") => Ok(crate::runtime::host_jdk::main_thread()),
         // The server's folder: the one the world folder sits in, as a
         // dedicated server's `<level-name>` sits in its working directory.
         ("getServerDirectory", "()Ljava/nio/file/Path;") => {
@@ -276,7 +277,10 @@ pub(crate) fn player_member(
         ("permissions", "()Lnet/minecraft/server/permissions/PermissionSet;") => {
             Some(match facts.permission_levels.get(&player) {
                 // The Brigadier façade's permission set answers its queries.
-                Some(level) => Ok(marker(format!("brigadier/permission-set/{level}"))),
+                Some(&level) => Ok(crate::runtime::host_brigadier::permission(
+                    crate::runtime::host_brigadier::PERMISSION_SET,
+                    level,
+                )),
                 None => refuse(r),
             })
         }
@@ -284,24 +288,16 @@ pub(crate) fn player_member(
     }
 }
 
-/// The id a registry key argument names: `registry/<id>` (a `Registries`
-/// static) or `resource-key/minecraft:root/<id>`.
-fn registry_key(value: &Value) -> Option<&str> {
-    let text = expect_ref(value)?;
-    text.strip_prefix("registry/").or_else(|| {
-        text.strip_prefix("resource-key/minecraft:root/")
-            .map(|id| id.strip_prefix("identifier/").unwrap_or(id))
-    })
+/// The id a registry key argument names: a `ResourceKey` in
+/// `minecraft:root` (`Registries.X`).
+fn registry_key(value: &Value) -> Option<String> {
+    let (registry, id) = crate::runtime::host_ids::resource_key_parts(value)?;
+    (registry == "minecraft:root").then_some(id)
 }
 
 /// The `namespace:path` an `Identifier` argument names.
 fn identifier_text(value: &Value) -> Option<String> {
-    let text = expect_ref(value)?.strip_prefix("identifier/")?;
-    Some(if text.contains(':') {
-        text.to_owned()
-    } else {
-        format!("minecraft:{text}")
-    })
+    crate::runtime::host_ids::identifier_key(value).map(str::to_owned)
 }
 
 /// Answer one call on a marker [`owns`] says is this module's.
@@ -316,7 +312,10 @@ pub(crate) fn answer(
     match (r.name.as_str(), descriptor) {
         ("hashCode", "()I") => return Ok(Value::Int(stable_hash(text))),
         ("equals", "(Ljava/lang/Object;)Z") => {
-            let same = args.first().and_then(expect_ref).is_some_and(|o| o == text);
+            let same = args
+                .first()
+                .and_then(crate::runtime::game_object::text)
+                .is_some_and(|o| o == text);
             return Ok(Value::Int(i32::from(same)));
         }
         _ => {}
@@ -326,14 +325,15 @@ pub(crate) fn answer(
     }
     if let Some(id) = text.strip_prefix(LEVEL_RESOURCE) {
         return match (r.name.as_str(), descriptor) {
-            ("id" | "toString", "()Ljava/lang/String;") => Ok(marker(id)),
+            // `toString` (`/<id>`) is the handle kind's (`server_values.rs`).
+            ("id", "()Ljava/lang/String;") => Ok(Value::Ref(Some(id.to_owned()))),
             _ => refuse(r),
         };
     }
     if text == RULES {
         let id = args
             .first()
-            .and_then(expect_ref)
+            .and_then(crate::runtime::game_object::text)
             .and_then(|t| t.strip_prefix(GAME_RULE));
         let read: fn(GameRuleValue) -> Value = match (r.name.as_str(), descriptor) {
             ("get", "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;") => {
@@ -368,7 +368,7 @@ pub(crate) fn answer(
     if text == COMMANDS {
         return match (r.name.as_str(), descriptor) {
             ("getDispatcher", "()Lcom/mojang/brigadier/CommandDispatcher;") => {
-                Ok(marker(crate::runtime::brigadier::DISPATCHER))
+                Ok(crate::runtime::host_brigadier::dispatcher())
             }
             _ => refuse(r),
         };
@@ -383,7 +383,7 @@ pub(crate) fn answer(
                 "lookupOrThrow",
                 "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/HolderLookup$RegistryLookup;",
             ) => match args.first().and_then(registry_key) {
-                Some(id) if facts.registries.contains_key(id) => {
+                Some(id) if facts.registries.contains_key(&id) => {
                     Ok(marker(format!("{REGISTRY}{id}")))
                 }
                 _ => refuse(r),
@@ -461,7 +461,8 @@ pub(crate) fn channel_of(
     value: &Value,
     type_id: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    identifier_text(value).or_else(|| expect_ref(value).and_then(|marker| type_id(marker)))
+    identifier_text(value)
+        .or_else(|| crate::runtime::game_object::text(value).and_then(|marker| type_id(marker)))
 }
 
 impl crate::runtime::StdHost {
@@ -471,24 +472,24 @@ impl crate::runtime::StdHost {
     /// takes either). `None` for any other read.
     pub(crate) fn facade_field(&self, receiver: &Value, r: &MethodRef) -> Option<Value> {
         self.game_event.as_deref()?;
-        let text = expect_ref(receiver)?;
+        let text = crate::runtime::game_object::text(receiver)?;
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             (
                 "net/minecraft/server/level/ServerPlayer",
                 "connection",
                 "Lnet/minecraft/server/network/ServerGamePacketListenerImpl;",
             ) => Some(marker(format!(
-                "game/connection/{}",
-                text.strip_prefix("game/player/")?
+                "game/connection/{:032x}",
+                crate::runtime::game_object::player_uuid(text)?
             ))),
             (
                 "net/minecraft/server/network/ServerGamePacketListenerImpl",
                 "player",
                 "Lnet/minecraft/server/level/ServerPlayer;",
-            ) => Some(marker(format!(
-                "game/player/{}",
-                text.strip_prefix("game/connection/")?
-            ))),
+            ) => Some(crate::runtime::game_object::player_value(
+                &self.game_event.as_deref()?.facade,
+                u128::from_str_radix(text.strip_prefix("game/connection/")?, 16).ok()?,
+            )),
             _ => None,
         }
     }
@@ -506,8 +507,7 @@ impl crate::runtime::StdHost {
         if let Some(answer) = self.saved_data.call(r, receiver, args) {
             return Some(answer);
         }
-        let player = expect_ref(receiver)?.strip_prefix("game/player/")?;
-        let player = u128::from_str_radix(player, 16).ok()?;
+        let player = crate::runtime::game_object::player_uuid(crate::runtime::game_object::text(receiver)?)?;
         let firing = self.game_event.as_deref()?;
         player_member(&firing.facade.server, player, r)
     }
@@ -520,6 +520,59 @@ const EVENT_LOOPS: &[&str] = &[
     "net/minecraft/util/thread/ReentrantBlockableEventLoop",
     "net/minecraft/util/thread/BlockableEventLoop",
 ];
+
+impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
+    /// `CommandSourceStack.sendSuccess(supplier, broadcast)` on the running
+    /// command's source: vanilla calls `supplier.get()` inside the call, and
+    /// only when the feedback goes somewhere (`StdHost::brigadier_feedback_calls_supplier`),
+    /// so the supplier runs now, or not at all, and its component is sent as
+    /// it is then. `None` for any other call.
+    fn invoke_send_success(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "net/minecraft/commands/CommandSourceStack"
+            || r.name != "sendSuccess"
+            || r.descriptor != "(Ljava/util/function/Supplier;Z)V"
+        {
+            return Ok(None);
+        }
+        let (Some(source), [supplier, broadcast]) = (receiver, args) else {
+            return Ok(None);
+        };
+        let broadcast = matches!(broadcast, Value::Int(flag) if *flag != 0);
+        match self.host.feedback_calls_supplier(source, broadcast) {
+            None => Ok(None),
+            Some(None) => self.host.unknown_operand_call(r).map(Some),
+            Some(Some(false)) => Ok(Some(Value::Void)),
+            Some(Some(true)) => {
+                let component = match self.invoke_callback(supplier, &[])? {
+                    Some(component) => component,
+                    None => {
+                        let get = MethodRef {
+                            owner: "java/util/function/Supplier".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        };
+                        match self.dispatch_owner(&get, 0xb9, Some(supplier)) {
+                            Some((owner, true)) => self.invoke(
+                                &owner,
+                                &get.name,
+                                &get.descriptor,
+                                Some(supplier.clone()),
+                                &[],
+                            )?,
+                            _ => return self.host.unknown_operand_call(r).map(Some),
+                        }
+                    }
+                };
+                self.host.send_feedback(r, &component, broadcast).map(Some)
+            }
+        }
+    }
+}
 
 impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// Server-façade calls that run jar code, which the host cannot do: a
@@ -535,6 +588,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         if let Some(value) = self.invoke_saved_data(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_send_success(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // Chat components with style and arguments (`facade_text.rs`).
         if let Some(value) = self.invoke_text(r, receiver, args)? {
             return Ok(Some(value));
@@ -544,7 +600,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         // so the task runs now rather than being queued. Only a façade
         // server (a `game/` marker) is the running one.
         let on_server = receiver
-            .and_then(expect_ref)
+            .and_then(crate::runtime::game_object::text)
             .is_some_and(|text| text.starts_with("game/"));
         if on_server
             && EVENT_LOOPS.contains(&r.owner.as_str())
@@ -659,7 +715,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let rules = expect_ref(&rules).unwrap().clone();
+        let rules = crate::runtime::game_object::text(&rules).unwrap().clone();
         let rule = |name: &str| {
             static_field(&call(
                 GAME_RULES_CLASS,
@@ -742,7 +798,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let access = expect_ref(&access).unwrap().clone();
+        let access = crate::runtime::game_object::text(&access).unwrap().clone();
         let lookup = call(
             "net/minecraft/core/RegistryAccess$Frozen",
             "lookupOrThrow",
@@ -752,10 +808,10 @@ mod tests {
             &facts,
             &access,
             &lookup,
-            &[marker("registry/minecraft:block")],
+            &[crate::runtime::host_ids::registry_key_of("minecraft:block")],
         )
         .unwrap();
-        let blocks = expect_ref(&blocks).unwrap().clone();
+        let blocks = crate::runtime::game_object::text(&blocks).unwrap().clone();
         let registry =
             |name: &str, descriptor: &str| call("net/minecraft/core/Registry", name, descriptor);
         assert_eq!(
@@ -768,7 +824,7 @@ mod tests {
                 &facts,
                 &blocks,
                 &contains,
-                &[marker("identifier/minecraft:dirt")]
+                &[crate::runtime::host_ids::identifier_of_text("minecraft:dirt")]
             )
             .unwrap(),
             Value::Int(1)
@@ -778,7 +834,7 @@ mod tests {
                 &facts,
                 &blocks,
                 &contains,
-                &[marker("identifier/minecraft:glass")]
+                &[crate::runtime::host_ids::identifier_of_text("minecraft:glass")]
             )
             .unwrap(),
             Value::Int(0)
@@ -789,7 +845,7 @@ mod tests {
                 &facts,
                 &access,
                 &lookup,
-                &[marker("registry/minecraft:worldgen/biome")]
+                &[crate::runtime::host_ids::registry_key_of("minecraft:worldgen/biome")]
             )
             .is_err()
         );
@@ -880,7 +936,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            channel_of(&marker("identifier/demo:sync"), |_| None).as_deref(),
+            channel_of(&crate::runtime::host_ids::identifier_of_text("demo:sync"), |_| None).as_deref(),
             Some("demo:sync")
         );
     }

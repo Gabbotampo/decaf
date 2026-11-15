@@ -39,9 +39,8 @@
 //! before this surface existed; `player` and `level` read `null` then, which
 //! is true while the client is starting.
 //!
-//! Chat components are text markers (`component/literal/<text>` or
-//! `component/translatable/<key>`); a style (`withStyle`, `withColor`,
-//! `Style`) is kept as legacy codes inside that text (`client_text.rs`).
+//! Chat components are host handles of their vanilla JSON (`host_component.rs`); a
+//! style object (`withStyle(Style)`, `Style`) is kept as legacy codes (`client_text.rs`).
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -105,7 +104,7 @@ const USER: &str = "client/user";
 /// `options.<name>()`: `client/option/<name>`.
 const OPTION: &str = "client/option/";
 /// A `Vec3` the façade handed out: `client/vec3/<x>,<y>,<z>`.
-const VEC3: &str = "client/vec3/";
+use crate::client_values::VEC3;
 /// A tooltip listener's `List<Component>`: the host collection the game
 /// seeds with the tooltip's lines and reads back after the firing.
 const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
@@ -126,7 +125,7 @@ pub(crate) fn tooltip_arguments() -> Vec<Value> {
 }
 
 /// A `java.awt.Color` constant: `client/awt-color/<aarrggbb>`.
-const AWT_COLOR: &str = "client/awt-color/";
+use crate::client_values::AWT_COLOR;
 /// `java.awt.Color`'s named constants (both spellings resolve).
 const AWT_COLORS: &[(&str, u32)] = &[
     ("WHITE", 0xffff_ffff),
@@ -144,11 +143,45 @@ const AWT_COLORS: &[(&str, u32)] = &[
     ("BLUE", 0xff00_00ff),
 ];
 
+pub(crate) fn awt_constant(name: &str) -> Option<Value> {
+    let canonical = match name {
+        "lightGray" => "LIGHT_GRAY",
+        "darkGray" => "DARK_GRAY",
+        "white" => "WHITE",
+        "gray" => "GRAY",
+        "black" => "BLACK",
+        "red" => "RED",
+        "pink" => "PINK",
+        "orange" => "ORANGE",
+        "yellow" => "YELLOW",
+        "green" => "GREEN",
+        "magenta" => "MAGENTA",
+        "cyan" => "CYAN",
+        "blue" => "BLUE",
+        other => other,
+    };
+    AWT_COLORS
+        .iter()
+        .find(|(field, _)| *field == canonical)
+        .map(|(_, argb)| marker(format!("{AWT_COLOR}{argb:08x}")))
+}
+
 /// `Runnable`s one firing may queue with `Minecraft.execute`.
 const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
 const VANILLA_KEY: &str = "client/vanilla-key/";
-const CATEGORY: &str = "key-category/";
+use crate::client_values::CATEGORY;
+/// The categories `KeyMapping.Category` registers itself (`minecraft:<name>`).
+const VANILLA_CATEGORIES: &[&str] = &[
+    "movement",
+    "misc",
+    "multiplayer",
+    "gameplay",
+    "inventory",
+    "creative",
+    "spectator",
+    "debug",
+];
 
 const KEY_MAPPING: &str = "net/minecraft/client/KeyMapping";
 const KEY_CATEGORY: &str = "net/minecraft/client/KeyMapping$Category";
@@ -517,6 +550,10 @@ struct KeyInit {
     mouse: bool,
     code: i32,
     category: Option<String>,
+    /// The actual category object passed to the constructor. A jar may pass
+    /// its own `new Category(id)`, which is equal by the record's id but is
+    /// not the registered singleton by reference identity.
+    category_value: Option<Value>,
 }
 
 /// One affine pose without rotation: `[sx, sy, tx, ty]`.
@@ -531,6 +568,8 @@ pub(crate) struct ClientState {
     key_inits: BTreeMap<String, KeyInit>,
     /// `KeyMapping.Category` object marker → its identifier.
     categories: BTreeMap<String, String>,
+    /// The ids `KeyMapping.Category.register` made a category of.
+    registered_categories: std::collections::BTreeSet<String>,
     keys: Vec<ClientKeyMapping>,
     /// Registrations that could not become a mapping or layer, with why.
     refused: Vec<String>,
@@ -548,7 +587,15 @@ pub(crate) struct ClientState {
     tasks: Vec<Value>,
 }
 
+/// A client object or value: a game handle (#156 P16d) for a `client/…` or
+/// `key-category/…` marker, the text itself for any other (an enum constant,
+/// a callback, a `String` answer).
 fn marker(text: impl Into<String>) -> Value {
+    crate::game_object::client_value(text.into())
+}
+
+/// A `String` answer: the text itself, never a client object it might spell.
+fn text(text: impl Into<String>) -> Value {
     Value::Ref(Some(text.into()))
 }
 
@@ -575,20 +622,22 @@ fn cut(text: &str) -> String {
     text.chars().take(MAX_TEXT).collect()
 }
 
-/// A drawn or sent text argument: a `String` or a component marker (a
-/// `FormattedCharSequence` is the component it came from). `None` for null.
-fn text_arg(value: &Value) -> Option<ClientText> {
-    let text = expect_ref(value)?;
-    if let Some(literal) = text.strip_prefix("component/literal/") {
-        return Some(ClientText::Literal(cut(literal)));
+/// A drawn or sent text argument: a `String` or a component as it is when
+/// drawn or sent (its state in `states`; a `FormattedCharSequence` is the
+/// component it came from). `None` for null.
+fn text_arg(value: &Value, states: &crate::host_component::States) -> Option<ClientText> {
+    let json = crate::facade_text::json_now(value, Some(states));
+    if let Some(literal) = json.as_ref().and_then(crate::host_component::bare_literal) {
+        return Some(ClientText::Literal(cut(&literal)));
     }
-    if let Some(key) = text.strip_prefix("component/translatable/") {
-        return Some(ClientText::Translatable(cut(key)));
+    if let Some(key) = json.as_ref().and_then(crate::host_component::bare_key) {
+        return Some(ClientText::Translatable(cut(&key)));
     }
-    if let Some(json) = text.strip_prefix(crate::facade_text::JSON_PREFIX) {
+    if let Some(json) = json {
         // Bounded by the component model itself (64 KiB).
-        return Some(ClientText::Json(json.to_owned()));
+        return Some(ClientText::Json(json.to_string()));
     }
+    let text = expect_ref(value)?;
     Some(ClientText::Literal(cut(text)))
 }
 
@@ -721,7 +770,7 @@ const KEYBOARD_NAMES: &[(i32, &str)] = &[
 
 /// A category marker's identifier: `key-category/<namespace>:<path>`.
 fn category_id(value: &Value, categories: &BTreeMap<String, String>) -> Option<String> {
-    let text = expect_ref(value)?;
+    let text = crate::game_object::text(value)?;
     if let Some(id) = text.strip_prefix(CATEGORY) {
         return Some(id.to_owned());
     }
@@ -755,6 +804,7 @@ fn key_init(
         mouse,
         code,
         category: category_id(category, categories),
+        category_value: Some(category.clone()).filter(|value| !matches!(value, Value::Ref(None))),
     })
 }
 
@@ -956,6 +1006,28 @@ impl StdHost {
     /// End the firing [`Self::begin_client_frame`] started: what the
     /// callbacks drew and sent, and the mappings' state after them.
     pub fn end_client_frame(&mut self) -> ClientFrameOutput {
+        // A tooltip line that is a component no read resolves (past the
+        // bound, a cycle) is left out of the tooltip and counted.
+        let unread = self
+            .mutable_collections
+            .get(TOOLTIP_LIST)
+            .map_or(0, |lines| {
+                lines
+                    .iter()
+                    .filter(|line| {
+                        crate::host_component::is_component(line)
+                            && crate::facade_text::json_now(line, Some(&self.component_states))
+                                .is_none()
+                    })
+                    .count()
+            });
+        for _ in 0..unread {
+            let _ = self.unknown_host_call(&MethodRef {
+                owner: "net/minecraft/network/chat/Component".into(),
+                name: "getString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            });
+        }
         let state = &mut self.client;
         state.frame = None;
         state.poses.clear();
@@ -969,7 +1041,7 @@ impl StdHost {
             tooltip: self.mutable_collections.remove(TOOLTIP_LIST).map(|lines| {
                 lines
                     .iter()
-                    .filter_map(text_arg)
+                    .filter_map(|line| text_arg(line, &self.component_states))
                     .take(MAX_TOOLTIP_LINES)
                     .collect()
             }),
@@ -981,7 +1053,9 @@ impl StdHost {
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
     pub(crate) fn client_static(&self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
-        if !self.client_environment() {
+        // `java.awt.Color` is a JDK singleton family even on a server host;
+        // model both the upper- and lower-case field spellings everywhere.
+        if !self.client_environment() && r.owner != "java/awt/Color" {
             return None;
         }
         let state = &self.client;
@@ -1034,18 +1108,18 @@ impl StdHost {
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
             // `java.awt.Color`'s constants, which HUD mods turn into ARGB
             // ints with `getRGB()` (durabilityviewer's indicator colours).
-            ("java/awt/Color", name) => AWT_COLORS
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, argb)| Ok(marker(format!("{AWT_COLOR}{argb:08x}")))),
+            ("java/awt/Color", name) => awt_constant(name).map(Ok),
             // Item, block and effect constants answer only in a firing: an
             // entrypoint reading `Items.DIAMOND` keeps the answer it always got.
             ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
                 format!("{}{}", items::ITEM, items::constant_id(name)),
             ))),
-            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => Some(Ok(
-                marker(format!("{}{}", items::BLOCK, items::constant_id(name))),
-            )),
+            // The id 26.3 registers for the constant (`vanilla_blocks.rs`); a
+            // constant 26.3 lacks is no block (#239's review B2).
+            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => {
+                crate::vanilla_blocks::field_id(name)
+                    .map(|id| Ok(marker(format!("{}{id}", items::BLOCK))))
+            }
             ("net/minecraft/world/effect/MobEffects", name) if frame.is_some() => {
                 Some(Ok(marker(format!(
                     "{}{}",
@@ -1115,9 +1189,16 @@ impl StdHost {
                 state.register_layer(&args[1], &args[2], "HudElementRegistry.attachElement");
                 Some(Ok(Value::Void))
             }
+            // One category per id: vanilla's own and a second registration of
+            // one throw `IllegalArgumentException`, which is not modelled (counted).
             (KEY_CATEGORY, "register") => {
                 let (namespace, path) = identifier_parts(args.first()?);
-                Some(Ok(marker(format!("{CATEGORY}{namespace}:{path}"))))
+                let id = format!("{namespace}:{path}");
+                let vanilla = namespace == "minecraft" && VANILLA_CATEGORIES.contains(&path);
+                if vanilla || !state.registered_categories.insert(id.clone()) {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                }
+                Some(Ok(marker(format!("{CATEGORY}{id}"))))
             }
             _ => None,
         }
@@ -1135,7 +1216,41 @@ impl StdHost {
         if !self.client_environment() {
             return None;
         }
-        let text = expect_ref(receiver)?.clone();
+        // A client registration event (`RegisterKeyMappingsEvent`...), as its firing names it.
+        if let Some(event) = crate::host_game_event::fired_event(receiver) {
+            return self.client_event_call(event.name(), r, args);
+        }
+        // A component's style calls (`client_text.rs`); an unlisted member keeps
+        // the host's own component model.
+        if crate::host_component::is_component(receiver) {
+            return Some(match text::component_call(r, args)? {
+                // The style as it is now (`withStyle`/`setStyle` change it in place).
+                text::ComponentCall::GetStyle => {
+                    match crate::facade_text::json_now(receiver, Some(&self.component_states)) {
+                        Some(json) => Ok(text::style_of(&json)),
+                        None => self.unknown_host_call(r),
+                    }
+                }
+                text::ComponentCall::Unknown => self.unknown_host_call(r),
+                // `return this`, the receiver's style changed in place.
+                text::ComponentCall::Restyle { codes, replace } => crate::host_component::change(
+                    &mut self.component_states,
+                    receiver,
+                    &crate::facade_text::argument,
+                    |state| text::apply_style(&mut state.base, &codes, replace),
+                )
+                .map(|()| receiver.clone()),
+            });
+        }
+        let text = crate::game_object::text(receiver)?.clone();
+        // Every `client/…` and `key-category/…` object is a handle now (#156 P16d), so a `String`
+        // spelling one is just that `String`: its own members answer, never the object's (#232's
+        // review: `new KeyMapping("client/minecraft", ..).getName().equals(..)` in a firing).
+        if !matches!(receiver, Value::Host(_))
+            && (text.starts_with("client/") || text.starts_with(CATEGORY))
+        {
+            return None;
+        }
         let refuse = || Err(NativeError::UnknownHostCall(r.clone()));
         // `NonNullList` is a `List`: the inventory's lists answer as one.
         if r.owner == "net/minecraft/core/NonNullList" && text.starts_with("list") {
@@ -1174,12 +1289,15 @@ impl StdHost {
         }
         // `BuiltInRegistries.ITEM.getKey(item)`: the item's identifier.
         if r.name == "getKey"
-            && let Some(id) = args.first().and_then(expect_ref).and_then(|a| {
-                a.strip_prefix(items::ITEM)
-                    .or_else(|| a.strip_prefix(items::BLOCK))
-            })
+            && let Some(id) = args
+                .first()
+                .and_then(crate::game_object::text)
+                .and_then(|a| {
+                    a.strip_prefix(items::ITEM)
+                        .or_else(|| a.strip_prefix(items::BLOCK))
+                })
         {
-            return Some(Ok(marker(format!("identifier/{id}"))));
+            return Some(Ok(crate::host_ids::identifier_of_text(id)));
         }
         // A stack the frame built answers as its slot marker does.
         if !text.starts_with("client/")
@@ -1206,54 +1324,40 @@ impl StdHost {
         // Components, styles, text colours and formatting constants
         // (`client_text.rs`); an unlisted component member keeps the host's
         // own component model.
-        if text.starts_with("component/")
-            || text.starts_with("client/style/")
+        if text.starts_with("client/style/")
             || text.starts_with("client/text-color/")
             || text.starts_with("enum/net/minecraft/ChatFormatting/")
         {
-            if let Some(value) = text::text_call(&text, r, args) {
+            if let Some(value) = text::text_call(&text, receiver, r, args) {
                 return Some(Ok(value));
             }
-            if text.starts_with("component/")
-                || text.starts_with("enum/")
-                || self.client.frame.is_none()
-            {
+            if text.starts_with("enum/") || self.client.frame.is_none() {
                 return None;
             }
             return Some(refuse());
         }
-        if let Some(event) = text.strip_prefix("game-event/") {
-            return self.client_event_call(event, r, args);
-        }
         if self.client.key_inits.contains_key(&text) {
             return self.key_mapping_call(&text, r, args);
         }
+        if self.client.categories.contains_key(&text)
+            && matches!(r.name.as_str(), "equals" | "hashCode")
+        {
+            return Some(self.unknown_host_call(r));
+        }
+        // `equals`, `hashCode` and `toString` of a client handle are its
+        // kind's (`game_object.rs`, `client_values.rs`), answered before here.
         if let Some(id) = text.strip_prefix(CATEGORY) {
-            return Some(match (r.name.as_str(), return_desc(&r.descriptor)) {
-                ("id", _) => {
-                    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
-                    Ok(marker(format!("identifier/{namespace}:{path}")))
-                }
-                ("label", _) => Ok(component_value(
+            return Some(match r.name.as_str() {
+                "id" => Ok(crate::host_ids::identifier_of_text(id)),
+                "label" => Ok(component_value(
                     "translatable",
                     &format!("key.category.{}", id.replacen(':', ".", 1)),
                 )),
-                ("hashCode", "I") => Ok(Value::Int(stable_hash(&text))),
-                ("equals", "Z") => Ok(flag(args.first() == Some(receiver))),
-                ("toString", _) => Ok(marker(text.clone())),
                 _ => refuse(),
             });
         }
         if !text.starts_with("client/") {
             return None;
-        }
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("hashCode", "()I") => return Some(Ok(Value::Int(stable_hash(&text)))),
-            ("equals", "(Ljava/lang/Object;)Z") => {
-                return Some(Ok(flag(args.first() == Some(receiver))));
-            }
-            ("toString", "()Ljava/lang/String;") => return Some(Ok(marker(text))),
-            _ => {}
         }
         if let Some(hex) = text.strip_prefix(AWT_COLOR) {
             let argb = u32::from_str_radix(hex, 16).ok()?;
@@ -1370,15 +1474,23 @@ impl StdHost {
                 }
                 Value::Void
             }
-            ("getName", "()Ljava/lang/String;") => marker(init.name),
-            ("getCategory", _) => marker(format!(
-                "{CATEGORY}{}",
-                init.category.as_deref().unwrap_or("minecraft:misc")
-            )),
+            // The jar's own `String`, never parsed into an object whatever it spells
+            // (#232's review: `new KeyMapping("client/minecraft", ..)`).
+            ("getName", "()Ljava/lang/String;") => text(init.name),
+            ("getCategory", _)
+                if init
+                    .category_value
+                    .as_ref()
+                    .is_some_and(crate::jar_object::is_object) =>
+            {
+                return Some(self.unknown_host_call(r));
+            }
+            // Java returns the constructor argument verbatim, including null.
+            ("getCategory", _) => init.category_value.clone().unwrap_or(Value::Ref(None)),
             ("hashCode", "()I") => Value::Int(stable_hash(object)),
             ("equals", "(Ljava/lang/Object;)Z") | ("same", _) => flag(
                 args.first()
-                    .and_then(expect_ref)
+                    .and_then(crate::game_object::text)
                     .is_some_and(|o| o == object),
             ),
             _ if in_frame => return Some(Err(NativeError::UnknownHostCall(r.clone()))),
@@ -1409,14 +1521,13 @@ impl StdHost {
                 ("y", "D") => double(y),
                 ("z", "D") => double(z),
                 ("distanceTo", "D") | ("distanceToSqr", "D") => {
-                    let o = expect_ref(args.first()?)?.strip_prefix(VEC3)?;
+                    let o = crate::game_object::text(args.first()?)?.strip_prefix(VEC3)?;
                     let o: Vec<f64> = o.split(',').filter_map(|c| c.parse().ok()).collect();
                     let d2 = (x - o.first()?).powi(2)
                         + (y - o.get(1)?).powi(2)
                         + (z - o.get(2)?).powi(2);
                     double(if name == "distanceTo" { d2.sqrt() } else { d2 })
                 }
-                ("toString", _) => Some(marker(format!("({x}, {y}, {z})"))),
                 _ => None,
             };
         }
@@ -1436,7 +1547,7 @@ impl StdHost {
         if let Some(mapping) = object.strip_prefix(VANILLA_KEY) {
             return match (name, returns) {
                 ("isDown", "Z") => Some(flag(frame.vanilla_keys_down.iter().any(|k| k == mapping))),
-                ("getName", _) => Some(marker(mapping)),
+                ("getName", _) => Some(text(mapping)),
                 _ => None,
             };
         }
@@ -1508,7 +1619,7 @@ impl StdHost {
                 // 26.3 reads the open screen through the GUI.
                 ("screen", _) if !frame.screen_open => Some(Value::Ref(None)),
                 ("setOverlayMessage", "V") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     self.client.message(ClientMessage::Overlay(text));
                     Some(Value::Void)
                 }
@@ -1521,7 +1632,7 @@ impl StdHost {
             },
             CHAT => match (name, r.descriptor.as_str()) {
                 ("addMessage", "(Lnet/minecraft/network/chat/Component;)V") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     self.client.message(ClientMessage::Chat(text));
                     Some(Value::Void)
                 }
@@ -1534,7 +1645,7 @@ impl StdHost {
                 }
                 match (name, returns) {
                     ("displayClientMessage", "V") => {
-                        let text = text_arg(args.first()?)?;
+                        let text = text_arg(args.first()?, &self.component_states)?;
                         let overlay = int_arg(args, 1).is_some_and(|v| v != 0);
                         self.client.message(if overlay {
                             ClientMessage::Overlay(text)
@@ -1544,7 +1655,7 @@ impl StdHost {
                         Some(Value::Void)
                     }
                     ("sendSystemMessage", "V") => {
-                        let text = text_arg(args.first()?)?;
+                        let text = text_arg(args.first()?, &self.component_states)?;
                         self.client.message(ClientMessage::Chat(text));
                         Some(Value::Void)
                     }
@@ -1566,9 +1677,9 @@ impl StdHost {
                     ("isAlive", "Z") => Some(flag(p.health > 0.0)),
                     ("getId", "I") => int(p.entity_id),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
-                    ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
+                    ("getScoreboardName" | "getPlainTextName", _) => Some(text(p.name.clone())),
                     ("getUUID", _) => uuid_value(&uuid_text(p.uuid)).ok(),
-                    ("getStringUUID", _) => Some(marker(uuid_text(p.uuid))),
+                    ("getStringUUID", _) => Some(text(uuid_text(p.uuid))),
                     ("level" | "clientLevel", _) if frame.level.is_some() => Some(marker(LEVEL)),
                     _ => None,
                 }
@@ -1581,10 +1692,10 @@ impl StdHost {
                     ("getDayTime" | "getOverworldClockTime", "J") => {
                         Some(Value::Long(level.day_time))
                     }
-                    ("dimension", _) => Some(marker(format!(
-                        "resource-key/dimension/{}",
-                        level.dimension
-                    ))),
+                    ("dimension", _) => Some(crate::host_ids::resource_key_named(
+                        "minecraft:dimension",
+                        &level.dimension,
+                    )),
                     ("isClientSide", "Z") => Some(flag(true)),
                     ("getMinY", "I") => int(level.min_y),
                     ("getHeight", "I") => int(level.height),
@@ -1658,7 +1769,7 @@ impl StdHost {
             },
             FONT => match (name, returns) {
                 ("width", "I") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     int(frame.metrics.width(&frame.metrics.resolve(&text)))
                 }
                 _ => None,
@@ -1715,7 +1826,7 @@ impl StdHost {
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
                 // A null string draws nothing (`text` returns early).
-                let Some(text) = text_arg(args.get(1)?) else {
+                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
                     return Some(Value::Void);
                 };
                 let v = ints(2, 3)?;
@@ -1761,7 +1872,7 @@ impl StdHost {
                 let slot = self.client_stack_slot(args.get(1)?)?;
                 let v = ints(2, 2)?;
                 let count = args.get(4).map(|text| {
-                    text_arg(text).map(|t| match t {
+                    text_arg(text, &self.component_states).map(|t| match t {
                         ClientText::Literal(s) | ClientText::Translatable(s) => s,
                         ClientText::Json(json) => serde_json::from_str(&json)
                             .map(|json| crate::facade_text::plain(&json))
@@ -1801,7 +1912,7 @@ impl StdHost {
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
-                let Some(text) = text_arg(args.get(1)?) else {
+                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
                     return Some(Value::Void);
                 };
                 let v = ints(2, 3)?;
@@ -2441,6 +2552,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rgb, Value::Int(0xff00_ff00_u32 as i32));
+        let upper = crate::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "LIGHT_GRAY", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        let lower = crate::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "lightGray", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        assert_eq!(upper, lower, "upper={upper:?} lower={lower:?}");
     }
 
     #[test]

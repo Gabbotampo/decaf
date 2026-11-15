@@ -70,6 +70,16 @@ impl<H: Host> Runtime<'_, H> {
         let start = usize::try_from(restart).unwrap_or(0);
         for (index, label) in labels.iter().enumerate().skip(start) {
             let matched = match (label, value) {
+                // An object as the `instanceof` opcode decides it: its class's
+                // chain, and a "no" counted only where the opcode counts one
+                // (a class outside what the runtime holds and Java 25's table).
+                (SwitchLabel::Class(class), Value::Host(handle))
+                    if crate::runtime::jar_object::is_object_handle(handle) =>
+                {
+                    self.switch_instance_of(value, class)
+                        || self.instance_of_is_guess(value, class)
+                            && self.handle_instance_of(handle, class)?
+                }
                 // A host handle by its kind's row (`host_ref.rs`), as the
                 // `instanceof` opcode decides it.
                 (SwitchLabel::Class(class), Value::Host(handle)) => {
@@ -95,6 +105,16 @@ impl<H: Host> Runtime<'_, H> {
         if class == "java/lang/Object" {
             return true;
         }
+        // A handle is what its kind's row says (`host_ref.rs`): an array is
+        // an `Object[]` by JLS array subtyping, not by a class chain.
+        // An object's "yes" is its class's chain; any other answer goes on
+        // to the paths below.
+        if let Value::Host(handle) = value {
+            let row = handle.instance_of(class, self) == Some(true);
+            if row || !crate::runtime::jar_object::is_object_handle(handle) {
+                return row;
+            }
+        }
         if let Some(own) = class_of_value(value)
             && (own == class || self.class_is_instance(&own, class))
         {
@@ -107,14 +127,25 @@ impl<H: Host> Runtime<'_, H> {
             return true;
         }
         // A string is a bare marker: no object, boxed, collection, array,
-        // callback, enum or game prefix claims it.
+        // callback, enum or game prefix claims it. A `#` claims it only as an
+        // object's `class#n` (`[I#0` is a string: arrays are handles).
         if class == "java/lang/String" || class == "java/lang/CharSequence" {
             let claimed = class_of_value(value).is_some()
-                || marker.contains('#')
-                || ["array/", "@", "enum/", "game/", "registry/", "identifier/"]
+                || marker.contains('#') && !value_class::is_plain_string(marker)
+                || ["@", "enum/", "game/"]
                     .iter()
                     .any(|prefix| marker.starts_with(prefix));
             return !claimed;
+        }
+        // A `String` spelling an object's key is no object.
+        if crate::runtime::jar_object::spells_key(value) {
+            return false;
+        }
+        // A `String` is an instance of `String`'s supertypes only, however it
+        // is spelled: `"java/util/List"` is no `List`, `"java/lang/Class"` no
+        // `Class` (#156 P13c), as the `instanceof` opcode answers.
+        if value_class::is_plain_string(marker) {
+            return value_class::string_instance_of(marker, class);
         }
         self.object_is_instance_of(marker, class)
     }

@@ -67,6 +67,8 @@ pub use original::ORIGINAL_PREFIX;
 use original::{Original, original_uuid};
 
 use crate::runtime::attachment_codec::{Codecs, Coded, READ_FAILED};
+use crate::runtime::host_attachment::{handle, key_of};
+use crate::runtime::host_ref::HostKind;
 use crate::runtime::java_nbt::NbtCompound;
 use crate::runtime::{
     ExecutionBudget, Host, MethodRef, NativeError, NativeJar, Runtime, StdHost, Value, expect_ref,
@@ -81,6 +83,12 @@ const BUILDER: &str = "net/neoforged/neoforge/attachment/AttachmentType$Builder"
 const TYPE: &str = "net/neoforged/neoforge/attachment/AttachmentType";
 const DEFERRED_REGISTER: &str = "net/neoforged/neoforge/registries/DeferredRegister";
 const DEFERRED_HOLDER: &str = "net/neoforged/neoforge/registries/DeferredHolder";
+
+/// The registration a holder handle names (`host_registry.rs`), as the text
+/// this bridge keys its registers' entries and bound types by.
+fn holder_key(value: &Value) -> Option<String> {
+    crate::runtime::host_registry::holder_serial(value).map(|serial| serial.to_string())
+}
 /// The unknown every sync NeoForge would send is counted under (design §3.3).
 pub const SYNC_NOT_SENT: &str = "neoforge:sync_attachments (not sent)";
 /// The holder classes a player's attachment call names in bytecode.
@@ -92,8 +100,6 @@ const HOLDER_OWNERS: [&str; 6] = [
     "net/neoforged/neoforge/attachment/AttachmentHolder",
     "net/neoforged/neoforge/attachment/IAttachmentHolder",
 ];
-/// A façade player's marker (`events::player_marker`).
-const PLAYER_PREFIX: &str = "game/player/";
 /// Types and builders one jar may make; past this the builder surface stays unmodelled.
 const MAX_TYPES: usize = 4096;
 const TYPE_ARG: &str = "Lnet/neoforged/neoforge/attachment/AttachmentType;";
@@ -238,6 +244,9 @@ pub struct AttachmentState {
     builders: BTreeMap<String, TypeSpec>,
     types: BTreeMap<String, TypeSpec>,
     next_marker: usize,
+    /// Each type's and builder's name in diagnostics (a counted refusal names an unregistered
+    /// type by it): the text it used to be, `nf-attachment/<class>/<n>`.
+    names: BTreeMap<String, String>,
     registers: Vec<Register>,
     /// Holder key → the type its supplier made, once registered.
     bound: BTreeMap<String, String>,
@@ -262,6 +271,18 @@ pub struct AttachmentState {
 }
 
 impl AttachmentState {
+    /// Whether holder `key` is an attachment holder that NeoForge's registration left unbound:
+    /// its supplier did not make a type, or its register never joined a bus. Before the
+    /// registration point every holder is unbound anyway (`host_registry::Binding`).
+    pub(crate) fn holder_left_unbound(&self, key: &str) -> bool {
+        self.registration_done
+            && !self.bound.contains_key(key)
+            && self
+                .registers
+                .iter()
+                .any(|register| register.entries.iter().any(|(_, _, holder)| holder == key))
+    }
+
     /// Every value this state holds that names a jar object: roots of the heap collection.
     pub(crate) fn root_texts<'a>(&'a self, out: &mut Vec<&'a str>) {
         fn value<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
@@ -335,10 +356,17 @@ impl AttachmentState {
             )
     }
 
-    fn new_marker(&mut self, class: &str) -> String {
-        let marker = format!("nf-attachment/{class}/{}", self.next_marker);
+    /// A new type or builder (`host_attachment.rs`): its handle and its table key (the handle's
+    /// key).
+    fn new_handle(&mut self, kind: HostKind, class: &str) -> (Value, String) {
+        let value = crate::runtime::host_attachment::mint(kind);
+        let key = key_of(&value, kind).unwrap_or_default().to_owned();
+        self.names.insert(
+            key.clone(),
+            format!("nf-attachment/{class}/{}", self.next_marker),
+        );
         self.next_marker += 1;
-        marker
+        (value, key)
     }
 
     fn drop_player(&mut self, player: u128) {
@@ -484,8 +512,7 @@ fn holder_op(r: &MethodRef) -> Option<(HolderOp, bool)> {
 }
 
 fn player_uuid(receiver: Option<&Value>) -> Option<u128> {
-    let hex = receiver.and_then(expect_ref)?.strip_prefix(PLAYER_PREFIX)?;
-    (hex.len() == 32).then(|| u128::from_str_radix(hex, 16).ok())?
+    crate::runtime::game_object::player_uuid(crate::runtime::game_object::text(receiver?)?)
 }
 
 fn npe(message: Option<String>) -> NativeError {
@@ -617,9 +644,9 @@ impl<H: Host> Runtime<'_, H> {
             if state.builders.len() + state.types.len() >= MAX_TYPES {
                 return Ok(None);
             }
-            let marker = state.new_marker(BUILDER);
+            let (builder, marker) = state.new_handle(HostKind::AttachmentBuilder, BUILDER);
             state.builders.insert(
-                marker.clone(),
+                marker,
                 TypeSpec {
                     default: args.first().cloned().unwrap_or(Value::Ref(None)),
                     holder_arg: spec.0,
@@ -629,12 +656,15 @@ impl<H: Host> Runtime<'_, H> {
                     sync: None,
                 },
             );
-            return Ok(Some(Value::Ref(Some(marker))));
+            return Ok(Some(builder));
         }
         if r.owner != BUILDER {
             return Ok(None);
         }
-        let Some(builder) = receiver.and_then(expect_ref).cloned() else {
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(builder) = key_of(receiver, HostKind::AttachmentBuilder).map(str::to_owned) else {
             return Ok(None);
         };
         let Some(spec) = state.builders.get(&builder).cloned() else {
@@ -645,9 +675,9 @@ impl<H: Host> Runtime<'_, H> {
         let mut spec = spec;
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("build", "()Lnet/neoforged/neoforge/attachment/AttachmentType;") => {
-                let marker = state.new_marker(TYPE);
-                state.types.insert(marker.clone(), spec);
-                return Ok(Some(Value::Ref(Some(marker))));
+                let (made, marker) = state.new_handle(HostKind::AttachmentType, TYPE);
+                state.types.insert(marker, spec);
+                return Ok(Some(made));
             }
             (
                 "serialize",
@@ -688,13 +718,15 @@ impl<H: Host> Runtime<'_, H> {
                 if spec.serializable() {
                     return Err(illegal_state("Serializer already set"));
                 }
-                let codec = expect_ref(&arg(0)).cloned().unwrap_or_default();
-                spec.serializer = if state.codecs.is_map_codec(&codec) {
-                    Serializer::MapCodec { codec, predicate }
-                } else {
-                    Serializer::Unmodelled(format!(
-                        "a MapCodec not built from CompoundTag.CODEC, flatXmap and fieldOf ({codec})"
-                    ))
+                let codec = crate::runtime::host_codec::modelled_codec_key(&arg(0)).map(str::to_owned);
+                spec.serializer = match codec {
+                    Some(codec) if state.codecs.is_map_codec(&codec) => {
+                        Serializer::MapCodec { codec, predicate }
+                    }
+                    _ => Serializer::Unmodelled(format!(
+                        "a MapCodec not built from CompoundTag.CODEC, flatXmap and fieldOf ({})",
+                        crate::runtime::value_text(&arg(0))
+                    )),
                 };
             }
             ("copyOnDeath", "()Lnet/neoforged/neoforge/attachment/AttachmentType$Builder;") => {
@@ -739,8 +771,9 @@ impl<H: Host> Runtime<'_, H> {
             }
             _ => return Ok(None),
         }
-        state.builders.insert(builder.clone(), spec);
-        Ok(Some(Value::Ref(Some(builder))))
+        state.builders.insert(builder, spec);
+        // `return this`: the same builder.
+        Ok(Some(receiver.clone()))
     }
 
     fn attachment_register_call(
@@ -749,24 +782,31 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let Some(marker) = receiver.and_then(expect_ref).cloned() else {
-            return Ok(None);
-        };
         // `DeferredHolder.get()`/`value()`, and `get()` through the `Supplier` a mod usually types
         // its holder field as.
         if ((r.owner == DEFERRED_HOLDER && matches!(r.name.as_str(), "get" | "value"))
             || (r.owner == "java/util/function/Supplier" && r.name == "get"))
             && r.descriptor == "()Ljava/lang/Object;"
         {
-            let Some(key) = marker.strip_prefix("holder/") else {
+            let Some(key) = receiver.and_then(holder_key) else {
                 return Ok(None);
             };
-            return self.attachment_holder_value(key);
+            return self.attachment_holder_value(&key);
         }
+        // A register handle (`host_deferred_register.rs`): its key names this
+        // one register, its text the registry and namespace.
+        let Some(register) = receiver.cloned() else {
+            return Ok(None);
+        };
+        let Some((marker, text)) = crate::runtime::host_deferred_register::parts(&register)
+            .map(|(key, text)| (key.to_owned(), text.to_owned()))
+        else {
+            return Ok(None);
+        };
         if r.owner != DEFERRED_REGISTER {
             return Ok(None);
         }
-        let Some(namespace) = marker.strip_prefix(REGISTER_PREFIX) else {
+        let Some(namespace) = text.strip_prefix(REGISTER_PREFIX) else {
             return Ok(None);
         };
         let namespace = namespace.to_owned();
@@ -784,14 +824,10 @@ impl<H: Host> Runtime<'_, H> {
             ) => {
                 // The host keeps the registration row and the holder as it always has; this keeps
                 // the supplier the row drops, to run at the registration point.
-                let holder =
-                    self.host
-                        .invoke_instance(r, &Value::Ref(Some(marker.clone())), args)?;
+                let holder = self.host.invoke_instance(r, &register, args)?;
                 let (Some(path), Some(key)) = (
                     args.first().and_then(expect_ref).cloned(),
-                    expect_ref(&holder)
-                        .and_then(|h| h.strip_prefix("holder/"))
-                        .map(str::to_owned),
+                    holder_key(&holder),
                 ) else {
                     return Ok(Some(holder));
                 };
@@ -824,7 +860,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         match state.bound.get(key) {
-            Some(marker) => Ok(Some(Value::Ref(Some(marker.clone())))),
+            Some(marker) => Ok(Some(handle(HostKind::AttachmentType, marker))),
             None => Err(npe(Some(format!(
                 "Trying to access unbound value: ResourceKey[{ATTACHMENT_TYPES_REGISTRY} / {namespace}:{path}]"
             )))),
@@ -841,15 +877,15 @@ impl<H: Host> Runtime<'_, H> {
         let mut value = arg.clone();
         if by_supplier {
             // `IAttachmentHolder`'s default overloads: `supplier.get()`, then the typed call.
-            let Some(marker) = expect_ref(arg).cloned() else {
+            if *arg == Value::Ref(None) {
                 return Err(crate::runtime::null_checks::invoke_on_null(&MethodRef {
                     owner: "java/util/function/Supplier".into(),
                     name: "get".into(),
                     descriptor: "()Ljava/lang/Object;".into(),
                 }));
-            };
-            value = if let Some(key) = marker.strip_prefix("holder/") {
-                match self.attachment_holder_value(key)? {
+            }
+            value = if let Some(key) = holder_key(arg) {
+                match self.attachment_holder_value(&key)? {
                     Some(value) => value,
                     None => return Ok(None),
                 }
@@ -862,8 +898,14 @@ impl<H: Host> Runtime<'_, H> {
         }
         // `validateAttachmentType` @0: `requireNonNull(type)`. In production (`FMLEnvironment`
         // answers `isProduction() == true` here) it checks nothing else (@5–11).
-        let Some(marker) = expect_ref(&value).cloned() else {
-            return Err(npe(None));
+        let marker = match &value {
+            Value::Ref(None) => return Err(npe(None)),
+            // A type this runtime built (`host_attachment.rs`); a String is never one.
+            value => match key_of(value, HostKind::AttachmentType) {
+                Some(key) => key.to_owned(),
+                // Some other object (a holder's unbound value): not a type this runtime built.
+                None => return Ok(None),
+            },
         };
         let Some(state) = self.attachments() else {
             return Ok(None);
@@ -880,7 +922,12 @@ impl<H: Host> Runtime<'_, H> {
         let Some((op, by_supplier)) = holder_op(r) else {
             return Ok(None);
         };
-        let original = original_uuid(receiver);
+        // The clone's old player: its marker, or its previous life's key
+        // (`events::clone_original`).
+        let original = original_uuid(receiver).or_else(|| {
+            self.host
+                .clone_original_of(crate::runtime::game_object::text(receiver?)?)
+        });
         let Some(player) = player_uuid(receiver).or(original) else {
             return Ok(None);
         };
@@ -898,7 +945,13 @@ impl<H: Host> Runtime<'_, H> {
             .cloned()
             .expect("type checked above");
         let id = state.ids.get(&type_marker).cloned();
-        let subject = id.clone().unwrap_or_else(|| type_marker.clone());
+        let subject = id.clone().unwrap_or_else(|| {
+            state
+                .names
+                .get(&type_marker)
+                .cloned()
+                .unwrap_or_else(|| type_marker.clone())
+        });
         if let Some(why) = spec.unbridgeable() {
             return Ok(Some(self.attachment_refusal(r, &subject, &why)));
         }
@@ -1272,10 +1325,12 @@ impl NativeJar {
         let mut callback_infos = crate::runtime::CallbackInfos::new();
         let mut runtime = Runtime {
             classes: &self.classes,
+            mixin_index: std::cell::OnceCell::new(),
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields,
             initialized_classes,
             arrays: BTreeMap::new(),
@@ -1283,6 +1338,7 @@ impl NativeJar {
             next_object: 0,
             streams: BTreeMap::new(),
             next_stream: 0,
+            pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             string_readers: BTreeMap::new(),
@@ -1298,6 +1354,8 @@ impl NativeJar {
             anchor_hooks: None,
             modify_hooks: None,
             pending_skipped_new: Vec::new(),
+            stream_plan: Default::default(),
+            store_verdict: Default::default(),
             depth: 0,
             budget,
         };
@@ -1324,6 +1382,8 @@ impl NativeJar {
             return Vec::new();
         }
         host.neoforge_attachments.registration_done = true;
+        // The registry step: which holders are bound is no longer known until it ends.
+        host.holders_registering();
         let entries: Vec<(String, String, Value, String)> = host
             .neoforge_attachments
             .registers
@@ -1349,11 +1409,17 @@ impl NativeJar {
             let ran = self.with_resident_runtime(host, budget, |runtime| {
                 runtime.invoke_callback(&supplier, &[])
             });
-            let made = match ran {
-                Ok(Ok(Some(Value::Ref(Some(marker)))))
-                    if host.neoforge_attachments.types.contains_key(&marker) =>
+            let (made, made_value) = match ran {
+                Ok(Ok(Some(value)))
+                    if key_of(&value, HostKind::AttachmentType)
+                        .is_some_and(|key| host.neoforge_attachments.types.contains_key(key)) =>
                 {
-                    marker
+                    (
+                        key_of(&value, HostKind::AttachmentType)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        value,
+                    )
                 }
                 Ok(Ok(other)) => {
                     problems.push(format!(
@@ -1370,7 +1436,9 @@ impl NativeJar {
             state.bound.insert(key.clone(), made.clone());
             state.ids.insert(made.clone(), id);
             // `DeferredHolder.get()` through the host's own path answers the type too.
-            host.holders.insert(key, Value::Ref(Some(made)));
+            if let Ok(serial) = key.parse() {
+                host.holders.insert(serial, made_value);
+            }
         }
         problems
     }

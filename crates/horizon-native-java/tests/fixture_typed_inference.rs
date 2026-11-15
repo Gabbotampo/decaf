@@ -244,6 +244,28 @@ fn construct(
     .unwrap()
 }
 
+/// The registry `BuiltInRegistries.<field>` answers (a host handle).
+fn built_in_registry(field: &str) -> Value {
+    let field = MethodRef {
+        owner: "net/minecraft/core/registries/BuiltInRegistries".into(),
+        name: field.into(),
+        descriptor: "Lnet/minecraft/core/DefaultedRegistry;".into(),
+    };
+    StdHost::new().get_static(&field).unwrap()
+}
+
+/// The `Identifier` `Identifier.parse(text)` answers (a host handle).
+fn parsed_id(text: &str) -> Value {
+    let parse = MethodRef {
+        owner: "net/minecraft/resources/Identifier".into(),
+        name: "parse".into(),
+        descriptor: "(Ljava/lang/String;)Lnet/minecraft/resources/Identifier;".into(),
+    };
+    StdHost::new()
+        .invoke(&parse, &[Value::Ref(Some(text.into()))])
+        .unwrap()
+}
+
 #[test]
 fn fabric_fixture_infers_typed_item_and_block_declarations() {
     let (root, jar_path) = build_jar(
@@ -290,9 +312,11 @@ fn fabric_fixture_infers_typed_item_and_block_declarations() {
     );
     // The full chain is kept: `durability` has no loader key, so it is not
     // exported and cannot fail the declaration for an unknown property.
-    let Value::Ref(Some(wand_marker)) = &wand.value else {
-        panic!("item value is not a marker: {:?}", wand.value);
+    // The item the jar `new`ed: a handle keyed `class#n`.
+    let Value::Host(wand_handle) = &wand.value else {
+        panic!("item value is not an object: {:?}", wand.value);
     };
+    let wand_marker = wand_handle.key();
     assert_eq!(
         host.item_properties(wand_marker),
         Some(&BTreeMap::from([
@@ -315,9 +339,10 @@ fn fabric_fixture_infers_typed_item_and_block_declarations() {
             item: true,
         })
     );
-    let Value::Ref(Some(lamp_marker)) = &lamp.value else {
-        panic!("block value is not a marker: {:?}", lamp.value);
+    let Value::Host(lamp_handle) = &lamp.value else {
+        panic!("block value is not an object: {:?}", lamp.value);
     };
+    let lamp_marker = lamp_handle.key();
     assert_eq!(
         host.block_properties(lamp_marker),
         Some(&BTreeMap::from([
@@ -371,8 +396,8 @@ fn explicit_declaration_replaces_an_inferred_one() {
     host.invoke(
         &register,
         &[
-            Value::Ref(Some("registry/minecraft:item".into())),
-            Value::Ref(Some("identifier/ruby:wand".into())),
+            built_in_registry("ITEM"),
+            parsed_id("ruby:wand"),
             Value::Ref(Some("net/minecraft/world/item/Item#0".into())),
         ],
     )
@@ -400,8 +425,8 @@ fn explicit_declaration_replaces_an_inferred_one() {
     host.invoke(
         &register,
         &[
-            Value::Ref(Some("registry/minecraft:item".into())),
-            Value::Ref(Some("identifier/ruby:plain".into())),
+            built_in_registry("ITEM"),
+            parsed_id("ruby:plain"),
             Value::Ref(Some("@indy:plain-item".into())),
         ],
     )
@@ -437,8 +462,8 @@ fn inference_records_a_plain_item_with_no_properties() {
             descriptor: REGISTER.into(),
         },
         &[
-            Value::Ref(Some("registry/minecraft:item".into())),
-            Value::Ref(Some("identifier/ruby:plain".into())),
+            built_in_registry("ITEM"),
+            parsed_id("ruby:plain"),
             Value::Ref(Some("net/minecraft/world/item/Item#0".into())),
         ],
     )
