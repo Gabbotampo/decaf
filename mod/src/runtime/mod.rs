@@ -13305,9 +13305,27 @@ fn array_operand_error(
     }
 }
 
+/// Maximum number of [`Value`] slots one jar-controlled array materialization
+/// may create. `Value` is 32 bytes on the 64-bit arcweld/Linux build, so the
+/// bound is about 512 MiB before the array table's HashMap overhead. It keeps
+/// a hostile jar from touching unbounded overcommitted memory; exceeding it is
+/// a refusal because the runtime cannot answer whether HotSpot would have had
+/// enough heap for the allocation.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
+
+/// The interpreter cannot answer an allocation whose host representation is
+/// over the fixed safety bound. Include both values so the refusal identifies
+/// the requested materialization and the limit that stopped it.
+fn array_bound_error(elements: u128) -> NativeError {
+    NativeError::Metadata(format!(
+        "array of {elements} elements exceeds the runtime's bound of {MAX_ARRAY_ELEMENTS}"
+    ))
+}
+
 /// An array creation's length. A negative one is the JVM's
 /// `NegativeArraySizeException` (its message is the length), which a jar's
-/// handler may catch; one over the runtime's bound is refused.
+/// handler may catch. Positive lengths are preserved and checked before their
+/// elements are materialized.
 fn array_length(value: i32) -> Result<usize, NativeError> {
     if value < 0 {
         return Err(NativeError::UncaughtException {
@@ -13316,10 +13334,52 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
             frame: None,
         });
     }
-    usize::try_from(value)
-        .ok()
-        .filter(|length| *length <= 1 << 20)
-        .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+    usize::try_from(value).map_err(|_| array_bound_error(u128::from(u32::MAX) + 1))
+}
+
+/// Most array objects one `multianewarray` may create. Each sub-array is its
+/// own entry in the runtime's array table, with a cost well above its element
+/// slots, so `new int[1 << 23][1]` must not pass on its 2^24 slots alone.
+pub(crate) const MAX_MULTIANEWARRAY_ARRAYS: u128 = 1 << 20;
+
+/// Check what a `multianewarray` will materialise before any of it exists:
+/// every level's element slots (the outer array's too, not only the leaves)
+/// against [`MAX_ARRAY_ELEMENTS`], and the number of array objects against
+/// [`MAX_MULTIANEWARRAY_ARRAYS`]. Only the supplied dimensions count: a partial
+/// array leaves its remaining dimensions null and creates nothing for them.
+fn array_total_elements(counts: &[usize]) -> Result<(), NativeError> {
+    // Level k holds prod(counts[..k]) arrays of counts[k] slots each.
+    let (mut arrays_at_level, mut arrays, mut slots) = (1_u128, 0_u128, 0_u128);
+    for &count in counts {
+        arrays = arrays.saturating_add(arrays_at_level);
+        arrays_at_level = arrays_at_level.saturating_mul(count as u128);
+        slots = slots.saturating_add(arrays_at_level);
+    }
+    if slots > MAX_ARRAY_ELEMENTS as u128 {
+        return Err(array_bound_error(slots));
+    }
+    if arrays > MAX_MULTIANEWARRAY_ARRAYS {
+        return Err(NativeError::Metadata(format!(
+            "multianewarray of {arrays} arrays exceeds the runtime's bound of \
+             {MAX_MULTIANEWARRAY_ARRAYS} arrays"
+        )));
+    }
+    Ok(())
+}
+
+/// Allocate repeated array elements without allowing Rust's allocator failure
+/// to abort the whole probe process. Allocation failure is a refusal, never a
+/// guessed catchable Java `OutOfMemoryError`.
+fn repeated_array_values(value: Value, length: usize) -> Result<Vec<Value>, NativeError> {
+    if length > MAX_ARRAY_ELEMENTS {
+        return Err(array_bound_error(length as u128));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| array_bound_error(length as u128))?;
+    values.resize(length, value);
+    Ok(values)
 }
 
 /// The null checks a method reference's adapter makes before its target runs
@@ -21528,17 +21588,26 @@ impl<H: Host> Runtime<'_, H> {
     /// reference that would fail a `TypeMismatch`.
     /// `descriptor` is the array class of this level (`[[I`); each nested
     /// level is an array of its component (`[I`).
-    fn new_multidim_array(&mut self, descriptor: &str, counts: &[usize]) -> Value {
+    fn new_multidim_array(
+        &mut self,
+        descriptor: &str,
+        counts: &[usize],
+    ) -> Result<Value, NativeError> {
         let length = counts.first().copied().unwrap_or(0);
         let component = &descriptor[1..];
         let values = if counts.len() <= 1 {
-            vec![Value::default_for(component); length]
+            repeated_array_values(Value::default_for(component), length)?
         } else {
-            (0..length)
-                .map(|_| self.new_multidim_array(component, &counts[1..]))
-                .collect()
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(length)
+                .map_err(|_| array_bound_error(length as u128))?;
+            for _ in 0..length {
+                values.push(self.new_multidim_array(component, &counts[1..])?);
+            }
+            values
         };
-        self.new_array_value(descriptor, values)
+        Ok(self.new_array_value(descriptor, values))
     }
 
     /// Materialize a `java.lang.reflect.Type[]` for the generic reflection
@@ -21964,7 +22033,14 @@ impl<H: Host> Runtime<'_, H> {
                 let element = return_desc(&r.descriptor)
                     .trim_start_matches('[')
                     .to_owned();
-                let mut values = Vec::with_capacity(end.saturating_sub(start));
+                let copy_len = end.saturating_sub(start);
+                if copy_len > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(copy_len as u128));
+                }
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(copy_len)
+                    .map_err(|_| array_bound_error(copy_len as u128))?;
                 for index in start..end {
                     values.push(
                         source
@@ -22032,7 +22108,10 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let class = value_class::array_class_marker(&component.replace('.', "/"));
                 // Each slot holds the component's zero (`0` for `int.class`).
-                self.new_array_value(&class, vec![Value::default_for(&class[1..]); length])
+                self.new_array_value(
+                    &class,
+                    repeated_array_values(Value::default_for(&class[1..]), length)?,
+                )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
                 Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
@@ -26000,7 +26079,10 @@ impl<H: Host> Runtime<'_, H> {
                     let component = value_class::primitive_array_component(atype)
                         .ok_or(NativeError::InvalidClass("invalid newarray type"))?;
                     let class = value_class::array_class_marker(component);
-                    stack.push(self.new_array_value(&class, vec![empty; length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(empty, length)),
+                    ));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
@@ -26008,7 +26090,10 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?;
                     let class = value_class::array_class_marker(&component);
-                    stack.push(self.new_array_value(&class, vec![Value::Ref(None); length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(Value::Ref(None), length)),
+                    ));
                 }
                 0xbe => {
                     self.pull_array_views();
@@ -26109,7 +26194,11 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|count| array_length(*count))
                             .collect::<Result<Vec<_>, _>>()
                     );
-                    stack.push(self.new_multidim_array(&descriptor, &counts));
+                    invoke_or_catch!(at, array_total_elements(&counts));
+                    stack.push(invoke_or_catch!(
+                        at,
+                        self.new_multidim_array(&descriptor, &counts)
+                    ));
                 }
                 0xc0 => {
                     // The reference stays on the stack; a cast to a class the
@@ -44567,7 +44656,7 @@ mandatory = true
             depth: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
-        let grid = runtime.new_multidim_array("[[I", &[2, 3]);
+        let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
         assert_eq!(host_array::exact_class(&grid), Some("[[I"));
         let outer = runtime.array(&grid).unwrap().clone();
         assert_eq!(outer.len(), 2);
