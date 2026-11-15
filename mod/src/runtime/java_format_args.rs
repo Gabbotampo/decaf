@@ -59,10 +59,16 @@ impl<H: Host> Runtime<'_, H> {
         // Java dispatches %s on Formattable through the jar object's
         // formatTo(Formatter, flags, width, precision), not toString(). The
         // bounded runtime does not yet execute that callback, so refuse the
-        // whole format rather than silently printing the wrong text.
+        // whole format rather than silently printing the wrong text. A jar
+        // object whose class chain can't be settled (`None`, a superclass or
+        // interface the runtime doesn't hold) might be Formattable too. No
+        // 26.3 game class implements it, and the JDK table settles JDK classes.
         if let Value::Host(handle) = value
             && let Some(class) = handle.class()
-            && self.class_known_instance_of(class, "java/util/Formattable") == Some(true)
+            && match self.class_known_instance_of(class, "java/util/Formattable") {
+                Some(known) => known,
+                None => handle.kind() == crate::runtime::host_ref::HostKind::JarObject,
+            }
         {
             return Arg::Opaque;
         }
