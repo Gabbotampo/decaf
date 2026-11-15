@@ -1259,7 +1259,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         Ok(Value::Ref(Some(format!(
             "@indy:{METAFACTORY_SITE}:0:{target}:{}",
-            bounded_captured_markers(&captures)
+            bounded_captured_markers(&captures)?
         ))))
     }
 

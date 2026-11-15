@@ -1552,6 +1552,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.mutable_collection_values(value)
     }
 
+    fn note_live_map_entry(&mut self, entry: &str, map: &str) {
+        self.inner.note_live_map_entry(entry, map)
+    }
+
+    fn live_map_entry_value(&self, entry: &Value, key: &Value, old: &Value) -> Option<Value> {
+        self.inner.live_map_entry_value(entry, key, old)
+    }
+
     fn holds_collection(&self, value: &Value) -> bool {
         self.inner.holds_collection(value)
     }

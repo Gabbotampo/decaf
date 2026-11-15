@@ -2393,6 +2393,16 @@ pub trait Host {
         None
     }
 
+    /// Remember that a mutable map entry marker came from `map` and was
+    /// changed through `setValue`.
+    fn note_live_map_entry(&mut self, _entry: &str, _map: &str) {}
+
+    /// The current value behind a mutable map entry marker, after a live
+    /// entry's `setValue`; `None` for immutable entries or unknown maps.
+    fn live_map_entry_value(&self, _entry: &Value, _key: &Value, _old: &Value) -> Option<Value> {
+        None
+    }
+
     /// Whether [`Self::mutable_collection_values`] would answer for `value`,
     /// without copying the values out (#203).
     fn holds_collection(&self, value: &Value) -> bool {
@@ -3200,6 +3210,8 @@ pub struct StdHost {
     view_copies: BTreeMap<String, String>,
     /// Which view each copy is (`keySet`, `values`, `entrySet`).
     view_kinds: BTreeMap<String, String>,
+    /// Mutable map entries whose `setValue` has made them live views.
+    map_entry_sources: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
@@ -3385,6 +3397,7 @@ impl StdHost {
             probe_tables: BTreeMap::new(),
             view_copies: BTreeMap::new(),
             view_kinds: BTreeMap::new(),
+            map_entry_sources: BTreeMap::new(),
             locales: BTreeMap::new(),
             constructed_uuids: BTreeMap::new(),
             levels: Vec::new(),
@@ -5030,6 +5043,15 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
+    }
+
+    fn note_live_map_entry(&mut self, entry: &str, map: &str) {
+        self.map_entry_sources
+            .insert(entry.to_owned(), map.to_owned());
+    }
+
+    fn live_map_entry_value(&self, entry: &Value, key: &Value, _old: &Value) -> Option<Value> {
+        StdHost::live_map_entry_value(self, entry, key)
     }
 
     fn collection_len(&self, value: &Value) -> Option<usize> {
@@ -7007,6 +7029,22 @@ impl Host for StdHost {
         {
             return Ok(Value::Int(1));
         }
+        // `Map.Entry.toString` is inherited from `Object`, but an entry from
+        // a mutable map remains live after `setValue`; refresh its snapshot
+        // before the generic Object method sees it.
+        if r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && object_methods::is_map_entry(receiver)
+        {
+            let (key, stored_value) = map_entry_parts(receiver)?;
+            let value = Host::live_map_entry_value(self, receiver, &key, &stored_value)
+                .unwrap_or(stored_value);
+            return Ok(Value::Ref(Some(format!(
+                "{}={}",
+                object_text(self, &key)?,
+                object_text(self, &value)?
+            ))));
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -8713,13 +8751,15 @@ impl Host for StdHost {
             }
         }
         if r.owner == "java/util/Map$Entry" {
-            let (key, value) = map_entry_parts(receiver)?;
+            let (key, stored_value) = map_entry_parts(receiver)?;
+            let value = Host::live_map_entry_value(self, receiver, &key, &stored_value)
+                .unwrap_or(stored_value);
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getKey", "()Ljava/lang/Object;") => Ok(key),
                 ("getValue", "()Ljava/lang/Object;") => Ok(value),
                 ("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
                     let replacement = Self::argument(r, args, 0)?.clone();
-                    self.entry_set_value(&key, &value, replacement)
+                    self.entry_set_value(receiver, &key, &value, replacement)
                 }
                 ("equals", "(Ljava/lang/Object;)Z") => {
                     let same = |a: &Value, b: &Value| boxed::canonical(a) == boxed::canonical(b);
@@ -11355,29 +11395,27 @@ fn enum_ordinal(value: &Value) -> i32 {
     }
 }
 
-/// The captured values of one `invokedynamic` site, as one bounded marker.
+/// The captured values of one [`invokedynamic`] site, as a bounded marker.
 ///
 /// A string-concat site captures the previous concat's marker, so its text
-/// would double at every link of a chain: a config writer that joins a few
-/// hundred keys reached a gigabyte before the bound. Transcribing the head is
-/// enough to name the site, and the bound keeps the chain flat.
-fn bounded_captured_markers(values: &[Value]) -> String {
-    const MAX_MARKER_CHARS: usize = 4096;
+/// would double at every link of a chain. The old implementation cut a
+/// capture at this bound, which forged a different host value and silently
+/// changed its answer. Refuse the whole callback instead; the runtime delivers
+/// and counts the resulting `StackOverflowError`.
+fn bounded_captured_markers(values: &[Value]) -> Result<String, NativeError> {
+    const MAX_MARKER_CHARS: usize = 1 << 20;
     let mut text = String::new();
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             text.push(',');
         }
         let marker = value_marker(value);
-        let room = MAX_MARKER_CHARS.saturating_sub(text.chars().count());
-        if marker.chars().count() > room {
-            text.extend(marker.chars().take(room));
-            text.push('\u{2026}');
-            break;
+        if text.chars().count().saturating_add(marker.chars().count()) > MAX_MARKER_CHARS {
+            return Err(host_recursion::refuse_at(MAX_MARKER_CHARS));
         }
         text.push_str(&marker);
     }
-    text
+    Ok(text)
 }
 
 /// One element of a collection as the collection readers hand it out: the
@@ -11992,6 +12030,18 @@ impl host_ref::Nested for HostNested<'_> {
 }
 
 impl StdHost {
+    /// Read the current value behind an entry whose `setValue` made it live.
+    fn live_map_entry_value(&self, entry: &Value, key: &Value) -> Option<Value> {
+        let entry = expect_ref(entry)?;
+        let map = self.map_entry_sources.get(entry)?;
+        self.mutable_collections
+            .get(map)?
+            .chunks(2)
+            .find_map(|pair| match pair {
+                [candidate, value] if candidate == key => Some(value.clone()),
+                _ => None,
+            })
+    }
     /// A handle's `toString`/`hashCode`/`equals` through its kind's row
     /// (`host_ref.rs`). One a held value leaves unknown (a held jar object's
     /// `hashCode`, which only the runtime can run) is counted.
@@ -28046,10 +28096,10 @@ impl<H: Host> Runtime<'_, H> {
                     let target = file.invoke_dynamic_target(index)?.map(|target| {
                         format!("{}#{}{}", target.owner, target.name, target.descriptor)
                     });
+                    let captures = invoke_or_catch!(at, bounded_captured_markers(&captured));
                     let marker = format!(
-                        "@indy:{class}#{method}:{index}:{}:{}",
-                        target.as_deref().unwrap_or("?"),
-                        bounded_captured_markers(&captured)
+                        "@indy:{class}#{method}:{index}:{}:{captures}",
+                        target.as_deref().unwrap_or("?")
                     );
                     if return_desc(&descriptor) != "V" {
                         stack.push(Value::Ref(Some(marker)));
@@ -32571,21 +32621,16 @@ mod tests {
 
     #[test]
     fn invokedynamic_captures_stay_bounded_across_concat_chains() {
-        // One captured marker is transcribed up to the bound, never whole.
-        let captured = bounded_captured_markers(&[Value::Ref(Some("x".repeat(1 << 20)))]);
-        assert_eq!(
-            captured.chars().count(),
-            4097,
-            "4096 transcribed + ellipsis"
-        );
-        assert!(captured.ends_with('\u{2026}'), "{captured}");
+        // An oversized capture is refused and counted; it is never shortened
+        // into a different callback value.
+        let error = bounded_captured_markers(&[Value::Ref(Some("x".repeat(1 << 20)))]).unwrap_err();
+        assert!(host_recursion::is_stack_overflow(&error));
 
-        // A concat site captures the previous concat's marker text, so a real
-        // chain nests. Each link adds one bounded prefix instead of doubling:
-        // transcription used to grow without limit here.
+        // A concat site captures the previous concat's marker text. A modest
+        // chain remains an exact marker rather than being cut at a prefix.
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
-            let captured = bounded_captured_markers(std::slice::from_ref(&value));
+            let captured = bounded_captured_markers(std::slice::from_ref(&value)).unwrap();
             value = Value::Ref(Some(format!("@indy:demo/C#m:0:?:{captured}")));
         }
         let Value::Ref(Some(marker)) = &value else {

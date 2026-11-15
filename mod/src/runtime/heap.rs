@@ -862,6 +862,8 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         keep(cached)
             && cache_owner(identity).is_none_or(|owner| keep(&owner) && !freed.holds_key(&owner))
     });
+    host.map_entry_sources
+        .retain(|_, map| keep(map) && !freed.holds_key(map));
     heap.fields.retain(|key, _| keep(field_receiver(key)));
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
@@ -1318,6 +1320,7 @@ mod tests {
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "map_entry_sources",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",

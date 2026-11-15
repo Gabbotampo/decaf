@@ -628,10 +628,12 @@ impl crate::runtime::StdHost {
     /// answer, as on the JVM. An entry no mutable map holds is an immutable
     /// `Map.entry`, which raises `UnsupportedOperationException`; one that
     /// several maps hold is refused rather than written to a guess. The
-    /// entry marker itself keeps its old value: a later `getValue()` on the
-    /// same entry reads the value it was created with.
+    /// the marker remains an immutable snapshot, while a mutable entry that
+    /// was changed is associated with its source map so later `getValue()` and
+    /// `toString()` read the live value.
     pub(crate) fn entry_set_value(
         &mut self,
+        entry: &Value,
         key: &Value,
         old: &Value,
         replacement: Value,
@@ -666,7 +668,12 @@ impl crate::runtime::StdHost {
                     .mutable_collections
                     .get_mut(marker)
                     .expect("the holder was just found");
-                Ok(std::mem::replace(&mut values[*index], replacement))
+                let old = std::mem::replace(&mut values[*index], replacement);
+                if let Some(entry) = expect_ref(entry) {
+                    self.map_entry_sources
+                        .insert(entry.to_owned(), marker.clone());
+                }
+                Ok(old)
             }
             _ => Err(NativeError::Metadata(
                 "Map.Entry.setValue: several maps hold this entry".into(),

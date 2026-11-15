@@ -25,6 +25,10 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        let entry_value = self
+            .host
+            .live_map_entry_value(value, &key, &entry_value)
+            .unwrap_or(entry_value);
         let key = self.value_of_text(&key, "Ljava/lang/Object;", class, method)?;
         let entry_value = self.value_of_text(&entry_value, "Ljava/lang/Object;", class, method)?;
         Ok(Some(Value::Ref(Some(format!("{key}={entry_value}")))))
