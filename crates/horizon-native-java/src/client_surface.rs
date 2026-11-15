@@ -2821,7 +2821,10 @@ mod tests {
     #[test]
     fn a_registered_mapping_answers_clicks_from_its_key_state() {
         let mut host = StdHost::new();
-        let object = marker("net/minecraft/client/KeyMapping#0");
+        let object = Value::Host(crate::HostRef::new(
+            crate::HostKind::JarObject,
+            "net/minecraft/client/KeyMapping#0",
+        ));
         let category = host
             .client_static(&method(
                 KEY_CATEGORY,
