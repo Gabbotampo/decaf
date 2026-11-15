@@ -211,9 +211,8 @@ impl<H: Host> Runtime<'_, H> {
                 crate::runtime::stream_pipeline::STREAM_TEXT.into(),
             ))));
         }
-        // A callback's `toString` is its hidden class and identity hash, which
-        // no run reproduces: counted, and its marker (which carries the run's
-        // tag) never printed (`callback_marker.rs`).
+        // A text holding a callback's key (a host collection's marker) is
+        // never printed: counted (`callback_marker.rs`).
         if crate::runtime::callback_marker::holds_callback(marker) {
             self.host.unknown_operand_call(&object_to_string())?;
             return Ok(Some(Value::Ref(Some(

@@ -145,7 +145,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(collector));
     }
     if let Some(comparator) = crate::jdk_stream::comparator_static(r, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         // `Modifier`'s predicates over the access flags reflection answers
@@ -351,7 +351,7 @@ pub(crate) fn instance_call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     if let Some(comparator) = crate::jdk_stream::comparator_instance(r, receiver, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
@@ -621,7 +621,7 @@ impl crate::StdHost {
 
     /// `Map.Entry.setValue` on an entry `entrySet()` handed out.
     ///
-    /// An entry marker is a value (`map-entry/k,v`), not a view, so the write
+    /// A host entry is a value (`host_entry.rs`), not a view, so the write
     /// goes to the one host map that holds exactly this key and value: the
     /// map the entry came from (`for (e : map.entrySet()) e.setValue(...)`,
     /// icy-better-horses freezing its coat lists). The earlier value is the

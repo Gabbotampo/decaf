@@ -3187,8 +3187,9 @@ pub struct StdHost {
     /// registered callbacks still reach.
     heap: heap::JavaHeap,
     /// Values the embedder holds between invocations (`StdHost::retain`),
-    /// with their hold counts: roots of the heap's collections.
-    retained: BTreeMap<String, usize>,
+    /// by their own text, with their hold counts and the texts of what a
+    /// callback's row holds: roots of the heap's collections.
+    retained: BTreeMap<String, (usize, Vec<String>)>,
     /// The jar objects collections freed (`heap::FreedObjects`).
     freed_objects: heap::FreedObjects,
     /// No collection runs (`Host::pause_collections`): a run that may be
@@ -11105,7 +11106,7 @@ fn bounded_captured_markers(values: &[Value]) -> String {
 /// [`value_marker`] form with its separator escapes already removed, which is
 /// what splitting an immutable `list/...` marker yields. A mutable collection
 /// answers the same form, so an element that itself holds a comma (a
-/// `map-entry/k,v` from `new ArrayList<>(map.entrySet())`) parses back whole,
+/// value marker with a `,` in it) parses back whole,
 /// and a lookup compares like with like.
 fn collection_item_marker(value: &Value) -> String {
     match value {
@@ -11580,6 +11581,10 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
 /// object by its marker, as before.
 fn host_text(value: &Value) -> String {
     match value {
+        // A callback never prints its key (`callback_marker::CALLBACK_TEXT`).
+        Value::Host(handle) if handle.kind() == HostKind::Callback => {
+            callback_marker::CALLBACK_TEXT.to_owned()
+        }
         Value::Host(handle) => handle
             .to_string(&mut MarkerText)
             .ok()
@@ -11700,6 +11705,11 @@ impl StdHost {
             _ => return self.unknown_host_call(r),
         };
         let answer = match r.name.as_str() {
+            // A callback's text: counted, a text answered, never its key.
+            "toString" if handle.kind() == HostKind::Callback => {
+                self.unknown_host_call(r)?;
+                Some(Value::Ref(Some(callback_marker::CALLBACK_TEXT.into())))
+            }
             "toString" => handle
                 .to_string(&mut HostNested(Some(self)))?
                 .map(|text| Value::Ref(Some(text))),
@@ -12244,27 +12254,13 @@ fn collection_value(kind: &str, values: &[Value]) -> Value {
 }
 
 fn map_entry_value(key: &Value, value: &Value) -> Value {
-    Value::Ref(Some(format!(
-        "map-entry/{},{}",
-        value_marker(key),
-        value_marker(value)
-    )))
+    host_entry::entry(key, value)
 }
 
+/// A host map entry's key and value (`host_entry.rs`).
 pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
-    let marker = expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("map-entry/"))
-        .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
-    let parts = split_capture_markers(marker)?;
-    if parts.len() != 2 {
-        return Err(NativeError::Metadata(
-            "map entry marker must contain key and value".into(),
-        ));
-    }
-    Ok((
-        parse_value_marker(&parts[0])?,
-        parse_value_marker(&parts[1])?,
-    ))
+    host_entry::parts(value)
+        .ok_or_else(|| NativeError::Metadata("expected a native map entry".into()))
 }
 
 fn is_collection_owner(owner: &str) -> bool {
@@ -19771,7 +19767,19 @@ fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
     Ok(captures)
 }
 
+/// A value marker from text a jar may have spelled or read (a `Ref`
+/// marker): no callback comes out of it (`HostRef::decode`).
 fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
+    parse_marker(marker, false)
+}
+
+/// [`parse_value_marker`] for text only the runtime wrote and no jar reads:
+/// a handle's own key, which may hold a callback (`HostRef::decode_trusted`).
+pub(crate) fn parse_value_marker_trusted(marker: &str) -> Result<Value, NativeError> {
+    parse_marker(marker, true)
+}
+
+fn parse_marker(marker: &str, trusted: bool) -> Result<Value, NativeError> {
     if marker == "null" {
         return Ok(Value::Ref(None));
     }
@@ -19781,7 +19789,12 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     if let Some(boxed) = Boxed::parse_marker(marker) {
         return Ok(Value::Boxed(boxed));
     }
-    if let Some(host) = HostRef::decode(marker) {
+    let host = if trusted {
+        HostRef::decode_trusted(marker)
+    } else {
+        HostRef::decode(marker)
+    };
+    if let Some(host) = host {
         return Ok(Value::Host(host));
     }
     if let Some(value) = marker.strip_prefix('i') {
@@ -21126,6 +21139,15 @@ impl<H: Host> Runtime<'_, H> {
             "apply",
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         );
+        // A comparator the runtime made (`jdk_stream.rs`): `compare(a, b)`.
+        if let Some((op, _)) = callback_marker::composite_of(callback)
+            && op.starts_with("cmp.")
+        {
+            let [a, b] = args else {
+                return Ok(None);
+            };
+            return Ok(Some(Value::Int(self.compare_with(callback, a, b)?)));
+        }
         let first = |value: &[Value]| value.first().cloned().unwrap_or(Value::Ref(None));
         for op in [
             callback_marker::IDENTITY_FUNCTION,
@@ -27243,9 +27265,12 @@ impl<H: Host> Runtime<'_, H> {
                         interfaces.push(',');
                         interfaces.push_str(&marker);
                     }
+                    // HotSpot links each `invokedynamic` instruction once: the
+                    // site is the instruction (`at`), not its constant, which
+                    // javac shares across a `finally` body's copies.
                     let callback = callback_marker::lambda(
                         &format!("{class}#{method}"),
-                        index,
+                        at,
                         &interfaces,
                         target,
                         file.invoke_dynamic_reference_kind(index),
@@ -36004,12 +36029,15 @@ mandatory = true
             name: "hashCode".into(),
             descriptor: "()I".into(),
         };
-        // `Objects.hashCode(key) ^ Objects.hashCode(value)` is the runtime's
-        // (`object_methods.rs`): it may run a jar key's `hashCode`, so the
-        // host alone counts the call.
+        // `Objects.hashCode(key) ^ Objects.hashCode(value)`: the entry is a
+        // handle (`host_entry.rs`), and a `String` key and value hash as Java
+        // does ("key".hashCode() ^ "value".hashCode()), uncounted.
         let before = host.unknown_host_call_count();
-        host.invoke_instance(&entry_hash, &entry, &[]).unwrap();
-        assert_eq!(host.unknown_host_call_count(), before + 1);
+        assert_eq!(
+            host.invoke_instance(&entry_hash, &entry, &[]).unwrap(),
+            Value::Int(106_079 ^ 111_972_721)
+        );
+        assert_eq!(host.unknown_host_call_count(), before);
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
             name: "removeIf".into(),

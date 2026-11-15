@@ -488,6 +488,10 @@ pub enum HostKind {
     /// (`callback_marker.rs`, #156 P15a). A handle, never a `String`: no
     /// String model reads it, so its text cannot be read out or forged.
     Callback,
+    /// A host map entry (`Map.entry(k, v)`, an `entrySet()` element): key
+    /// the entry's key and value (`HostRef::of_values`, `host_entry.rs`). A
+    /// handle so that what it holds (a callback) is never `String` text.
+    MapEntry,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2021,6 +2025,18 @@ const KINDS: &[KindInfo] = &[
         canonical: crate::runtime::callback_marker::canonical,
         methods: &crate::runtime::callback_marker::METHODS,
     },
+    KindInfo {
+        kind: HostKind::MapEntry,
+        tag: "ment",
+        // `KeyValueHolder`, `HashMap$Node`, `TreeMap$Entry`...: which one is
+        // not recorded, so the exact class is counted.
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_entry::entry_types,
+        },
+        // A value: equal entries may be different objects.
+        canonical: |_| false,
+        methods: &crate::runtime::host_entry::METHODS,
+    },
 ];
 
 impl HostKind {
@@ -2150,7 +2166,7 @@ impl HostRef {
         crate::runtime::split_capture_markers(&self.key)
             .ok()?
             .iter()
-            .map(|marker| crate::runtime::parse_value_marker(marker).ok())
+            .map(|marker| crate::runtime::parse_value_marker_trusted(marker).ok())
             .collect()
     }
 
@@ -2250,15 +2266,22 @@ impl HostRef {
         format!("h{}:{}", self.kind.info().tag, self.key)
     }
 
-    /// Read [`Self::encode`] back.
+    /// Read [`Self::encode`] back from text a jar may have spelled or read
+    /// (a `Ref` marker): never a callback, nor a handle whose key holds one
+    /// at any depth. A callback reaches a jar only as its handle, so no text
+    /// becomes one (#261 re-review).
     pub(crate) fn decode(text: &str) -> Option<Self> {
-        let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
-        let kind = HostKind::from_tag(tag)?;
-        // A callback's key carries the run's tag, which no jar text can
-        // spell (`callback_marker.rs`).
-        if kind == HostKind::Callback && !crate::runtime::callback_marker::is_key(key) {
+        if text.contains("hcb:") {
             return None;
         }
+        Self::decode_trusted(text)
+    }
+
+    /// [`Self::decode`] for text only the runtime wrote and no jar reads: a
+    /// handle's own key ([`Self::values`], a callback key's captures).
+    pub(crate) fn decode_trusted(text: &str) -> Option<Self> {
+        let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
+        let kind = HostKind::from_tag(tag)?;
         Some(Self::new(kind, key))
     }
 }
@@ -2283,26 +2306,26 @@ mod tests {
                 "{:?}",
                 info.kind
             );
-            // A callback decodes only from a key carrying the run's tag
-            // (`callback_marker::is_key`).
-            let key = match info.kind {
-                HostKind::Callback => {
-                    let callback = crate::runtime::callback_marker::test_token("a,b\\c:d");
-                    crate::runtime::callback_marker::callback_text(&callback)
-                        .unwrap()
-                        .to_owned()
-                }
-                _ => "a,b\\c:d".to_owned(),
-            };
-            let handle = HostRef::new(info.kind, key);
-            assert_eq!(HostRef::decode(&handle.encode()), Some(handle.clone()));
+            let handle = HostRef::new(info.kind, "a,b\\c:d");
+            assert_eq!(
+                HostRef::decode_trusted(&handle.encode()),
+                Some(handle.clone())
+            );
+            // From text a jar may hold, a callback (or a handle holding one)
+            // is nothing.
+            if info.kind == HostKind::Callback {
+                assert_eq!(HostRef::decode(&handle.encode()), None);
+            } else {
+                assert_eq!(HostRef::decode(&handle.encode()), Some(handle.clone()));
+            }
             if let ClassRule::Fixed(class) = info.class {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
         }
-        // A callback's text without the run's tag decodes to nothing.
+        // Nor does any handle whose key holds a callback (an optional of a
+        // lambda spelled by a jar).
         assert_eq!(
-            HostRef::decode("hcb:@indy:x:demo/A#m:0:java/lang/Runnable:?:"),
+            HostRef::decode("hopt:hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#evil()V:"),
             None
         );
     }

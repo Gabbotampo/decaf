@@ -358,19 +358,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             return handle.hash_code(&mut RuntimeNested::new(self));
         }
-        let Some(marker) = expect_ref(value) else {
+        if expect_ref(value).is_none() {
             return Ok(None);
-        };
+        }
         if let Some(path) = self.file_path(value) {
             return Ok(Some(file_hash(path)));
-        }
-        if marker.starts_with("map-entry/") {
-            // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
-            let (key, entry) = map_entry_parts(value)?;
-            let (Some(key), Some(entry)) = (self.java_hash(&key)?, self.java_hash(&entry)?) else {
-                return Ok(None);
-            };
-            return Ok(Some(key ^ entry));
         }
         let Some(kind) = self.host_collection_kind(value) else {
             return Ok(None);
@@ -755,6 +747,15 @@ impl<H: Host> Runtime<'_, H> {
         if !matches!(opcode, 0xb6 | 0xb9) || crate::jar_object::is_object_handle(handle) {
             return Ok(None);
         }
+        // A callback's `toString`: counted, a text answered (`host_ref_text`).
+        if handle.kind() == crate::host_ref::HostKind::Callback
+            && r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && args.is_empty()
+        {
+            let text = self.host_ref_text(handle, class, method)?;
+            return Ok(text.map(|text| Value::Ref(Some(text))));
+        }
         let mut nested = RuntimeNested {
             runtime: self,
             class,
@@ -797,6 +798,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<String>, NativeError> {
+        // A callback's text is its hidden class and identity hash: counted,
+        // and a text answered (`callback_marker::CALLBACK_TEXT`), never the
+        // `null` a jar would dereference where Java never fails.
+        if handle.kind() == crate::host_ref::HostKind::Callback {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "toString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            })?;
+            return Ok(Some(crate::callback_marker::CALLBACK_TEXT.into()));
+        }
         handle.to_string(&mut RuntimeNested {
             runtime: self,
             class,
@@ -877,7 +889,7 @@ impl<H: Host> Runtime<'_, H> {
             }
             // `Map.Entry.hashCode()` is `host_value_hash`'s; an entry whose
             // key or value has no hash the runtime can compute is counted.
-            if expect_ref(receiver).is_some_and(|marker| marker.starts_with("map-entry/")) {
+            if is_map_entry(receiver) {
                 return match self.java_hash(receiver)? {
                     Some(hash) => Ok(Some(Value::Int(hash))),
                     None => self.host.unknown_operand_call(r).map(Some),
@@ -994,9 +1006,9 @@ impl<H: Host> Runtime<'_, H> {
     }
 }
 
-/// Whether a value is the host's `Map.Entry` (`map-entry/k,v`).
+/// Whether a value is the host's `Map.Entry` (`host_entry.rs`).
 pub(crate) fn is_map_entry(value: &Value) -> bool {
-    expect_ref(value).is_some_and(|marker| marker.starts_with("map-entry/"))
+    crate::host_entry::parts(value).is_some()
 }
 
 /// `a.equals(b)` for a string or a box `a`: equal values of the same kind. A

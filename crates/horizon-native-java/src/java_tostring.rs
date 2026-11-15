@@ -20,19 +20,8 @@ pub(crate) fn owner(value: &Value) -> Option<String> {
     }
     // The optionals are host handles (`host_ref.rs`), printed through
     // [`modelled`].
-    // A host map entry, when the text is one (a string that merely starts
-    // like one stays a string).
-    if marker.starts_with("map-entry/")
-        && crate::map_entry_parts(&Value::Ref(Some(marker.to_owned()))).is_ok()
-    {
-        return Some("java/util/Map$Entry".to_owned());
-    }
     // Prefix families the host models before any class marker.
-    let prefix = [
-        ("charset/", "java/nio/charset/Charset"),
-        // `key + "=" + value` (`Map.entry`, an entry from `entrySet()`).
-        ("map-entry/", "java/util/Map$Entry"),
-    ];
+    let prefix = [("charset/", "java/nio/charset/Charset")];
     for (prefix, owner) in prefix {
         if marker.starts_with(prefix) {
             return Some(owner.to_owned());

@@ -13,24 +13,30 @@
 //! between them, and the collector traces them (`heap::value_texts`). The key
 //! names the object: one per call site for a lambda that captures nothing
 //! (HotSpot 25), one per evaluation (`~<n>`) for everything else, so `==` is
-//! key equality. Its text is the bounded fallback for a handle decoded from
-//! text (a host collection's marker), which has no row.
+//! key equality. Its text is the bounded fallback for a handle read back
+//! from another handle's key (an optional of a lambda), which has no row.
 //!
 //! Keys:
 //!
-//! * a lambda: `@indy:<tag>:<class#method>:<cp index>[~<n>]:<interfaces>:<target>:<captures>`;
-//! * a combinator's result: `@fn:<tag>:<op>[~<n>]:<operands>` (`predicate.and`,
-//!   `consumer.then`, the operand-free `identity/function`...).
+//! * a lambda: `@indy:<class#method>:<site>[~<n>]:<interfaces>:<target>:<captures>`;
+//! * a combinator's result: `@fn:<op>[~<n>]:<operands>` (`predicate.and`,
+//!   `cmp.then`, the operand-free `identity/function`, `cmp.natural`...).
 //!
-//! `<tag>` is random per process and never printed; a handle decoded from
-//! text (`HostRef::decode`) must carry it ([`is_key`]). `<interfaces>` are
+//! A key holds no secret: no text becomes a callback. `HostRef::decode`
+//! refuses one, and any handle whose key holds one, from text a jar may
+//! have spelled or read (a `Ref` marker); only a handle's own key, which no
+//! jar reads, is read back with `decode_trusted` (an optional of a lambda).
+//! So a structure that holds a callback for a jar is a handle too
+//! (comparators here, `HostKind::MapEntry`). `<site>` is the call site's
+//! instruction offset in `<class#method>`: HotSpot links each
+//! `invokedynamic` instruction once, and javac duplicates a `finally` body's
+//! lambda across instructions that share one constant. `<interfaces>` are
 //! the call site's functional interface (the `invokedynamic` descriptor's
 //! return type) and `altMetafactory`'s marker interfaces, `,`-joined: a
 //! lambda's class implements exactly those (javap and HotSpot 25:
 //! `instanceof Runnable` true, `Comparable`/`Serializable` false). Captures
-//! and operands are escaped value markers (`value_marker`), split back by
-//! `split_capture_markers`, so a nested callback or a captured `|` reads back
-//! whole.
+//! and operands are escaped value markers (`value_marker`), bounded: the row
+//! holds them exactly.
 
 use crate::host_ref::{ClassHierarchy, HostKind, HostRef, JdkHierarchy, Methods};
 use crate::{MethodRef, NativeError, Value};
@@ -83,26 +89,14 @@ fn next_evaluation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The per-process tag every live callback's text carries.
-fn tag() -> &'static str {
-    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TAG.get_or_init(|| {
-        use std::hash::{BuildHasher, Hasher};
-        let value = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        format!("{value:016x}")
-    })
+/// `@indy:`, the start of every lambda's key.
+fn prefix() -> &'static str {
+    "@indy:"
 }
 
-/// `@indy:<tag>:`, the start of every lambda's key.
-fn prefix() -> String {
-    format!("@indy:{}:", tag())
-}
-
-/// `@fn:<tag>:`, the start of every combinator result's key.
-fn composite_prefix() -> String {
-    format!("@fn:{}:", tag())
+/// `@fn:`, the start of every combinator result's key.
+fn composite_prefix() -> &'static str {
+    "@fn:"
 }
 
 /// What a callback prints where its text is counted (`toString`, string
@@ -128,7 +122,8 @@ pub(crate) fn make(
     )
 }
 
-/// A new lambda's handle from `source`'s call site `index`, implementing
+/// A new lambda's handle from `source`'s call site (the `invokedynamic`
+/// instruction's offset, `site`), implementing
 /// `interfaces` (`,`-joined), run by `target` (`None` when the bootstrap
 /// names none) through a handle of `ref_kind`, holding `captures`.
 ///
@@ -140,7 +135,7 @@ pub(crate) fn make(
 /// back from text; the row holds them exactly.
 pub(crate) fn lambda(
     source: &str,
-    index: u16,
+    site: usize,
     interfaces: &str,
     target: Option<MethodRef>,
     ref_kind: Option<u8>,
@@ -148,9 +143,9 @@ pub(crate) fn lambda(
     fresh: bool,
 ) -> Value {
     let site = if captures.is_empty() && !fresh {
-        index.to_string()
+        site.to_string()
     } else {
-        format!("{index}~{}", next_evaluation())
+        format!("{site}~{}", next_evaluation())
     };
     let target_text = target.as_ref().map_or_else(
         || "?".to_owned(),
@@ -204,10 +199,18 @@ pub(crate) fn lambda_from_text(
         crate::split_capture_markers(captures)
             .unwrap()
             .iter()
-            .map(|marker| crate::parse_value_marker(marker).unwrap())
+            .map(|marker| crate::parse_value_marker_trusted(marker).unwrap())
             .collect()
     };
-    lambda(source, index, interfaces, target, None, captures, false)
+    lambda(
+        source,
+        usize::from(index),
+        interfaces,
+        target,
+        None,
+        captures,
+        false,
+    )
 }
 
 /// The lambda a callback handle is: its row, or (a handle read back from
@@ -239,13 +242,7 @@ fn handle(key: String) -> Value {
 
 /// Whether `text` is a lambda's key of this process.
 pub(crate) fn is_callback(text: &str) -> bool {
-    text.starts_with(&prefix())
-}
-
-/// Whether `text` is a callback key of this process (a lambda's or a
-/// combinator result's): the only keys a `Callback` handle decodes from.
-pub(crate) fn is_key(text: &str) -> bool {
-    is_callback(text) || text.starts_with(&composite_prefix())
+    text.starts_with(prefix())
 }
 
 /// The key of `value` when it is a callback handle.
@@ -256,16 +253,17 @@ pub(crate) fn callback_text(value: &Value) -> Option<&str> {
     }
 }
 
-/// Whether `text` holds a callback's key anywhere (a collection marker
-/// embeds a handle's text form): such text is never printed.
+/// Whether a runtime marker's `text` (a host collection's) embeds a
+/// callback handle (`hcb:…`): such text is never printed. A plain `String`
+/// holds none, however it is spelled.
 pub(crate) fn holds_callback(text: &str) -> bool {
-    text.contains(&prefix()) || text.contains(&composite_prefix())
+    text.contains("hcb:") && !crate::value_class::is_plain_string(text)
 }
 
 /// The interfaces a callback keyed `key` implements: a lambda's call site
 /// interface and markers, a combinator's own interface.
 pub(crate) fn interfaces(key: &str) -> Vec<&str> {
-    if let Some(rest) = key.strip_prefix(&prefix()) {
+    if let Some(rest) = key.strip_prefix(prefix()) {
         return rest
             .split(':')
             .nth(2)
@@ -273,7 +271,7 @@ pub(crate) fn interfaces(key: &str) -> Vec<&str> {
             .unwrap_or_default();
     }
     let op = key
-        .strip_prefix(&composite_prefix())
+        .strip_prefix(composite_prefix())
         .and_then(|rest| rest.split_once(':'))
         .map_or("", |(op, _)| op.split('~').next().unwrap_or_default());
     match op {
@@ -285,6 +283,7 @@ pub(crate) fn interfaces(key: &str) -> Vec<&str> {
         }
         "bifunction.then" => vec!["java/util/function/BiFunction"],
         IDENTITY_UNARY => vec!["java/util/function/UnaryOperator"],
+        op if op.starts_with("cmp.") => vec!["java/util/Comparator"],
         _ => Vec::new(),
     }
 }
@@ -293,7 +292,7 @@ pub(crate) fn interfaces(key: &str) -> Vec<&str> {
 pub(crate) fn parse(text: &str) -> Result<Callback, NativeError> {
     let malformed = |what: &str| NativeError::Metadata(format!("callback marker has no {what}"));
     let rest = text
-        .strip_prefix(&prefix())
+        .strip_prefix(prefix())
         .ok_or_else(|| NativeError::Metadata("not a callback of this run".into()))?;
     // The first four fields hold no `:` (a class, an index, an interface and
     // a descriptor have none); the captures may (a handle's `h<tag>:<key>`).
@@ -314,7 +313,7 @@ pub(crate) fn parse(text: &str) -> Result<Callback, NativeError> {
     } else {
         crate::split_capture_markers(captures)?
             .into_iter()
-            .map(|capture| crate::parse_value_marker(&capture))
+            .map(|capture| crate::parse_value_marker_trusted(&capture))
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(Callback {
@@ -359,6 +358,30 @@ pub(crate) fn composite(op: &str, operands: &[&Value]) -> Value {
     Value::Host(HostRef::with_row(HostKind::Callback, key, row))
 }
 
+/// The operation and operands of `value` when it is a combinator result:
+/// its row, or (read back from another handle's key) its key's text.
+pub(crate) fn composite_of(value: &Value) -> Option<(String, Vec<Value>)> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::Callback {
+        return None;
+    }
+    if let Some(row) = handle.row() {
+        return match row {
+            Row::Composite { op, operands } => Some((op.clone(), operands.clone())),
+            Row::Lambda { .. } => None,
+        };
+    }
+    let (op, _) = handle
+        .key()
+        .strip_prefix(composite_prefix())?
+        .split_once(':')?;
+    let op = op.split('~').next().unwrap_or_default().to_owned();
+    let operands = composite_operands(value, &op)?;
+    Some((op, operands))
+}
+
 /// The operands of `value` when it is a combinator result of `op`.
 pub(crate) fn composite_operands(value: &Value, op: &str) -> Option<Vec<Value>> {
     if let Value::Host(handle) = value
@@ -371,7 +394,7 @@ pub(crate) fn composite_operands(value: &Value, op: &str) -> Option<Vec<Value>> 
         };
     }
     let rest = callback_text(value)?
-        .strip_prefix(&composite_prefix())?
+        .strip_prefix(composite_prefix())?
         .strip_prefix(op)?;
     // A result's own number (`~<n>`), which only names the object.
     let rest = match rest.strip_prefix('~') {
@@ -384,7 +407,7 @@ pub(crate) fn composite_operands(value: &Value, op: &str) -> Option<Vec<Value>> 
     crate::split_capture_markers(rest)
         .ok()?
         .iter()
-        .map(|marker| crate::parse_value_marker(marker).ok())
+        .map(|marker| crate::parse_value_marker_trusted(marker).ok())
         .collect()
 }
 
@@ -441,13 +464,30 @@ fn instance_of(handle: &HostRef, wanted: &str, hierarchy: &dyn ClassHierarchy) -
     (!unknown).then_some(false)
 }
 
-/// A callback's object methods: identity `equals`; `toString` and
+/// `callback.equals(other)`: identity, but a reversed comparator
+/// (`ReverseComparator2`) equals another over the same comparator.
+fn equals(handle: &HostRef, other: &Value) -> Option<bool> {
+    let reversed = |value: &Value| match composite_of(value) {
+        Some((op, operands)) if op == "cmp.reverse" => operands.into_iter().next(),
+        _ => None,
+    };
+    if let (Some(mine), Some(theirs)) = (reversed(&Value::Host(handle.clone())), reversed(other)) {
+        return match (&mine, &theirs) {
+            (Value::Host(mine), Value::Host(theirs)) => mine.same_object(theirs),
+            _ => Some(mine == theirs),
+        };
+    }
+    crate::host_path::identity_equals(handle, other)
+}
+
+/// A callback's object methods: identity `equals` (a reversed comparator's
+/// by its operand); `toString` and
 /// `hashCode` name its hidden class and identity hash, which no run
 /// reproduces (counted).
 pub(crate) const METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
-    equals: |handle, other, _| Ok(crate::host_path::identity_equals(handle, other)),
+    equals: |handle, other, _| Ok(equals(handle, other)),
     instance_of,
     // Its target is a class of the jar that made it.
     crosses_jars: |_, _| false,
@@ -466,23 +506,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_this_runs_tag_makes_a_callback() {
-        let live = make(
+    fn no_text_becomes_a_callback() {
+        let key = make(
             "demo/Mod#init",
             4,
             "java/lang/Runnable",
             "demo/Mod#lambda$0()V",
             "i5",
         );
-        assert!(is_callback(&live));
-        assert_eq!(interfaces(&live), ["java/lang/Runnable"]);
-        let parsed = parse(&live).unwrap();
+        assert_eq!(interfaces(&key), ["java/lang/Runnable"]);
+        let parsed = parse(&key).unwrap();
         assert_eq!(parsed.target.name, "lambda$0");
         assert_eq!(parsed.captures, [Value::Int(5)]);
-        // The same text with any other tag is a `String`.
-        let forged = live.replacen(tag(), "x", 1);
-        assert!(!is_callback(&forged) && parse(&forged).is_err());
-        assert!(!is_callback("@indy:demo/Mod#init:4:demo/Mod#lambda$0()V:"));
+        // Spelled by a jar, the key's text is a `String`, and no marker
+        // reader makes a callback of it.
+        let spelled = Value::Ref(Some(key.clone()));
+        assert!(lambda_of(&spelled).is_none() && callback_text(&spelled).is_none());
+        let encoded = HostRef::new(HostKind::Callback, key).encode();
+        assert!(crate::parse_value_marker(&encoded).is_err());
+        // A handle's own key (an optional of a lambda) still reads it back.
+        assert!(matches!(
+            crate::parse_value_marker_trusted(&encoded),
+            Ok(Value::Host(handle)) if handle.kind() == HostKind::Callback
+        ));
     }
 
     #[test]

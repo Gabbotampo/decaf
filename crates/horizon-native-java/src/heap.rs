@@ -145,8 +145,13 @@ impl StdHost {
     /// hand); one the embedder keeps across later calls must be retained.
     /// Holds are counted: two `retain`s need two `release`s.
     pub fn retain(&mut self, value: &Value) {
-        for text in pin_texts(value) {
-            *self.retained.entry(text.to_owned()).or_default() += 1;
+        let mut texts = pin_texts(value).into_iter();
+        if let Some(own) = texts.next() {
+            let entry = self
+                .retained
+                .entry(own.to_owned())
+                .or_insert_with(|| (0, texts.map(str::to_owned).collect()));
+            entry.0 += 1;
         }
     }
 
@@ -154,12 +159,12 @@ impl StdHost {
     /// collections may free it (and what only it reached) when the jar no
     /// longer reaches it either.
     pub fn release(&mut self, value: &Value) {
-        for text in pin_texts(value) {
-            if let Some(holds) = self.retained.get_mut(text) {
-                *holds -= 1;
-                if *holds == 0 {
-                    self.retained.remove(text);
-                }
+        if let Some(own) = pin_texts(value).first()
+            && let Some((holds, _)) = self.retained.get_mut(*own)
+        {
+            *holds -= 1;
+            if *holds == 0 {
+                self.retained.remove(*own);
             }
         }
     }
@@ -244,7 +249,10 @@ impl StdHost {
             value(field, out);
         }
         // What the embedder holds between invocations (`StdHost::retain`).
-        out.extend(self.retained.keys().map(String::as_str));
+        for (own, (_, held)) in &self.retained {
+            out.push(own);
+            out.extend(held.iter().map(String::as_str));
+        }
         // Only the logged calls the log is read back for (event
         // registrations, `events::read_back_call`). Every other call is
         // history: a constructor's receiver is the new object itself, and
@@ -1034,7 +1042,7 @@ mod tests {
         );
         host.mutable_collections.insert(
             "java/util/ArrayList#7".into(),
-            vec![text("map-entry/rkey,rdemo/Node#1")],
+            vec![crate::host_entry::entry(&text("key"), &text("demo/Node#1"))],
         );
         host.mutable_collections
             .insert("java/util/ArrayList#8".into(), vec![text("demo/Node#3")]);
