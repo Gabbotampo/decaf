@@ -406,17 +406,27 @@ impl<H: Host> Runtime<'_, H> {
                             && (r.descriptor == "()Lcom/google/common/collect/ImmutableMap;"
                                 || r.descriptor == "()Ljava/util/Map;") =>
                     {
-                        let Some(map) = self.fields.get(&map_field) else {
-                            return Ok(Some(collection_value("map", &[])));
+                        // `buildOrThrow`: what `ImmutableMap.of` makes for the
+                        // entries put (the shared `RegularImmutableMap.EMPTY`,
+                        // `SingletonImmutableBiMap`, `RegularImmutableMap`),
+                        // counted on a host that makes none (#253: never a
+                        // collection literal, never a JDK `Map.of` class).
+                        let values = match self.fields.get(&map_field) {
+                            Some(map) => runtime_collection_values(&*self.host, map)?,
+                            None => Vec::new(),
                         };
-                        let values = runtime_collection_values(&*self.host, map)?;
-                        Ok(Some(
-                            self.host
-                                .immutable_collection("map", values)
-                                .ok_or_else(|| {
-                                    NativeError::Metadata("immutable map host missing".into())
-                                })?,
-                        ))
+                        let of = MethodRef {
+                            owner: "com/google/common/collect/ImmutableMap".into(),
+                            name: "of".into(),
+                            descriptor: r.descriptor.clone(),
+                        };
+                        match self
+                            .host
+                            .factory_collection(&of.owner, &of.name, "map", values)
+                        {
+                            Some(made) => Ok(Some(made)),
+                            None => self.host.unknown_operand_call(r).map(Some),
+                        }
                     }
                     _ => Ok(None),
                 }
