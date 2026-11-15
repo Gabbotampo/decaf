@@ -118,9 +118,7 @@ fn self_registered_holders_match_java_25() {
     );
     assert_eq!(fixture.text("holder"), EXPECTED);
 
-    let mut fabric_without_sync = fixture.jar.seed_host(
-        StdHost::new(),
-    );
+    let mut fabric_without_sync = fixture.jar.seed_host(StdHost::new());
     let without_sync = fixture
         .jar
         .invoke_method_with_args(
@@ -134,9 +132,9 @@ fn self_registered_holders_match_java_25() {
         .unwrap();
     assert_eq!(without_sync, Value::Ref(Some(EXPECTED.into())));
 
-    let mut fabric_with_sync = fixture.jar.seed_host(
-        StdHost::new().with_mod("fabric-registry-sync-v0", "8.0.4"),
-    );
+    let mut fabric_with_sync = fixture
+        .jar
+        .seed_host(StdHost::new().with_mod("fabric-registry-sync-v0", "8.0.4"));
     let bound = fixture
         .jar
         .invoke_method_with_args(
