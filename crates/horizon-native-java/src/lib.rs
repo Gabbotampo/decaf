@@ -16020,6 +16020,16 @@ impl ExecutionBudget {
         self.deadline
             .is_some_and(|(deadline, _)| std::time::Instant::now() >= deadline)
     }
+
+    /// The wall-clock hang guard used by interpreter call sites.
+    pub fn wall_expired(&self) -> bool {
+        self.expired()
+    }
+
+    /// The deterministic instruction bound, when this budget has one.
+    pub fn instruction_limit(&self) -> Option<usize> {
+        self.instruction_limit
+    }
 }
 
 // How deep jar frames may nest (as deep as the thread's stack holds) lives in
@@ -26367,6 +26377,12 @@ impl<H: Host> Runtime<'_, H> {
         self.arrays
             .get(key)
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))
+    }
+
+    /// Whether `value` is a stream this runtime made. Stream identity hashes
+    /// stay unknown even when a collection asks through a nested path.
+    fn is_live_stream_value(&self, value: &Value) -> bool {
+        expect_ref(value).is_some_and(|marker| self.is_live_stream(marker))
     }
 
     fn new_stream(&mut self, class: &str, method: &str, values: Vec<Value>) -> Value {
