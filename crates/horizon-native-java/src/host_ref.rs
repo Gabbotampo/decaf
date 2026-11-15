@@ -332,6 +332,10 @@ pub enum HostKind {
     Thread,
     /// A logger: key `of_values([api, name])`.
     Logger,
+    /// One of Log4j 2's canonical standard levels: key its encoded name/int.
+    Log4jLevel,
+    /// A runtime-materialized `Level[]` returned by `Level.values()`.
+    Log4jLevelArray,
     /// A `StackWalker`: key `""` for `getInstance()`'s, `options` otherwise.
     StackWalker,
     /// A `StackWalker.StackFrame` / `StackTraceElement` of a jar frame: key
@@ -433,6 +437,8 @@ pub enum HostKind {
     /// DataFixerUpper's `Pair.of(..)`: key `[serial, first, second]`
     /// (`host_codec.rs`).
     DfuPair,
+    /// DataFixerUpper Either values keyed by side and payload.
+    DfuEither,
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
@@ -472,6 +478,8 @@ pub enum HostKind {
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
+    /// A `StackWalker.Option` enum constant: key its name.
+    StackWalkerOption,
     /// A `Character.UnicodeBlock` constant: key its name.
     UnicodeBlock,
     /// A `Locale` constant: key `<language>_<country>`.
@@ -535,6 +543,18 @@ pub enum HostKind {
     /// the entry's key and value (`HostRef::of_values`, `host_entry.rs`). A
     /// handle so that what it holds (a callback) is never `String` text.
     MapEntry,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
     /// Vanilla's `FileToIdConverter` record.
@@ -1546,6 +1566,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_jdk::LOGGER,
     },
     KindInfo {
+        kind: HostKind::Log4jLevel,
+        tag: "l4lvl",
+        class: ClassRule::Fixed("org/apache/logging/log4j/Level"),
+        canonical: always_canonical,
+        methods: &crate::host_log4j_level::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Log4jLevelArray,
+        tag: "l4arr",
+        class: ClassRule::Fixed("[Lorg/apache/logging/log4j/Level;"),
+        canonical: never_canonical,
+        methods: &crate::host_array::ARRAY,
+    },
+    KindInfo {
         kind: HostKind::StackWalker,
         tag: "walker",
         class: ClassRule::Fixed("java/lang/StackWalker"),
@@ -1927,6 +1961,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_codec::PAIR_METHODS,
     },
     KindInfo {
+        kind: HostKind::DfuEither,
+        tag: "deither",
+        class: ClassRule::Unknown {
+            declared: crate::dfu_either::either_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::dfu_either::EITHER_METHODS,
+    },
+    KindInfo {
         kind: HostKind::OpaqueCodec,
         tag: "ocdc",
         class: ClassRule::Unknown {
@@ -2034,6 +2077,14 @@ const KINDS: &[KindInfo] = &[
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::CODING_ERROR_ACTION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StackWalkerOption,
+        tag: "swopt",
+        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
+        // One object per enum constant.
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
     },
     KindInfo {
         kind: HostKind::UnicodeBlock,
@@ -2252,6 +2303,56 @@ const KINDS: &[KindInfo] = &[
         // A value: equal entries may be different objects.
         canonical: |_| false,
         methods: &crate::host_entry::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
@@ -2520,11 +2621,6 @@ impl HostRef {
     /// text becomes a callback (#261 round-3 B1). A callback reaches a jar
     /// only as the handle the runtime made.
     pub(crate) fn decode(text: &str) -> Option<Self> {
-        // A text naming a callback anywhere is refused outright, as before;
-        // the structural rule above is what holds once escapes nest.
-        if text.contains("hcb:") {
-            return None;
-        }
         let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
         let kind = HostKind::from_tag(tag)?;
         (kind != HostKind::Callback).then(|| Self::new(kind, key))
@@ -2562,12 +2658,16 @@ mod tests {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
         }
-        // Nor does any handle whose key holds a callback (an optional of a
-        // lambda spelled by a jar).
-        assert_eq!(
-            HostRef::decode("hopt:hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#evil()V:"),
-            None
-        );
+        // Nor does a handle decoded from text yield one from its key (an
+        // optional of a lambda spelled by a jar): it is read back as text
+        // again.
+        let spelled =
+            HostRef::decode("hopt:hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#evil()V:")
+                .unwrap();
+        assert!(spelled.values().is_none_or(|held| {
+            held.iter()
+                .all(|value| !matches!(value, Value::Host(h) if h.kind() == HostKind::Callback))
+        }));
     }
 
     /// A kind whose runtime class is unknown is never found through a type it
