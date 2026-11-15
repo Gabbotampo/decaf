@@ -608,9 +608,11 @@ pub(crate) fn invoke<H: Host>(
             "com/google/common/collect/ArrayListMultimap",
             "array",
         )?)),
-        ("com/google/common/collect/HashMultimap", "create", _) => {
-            Ok(Some(this.host.unknown_operand_call(r)?))
-        }
+        ("com/google/common/collect/HashMultimap", "create", _) => Ok(Some(make_multimap(
+            this,
+            "com/google/common/collect/HashMultimap",
+            "hash",
+        )?)),
         ("com/google/common/collect/LinkedHashMultimap", "create", _) => Ok(Some(make_multimap(
             this,
             "com/google/common/collect/LinkedHashMultimap",
