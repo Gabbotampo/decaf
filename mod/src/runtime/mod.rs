@@ -81,6 +81,8 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+#[cfg(test)]
+mod host_defaults_tests;
 mod host_deferred_register;
 mod host_entry;
 mod host_events;
@@ -115,6 +117,7 @@ mod iteration_guard;
 mod jar_compare;
 mod jar_object;
 mod jar_operands;
+mod jar_server_values;
 mod jar_text;
 mod jar_throwables;
 mod java_format;
@@ -2519,9 +2522,10 @@ pub trait Host {
         None
     }
 
-    /// A collection's `modCount` (`mod_count.rs`).
+    /// A collection's `modCount` (`mod_count.rs`). A host that keeps none
+    /// answers [`mod_count::ModStamp::UNKEPT`], whose every check is counted.
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
-        mod_count::ModStamp::default()
+        mod_count::ModStamp::UNKEPT
     }
 
     fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
@@ -2682,13 +2686,16 @@ pub trait Host {
         false
     }
 
-    /// Message a host recorded for one bounded Throwable marker.
+    /// Message a host recorded for one bounded Throwable marker: `Some(None)`
+    /// for a throwable recorded without one (`getMessage()` is `null`), `None`
+    /// when the host recorded nothing for `marker`, so its message is not
+    /// known (a caller answering `getMessage` counts it, never `null`).
     ///
     /// The interpreter keeps objects as markers, so a host that answers
     /// `Throwable#getMessage` can report the same text an `athrow` carries.
     /// Hosts that do not model exceptions keep the default: an uncaught throw
     /// is still diagnosed, just without a message.
-    fn throwable_message(&self, _marker: &str) -> Option<String> {
+    fn throwable_message(&self, _marker: &str) -> Option<Option<String>> {
         None
     }
 
@@ -5247,11 +5254,17 @@ impl Host for StdHost {
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
     /// `athrow` diagnostic names the same message `getMessage` would return.
-    fn throwable_message(&self, marker: &str) -> Option<String> {
-        self.throwable_messages.get(marker).cloned().flatten()
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
+        self.throwable_messages.get(marker).cloned()
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
+        // A throw the runtime raised carries no cause (its `getCause()` is
+        // `null`), except the initializer error that wraps the `<clinit>`
+        // throw, whose cause this host never held: left unrecorded, counted.
+        if !marker.starts_with("java/lang/ExceptionInInitializerError#") {
+            self.throwable_causes.insert(marker.to_owned(), None);
+        }
         self.throwable_messages.insert(marker.to_owned(), message);
     }
 
@@ -6910,6 +6923,24 @@ impl Host for StdHost {
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
+            }
+            // A throwable whose constructor this host never saw (its message
+            // and cause were not recorded): `getMessage`, `getCause` and
+            // `toString` are not known to be `null`, so they are counted.
+            if matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("getMessage", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;")
+            ) && !self.throwable_messages.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
+            }
+            // The cause is its own record: a throw the runtime raised has its
+            // message but, for an `ExceptionInInitializerError`, a cause the
+            // host never held (#257's review), so that one is counted.
+            if (r.name.as_str(), r.descriptor.as_str()) == ("getCause", "()Ljava/lang/Throwable;")
+                && !self.throwable_causes.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getMessage", "()Ljava/lang/String;") => {
@@ -11449,7 +11480,7 @@ fn thrown_message<H: Host>(value: &Value, host: &H) -> Option<String> {
     if !is_throwable_marker(marker) {
         return None;
     }
-    host.throwable_message(marker)
+    host.throwable_message(marker).flatten()
 }
 
 fn capability_text(value: &Value) -> String {
@@ -11675,6 +11706,20 @@ fn stand_in_class(kind: &str) -> &'static str {
         "set" => "java/util/LinkedHashSet",
         _ => "java/util/ArrayList",
     }
+}
+
+/// A reader constructor's operand that is not a reader this model holds: a
+/// `null` throws `Reader(Object lock)`'s bare `NullPointerException`, any
+/// other value is left to the host (`Ok(None)`), which counts it.
+fn null_reader_operand(args: &[Value]) -> Result<Option<Value>, NativeError> {
+    if matches!(args.first(), Some(Value::Ref(None))) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(None)
 }
 
 fn value_text(value: &Value) -> String {
@@ -23625,9 +23670,16 @@ impl<H: Host> Runtime<'_, H> {
                         Some(text) => text,
                         // A jar resource opened by the host is read here, so a
                         // config loader's `getResourceAsStream` reaches Gson.
-                        None => self.host.resource_stream_text(stream).unwrap_or_default(),
+                        // A stream the host holds no text for is not empty:
+                        // the reader is left to the host, which counts it.
+                        None => match self.host.resource_stream_text(stream) {
+                            Some(text) => text,
+                            None => return Ok(None),
+                        },
                     },
-                    None => String::new(),
+                    // `Reader(Object lock)` throws a bare NPE for a `null`
+                    // stream (#257's review); any other operand is not ours.
+                    None => return null_reader_operand(args),
                 };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
@@ -23636,11 +23688,16 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let text = args
-                    .first()
-                    .and_then(expect_ref)
-                    .and_then(|reader| self.string_readers.remove(reader))
-                    .unwrap_or_default();
+                // Only a reader this model holds the text of; a `null` reader
+                // is `Reader(lock)`'s NPE, and any other is left to the host,
+                // which counts it (#257's review: an empty reader made
+                // `readLine()` a silent `null`).
+                let Some(reader) = args.first().and_then(expect_ref) else {
+                    return null_reader_operand(args);
+                };
+                let Some(text) = self.string_readers.remove(reader) else {
+                    return Ok(None);
+                };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
@@ -26373,6 +26430,13 @@ impl<H: Host> Runtime<'_, H> {
                             at,
                             self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
                         )
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_jar_server_value(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        // A jar's own `BlockPos`/`LevelResource`: the game's
+                        // members on its fields (`jar_server_values.rs`).
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
                     {
