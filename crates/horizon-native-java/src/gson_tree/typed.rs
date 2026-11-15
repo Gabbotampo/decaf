@@ -27,7 +27,7 @@
 //! reader here, which the `fromJson` call counts), never an approximation.
 //! Counted: a type variable, a class this does not list (`Queue`'s
 //! `ArrayDeque`, `EnumSet`, `ConcurrentHashMap`, `Iterable`, which Gson
-//! refuses with a `JsonIOException`, ...), `char`, a value of the wrong kind
+//! refuses with a `JsonIOException`, ...), a value of the wrong kind
 //! for its reader (Gson's `JsonSyntaxException`), a `null` in a primitive
 //! array, a `TreeSet`/`TreeMap` whose elements are not one comparable kind
 //! (Java's `ClassCastException`), a map key read as anything but a `String` or
@@ -582,8 +582,20 @@ fn gson_scalar(tree: &Tree, class: &str) -> Option<Option<Value>> {
                 }
             })
         }
-        // `char`/`Character`, `Number`, `BigDecimal`...: not reproduced.
-        "char" | "java/lang/Character" | "java/lang/Number" | "java/lang/CharSequence" => None,
+        // `TypeAdapters.CHARACTER`: a string of exactly one UTF-16 unit.
+        "char" | "java/lang/Character" => match tree {
+            Tree::Str(text) | Tree::Num(text) => {
+                let mut units = text.encode_utf16();
+                match (units.next(), units.next()) {
+                    (Some(unit), None) if class == "char" => Some(Value::Int(i32::from(unit))),
+                    (Some(unit), None) => Some(Value::Boxed(Boxed::Character(unit))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        // `Number`, `CharSequence`, `BigDecimal`...: not reproduced.
+        "java/lang/Number" | "java/lang/CharSequence" => None,
         _ => return None,
     })
 }

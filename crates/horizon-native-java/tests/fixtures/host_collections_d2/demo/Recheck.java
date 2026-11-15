@@ -96,6 +96,22 @@ public final class Recheck {
             + cls(c.nested.get(0).get(0));
     }
 
+    static final class Prims {
+        boolean flag = true;
+        char letter = 'a';
+        float ratio = 0.1f;
+        byte small = -2;
+        short mid = 300;
+    }
+
+    /** A jar object's primitive fields written and read back as Gson's adapters do. */
+    public static String gsonPrimitiveFields() {
+        Gson gson = new Gson();
+        String json = gson.toJson(new Prims());
+        Prims back = gson.fromJson(json, Prims.class);
+        return json + "|" + back.flag + back.letter + back.ratio + back.small + back.mid;
+    }
+
     /** `compareTo` between a `String` and a `Double`: Java's `ClassCastException`. */
     public static String gsonTreeSetMixed() {
         TreeSet t = new Gson().fromJson("[\"b\",1]", TreeSet.class);
@@ -156,6 +172,7 @@ public final class Recheck {
         System.out.println("gsonMapValues=" + run(Recheck::gsonMapValues));
         System.out.println("gsonLinkedHashMap=" + run(Recheck::gsonLinkedHashMap));
         System.out.println("gsonTypedFields=" + run(Recheck::gsonTypedFields));
+        System.out.println("gsonPrimitiveFields=" + run(Recheck::gsonPrimitiveFields));
         System.out.println("gsonTreeSetMixed=" + run(Recheck::gsonTreeSetMixed));
         System.out.println("gsonQueue=" + run(Recheck::gsonQueue));
         System.out.println("gsonDuplicateKey=" + run(Recheck::gsonDuplicateKey));

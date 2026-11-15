@@ -202,7 +202,8 @@ fn line_of(oracle: &'static str, method: &str) -> &'static str {
 ///   `ObjectTypeAdapter`'s (a nested `LinkedTreeMap` in document order), a
 ///   `LinkedHashMap` target in document order, and a jar class's
 ///   `Map<String, Integer>`, `List<Double>`, `Set<String>`, `int[]`,
-///   `Map<Integer, String>` and `List<List<Long>>` fields as declared;
+///   `Map<Integer, String>` and `List<List<Long>>` fields as declared, and its
+///   `boolean`/`char`/`float`/`byte`/`short` fields written and read back;
 /// - a `String` spelled `<collection class>#<word>` is a `String`: no
 ///   collection type's `instanceof`, a `List` cast throws;
 /// - counted, where Java throws or makes a class not modelled here:
@@ -224,6 +225,7 @@ fn recheck_gson_reads_are_javas_or_counted() {
         "gsonMapValues",
         "gsonLinkedHashMap",
         "gsonTypedFields",
+        "gsonPrimitiveFields",
         "forgedCollectionText",
     ];
     let counted = [
