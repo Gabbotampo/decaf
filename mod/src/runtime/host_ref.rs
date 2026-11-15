@@ -377,6 +377,10 @@ pub enum HostKind {
     FabricPayloadTypes,
     /// A `ResourceLoader`: key its `PackType`.
     FabricResourceLoader,
+    /// Fabric biome modification phase singleton.
+    FabricModificationPhase,
+    /// Fabric static Identifier initialized once by its owner.
+    FabricStaticIdentifier,
     /// An object `new` (or a model) allocated: key `class#n`
     /// (`jar_object.rs`), one key per allocation.
     JarObject,
@@ -1671,6 +1675,22 @@ const KINDS: &[KindInfo] = &[
         // One per `PackType` (`IMPL_MAP`).
         canonical: always_canonical,
         methods: &crate::runtime::host_fabric_runtime::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricModificationPhase,
+        tag: "fmp",
+        class: ClassRule::Fixed("net/fabricmc/fabric/api/biome/v1/ModificationPhase"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_fabric_runtime::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricStaticIdentifier,
+        tag: "fsi",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_ids::identifier_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::host_ids::IDENTIFIER_METHODS,
     },
     KindInfo {
         kind: HostKind::JarObject,
