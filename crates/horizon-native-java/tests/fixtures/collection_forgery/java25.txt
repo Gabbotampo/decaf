@@ -1,0 +1,5 @@
+list=java.lang.String|TTFFFFF|TTTH|1T|StringT|list/a,b|<list/a,b>8|CCECCECCE
+set=java.lang.String|TTFFFFF|TTTH|1T|StringT|set/x|<set/x>5|CCECCECCE
+map=java.lang.String|TTFFFFF|TTTH|1T|StringT|map/k=v|<map/k=v>7|CCECCECCE
+bare=java.lang.String|TTFFFFF|TTTH|1T|StringT|list|<list>4|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|set|<set>3|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|map|<map>3|CCECCECCE
+hashed=java.lang.String|TTFFFFF|TTTH|1T|StringT|list#i1/a,b|<list#i1/a,b>11|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|map#i2/k,v|<map#i2/k,v>10|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|list#3/a|<list#3/a>8|CCECCECCE;java.lang.String|TTFFFFF|TTTH|1T|StringT|set#i0|<set#i0>6|CCECCECCE

@@ -470,7 +470,7 @@ impl Handle {
                 position: index("pos")?,
                 values: strings("values")?
                     .iter()
-                    .map(|marker| parse_collection_value(marker))
+                    .map(|marker| parse_value_marker(marker))
                     .collect::<Result<_, _>>()?,
             },
             Some("drop") => Self::Drop {
