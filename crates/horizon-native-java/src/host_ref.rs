@@ -492,6 +492,10 @@ pub enum HostKind {
     /// the entry's key and value (`HostRef::of_values`, `host_entry.rs`). A
     /// handle so that what it holds (a callback) is never `String` text.
     MapEntry,
+    /// Fabric resource-loader v0's helper, one per pack type.
+    FabricResourceManagerHelper,
+    /// Vanilla's `FileToIdConverter` record.
+    FileToIdConverter,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2036,6 +2040,20 @@ const KINDS: &[KindInfo] = &[
         // A value: equal entries may be different objects.
         canonical: |_| false,
         methods: &crate::host_entry::METHODS,
+        kind: HostKind::FabricResourceManagerHelper,
+        tag: "rmh",
+        class: ClassRule::Unknown {
+            declared: crate::client_reload::helper_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::client_reload::HELPER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FileToIdConverter,
+        tag: "ftid",
+        class: ClassRule::FromKey(crate::client_reload::converter_class),
+        canonical: never_canonical,
+        methods: &crate::client_reload::CONVERTER_METHODS,
     },
 ];
 
