@@ -86,17 +86,18 @@ pub(super) fn invoke(
             if kind != "path" {
                 return Err(unsupported(&format!("kind {named} doesn't have paths")));
             }
-            host.origin_paths(receiver, &root_path(argument)).unwrap_or_else(|| {
-                host.owned_collection(
-                    receiver,
-                    "getPaths",
-                    "java/util/Collections$SingletonList",
-                    false,
-                    vec![path_value(&root_path(argument))],
-                )
-                .unwrap_or(Value::Ref(None))
-            })
-        },
+            host.origin_paths(receiver, &root_path(argument))
+                .unwrap_or_else(|| {
+                    host.owned_collection(
+                        receiver,
+                        "getPaths",
+                        "java/util/Collections$SingletonList",
+                        false,
+                        vec![path_value(&root_path(argument))],
+                    )
+                    .unwrap_or(Value::Ref(None))
+                })
+        }
         ("getParentModId", "()Ljava/lang/String;") => {
             if kind != "nested" {
                 return Err(unsupported(&format!(
