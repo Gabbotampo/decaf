@@ -406,7 +406,7 @@ public class Libs {
         multi.put("a", 1);
         multi.put("a", 2);
         multi.put("a", 1);
-        multi.put("b", 5);
+        multi.get("b").add(5);
 
         Supplier<Integer> memo = Suppliers.memoize(() -> ++supplied)::get;
         int m1 = memo.get();

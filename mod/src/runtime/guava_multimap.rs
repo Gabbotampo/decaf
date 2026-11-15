@@ -324,16 +324,9 @@ fn invoke_multimap<H: Host>(
         }
         ("get", "(Ljava/lang/Object;)Ljava/util/Collection;")
         | ("get", "(Ljava/lang/Object;)Ljava/util/List;")
-        | ("get", "(Ljava/lang/Object;)Ljava/util/Set;") => {
-            if let Some(values) = values_for_key(this, &source, &args[0], false)? {
-                return Ok(Some(values));
-            }
-            let kind = source_kind(this, &source).unwrap_or_else(|| "array".into());
-            let class = value_collection_class(&kind);
-            Ok(Some(this.host.empty_mutable_collection(class).ok_or_else(
-                || NativeError::Metadata("Guava value collection is unavailable".into()),
-            )?))
-        }
+        | ("get", "(Ljava/lang/Object;)Ljava/util/Set;") => Ok(Some(
+            values_for_key(this, &source, &args[0], true)?.unwrap(),
+        )),
         ("containsKey", "(Ljava/lang/Object;)Z") => Ok(Some(Value::Int(
             values_for_key(this, &source, &args[0], false)?.is_some_and(|v| {
                 crate::runtime::runtime_collection_values(&*this.host, &v).is_ok_and(|x| !x.is_empty())
