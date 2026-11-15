@@ -1533,7 +1533,7 @@ impl CallbackInfos {
     /// rest of the execution ([`Self::held`]).
     fn hold<'v>(&mut self, values: impl IntoIterator<Item = &'v Value>) {
         for value in values {
-            if let Some(text) = heap::value_text(value) {
+            for text in heap::value_texts(value) {
                 self.held.insert(text.to_owned());
             }
         }
@@ -12424,10 +12424,7 @@ fn box_callback_result<H: Host>(
         // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
         return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
-    let Some(marker) = callback_marker::callback_text(receiver) else {
-        return Ok(value);
-    };
-    let Ok(callback) = parse_callback_marker(marker) else {
+    let Some(callback) = callback_marker::lambda_of(receiver) else {
         return Ok(value);
     };
     let target_return = return_desc(&callback.target.descriptor).to_owned();
@@ -13809,7 +13806,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
@@ -13842,7 +13841,9 @@ impl ClassFile {
         });
         let handle_index = implementation.unwrap_or(bootstrap.method_ref);
         let handle = match self.pool.get(handle_index as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             other => {
                 return Err(NativeError::InvalidConstant(
                     handle_index,
@@ -13851,6 +13852,24 @@ impl ClassFile {
             }
         };
         Ok(Some(self.method_ref(handle)?))
+    }
+
+    /// The reference kind of a lambda call site's implementation handle (its
+    /// bootstrap's second static argument; JVMS 5.4.3.5), `None` when the
+    /// bootstrap has none.
+    fn invoke_dynamic_reference_kind(&self, index: u16) -> Option<u8> {
+        let Some(Cp::InvokeDynamic { bootstrap, .. }) = self.pool.get(index as usize) else {
+            return None;
+        };
+        let argument = self
+            .bootstrap_methods
+            .get(*bootstrap as usize)?
+            .arguments
+            .get(1)?;
+        match self.pool.get(*argument as usize) {
+            Some(Cp::MethodHandle { reference_kind, .. }) => Some(*reference_kind),
+            _ => None,
+        }
     }
 
     /// The interfaces `LambdaMetafactory.altMetafactory` adds to a lambda's
@@ -13869,11 +13888,11 @@ impl ClassFile {
             return Vec::new();
         };
         let is_alt = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => {
-                self.method_ref(*reference_index).is_ok_and(|r| {
-                    r.owner == "java/lang/invoke/LambdaMetafactory" && r.name == "altMetafactory"
-                })
-            }
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => self.method_ref(*reference_index).is_ok_and(|r| {
+                r.owner == "java/lang/invoke/LambdaMetafactory" && r.name == "altMetafactory"
+            }),
             _ => false,
         };
         let int = |at: usize| match bootstrap
@@ -13919,7 +13938,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
@@ -13974,6 +13995,8 @@ enum Cp {
         nt: u16,
     },
     MethodHandle {
+        /// JVMS 4.4.8: 5 `invokeVirtual` ... 9 `invokeInterface`.
+        reference_kind: u8,
         reference_index: u16,
     },
     MethodType,
@@ -19596,19 +19619,9 @@ impl NativeJar {
         dispatch: &EventDispatch,
         host: &mut H,
     ) -> Result<Value, NativeError> {
-        let marker = dispatch
-            .listener
-            .args
-            .iter()
-            .rev()
-            .find_map(|value| {
-                crate::runtime::callback_marker::callback_text(value)
-                    .filter(|key| callback_marker::is_callback(key))
-            })
-            .ok_or_else(|| {
-                NativeError::Metadata("event listener has no invokedynamic marker".into())
-            })?;
-        let callback = parse_callback_marker(marker)?;
+        let callback = events::indy_argument(&dispatch.listener.args).ok_or_else(|| {
+            NativeError::Metadata("event listener has no invokedynamic marker".into())
+        })??;
         let class = self.classes.get(&callback.target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
                 "{}#{}{}",
@@ -19654,15 +19667,6 @@ impl NativeJar {
             host,
         )
     }
-}
-
-/// A callback marker read back (`callback_marker.rs`).
-type CallbackMarker = callback_marker::Callback;
-
-/// Read a live callback's text back (`callback_marker::parse`): a `String`
-/// spelled like one is no callback.
-fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
-    callback_marker::parse(marker)
 }
 
 /// The callback a `Predicate`/`Consumer`/`Function` combinator answers
@@ -21208,10 +21212,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         // Only a callback handle is a callback: a `String` spelled like one
         // is the `String` it is.
-        let Some(marker) = callback_marker::callback_text(marker) else {
-            return Ok(None);
-        };
-        let Ok(callback) = parse_callback_marker(marker) else {
+        let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
         // The callback target may live in a linked library jar, so resolve it
@@ -21231,17 +21232,22 @@ impl<H: Host> Runtime<'_, H> {
             // is the interpreter's, and the host's identity `Function.apply`
             // would otherwise hand the receiver back unchanged.
             //
-            // The marker does not record the handle kind, so the arity tells
-            // the shapes apart: the callback's values are the captures followed
-            // by the call's own arguments, exactly the JVM's argument order. One
-            // more value than the target declares is a receiver
-            // (`Enum.class::isAssignableFrom` bound, `String::length`
-            // unbound); exactly as many is a static reference
-            // (`Integer::parseInt`).
+            // The callback's values are the captures followed by the call's own
+            // arguments, exactly the JVM's argument order. The implementation
+            // handle's kind says whether the first is a receiver (#156 P15b):
+            // `invokestatic` (6) takes none (`Integer::parseInt`); a virtual,
+            // special or interface handle takes one (`String::length`
+            // unbound, `Enum.class::isAssignableFrom` bound). A handle read
+            // back from text has no kind, and the arity tells them apart: one
+            // more value than the target declares is a receiver.
             let mut values = callback.captures.clone();
             values.extend_from_slice(args);
             let expected = arg_count(&callback.target.descriptor);
-            if values.len() == expected && callback.target.name != "<init>" {
+            let is_static = match callback.ref_kind {
+                Some(kind) => kind == 6,
+                None => values.len() == expected && callback.target.name != "<init>",
+            };
+            if is_static {
                 method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
                 // A jar object argument no model can read is counted
@@ -21287,7 +21293,13 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(Some(Value::Ref(Some(text))));
                 }
                 let object = self.new_object(&callback.target.owner);
-                if string_constructors::count(self, &callback.target)?.is_none() {
+                // `StringBuilder::new`: the interpreter's own builder, as `new`
+                // and `<init>` make it (`jdk_string_builder.rs`).
+                if self
+                    .invoke_string_builder(&callback.target, Some(&object), &values)?
+                    .is_none()
+                    && string_constructors::count(self, &callback.target)?.is_none()
+                {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
                 }
@@ -27218,9 +27230,7 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         continue;
                     }
-                    let target = file.invoke_dynamic_target(index)?.map(|target| {
-                        format!("{}#{}{}", target.owner, target.name, target.descriptor)
-                    });
+                    let target = file.invoke_dynamic_target(index)?;
                     // The call site's own type is the functional interface the
                     // lambda's class implements, with `altMetafactory`'s
                     // markers after it (`callback_marker.rs`).
@@ -27237,8 +27247,10 @@ impl<H: Host> Runtime<'_, H> {
                         &format!("{class}#{method}"),
                         index,
                         &interfaces,
-                        target.as_deref().unwrap_or("?"),
-                        &bounded_captured_markers(&captured),
+                        target,
+                        file.invoke_dynamic_reference_kind(index),
+                        captured,
+                        false,
                     );
                     if return_desc(&descriptor) != "V" {
                         stack.push(callback);
@@ -28928,8 +28940,9 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                 Cp::Double(f64::from_bits((high << 32) | low))
             }
             15 => {
-                let _ = r.u1()?;
+                let reference_kind = r.u1()?;
                 Cp::MethodHandle {
+                    reference_kind,
                     reference_index: r.u2()?,
                 }
             }
@@ -30771,12 +30784,10 @@ pub fn dispatch_payload_frame_with(
     }) else {
         return Ok(false);
     };
-    let Some(marker) = callback_marker::callback_text(&registration.handler) else {
+    let Some(callback) = callback_marker::lambda_of(&registration.handler) else {
         return Ok(false);
     };
-    let Some((target, captures)) = parse_dynamic_handler(marker) else {
-        return Ok(false);
-    };
+    let (target, captures) = (callback.target, callback.captures);
     let class = jar.classes.get(&target.owner).ok_or_else(|| {
         NativeError::MissingMethod(format!(
             "{}#{}{}",
@@ -30805,13 +30816,6 @@ pub fn dispatch_payload_frame_with(
     // entrypoint built (a handler map, a config) and what earlier frames left.
     jar.invoke_persistent(&target, receiver, &args, host, &ExecutionBudget::UNBOUNDED)?;
     Ok(true)
-}
-
-/// Parse an `@indy:` handler marker into its implementation method and bound
-/// captures. Runtime arguments (the payload and context) are not included.
-fn parse_dynamic_handler(marker: &str) -> Option<(MethodRef, Vec<Value>)> {
-    let callback = callback_marker::parse(marker).ok()?;
-    Some((callback.target, callback.captures))
 }
 
 #[cfg(test)]
@@ -31555,7 +31559,7 @@ mod tests {
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
             let captured = bounded_captured_markers(std::slice::from_ref(&value));
-            value = crate::runtime::callback_marker::lambda("demo/C#m", 0, "", "?", &captured);
+            value = crate::runtime::callback_marker::lambda_from_text("demo/C#m", 0, "", "?", &captured);
         }
         let Some(marker) = crate::runtime::callback_marker::callback_text(&value) else {
             panic!("expected a callback");
@@ -36222,7 +36226,7 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    crate::runtime::callback_marker::lambda(
+                    crate::runtime::callback_marker::lambda_from_text(
                         "demo#0",
                         0,
                         "",
@@ -38293,7 +38297,10 @@ mandatory = true
                 },
                 Cp::Utf8("accept".into()),
                 Cp::Utf8("(Ljava/lang/Object;)Ljava/lang/Object;".into()),
-                Cp::MethodHandle { reference_index: 6 },
+                Cp::MethodHandle {
+                    reference_kind: 6,
+                    reference_index: 6,
+                },
                 Cp::MethodRef { class: 7, nt: 8 },
                 Cp::Class(9),
                 Cp::NameType {
@@ -38334,16 +38341,19 @@ mandatory = true
                 &mut NullHost,
             )
             .unwrap();
+        // A capturing lambda is a new object per evaluation (its own key);
+        // its target and captures are what the site bound.
+        let callback = crate::runtime::callback_marker::lambda_of(&value).expect("a lambda");
         assert_eq!(
-            value,
-            crate::runtime::callback_marker::lambda(
-                "demo/Lambda#make",
-                1,
-                "java/lang/Object",
-                "demo/Target#callback(Ljava/lang/Object;)V",
-                "rcapture"
-            )
+            callback.target,
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "callback".into(),
+                descriptor: "(Ljava/lang/Object;)V".into(),
+            }
         );
+        assert_eq!(callback.captures, [Value::Ref(Some("capture".into()))]);
+        assert_eq!(callback.sam, "java/lang/Object");
     }
 
     #[test]
@@ -38363,7 +38373,7 @@ mandatory = true
                 },
                 Cp::Utf8("apply".into()),
                 Cp::Utf8("(Ljava/lang/Object;)Ljava/lang/Object;".into()),
-                Cp::MethodHandle { reference_index: 6 },
+                Cp::MethodHandle { reference_kind: 6, reference_index: 6 },
                 Cp::MethodRef { class: 7, nt: 8 },
                 Cp::Class(9),
                 Cp::NameType {
@@ -38373,7 +38383,7 @@ mandatory = true
                 Cp::Utf8("java/lang/invoke/LambdaMetafactory".into()),
                 Cp::Utf8("metafactory".into()),
                 Cp::Utf8("(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;".into()),
-                Cp::MethodHandle { reference_index: 13 },
+                Cp::MethodHandle { reference_kind: 6, reference_index: 13 },
                 Cp::MethodRef { class: 14, nt: 15 },
                 Cp::Class(16),
                 Cp::NameType {
@@ -39645,7 +39655,7 @@ mandatory = true
             raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
-        let marker = crate::runtime::callback_marker::lambda(
+        let marker = crate::runtime::callback_marker::lambda_from_text(
             "demo/Caller#make",
             0,
             "",
@@ -39672,7 +39682,7 @@ mandatory = true
                 None,
                 &[
                     optional_wrap(Value::Ref(Some("input".into()))),
-                    crate::runtime::callback_marker::lambda(
+                    crate::runtime::callback_marker::lambda_from_text(
                         "demo/Caller#make",
                         0,
                         "",
@@ -39696,7 +39706,7 @@ mandatory = true
             "demo/Target#callback(Ljava/lang/Object;)V",
             &value_marker(&Value::Ref(Some("a,b\\c".into()))),
         );
-        let parsed = parse_callback_marker(&marker).unwrap();
+        let parsed = callback_marker::parse(&marker).unwrap();
         assert_eq!(parsed.captures, vec![Value::Ref(Some("a,b\\c".into()))]);
     }
 
@@ -39732,7 +39742,7 @@ mandatory = true
                         .into(),
                 },
                 receiver: Some(Value::Ref(Some("event-bus".into()))),
-                args: vec![crate::runtime::callback_marker::lambda(
+                args: vec![crate::runtime::callback_marker::lambda_from_text(
                     "demo/Mod#wire",
                     1,
                     "",
@@ -40215,7 +40225,7 @@ mandatory = true
                 &create,
                 &[
                     Value::Ref(Some("demo/Event".into())),
-                    crate::runtime::callback_marker::lambda(
+                    crate::runtime::callback_marker::lambda_from_text(
                         "demo/Mod#event",
                         0,
                         "",
@@ -40231,7 +40241,7 @@ mandatory = true
             name: "register".into(),
             descriptor: "(Ljava/lang/Object;)V".into(),
         };
-        let listener = crate::runtime::callback_marker::lambda(
+        let listener = crate::runtime::callback_marker::lambda_from_text(
             "demo/Mod#wire",
             1,
             "",

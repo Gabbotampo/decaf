@@ -148,7 +148,9 @@ fn record_components(file: &ClassFile, index: u16) -> Option<Vec<Component>> {
     let mut components = Vec::new();
     for (name, getter) in names.zip(getters) {
         let field = match file.pool.get(*getter as usize) {
-            Some(Cp::MethodHandle { reference_index }) => file.field_ref(*reference_index).ok()?,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => file.field_ref(*reference_index).ok()?,
             _ => return None,
         };
         components.push(Component {

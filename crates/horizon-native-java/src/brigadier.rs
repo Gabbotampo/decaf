@@ -61,7 +61,7 @@ use crate::{
     expect_ref, expect_string,
     host_brigadier::{self as handles, PERMISSION_SET, REQUIRES},
     host_ref::HostKind,
-    identifier_value, parse_callback_marker, return_desc, stable_hash, uuid_value,
+    identifier_value, return_desc, stable_hash, uuid_value,
 };
 
 const COMMAND_SELECTION: &str = "net/minecraft/commands/Commands$CommandSelection";
@@ -2052,12 +2052,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
             return false;
         }
-        let Some(text) = crate::callback_marker::callback_text(receiver)
-            .filter(|t| crate::callback_marker::is_callback(t))
-        else {
-            return false;
-        };
-        let Ok(callback) = parse_callback_marker(text) else {
+        let Some(callback) = crate::callback_marker::lambda_of(receiver) else {
             return false;
         };
         let Some(method) = self
@@ -2091,13 +2086,7 @@ impl NativeJar {
             if self.classes.contains_key(&target.owner) {
                 break;
             }
-            let Some(inner) = captures
-                .first()
-                .and_then(crate::callback_marker::callback_text)
-            else {
-                break;
-            };
-            let Ok(inner) = parse_callback_marker(inner) else {
+            let Some(inner) = captures.first().and_then(crate::callback_marker::lambda_of) else {
                 break;
             };
             let mut next = inner.captures;
@@ -2124,10 +2113,7 @@ impl NativeJar {
                 "a null {method} callback was called"
             )));
         }
-        if let Some(text) = crate::callback_marker::callback_text(callback)
-            && crate::callback_marker::is_callback(text)
-        {
-            let parsed = parse_callback_marker(text)?;
+        if let Some(parsed) = crate::callback_marker::lambda_of(callback) {
             let (target, mut captures) =
                 self.command_callback_target(parsed.target, parsed.captures);
             let found = self

@@ -98,6 +98,11 @@ pub struct HostRef {
     /// `&String` the text readers take (`expect_ref`, [`Self::key_text`]).
     key: Arc<String>,
     origin: u64,
+    /// A callback's row (`callback_marker::Row`): its target and the values
+    /// it holds, exactly. Not part of the value either: the key names the
+    /// object, and a handle decoded from text (a host collection's marker)
+    /// has no row, so its readers fall back to the key's bounded text.
+    row: Option<Arc<crate::callback_marker::Row>>,
 }
 
 /// The next [`HostRef::origin`]: only ever compared for equality, never shown.
@@ -2107,7 +2112,22 @@ impl HostRef {
             kind,
             key: Arc::new(key.into()),
             origin: NEXT_ORIGIN.fetch_add(1, AtomicOrdering::Relaxed),
+            row: None,
         }
+    }
+
+    /// A callback handle keyed `key` that carries `row` (`callback_marker.rs`).
+    pub(crate) fn with_row(kind: HostKind, key: String, row: crate::callback_marker::Row) -> Self {
+        Self {
+            row: Some(Arc::new(row)),
+            ..Self::new(kind, key)
+        }
+    }
+
+    /// The row a callback handle carries, when it was made rather than
+    /// decoded from text.
+    pub(crate) fn row(&self) -> Option<&crate::callback_marker::Row> {
+        self.row.as_deref()
     }
 
     /// A handle whose key holds `values`: each value's marker, separators

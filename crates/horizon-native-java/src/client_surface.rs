@@ -48,7 +48,7 @@ use crate::{
     ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
     component_value,
     events::{self, GameEvent, ListenerCallback},
-    expect_ref, identifier_parts, parse_callback_marker, return_desc, stable_hash, uuid_value,
+    expect_ref, identifier_parts, return_desc, stable_hash, uuid_value,
 };
 
 // The player's items and effects (`ItemStack`, `Inventory`, effects). A
@@ -941,17 +941,12 @@ impl StdHost {
         let mut layers = Vec::new();
         let mut refused = Vec::new();
         for (id, element, source) in &self.client.layers {
-            let callback = match crate::callback_marker::callback_text(element) {
-                Some(text) if crate::callback_marker::is_callback(text) => {
-                    match parse_callback_marker(text) {
-                        Ok(marker) => Some(ListenerCallback::Indy {
-                            target: marker.target,
-                            captures: marker.captures,
-                        }),
-                        Err(_) => None,
-                    }
-                }
-                _ => events::jar_object(jar, element).and_then(|(class, value)| {
+            let callback = match crate::callback_marker::lambda_of(element) {
+                Some(marker) => Some(ListenerCallback::Indy {
+                    target: marker.target,
+                    captures: marker.captures,
+                }),
+                None => events::jar_object(jar, element).and_then(|(class, value)| {
                     ["extractRenderState", "render"]
                         .iter()
                         .find_map(|name| events::resolve_method(jar, class, name, LAYER_DESCRIPTOR))
@@ -2087,14 +2082,12 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<(), NativeError> {
-        let callback = match crate::callback_marker::callback_text(task) {
-            Some(text) if crate::callback_marker::is_callback(text) => parse_callback_marker(text)
-                .ok()
-                .map(|marker| ListenerCallback::Indy {
-                    target: marker.target,
-                    captures: marker.captures,
-                }),
-            _ => events::jar_object(self, task).and_then(|(class, value)| {
+        let callback = match crate::callback_marker::lambda_of(task) {
+            Some(marker) => Some(ListenerCallback::Indy {
+                target: marker.target,
+                captures: marker.captures,
+            }),
+            None => events::jar_object(self, task).and_then(|(class, value)| {
                 events::resolve_method(self, class, "run", "()V").map(|method| {
                     ListenerCallback::Object {
                         receiver: value.clone(),

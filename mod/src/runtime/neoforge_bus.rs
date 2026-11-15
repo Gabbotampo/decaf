@@ -77,7 +77,7 @@
 
 use crate::runtime::events::ListenerCallback;
 use crate::runtime::neoforge_event_classes::{ABSTRACT, CANCELLABLE, EVENT_CLASSES, MOD_BUS};
-use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, parse_callback_marker};
+use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref};
 
 pub(crate) use crate::runtime::host_events::{game_bus, mod_bus};
 
@@ -426,10 +426,7 @@ impl<H: Host> Runtime<'_, H> {
     /// typetools' `resolveRawArgument(Consumer.class, consumer.getClass())`, where the runtime can
     /// follow it; `None` where it cannot (counted, departure B3).
     fn consumer_event_class(&self, consumer: &Value) -> Option<String> {
-        if let Some(text) = crate::runtime::callback_marker::callback_text(consumer)
-            && crate::runtime::callback_marker::is_callback(text)
-        {
-            let marker = parse_callback_marker(text).ok()?;
+        if let Some(marker) = crate::runtime::callback_marker::lambda_of(consumer) {
             let parameters = crate::runtime::descriptor_arguments(&marker.target.descriptor);
             // `populateLambdaArgs`: an implementation method with one parameter fewer than
             // `accept` (none) is an unbound instance reference, and `T` is the method's declaring
@@ -479,10 +476,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `accept` of a jar object (its typed `accept(Event)` when it declares one, so the bridge's
     /// cast of a game event is not needed).
     fn consumer_callback(&self, consumer: &Value, class: &str) -> Option<ListenerCallback> {
-        if let Some(text) = crate::runtime::callback_marker::callback_text(consumer)
-            && crate::runtime::callback_marker::is_callback(text)
-        {
-            let marker = parse_callback_marker(text).ok()?;
+        if let Some(marker) = crate::runtime::callback_marker::lambda_of(consumer) {
             return Some(ListenerCallback::Indy {
                 target: marker.target,
                 captures: marker.captures,

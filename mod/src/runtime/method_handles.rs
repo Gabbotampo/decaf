@@ -1242,19 +1242,38 @@ impl<H: Host> Runtime<'_, H> {
         implementation: &Handle,
         captured: &[Value],
     ) -> Result<Value, NativeError> {
-        let (target, captures) = match implementation {
+        let (target, captures, ref_kind) = match implementation {
             Handle::Direct {
+                kind,
                 owner,
                 name,
                 descriptor,
-                ..
-            } => (format!("{owner}#{name}{descriptor}"), captured.to_vec()),
+            } => (
+                MethodRef {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    descriptor: descriptor.clone(),
+                },
+                captured.to_vec(),
+                // JVMS 5.4.3.5's reference kinds, as a class file's handle.
+                Some(match kind {
+                    Kind::Virtual => 5,
+                    Kind::Static => 6,
+                    Kind::Special => 7,
+                    Kind::Constructor => 8,
+                }),
+            ),
             other => {
                 let mut captures = vec![other.value()];
                 captures.extend_from_slice(captured);
                 (
-                    format!("{HANDLE_CLASS}#invokeExact{}", other.descriptor()?),
+                    MethodRef {
+                        owner: HANDLE_CLASS.to_owned(),
+                        name: "invokeExact".to_owned(),
+                        descriptor: other.descriptor()?,
+                    },
                     captures,
+                    Some(5),
                 )
             }
         };
@@ -1263,12 +1282,16 @@ impl<H: Host> Runtime<'_, H> {
             .strip_prefix('L')
             .and_then(|class| class.strip_suffix(';'))
             .unwrap_or("");
+        // Each reflective `metafactory` call links a call site of its own, so
+        // its lambda is a new object (`fresh`).
         Ok(crate::runtime::callback_marker::lambda(
             METAFACTORY_SITE,
             0,
             sam,
-            &target,
-            &bounded_captured_markers(&captures),
+            Some(target),
+            ref_kind,
+            captures,
+            true,
         ))
     }
 

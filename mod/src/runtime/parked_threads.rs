@@ -80,9 +80,7 @@ fn runnable_name(value: &Value) -> String {
     if let Some(class) = crate::runtime::jar_object::object_class(value) {
         return class.to_owned();
     }
-    if let Some(key) = crate::runtime::callback_marker::callback_text(value)
-        && let Ok(callback) = crate::runtime::callback_marker::parse(key)
-    {
+    if let Some(callback) = crate::runtime::callback_marker::lambda_of(value) {
         return format!("{}#{}", callback.target.owner, callback.target.name);
     }
     let Some(marker) = expect_ref(value) else {

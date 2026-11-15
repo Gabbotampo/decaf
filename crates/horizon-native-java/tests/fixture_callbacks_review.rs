@@ -10,7 +10,8 @@
 //! * `instanceof`, casts, type switches and `Class.isInstance` answer from the
 //!   lambda's interfaces, intersection-cast markers included (`Serializable`,
 //!   a marker interface); an undecidable one is counted;
-//! * captures and composites read back whole.
+//! * captures and composites read back whole, however long (#156 P15b: a
+//!   lambda's row holds its captures as values).
 //!
 //! `fixtures/callbacks_review/` is the reviewer's probe as written
 //! (`lib.Cb`/`lib.Cb2` sit in a jar of their own, so the run does not hold
@@ -64,31 +65,7 @@ const COUNTED: &[(&str, &[&str])] = &[
         "getClassAssignable",
         &["java/lang/Object#getClass()Ljava/lang/Class;"],
     ),
-    (
-        "capLong",
-        &["java/util/function/Supplier#get()Ljava/lang/Object;"],
-    ),
-    (
-        "capLongRun",
-        &["java/util/function/Supplier#get()Ljava/lang/Object;"],
-    ),
-    (
-        "capLongPredicate",
-        &["java/util/function/Supplier#get()Ljava/lang/Object;"],
-    ),
-    (
-        "capLongInStream",
-        &["java/util/function/Supplier#get()Ljava/lang/Object;"],
-    ),
-    (
-        "capCallbackInCallback",
-        &["java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z"],
-    ),
     ("hashTwice", &["java/lang/Runnable#hashCode()I"]),
-    (
-        "capLongPredicateTrue",
-        &["java/util/function/Supplier#get()Ljava/lang/Object;"],
-    ),
     (
         "unkSuperRunnable",
         &["java/lang/Runnable#<instanceof>(Ljava/lang/Object;)Z"],
@@ -100,13 +77,6 @@ const DEPARTURES: &[(&str, &str)] = &[
     // A lambda's `getClass()` names its hidden class: counted, and the `null`
     // it answers fails `isAssignableFrom` (P15b models the class).
     ("getClassAssignable", "NullPointerException"),
-    // A capture past 4096 characters is cut, so the callback no longer runs:
-    // counted, never run with the cut text (P15b holds captures as values).
-    ("capLong", "false,4;false,4"),
-    ("capLongRun", "null"),
-    ("capLongPredicate", "null"),
-    ("capLongInStream", "null"),
-    ("capLongPredicateTrue", "null"),
     // `lib.Cb2` is not in the jar, so whether it extends `Runnable` is
     // unknown: counted.
     ("unkSuperRunnable", "false,false"),

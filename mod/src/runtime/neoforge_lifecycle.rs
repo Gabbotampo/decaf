@@ -364,10 +364,7 @@ impl NativeJar {
     /// How a queued `Runnable#run` or `Supplier#get` is reached: a lambda or method reference, or
     /// a jar object's method.
     fn work_callback(&self, task: &DeferredTask) -> Option<ListenerCallback> {
-        if let Some(text) = crate::runtime::callback_marker::callback_text(&task.work)
-            && crate::runtime::callback_marker::is_callback(text)
-        {
-            let marker = crate::runtime::parse_callback_marker(text).ok()?;
+        if let Some(marker) = crate::runtime::callback_marker::lambda_of(&task.work) {
             return Some(ListenerCallback::Indy {
                 target: marker.target,
                 captures: marker.captures,

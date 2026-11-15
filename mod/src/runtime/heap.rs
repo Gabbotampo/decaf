@@ -145,7 +145,7 @@ impl StdHost {
     /// hand); one the embedder keeps across later calls must be retained.
     /// Holds are counted: two `retain`s need two `release`s.
     pub fn retain(&mut self, value: &Value) {
-        if let Some(text) = pin_text(value) {
+        for text in pin_texts(value) {
             *self.retained.entry(text.to_owned()).or_default() += 1;
         }
     }
@@ -154,12 +154,12 @@ impl StdHost {
     /// collections may free it (and what only it reached) when the jar no
     /// longer reaches it either.
     pub fn release(&mut self, value: &Value) {
-        if let Some(text) = pin_text(value)
-            && let Some(holds) = self.retained.get_mut(text)
-        {
-            *holds -= 1;
-            if *holds == 0 {
-                self.retained.remove(text);
+        for text in pin_texts(value) {
+            if let Some(holds) = self.retained.get_mut(text) {
+                *holds -= 1;
+                if *holds == 0 {
+                    self.retained.remove(text);
+                }
             }
         }
     }
@@ -238,9 +238,7 @@ impl StdHost {
     /// is listed, including bootstrap-only ones.
     fn root_texts<'a>(&'a self, out: &mut Vec<&'a str>) {
         fn value<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
-            if let Some(text) = value_text(value) {
-                out.push(text);
-            }
+            out.extend(value_texts(value));
         }
         for field in self.persistent_static_fields.values() {
             value(field, out);
@@ -439,14 +437,14 @@ fn collectable(marker: &str) -> bool {
     crate::runtime::jar_object::collection_key(marker).is_some()
 }
 
-/// The text a hold keeps: a handle's key, or a reference's text that may name
+/// The texts a hold keeps: a handle's key (and a callback's held values), or a reference's text that may name
 /// an object (a marker, a callback's captures). A plain `String` holds no
 /// object, and pinning each would grow the set by every string an
 /// invocation answered.
-fn pin_text(value: &Value) -> Option<&str> {
+fn pin_texts(value: &Value) -> Vec<&str> {
     match value {
-        Value::Ref(Some(text)) if crate::runtime::value_class::is_plain_string(text) => None,
-        other => value_text(other),
+        Value::Ref(Some(text)) if crate::runtime::value_class::is_plain_string(text) => Vec::new(),
+        other => value_texts(other),
     }
 }
 
@@ -550,6 +548,28 @@ impl FreedObjects {
 
 fn value_bytes(value: &Value) -> usize {
     value_text(value).map_or(8, str::len)
+}
+
+/// Every text a value names other objects through: [`value_text`], and for
+/// a callback the texts of the values its row holds, which its key names
+/// only in bounded text (#156 P15b). Every root and heap walker uses this.
+pub(crate) fn value_texts(value: &Value) -> Vec<&str> {
+    fn push<'a>(value: &'a Value, out: &mut Vec<&'a str>, depth: usize) {
+        if let Some(text) = value_text(value) {
+            out.push(text);
+        }
+        if depth < 64
+            && let Value::Host(handle) = value
+            && let Some(row) = handle.row()
+        {
+            for held in row.values() {
+                push(held, out, depth + 1);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    push(value, &mut out, 0);
+    out
 }
 
 /// The text a value names other objects through: a reference's, or a host
@@ -744,9 +764,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                     .flat_map(|(_, (elements, _))| elements),
             );
         for value in kept_values {
-            if let Some(text) = value_text(value) {
-                roots.push(text);
-            }
+            roots.extend(value_texts(value));
         }
         for text in roots {
             collectable.scan(text, &mut pending);
@@ -804,7 +822,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .chain(enumerations)
             .chain(components)
         {
-            if let Some(text) = value_text(value) {
+            for text in value_texts(value) {
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
             }
@@ -916,7 +934,8 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<(), NativeError> {
         let roots = crossing
             .iter()
-            .filter_map(|value| value_text(value).map(str::to_owned))
+            .flat_map(value_texts)
+            .map(str::to_owned)
             .collect();
         self.persist_resident_heap_with(roots)
     }
@@ -1001,7 +1020,7 @@ mod tests {
         let (mut host, mut heap) = graph("demo/Mod#unused");
         host.persistent_static_fields.insert(
             "demo/Mod#ROOTLjava/lang/Object;".into(),
-            crate::runtime::callback_marker::lambda(
+            crate::runtime::callback_marker::lambda_from_text(
                 "demo/Mod#init",
                 4,
                 "",

@@ -30,7 +30,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
