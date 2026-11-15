@@ -27,19 +27,40 @@ pub(crate) fn bit_conversion(
     if receiver.kind() != HostKind::RandomSource || previous.method.owner != RANDOM_SOURCE {
         return None;
     }
-    let follows = match (
-        r.owner.as_str(),
-        r.name.as_str(),
-        r.descriptor.as_str(),
-        previous.method.name.as_str(),
-        previous.method.descriptor.as_str(),
-    ) {
-        ("java/lang/Double", "doubleToRawLongBits", "(D)J", "nextDouble", "()D")
-        | ("java/lang/Float", "floatToRawIntBits", "(F)I", "nextFloat", "()F")
-        | ("java/lang/Double", "longBitsToDouble", "(J)D", "nextLong", "()J")
-        | ("java/lang/Float", "intBitsToFloat", "(I)F", "nextInt", "()I") => true,
-        _ => false,
-    };
+    let follows = matches!(
+        (
+            r.owner.as_str(),
+            r.name.as_str(),
+            r.descriptor.as_str(),
+            previous.method.name.as_str(),
+            previous.method.descriptor.as_str(),
+        ),
+        (
+            "java/lang/Double",
+            "doubleToRawLongBits",
+            "(D)J",
+            "nextDouble",
+            "()D"
+        ) | (
+            "java/lang/Float",
+            "floatToRawIntBits",
+            "(F)I",
+            "nextFloat",
+            "()F"
+        ) | (
+            "java/lang/Double",
+            "longBitsToDouble",
+            "(J)D",
+            "nextLong",
+            "()J"
+        ) | (
+            "java/lang/Float",
+            "intBitsToFloat",
+            "(I)F",
+            "nextInt",
+            "()I"
+        )
+    );
     if !follows {
         return None;
     }
