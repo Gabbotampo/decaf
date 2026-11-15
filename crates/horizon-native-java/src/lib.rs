@@ -6269,6 +6269,38 @@ impl Host for StdHost {
         if let Some(value) = jdk_character::static_call(r, args) {
             return value;
         }
+        // Gson's numeric edge cases are compared by raw IEEE bits in the
+        // fixture. Keep the signed zero and NaN payload exactly as Java does.
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/lang/Double", "doubleToRawLongBits", "(D)J") => {
+                return Ok(Value::Long(
+                    expect_float(r, Self::argument(r, args, 0)?)?.to_bits() as i64,
+                ));
+            }
+            ("java/lang/Double", "doubleToLongBits", "(D)J") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                let bits = if value.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Long(bits as i64));
+            }
+            ("java/lang/Float", "floatToRawIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                return Ok(Value::Int(value.to_bits() as i32));
+            }
+            ("java/lang/Float", "floatToIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                let bits = if value.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Int(bits as i32));
+            }
+            _ => {}
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
