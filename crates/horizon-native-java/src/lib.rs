@@ -26,6 +26,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+pub mod client_frame;
 mod client_reload;
 pub mod client_surface;
 mod client_values;
@@ -5893,6 +5894,9 @@ impl Host for StdHost {
         }
         // Mixin's environment and MixinExtras' bootstrap (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_invoke(r) {
+            return Ok(value);
+        }
+        if let Some(value) = client_frame::block_pos_static(r, args) {
             return Ok(value);
         }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
@@ -11884,6 +11888,8 @@ fn marker_id(value: &str) -> Option<String> {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
+        "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
