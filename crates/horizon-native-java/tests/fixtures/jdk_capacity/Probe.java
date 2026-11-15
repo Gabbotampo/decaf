@@ -84,10 +84,12 @@ public final class Probe {
     public static String hashMapFloatBound() { new HashMap<Object, Object>(B, .75f); return "ok"; }
     public static String hashMapFloatOver() { new HashMap<Object, Object>(B + 1, .75f); return "ok"; }
     public static String hashMapFloatMax() { new HashMap<Object, Object>(Integer.MAX_VALUE, .75f); return "ok"; }
+    public static String hashMapFirstPut() { HashMap<Object, Object> map = new HashMap<Object, Object>(Integer.MAX_VALUE); map.put("k", "v"); return "ok"; }
 
     public static String hashSetBound() { new HashSet<Object>(B); return "ok"; }
     public static String hashSetOver() { new HashSet<Object>(B + 1); return "ok"; }
     public static String hashSetMax() { new HashSet<Object>(Integer.MAX_VALUE); return "ok"; }
+    public static String hashSetFirstPut() { HashSet<Object> set = new HashSet<Object>(Integer.MAX_VALUE); set.add("v"); return "ok"; }
 
     public static String linkedHashMapBound() { new LinkedHashMap<Object, Object>(B); return "ok"; }
     public static String linkedHashMapOver() { new LinkedHashMap<Object, Object>(B + 1); return "ok"; }
@@ -98,6 +100,7 @@ public final class Probe {
     public static String linkedHashMapOrderBound() { new LinkedHashMap<Object, Object>(B, .75f, true); return "ok"; }
     public static String linkedHashMapOrderOver() { new LinkedHashMap<Object, Object>(B + 1, .75f, true); return "ok"; }
     public static String linkedHashMapOrderMax() { new LinkedHashMap<Object, Object>(Integer.MAX_VALUE, .75f, true); return "ok"; }
+    public static String linkedHashMapFirstPut() { LinkedHashMap<Object, Object> map = new LinkedHashMap<Object, Object>(Integer.MAX_VALUE); map.put("k", "v"); return "ok"; }
 
     public static String dequeUnderBound() { new ArrayDeque<Object>(B - 1); return "ok"; }
     public static String dequeBound() { new ArrayDeque<Object>(B); return "ok"; }
@@ -121,4 +124,8 @@ public final class Probe {
     public static String ensureBuilderBound() { new StringBuilder().ensureCapacity(B); return "ok"; }
     public static String ensureBuilderOver() { new StringBuilder().ensureCapacity(B + 1); return "ok"; }
     public static String ensureBuilderMax() { new StringBuilder().ensureCapacity(Integer.MAX_VALUE); return "ok"; }
+
+    public static String ensureArrayListGrowth() { new ArrayList<Object>(B - 1).ensureCapacity(B); return "ok"; }
+    public static String ensureVectorGrowth() { new Vector<Object>(B - 1).ensureCapacity(B); return "ok"; }
+    public static String ensureBuilderGrowth() { new StringBuilder(B - 1).ensureCapacity(B); return "ok"; }
 }

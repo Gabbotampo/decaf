@@ -3602,8 +3602,43 @@ impl StdHost {
             self.next_neutral_collection,
         );
         self.next_neutral_collection += 1;
-        self.mutable_collections.insert(marker.clone(), values);
+        self.mutable_collections
+            .insert(marker.clone(), values.clone());
+        if matches!(class, "java/util/ArrayList" | "java/util/Vector") {
+            self.mutable_collections.set_capacity(
+                marker.clone(),
+                values.len(),
+                class == "java/util/Vector",
+            );
+        }
         jar_object::collection(marker)
+    }
+
+    /// The backing capacity of a plain ArrayList/Vector row and its growth
+    /// policy. Hash collections use `HashTable` because their table is lazy.
+    fn ensure_collection_capacity(
+        &mut self,
+        marker: &str,
+        needed: usize,
+    ) -> Result<(), NativeError> {
+        let Some((old, vector)) = self.mutable_collections.capacity(marker) else {
+            return Ok(());
+        };
+        if needed <= old {
+            return Ok(());
+        }
+        let grown = if vector {
+            old.saturating_mul(2)
+        } else {
+            old.saturating_add(old / 2)
+        };
+        let new_capacity = needed.max(grown);
+        if new_capacity > MAX_ARRAY_ELEMENTS {
+            return Err(array_bound_error(new_capacity as u128));
+        }
+        self.mutable_collections
+            .set_capacity(marker.to_owned(), new_capacity, vector);
+        Ok(())
     }
 
     /// A map's `keySet()`/`values()`/`entrySet()`: Java caches one view per
@@ -4942,12 +4977,6 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
                     frame: None,
                 });
             }
-            array_capacity(capacity)?;
-        }
-        ("java/util/ArrayList" | "java/util/Vector", "ensureCapacity", "(I)V")
-        | ("java/lang/StringBuilder" | "java/lang/StringBuffer", "ensureCapacity", "(I)V")
-            if capacity > 0 =>
-        {
             array_capacity(capacity)?;
         }
         _ => {}
@@ -7049,6 +7078,31 @@ impl Host for StdHost {
         if let Some(value) = registry_lookup::instance_call(self, r, receiver, args) {
             return value;
         }
+        if matches!(
+            (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()),
+            (
+                "java/util/ArrayList" | "java/util/Vector",
+                "ensureCapacity",
+                "(I)V"
+            )
+        ) {
+            let minimum = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+            if minimum > 0 {
+                let marker = expect_ref(receiver).to_owned();
+                let vector = r.owner == "java/util/Vector";
+                if let Some(marker) = marker {
+                    if self.mutable_collections.capacity(marker).is_none() {
+                        self.mutable_collections.set_capacity(
+                            marker.clone(),
+                            if vector { 10 } else { 0 },
+                            vector,
+                        );
+                    }
+                    self.ensure_collection_capacity(marker, minimum as usize)?;
+                }
+            }
+            return Ok(Value::Void);
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -7880,16 +7934,36 @@ impl Host for StdHost {
                         }
                         source = unique;
                     }
-                    self.mutable_collections.insert(marker.to_owned(), source);
+                    self.mutable_collections
+                        .insert(marker.to_owned(), source.clone());
+                    if owner == "java/util/ArrayList" || owner == "java/util/Vector" {
+                        self.mutable_collections.set_capacity(
+                            marker.to_owned(),
+                            source.len(),
+                            owner == "java/util/Vector",
+                        );
+                    }
                     return Ok(Value::Void);
                 }
                 // The JDK collection's constructor: on a jar subclass
                 // (emotecraft's `UUIDMap extends ConcurrentHashMap`) it is the
                 // `super()` call, and the object is that collection from here on.
-                (_, "<init>", _) => {
+                (owner, "<init>", descriptor) => {
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
+                    if matches!(owner, "java/util/ArrayList" | "java/util/Vector") {
+                        let vector = owner == "java/util/Vector";
+                        let capacity = if descriptor == "()V" {
+                            if vector { 10 } else { 0 }
+                        } else if descriptor == "(I)V" {
+                            expect_int(r, args.first().unwrap_or(&Value::Int(0)))?.max(0) as usize
+                        } else {
+                            0
+                        };
+                        self.mutable_collections
+                            .set_capacity(marker.to_owned(), capacity, vector);
+                    }
                     return Ok(Value::Void);
                 }
                 (owner, "offer" | "offerLast" | "addLast", "(Ljava/lang/Object;)Z")
@@ -8036,6 +8110,11 @@ impl Host for StdHost {
                 }
                 (owner, "add", "(Ljava/lang/Object;)Z") if is_list_like_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
+                    let needed = self
+                        .mutable_collections
+                        .get(marker)
+                        .map_or(1, |values| values.len() + 1);
+                    self.ensure_collection_capacity(marker, needed)?;
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -8045,6 +8124,8 @@ impl Host for StdHost {
                 (owner, "add", "(ILjava/lang/Object;)V") if is_list_like_owner(owner) => {
                     let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let value = Self::argument(r, args, 1)?.clone();
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + 1)?;
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
@@ -8057,6 +8138,8 @@ impl Host for StdHost {
                     let source = Self::argument(r, args, 0)?;
                     let additions = host_collection_values(self, source)?;
                     let changed = !additions.is_empty();
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + additions.len())?;
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -8067,6 +8150,8 @@ impl Host for StdHost {
                     let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let source = Self::argument(r, args, 1)?;
                     let additions = host_collection_values(self, source)?;
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + additions.len())?;
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
@@ -17953,6 +18038,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -18159,6 +18245,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -18321,6 +18408,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -20856,6 +20944,10 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// The current backing capacity of each modelled StringBuilder. Its
+    /// growth is `(old << 1) + 2`, so ensureCapacity can refuse the actual
+    /// array length rather than only the requested minimum.
+    string_builder_capacities: BTreeMap<String, usize>,
     /// Text each `java.io.StringReader` (and each modelled file or stream
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
@@ -32380,6 +32472,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -32445,6 +32538,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -39520,6 +39614,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -39680,6 +39775,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -39863,6 +39959,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40222,6 +40319,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40525,6 +40623,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45756,6 +45855,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45809,6 +45909,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),

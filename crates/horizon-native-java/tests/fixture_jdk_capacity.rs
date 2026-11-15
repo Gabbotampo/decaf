@@ -79,23 +79,47 @@ fn bound_is_accepted_when_the_backing_array_is_at_most_the_limit() {
 }
 
 #[test]
+fn lazy_hash_constructors_succeed_until_the_first_table_allocation() {
+    let fixture = fixture();
+    for method in [
+        "hashMapOver",
+        "hashMapMax",
+        "hashMapFloatOver",
+        "hashMapFloatMax",
+        "hashSetOver",
+        "hashSetMax",
+        "linkedHashMapOver",
+        "linkedHashMapMax",
+        "linkedHashMapFloatOver",
+        "linkedHashMapFloatMax",
+        "linkedHashMapOrderOver",
+        "linkedHashMapOrderMax",
+    ] {
+        assert_eq!(fixture.text(method), "ok", "{method}");
+    }
+    for (method, elements) in [
+        ("hashMapFirstPut", 1 << 30),
+        ("hashSetFirstPut", 1 << 30),
+        ("linkedHashMapFirstPut", 1 << 30),
+    ] {
+        refusal(&fixture, method, elements);
+    }
+}
+
+#[test]
+fn ensure_capacity_checks_the_jdk_growth_length() {
+    let fixture = fixture();
+    refusal(&fixture, "ensureArrayListGrowth", 25_165_822);
+    refusal(&fixture, "ensureVectorGrowth", 33_554_430);
+    refusal(&fixture, "ensureBuilderGrowth", 33_554_432);
+}
+
+#[test]
 fn oversized_backing_arrays_are_refused() {
     let fixture = fixture();
     for (method, elements) in [
         ("arrayListOver", BOUND + 1),
         ("arrayListMax", i32::MAX as usize),
-        ("hashMapOver", 1 << 25),
-        ("hashMapMax", 1 << 30),
-        ("hashMapFloatOver", 1 << 25),
-        ("hashMapFloatMax", 1 << 30),
-        ("hashSetOver", 1 << 25),
-        ("hashSetMax", 1 << 30),
-        ("linkedHashMapOver", 1 << 25),
-        ("linkedHashMapMax", 1 << 30),
-        ("linkedHashMapFloatOver", 1 << 25),
-        ("linkedHashMapFloatMax", 1 << 30),
-        ("linkedHashMapOrderOver", 1 << 25),
-        ("linkedHashMapOrderMax", 1 << 30),
         ("dequeBound", BOUND + 1),
         ("dequeOver", BOUND + 2),
         ("dequeMax", i32::MAX as usize),

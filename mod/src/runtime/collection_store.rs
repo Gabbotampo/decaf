@@ -19,6 +19,9 @@ use crate::runtime::Value;
 #[derive(Clone, Debug, Default)]
 pub struct CollectionStore {
     map: BTreeMap<String, Vec<Value>>,
+    /// Backing capacity for the plain ArrayList/Vector rows this host owns:
+    /// `(capacity, vector)`. Hash tables keep their own lazy table state.
+    capacities: BTreeMap<String, (usize, bool)>,
     generations: HashMap<String, u64>,
     next: u64,
     /// The collections someone mirrors elsewhere (an `Arrays.asList` view's
@@ -65,7 +68,16 @@ impl CollectionStore {
 
     pub(crate) fn remove(&mut self, marker: &str) -> Option<Vec<Value>> {
         self.bump(marker);
+        self.capacities.remove(marker);
         self.map.remove(marker)
+    }
+
+    pub(crate) fn capacity(&self, marker: &str) -> Option<(usize, bool)> {
+        self.capacities.get(marker).copied()
+    }
+
+    pub(crate) fn set_capacity(&mut self, marker: String, capacity: usize, vector: bool) {
+        self.capacities.insert(marker, (capacity, vector));
     }
 
     pub(crate) fn get_mut(&mut self, marker: &str) -> Option<&mut Vec<Value>> {
@@ -100,6 +112,8 @@ impl CollectionStore {
         self.map.retain(|marker, values| keep(marker, values));
         self.watched.retain(|marker| self.map.contains_key(marker));
         self.generations
+            .retain(|marker, _| self.map.contains_key(marker));
+        self.capacities
             .retain(|marker, _| self.map.contains_key(marker));
         self.generations.values_mut().for_each(|g| *g = next);
     }

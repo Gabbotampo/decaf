@@ -384,7 +384,7 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 None
             };
-            table.insert(entry, hash);
+            table.insert(entry, hash)?;
         }
         if table.linked || table.order_unknown() {
             return Ok(());
@@ -1014,12 +1014,6 @@ impl<H: Host> Runtime<'_, H> {
                 format_java_float32(f64::from(load_factor))
             )));
         }
-        if let Some(cap) = capacity {
-            let table = hash_table_capacity(cap);
-            if table > crate::MAX_ARRAY_ELEMENTS {
-                return Err(crate::array_bound_error(table as u128));
-            }
-        }
         // The host's empty row.
         let empty = MethodRef {
             owner: r.owner.clone(),
@@ -1117,7 +1111,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Lookup::Absent => {
                     let capacity = table.capacity();
-                    table.insert(key, hash);
+                    table.insert(key, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1152,7 +1146,7 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Absent => {
                 entries.extend([key.clone(), value]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(key, hash);
+                table.insert(key, hash)?;
                 Ok(Some(Value::Ref(None)))
             }
         }
@@ -1175,7 +1169,7 @@ impl<H: Host> Runtime<'_, H> {
                     && self.is_synced(&marker, table)
                 {
                     let capacity = table.capacity();
-                    table.insert(element, hash);
+                    table.insert(element, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1190,7 +1184,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(receiver)?;
                 entries.push(element.clone());
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(element, hash);
+                table.insert(element, hash)?;
                 Ok(Some(true))
             }
         }
@@ -1296,7 +1290,7 @@ impl<H: Host> Runtime<'_, H> {
         source: &Value,
     ) -> Result<(), NativeError> {
         let entries = self.collection_elements(source)?;
-        table.presize(entries.len() / 2);
+        table.presize(entries.len() / 2)?;
         for pair in entries.chunks(2) {
             let [key, value] = pair else { continue };
             if self
@@ -1704,12 +1698,6 @@ impl<H: Host> Runtime<'_, H> {
             ModVerdict::Unknown => Ok(Value::Void),
         }
     }
-}
-
-/// The backing table size `HashMap.tableSizeFor` computes for an initial
-/// capacity. The shared table model is the JDK 25 implementation.
-fn hash_table_capacity(capacity: i32) -> usize {
-    hash_table::table_size_for(i64::from(capacity)) as usize
 }
 
 fn concurrent_modification() -> NativeError {
