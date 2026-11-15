@@ -435,6 +435,12 @@ pub enum HostKind {
     /// jar's `new ArrayList()` (a [`HostKind::JarObject`]), whose row it
     /// shares.
     Collection,
+    /// Kotlin's declaration-order enum entries view.
+    KotlinEnumEntries,
+    /// A Kotlin lazy holder.
+    KotlinLazy,
+    /// Kotlin's canonical empty list, set, or map singleton.
+    KotlinEmptyCollection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
@@ -494,6 +500,18 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
     /// Vanilla's `FileToIdConverter` record.
@@ -553,6 +571,11 @@ pub(crate) trait Nested {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError>;
     /// `Objects.equals(a, b)`.
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError>;
+    /// The held values of a Java collection, when the host keeps its entries.
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        let _ = value;
+        None
+    }
     /// `String.valueOf(value)`.
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError>;
     /// The vanilla JSON a chat component holds now (its host's state,
@@ -1994,6 +2017,27 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::KotlinEnumEntries,
+        tag: "kentries",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::enum_entries_class),
+        canonical: never_canonical,
+        methods: &crate::kotlin_stdlib::ENUM_ENTRIES_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinLazy,
+        tag: "klazy",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::lazy_class),
+        canonical: never_canonical,
+        methods: &crate::kotlin_stdlib::LAZY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinEmptyCollection,
+        tag: "kempty",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::empty_class),
+        canonical: always_canonical,
+        methods: &crate::kotlin_stdlib::EMPTY_COLLECTION_METHODS,
+    },
+    KindInfo {
         kind: HostKind::TimeUnit,
         tag: "tunit",
         class: ClassRule::Fixed("java/util/concurrent/TimeUnit"),
@@ -2210,6 +2254,56 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
