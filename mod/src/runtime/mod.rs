@@ -3234,6 +3234,9 @@ pub struct StdHost {
     own_loader_classes: BTreeSet<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
+    /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
+    fabric_origins: BTreeMap<String, (String, String)>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
@@ -3517,6 +3520,7 @@ impl StdHost {
             run_loader: class_precedence::RunLoader::default(),
             own_loader_classes: BTreeSet::new(),
             fabric_metadata: BTreeMap::new(),
+            fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
@@ -4085,6 +4089,18 @@ impl StdHost {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
             self.record_loaded_mod(&nested);
+            if let Some(nested_id) = nested.fabric_id.as_deref() {
+                let parent = jar
+                    .fabric_id
+                    .as_deref()
+                    .or(jar.neoforge_id.as_deref())
+                    .unwrap_or("jar");
+                let sublocation = entry.clone();
+                self.fabric_origins.insert(
+                    nested_id.to_owned(),
+                    ("nested".into(), format!("{parent}|{sublocation}")),
+                );
+            }
         }
         Ok(added)
     }
@@ -4108,6 +4124,9 @@ impl StdHost {
             }
         }
         if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
+            self.fabric_origins
+                .entry(id.to_owned())
+                .or_insert_with(|| ("path".into(), id.to_owned()));
             let version = jar
                 .fabric_version
                 .as_deref()
@@ -5938,6 +5957,10 @@ impl Host for StdHost {
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
+        // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = mod_origin::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = Self::fabric_mods_static(r) {
             return Ok(value);
         }
@@ -11025,7 +11048,7 @@ impl Host for StdHost {
                 // Fabric Loader's own origin for a jar container is a `PATH`
                 // origin over the container's root (`mod_origin.rs`).
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
-                Ok(mod_origin::origin_value(&id))
+                Ok(self.fabric_origin(&id))
             }
             (
                 "net/fabricmc/loader/api/ModContainer",
@@ -24448,6 +24471,9 @@ impl<H: Host> Runtime<'_, H> {
     /// holds one `enum/<class>/<name>` marker per constant, so `length`,
     /// `clone`, element reads and ordinal lookups all work.
     fn invoke_game_enum_values(&mut self, r: &MethodRef) -> Option<Value> {
+        if let Some(values) = mod_origin::enum_values(r) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         if r.name != "values" {
             return None;
         }

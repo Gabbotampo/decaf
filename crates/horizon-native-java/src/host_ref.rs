@@ -353,6 +353,7 @@ pub enum HostKind {
     FabricModMetadata,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
+    FabricModOriginKind,
     /// A Fabric metadata `Person`: key the mod id and JSON pointer.
     FabricPerson,
     /// A Fabric `ContactInformation`: key the mod id and JSON pointer, or no
@@ -1679,6 +1680,13 @@ const KINDS: &[KindInfo] = &[
         // The container's own origin.
         canonical: always_canonical,
         methods: &crate::host_fabric_loader::ORIGIN_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricModOriginKind,
+        tag: "fmok",
+        class: ClassRule::Fixed(crate::mod_origin::ORIGIN_KIND),
+        canonical: always_canonical,
+        methods: &crate::mod_origin::KIND_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricPerson,
