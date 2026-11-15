@@ -284,6 +284,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         a: &Value,
         b: &Value,
     ) -> Result<i32, NativeError> {
+        // One level of a composed comparator (#250): a chain as deep as a jar builds it ends
+        // in a `StackOverflowError`, as Java's lambda chain does.
+        let _level = crate::host_recursion::enter()?;
         // `sorted(null)` and `List.sort(null)` mean natural order.
         if *comparator == Value::Ref(None) {
             return self.natural_order(a, b);
