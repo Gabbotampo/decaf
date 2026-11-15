@@ -204,9 +204,7 @@ def mark_closure_regressions(rows: list[dict]) -> list[dict]:
     regressions = []
     for modes in by_jar.values():
         alone, closure = modes.get("alone"), modes.get("closure")
-        if not alone or not closure or closure.get("stage") == "dependency":
-            continue
-        if not closure.get("deps"):
+        if not alone or not closure:
             continue
         alone_rank = VERDICT_RANK.get(alone.get("verdict"), 99)
         closure_rank = VERDICT_RANK.get(closure.get("verdict"), 99)
@@ -221,6 +219,8 @@ def mark_closure_regressions(rows: list[dict]) -> list[dict]:
                 "closure_verdict": closure.get("verdict"),
                 "alone_unknown": alone_unknown, "closure_unknown": closure_unknown,
                 "failure": closure.get("failure", ""),
+                "failure_kind": ("missing-dependency" if closure.get("stage") == "dependency"
+                                  else "dependency-execution"),
                 "deps": closure.get("deps", []),
             })
     return regressions
