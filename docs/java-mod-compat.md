@@ -571,7 +571,7 @@ is worse than refusing it. Its 19 rows name 18 hook points, and the game fires e
 
 | Hook point | Vanilla target | Position | Contract | What the game hands the callback |
 |---|---|---|---|---|
-| `player_tick` | `ServerPlayer#tick` | `TAIL` | listen | the player |
+| `player_tick` | `ServerPlayer#tick` | `TAIL` | listen | **unbound:** no pinned hook fires at `ServerPlayer.tick`'s level entity-loop moment; `Player.tick`'s pair is a different moment (a native Mixin escape hatch is a separate option) |
 | `item_picked_up` | `ItemEntity#playerTouch` | `HEAD` | cancel | a dropped item (no entity id: a new object each firing), the player |
 | `living_death` | `LivingEntity#die` | `HEAD` | cancel | the entity (the player for a player), an opaque `DamageSource` |
 | `player_died` | `ServerPlayer#die` | `HEAD` | listen | the player, an opaque `DamageSource` |
