@@ -96,6 +96,12 @@ public final class RandomSources {
 
   public static String quick() { RandomSource r = RandomSource.create(1L); return r == null ? "null" : r.getClass().getName() + "|" + r.nextInt(); }
 
+  public static String countedHash() {
+    PositionalRandomFactory f = RandomSource.create(123456789L).forkPositional();
+    RandomSource r = f.fromHashOf("minecraft:ore");
+    return r == null ? "null" : r.getClass().getName();
+  }
+
   public static String errors() {
     StringBuilder out = new StringBuilder();
     for (int bound : new int[] {0, -1, Integer.MIN_VALUE}) {

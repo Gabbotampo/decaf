@@ -131,3 +131,27 @@ fn quick_seeded_factory_smoke() {
         host.unknown_host_calls()
     );
 }
+
+#[test]
+fn positional_from_hash_of_stays_counted() {
+    let mut host = StdHost::new();
+    let answer = jar().invoke_method_with_args(
+        "demo/RandomSources",
+        "countedHash",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(answer, Ok(Value::Ref(Some(ref text))) if text == "null"),
+        "{answer:?}"
+    );
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![(
+            "net/minecraft/world/level/levelgen/PositionalRandomFactory#fromHashOf(Ljava/lang/String;)Lnet/minecraft/util/RandomSource;".into(),
+            1,
+        )]
+    );
+}

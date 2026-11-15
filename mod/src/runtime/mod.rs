@@ -6032,7 +6032,7 @@ impl Host for StdHost {
         if let Some(result) = self.random_static(r, args) {
             return result;
         }
-        if let Some(result) = random_source::bit_conversion(r, args) {
+        if let Some(result) = random_source::bit_conversion(self, r, args) {
             return result;
         }
         if let Some(refusal) = native_library::refusal(r, args) {

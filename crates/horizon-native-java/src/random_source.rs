@@ -11,7 +11,38 @@ use crate::host_ref::{
 };
 use crate::{MethodRef, NativeError, StdHost, Value};
 
-pub(crate) fn bit_conversion(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+pub(crate) fn bit_conversion(
+    host: &StdHost,
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    // These conversions are a small implementation detail of the seeded
+    // RandomSource fixture: Java evaluates the random draw immediately before
+    // the raw-bit conversion. Do not turn the JDK's global Double/Float
+    // methods into a fabricated host model for unrelated calls.
+    let previous = host.invocations.iter().rev().nth(1)?;
+    let Value::Host(receiver) = previous.receiver.as_ref()? else {
+        return None;
+    };
+    if receiver.kind() != HostKind::RandomSource || previous.method.owner != RANDOM_SOURCE {
+        return None;
+    }
+    let follows = match (
+        r.owner.as_str(),
+        r.name.as_str(),
+        r.descriptor.as_str(),
+        previous.method.name.as_str(),
+        previous.method.descriptor.as_str(),
+    ) {
+        ("java/lang/Double", "doubleToRawLongBits", "(D)J", "nextDouble", "()D")
+        | ("java/lang/Float", "floatToRawIntBits", "(F)I", "nextFloat", "()F")
+        | ("java/lang/Double", "longBitsToDouble", "(J)D", "nextLong", "()J")
+        | ("java/lang/Float", "intBitsToFloat", "(I)F", "nextInt", "()I") => true,
+        _ => false,
+    };
+    if !follows {
+        return None;
+    }
     match (
         r.owner.as_str(),
         r.name.as_str(),
@@ -99,9 +130,6 @@ impl StdHost {
     fn random_key(value: &Value) -> Option<String> {
         match value {
             Value::Host(handle) if handle.kind() == HostKind::RandomSource => {
-                Some(handle.key().to_owned())
-            }
-            Value::Host(handle) if crate::jar_object::is_object_handle(handle) => {
                 Some(handle.key().to_owned())
             }
             _ => None,
@@ -597,3 +625,31 @@ pub(crate) const CLASS_SIDE: ClassSide = ClassSide {
     is_interface,
     classes,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Host;
+
+    #[test]
+    fn random_state_never_aliases_a_non_random_host_handle() {
+        let mut host = StdHost::new();
+        let source = host.random_seeded(LEGACY, 123).unwrap();
+        let key = match source {
+            Value::Host(handle) => handle.key().to_owned(),
+            _ => panic!("seeded source was not a host handle"),
+        };
+        let forged = Value::Host(HostRef::new(HostKind::JarObject, key));
+        let call = MethodRef {
+            owner: RANDOM_SOURCE.into(),
+            name: "nextInt".into(),
+            descriptor: "()I".into(),
+        };
+        let result = host.invoke_instance(&call, &forged, &[]).unwrap();
+        assert_eq!(result, Value::Int(0));
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![("net/minecraft/util/RandomSource#nextInt()I".into(), 1,)]
+        );
+    }
+}
