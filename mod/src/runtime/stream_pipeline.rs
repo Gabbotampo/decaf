@@ -373,18 +373,30 @@ pub(crate) struct Pipelines {
     used: BTreeSet<String>,
 }
 
-/// The marker of a new stream (a source or a stage). Streams are still
-/// marker text (#156's P15 moves them onto handles); the per-process random
-/// tag keeps a jar `String` constant from spelling a live stream, so a forged
-/// one is the `String` it is (`is_live_stream`).
+/// The marker of a new stream (a source or a stage). Streams are still marker
+/// text (#156's P15 moves them onto handles). A stable keyed suffix keeps a jar
+/// `String` constant from spelling a live stream, so a forged one is the
+/// `String` it is (`is_live_stream`). A random `HashMap` seed here used to feed
+/// the jar's Java `HashMap` bucket order, making the same probe take different
+/// paths.
+
 pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
-    static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let tag = TAG.get_or_init(|| {
-        use std::hash::{BuildHasher, Hasher};
-        std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish()
-    });
+    // This is a stable keyed hash rather than `RandomState`: marker text must
+    // be reproducible across probe processes, or it changes Java hash-table
+    // bucket order. The key is runtime-owned and the live-stream table still
+    // validates every marker before treating it as a stream.
+    let mut tag = 0x7f4a_7c15_9e37_79b9_u64;
+    for byte in class
+        .bytes()
+        .chain(*b"/|")
+        .chain(method.bytes())
+        .chain(*b"/|")
+        .chain(n.to_le_bytes())
+    {
+        tag ^= u64::from(byte);
+        tag = tag.wrapping_mul(0x1000_0000_01b3);
+        tag ^= tag >> 29;
+    }
     format!("stream/{class}/{method}/{n}~{tag:016x}")
 }
 

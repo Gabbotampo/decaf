@@ -29,7 +29,7 @@
 //! or edits the node stops at the node's first member, which names it.
 //!
 //! **The bound.** Every call runs on a strict host (an unmodelled host call
-//! fails instead of answering a neutral value) under its own 250 ms budget.
+//! fails instead of answering a neutral value) under its own generous five-second fail-safe budget.
 //! A failure in steps 1–3, 5 or 6 refuses the whole config with the step and
 //! the member it stopped at; a failure in one `shouldApplyMixin` (or its
 //! `preApply`/`postApply`) refuses that Mixin only, and the session goes on,
@@ -50,8 +50,7 @@
 use super::*;
 
 /// The wall-clock bound of one plugin call.
-pub(crate) const CONFIG_PLUGIN_CALL_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(250);
+pub(crate) const CONFIG_PLUGIN_CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Companion Mixins one `getMixins()` may add.
 const MAX_COMPANION_MIXINS: usize = 512;

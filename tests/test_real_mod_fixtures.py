@@ -194,5 +194,27 @@ class RealModFixtureTest(unittest.TestCase):
         self.assertTrue(rows["neoforge-fixture.jar"]["probes"])
 
 
+    def test_native_probe_json_is_repeatable_for_one_jar(self) -> None:
+        """The same binary and jar produce byte-identical census JSON."""
+        probe = self.bin_dir / "horizon-native-java"
+        if not probe.is_file():
+            self.skipTest(f"native probe not built in {self.bin_dir.relative_to(ROOT)}")
+        jar = self.output / "fabric-fixture.jar"
+
+        def run() -> dict:
+            result = subprocess.run(
+                [str(probe), "--json", "--game-version", "26.3", str(jar), "main"],
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=120,
+            )
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+        first = json.dumps(run(), sort_keys=True, separators=(",", ":"))
+        second = json.dumps(run(), sort_keys=True, separators=(",", ":"))
+        self.assertEqual(first, second)
+
+
 if __name__ == "__main__":
     unittest.main()
