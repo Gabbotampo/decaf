@@ -1584,6 +1584,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.record_throwable(marker, message);
     }
 
+    fn throwable_suppressed(&self, marker: &str) -> Option<Vec<Value>> {
+        self.inner.throwable_suppressed(marker)
+    }
+
+    fn record_throwable_suppressed(&mut self, marker: &str, value: Value) {
+        self.inner.record_throwable_suppressed(marker, value);
+    }
+
     fn record_throwable_cause(&mut self, marker: &str, cause: Value) {
         self.inner.record_throwable_cause(marker, cause);
     }
@@ -1594,6 +1602,23 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn take_wrapped_cause(&mut self, class: &str, message: &Option<String>) -> Option<Value> {
         self.inner.take_wrapped_cause(class, message)
+    }
+
+    fn record_wrapped_suppressed(&mut self, class: &str, message: Option<&str>, value: Value) {
+        self.inner.record_wrapped_suppressed(class, message, value);
+    }
+
+    fn take_wrapped_suppressed(&mut self, class: &str, message: &Option<String>) -> Vec<Value> {
+        self.inner.take_wrapped_suppressed(class, message)
+    }
+
+    fn record_fabric_entrypoint_failure(&mut self, kind: &str, class: &str, cause: Value) {
+        self.inner
+            .record_fabric_entrypoint_failure(kind, class, cause);
+    }
+
+    fn take_fabric_entrypoint_failure(&mut self, kind: &str, class: &str) -> Option<Value> {
+        self.inner.take_fabric_entrypoint_failure(kind, class)
     }
 
     fn persistent_class_state(&self) -> (BTreeMap<String, Value>, BTreeSet<String>) {

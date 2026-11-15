@@ -49,6 +49,14 @@ public final class Probe implements ModInitializer {
         return Loader.invokeFailure(FabricLoader.getInstance());
     }
 
+    public static String invokeFailureSuppressed() {
+        return Loader.invokeFailureSuppressed(FabricLoader.getInstance());
+    }
+
+    public static String invokeConstructorFailure() {
+        return Loader.invokeConstructorFailure(FabricLoader.getInstance());
+    }
+
     public static String otherTypes() {
         return Loader.otherTypes(FabricLoader.getInstance());
     }

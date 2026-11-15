@@ -39,6 +39,8 @@ entrypoints=1trueprobe-fixturetrue0true
 invokeAll=demo.Probe;
 invokeWrong=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:EntrypointException
 invokeFailure=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:1
+invokeFailureSuppressed=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:1:0:none
+invokeConstructorFailure=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Throwing'!;EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture';LanguageAdapterException:Could not instantiate class demo.Throwing!;InvocationTargetException:null;IllegalStateException:ctor boom
 otherTypes=false|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|falsefalsefalse
 spelled=Stringtrue-1040676293falsefalsefalsefalsefalsefalsefalsefalsefabric-loader!,Stringtrue-1221724595falsefalsefalsefalsefalsefalsefalsefalsefabric-mapping-resolver!,Stringtrue1990584267falsefalsefalsefalsefalsefalsefalsefalseCLIENT!,Stringtrue-1852497085falsefalsefalsefalsefalsefalsefalsefalseSERVER!,Stringtrue3145783falsefalsefalsefalsefalsefalsefalsefalsefli:!,Stringtrue-952377214falsefalsefalsefalsefalsefalsefalsefalsefenv:rSERVER!,Stringtrue1041408092falsefalsefalsefalsefalsefalsefalsefalsefpt:rplayToClient!,Stringtrue-116919410falsefalsefalsefalsefalsefalsefalsefalsefrl:rSERVER_DATA!,falsefalsefalsefabric-entrypoint/main/demo/Probe/probe-fixture!,falsefalsefalsefabric-payload-types/playToClient!,falsefalsefalsefabric-resource-loader/SERVER_DATA!,falsefalsefalsefabric-entrypoint-instance/demo/Probe!,12sfalse
 forged=CCECCE
@@ -180,6 +182,7 @@ fn the_singletons_and_the_entrypoint_answer_as_java_25() {
         "invokeAll",
         "invokeWrong",
         "invokeFailure",
+        "invokeFailureSuppressed",
     ] {
         let (text, unknown) = run(method, method);
         assert_eq!(text, expected(method), "{method}: {unknown:?}");
@@ -193,6 +196,62 @@ fn the_singletons_and_the_entrypoint_answer_as_java_25() {
         "{unknown:?}"
     );
     assert_eq!(unknown, Vec::<(String, usize)>::new());
+}
+
+#[test]
+fn constructor_failures_keep_the_loader_exception_chain() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "constructor-failure",
+        &sources,
+        r#"{"id":"probe-fixture","version":"1.0","entrypoints":{"main":["demo.Throwing","demo.Good"]}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    assert!(
+        fixture
+            .jar
+            .execute("demo/Throwing", None, "main", &mut host)
+            .is_err()
+    );
+    fixture
+        .jar
+        .execute("demo/Good", None, "main", &mut host)
+        .unwrap();
+    assert_eq!(
+        fixture.text_on(&mut host, "invokeConstructorFailure"),
+        expected("invokeConstructorFailure")
+    );
+}
+
+#[test]
+fn later_entrypoint_failures_are_suppressed_in_order() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "suppressed-entrypoint-failures",
+        &sources,
+        r#"{"id":"probe-fixture","version":"1.0","entrypoints":{"main":["demo.Probe","demo.Probe"]}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    assert_eq!(
+        fixture.text_on(&mut host, "invokeFailureSuppressed"),
+        "RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:2:1:RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException"
+    );
 }
 
 /// Fabric keeps duplicate declarations as separate storage entries. Both are
