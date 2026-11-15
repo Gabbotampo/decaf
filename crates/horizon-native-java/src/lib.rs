@@ -174,6 +174,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
 mod reference_identity;
@@ -2410,6 +2411,14 @@ pub trait Host {
     /// The collection an unmodifiable view (`Collections.unmodifiableList`)
     /// reads, by the view's marker.
     fn unmodifiable_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// A new `Collections$UnmodifiableList` or `$UnmodifiableRandomAccessList`
+    /// (`class`) reading `source` live: what `UnmodifiableList.subList` makes
+    /// with `new` (#251), whatever `source`'s own class. `None` when the host
+    /// keeps no views, so the call is counted.
+    fn unmodifiable_list_view_as(&mut self, _class: &str, _source: &Value) -> Option<Value> {
         None
     }
 
@@ -4915,6 +4924,10 @@ impl Host for StdHost {
         self.unmodifiable_collections.get(marker).cloned().flatten()
     }
 
+    fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {
+        self.unmodifiable_view_as(class, source)
+    }
+
     fn is_jdk_list_of(&self, marker: &str) -> bool {
         self.jdk_list_of.contains(marker)
     }
@@ -5303,6 +5316,11 @@ impl Host for StdHost {
         }
         // The client stand-ins' fields (`Minecraft.player`, `options.keyJump`),
         // key categories and input types.
+        if r.owner == "java/awt/Color"
+            && let Some(value) = client_surface::awt_constant(&r.name)
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.client_static(r) {
             return value;
         }
@@ -26400,6 +26418,11 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
                     {
