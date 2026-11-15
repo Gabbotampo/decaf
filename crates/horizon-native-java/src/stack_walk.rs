@@ -93,7 +93,10 @@ impl<H: Host> Runtime<'_, H> {
                 // instead of returning a silently truncated stream.
                 let snapshot = snapshot();
                 if snapshot.len() < 2 {
-                    return Ok(None);
+                    // Keep the stream shape usable for jars that dereference
+                    // the walk result, but mark it unknown: Java would expose
+                    // the launcher caller that the native stack does not hold.
+                    self.host.unknown_operand_call(r)?;
                 }
                 let frames = snapshot
                     .iter()
