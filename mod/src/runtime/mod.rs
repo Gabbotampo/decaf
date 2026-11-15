@@ -125,6 +125,7 @@ mod java_format;
 mod java_format_args;
 mod java_identifier;
 mod java_immutable;
+mod java_math;
 mod java_nbt;
 mod java_numbers;
 mod java_regex;
@@ -3493,7 +3494,17 @@ impl StdHost {
     }
 
     fn empty_collection(&mut self, kind: &str) -> Value {
-        self.new_collection(stand_in_class(kind), Vec::new())
+        self.empty_collection_class(match kind {
+            "map" => "java/util/LinkedHashMap",
+            "set" => "java/util/LinkedHashSet",
+            _ => "java/util/ArrayList",
+        })
+    }
+
+    /// Allocate a fresh mutable collection with the concrete JDK class a
+    /// library factory constructs.
+    fn empty_collection_class(&mut self, class: &str) -> Value {
+        self.new_collection(class, Vec::new())
     }
 
     /// A new mutable collection of class `class` holding `values`: an object
@@ -5169,7 +5180,13 @@ impl Host for StdHost {
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
-        Some(self.empty_collection(kind))
+        let class = match kind {
+            "map" => "java/util/LinkedHashMap",
+            "set" => "java/util/LinkedHashSet",
+            "list" => "java/util/ArrayList",
+            class => class,
+        };
+        Some(self.empty_collection_class(class))
     }
 
     fn array_view(
@@ -5520,6 +5537,12 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_invoke(r, args) {
             return value;
         }
+        if let Some(result) = guava_model::sized_factory_class(r, args) {
+            return result.map(|class| self.empty_collection_class(class));
+        }
+        if let Some(class) = guava_model::empty_factory_class(r) {
+            return Ok(self.empty_collection_class(class));
+        }
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
@@ -5527,6 +5550,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = java_math::static_call(r, args) {
             return value;
         }
         if let Some(value) = java_identifier::invoke_static(self, r, args) {
@@ -12364,6 +12390,7 @@ fn is_set_owner(owner: &str) -> bool {
                 | "java/util/concurrent/CopyOnWriteArraySet"
                 | "java/util/concurrent/ConcurrentSkipListSet"
                 | "java/util/concurrent/ConcurrentHashMap$KeySetView"
+                | "java/util/Collections$SetFromMap"
                 | "java/util/EnumSet"
                 | "com/google/common/collect/ImmutableSet"
         )
@@ -13333,9 +13360,27 @@ fn array_operand_error(
     }
 }
 
+/// Maximum number of [`Value`] slots one jar-controlled array materialization
+/// may create. `Value` is 32 bytes on the 64-bit arcweld/Linux build, so the
+/// bound is about 512 MiB before the array table's HashMap overhead. It keeps
+/// a hostile jar from touching unbounded overcommitted memory; exceeding it is
+/// a refusal because the runtime cannot answer whether HotSpot would have had
+/// enough heap for the allocation.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
+
+/// The interpreter cannot answer an allocation whose host representation is
+/// over the fixed safety bound. Include both values so the refusal identifies
+/// the requested materialization and the limit that stopped it.
+fn array_bound_error(elements: u128) -> NativeError {
+    NativeError::Metadata(format!(
+        "array of {elements} elements exceeds the runtime's bound of {MAX_ARRAY_ELEMENTS}"
+    ))
+}
+
 /// An array creation's length. A negative one is the JVM's
 /// `NegativeArraySizeException` (its message is the length), which a jar's
-/// handler may catch; one over the runtime's bound is refused.
+/// handler may catch. Positive lengths are preserved and checked before their
+/// elements are materialized.
 fn array_length(value: i32) -> Result<usize, NativeError> {
     if value < 0 {
         return Err(NativeError::UncaughtException {
@@ -13344,10 +13389,52 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
             frame: None,
         });
     }
-    usize::try_from(value)
-        .ok()
-        .filter(|length| *length <= 1 << 20)
-        .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+    usize::try_from(value).map_err(|_| array_bound_error(u128::from(u32::MAX) + 1))
+}
+
+/// Most array objects one `multianewarray` may create. Each sub-array is its
+/// own entry in the runtime's array table, with a cost well above its element
+/// slots, so `new int[1 << 23][1]` must not pass on its 2^24 slots alone.
+pub(crate) const MAX_MULTIANEWARRAY_ARRAYS: u128 = 1 << 20;
+
+/// Check what a `multianewarray` will materialise before any of it exists:
+/// every level's element slots (the outer array's too, not only the leaves)
+/// against [`MAX_ARRAY_ELEMENTS`], and the number of array objects against
+/// [`MAX_MULTIANEWARRAY_ARRAYS`]. Only the supplied dimensions count: a partial
+/// array leaves its remaining dimensions null and creates nothing for them.
+fn array_total_elements(counts: &[usize]) -> Result<(), NativeError> {
+    // Level k holds prod(counts[..k]) arrays of counts[k] slots each.
+    let (mut arrays_at_level, mut arrays, mut slots) = (1_u128, 0_u128, 0_u128);
+    for &count in counts {
+        arrays = arrays.saturating_add(arrays_at_level);
+        arrays_at_level = arrays_at_level.saturating_mul(count as u128);
+        slots = slots.saturating_add(arrays_at_level);
+    }
+    if slots > MAX_ARRAY_ELEMENTS as u128 {
+        return Err(array_bound_error(slots));
+    }
+    if arrays > MAX_MULTIANEWARRAY_ARRAYS {
+        return Err(NativeError::Metadata(format!(
+            "multianewarray of {arrays} arrays exceeds the runtime's bound of \
+             {MAX_MULTIANEWARRAY_ARRAYS} arrays"
+        )));
+    }
+    Ok(())
+}
+
+/// Allocate repeated array elements without allowing Rust's allocator failure
+/// to abort the whole probe process. Allocation failure is a refusal, never a
+/// guessed catchable Java `OutOfMemoryError`.
+fn repeated_array_values(value: Value, length: usize) -> Result<Vec<Value>, NativeError> {
+    if length > MAX_ARRAY_ELEMENTS {
+        return Err(array_bound_error(length as u128));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| array_bound_error(length as u128))?;
+    values.resize(length, value);
+    Ok(values)
 }
 
 /// The null checks a method reference's adapter makes before its target runs
@@ -14962,6 +15049,10 @@ impl NativeJar {
                                     slice: None,
                                     shift: None,
                                 };
+                                if injection_metadata_requires_refusal(inject) {
+                                    unresolved.push(plan);
+                                    continue;
+                                }
                                 let (slice, shift) =
                                     match resolve_injection_modifiers(anchor, &inject_slices) {
                                         Ok(modifiers) => modifiers,
@@ -21641,17 +21732,26 @@ impl<H: Host> Runtime<'_, H> {
     /// reference that would fail a `TypeMismatch`.
     /// `descriptor` is the array class of this level (`[[I`); each nested
     /// level is an array of its component (`[I`).
-    fn new_multidim_array(&mut self, descriptor: &str, counts: &[usize]) -> Value {
+    fn new_multidim_array(
+        &mut self,
+        descriptor: &str,
+        counts: &[usize],
+    ) -> Result<Value, NativeError> {
         let length = counts.first().copied().unwrap_or(0);
         let component = &descriptor[1..];
         let values = if counts.len() <= 1 {
-            vec![Value::default_for(component); length]
+            repeated_array_values(Value::default_for(component), length)?
         } else {
-            (0..length)
-                .map(|_| self.new_multidim_array(component, &counts[1..]))
-                .collect()
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(length)
+                .map_err(|_| array_bound_error(length as u128))?;
+            for _ in 0..length {
+                values.push(self.new_multidim_array(component, &counts[1..])?);
+            }
+            values
         };
-        self.new_array_value(descriptor, values)
+        Ok(self.new_array_value(descriptor, values))
     }
 
     /// Materialize a `java.lang.reflect.Type[]` for the generic reflection
@@ -22077,7 +22177,14 @@ impl<H: Host> Runtime<'_, H> {
                 let element = return_desc(&r.descriptor)
                     .trim_start_matches('[')
                     .to_owned();
-                let mut values = Vec::with_capacity(end.saturating_sub(start));
+                let copy_len = end.saturating_sub(start);
+                if copy_len > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(copy_len as u128));
+                }
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(copy_len)
+                    .map_err(|_| array_bound_error(copy_len as u128))?;
                 for index in start..end {
                     values.push(
                         source
@@ -22145,7 +22252,10 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let class = value_class::array_class_marker(&component.replace('.', "/"));
                 // Each slot holds the component's zero (`0` for `int.class`).
-                self.new_array_value(&class, vec![Value::default_for(&class[1..]); length])
+                self.new_array_value(
+                    &class,
+                    repeated_array_values(Value::default_for(&class[1..]), length)?,
+                )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
                 Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
@@ -26113,7 +26223,10 @@ impl<H: Host> Runtime<'_, H> {
                     let component = value_class::primitive_array_component(atype)
                         .ok_or(NativeError::InvalidClass("invalid newarray type"))?;
                     let class = value_class::array_class_marker(component);
-                    stack.push(self.new_array_value(&class, vec![empty; length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(empty, length)),
+                    ));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
@@ -26121,7 +26234,10 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?;
                     let class = value_class::array_class_marker(&component);
-                    stack.push(self.new_array_value(&class, vec![Value::Ref(None); length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(Value::Ref(None), length)),
+                    ));
                 }
                 0xbe => {
                     self.pull_array_views();
@@ -26222,7 +26338,11 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|count| array_length(*count))
                             .collect::<Result<Vec<_>, _>>()
                     );
-                    stack.push(self.new_multidim_array(&descriptor, &counts));
+                    invoke_or_catch!(at, array_total_elements(&counts));
+                    stack.push(invoke_or_catch!(
+                        at,
+                        self.new_multidim_array(&descriptor, &counts)
+                    ));
                 }
                 0xc0 => {
                     // The reference stays on the stack; a cast to a class the
@@ -29684,6 +29804,26 @@ fn mixin_target_owners(mixin: &Annotation) -> Vec<String> {
 }
 
 /// A boolean annotation element; absent or non-boolean is false.
+/// The bounded injector does not implement Mixin's injection-count or local-capture metadata.
+/// Refuse non-default values so a game-hook plan is counted instead of silently claiming the
+/// loader would have accepted or warned about it.
+fn injection_metadata_requires_refusal(annotation: &Annotation) -> bool {
+    let nonzero = |key: &str| {
+        matches!(
+            annotation.values.get(key),
+            Some(AnnotationValue::Int(value)) if *value != 0
+        )
+    };
+    if nonzero("require") || nonzero("expect") {
+        return true;
+    }
+    match annotation.values.get("locals") {
+        None => false,
+        Some(AnnotationValue::String(value)) => value.rsplit('.').next() != Some("NO_CAPTURE"),
+        Some(_) => true,
+    }
+}
+
 fn annotation_bool(annotation: &Annotation, key: &str) -> bool {
     matches!(
         annotation.values.get(key),
@@ -30913,6 +31053,102 @@ mod tests {
             host.invoke_instance(&equals, &first, std::slice::from_ref(&second))
                 .unwrap(),
             Value::Int(0)
+        );
+    }
+
+    #[test]
+    fn guava_empty_factories_keep_their_java_classes_and_identity_maps() {
+        let factories = [
+            (
+                "com/google/common/collect/Maps",
+                "newHashMap",
+                "()Ljava/util/HashMap;",
+                "java/util/HashMap",
+            ),
+            (
+                "com/google/common/collect/Lists",
+                "newArrayList",
+                "()Ljava/util/ArrayList;",
+                "java/util/ArrayList",
+            ),
+            (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "()Ljava/util/HashSet;",
+                "java/util/HashSet",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newLinkedHashMap",
+                "()Ljava/util/LinkedHashMap;",
+                "java/util/LinkedHashMap",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newIdentityHashMap",
+                "()Ljava/util/IdentityHashMap;",
+                "java/util/IdentityHashMap",
+            ),
+            (
+                "com/google/common/collect/Sets",
+                "newIdentityHashSet",
+                "()Ljava/util/Set;",
+                "java/util/Collections$SetFromMap",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newConcurrentMap",
+                "()Ljava/util/concurrent/ConcurrentMap;",
+                "java/util/concurrent/ConcurrentHashMap",
+            ),
+            (
+                "com/google/common/collect/Lists",
+                "newLinkedList",
+                "()Ljava/util/LinkedList;",
+                "java/util/LinkedList",
+            ),
+        ];
+        let mut host = StdHost::new();
+        for (owner, name, descriptor, class) in factories {
+            let r = MethodRef {
+                owner: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            let first = host.invoke(&r, &[]).unwrap();
+            let second = host.invoke(&r, &[]).unwrap();
+            assert_eq!(class_of_value(&first).as_deref(), Some(class));
+            assert_ne!(first, second, "each Guava factory call allocates");
+        }
+        let make = MethodRef {
+            owner: "com/google/common/collect/Maps".into(),
+            name: "newIdentityHashMap".into(),
+            descriptor: "()Ljava/util/IdentityHashMap;".into(),
+        };
+        let map = host.invoke(&make, &[]).unwrap();
+        let put = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "put".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let get = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "get".into(),
+            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let key_a = Value::Ref(Some("demo/Object#1".into()));
+        let key_b = Value::Ref(Some("demo/Object#2".into()));
+        host.invoke_instance(&put, &map, &[key_a.clone(), Value::Int(1)])
+            .unwrap();
+        host.invoke_instance(&put, &map, &[key_b.clone(), Value::Int(2)])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(&get, &map, &[key_a]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&get, &map, &[key_b]).unwrap(),
+            Value::Int(2)
         );
     }
 
@@ -44720,7 +44956,7 @@ mandatory = true
             depth: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
-        let grid = runtime.new_multidim_array("[[I", &[2, 3]);
+        let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
         assert_eq!(host_array::exact_class(&grid), Some("[[I"));
         let outer = runtime.array(&grid).unwrap().clone();
         assert_eq!(outer.len(), 2);
