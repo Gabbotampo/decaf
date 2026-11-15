@@ -77,7 +77,16 @@ fn self_containing_collections_answer_as_java_25() {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let text = fixture.text_on(&mut host, method);
         let unknown = host.unknown_host_calls();
-        if text != expected(method) || !unknown.is_empty() {
+        // A jar recursion caught at the jar-frame bound is counted (`fixture_deep_recursion.rs`):
+        // `compareToCycle` recurses without end, `streamChains` runs its last chain where such a
+        // recursion was caught. The bound cannot tell an endless recursion from a deep one.
+        let counted: &[&str] = if matches!(method, "streamChains" | "compareToCycle") {
+            &["java/lang/StackOverflowError#<frame-bound>()V"]
+        } else {
+            &[]
+        };
+        let names: Vec<&str> = unknown.iter().map(|(call, _)| call.as_str()).collect();
+        if text != expected(method) || names != counted {
             failures.push(format!(
                 "{method}\n  java:   {}\n  native: {text}\n  unknown: {unknown:?}",
                 expected(method)

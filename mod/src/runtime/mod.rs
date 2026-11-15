@@ -13478,6 +13478,10 @@ pub struct Field {
     pub name: String,
     pub descriptor: String,
     pub access: u16,
+    /// The field's `RuntimeVisibleAnnotations` (Gson's `@SerializedName`, `gson_model.rs`);
+    /// `None` where the attribute could not be read (the class still loads, with a warning,
+    /// and a reader that needs the field's annotations counts instead of guessing).
+    pub annotations: Option<Vec<Annotation>>,
 }
 
 impl Field {
@@ -13533,11 +13537,12 @@ impl ClassFile {
         let super_name = class_name(&pool, super_index)?;
         let interface_count = r.u2()? as usize;
         r.skip(interface_count * 2)?;
-        let fields = read_fields(&mut r, &pool)?;
+        let (fields, field_warnings) = read_fields(&mut r, &pool)?;
         let (methods, method_warnings) = read_methods(&mut r, &pool)?;
         let (annotations, bootstrap_methods, warnings) = read_class_attributes(&mut r, &pool)?;
-        let warnings = method_warnings
+        let warnings = field_warnings
             .into_iter()
+            .chain(method_warnings)
             .chain(warnings)
             .map(|warning| format!("{name}: {warning}"))
             .collect();
@@ -24217,14 +24222,24 @@ impl<H: Host> Runtime<'_, H> {
         }
         self.ensure_initialized(class)?;
         let value = self.new_object(class);
-        for (declaring, name, descriptor, access) in fields {
+        for (declaring, name, descriptor, access, names) in fields {
             if !style.includes_field(access) {
                 continue;
             }
-            // The naming policy names the JSON key on the way in too.
-            let Some(raw) = document.get(&style.field_name(&name)) else {
+            // The naming policy, or `@SerializedName`'s value and alternates, names the JSON
+            // key on the way in too. A field whose names are unknown, or a document holding
+            // more than one of a field's names (Gson keeps the last in document order, which
+            // the parsed document does not keep), is a counted read answering `null`.
+            let Some(keys) = style.json_names(&name, &names) else {
+                return self.count_gson_read().map(Some);
+            };
+            let mut present = keys.iter().filter_map(|key| document.get(key));
+            let Some(raw) = present.next() else {
                 continue;
             };
+            if present.next().is_some() {
+                return self.count_gson_read().map(Some);
+            }
             let Some(field_value) = self.gson_field_value(raw, &descriptor, style)? else {
                 return Ok(None);
             };
@@ -24243,6 +24258,15 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok(Some(value))
+    }
+
+    /// A `fromJson` this model cannot answer: counted, with the host's neutral answer.
+    fn count_gson_read(&mut self) -> Result<Value, NativeError> {
+        self.host.unknown_operand_call(&MethodRef {
+            owner: "com/google/gson/Gson".into(),
+            name: "fromJson".into(),
+            descriptor: "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;".into(),
+        })
     }
 
     /// Convert one JSON value to the field descriptor it must land in.
@@ -24956,6 +24980,17 @@ impl<H: Host> Runtime<'_, H> {
                 if let Ok(Some(handler)) =
                     self.exception_handler(file, method, desc, at, host_recursion::STACK_OVERFLOW)
                 {
+                    // The bound (`frame_bound.rs`: the thread's stack, at most
+                    // `MAX_JAR_CALL_DEPTH` frames) is far shallower than HotSpot's default
+                    // stack, which nests a jar's recursion ~4,400 to ~37,000 frames deep
+                    // (Java 25, `-Xss1m` and `-Xss2m`). A recursion refused here may have
+                    // finished on the JVM, so the caught throw is counted, never an exact
+                    // answer; a strict host refuses it.
+                    self.host.unknown_operand_call(&MethodRef {
+                        owner: host_recursion::STACK_OVERFLOW.into(),
+                        name: "<frame-bound>".into(),
+                        descriptor: "()V".into(),
+                    })?;
                     let value = self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
                     return Ok((handler, value));
                 }
@@ -28971,21 +29006,51 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
     }
     Ok(pool)
 }
-fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Field>, NativeError> {
+/// The class's fields, with their visible annotations, and the warnings reading them gave.
+///
+/// A field's annotations used to be skipped unread; they are read now for Gson's
+/// `@SerializedName`. A malformed or too-deep attribute must not refuse a class that loaded
+/// before, so it leaves that field's annotations unknown (`None`) with a warning instead.
+fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(Vec<Field>, Vec<String>), NativeError> {
+    let mut warnings = Vec::new();
     let n = r.u2()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let access = r.u2()?;
         let name = utf8(pool, r.u2()?)?;
         let descriptor = utf8(pool, r.u2()?)?;
-        skip_attributes(r, pool)?;
+        let attrs = r.u2()? as usize;
+        let mut annotations = Some(Vec::new());
+        for _ in 0..attrs {
+            let attr = utf8(pool, r.u2()?)?;
+            let len = r.u4()? as usize;
+            let bytes = r.bytes(len)?;
+            if attr != "RuntimeVisibleAnnotations" {
+                continue;
+            }
+            match read_annotations(&mut Reader::new(bytes), pool) {
+                Ok(read) => {
+                    if let Some(annotations) = annotations.as_mut() {
+                        annotations.extend(read);
+                    }
+                }
+                Err(error) => {
+                    push_class_annotation_warning(
+                        &mut warnings,
+                        format!("field {name}: annotations unreadable ({error}); skipped"),
+                    );
+                    annotations = None;
+                }
+            }
+        }
         out.push(Field {
             name,
             descriptor,
             access,
+            annotations,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 /// The error a `RuntimeVisibleAnnotations` attribute nested past [`MAX_ANNOTATION_DEPTH`] gives.
 const ANNOTATIONS_TOO_DEEP: &str = "annotation values nested too deeply";
