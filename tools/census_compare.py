@@ -200,7 +200,7 @@ def build_probe(checkout: Path, target: Path, output: Path) -> None:
     output.chmod(output.stat().st_mode | 0o111)
 
 
-def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role: str, path: Path) -> dict:
+def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role: str, path: Path, *, include_game_table: bool = False) -> dict:
     command = [sys.executable, str(base_checkout / "tools" / "unmodelled_calls.py"), "--probe", str(probe), "--json", str(path), "--jobs", str(args.jobs), "--role", role, "--dependency-mode", args.dependency_mode]
     for corpus in args.corpus:
         command += ["--corpus", corpus]
@@ -208,7 +208,7 @@ def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role:
         command += ["--fabric-loader", str(args.fabric_loader)]
     for provider in args.provider_dir:
         command += ["--provider-dir", str(provider)]
-    if args.game_block_classes:
+    if include_game_table and args.game_block_classes:
         command += ["--game-block-classes", str(args.game_block_classes.expanduser().resolve())]
     subprocess.run(command, cwd=base_checkout, check=True)
     return json.loads(path.read_text())
@@ -262,7 +262,8 @@ def main(argv: list[str] | None = None) -> int:
             for number in range(args.repeat):
                 # Both probes run under the BASE checkout's driver, so the flags mean the same thing.
                 path = root / f"{role}-{label}-{number}.json"
-                payload = run_census(driver_checkout, probe, args, role, path)
+                payload = run_census(driver_checkout, probe, args, role, path,
+                                     include_game_table=(label == "merged"))
                 payload["sha"] = base_sha if label == "base" else merged_sha
                 repetitions[label].append(payload)
         report = compare_payloads(repetitions["base"][0], repetitions["merged"][0], repetitions, role)
