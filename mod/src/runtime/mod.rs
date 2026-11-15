@@ -4038,7 +4038,7 @@ impl StdHost {
             + self.synchronized_views.len()
             + self.reversed_views.len()
             + 1;
-        for hops in 0..hops_bound {
+        for _ in 0..hops_bound {
             let target = self.synchronized_target(&marker).to_owned();
             let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
                 source.clone()
@@ -4046,14 +4046,9 @@ impl StdHost {
                 reversed = !reversed;
                 base.clone()
             } else {
-                let mut values = match self.mutable_collections.get(&target) {
-                    Some(values) => values.clone(),
-                    // A view over a collection the host keeps no row for (a literal).
-                    None if hops > 0 => {
-                        collection_values(&jar_object::stored_value(&target)).ok()?
-                    }
-                    None => return None,
-                };
+                // A collection is a handle with a row (#156 P14d2): a view over
+                // anything else reads nothing.
+                let mut values = self.mutable_collections.get(&target)?.clone();
                 if reversed {
                     values.reverse();
                 }
