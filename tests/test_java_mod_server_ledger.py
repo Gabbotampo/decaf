@@ -58,7 +58,7 @@ class JavaModServerLedgerTests(unittest.TestCase):
 
     @staticmethod
     def _jar(directory, name, *, fabric=None, neoforge=None, mod_class=False,
-             fabric_raw=None, corrupt=False):
+             fabric_raw=None, corrupt=False, legacy_mods=False):
         path = Path(directory) / name
         if corrupt:
             path.write_bytes(b"not a zip")
@@ -69,7 +69,7 @@ class JavaModServerLedgerTests(unittest.TestCase):
             elif fabric is not None:
                 jar.writestr("fabric.mod.json", json.dumps(fabric))
             if neoforge is not None:
-                jar.writestr("META-INF/neoforge.mods.toml", neoforge)
+                jar.writestr("META-INF/mods.toml" if legacy_mods else "META-INF/neoforge.mods.toml", neoforge)
             if mod_class:
                 jar.writestr(
                     "example/ExampleMod.class",
@@ -275,7 +275,8 @@ class JavaModServerLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             client = self._jar(
                 tmp, "client.jar",
-                neoforge='modLoader = "javafml"\n[[mods]]\nmodId = "client"\nclientSideOnly = true\n',
+                neoforge='clientSideOnly = true\nmodLoader = "javafml"\n[[mods]]\nmodId = "client"\n',
+                legacy_mods=True,
             )
             server = self._jar(
                 tmp, "server.jar",

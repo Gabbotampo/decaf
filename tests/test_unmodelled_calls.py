@@ -183,19 +183,21 @@ class UnmodelledCallsTests(unittest.TestCase):
             return (b"\xca\xfe\xba\xbe" + struct.pack(">HHH", 0, 52, 13) + b"".join(pool)
                     + struct.pack(">HHHHHH", 0x21, 2, 4, 0, 0, 0) + struct.pack(">H", 1) + attr)
 
-        def jar(name, toml, mod):
+        def jar(name, toml, mod, legacy=False):
             path = directory / name
             with zipfile.ZipFile(path, "w") as archive:
-                archive.writestr("META-INF/neoforge.mods.toml", toml)
+                archive.writestr("META-INF/mods.toml" if legacy else "META-INF/neoforge.mods.toml", toml)
                 archive.writestr("example/ExampleMod.class", mod)
             return path
 
-        # A TOML-only jar has no @Mod and remains a library, while the loader
-        # side flag is still retained for the server-role decision.
-        client_toml = jar("client.jar", 'clientSideOnly = true\n', mod_class())
-        self.assertEqual(TOOL.classify_client(client_toml, "neoforge")[0], "client-only")
+        # Distant Horizons' shape: a mod-scoped property in NeoForge's file is
+        # ordinary mod metadata, not the physical-side selector.
+        client_toml = jar("client.jar", '[[mods]]\nmodId = "dh"\nclientSideOnly = "true"\nside = "BOTH"\n', mod_class())
+        self.assertEqual(TOOL.classify_client(client_toml, "neoforge")[0], "neo-client")
         metadata = TOOL.ledger.read_jar_entrypoints(client_toml, force_neoforge=True)
-        self.assertTrue(metadata.client_side_only)
+        self.assertFalse(metadata.client_side_only)
+        legacy = jar("legacy.jar", 'clientSideOnly = true\n[[mods]]\nmodId = "legacy"\n', mod_class(), legacy=True)
+        self.assertEqual(TOOL.classify_client(legacy, "neoforge")[0], "client-only")
         dual = jar("dual.jar", "", mod_class(("CLIENT", "DEDICATED_SERVER")))
         self.assertEqual(TOOL.classify_client(dual, "neoforge")[0], "neo-client")
 

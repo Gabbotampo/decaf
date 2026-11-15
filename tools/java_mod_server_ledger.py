@@ -414,6 +414,17 @@ def fabric_entrypoint_kinds(obj: dict) -> tuple[str, ...]:
     return tuple(sorted(kinds))
 
 
+def forge_client_side_only(text: str) -> bool:
+    """Read Forge's root-level `clientSideOnly`, before TOML tables."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            return False
+        if re.fullmatch(r"clientSideOnly\s*=\s*[\"']?true[\"']?", line, re.I):
+            return True
+    return False
+
+
 def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> JarEntrypoints | None:
     """Read a jar's loader metadata; None when the jar cannot be read.
 
@@ -441,13 +452,9 @@ def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> 
                 fabric_environment = "*"
                 fabric_client_only = False
             client_side_only = fabric_client_only
-            for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
-                if name in names:
-                    text = jar.read(name).decode("utf-8", errors="replace")
-                    client_side_only = fabric_client_only or bool(
-                        re.search(r"(?im)^\s*clientSideOnly\s*=\s*[\"']?true[\"']?\s*$", text)
-                    )
-                    break
+            if "META-INF/mods.toml" in names:
+                text = jar.read("META-INF/mods.toml").decode("utf-8", errors="replace")
+                client_side_only = fabric_client_only or forge_client_side_only(text)
             if (client_side_only and not force_neoforge) or (
                 not force_neoforge and any(kind in SERVER_ENTRYPOINT_KINDS for kind in kinds)
             ):
