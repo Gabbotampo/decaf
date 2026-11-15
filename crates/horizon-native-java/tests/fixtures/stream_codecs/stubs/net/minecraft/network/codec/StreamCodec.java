@@ -9,6 +9,11 @@ public interface StreamCodec<B, V> extends StreamEncoder<B, V>, StreamDecoder<B,
     return null;
   }
 
+  StreamCodec<?, ?> map(java.util.function.Function<?, ?> a, java.util.function.Function<?, ?> b);
+  StreamCodec<?, ?> apply(CodecOperation operation);
+  StreamCodec<?, ?> dispatch(java.util.function.Function<?, ?> a, java.util.function.Function<?, ?> b);
+  interface CodecOperation {}
+
   static <B, C, T1, T2> StreamCodec<B, C> composite(
       StreamCodec<? super B, T1> codec1, Function<C, T1> getter1,
       StreamCodec<? super B, T2> codec2, Function<C, T2> getter2,

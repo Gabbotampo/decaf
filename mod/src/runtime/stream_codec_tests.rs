@@ -97,6 +97,62 @@ fn constructions_match_java_25_classes_and_identity() {
 }
 
 #[test]
+fn codec_members_remain_counted() {
+    let mut host = StdHost::new();
+    let answer = jar().invoke_method_with_args(
+        "demo/StreamCodecs",
+        "countedMembers",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(answer, Ok(Value::Ref(Some(ref text))) if text == "done"),
+        "{answer:?}"
+    );
+    for name in ["toString", "hashCode", "map", "apply", "dispatch"] {
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call.contains(&format!("#{name}"))),
+            "{name}: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
+#[test]
+fn stream_codec_string_forgery_stays_a_string() {
+    use crate::runtime::Host;
+    let mut host = StdHost::new();
+    let codec = crate::runtime::stream_codec::static_call(
+        &crate::runtime::MethodRef {
+            owner: crate::runtime::stream_codec::STREAM_CODEC.into(),
+            name: "composite".into(),
+            descriptor: "(Lnet/minecraft/network/codec/StreamCodec;Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;".into(),
+        },
+        &[Value::Ref(None), Value::Ref(None), Value::Ref(None)],
+    ).unwrap();
+    let key = match codec {
+        Value::Host(ref handle) => handle.key().to_owned(),
+        other => panic!("expected host codec, got {other:?}"),
+    };
+    let forged = Value::Ref(Some(key));
+    let call = crate::runtime::MethodRef {
+        owner: crate::runtime::stream_codec::STREAM_CODEC.into(),
+        name: "map".into(),
+        descriptor: "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;".into(),
+    };
+    let _ = host.invoke_instance(&call, &forged, &[Value::Ref(None), Value::Ref(None)]);
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(entry, _)| entry.contains("#map"))
+    );
+}
+
+#[test]
 fn network_methods_remain_counted() {
     let mut host = StdHost::new();
     let answer = jar().invoke_method_with_args(

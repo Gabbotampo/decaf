@@ -53,6 +53,17 @@ public final class StreamCodecs {
         + "|" + one.equals(oneAgain);
   }
 
+  public static String countedMembers() {
+    StreamCodec<ByteBuf, Payload> codec = compositeOne();
+    try { codec.toString(); } catch (Throwable ignored) {}
+    try { codec.hashCode(); } catch (Throwable ignored) {}
+    try { codec.equals(codec); } catch (Throwable ignored) {}
+    try { codec.map(x -> x, x -> x); } catch (Throwable ignored) {}
+    try { codec.apply(null); } catch (Throwable ignored) {}
+    try { codec.dispatch(x -> x, x -> codec); } catch (Throwable ignored) {}
+    return "done";
+  }
+
   public static String encodeDecode() {
     StreamCodec<ByteBuf, Payload> one = compositeOne();
     try {
