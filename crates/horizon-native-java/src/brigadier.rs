@@ -58,16 +58,12 @@ use crate::{
     ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, arg_count, boolean_value,
     component_value,
     events::{EventContext, EventFacade, EventFiring, FacadePlayer, GameEvent},
-    expect_ref, expect_string, identifier_value, parse_callback_marker, return_desc, stable_hash,
-    uuid_value,
+    expect_ref, expect_string,
+    host_brigadier::{self as handles, PERMISSION_SET, REQUIRES},
+    host_ref::HostKind,
+    identifier_value, parse_callback_marker, return_desc, stable_hash, uuid_value,
 };
 
-/// The dispatcher a registration callback receives.
-pub const DISPATCHER: &str = "brigadier/dispatcher";
-/// The `CommandBuildContext` a registration callback receives: only passed
-/// along (to `ItemArgument.item(context)` and the like).
-pub const BUILD_CONTEXT: &str = "brigadier/build-context";
-const CONTEXT: &str = "brigadier/context";
 const COMMAND_SELECTION: &str = "net/minecraft/commands/Commands$CommandSelection";
 const SYNTAX_EXCEPTION: &str = "com/mojang/brigadier/exceptions/CommandSyntaxException";
 const PERMISSION_LEVEL: &str = "net/minecraft/server/permissions/PermissionLevel";
@@ -112,6 +108,9 @@ const MAX_MESSAGES: usize = 256;
 const MAX_EXCEPTION_TYPES: usize = 1024;
 /// How deep a `CommandNode.addChild` merge may recurse.
 const MAX_MERGE_DEPTH: usize = 64;
+/// How many finished runs a kept context or source still answers for; an
+/// older one is counted.
+const MAX_KEPT_RUNS: usize = 32;
 
 /// What an argument node parses, as the jar asked for it.
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +215,9 @@ pub struct TreeNode {
     /// A `fork` or a redirect with a modifier: the source changes on the way,
     /// which the game does not model.
     pub modifier: bool,
+    /// `CommandNode.isFork`: a `fork`, or a `forward` with `fork` true (a
+    /// `redirect` with a modifier is `forward(target, modifier, false)`).
+    pub fork: bool,
     /// A custom `SuggestionProvider` (`suggests`).
     pub suggests: Option<Value>,
 }
@@ -229,6 +231,7 @@ impl TreeNode {
             requirement: None,
             redirect: None,
             modifier: false,
+            fork: false,
             suggests: None,
         }
     }
@@ -275,12 +278,45 @@ pub struct BrigadierState {
     /// PermissionCheck.Require(permission)` objects, by object marker.
     permission_objects: BTreeMap<String, u8>,
     /// Messages of `new SimpleCommandExceptionType(message)`, by marker.
-    exception_types: BTreeMap<String, CommandText>,
+    /// A `SimpleCommandExceptionType`'s message object, read when an
+    /// exception is made (Java keeps the `Message` and reads it then).
+    exception_types: BTreeMap<String, Value>,
     /// The text each `CommandSyntaxException` this host raised or created
     /// carries, by its message, so the outcome keeps a translation key.
     exception_texts: BTreeMap<String, CommandText>,
     next_exception: usize,
+    /// The serial the next command run (or requirement check) takes: its
+    /// context's and sources' handles hold it, so an object kept from an
+    /// earlier run is never the running one's.
+    next_run: usize,
     exec: Option<Box<Execution>>,
+    /// What the last [`MAX_KEPT_RUNS`] runs named (their invocation and
+    /// sources), so a context or source a jar kept answers for its own run,
+    /// as the Java object does.
+    kept: std::collections::VecDeque<KeptRun>,
+}
+
+/// What one finished run named.
+#[derive(Clone, Debug)]
+struct KeptRun {
+    run: usize,
+    invocation: Option<CommandInvocation>,
+    sources: Vec<CommandSource>,
+}
+
+/// One command dispatch: the requirement checks and the run of one command
+/// for one source. Brigadier checks `requires` while parsing with the very
+/// `CommandSourceStack` it then runs the command with, so every check and the
+/// run of one dispatch see one source object
+/// ([`NativeJar::check_requirement_in`], [`NativeJar::run_command_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandDispatch(usize);
+
+impl StdHost {
+    /// A new command dispatch on this host.
+    pub fn command_dispatch(&mut self) -> CommandDispatch {
+        CommandDispatch(self.brigadier.new_run())
+    }
 }
 
 /// The source a command runs as (`CommandSourceStack`).
@@ -362,15 +398,30 @@ impl CommandText {
         }
     }
 
-    /// The text of a component marker (`component/literal/...`).
-    fn of(value: &Value) -> Self {
-        let raw = expect_string(value);
-        if let Some(key) = raw.strip_prefix("component/translatable/") {
-            return Self::key(key);
+    /// The text of a component as it is now (`host_component.rs`: its
+    /// state in `states`, read when the message is sent), or a string's own
+    /// text. `None` for a component no read can resolve (past the bound or
+    /// a cycle): the caller counts it rather than sending other text.
+    fn of(value: &Value, states: &crate::host_component::States) -> Option<Self> {
+        let json = crate::facade_text::json_now(value, Some(states));
+        if json.is_none() && crate::host_component::is_component(value) {
+            return None;
         }
-        if raw.starts_with(crate::facade_text::JSON_PREFIX)
-            && let Some(json) = crate::facade_text::to_json(value)
-        {
+        Some(Self::resolved(value, json))
+    }
+
+    fn resolved(value: &Value, json: Option<serde_json::Value>) -> Self {
+        if let Some(key) = json.as_ref().and_then(crate::host_component::bare_key) {
+            return Self::key(&key);
+        }
+        if let Some(text) = json.as_ref().and_then(crate::host_component::bare_literal) {
+            return Self {
+                text,
+                translate: false,
+                component: None,
+            };
+        }
+        if let Some(json) = json {
             return Self {
                 text: crate::facade_text::plain(&json),
                 translate: false,
@@ -378,10 +429,7 @@ impl CommandText {
             };
         }
         Self {
-            text: raw
-                .strip_prefix("component/literal/")
-                .unwrap_or(raw)
-                .to_owned(),
+            text: expect_string(value).to_owned(),
             translate: false,
             component: None,
         }
@@ -427,17 +475,17 @@ pub struct CommandRun {
     pub messages: Vec<CommandMessage>,
 }
 
-/// A message as the command queued it: a `sendSuccess` keeps its supplier,
-/// which runs after the command returns (the interpreter cannot call back
-/// into the jar from a host call).
+/// A message as the command queued it, its text read when it was sent (a
+/// `sendSuccess` supplier runs inside the call, `Runtime::invoke_send_success`).
 #[derive(Clone, Debug)]
 enum Pending {
-    Supplier { supplier: Value, broadcast: bool },
     Text(CommandMessage),
 }
 
 #[derive(Clone, Debug)]
 struct Execution {
+    /// The run's serial ([`BrigadierState::new_run`]).
+    run: usize,
     invocation: Option<CommandInvocation>,
     /// The sources this execution named: 0 is the one the command runs as.
     sources: Vec<CommandSource>,
@@ -446,10 +494,6 @@ struct Execution {
 
 fn marker(text: String) -> Value {
     Value::Ref(Some(text))
-}
-
-fn node_marker(id: usize) -> Value {
-    marker(format!("brigadier/node/{id}"))
 }
 
 fn level_name(level: u8) -> &'static str {
@@ -471,25 +515,13 @@ fn uuid_text(uuid: u128) -> String {
     )
 }
 
-/// The id after `prefix` in a `brigadier/<kind>/<id>` marker.
-fn marker_id(value: &Value, prefix: &str) -> Option<usize> {
-    expect_ref(value)?.strip_prefix(prefix)?.parse().ok()
-}
-
-/// The operator level a permission-ish marker stands for.
+/// The operator level a permission value (a handle, or a `PermissionLevel`
+/// constant) stands for.
 fn level_of(value: &Value) -> Option<u8> {
-    let text = expect_ref(value)?;
-    for prefix in [
-        "brigadier/permission/",
-        "brigadier/permission-check/",
-        "brigadier/permission-set/",
-        "brigadier/requires/",
-    ] {
-        if let Some(level) = text.strip_prefix(prefix) {
-            return level.parse().ok();
-        }
+    if let Some((_, level)) = handles::permission_of(value) {
+        return Some(level);
     }
-    let name = text.strip_prefix(&format!("enum/{PERMISSION_LEVEL}/"))?;
+    let name = expect_ref(value)?.strip_prefix(&format!("enum/{PERMISSION_LEVEL}/"))?;
     PERMISSION_LEVELS
         .iter()
         .position(|n| *n == name)
@@ -595,10 +627,10 @@ fn argument_factory(r: &MethodRef, args: &[Value]) -> Option<ArgumentKind> {
         },
         ("HexColorArgument", "hexColor") => ArgumentKind::HexColor,
         ("ResourceArgument" | "ResourceOrTagArgument", "resource" | "resourceOrTag") => {
-            // The key is `Registries.X`, a `registry/<id>` marker.
-            let registry = expect_ref(args.get(1)?)?
-                .strip_prefix("registry/")?
-                .to_owned();
+            // The key is `Registries.X`, `ResourceKey[minecraft:root / <id>]`.
+            let registry = crate::host_ids::named_id(args.get(1)?).filter(|_| {
+                crate::host_ids::is_resource_key(args.get(1).unwrap_or(&Value::Ref(None)))
+            })?;
             ArgumentKind::Resource {
                 registry,
                 tag: r.name == "resourceOrTag",
@@ -619,6 +651,16 @@ impl BrigadierState {
         Ok(self.nodes.len() - 1)
     }
 
+    /// The handle on node `id` (its kind and name in the key).
+    fn node_value(&self, id: usize) -> Value {
+        let (kind, name) = match &self.nodes[id].kind {
+            NodeKind::Root => (handles::ROOT, ""),
+            NodeKind::Literal(name) => (handles::LITERAL, name.as_str()),
+            NodeKind::Argument { name, .. } => (handles::ARGUMENT, name.as_str()),
+        };
+        handles::node(id, kind, name)
+    }
+
     fn root(&mut self) -> Result<usize, NativeError> {
         match self.root {
             Some(root) => Ok(root),
@@ -637,6 +679,10 @@ impl BrigadierState {
             )));
         }
         let arguments = self.push_node(TreeNode::new(NodeKind::Root))?;
+        let tag = match kind {
+            NodeKind::Literal(_) => handles::LITERAL,
+            _ => handles::ARGUMENT,
+        };
         let id = self.next_builder;
         self.next_builder += 1;
         self.builders.insert(
@@ -646,28 +692,30 @@ impl BrigadierState {
                 arguments,
             },
         );
-        Ok(marker(format!("brigadier/builder/{id}")))
+        Ok(handles::builder(id, tag))
     }
 
-    fn new_argument_type(&mut self, kind: ArgumentKind) -> Result<Value, NativeError> {
+    /// A new argument type of `kind`, which a factory declared to return
+    /// `class`.
+    fn new_argument_type(&mut self, kind: ArgumentKind, class: &str) -> Result<Value, NativeError> {
         if self.arguments.len() >= MAX_ARGUMENT_TYPES {
             return Err(NativeError::Metadata(format!(
                 "brigadier: more than {MAX_ARGUMENT_TYPES} argument types"
             )));
         }
         self.arguments.push(kind);
-        Ok(marker(format!(
-            "brigadier/argtype/{}",
-            self.arguments.len() - 1
-        )))
+        Ok(handles::argument_type(self.arguments.len() - 1, class))
     }
 
     /// The argument type an `argument(name, type)` call passed.
     fn argument_kind(&self, value: &Value) -> ArgumentKind {
-        if let Some(id) = marker_id(value, "brigadier/argtype/")
+        if let Some(id) = handles::argument_type_id(value)
             && let Some(kind) = self.arguments.get(id)
         {
             return kind.clone();
+        }
+        if let Some(class) = crate::jar_object::object_class(value) {
+            return ArgumentKind::Unmodelled(class.to_owned());
         }
         let text = expect_string(value);
         ArgumentKind::Unmodelled(match text.split_once('#') {
@@ -733,27 +781,28 @@ impl BrigadierState {
 
     /// The node a `then`/`redirect`/`addChild` argument names: a built node,
     /// or a builder (built at that call, as `then(ArgumentBuilder)` does).
-    fn node_of(&mut self, value: &Value) -> Result<usize, NativeError> {
-        if let Some(id) = marker_id(value, "brigadier/node/").filter(|&id| id < self.nodes.len()) {
+    ///
+    /// Anything else (a string spelled like an old marker, a jar's own
+    /// `CommandNode` subclass) is not modelled: the call `r` is refused as an
+    /// unmodelled one, which `brigadier_call` counts.
+    fn node_of(&mut self, value: &Value, r: &MethodRef) -> Result<usize, NativeError> {
+        if let Some(id) = handles::node_id(value).filter(|&id| id < self.nodes.len()) {
             return Ok(id);
         }
-        if let Some(id) = marker_id(value, "brigadier/builder/") {
+        if let Some(id) = handles::builder_id(value) {
             return self.build(id);
         }
-        if value == &Value::Ref(Some(DISPATCHER.into())) {
+        if handles::is(value, HostKind::BrigadierDispatcher) {
             return self.root();
         }
-        Err(NativeError::Metadata(format!(
-            "brigadier: {} is not a command node",
-            expect_string(value)
-        )))
+        Err(NativeError::UnknownHostCall(r.clone()))
     }
 
     /// The requirement a `requires(predicate)` argument stands for.
     fn requirement(value: &Value) -> Requirement {
-        match expect_ref(value).and_then(|t| t.strip_prefix("brigadier/requires/")) {
-            Some(level) => Requirement::Level(level.parse().unwrap_or(NOBODY)),
-            None => Requirement::Predicate(value.clone()),
+        match handles::permission_of(value) {
+            Some((what, level)) if what == REQUIRES => Requirement::Level(level),
+            _ => Requirement::Predicate(value.clone()),
         }
     }
 
@@ -793,9 +842,62 @@ impl BrigadierState {
         self.exec.as_deref()
     }
 
+    /// A serial for a new command run.
+    fn new_run(&mut self) -> usize {
+        let run = self.next_run;
+        self.next_run += 1;
+        run
+    }
+
+    /// What run `run` named: the running one, or a kept one.
+    fn run_record(&self, run: usize) -> Option<(Option<&CommandInvocation>, &[CommandSource])> {
+        if let Some(exec) = self.exec().filter(|exec| exec.run == run) {
+            return Some((exec.invocation.as_ref(), &exec.sources));
+        }
+        self.kept
+            .iter()
+            .rev()
+            .find(|kept| kept.run == run)
+            .map(|kept| (kept.invocation.as_ref(), kept.sources.as_slice()))
+    }
+
+    /// Keep what a finished execution named (one record per run: a dispatch's
+    /// requirement checks, its run and its suppliers share it).
+    fn keep(&mut self, exec: &Execution) {
+        if let Some(kept) = self.kept.iter_mut().find(|kept| kept.run == exec.run) {
+            if exec.invocation.is_some() {
+                kept.invocation.clone_from(&exec.invocation);
+            }
+            return;
+        }
+        if self.kept.len() >= MAX_KEPT_RUNS {
+            self.kept.pop_front();
+        }
+        self.kept.push_back(KeptRun {
+            run: exec.run,
+            invocation: exec.invocation.clone(),
+            sources: exec.sources.clone(),
+        });
+    }
+
+    /// The source a handle names, of the running command or a kept run;
+    /// `None` for an older one.
     fn source(&self, value: &Value) -> Option<&CommandSource> {
-        let id = marker_id(value, "brigadier/source/")?;
-        self.exec()?.sources.get(id)
+        let (run, at) = handles::source_of(value)?;
+        self.run_record(run)?.1.get(at)
+    }
+
+    /// Whether a source handle is the running command's (the only one whose
+    /// messages reach a player now).
+    fn is_running_source(&self, value: &Value) -> bool {
+        handles::source_of(value)
+            .is_some_and(|(run, _)| self.exec().is_some_and(|exec| exec.run == run))
+    }
+
+    /// A context handle's run and that run's invocation, while it is kept.
+    fn context_record(&self, value: &Value) -> Option<(usize, Option<&CommandInvocation>)> {
+        let run = handles::context_run(value)?;
+        Some((run, self.run_record(run)?.0))
     }
 
     fn queue(&mut self, pending: Pending) -> Result<(), NativeError> {
@@ -866,6 +968,65 @@ impl StdHost {
         }
         out.extend(self.brigadier.permission_objects.keys().map(String::as_str));
         out.extend(self.brigadier.exception_types.keys().map(String::as_str));
+        out.extend(
+            self.brigadier
+                .exception_types
+                .values()
+                .filter_map(|message| match message {
+                    Value::Host(handle) => Some(handle.key()),
+                    Value::Ref(Some(text)) => Some(text.as_str()),
+                    _ => None,
+                }),
+        );
+    }
+
+    /// `CommandSourceStack.sendSuccess(supplier, broadcast)` (26.3 bytecode): vanilla calls
+    /// `supplier.get()` inside the call, and only when `acceptsSuccess() && !silent` (send to
+    /// the source) or `broadcast && shouldInformAdmins() && !silent`. The console accepts
+    /// success; a player does when the `sendCommandFeedback` rule is on. A player's message
+    /// only broadcast to operators (the rule off, `broadcast` set) is not modelled: counted.
+    pub(crate) fn brigadier_feedback_calls_supplier(
+        &self,
+        source: &Value,
+        broadcast: bool,
+    ) -> Option<Option<bool>> {
+        if !self.brigadier.is_running_source(source) {
+            return None;
+        }
+        let source = self.brigadier.source(source)?;
+        if source.player.is_none() {
+            return Some(Some(true));
+        }
+        let rule = self.game_event.as_ref().and_then(|firing| {
+            firing
+                .facade
+                .server
+                .game_rules
+                .get("send_command_feedback")
+                .cloned()
+        });
+        Some(match rule {
+            Some(crate::game_rules::GameRuleValue::Bool(true)) => Some(true),
+            Some(crate::game_rules::GameRuleValue::Bool(false)) if !broadcast => Some(false),
+            _ => None,
+        })
+    }
+
+    /// The component a `sendSuccess` supplier gave, sent now as it is.
+    pub(crate) fn brigadier_send_feedback(
+        &mut self,
+        r: &MethodRef,
+        component: &Value,
+        broadcast: bool,
+    ) -> Result<Value, NativeError> {
+        let Some(text) = CommandText::of(component, &self.component_states) else {
+            return self.unknown_host_call(r);
+        };
+        self.brigadier.queue(Pending::Text(CommandMessage {
+            kind: MessageKind::Success { broadcast },
+            text,
+        }))?;
+        Ok(Value::Void)
     }
 
     /// Statics of the command surface: permission levels, checks and sets,
@@ -873,14 +1034,16 @@ impl StdHost {
     /// instance field of a host object reaches the host as a static read).
     pub(crate) fn brigadier_static(&self, r: &MethodRef) -> Option<Value> {
         let level = |l: u8| {
-            Some(marker(format!(
-                "brigadier/{}/{l}",
+            Some(handles::permission(
                 match r.descriptor.as_str() {
-                    "Lnet/minecraft/server/permissions/Permission;" => "permission",
-                    "Lnet/minecraft/server/permissions/PermissionCheck;" => "permission-check",
-                    _ => "permission-set",
-                }
-            )))
+                    "Lnet/minecraft/server/permissions/Permission;" => handles::PERMISSION,
+                    "Lnet/minecraft/server/permissions/PermissionCheck;" => {
+                        handles::PERMISSION_CHECK
+                    }
+                    _ => PERMISSION_SET,
+                },
+                l,
+            ))
         };
         match (r.owner.as_str(), r.name.as_str()) {
             ("net/minecraft/commands/Commands", name) if name.starts_with("LEVEL_") => {
@@ -962,11 +1125,11 @@ impl StdHost {
             }
             ("net/minecraft/commands/Commands", "hasPermission") => {
                 let level = level_of(args.first()?)?;
-                return Some(Ok(marker(format!("brigadier/requires/{level}"))));
+                return Some(Ok(handles::permission(REQUIRES, level)));
             }
             ("net/minecraft/server/permissions/LevelBasedPermissionSet", "forLevel") => {
                 let level = level_of(args.first()?)?;
-                return Some(Ok(marker(format!("brigadier/permission-set/{level}"))));
+                return Some(Ok(handles::permission(PERMISSION_SET, level)));
             }
             // `Component.empty()`: an empty literal (command feedback appends
             // to one).
@@ -993,7 +1156,12 @@ impl StdHost {
         let kind = argument_factory(r, args)?;
         // A getter (`getInteger`) of a type is not a factory; those take the
         // context and were answered above or refuse below.
-        Some(self.brigadier.new_argument_type(kind))
+        let declared = return_desc(&r.descriptor);
+        let class = declared
+            .strip_prefix('L')
+            .and_then(|class| class.strip_suffix(';'))
+            .unwrap_or(owner);
+        Some(self.brigadier.new_argument_type(kind, class))
     }
 
     /// fabric-permissions-api without a permissions provider: `check` answers
@@ -1007,14 +1175,14 @@ impl StdHost {
         let last = crate::descriptor_arguments(&r.descriptor).pop()?;
         match (r.name.as_str(), last.as_str()) {
             ("require", "I") => {
-                let level = int_arg(args, 1)?.clamp(0, 4);
-                Some(Ok(marker(format!("brigadier/requires/{level}"))))
+                let level = int_arg(args, 1)?.clamp(0, 4) as u8;
+                Some(Ok(handles::permission(REQUIRES, level)))
             }
             ("require", "Z") => {
                 let level = if int_arg(args, 1)? != 0 { 0 } else { NOBODY };
-                Some(Ok(marker(format!("brigadier/requires/{level}"))))
+                Some(Ok(handles::permission(REQUIRES, level)))
             }
-            ("require", _) => Some(Ok(marker(format!("brigadier/requires/{NOBODY}")))),
+            ("require", _) => Some(Ok(handles::permission(REQUIRES, NOBODY))),
             ("check", "Z") => Some(Ok(Value::Int(int_arg(args, 2)?))),
             ("check", "I") => {
                 let wanted = int_arg(args, 2)?;
@@ -1034,8 +1202,7 @@ impl StdHost {
             return Some(source.level);
         }
         let exec = self.brigadier.exec()?;
-        let player = expect_ref(value)?.strip_prefix("game/player/")?;
-        let uuid = u128::from_str_radix(player, 16).ok()?;
+        let uuid = crate::game_object::player_uuid(crate::game_object::text(value)?)?;
         let source = exec.sources.first()?;
         Some(if source.player == Some(uuid) {
             source.level
@@ -1044,25 +1211,58 @@ impl StdHost {
         })
     }
 
-    /// The running command's argument `name`.
-    fn command_argument(&self, args: &[Value], at: usize) -> Result<&CommandArgument, NativeError> {
-        let name = args.get(at).map(expect_string).unwrap_or_default();
-        let invocation = self
-            .brigadier
-            .exec()
-            .and_then(|exec| exec.invocation.as_ref())
-            .ok_or_else(|| NativeError::Metadata("brigadier: no command is running".into()))?;
-        invocation
-            .arguments
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, value)| value)
-            .ok_or_else(|| NativeError::UncaughtException {
-                class: "java/lang/IllegalArgumentException".into(),
-                message: Some(format!("No such argument '{name}' exists on this command")),
-                frame: None,
-            })
+    /// Argument `name` of the run `context` (a context handle) belongs to.
+    /// `None` when the context is not one the host can read (an older run's,
+    /// a requirement check's): the caller counts the call.
+    fn command_argument(
+        &self,
+        context: &Value,
+        name: &str,
+    ) -> Option<Result<CommandArgument, NativeError>> {
+        let (_, invocation) = self.brigadier.context_record(context)?;
+        Some(
+            invocation?
+                .arguments
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!("No such argument '{name}' exists on this command")),
+                    frame: None,
+                }),
+        )
+    }
+
+    /// Whether `value`, handed where a `CommandContext` (or a source) is
+    /// declared, is a plain string: Java's cast throws for it.
+    fn forged(value: &Value) -> bool {
+        matches!(value, Value::Ref(Some(text)) if crate::value_class::is_plain_string(text))
+    }
+
+    /// Argument `name` of the context a getter or `getArgument` was handed
+    /// (`args[0]` for a static getter): its own run's, never the running
+    /// one's. `Err` with the answer to give when it cannot be read: a
+    /// `ClassCastException` for a String (Java's cast), a counted call
+    /// otherwise.
+    fn context_value(
+        &mut self,
+        r: &MethodRef,
+        context: &Value,
+        name: &str,
+    ) -> Result<CommandArgument, Result<Value, NativeError>> {
+        if !handles::is(context, HostKind::CommandContext) && Self::forged(context) {
+            return Err(Err(crate::checkcast::class_cast_exception(
+                "java/lang/String",
+                "com/mojang/brigadier/context/CommandContext",
+            )));
+        }
+        match self.command_argument(context, name) {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(error)) => Err(Err(error)),
+            None => Err(self.unknown_host_call(r)),
+        }
     }
 
     /// `IntegerArgumentType.getInteger(context, name)` and its siblings.
@@ -1075,9 +1275,14 @@ impl StdHost {
         let name_at = crate::descriptor_arguments(&r.descriptor)
             .len()
             .checked_sub(1)?;
-        let value = match self.command_argument(args, name_at) {
-            Ok(value) => value.clone(),
-            Err(error) => return Some(Err(error)),
+        let name = args
+            .get(name_at)
+            .map(expect_string)
+            .unwrap_or_default()
+            .to_owned();
+        let value = match self.context_value(r, args.first()?, &name) {
+            Ok(value) => value,
+            Err(answer) => return Some(answer),
         };
         let mismatch = || {
             Some(Err(NativeError::UncaughtException {
@@ -1107,7 +1312,7 @@ impl StdHost {
                 "BlockPosArgument",
                 "getBlockPos" | "getLoadedBlockPos" | "getSpawnablePos",
                 CommandArgument::BlockPos([x, y, z]),
-            ) => marker(format!("block-pos/{x},{y},{z}")),
+            ) => crate::game_object::server_value(format!("block-pos/{x},{y},{z}")),
             ("IdentifierArgument", "getId", CommandArgument::Identifier(id)) => {
                 let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", &id));
                 identifier_value(namespace, path)
@@ -1116,7 +1321,7 @@ impl StdHost {
                 return Some(uuid_value(&uuid_text(uuid)));
             }
             ("DimensionArgument", "getDimension", CommandArgument::Dimension(id)) => {
-                marker(format!("game/level/{id}"))
+                crate::game_object::server_value(format!("game/level/{id}"))
             }
             _ => return mismatch(),
         }))
@@ -1150,6 +1355,9 @@ impl StdHost {
             }
             _ => return None,
         };
+        // The players and entities a selector found, as the firing's façade
+        // knows them (`game_object::player_value`).
+        let facade = self.firing_facade();
         let refuse = |this: &mut Self, key: &str| {
             this.brigadier
                 .exception_texts
@@ -1157,8 +1365,8 @@ impl StdHost {
             Some(Err(syntax_error(key)))
         };
         let one = |entity: &SelectedEntity| match entity {
-            SelectedEntity::Player(uuid) => marker(format!("game/player/{uuid:032x}")),
-            SelectedEntity::Entity(id) => marker(format!("game/entity/{id}")),
+            SelectedEntity::Player(uuid) => crate::game_object::player_value(&facade, *uuid),
+            SelectedEntity::Entity(id) => crate::game_object::entity_value(&facade, *id),
         };
         match (getter, selected.as_slice()) {
             ("getEntity", []) | ("getEntities", []) => {
@@ -1182,9 +1390,85 @@ impl StdHost {
         }
     }
 
-    /// `context.getArgument(name, Class)`: the boxed value.
-    fn context_argument(&mut self, args: &[Value]) -> Result<Value, NativeError> {
-        Ok(match self.command_argument(args, 0)?.clone() {
+    /// `context.getArgument(name, clazz)` on `context`'s own run: the boxed
+    /// value when it is a `clazz` (a primitive class reads as its wrapper),
+    /// else brigadier's `IllegalArgumentException` (`CommandContext`,
+    /// 1.3.11): `Argument 'n' is defined as Integer, not class
+    /// java.lang.String`. A class whose kind the runtime cannot tell (a jar's
+    /// or the game's, for a JDK value) is counted.
+    fn context_argument(
+        &mut self,
+        r: &MethodRef,
+        context: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let name = args
+            .first()
+            .map(expect_string)
+            .unwrap_or_default()
+            .to_owned();
+        let argument = match self.context_value(r, context, &name) {
+            Ok(argument) => argument,
+            Err(answer) => return answer,
+        };
+        let class = match &argument {
+            CommandArgument::Bool(_) => "java/lang/Boolean",
+            CommandArgument::Int(_) => "java/lang/Integer",
+            CommandArgument::Long(_) => "java/lang/Long",
+            CommandArgument::Float(_) => "java/lang/Float",
+            CommandArgument::Double(_) => "java/lang/Double",
+            CommandArgument::Str(_) => "java/lang/String",
+            CommandArgument::Uuid(_) => "java/util/UUID",
+            CommandArgument::Identifier(_) => "net/minecraft/resources/Identifier",
+            // An `EntitySelector`, `Coordinates` or `ResourceKey` is resolved
+            // by the type's own getter; the raw object is not modelled.
+            _ => return self.unknown_host_call(r),
+        };
+        let Some(wanted) = args.get(1).and_then(crate::host_class::class_name) else {
+            return self.unknown_host_call(r);
+        };
+        let wrapper = match wanted {
+            "boolean" => "java/lang/Boolean",
+            "int" => "java/lang/Integer",
+            "long" => "java/lang/Long",
+            "float" => "java/lang/Float",
+            "double" => "java/lang/Double",
+            other => other,
+        };
+        let fits = wrapper == class
+            || wrapper == "java/lang/Object"
+            || crate::jdk_closure::class(class)
+                .is_some_and(|row| row.supertypes.contains(&wrapper));
+        if !fits {
+            // The JDK's value classes are final with known supertypes; the
+            // message prints `clazz.toString()`, which needs its kind.
+            let shown = match wanted {
+                "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" => {
+                    wanted.to_owned()
+                }
+                _ => match crate::jdk_closure::class(wanted) {
+                    Some(row) if crate::jdk_closure::class(class).is_some() => format!(
+                        "{} {}",
+                        if row.is_interface {
+                            "interface"
+                        } else {
+                            "class"
+                        },
+                        wanted.replace('/', ".")
+                    ),
+                    _ => return self.unknown_host_call(r),
+                },
+            };
+            let simple = class.rsplit('/').next().unwrap_or(class);
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/IllegalArgumentException".into(),
+                message: Some(format!(
+                    "Argument '{name}' is defined as {simple}, not {shown}"
+                )),
+                frame: None,
+            });
+        }
+        Ok(match argument {
             CommandArgument::Bool(v) => boolean_value(v),
             CommandArgument::Int(v) => Value::Int(v),
             CommandArgument::Long(v) => Value::Long(v),
@@ -1195,13 +1479,7 @@ impl StdHost {
                 identifier_value(namespace, path)
             }
             CommandArgument::Uuid(uuid) => uuid_value(&uuid_text(uuid))?,
-            // An `EntitySelector`, `Coordinates` or `ResourceKey` is resolved
-            // by the type's own getter; the raw object is not modelled.
-            other => {
-                return Err(NativeError::Metadata(format!(
-                    "brigadier: getArgument of a {other:?} argument is not modelled"
-                )));
-            }
+            _ => return self.unknown_host_call(r),
         })
     }
 
@@ -1213,16 +1491,11 @@ impl StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        let text = expect_ref(receiver)?.clone();
         let name = r.name.as_str();
-        // The objects `new` made of permission and exception classes.
-        if name == "<init>" {
-            return self.brigadier_init(r, &text, args);
-        }
-        if text == "game-event/register_commands" {
+        if crate::host_game_event::fired_event(receiver) == Some(GameEvent::RegisterCommands) {
             return match name {
-                "getDispatcher" => Some(Ok(marker(DISPATCHER.into()))),
-                "getBuildContext" => Some(Ok(marker(BUILD_CONTEXT.into()))),
+                "getDispatcher" => Some(Ok(handles::dispatcher())),
+                "getBuildContext" => Some(Ok(handles::build_context())),
                 "getCommandSelection" => {
                     let dedicated = self.game_event.as_ref().is_some_and(|f| f.facade.dedicated);
                     let selection = if dedicated { "DEDICATED" } else { "INTEGRATED" };
@@ -1231,44 +1504,54 @@ impl StdHost {
                 _ => None,
             };
         }
-        if let Some(answer) = self.permission_call(r, &text, args) {
+        // Styling a command's message with a style object (`withStyle(ChatFormatting)`/
+        // `withColor(int)` are `facade_text.rs`'s).
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/network/chat/MutableComponent" | "net/minecraft/network/chat/Component"
+        ) && crate::host_component::is_component(receiver)
+            && matches!(name, "withStyle" | "withColor" | "setStyle")
+        {
+            // A `Style` or a `UnaryOperator<Style>` is not modelled on the
+            // command surface: answering the receiver unstyled would send
+            // the wrong text, so the call is counted (a running command
+            // refuses it).
+            return Some(self.unknown_host_call(r));
+        }
+        if let Value::Host(_) = receiver {
+            // What a model does not answer is an unmodelled call: counted
+            // (and refused by a strict host, as a running command's is),
+            // once: a model that went through `unknown_host_call` already did.
+            let counted = self.unknown_host_call_count();
+            return match self.brigadier_handle_call(r, receiver, args) {
+                Some(Err(NativeError::UnknownHostCall(_)))
+                    if self.unknown_host_call_count() == counted =>
+                {
+                    Some(self.unknown_host_call(r))
+                }
+                answer => answer,
+            };
+        }
+        let text = crate::game_object::text(receiver)?.clone();
+        // The objects `new` made of permission and exception classes.
+        if name == "<init>" {
+            return self.brigadier_init(r, &text, args);
+        }
+        if let Some(answer) = self.permission_call(r, receiver, args) {
             return Some(answer);
-        }
-        if text == DISPATCHER {
-            return Some(self.dispatcher_call(r, args));
-        }
-        if let Some(id) = marker_id(receiver, "brigadier/builder/") {
-            return Some(self.builder_call(r, id, receiver, args));
-        }
-        if let Some(id) = marker_id(receiver, "brigadier/node/") {
-            return Some(self.node_call(r, id, args));
-        }
-        if text == CONTEXT {
-            return Some(match name {
-                "getSource" => Ok(marker("brigadier/source/0".into())),
-                "getArgument" => self.context_argument(args),
-                "getInput" => Ok(self
-                    .brigadier
-                    .exec()
-                    .and_then(|e| e.invocation.as_ref())
-                    .map_or(Value::Ref(None), |i| marker(i.input.clone()))),
-                _ => Err(NativeError::UnknownHostCall(r.clone())),
-            });
-        }
-        if text.starts_with("brigadier/source/") {
-            return Some(self.source_call(r, receiver, args));
         }
         if let Some(type_marker) = text
             .strip_prefix("com/mojang/brigadier/exceptions/SimpleCommandExceptionType#")
             .map(|_| text.clone())
             && matches!(name, "create" | "createWithContext")
         {
-            let message = self
-                .brigadier
-                .exception_types
-                .get(&type_marker)
-                .cloned()
-                .unwrap_or_else(|| CommandText::key("command.failed"));
+            let message = match self.brigadier.exception_types.get(&type_marker) {
+                Some(message) => match CommandText::of(message, &self.component_states) {
+                    Some(message) => message,
+                    None => return Some(self.unknown_host_call(r)),
+                },
+                None => CommandText::key("command.failed"),
+            };
             let mut messages = std::mem::take(&mut self.throwable_messages);
             let value = self.brigadier.new_exception(message, &mut messages);
             self.throwable_messages = messages;
@@ -1276,12 +1559,13 @@ impl StdHost {
         }
         // `player.sendSystemMessage(component)` while a command runs: to them.
         if self.brigadier.exec.is_some()
-            && let Some(player) = text.strip_prefix("game/player/")
+            && let Some(uuid) = crate::game_object::player_uuid(&text)
             && name == "sendSystemMessage"
             && r.descriptor == "(Lnet/minecraft/network/chat/Component;)V"
-            && let Ok(uuid) = u128::from_str_radix(player, 16)
         {
-            let text = CommandText::of(args.first()?);
+            let Some(text) = CommandText::of(args.first()?, &self.component_states) else {
+                return Some(self.unknown_host_call(r));
+            };
             return Some(
                 self.brigadier
                     .queue(Pending::Text(CommandMessage {
@@ -1303,15 +1587,46 @@ impl StdHost {
             let value = coords.split(',').nth(at)?.parse().ok()?;
             return Some(Ok(Value::Int(value)));
         }
-        // Styling a command's message: the text stays, the style is dropped
-        // (component markers carry text only).
-        if matches!(
-            r.owner.as_str(),
-            "net/minecraft/network/chat/MutableComponent" | "net/minecraft/network/chat/Component"
-        ) && text.starts_with("component/")
-            && matches!(name, "withStyle" | "withColor" | "setStyle")
-        {
-            return Some(Ok(receiver.clone()));
+        None
+    }
+
+    /// Calls on the command surface's handles (`host_brigadier.rs`).
+    fn brigadier_handle_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if handles::is(receiver, HostKind::CommandPermission) {
+            return self.permission_call(r, receiver, args);
+        }
+        if handles::is(receiver, HostKind::BrigadierDispatcher) {
+            return Some(self.dispatcher_call(r, args));
+        }
+        if let Some(id) = handles::builder_id(receiver) {
+            return Some(self.builder_call(r, id, receiver, args));
+        }
+        if let Some(id) = handles::node_id(receiver) {
+            return Some(self.node_call(r, id, args));
+        }
+        if handles::is(receiver, HostKind::CommandContext) {
+            // The context's own run (a kept one too), never the running one's.
+            let Some((run, invocation)) = self.brigadier.context_record(receiver) else {
+                return Some(Err(NativeError::UnknownHostCall(r.clone())));
+            };
+            let input = invocation.map(|i| i.input.clone());
+            return Some(match r.name.as_str() {
+                "getSource" => Ok(handles::source(run, 0)),
+                "getArgument" => self.context_argument(r, receiver, args),
+                "getInput" => match input {
+                    Some(input) => Ok(marker(input)),
+                    None => Err(NativeError::UnknownHostCall(r.clone())),
+                },
+                _ => Err(NativeError::UnknownHostCall(r.clone())),
+            });
+        }
+        if handles::is(receiver, HostKind::CommandSource) {
+            return Some(self.source_call(r, receiver, args));
         }
         None
     }
@@ -1341,11 +1656,11 @@ impl StdHost {
                 Some(Ok(Value::Void))
             }
             "com/mojang/brigadier/exceptions/SimpleCommandExceptionType" => {
-                let text = CommandText::of(args.first()?);
+                let message = args.first()?.clone();
                 if self.brigadier.exception_types.len() < MAX_EXCEPTION_TYPES {
                     self.brigadier
                         .exception_types
-                        .insert(receiver.to_owned(), text);
+                        .insert(receiver.to_owned(), message);
                 }
                 Some(Ok(Value::Void))
             }
@@ -1357,11 +1672,15 @@ impl StdHost {
     fn permission_call(
         &mut self,
         r: &MethodRef,
-        text: &str,
+        receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        let own = level_of(&marker(text.to_owned()))
-            .or_else(|| self.brigadier.permission_objects.get(text).copied())?;
+        // What a permission handle is; `None` for a `PermissionLevel`
+        // constant or a permission object `new` made.
+        let what = handles::permission_of(receiver).map(|(what, _)| what);
+        let text = expect_string(receiver);
+        let own =
+            level_of(receiver).or_else(|| self.brigadier.permission_objects.get(text).copied())?;
         let other = |host: &Self, value: &Value| {
             level_of(value).or_else(|| {
                 host.brigadier
@@ -1372,14 +1691,14 @@ impl StdHost {
         };
         let flag = |b: bool| Some(Ok(Value::Int(i32::from(b))));
         let name = r.name.as_str();
-        if text.starts_with("brigadier/permission-set/") {
+        if what.as_deref() == Some(PERMISSION_SET) {
             return match name {
                 "hasPermission" => flag(own >= other(self, args.first()?)?),
                 "level" => Some(Ok(permission_level_marker(own))),
                 _ => Some(Err(NativeError::UnknownHostCall(r.clone()))),
             };
         }
-        if text.starts_with("brigadier/permission-check/")
+        if what.as_deref() == Some(handles::PERMISSION_CHECK)
             || (r.owner.ends_with("PermissionCheck$Require") && name == "check")
         {
             return match name {
@@ -1387,16 +1706,28 @@ impl StdHost {
                 _ => Some(Err(NativeError::UnknownHostCall(r.clone()))),
             };
         }
-        if text.starts_with("brigadier/requires/") {
+        if what.as_deref() == Some(REQUIRES) {
             return match name {
+                // `PermissionProviderCheck.test(T)` casts its argument to a
+                // `PermissionSetSupplier`: a String throws, an object the host
+                // cannot read is counted.
                 "test" => {
-                    let level = self.subject_level(args.first()?).unwrap_or(0);
-                    flag(level >= own)
+                    let subject = args.first()?;
+                    match self.subject_level(subject) {
+                        Some(level) => flag(level >= own),
+                        None if Self::forged(subject) => {
+                            Some(Err(crate::checkcast::class_cast_exception(
+                                "java/lang/String",
+                                "net/minecraft/server/permissions/PermissionSetSupplier",
+                            )))
+                        }
+                        None => Some(Err(NativeError::UnknownHostCall(r.clone()))),
+                    }
                 }
                 _ => Some(Err(NativeError::UnknownHostCall(r.clone()))),
             };
         }
-        if text.starts_with(&format!("enum/{PERMISSION_LEVEL}/")) {
+        if what.is_none() && text.starts_with(&format!("enum/{PERMISSION_LEVEL}/")) {
             return match name {
                 "id" | "ordinal" => Some(Ok(Value::Int(i32::from(own)))),
                 "isEqualOrHigherThan" => flag(own >= other(self, args.first()?)?),
@@ -1404,7 +1735,7 @@ impl StdHost {
                 _ => None,
             };
         }
-        // A `HasCommandLevel` object.
+        // A `Permission` (a `HasCommandLevel`).
         match name {
             "level" => Some(Ok(permission_level_marker(own))),
             _ => None,
@@ -1418,12 +1749,16 @@ impl StdHost {
                 let built = self.brigadier.node_of(
                     args.first()
                         .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?,
+                    r,
                 )?;
                 let root = self.brigadier.root()?;
                 self.brigadier.add_child(root, built, 0)?;
-                Ok(node_marker(built))
+                Ok(self.brigadier.node_value(built))
             }
-            "getRoot" => Ok(node_marker(self.brigadier.root()?)),
+            "getRoot" => {
+                let root = self.brigadier.root()?;
+                Ok(self.brigadier.node_value(root))
+            }
             _ => Err(NativeError::UnknownHostCall(r.clone())),
         }
     }
@@ -1453,12 +1788,20 @@ impl StdHost {
                         frame: None,
                     });
                 }
-                let child = self.brigadier.node_of(first.ok_or_else(unknown)?)?;
+                let child = self.brigadier.node_of(first.ok_or_else(unknown)?, r)?;
                 self.brigadier.add_child(builder.arguments, child, 0)?;
                 Ok(receiver.clone())
             }
             "executes" | "requires" | "suggests" | "redirect" | "fork" | "forward" => {
                 let value = first.cloned().unwrap_or(Value::Ref(None));
+                // A plain string is no `Command`, `Predicate` or provider:
+                // not modelled (a string spelled `brigadier/requires/0` is
+                // no level check), refused and counted.
+                if let Value::Ref(Some(text)) = &value
+                    && crate::value_class::is_plain_string(text)
+                {
+                    return Err(unknown());
+                }
                 let target = match r.name.as_str() {
                     "redirect" | "fork" | "forward" => {
                         if !self.brigadier.nodes[builder.arguments].children.is_empty() {
@@ -1468,10 +1811,12 @@ impl StdHost {
                                 frame: None,
                             });
                         }
-                        Some(self.brigadier.node_of(&value)?)
+                        Some(self.brigadier.node_of(&value, r)?)
                     }
                     _ => None,
                 };
+                let fork = r.name == "fork"
+                    || (r.name == "forward" && args.get(2) == Some(&Value::Int(1)));
                 let modifier = match r.name.as_str() {
                     "fork" => true,
                     "redirect" | "forward" => {
@@ -1489,17 +1834,21 @@ impl StdHost {
                     _ => {
                         template.redirect = target;
                         template.modifier = modifier;
+                        template.fork = fork;
                     }
                 }
                 Ok(receiver.clone())
             }
-            "build" => Ok(node_marker(self.brigadier.build(id)?)),
+            "build" => {
+                let built = self.brigadier.build(id)?;
+                Ok(self.brigadier.node_value(built))
+            }
             "getLiteral" | "getName" => Ok(marker(builder.template.kind.name().to_owned())),
             "getCommand" => Ok(builder.template.command.clone().unwrap_or(Value::Ref(None))),
             "getRedirect" => Ok(builder
                 .template
                 .redirect
-                .map_or(Value::Ref(None), node_marker)),
+                .map_or(Value::Ref(None), |id| self.brigadier.node_value(id))),
             "getArguments" => {
                 let children = self.brigadier.nodes[builder.arguments].children.clone();
                 Ok(self.node_list(&children))
@@ -1513,8 +1862,11 @@ impl StdHost {
             "java/util/ArrayList#brigadier-nodes-{}",
             stable_hash(&format!("{ids:?}"))
         );
-        self.mutable_collections
-            .insert(list.clone(), ids.iter().copied().map(node_marker).collect());
+        let nodes = ids
+            .iter()
+            .map(|&id| self.brigadier.node_value(id))
+            .collect();
+        self.mutable_collections.insert(list.clone(), nodes);
         marker(list)
     }
 
@@ -1540,18 +1892,21 @@ impl StdHost {
                     .iter()
                     .copied()
                     .find(|&c| self.brigadier.nodes[c].kind.name() == wanted)
-                    .map_or(Value::Ref(None), node_marker))
+                    .map_or(Value::Ref(None), |id| self.brigadier.node_value(id)))
             }
             "getChildren" => Ok(self.node_list(&node.children)),
             "getCommand" => Ok(node.command.unwrap_or(Value::Ref(None))),
-            "getRedirect" => Ok(node.redirect.map_or(Value::Ref(None), node_marker)),
-            "isFork" => Ok(Value::Int(i32::from(node.modifier))),
+            "getRedirect" => Ok(node
+                .redirect
+                .map_or(Value::Ref(None), |id| self.brigadier.node_value(id))),
+            "isFork" => Ok(Value::Int(i32::from(node.fork))),
             "addChild" => {
-                let child = self.brigadier.node_of(args.first().ok_or_else(unknown)?)?;
+                let child = self
+                    .brigadier
+                    .node_of(args.first().ok_or_else(unknown)?, r)?;
                 self.brigadier.add_child(id, child, 0)?;
                 Ok(Value::Void)
             }
-            "hashCode" => Ok(Value::Int(stable_hash(&format!("brigadier/node/{id}")))),
             _ => Err(unknown()),
         }
     }
@@ -1569,24 +1924,27 @@ impl StdHost {
             .source(receiver)
             .cloned()
             .ok_or_else(unknown)?;
+        let facade = self.firing_facade();
         let player = || {
             source
                 .player
-                .map(|uuid| marker(format!("game/player/{uuid:032x}")))
+                .map(|uuid| crate::game_object::player_value(&facade, uuid))
         };
         let first = args.first();
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("permissions", _) => Ok(marker(format!("brigadier/permission-set/{}", source.level))),
+            ("permissions", _) => Ok(handles::permission(PERMISSION_SET, source.level)),
             // The pre-26 API, which some multi-version jars still call.
             ("hasPermission", "(I)Z") => {
                 let wanted = int_arg(args, 0).ok_or_else(unknown)?;
                 Ok(Value::Int(i32::from(i32::from(source.level) >= wanted)))
             }
-            ("getServer", _) => Ok(marker("game/server".into())),
+            ("getServer", _) => Ok(crate::game_object::server_value("game/server".into())),
             // A source whose level is unknown (a player: no mod API dimension read) refuses the
             // same way any unmodelled host call does, and the call is counted.
             ("getLevel", _) => match source.dimension.as_deref() {
-                Some(dimension) => Ok(marker(format!("game/level/{dimension}"))),
+                Some(dimension) => Ok(crate::game_object::server_value(format!(
+                    "game/level/{dimension}"
+                ))),
                 None => self.unknown_host_call(r),
             },
             ("isPlayer", "()Z") => Ok(Value::Int(i32::from(source.player.is_some()))),
@@ -1635,52 +1993,29 @@ impl StdHost {
                 self.mutable_collections.insert(list.clone(), names);
                 Ok(marker(list))
             }
-            ("sendSuccess", _) => {
-                let supplier = first.cloned().ok_or_else(unknown)?;
-                let broadcast = args.get(1) == Some(&Value::Int(1));
-                self.brigadier.queue(Pending::Supplier {
-                    supplier,
-                    broadcast,
-                })?;
-                Ok(Value::Void)
+            // Messages reach a player only from the running command's source.
+            ("sendSuccess" | "sendFailure" | "sendSystemMessage", _)
+                if !self.brigadier.is_running_source(receiver) =>
+            {
+                Err(unknown())
             }
+            // The supplier runs inside the call: the interpreter answers it
+            // (`Runtime::invoke_send_success`); a host alone cannot run it.
+            ("sendSuccess", _) => Err(unknown()),
             ("sendFailure" | "sendSystemMessage", "(Lnet/minecraft/network/chat/Component;)V") => {
                 let kind = if r.name == "sendFailure" {
                     MessageKind::Failure
                 } else {
                     MessageKind::System
                 };
-                let text = CommandText::of(first.ok_or_else(unknown)?);
+                let text = CommandText::of(first.ok_or_else(unknown)?, &self.component_states)
+                    .ok_or_else(unknown)?;
                 self.brigadier
                     .queue(Pending::Text(CommandMessage { kind, text }))?;
                 Ok(Value::Void)
             }
-            ("hashCode", "()I") => Ok(Value::Int(stable_hash(expect_string(receiver)))),
-            ("equals", "(Ljava/lang/Object;)Z") => {
-                Ok(Value::Int(i32::from(first == Some(receiver))))
-            }
             _ => Err(unknown()),
         }
-    }
-
-    /// `instanceof` on the command surface's markers.
-    pub(crate) fn brigadier_instance_of(&self, marker: &str, wanted: &str) -> bool {
-        if marker.starts_with("brigadier/source/") {
-            return matches!(
-                wanted,
-                "net/minecraft/commands/CommandSourceStack"
-                    | "net/minecraft/commands/SharedSuggestionProvider"
-                    | "net/minecraft/commands/ExecutionCommandSource"
-                    | "net/minecraft/server/permissions/PermissionSetSupplier"
-            );
-        }
-        if marker.starts_with("brigadier/node/") {
-            return wanted.starts_with("com/mojang/brigadier/tree/");
-        }
-        if marker.starts_with("brigadier/builder/") {
-            return wanted.starts_with("com/mojang/brigadier/builder/");
-        }
-        false
     }
 
     /// How many host calls the log holds, so a command's calls can be rolled
@@ -1779,9 +2114,14 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<Value, NativeError> {
-        let text = expect_ref(callback)
-            .ok_or_else(|| NativeError::Metadata(format!("a null {method} callback was called")))?;
-        if text.starts_with("@indy:") {
+        if *callback == Value::Ref(None) {
+            return Err(NativeError::Metadata(format!(
+                "a null {method} callback was called"
+            )));
+        }
+        if let Some(text) = expect_ref(callback)
+            && text.starts_with("@indy:")
+        {
             let parsed = parse_callback_marker(text)?;
             let (target, mut captures) =
                 self.command_callback_target(parsed.target, parsed.captures);
@@ -1817,7 +2157,7 @@ impl NativeJar {
             }
             return self.invoke_persistent(&target, receiver, &captures, host, budget);
         }
-        if let Some((class, _)) = text.split_once('#')
+        if let Some(class) = crate::jar_object::object_class(callback)
             && self.classes.contains_key(class)
         {
             let mut current = class.to_owned();
@@ -1843,7 +2183,8 @@ impl NativeJar {
             }
         }
         Err(NativeError::Metadata(format!(
-            "{method} callback {text} is not a lambda or object of this jar"
+            "{method} callback {} is not a lambda or object of this jar",
+            crate::describe_value(callback)
         )))
     }
 
@@ -1853,6 +2194,7 @@ impl NativeJar {
         &self,
         host: &mut StdHost,
         facade: Arc<EventFacade>,
+        run: usize,
         invocation: Option<CommandInvocation>,
         sources: Vec<CommandSource>,
         f: impl FnOnce(&Self, &mut StdHost) -> T,
@@ -1870,22 +2212,43 @@ impl NativeJar {
             context,
         )));
         let outer = host.brigadier.exec.replace(Box::new(Execution {
+            run,
             invocation,
             sources,
             pending: Vec::new(),
         }));
         let out = f(self, host);
         let exec = std::mem::replace(&mut host.brigadier.exec, outer);
+        if let Some(exec) = &exec {
+            host.brigadier.keep(exec);
+        }
         host.game_event = outer_event;
         host.strict_unknown_host_calls = strict;
         host.brigadier_truncate_log(marks);
         (out, exec.map(|e| e.pending).unwrap_or_default())
     }
 
-    /// Whether `requirement` lets `source` use a node. A level compares;
-    /// a jar predicate runs (`Predicate.test(source)`), strictly.
+    /// Whether `requirement` lets `source` use a node, as a dispatch of its
+    /// own ([`Self::check_requirement_in`]).
     pub fn check_requirement(
         &self,
+        requirement: &Requirement,
+        source: &CommandSource,
+        facade: Arc<EventFacade>,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<bool, NativeError> {
+        let dispatch = host.command_dispatch();
+        self.check_requirement_in(dispatch, requirement, source, facade, host, budget)
+    }
+
+    /// Whether `requirement` lets `source` use a node in `dispatch`. A level
+    /// compares; a jar predicate runs (`Predicate.test(source)`), strictly,
+    /// with the dispatch's source object: the one every other check and the
+    /// run of `dispatch` see.
+    pub fn check_requirement_in(
+        &self,
+        CommandDispatch(run): CommandDispatch,
         requirement: &Requirement,
         source: &CommandSource,
         facade: Arc<EventFacade>,
@@ -1896,13 +2259,14 @@ impl NativeJar {
             Requirement::Level(level) => return Ok(source.level >= *level),
             Requirement::Predicate(predicate) => predicate.clone(),
         };
+        let sources = vec![source.clone()];
         let (result, _) =
-            self.with_command_execution(host, facade, None, vec![source.clone()], |jar, host| {
+            self.with_command_execution(host, facade, run, None, sources, |jar, host| {
                 jar.invoke_functional(
                     &predicate,
                     "test",
                     "(Ljava/lang/Object;)Z",
-                    vec![marker("brigadier/source/0".into())],
+                    vec![handles::source(run, 0)],
                     host,
                     budget,
                 )
@@ -1934,7 +2298,9 @@ impl NativeJar {
                 uuid: PROBE_PLAYER,
                 name: "Player".into(),
                 level: Some("minecraft:overworld".into()),
-                entity_id: Some(0),
+                entity_id: None,
+                session: 0,
+                life: 0,
             }],
             ..EventFacade::default()
         });
@@ -1964,10 +2330,28 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> CommandRun {
+        let dispatch = host.command_dispatch();
+        self.run_command_in(dispatch, command, invocation, facade, host, budget)
+    }
+
+    /// [`Self::run_command`] in `dispatch`: the command's source is the
+    /// object the dispatch's requirement checks saw.
+    pub fn run_command_in(
+        &self,
+        CommandDispatch(run): CommandDispatch,
+        command: &Value,
+        invocation: &CommandInvocation,
+        facade: Arc<EventFacade>,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> CommandRun {
         let sources = vec![invocation.source.clone()];
+        // The suppliers run as part of the same run: a lambda that kept the
+        // context or the source still names them.
         let (result, pending) = self.with_command_execution(
             host,
             Arc::clone(&facade),
+            run,
             Some(invocation.clone()),
             sources.clone(),
             |jar, host| {
@@ -1975,47 +2359,18 @@ impl NativeJar {
                     command,
                     "run",
                     "(Lcom/mojang/brigadier/context/CommandContext;)I",
-                    vec![marker(CONTEXT.into())],
+                    vec![handles::context(run)],
                     host,
                     budget,
                 )
             },
         );
         let mut messages = Vec::new();
-        let mut refused = None;
+        // Nothing queued runs after the command now; kept for the outcome's shape.
+        let refused: Option<String> = None;
         for item in pending {
             match item {
                 Pending::Text(message) => messages.push(message),
-                Pending::Supplier {
-                    supplier,
-                    broadcast,
-                } => {
-                    let (component, _) = self.with_command_execution(
-                        host,
-                        Arc::clone(&facade),
-                        Some(invocation.clone()),
-                        sources.clone(),
-                        |jar, host| {
-                            jar.invoke_functional(
-                                &supplier,
-                                "get",
-                                "()Ljava/lang/Object;",
-                                Vec::new(),
-                                host,
-                                budget,
-                            )
-                        },
-                    );
-                    match component {
-                        Ok(component) => messages.push(CommandMessage {
-                            kind: MessageKind::Success { broadcast },
-                            text: CommandText::of(&component),
-                        }),
-                        Err(error) => {
-                            refused.get_or_insert_with(|| format!("sendSuccess supplier: {error}"));
-                        }
-                    }
-                }
             }
         }
         let outcome = match (result, refused) {
@@ -2110,7 +2465,7 @@ mod tests {
             "com/mojang/brigadier/CommandDispatcher",
             "register",
             REGISTER,
-            &marker(DISPATCHER.into()),
+            &handles::dispatcher(),
             std::slice::from_ref(builder),
         )
     }
@@ -2134,13 +2489,15 @@ mod tests {
             name: "getLevel".into(),
             descriptor: "()Lnet/minecraft/server/level/ServerLevel;".into(),
         };
+        let run = host.brigadier.new_run();
         let (result, _) = jar.with_command_execution(
             host,
             Arc::new(EventFacade::default()),
+            run,
             None,
             vec![source],
             |_jar, host| {
-                host.brigadier_call(&call, &marker("brigadier/source/0".into()), &[])
+                host.brigadier_call(&call, &handles::source(run, 0), &[])
                     .expect("modelled")
             },
         );
@@ -2154,7 +2511,7 @@ mod tests {
         let (console, calls) = get_level(&mut host, &jar, Some("minecraft:overworld"));
         assert_eq!(
             console.unwrap(),
-            marker("game/level/minecraft:overworld".into())
+            crate::game_object::server_value("game/level/minecraft:overworld".into())
         );
         assert_eq!(calls, 0);
 
@@ -2237,7 +2594,7 @@ mod tests {
             })
             .unwrap();
         let has = "(Lnet/minecraft/server/permissions/Permission;)Z";
-        let set = |level: u8| marker(format!("brigadier/permission-set/{level}"));
+        let set = |level: u8| handles::permission(PERMISSION_SET, level);
         let owner = "net/minecraft/server/permissions/PermissionSet";
         assert_eq!(
             call(
