@@ -1,6 +1,5 @@
 basic=java.util.Collections$SetFromMap|true|false|true|2|2|[a, b]|195|true|true|true|true|[]
-identity=2|true|false|2|false|true
+hashMapDifferential=SetFromMap|[a, b]|[a, b]|195|true|2|true|true|true|true|ConcurrentModificationException|null|ConcurrentModificationException|null|IllegalArgumentException|Map is non-empty|[x, y, z]|{x=true, y=true, z=true}
+linkedMapDifferential=SetFromMap|[b, a]|[b, a]|195|true|2|true|true|true|true|ConcurrentModificationException|null|ConcurrentModificationException|null|IllegalArgumentException|Map is non-empty|[x, y, z]|{x=true, y=true, z=true}
 duplicate=IllegalArgumentException|Map is non-empty
-weak=java.util.Collections$SetFromMap
-concurrent=java.util.Collections$SetFromMap
 nullMap=NullPointerException|Cannot invoke "java.util.Map.isEmpty()" because "map" is null

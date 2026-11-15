@@ -8020,9 +8020,9 @@ impl Host for StdHost {
                 if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
                     return answer;
                 }
-            }
-            if let Some(answer) = self.set_from_map_member(r, marker, args) {
-                return answer;
+                if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                    return answer;
+                }
             }
             if r.name == "removeIf"
                 && r.descriptor == "(Ljava/util/function/Predicate;)Z"

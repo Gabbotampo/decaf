@@ -565,6 +565,15 @@ impl<H: Host> Runtime<'_, H> {
     /// that would show an unknown order, and answer the members that look a
     /// key up. `args[0]` may be replaced by the stored key it `equals`
     /// (`compute*`/`merge`), for the rest of the dispatch to find.
+    fn refresh_set_from_map(&mut self, value: &Value) -> Result<(), NativeError> {
+        if self.host.is_set_from_map(value)
+            && let Some(map) = self.host.set_from_map_source(value)
+        {
+            self.resync_hash_table(&map)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn invoke_hash_collection(
         &mut self,
         r: &MethodRef,
@@ -572,6 +581,25 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &mut [Value],
     ) -> Result<Option<Value>, NativeError> {
+        // A SetFromMap's order is its backing HashMap/LinkedHashMap's order.
+        // Refresh the table for both the receiver and any collection argument,
+        // so copying/printing the view sees the same live order as the map.
+        if let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb7 | 0xb9)) {
+            self.refresh_set_from_map(receiver)?;
+        }
+        for arg in args.iter() {
+            self.refresh_set_from_map(arg)?;
+        }
+        if let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb7 | 0xb9))
+            && self.host.is_set_from_map(receiver)
+            && matches!(r.name.as_str(), "removeIf" | "retainAll")
+        {
+            // Set's default removeIf/retainAll walks an iterator. The host
+            // can answer these two live-view operations directly, preserving
+            // write-through to the backing map instead of mutating a detached
+            // iterator row.
+            return self.host.invoke_instance(r, receiver, args).map(Some);
+        }
         if let Some(answer) = self.map_view_copy(r, opcode, receiver, args)? {
             return Ok(answer);
         }

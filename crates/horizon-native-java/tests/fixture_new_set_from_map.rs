@@ -8,7 +8,9 @@ use horizon_native_java::StdHost;
 const PROBE: &str = r#"package demo;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 public final class Probe {
+  enum Key { A }
   static String ex(Runnable r) { try { r.run(); return "ok"; } catch (Throwable t) { return t.getClass().getSimpleName()+"|"+t.getMessage(); } }
   public static String basic() {
     Map<String,Boolean> m = new LinkedHashMap<>(); Set<String> s = Collections.newSetFromMap(m);
@@ -17,15 +19,37 @@ public final class Probe {
     boolean rem=s.remove("a"); m.remove("b");
     return before+"|"+rem+"|"+s.isEmpty()+"|"+m.isEmpty()+"|"+s;
   }
-  public static String identity() {
-    Map<Object,Boolean> m = new IdentityHashMap<>(); Set<Object> s = Collections.newSetFromMap(m);
-    Object x=new Object(), y=new Object(); s.add(x); s.add(y);
-    return s.size()+"|"+s.contains(x)+"|"+s.contains(new Object())+"|"+m.size()+"|"+s.equals(Set.of(x))+"|"+s.toString().startsWith("[");
+  static String differential(boolean linked) {
+    Map<String,Boolean> m = linked ? new LinkedHashMap<>() : new HashMap<>();
+    Set<String> s = Collections.newSetFromMap(m);
+    s.add("b"); s.add("a");
+    String iter = new ArrayList<>(s).toString();
+    String before = s.getClass().getSimpleName()+"|"+iter+"|"+s.toString()+"|"+s.hashCode()+"|"+s.equals(new HashSet<>(List.of("a","b")))+"|"+m.size();
+    boolean retained = s.retainAll(List.of("a"));
+    boolean retainedWrites = m.size()==1 && m.containsKey("a") && !m.containsKey("b");
+    boolean removed = s.removeIf("a"::equals);
+    boolean removedWrites = m.isEmpty() && s.isEmpty();
+    m.put("x", true);
+    Iterator<String> mapIt = s.iterator();
+    m.put("y", true);
+    String cmeMap = ex(mapIt::next);
+    Iterator<String> setIt = s.iterator();
+    s.add("z");
+    String cmeSet = ex(setIt::next);
+    String nonEmpty = ex(() -> Collections.newSetFromMap(m));
+    return before+"|"+retained+"|"+retainedWrites+"|"+removed+"|"+removedWrites+"|"+cmeMap+"|"+cmeSet+"|"+nonEmpty+"|"+s+"|"+m;
   }
+  public static String hashMapDifferential() { return differential(false); }
+  public static String linkedMapDifferential() { return differential(true); }
   public static String duplicate() { Map<String,Boolean> m=new HashMap<>(); m.put("x",true); return ex(()->Collections.newSetFromMap(m)); }
   public static String nullMap() { return ex(()->Collections.newSetFromMap(null)); }
-  public static String weak() { return Collections.newSetFromMap(new WeakHashMap<>()).getClass().getName(); }
-  public static String concurrent() { return Collections.newSetFromMap(new ConcurrentHashMap<>()).getClass().getName(); }
+  public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
+  public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
+  public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
+  public static String skipList() { return ex(()->Collections.newSetFromMap(new ConcurrentSkipListMap<>())); }
+  public static String tree() { return ex(()->Collections.newSetFromMap(new TreeMap<>())); }
+  public static String enumMap() { return ex(()->Collections.newSetFromMap(new EnumMap<Key,Boolean>(Key.class))); }
+  public static String hashtable() { return ex(()->Collections.newSetFromMap(new Hashtable<>())); }
 }
 "#;
 
@@ -45,7 +69,13 @@ fn expected(name: &str) -> &str {
 #[test]
 fn linked_map_view_is_live_and_matches_set_contracts() {
     let fixture = fixture();
-    for method in ["basic", "identity", "duplicate", "nullMap"] {
+    for method in [
+        "basic",
+        "duplicate",
+        "nullMap",
+        "hashMapDifferential",
+        "linkedMapDifferential",
+    ] {
         assert_eq!(fixture.text(method), expected(method), "{method}");
     }
 }
@@ -54,9 +84,24 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
 fn unsupported_map_implementations_are_counted() {
     let fixture = fixture();
     let mut host = fixture.jar.seed_host(StdHost::new());
-    fixture.text_on(&mut host, "weak");
-    fixture.text_on(&mut host, "concurrent");
-    assert!(host.unknown_host_calls().iter().any(|(call, _)| {
-        call == "java/util/Collections#newSetFromMap(Ljava/util/Map;)Ljava/util/Set;"
-    }));
+    for method in [
+        "identity",
+        "weak",
+        "concurrent",
+        "skipList",
+        "tree",
+        "enumMap",
+        "hashtable",
+    ] {
+        fixture.text_on(&mut host, method);
+    }
+    let factory = "java/util/Collections#newSetFromMap(Ljava/util/Map;)Ljava/util/Set;";
+    assert_eq!(
+        host.unknown_host_calls()
+            .iter()
+            .find_map(|(call, count)| (call == factory).then_some(*count)),
+        Some(7),
+        "unsupported map implementations must remain counted: {:?}",
+        host.unknown_host_calls()
+    );
 }

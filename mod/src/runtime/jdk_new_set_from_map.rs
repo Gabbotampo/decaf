@@ -1,7 +1,7 @@
 //! Exact bounded model of `Collections.newSetFromMap` over the host's
 //! existing mutable collection handles.
 
-use crate::runtime::{Host, MethodRef, NativeError, StdHost, Value, expect_ref};
+use crate::runtime::{Boxed, Host, MethodRef, NativeError, StdHost, Value, expect_ref};
 
 const SET_CLASS: &str = "java/util/Collections$SetFromMap";
 
@@ -38,13 +38,10 @@ impl StdHost {
             }));
         }
         let class = map.split_once('#').map_or(map.as_str(), |(class, _)| class);
-        if matches!(
-            class,
-            "java/util/WeakHashMap"
-                | "java/util/concurrent/ConcurrentHashMap"
-                | "java/util/concurrent/ConcurrentSkipListMap"
-                | "java/util/TreeMap"
-        ) {
+        // `SetFromMap` delegates every operation to the map. The bounded host
+        // can prove the exact order/equality/mod-count contract only for these
+        // two map implementations; every other Map stays counted (#316).
+        if !matches!(class, "java/util/HashMap" | "java/util/LinkedHashMap") {
             return None;
         }
         let marker = crate::runtime::jar_object::collection_key_for(
@@ -93,7 +90,11 @@ impl StdHost {
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
             };
-            if matches!(result, Value::Int(flag) if flag != 0) {
+            if matches!(
+                result,
+                Value::Int(flag) if flag != 0
+            ) || matches!(result, Value::Boxed(Boxed::Boolean(true)))
+            {
                 removed.push(key);
             }
         }
@@ -143,41 +144,27 @@ impl StdHost {
     pub(crate) fn set_from_map_member(
         &mut self,
         r: &MethodRef,
-        marker: &str,
+        receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        let map = self.set_from_map_views.get(marker)?.clone();
-        let identity = map
-            .split_once('#')
-            .map(|(class, _)| class == "java/util/IdentityHashMap")
-            .unwrap_or(false);
-        let values = self.mutable_collections.get_mut(&map)?;
-        let identity_equal = |left: &Value, right: &Value| -> Option<bool> {
-            match (left, right) {
-                (Value::Host(left), Value::Host(right)) => left.same_object(right),
-                (Value::Ref(None), Value::Ref(None)) => Some(true),
-                _ => None,
-            }
+        // The table is keyed by the host handle's identity. A String spelling
+        // the key is deliberately rejected before this lookup (#156 P12b).
+        let Value::Host(handle) = receiver else {
+            return None;
         };
+        if handle.kind() != crate::runtime::host_ref::HostKind::Collection {
+            return None;
+        }
+        let map = self.set_from_map_views.get(handle.key())?.clone();
+        let values = self.mutable_collections.get_mut(&map)?;
         let position = |values: &[Value], key: &Value| -> Option<Option<usize>> {
-            if identity {
-                for (index, pair) in values.as_chunks::<2>().0.iter().enumerate() {
-                    match identity_equal(&pair[0], key) {
-                        Some(true) => return Some(Some(index)),
-                        Some(false) => {}
-                        None => return None,
-                    }
-                }
-                Some(None)
-            } else {
-                Some(
-                    values
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .position(|pair| pair[0] == *key),
-                )
-            }
+            Some(
+                values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|pair| pair[0] == *key),
+            )
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
@@ -188,7 +175,7 @@ impl StdHost {
                 if position.is_some() {
                     return Some(Ok(Value::Int(0)));
                 }
-                values.extend([key, Value::Int(1)]);
+                values.extend([key, Value::Boxed(Boxed::Boolean(true))]);
                 Some(Ok(Value::Int(1)))
             }
             ("remove", "(Ljava/lang/Object;)Z") => {
@@ -232,4 +219,52 @@ pub(crate) fn is_set_value(value: &Value) -> bool {
         .split_once('#')
         .map_or(marker.as_str(), |(class, _)| class);
     class == "set" || crate::runtime::is_set_owner(class)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::host_ref::HostKind;
+    use crate::runtime::jar_object::{self, CollectionFamily};
+    use crate::runtime::{Host, MethodRef, StdHost, Value};
+
+    fn factory() -> MethodRef {
+        MethodRef {
+            owner: "java/util/Collections".into(),
+            name: "newSetFromMap".into(),
+            descriptor: "(Ljava/util/Map;)Ljava/util/Set;".into(),
+        }
+    }
+
+    #[test]
+    fn a_string_spelling_the_exact_set_marker_cannot_mutate_the_backing_map() {
+        let mut host = StdHost::new();
+        let map_key =
+            jar_object::collection_key_for("java/util/HashMap", CollectionFamily::Neutral, 9001);
+        host.mutable_collections.insert(map_key.clone(), Vec::new());
+        let map = jar_object::collection(map_key.clone());
+        let set = host
+            .new_set_from_map(&factory(), std::slice::from_ref(&map))
+            .expect("HashMap is supported")
+            .expect("empty backing map succeeds");
+        let (marker, handle_kind) = match &set {
+            Value::Host(handle) => (handle.key().to_owned(), handle.kind()),
+            other => panic!("expected host set, got {other:?}"),
+        };
+        assert_eq!(handle_kind, HostKind::Collection);
+        let forged = Value::Ref(Some(marker.clone()));
+        let add = MethodRef {
+            owner: "java/util/Set".into(),
+            name: "add".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        let _ = host
+            .invoke_instance(&add, &forged, &[Value::Ref(Some("forged".into()))])
+            .expect("the forged String remains an ordinary counted receiver");
+        assert!(host.mutable_collections.get(&map_key).unwrap().is_empty());
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call == "java/util/Set#add(Ljava/lang/Object;)Z")
+        );
+    }
 }
