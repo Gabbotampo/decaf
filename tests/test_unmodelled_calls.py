@@ -45,9 +45,10 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual({pair: oracle.cache[pair] for pair in valid},
                          {pair: answer for pair, answer in self.FABRIC_REVIEW_PAIRS.items()
                           if answer is not None})
-        with self.assertRaises(TOOL.FabricOracleUnavailable):
-            oracle.evaluate({pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items()
-                             if answer is None})
+        invalid = {pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items() if answer is None}
+        oracle.evaluate(invalid)
+        self.assertFalse(oracle.cache[next(iter(invalid))])
+        self.assertTrue(oracle.parse_errors)
     def test_aggregate_counts_jars_calls_and_sole_rows(self):
         corpora = {
             "wide": [

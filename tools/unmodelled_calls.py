@@ -73,6 +73,7 @@ class FabricPredicateOracle:
     def __init__(self, loader: Path):
         self.loader = loader
         self.cache: dict[tuple[str, str], bool] = {}
+        self.parse_errors: dict[tuple[str, str], str] = {}
         self.java = shutil.which("java")
         self.javac = shutil.which("javac")
         if not self.java or not self.javac:
@@ -117,10 +118,10 @@ class FabricPredicateOracle:
             raise FabricOracleUnavailable("Fabric predicate oracle returned the wrong number of answers")
         for pair, answer in zip(pending, answers):
             if "error" in answer:
-                raise FabricOracleUnavailable(
-                    f"Fabric predicate parse error for {pair[0]!r}: {answer['error']}"
-                )
-            self.cache[pair] = bool(answer.get("ok"))
+                self.parse_errors[pair] = str(answer["error"])
+                self.cache[pair] = False
+            else:
+                self.cache[pair] = bool(answer.get("ok"))
 
     def matches(self, version: str, predicates: tuple[str, ...]) -> bool:
         pairs = {(predicate, version) for predicate in predicates}
