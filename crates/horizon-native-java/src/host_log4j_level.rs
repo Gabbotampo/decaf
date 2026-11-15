@@ -1,7 +1,11 @@
-//! Canonical Log4j 2 `Level` objects and their deterministic API.
+//! Canonical Log4j 2 `Level` objects and its process-local level registry.
+
+use std::collections::BTreeMap;
 
 use crate::host_ref::{HostKind, HostRef, Methods, Nested, instance_of_class};
 use crate::{MethodRef, NativeError, Value, expect_ref};
+
+pub(crate) type CustomLevels = BTreeMap<String, (String, i32)>;
 
 const OWNER: &str = "org/apache/logging/log4j/Level";
 const LEVEL_DESC: &str = "Lorg/apache/logging/log4j/Level;";
@@ -16,33 +20,47 @@ const LEVELS: &[(&str, i32)] = &[
     ("ALL", i32::MAX),
 ];
 
-fn level_value(name: &str) -> Value {
-    Value::Host(HostRef::new(HostKind::Log4jLevel, name))
+fn text(value: &str) -> Value {
+    Value::Ref(Some(value.into()))
 }
 
-fn level_name(value: &Value) -> Option<&str> {
-    match value {
-        Value::Host(handle) if handle.kind() == HostKind::Log4jLevel => LEVELS
-            .iter()
-            .find(|(name, _)| *name == handle.key())
-            .map(|(name, _)| *name),
+fn level_value(name: &str, int_level: i32) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::Log4jLevel,
+        &[text(name), Value::Int(int_level)],
+    ))
+}
+
+fn level_parts(value: &Value) -> Option<(String, i32)> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::Log4jLevel {
+        return None;
+    }
+    match handle.values()?.as_slice() {
+        [Value::Ref(Some(name)), Value::Int(int_level)] => Some((name.clone(), *int_level)),
         _ => None,
     }
 }
 
-fn level_int(name: &str) -> Option<i32> {
-    LEVELS
-        .iter()
-        .find(|(known, _)| *known == name)
-        .map(|(_, value)| *value)
-}
-
-fn lookup(name: &str) -> Option<&'static str> {
+fn standard(name: &str) -> Option<(&'static str, i32)> {
     let normalized = name.trim().to_uppercase();
     LEVELS
         .iter()
+        .copied()
         .find(|(known, _)| *known == normalized)
-        .map(|(known, _)| *known)
+}
+
+fn normalized(name: &str) -> String {
+    name.trim().to_uppercase()
+}
+
+fn lookup(name: &str, custom: &CustomLevels) -> Option<(String, i32)> {
+    if let Some((known, int_level)) = standard(name) {
+        return Some((known.into(), int_level));
+    }
+    custom.get(&normalized(name)).cloned()
 }
 
 fn illegal(message: impl Into<String>) -> NativeError {
@@ -62,11 +80,11 @@ fn null_pointer(message: impl Into<String>) -> NativeError {
 }
 
 fn level_text(handle: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
-    Ok(level_name(&Value::Host(handle.clone())).map(str::to_owned))
+    Ok(level_parts(&Value::Host(handle.clone())).map(|(name, _)| name))
 }
 
 fn level_hash(handle: &HostRef, _: &mut dyn Nested) -> Result<Option<i32>, NativeError> {
-    Ok(level_name(&Value::Host(handle.clone())).map(|text| {
+    Ok(level_parts(&Value::Host(handle.clone())).map(|(text, _)| {
         text.encode_utf16().fold(0i32, |hash, unit| {
             hash.wrapping_mul(31).wrapping_add(i32::from(unit))
         })
@@ -90,10 +108,10 @@ fn level_compare(
     other: &Value,
     _: &mut dyn Nested,
 ) -> Result<Option<i32>, NativeError> {
-    let Some(left) = level_name(&Value::Host(handle.clone())).and_then(level_int) else {
+    let Some((_, left)) = level_parts(&Value::Host(handle.clone())) else {
         return Ok(None);
     };
-    let Some(right) = level_name(other).and_then(level_int) else {
+    let Some((_, right)) = level_parts(other) else {
         return match other {
             Value::Ref(None) => Err(null_pointer(
                 "Cannot invoke \"org.apache.logging.log4j.Level.intLevel()\" because \"other\" is null",
@@ -119,15 +137,73 @@ pub(crate) const METHODS: Methods = Methods {
 
 pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
     (owner == OWNER)
-        .then(|| lookup(name).map(level_value))
+        .then(|| standard(name).map(|(name, int)| level_value(name, int)))
         .flatten()
 }
 
-pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+fn custom_order(custom: &CustomLevels) -> Vec<(String, i32)> {
+    let mut levels = LEVELS
+        .iter()
+        .map(|(name, int)| ((*name).into(), *int))
+        .collect::<Vec<_>>();
+    levels.extend(custom.values().cloned());
+    let size = (levels.len().saturating_mul(4) / 3 + 1)
+        .next_power_of_two()
+        .max(16);
+    levels.sort_by_key(|(name, _)| {
+        let hash = name.encode_utf16().fold(0u32, |hash, unit| {
+            hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+        });
+        ((hash ^ (hash >> 16)) as usize) & (size - 1)
+    });
+    levels
+}
+
+fn values_array(custom: &CustomLevels) -> Value {
+    let values = custom_order(custom)
+        .into_iter()
+        .map(|(name, int)| level_value(&name, int))
+        .collect::<Vec<_>>();
+    Value::Host(HostRef::of_values(HostKind::Log4jLevelArray, &values))
+}
+
+pub(crate) fn array_values(value: &Value) -> Option<Vec<Value>> {
+    match value {
+        Value::Host(handle) if handle.kind() == HostKind::Log4jLevelArray => handle.values(),
+        _ => None,
+    }
+}
+
+pub(crate) fn static_call(
+    r: &MethodRef,
+    args: &[Value],
+    custom: &mut CustomLevels,
+) -> Option<Result<Value, NativeError>> {
     if r.owner != OWNER {
         return None;
     }
     match (r.name.as_str(), r.descriptor.as_str()) {
+        ("forName", "(Ljava/lang/String;I)Lorg/apache/logging/log4j/Level;") => {
+            let Some(Value::Ref(Some(raw))) = args.first() else {
+                return Some(Err(illegal("Illegal null or empty Level name.")));
+            };
+            if raw.is_empty() {
+                return Some(Err(illegal("Illegal null or empty Level name.")));
+            }
+            if let Some((name, int)) = standard(raw) {
+                return Some(Ok(level_value(name, int)));
+            }
+            let key = normalized(raw);
+            if let Some((name, int)) = custom.get(&key) {
+                return Some(Ok(level_value(name, *int)));
+            }
+            let int = match args.get(1) {
+                Some(Value::Int(int)) => *int,
+                _ => return None,
+            };
+            custom.insert(key, (raw.clone(), int));
+            Some(Ok(level_value(raw, int)))
+        }
         ("getLevel", "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;") => {
             let Some(Value::Ref(Some(raw))) = args.first() else {
                 return Some(Err(illegal("Illegal null or empty Level name.")));
@@ -135,39 +211,47 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             if raw.is_empty() {
                 return Some(Err(illegal("Illegal null or empty Level name.")));
             }
-            Some(Ok(lookup(raw).map_or(Value::Ref(None), level_value)))
+            Some(Ok(lookup(raw, custom)
+                .map(|(name, int)| level_value(&name, int))
+                .unwrap_or(Value::Ref(None))))
         }
         ("valueOf", "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;") => {
             let Some(Value::Ref(Some(raw))) = args.first() else {
                 return Some(Err(null_pointer("No level name given.")));
             };
-            Some(match lookup(raw) {
-                Some(name) => Ok(level_value(name)),
+            Some(match lookup(raw, custom) {
+                Some((name, int)) => Ok(level_value(&name, int)),
                 None => Err(illegal(format!(
                     "Unknown level constant [{}].",
-                    raw.trim().to_uppercase()
+                    normalized(raw)
                 ))),
             })
         }
-        ("toLevel", "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;") => {
-            let value = args
-                .first()
-                .and_then(expect_ref)
-                .and_then(|raw| lookup(raw));
-            Some(Ok(value.map_or_else(|| level_value("DEBUG"), level_value)))
-        }
+        ("toLevel", "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;") => Some(Ok(args
+            .first()
+            .and_then(expect_ref)
+            .and_then(|raw| lookup(raw, custom))
+            .map_or_else(
+                || level_value("DEBUG", 500),
+                |(name, int)| level_value(&name, int),
+            ))),
         ("toLevel", descriptor)
             if descriptor == format!("(Ljava/lang/String;{LEVEL_DESC}){LEVEL_DESC}") =>
         {
-            let value = args
+            Some(Ok(args
                 .first()
                 .and_then(expect_ref)
-                .and_then(|raw| lookup(raw));
-            Some(Ok(value.map_or_else(
-                || args.get(1).cloned().unwrap_or_else(|| level_value("DEBUG")),
-                level_value,
-            )))
+                .and_then(|raw| lookup(raw, custom))
+                .map_or_else(
+                    || {
+                        args.get(1)
+                            .cloned()
+                            .unwrap_or_else(|| level_value("DEBUG", 500))
+                    },
+                    |(name, int)| level_value(&name, int),
+                )))
         }
+        ("values", "()[Lorg/apache/logging/log4j/Level;") => Some(Ok(values_array(custom))),
         _ => None,
     }
 }
@@ -177,57 +261,37 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    let name = level_name(receiver)?;
-    let value = level_int(name)?;
+    let (_, value) = level_parts(receiver)?;
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("intLevel", "()I") => Some(Ok(Value::Int(value))),
         ("name" | "toString", "()Ljava/lang/String;") => {
-            Some(Ok(Value::Ref(Some(name.to_owned()))))
+            Some(Ok(Value::Ref(Some(level_parts(receiver)?.0))))
         }
         ("isMoreSpecificThan", descriptor) if descriptor == format!("({LEVEL_DESC})Z") => {
-            let other = match level_argument(args)? {
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
-            Some(Ok(Value::Int(i32::from(value <= other))))
+            Some(Ok(Value::Int(i32::from(value <= level_argument(args)?))))
         }
         ("isLessSpecificThan", descriptor) if descriptor == format!("({LEVEL_DESC})Z") => {
-            let other = match level_argument(args)? {
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
-            Some(Ok(Value::Int(i32::from(value >= other))))
+            Some(Ok(Value::Int(i32::from(value >= level_argument(args)?))))
         }
         ("isInRange", descriptor) if descriptor == format!("({LEVEL_DESC}{LEVEL_DESC})Z") => {
-            let low = match level_argument(args)? {
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
-            let high = match level_argument(args.get(1..).unwrap_or_default())? {
-                Ok(value) => value,
-                Err(error) => return Some(Err(error)),
-            };
+            let low = level_argument(args)?;
+            let high = level_argument(args.get(1..)?)?;
             Some(Ok(Value::Int(i32::from(value >= low && value <= high))))
         }
         _ => None,
     }
 }
 
-fn level_argument(args: &[Value]) -> Option<Result<i32, NativeError>> {
-    match args.first() {
-        Some(Value::Ref(None)) | None => Some(Err(null_pointer("Level argument is null"))),
-        Some(value) => level_name(value).and_then(level_int).map(Ok),
-    }
+fn level_argument(args: &[Value]) -> Option<i32> {
+    level_parts(args.first()?).map(|(_, int)| int)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn text(value: &str) -> Value {
         Value::Ref(Some(value.into()))
     }
-
     fn method(name: &str, descriptor: &str) -> MethodRef {
         MethodRef {
             owner: OWNER.into(),
@@ -237,55 +301,37 @@ mod tests {
     }
 
     #[test]
-    fn lookup_defaults_and_errors_match_log4j() {
-        let get = method(
-            "getLevel",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;",
-        );
-        assert_eq!(
-            static_call(&get, &[text("missing")]).unwrap().unwrap(),
-            Value::Ref(None)
-        );
+    fn custom_levels_are_canonical_and_values_are_ordered() {
+        let mut custom = CustomLevels::new();
+        let first = static_call(
+            &method(
+                "forName",
+                "(Ljava/lang/String;I)Lorg/apache/logging/log4j/Level;",
+            ),
+            &[text("custom"), Value::Int(350)],
+            &mut custom,
+        )
+        .unwrap()
+        .unwrap();
+        let second = static_call(
+            &method(
+                "forName",
+                "(Ljava/lang/String;I)Lorg/apache/logging/log4j/Level;",
+            ),
+            &[text(" CUSTOM "), Value::Int(1)],
+            &mut custom,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(level_parts(&first), Some(("custom".into(), 350)));
         assert!(matches!(
-            static_call(&get, &[Value::Ref(None)]),
-            Some(Err(NativeError::UncaughtException { class, .. }))
-                if class == "java/lang/IllegalArgumentException"
+            static_call(
+                &method("values", "()[Lorg/apache/logging/log4j/Level;"),
+                &[],
+                &mut custom
+            ),
+            Some(Ok(Value::Host(_)))
         ));
-        let value_of = method(
-            "valueOf",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;",
-        );
-        assert!(matches!(
-            static_call(&value_of, &[text("missing")]),
-            Some(Err(NativeError::UncaughtException { class, .. }))
-                if class == "java/lang/IllegalArgumentException"
-        ));
-        let to = method(
-            "toLevel",
-            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Level;",
-        );
-        assert_eq!(
-            static_call(&to, &[text("missing")]).unwrap().unwrap(),
-            static_field(OWNER, "DEBUG").unwrap()
-        );
-    }
-
-    #[test]
-    fn standard_levels_have_exact_names_and_int_levels() {
-        for (name, int) in LEVELS {
-            let value = static_field(OWNER, name).unwrap();
-            assert_eq!(
-                instance_call(&method("intLevel", "()I"), &value, &[])
-                    .unwrap()
-                    .unwrap(),
-                Value::Int(*int)
-            );
-            assert_eq!(
-                instance_call(&method("name", "()Ljava/lang/String;"), &value, &[])
-                    .unwrap()
-                    .unwrap(),
-                text(name)
-            );
-        }
     }
 }

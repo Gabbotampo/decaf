@@ -144,9 +144,6 @@ fn long_arg(args: &[Value], index: usize) -> Option<i64> {
 
 /// A static call the model answers, or `None` to leave it to the host.
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
-    if let Some(value) = crate::runtime::host_log4j_level::static_call(r, args) {
-        return Some(value);
-    }
     if let Some(collector) = to_map_collector(r, args) {
         return Some(Ok(collector));
     }

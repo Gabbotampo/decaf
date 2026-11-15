@@ -16,6 +16,7 @@ public final class Level implements Comparable<Level> {
   public int compareTo(Level x){return 0;}
   public static Level getLevel(String x){return null;} public static Level valueOf(String x){return null;}
   public static Level toLevel(String x){return null;} public static Level toLevel(String x,Level d){return null;}
+  public static Level forName(String x,int i){return null;} public static Level[] values(){return null;}
 }
 "#;
 const PROBE: &str = r#"
@@ -26,12 +27,15 @@ public final class Probe {
     Level info=Level.INFO, error=Level.ERROR;
     String forged="l4lvl:INFO";
     String strict; try { Level.valueOf("missing"); strict="no"; } catch (IllegalArgumentException e) { strict="yes"; }
+    Level custom=Level.forName("custom",350), repeat=Level.forName(" CUSTOM ",1);
+    StringBuilder order=new StringBuilder(); for(Level level:Level.values()) order.append(level.name()).append(":").append(level.intLevel()).append(",");
     return (info==Level.valueOf(" info "))+"|"+info.name()+"|"+info.intLevel()+"|"+info.toString()
       +"|"+error.isMoreSpecificThan(info)+"|"+info.isLessSpecificThan(error)
       +"|"+error.isInRange(Level.ERROR,Level.DEBUG)+"|"+error.compareTo(info)
       +"|"+(Level.getLevel("missing")==null)+"|"+Level.toLevel("missing").toString()
       +"|"+Level.toLevel(null,Level.WARN).toString()+"|"+strict
-      +"|"+forged.getClass().getName()+"|"+forged.equals("l4lvl:INFO");
+      +"|"+custom.name()+"|"+custom.intLevel()+"|"+(custom==repeat)+"|"+(Level.valueOf("custom")==custom)
+      +"|"+order+"|"+forged.getClass().getName()+"|"+forged.equals("l4lvl:INFO");
   }
 }
 "#;
@@ -39,7 +43,7 @@ public final class Probe {
 #[test]
 fn real_log4j_level_surface_matches_java25_oracle() {
     // Java 25.0.5 + Log4j API 2.26.0 output:
-    // true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|java.lang.String|true
+    // true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|custom|350|true|true|TRACE:600,ALL:2147483647,custom:350,ERROR:200,INFO:400,FATAL:100,DEBUG:500,OFF:0,WARN:300,|java.lang.String|true
     let fixture = Fixture::build(
         "log4j-levels",
         &[
@@ -49,6 +53,6 @@ fn real_log4j_level_surface_matches_java25_oracle() {
     );
     assert_eq!(
         fixture.text("levels"),
-        "true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|java.lang.String|true"
+        "true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|custom|350|true|true|TRACE:600,ALL:2147483647,custom:350,ERROR:200,INFO:400,FATAL:100,DEBUG:500,OFF:0,WARN:300,|java.lang.String|true"
     );
 }
