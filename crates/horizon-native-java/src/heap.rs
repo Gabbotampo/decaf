@@ -355,6 +355,9 @@ impl StdHost {
         push(self.iterator_guards.get(marker), out);
         push(self.collection_comparators.get(marker), out);
         push(self.references.get(marker), out);
+        if self.random_sources.contains_key(marker) {
+            out.push(format!("{:?}", self.random_sources.get(marker)));
+        }
         push(self.throwable_causes.get(marker), out);
         push(self.throwable_suppressed.get(marker), out);
         push(self.hash_tables.get(marker), out);
@@ -381,6 +384,7 @@ impl StdHost {
             .chain(self.iterator_guards.keys())
             .chain(self.collection_comparators.keys())
             .chain(self.references.keys())
+            .chain(self.random_sources.keys())
             .chain(self.throwable_causes.keys())
             .chain(self.throwable_suppressed.keys())
             .chain(self.throwable_messages.keys())
@@ -407,6 +411,7 @@ impl StdHost {
         self.iterator_guards.retain(|key, _| keep(key));
         self.collection_comparators.retain(|key, _| keep(key));
         self.references.retain(|key, _| keep(key));
+        self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
@@ -474,6 +479,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
 }
@@ -667,6 +673,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
             .chain(host.enumerations.keys().map(String::as_str))
             .chain(host.component_states.keys().map(String::as_str))
@@ -1326,6 +1333,7 @@ mod tests {
             "holders",
             "holder_rows",
             "mutable_collections",
+            "random_sources",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",

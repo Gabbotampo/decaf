@@ -184,6 +184,10 @@ mod server_values;
 mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
+mod random_source;
+#[cfg(test)]
+#[path = "random_source_tests.rs"]
+mod random_source_tests;
 mod reference_identity;
 mod references;
 mod reflect_constructors;
@@ -2317,6 +2321,10 @@ pub trait Host {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
 
+    fn random_new(&mut self, _class: &str) -> Option<Value> {
+        None
+    }
+
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
     /// (`jar_operands.rs`). A host that counts nothing errors instead.
@@ -3192,6 +3200,8 @@ pub struct StdHost {
     /// EMPTY_LIST` for `Collections.emptyList()`): its key, made on first use
     /// (`java_immutable.rs`).
     shared_empties: BTreeMap<&'static str, String>,
+    /// Explicitly seeded Minecraft RandomSource state, keyed by its host handle.
+    random_sources: BTreeMap<String, random_source::State>,
     /// The collections Java hands out as the same object on every call (a
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
@@ -3400,6 +3410,7 @@ impl StdHost {
             mutable_collections: collection_store::CollectionStore::default(),
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            random_sources: BTreeMap::new(),
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
@@ -5868,8 +5879,18 @@ impl Host for StdHost {
         }
     }
 
+    fn random_new(&mut self, class: &str) -> Option<Value> {
+        StdHost::random_new(self, class)
+    }
+
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         self.record(r, None, args);
+        if let Some(result) = self.random_static(r, args) {
+            return result;
+        }
+        if let Some(result) = random_source::bit_conversion(r, args) {
+            return result;
+        }
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
@@ -7164,6 +7185,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = self.random_instance(r, receiver, args) {
+            return result;
+        }
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
@@ -27137,7 +27161,11 @@ impl<H: Host> Runtime<'_, H> {
                             // and in this frame, so its failure is catchable
                             // at this instruction.
                             invoke_or_catch!(at, self.ensure_initialized(&created));
-                            stack.push(self.new_object(&created));
+                            let object = self
+                                .host
+                                .random_new(&created)
+                                .unwrap_or_else(|| self.new_object(&created));
+                            stack.push(object);
                         }
                         // A cancelled NEW leaves the reference descriptor's
                         // default (null) and makes the matching `<init>` skip.

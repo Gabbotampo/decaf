@@ -403,6 +403,8 @@ pub enum HostKind {
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
+    /// An explicitly seeded Minecraft RandomSource or positional factory.
+    RandomSource,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -760,6 +762,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::TypeToken,
         &crate::host_type_token::TOKEN_CLASS_SIDE,
     ),
+    (HostKind::RandomSource, &crate::random_source::CLASS_SIDE),
 ];
 
 /// One row of the kind table.
@@ -1922,6 +1925,13 @@ const KINDS: &[KindInfo] = &[
         // declared type alone, and two such handles prove nothing.
         canonical: crate::host_codec::opaque_canonical,
         methods: &crate::host_codec::OPAQUE_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RandomSource,
+        tag: "rand",
+        class: ClassRule::FromKey(crate::random_source::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::random_source::METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,
