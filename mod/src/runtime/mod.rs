@@ -3913,7 +3913,11 @@ impl StdHost {
     /// make this answerable are recorded and also return `None`, so the call
     /// goes on to the rest of the host.
     fn item_like_call(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
-        let marker = expect_ref(receiver)?.clone();
+        // Only objects the runtime actually allocated can be recorded as a
+        // mod's Item/Block.  Game handles (the P16 representation of
+        // vanilla Items/Blocks) are left for the game-object/client surface;
+        // a String that merely spells an object key is never an object.
+        let marker = jar_object::object_key(receiver)?.to_owned();
         if r.name == "<init>" {
             match r.owner.as_str() {
                 "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem" => {
@@ -3921,10 +3925,10 @@ impl StdHost {
                     if r.owner == "net/minecraft/world/item/BlockItem"
                         && r.descriptor
                             .starts_with("(Lnet/minecraft/world/level/block/Block;")
-                        && let Some(Value::Ref(Some(block))) = args.first()
+                        && let Some(block) = args.first().and_then(jar_object::instance_key)
                     {
                         self.block_items
-                            .entry(block.clone())
+                            .entry(block.to_owned())
                             .or_insert_with(|| receiver.clone());
                     }
                 }
@@ -3947,9 +3951,11 @@ impl StdHost {
         }
         if self.constructed_blocks.contains(&marker) {
             return Some(self.block_items.get(&marker).cloned().unwrap_or_else(|| {
-                Value::Ref(Some(
-                    "net/minecraft/world/item/Item#net/minecraft/world/item/Items.AIR".into(),
-                ))
+                if self.environment_type != "SERVER" {
+                    game_object::client_value("client/item/minecraft:air".into())
+                } else {
+                    game_object::server_value("game/item/minecraft:air".into())
+                }
             }));
         }
         None
@@ -31694,13 +31700,33 @@ mod tests {
             descriptor: "()Lnet/minecraft/world/item/Item;".into(),
         };
         let mut host = StdHost::new();
-        let diamond = Value::Ref(Some(
-            "net/minecraft/world/item/Item#net/minecraft/world/item/Items.DIAMOND".into(),
-        ));
+        let item = jar_object::handle("net/minecraft/world/item/Item#0".into());
+        host.invoke_instance(
+            &MethodRef {
+                owner: "net/minecraft/world/item/Item".into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/item/Item$Properties;)V".into(),
+            },
+            &item,
+            &[Value::Ref(None)],
+        )
+        .unwrap();
+        assert_eq!(host.invoke_instance(&as_item, &item, &[]).unwrap(), item);
+        host.begin_client_frame(
+            std::sync::Arc::new(crate::runtime::client_surface::ClientSnapshot::default()),
+            &[],
+        );
+        let diamond = game_object::client_value("client/item/minecraft:diamond".into());
         assert_eq!(
             host.invoke_instance(&as_item, &diamond, &[]).unwrap(),
             diamond
         );
+        let stone = game_object::client_value("client/block/minecraft:stone".into());
+        assert_eq!(
+            host.invoke_instance(&as_item, &stone, &[]).unwrap(),
+            game_object::client_value("client/item/minecraft:stone".into())
+        );
+        host.end_client_frame();
         let stranger = Value::Ref(Some("net/minecraft/world/level/block/Block#stone".into()));
         // An object it never saw built keeps the host's neutral answer for an
         // unmodelled call (null), as before, not a confident `Items.AIR`.

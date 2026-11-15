@@ -3,8 +3,9 @@
 //! `Block` answers the `BlockItem` built for it (vanilla's `Item.BY_BLOCK`), or
 //! `Items.AIR` when there is none, never null.
 
+use horizon_native_java::client_surface::ClientSnapshot;
 use horizon_native_java::{NativeJar, StdHost, Value};
-use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command, sync::Arc};
 use zip::write::SimpleFileOptions;
 
 fn javac() -> std::path::PathBuf {
@@ -140,6 +141,24 @@ public class Block implements net.minecraft.world.level.ItemLike {
 "#,
     );
     sources.insert(
+        "net/minecraft/world/item/Items.java",
+        r#"package net.minecraft.world.item;
+public final class Items {
+    public static final Item AIR = null;
+    public static final Item DIAMOND = null;
+    public static final Item STONE = null;
+}
+"#,
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/Blocks.java",
+        r#"package net.minecraft.world.level.block;
+public final class Blocks {
+    public static final Block STONE = null;
+}
+"#,
+    );
+    sources.insert(
         "demo/CabinetBlock.java",
         r#"package demo;
 public class CabinetBlock extends net.minecraft.world.level.block.Block {
@@ -152,12 +171,16 @@ public class CabinetBlock extends net.minecraft.world.level.block.Block {
         r#"package demo;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.ItemLike;
 public final class Main {
     public static void main() {
         Item plain = new Item(null);
         ItemLike asLike = plain;
         Probe.check("item", asLike.asItem() == plain);
+        Probe.check("vanilla-item", Items.DIAMOND.asItem() == Items.DIAMOND);
+        Probe.check("vanilla-block", Blocks.STONE.asItem() == Items.STONE);
         CabinetBlock cabinet = new CabinetBlock();
         BlockItem cabinetItem = new BlockItem(cabinet, null);
         Probe.check("block", cabinet.asItem() == cabinetItem);
@@ -177,18 +200,24 @@ public final class Main {
             "net/minecraft/world/item/Item.class",
             "net/minecraft/world/item/BlockItem.class",
             "net/minecraft/world/level/block/Block.class",
+            "net/minecraft/world/item/Items.class",
+            "net/minecraft/world/level/block/Blocks.class",
         ],
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let mut host = jar.seed_host(StdHost::new());
+    host.begin_client_frame(Arc::new(ClientSnapshot::default()), &[]);
     jar.execute("demo.Main", Some("main"), "main", &mut host)
         .unwrap();
+    host.end_client_frame();
     assert_eq!(
         checks(&host),
         BTreeMap::from([
             ("block".to_owned(), true),
             ("item".to_owned(), true),
             ("no-item".to_owned(), true),
+            ("vanilla-block".to_owned(), true),
+            ("vanilla-item".to_owned(), true),
         ])
     );
 }
