@@ -321,7 +321,7 @@ impl GsonStyle {
     }
 
     /// Whether a `toJson`/`fromJson` on this `Gson` must be a counted unknown.
-    pub(super) fn is_counted(&self) -> bool {
+    pub(crate) fn is_counted(&self) -> bool {
         self.counted
     }
 
@@ -759,7 +759,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// The style a builder or `Gson` receiver carries, or Gson's default.
-    pub(super) fn gson_style_of(&self, receiver: Option<&Value>) -> GsonStyle {
+    pub(crate) fn gson_style_of(&self, receiver: Option<&Value>) -> GsonStyle {
         receiver
             .and_then(expect_ref)
             .map_or_else(GsonStyle::default, |marker| self.gson_style(marker))
@@ -775,7 +775,7 @@ impl<H: Host> Runtime<'_, H> {
     /// Gson's `toJson` text for a modelled value, or `None` when the value has
     /// no honest JSON shape (an object the runtime does not own and cannot
     /// reflect over). The caller counts the call instead of writing fake text.
-    pub(super) fn gson_to_json(
+    pub(crate) fn gson_to_json(
         &mut self,
         value: &Value,
         style: &GsonStyle,
@@ -790,6 +790,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         let text = match value {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
+            // Arrays are reflected as JSON arrays, preserving primitive and
+            // reference elements exactly as Gson's TypeAdapterRuntimeTypeWrapper.
+            Value::Host(handle) if handle.kind() == crate::HostKind::Array => {
+                self.gson_array_text(&self.array(value)?.clone(), style, depth)?
+            }
             // A host model's object (`Optional`): Gson reflects its private
             // fields, which JDK 25's module system refuses; not answered.
             Value::Host(handle) if !crate::jar_object::is_object_handle(handle) => None,
@@ -837,11 +842,18 @@ impl<H: Host> Runtime<'_, H> {
             // A marker, or an object by its key (`jar_object.rs`).
             Value::Ref(Some(_)) | Value::Host(_) => {
                 let marker = expect_ref(value).map_or("", String::as_str);
-                // A jar enum constant serializes as its name.
-                if let Some(name) = marker
-                    .strip_prefix("enum/")
-                    .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
-                {
+                // A jar enum constant serializes as its name. The runtime's
+                // enum constructor table preserves the name for object handles.
+                let enum_name = self
+                    .enum_constants
+                    .get(crate::jar_object::object_key(value).unwrap_or_default())
+                    .map(|(name, _)| name.as_str())
+                    .or_else(|| {
+                        marker
+                            .strip_prefix("enum/")
+                            .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
+                    });
+                if let Some(name) = enum_name {
                     Some(format!("\"{}\"", style.escape(name)))
                 } else if let Some(kind) = gson_marker_kind(self.host, value) {
                     let values = runtime_collection_values(self.host, value)?;
@@ -958,7 +970,10 @@ impl<H: Host> Runtime<'_, H> {
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            members.push((style.field_name(&name), value));
+            members.push((
+                self.gson_field_name(&declaring, &name, &descriptor, style),
+                value,
+            ));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -981,6 +996,27 @@ impl<H: Host> Runtime<'_, H> {
         out.push_str(&style.line(depth));
         out.push('}');
         Ok(Some(out))
+    }
+
+    fn gson_field_name(
+        &self,
+        declaring: &str,
+        name: &str,
+        descriptor: &str,
+        style: &GsonStyle,
+    ) -> String {
+        let serialized = self
+            .class(declaring)
+            .into_iter()
+            .flat_map(|file| file.field_annotations(name, descriptor))
+            .find(|annotation| {
+                annotation.descriptor == "Lcom/google/gson/annotations/SerializedName;"
+            })
+            .and_then(|annotation| match annotation.values.get("value") {
+                Some(crate::AnnotationValue::String(value)) => Some(value.clone()),
+                _ => None,
+            });
+        serialized.unwrap_or_else(|| style.field_name(name))
     }
 
     /// Every declared field of `class` and its superclasses with its access
@@ -1063,12 +1099,12 @@ pub(super) fn non_executable_prefix(style: &GsonStyle) -> Option<&'static str> {
 /// A neutral marker names its kind directly; a `new`-backed marker is a class
 /// name whose list/set/map family decides how its pairs or elements serialize.
 fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
-    let marker = expect_ref(value)?;
+    let marker = expect_ref(value)
+        .map(String::as_str)
+        .or_else(|| crate::jar_object::object_key(value))?;
     if host.holds_collection(value) {
-        let class = marker
-            .split_once('#')
-            .map_or(marker.as_str(), |(class, _)| class);
-        return if is_map_owner(class) {
+        let class = marker.split_once('#').map_or(marker, |(class, _)| class);
+        return if is_map_owner(class) || class.contains("Map") {
             Some("map")
         } else {
             Some("list")
