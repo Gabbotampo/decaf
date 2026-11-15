@@ -1,0 +1,2 @@
+setup=ok
+check=122java.util.ImmutableCollections$MapN|{c=3}java.util.ImmutableCollections$Map1|[x, y, z]java.util.ImmutableCollections$ListNUOE|2truetruejava.util.ImmutableCollections$Set12|[1, 2, 3]java.util.ImmutableCollections$ListNUOE|[4, 5, 9]java.util.ArrayList|[6]java.util.ImmutableCollections$List12UOE|8false

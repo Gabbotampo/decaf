@@ -1,0 +1,9 @@
+surface=net.minecraft.core.NonNullList|java.util.AbstractList|TTF0TT
+subListClass=java.util.AbstractList$SubList
+subListSet=T
+subListAdd=UnsupportedOperationException
+subListClear=UnsupportedOperationException
+subListRemove=UnsupportedOperationException
+subListSetNull=NullPointerException
+listSubListSet=T
+listSubListClear=UnsupportedOperationException
