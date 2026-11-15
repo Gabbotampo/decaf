@@ -19,6 +19,7 @@ mod array_deque;
 mod array_store;
 mod array_views;
 mod attachment_codec;
+mod bigdecimal_slice;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -26,6 +27,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+pub mod client_frame;
 mod client_reload;
 pub mod client_surface;
 mod client_values;
@@ -102,6 +104,7 @@ mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
 mod host_log4j_level;
+mod host_map_entry;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
@@ -150,6 +153,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod kotlin_stdlib;
 mod lambda_boxing;
 mod library_dispatch;
 mod linked_resources;
@@ -2390,21 +2394,60 @@ pub trait Host {
         None
     }
 
+    /// The key and value of a host `Map.Entry` now (`host_map_entry.rs`); `None` for any
+    /// other value, or when the entry's contents are unknown.
+    fn map_entry_parts(&self, _value: &Value) -> Option<(Value, Value)> {
+        None
+    }
+
+    /// A host `Map.Entry`: a new holder or snapshot, or `map`'s node of `key`
+    /// (`host_map_entry.rs`). A host that keeps no entries answers one whose contents are
+    /// unknown.
+    fn mint_map_entry(
+        &mut self,
+        _map: Option<&Value>,
+        _key: &Value,
+        _value: &Value,
+        _made: host_map_entry::EntryMade,
+    ) -> Value {
+        host_map_entry::unknown_entry()
+    }
+
+    /// The entry an unmodifiable view's entry wraps (`host_map_entry.rs`, `Life::Wrapped`): what
+    /// `UnmodifiableCollection.toArray(IntFunction)` hands out, the source's own entry. `None` for
+    /// any other value.
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        let _ = entry;
+        None
+    }
+
+    /// [`Self::mint_map_entry`] over the pairs `[k, v, k, v...]` of `map`.
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        pairs
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [key, value] => Some(self.mint_map_entry(Some(map), key, value, made)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Before and after a call on the map `marker`: its entries follow it
+    /// (`host_map_entry.rs`).
+    fn entries_before_call(&mut self, _marker: &str, _name: &str, _args: &[Value]) {}
+
+    fn entries_after_call(&mut self, _marker: &str) {}
+
     /// The current elements of a mutable collection marker, when the host
     /// keeps one. Interpreter helpers that need a collection's contents run
     /// through the generic `Host` boundary, so the table is exposed here
     /// rather than only on [`StdHost`].
     fn mutable_collection_values(&self, _value: &Value) -> Option<Vec<Value>> {
-        None
-    }
-
-    /// Remember that a mutable map entry marker came from `map` and was
-    /// changed through `setValue`.
-    fn note_live_map_entry(&mut self, _entry: &str, _map: &str) {}
-
-    /// The current value behind a mutable map entry marker, after a live
-    /// entry's `setValue`; `None` for immutable entries or unknown maps.
-    fn live_map_entry_value(&self, _entry: &Value, _key: &Value, _old: &Value) -> Option<Value> {
         None
     }
 
@@ -2660,6 +2703,12 @@ pub trait Host {
     /// read through this query, which drains the bytes a `read` call would
     /// consume. A host that keeps no stream table keeps the default.
     fn resource_stream_text(&mut self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
         None
     }
 
@@ -3068,6 +3117,10 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Each vanilla block's full internal-name transitive class/interface closure
+    /// (`minecraft:fire` → `net/minecraft/world/level/block/FireBlock`, ...),
+    /// which a game host seeds from its prepared `block-behaviours.json`.
+    game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
     /// Objects a game `Item` constructor built (a mod's item subclasses
     /// included), and the `BlockItem` built for each block: vanilla's
     /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
@@ -3223,12 +3276,12 @@ pub struct StdHost {
     view_copies: BTreeMap<String, String>,
     /// Which view each copy is (`keySet`, `values`, `entrySet`).
     view_kinds: BTreeMap<String, String>,
-    /// Mutable map entries whose `setValue` has made them live views.
-    map_entry_sources: BTreeMap<String, String>,
     /// (language, country) of every `java.util.Locale` a jar constructed,
     /// keyed by its object marker. The static constants (`Locale.US`) need no
     /// row: their marker already spells the pair.
     locales: BTreeMap<String, (String, String)>,
+    /// The `Map.Entry` objects the host made, by handle key (`host_map_entry.rs`).
+    map_entries: host_map_entry::Entries,
     /// The two halves of every `new UUID(msb, lsb)` a jar constructed, keyed
     /// by its object key (`host_jdk_value.rs`).
     constructed_uuids: BTreeMap<String, (i64, i64)>,
@@ -3357,6 +3410,7 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            game_block_classes: Arc::default(),
             constructed_items: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
@@ -3415,8 +3469,8 @@ impl StdHost {
             probe_tables: BTreeMap::new(),
             view_copies: BTreeMap::new(),
             view_kinds: BTreeMap::new(),
-            map_entry_sources: BTreeMap::new(),
             locales: BTreeMap::new(),
+            map_entries: host_map_entry::Entries::default(),
             constructed_uuids: BTreeMap::new(),
             levels: Vec::new(),
             references: BTreeMap::new(),
@@ -3651,6 +3705,16 @@ impl StdHost {
             self.note_view_kind(&marker, view);
         }
         made
+    }
+
+    /// The `entrySet()` view the one view cache holds for the map stored as `map`
+    /// ([`Self::cached_collection`]); `None` before the first `entrySet()` or after the heap
+    /// collected it (`host_map_entry.rs` reads its handles and resets its layout).
+    pub(crate) fn entry_view_of(&self, map: &str) -> Option<&String> {
+        let identity = cache_identity(&jar_object::stored_value(map))?;
+        self.cached_collections
+            .get(&(identity, "entrySet".to_owned()))
+            .filter(|view| self.mutable_collections.contains_key(*view))
     }
 
     /// The one collection Java answers for `member` of `of` on every call (a
@@ -3927,6 +3991,13 @@ impl StdHost {
         classes: impl IntoIterator<Item = ClassFile>,
     ) -> Result<usize, NativeError> {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
+    }
+
+    /// Seed each vanilla block's full binary-name transitive class/interface closure, so
+    /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
+    pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
+        self.game_block_classes = classes;
+        self
     }
 
     /// ItemLike.asItem() as vanilla answers it, for objects whose game
@@ -4984,6 +5055,16 @@ impl StdHost {
                 }
                 Ok(None)
             }
+            // Vanilla subclass constructors carry class-specific arguments
+            // (BlockSetType, TreeGrower, base state, ...). Until each argument
+            // family is decoded exactly, keep the constructor counted.
+            owner
+                if r.name == "<init>"
+                    && owner != BLOCK_CLASS
+                    && owner.starts_with("net/minecraft/world/level/block/") =>
+            {
+                self.unknown_host_call(r).map(Some)
+            }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
                     return Ok(None);
@@ -5133,15 +5214,6 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
-    }
-
-    fn note_live_map_entry(&mut self, entry: &str, map: &str) {
-        self.map_entry_sources
-            .insert(entry.to_owned(), map.to_owned());
-    }
-
-    fn live_map_entry_value(&self, entry: &Value, key: &Value, _old: &Value) -> Option<Value> {
-        StdHost::live_map_entry_value(self, entry, key)
     }
 
     fn collection_len(&self, value: &Value) -> Option<usize> {
@@ -5498,6 +5570,16 @@ impl Host for StdHost {
         Some(text)
     }
 
+    fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
+        let block_id = marker.strip_prefix("game/block/")?;
+        let classes = self.game_block_classes.get(block_id)?;
+        // The game seed must contain the full binary-name transitive closure
+        // (`BlockBehaviour`, inherited interfaces such as `BucketPickup`, ...).
+        // Anything absent is unknown and therefore counted.
+        (wanted == "java/lang/Object" || classes.iter().any(|class| class == wanted))
+            .then_some(true)
+    }
+
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let start = (*index).min(bytes.len());
@@ -5537,6 +5619,41 @@ impl Host for StdHost {
         self.constructed_uuids
             .get(jar_object::object_key(value)?)
             .copied()
+    }
+
+    fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
+        self.map_entry_now(value)
+    }
+
+    fn mint_map_entry(
+        &mut self,
+        map: Option<&Value>,
+        key: &Value,
+        value: &Value,
+        made: host_map_entry::EntryMade,
+    ) -> Value {
+        StdHost::mint_map_entry(self, map, key, value, made)
+    }
+
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        StdHost::mint_map_entries(self, map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        StdHost::view_entry_inner(self, entry)
+    }
+
+    fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
+        StdHost::entries_before_call(self, marker, name, args);
+    }
+
+    fn entries_after_call(&mut self, marker: &str) {
+        StdHost::entries_after_call(self, marker);
     }
 
     // No host marker answers `instanceof` any more: the command surface
@@ -5662,6 +5779,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = bigdecimal_slice::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = http_client::static_field(&r.owner, &r.name, &r.descriptor) {
             return Ok(value);
         }
@@ -5674,6 +5794,17 @@ impl Host for StdHost {
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
         if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
             return Ok(value);
+        }
+        // `Blocks.<FIELD>` is already a game registry handle in the current
+        // P16 API. The 26.3 field table is the authority: an absent field is
+        // a real `NoSuchFieldError` path and remains counted.
+        if r.owner == "net/minecraft/world/level/block/Blocks"
+            && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
+        {
+            return match crate::vanilla_blocks::field_id(&r.name) {
+                Some(id) => Ok(crate::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
         }
         // Registry statics are handles instead of a null constant so
         // registration calls downstream can name their target registry. The
@@ -5861,6 +5992,9 @@ impl Host for StdHost {
         }
         // Mixin's environment and MixinExtras' bootstrap (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_invoke(r) {
+            return Ok(value);
+        }
+        if let Some(value) = client_frame::block_pos_static(r, args) {
             return Ok(value);
         }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
@@ -7151,22 +7285,6 @@ impl Host for StdHost {
             && crate::game_object::handle_key(receiver) == Some("client/stack/empty")
         {
             return Ok(Value::Int(1));
-        }
-        // `Map.Entry.toString` is inherited from `Object`, but an entry from
-        // a mutable map remains live after `setValue`; refresh its snapshot
-        // before the generic Object method sees it.
-        if r.name == "toString"
-            && r.descriptor == "()Ljava/lang/String;"
-            && object_methods::is_map_entry(receiver)
-        {
-            let (key, stored_value) = map_entry_parts(receiver)?;
-            let value = Host::live_map_entry_value(self, receiver, &key, &stored_value)
-                .unwrap_or(stored_value);
-            return Ok(Value::Ref(Some(format!(
-                "{}={}",
-                object_text(self, &key)?,
-                object_text(self, &value)?
-            ))));
         }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
@@ -8896,41 +9014,25 @@ impl Host for StdHost {
                 _ => {}
             }
         }
-        if r.owner == "java/util/Map$Entry" {
-            let (key, stored_value) = map_entry_parts(receiver)?;
-            let value = Host::live_map_entry_value(self, receiver, &key, &stored_value)
-                .unwrap_or(stored_value);
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getKey", "()Ljava/lang/Object;") => Ok(key),
-                ("getValue", "()Ljava/lang/Object;") => Ok(value),
+        // A host `Map.Entry`'s accessors, whatever class the call names
+        // (`host_map_entry.rs`); its `equals`/`hashCode`/`toString` are its row.
+        if host_map_entry::is_entry(receiver) {
+            let part = |host: &Self, first: bool| {
+                host.map_entry_now(receiver)
+                    .map(|(key, value)| if first { key } else { value })
+            };
+            let answer = match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getKey", "()Ljava/lang/Object;") => part(self, true),
+                ("getValue", "()Ljava/lang/Object;") => part(self, false),
                 ("setValue", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-                    let replacement = Self::argument(r, args, 0)?.clone();
-                    self.entry_set_value(receiver, &key, &value, replacement)
+                    let value = Self::argument(r, args, 0)?.clone();
+                    return self.map_entry_set_value(r, receiver, value);
                 }
-                ("equals", "(Ljava/lang/Object;)Z") => {
-                    let same = |a: &Value, b: &Value| boxed::canonical(a) == boxed::canonical(b);
-                    let equal = map_entry_parts(Self::argument(r, args, 0)?).is_ok_and(
-                        |(other_key, other_value)| {
-                            same(&key, &other_key) && same(&value, &other_value)
-                        },
-                    );
-                    Ok(Value::Int(equal as i32))
-                }
-                // The runtime answers it (`object_methods.rs`, `host_value_hash`):
-                // a jar key's own `hashCode` is not the host's to run.
-                ("hashCode", "()I") => self.unknown_host_call(r),
-                // JDK 25: `key + "=" + value`, each `String.valueOf`'d (a box
-                // as Java prints it; a jar object, which the host cannot run,
-                // counted as in any collection's text).
-                ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
-                    "{}={}",
-                    object_text(self, &key)?,
-                    object_text(self, &value)?
-                )))),
-                _ => Err(NativeError::MissingMethod(format!(
-                    "{}#{}{}",
-                    r.owner, r.name, r.descriptor
-                ))),
+                _ => None,
+            };
+            return match answer {
+                Some(answer) => Ok(answer),
+                None => self.unknown_host_call(r),
             };
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
@@ -9175,17 +9277,31 @@ impl Host for StdHost {
             }
             (owner, "entrySet", "()Ljava/util/Set;") if is_map_owner(owner) => {
                 let values = host_collection_values(self, receiver)?;
-                let entries = values
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| {
-                        let key = pair[0].clone();
-                        let value = pair[1].clone();
-                        Ok(map_entry_value(&key, &value))
-                    })
-                    .collect::<Result<Vec<_>, NativeError>>()?;
-                Ok(self.map_view(receiver, "entrySet", "set", entries))
+                // `Map.of(..)`'s entry set makes a `KeyValueHolder` per entry; any other map
+                // hands out its nodes (`host_map_entry.rs`).
+                let made = match expect_ref(receiver)
+                    .and_then(|marker| marker.rsplit_once('#'))
+                    .map(|(class, _)| class)
+                {
+                    Some(
+                        "java/util/ImmutableCollections$MapN"
+                        | "java/util/ImmutableCollections$Map1",
+                    ) => host_map_entry::EntryMade::Holder,
+                    _ => host_map_entry::EntryMade::Node,
+                };
+                let entries = self.mint_map_entries(receiver, &values, made);
+                // The map's one `entrySet` view (#156 P14d1's per-map view cache, keyed by the
+                // map's identity): Java's maps cache it (`HashMap.entrySet` field), so every
+                // call answers the same object (#221 review B2), refreshed here from the map. It
+                // holds the entry handles themselves, so every reading of one node stays the
+                // same object. Java's `EntrySet.contains` looks the key up in the map; this
+                // view's own table is laid out afresh from its entries as they are now.
+                let set = self.map_view(receiver, "entrySet", "set", entries);
+                if let Some(marker) = expect_ref(&set) {
+                    let marker = marker.clone();
+                    self.hash_tables.remove(&marker);
+                }
+                Ok(set)
             }
             // `ConcurrentHashMap.keySet()` declares its `KeySetView`; the
             // snapshot is the same key set.
@@ -11623,9 +11739,8 @@ fn bounded_captured_markers(values: &[Value]) -> Result<String, NativeError> {
 /// One element of a collection as the collection readers hand it out: the
 /// [`value_marker`] form with its separator escapes already removed, which is
 /// what splitting an immutable `list/...` marker yields. A mutable collection
-/// answers the same form, so an element that itself holds a comma (a
-/// `map-entry/k,v` from `new ArrayList<>(map.entrySet())`) parses back whole,
-/// and a lookup compares like with like.
+/// answers the same form, so an element that itself holds a comma parses back
+/// whole, and a lookup compares like with like.
 fn collection_item_marker(value: &Value) -> String {
     match value {
         Value::Ref(Some(value)) => format!("r{value}"),
@@ -11868,6 +11983,8 @@ fn marker_id(value: &str) -> Option<String> {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
+        "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
@@ -12149,6 +12266,10 @@ impl host_ref::Nested for MarkerText {
         Ok(None)
     }
 
+    fn collection_entries(&mut self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
+
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         let _level = host_recursion::enter()?;
         Ok(Some(match value {
@@ -12201,6 +12322,10 @@ impl host_ref::Nested for HostNested<'_> {
         })
     }
 
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        self.0.as_deref_mut()?.mutable_collection_entries(value)
+    }
+
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         let _level = host_recursion::enter()?;
         Ok(match (value, self.0.as_deref_mut()) {
@@ -12229,21 +12354,13 @@ impl host_ref::Nested for HostNested<'_> {
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.0.as_deref()?.constructed_uuid(value)
     }
+
+    fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        self.0.as_deref()?.map_entry_now(value)
+    }
 }
 
 impl StdHost {
-    /// Read the current value behind an entry whose `setValue` made it live.
-    fn live_map_entry_value(&self, entry: &Value, key: &Value) -> Option<Value> {
-        let entry = expect_ref(entry)?;
-        let map = self.map_entry_sources.get(entry)?;
-        self.mutable_collections
-            .get(map)?
-            .chunks(2)
-            .find_map(|pair| match pair {
-                [candidate, value] if candidate == key => Some(value.clone()),
-                _ => None,
-            })
-    }
     /// A handle's `toString`/`hashCode`/`equals` through its kind's row
     /// (`host_ref.rs`). One a held value leaves unknown (a held jar object's
     /// `hashCode`, which only the runtime can run) is counted.
@@ -12799,30 +12916,6 @@ fn collection_value(kind: &str, values: &[Value]) -> Value {
         // No literal spells a jar object's key (`jar_object::unspell_key`).
         jar_object::unspell_key(format!("{kind}/{values}"))
     }))
-}
-
-fn map_entry_value(key: &Value, value: &Value) -> Value {
-    Value::Ref(Some(format!(
-        "map-entry/{},{}",
-        value_marker(key),
-        value_marker(value)
-    )))
-}
-
-pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeError> {
-    let marker = expect_ref(value)
-        .and_then(|marker| marker.strip_prefix("map-entry/"))
-        .ok_or_else(|| NativeError::Metadata("expected a native map entry marker".into()))?;
-    let parts = split_capture_markers(marker)?;
-    if parts.len() != 2 {
-        return Err(NativeError::Metadata(
-            "map entry marker must contain key and value".into(),
-        ));
-    }
-    Ok((
-        parse_value_marker(&parts[0])?,
-        parse_value_marker(&parts[1])?,
-    ))
 }
 
 fn is_collection_owner(owner: &str) -> bool {
@@ -22681,9 +22774,6 @@ impl<H: Host> Runtime<'_, H> {
                 "java/lang/Iterable",
             ],
             "map" => &["java/util/Map"],
-            // A host map entry (`HashMap`/`TreeMap` node, `Map.entry`): every
-            // one implements only `Map.Entry`.
-            "map-entry" => &["java/util/Map$Entry"],
             _ => &[],
         };
         if collection_kinds.contains(&wanted) {
@@ -26289,6 +26379,32 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn invoke_bigdecimal_static(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        match bigdecimal_slice::static_call(self, r, args) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn invoke_bigdecimal_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        match bigdecimal_slice::instance_call(self, r, receiver, args) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// One jar frame, executed instruction by instruction.
     fn invoke_throwable_suppressed(
         &mut self,
@@ -26321,6 +26437,24 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<Value>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // Kotlin stdlib facades and holder methods are registration/runtime
+        // surfaces: the native interpreter records their exact bounded result
+        // without executing the bundled implementation.
+        let kotlin_call = MethodRef {
+            owner: class.to_owned(),
+            name: method.to_owned(),
+            descriptor: desc.to_owned(),
+        };
+        if let Some(receiver) = receiver.as_ref()
+            && let Some(value) = kotlin_stdlib::instance(self, &kotlin_call, receiver, args)
+        {
+            return value;
+        }
+        if receiver.is_none()
+            && let Some(value) = kotlin_stdlib::invoke(self, &kotlin_call, args)
+        {
+            return value;
+        }
         // Snapshot the table so the frame's class reference outlives the
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
@@ -27675,6 +27809,15 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_bigdecimal_instance(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
+                    {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
                     ) {
                         // A JDK skeleton's body or a JDK interface default the
@@ -27704,6 +27847,11 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         // FML's `InterModComms` (`neoforge_imc.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(text) =
                         invoke_or_catch!(at, string_constructors::build(self, &r, &args))
@@ -32111,6 +32259,96 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// A vanilla subclass constructor is not modelled without an exact argument
+    /// decoder; the call stays counted instead of selecting a wrong template.
+    #[test]
+    fn subclass_constructors_stay_counted() {
+        let mut host = StdHost::new();
+        host.set_strict_unknown_host_calls(true);
+        let call = MethodRef {
+            owner: "net/minecraft/world/level/block/DoorBlock".into(),
+            name: "<init>".into(),
+            descriptor: "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+                .into(),
+        };
+        let _ = host.invoke_instance(
+            &call,
+            &Value::Ref(Some("door#1".into())),
+            &[Value::Ref(Some("properties#1".into()))],
+        );
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    /// With the game's block classes seeded, a vanilla block constant answers
+    /// `instanceof` for its real class chain and interfaces, and only those.
+    #[test]
+    fn seeded_block_classes_answer_instanceof() {
+        let classes = BTreeMap::from([(
+            "minecraft:fire".to_owned(),
+            vec![
+                "net/minecraft/world/level/block/FireBlock".into(),
+                "net/minecraft/world/level/block/BaseFireBlock".into(),
+                "net/minecraft/world/level/block/Block".into(),
+                "net/minecraft/world/level/block/state/BlockBehaviour".into(),
+                "net/minecraft/world/level/ItemLike".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let fire = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/Blocks".into(),
+                name: "FIRE".into(),
+                descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
+            })
+            .unwrap();
+        let marker = match &fire {
+            Value::Host(handle) => handle.key().to_owned(),
+            other => panic!("expected a game handle, got {other:?}"),
+        };
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/ItemLike"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
+            None
+        );
+        assert_eq!(
+            host.game_instance_of(
+                &marker,
+                "net/minecraft/world/level/block/state/BlockBehaviour"
+            ),
+            Some(true)
+        );
+        // Simple names and unrelated interfaces remain counted.
+        assert_eq!(host.game_instance_of(&marker, "FireBlock"), None);
+        assert_eq!(host.game_instance_of(&marker, "java/lang/Cloneable"), None);
+        // An unseeded block keeps the interpreter's own answer.
+        assert_eq!(
+            host.game_instance_of(
+                "net/minecraft/world/level/block/Block#net/minecraft/world/level/block/Blocks.STONE",
+                "net/minecraft/world/level/block/FireBlock"
+            ),
+            None
+        );
+    }
+
+    /// Non-block game constants remain counted until an exact family model exists.
+    #[test]
+    fn non_block_game_constants_stay_counted() {
+        let mut host = StdHost::new();
+        let _ = host.get_static(&MethodRef {
+            owner: "net/minecraft/world/level/block/SoundType".into(),
+            name: "WOOD".into(),
+            descriptor: "Lnet/minecraft/world/level/block/SoundType;".into(),
+        });
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
     /// `asItem()` is answered only for receivers the host knows: a vanilla
     /// `Items.X` constant is itself, and an object it never saw built keeps the
     /// neutral unmodelled answer rather than a confident `Items.AIR`.
@@ -32930,6 +33168,7 @@ mod tests {
         // `%a` of an `Integer` throws on the JDK: the call is the host's,
         // counted, not an approximation.
         assert_eq!(format("%a", "[Ljava/lang/Object;#0"), Value::Ref(None));
+        #[allow(clippy::drop_non_drop)]
         drop(format);
         let locale_method = MethodRef {
             owner: "java/lang/String".into(),
@@ -33089,7 +33328,6 @@ mod tests {
             marker.chars().count()
         );
     }
-
     #[test]
     fn metadata_accepts_a_raw_control_character_inside_a_string() {
         // Gson's lenient parser, which Fabric reads the metadata with, accepts
@@ -37520,12 +37758,11 @@ mandatory = true
             name: "hashCode".into(),
             descriptor: "()I".into(),
         };
-        // `Objects.hashCode(key) ^ Objects.hashCode(value)` is the runtime's
-        // (`object_methods.rs`): it may run a jar key's `hashCode`, so the
-        // host alone counts the call.
-        let before = host.unknown_host_call_count();
-        host.invoke_instance(&entry_hash, &entry, &[]).unwrap();
-        assert_eq!(host.unknown_host_call_count(), before + 1);
+        // `Objects.hashCode(key) ^ Objects.hashCode(value)`, both Strings here.
+        assert_eq!(
+            host.invoke_instance(&entry_hash, &entry, &[]).unwrap(),
+            Value::Int(stable_hash("key") ^ stable_hash("value"))
+        );
         let remove_if = MethodRef {
             owner: "java/util/Collection".into(),
             name: "removeIf".into(),

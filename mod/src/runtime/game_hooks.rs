@@ -1377,6 +1377,41 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.constructed_uuid(value)
     }
 
+    fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
+        self.inner.map_entry_parts(value)
+    }
+
+    fn mint_map_entry(
+        &mut self,
+        map: Option<&Value>,
+        key: &Value,
+        value: &Value,
+        made: crate::runtime::host_map_entry::EntryMade,
+    ) -> Value {
+        self.inner.mint_map_entry(map, key, value, made)
+    }
+
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: crate::runtime::host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        self.inner.mint_map_entries(map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        self.inner.unwrapped_view_entry(entry)
+    }
+
+    fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
+        self.inner.entries_before_call(marker, name, args);
+    }
+
+    fn entries_after_call(&mut self, marker: &str) {
+        self.inner.entries_after_call(marker);
+    }
+
     fn component_states(&self) -> Option<&crate::runtime::host_component::States> {
         self.inner.component_states()
     }
@@ -1550,14 +1585,6 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.inner.mutable_collection_values(value)
-    }
-
-    fn note_live_map_entry(&mut self, entry: &str, map: &str) {
-        self.inner.note_live_map_entry(entry, map)
-    }
-
-    fn live_map_entry_value(&self, entry: &Value, key: &Value, old: &Value) -> Option<Value> {
-        self.inner.live_map_entry_value(entry, key, old)
     }
 
     fn holds_collection(&self, value: &Value) -> bool {

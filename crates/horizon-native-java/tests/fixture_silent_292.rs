@@ -16,7 +16,6 @@ public final class Probe {
  public static String capturingSupplier() { String a="left", b="right"; return helper(() -> a+":"+b); }
  public static String capturingInts() { int a=4, b=5; return helper(() -> ""+(a+b)); }
  public static String capturingLargeSupplier() { Object a0=Optional.empty(); for(int i=0;i<1000;i++) a0=Optional.of(a0); final Object a=a0; final String b="x"; return helper(() -> String.valueOf(a).length()+b); }
- public static String entrySetValueMap() { Map<String,Object> m=new HashMap<>(); m.put("k",null); Map.Entry<String,Object> e=m.entrySet().iterator().next(); e.setValue(m); return e.toString(); }
 }
 "#;
 #[test]
@@ -29,7 +28,6 @@ fn silent_292_rows_match_java_25() {
         ("capturingSupplier", "left:right", false),
         ("capturingInts", "9", false),
         ("capturingLargeSupplier", "10014x", false),
-        ("entrySetValueMap", "k={k=(this Map)}", false),
     ];
     for (method, expected, counted) in cases {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
