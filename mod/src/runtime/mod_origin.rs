@@ -224,7 +224,7 @@ fn static_kind_call(r: &MethodRef, args: &[Value]) -> Result<Option<Value>, Nati
                 class: "java/lang/IllegalArgumentException".into(),
                 message: Some(format!(
                     "No enum constant {}.{name}",
-                    ORIGIN_KIND.replace('/', ".").replace('$', ".")
+                    ORIGIN_KIND.replace(['/', '$'], ".")
                 )),
                 frame: None,
             })
