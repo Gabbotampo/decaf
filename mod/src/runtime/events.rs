@@ -353,6 +353,8 @@ enum Shape {
     ChangeLevel,
     /// `(CommandDispatcher, CommandBuildContext, Commands.CommandSelection)`
     Commands,
+    /// (CommandDispatcher, CommandBuildContext)
+    ClientCommands,
     /// `(Minecraft)`
     Minecraft,
     /// `(ClientLevel)`
@@ -673,7 +675,7 @@ const FABRIC_FIELDS: &[FabricField] = &[
         method: "register",
         descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;)V",
         event: GameEvent::RegisterCommands,
-        shape: Shape::Commands,
+        shape: Shape::ClientCommands,
     },
     fabric(
         client_lifecycle!("ClientTickEvents"),
@@ -2473,6 +2475,10 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
                 )),
             ]
         }
+        Shape::ClientCommands => vec![
+            crate::runtime::host_brigadier::dispatcher(),
+            crate::runtime::host_brigadier::build_context(),
+        ],
         Shape::Minecraft => vec![crate::runtime::game_object::client_value(
             crate::runtime::client_surface::MINECRAFT.into(),
         )],
