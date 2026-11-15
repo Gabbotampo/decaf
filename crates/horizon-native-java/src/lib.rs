@@ -40,7 +40,9 @@ mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
+mod dfu_either;
 mod dfu_pair;
+mod dfu_pair_ops;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
@@ -5854,6 +5856,9 @@ impl Host for StdHost {
         if let Some(value) = dfu_pair::static_call(r, args) {
             return value;
         }
+        if let Some(value) = dfu_either::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
@@ -7180,6 +7185,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_pair::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = dfu_either::host_instance_call(r, receiver, args) {
             return value;
         }
         if let Some(value) = self.holder_call(r, receiver) {
@@ -22329,7 +22337,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `name` is `wanted` or a subclass (or implementor) of it.
-    fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
+    pub(crate) fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
         let mut current = jar_object::marker_class_or_text(name).to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             if current == wanted {
@@ -22358,6 +22366,26 @@ impl<H: Host> Runtime<'_, H> {
             current = file.super_name.clone();
         }
         false
+    }
+
+    pub(crate) fn dfu_pair_subclass_state(&self, receiver: &Value) -> Option<(Value, Value)> {
+        let key = jar_object::object_key(receiver)?;
+        let state = self.fields.get(&format!("{key}|#dfuPair"))?;
+        crate::host_codec::pair_parts(state)
+    }
+
+    pub(crate) fn set_dfu_pair_subclass_state(
+        &mut self,
+        receiver: &Value,
+        first: &Value,
+        second: &Value,
+    ) -> Option<()> {
+        let key = jar_object::object_key(receiver)?;
+        self.fields.insert(
+            format!("{key}|#dfuPair"),
+            crate::host_codec::pair(first, second),
+        );
+        Some(())
     }
 
     /// `target.isAssignableFrom(source)` (internal names): known, counted
@@ -27096,6 +27124,23 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A jar's copy of a loader class its run's loader
                         // lacks (`class_precedence.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_pair_ops::runtime_call(
+                            self,
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_either::runtime_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
