@@ -61,6 +61,7 @@ mod file_attributes;
 mod files_copy;
 mod files_move;
 mod frame_bound;
+mod game_block_classes;
 mod game_codecs;
 mod game_hooks;
 mod game_object;
@@ -3723,8 +3724,43 @@ impl StdHost {
             self.next_neutral_collection,
         );
         self.next_neutral_collection += 1;
-        self.mutable_collections.insert(marker.clone(), values);
+        self.mutable_collections
+            .insert(marker.clone(), values.clone());
+        if matches!(class, "java/util/ArrayList" | "java/util/Vector") {
+            self.mutable_collections.set_capacity(
+                marker.clone(),
+                values.len(),
+                class == "java/util/Vector",
+            );
+        }
         jar_object::collection(marker)
+    }
+
+    /// The backing capacity of a plain ArrayList/Vector row and its growth
+    /// policy. Hash collections use `HashTable` because their table is lazy.
+    fn ensure_collection_capacity(
+        &mut self,
+        marker: &str,
+        needed: usize,
+    ) -> Result<(), NativeError> {
+        let Some((old, vector)) = self.mutable_collections.capacity(marker) else {
+            return Ok(());
+        };
+        if needed <= old {
+            return Ok(());
+        }
+        let grown = if vector {
+            old.saturating_mul(2)
+        } else {
+            old.saturating_add(old / 2)
+        };
+        let new_capacity = needed.max(grown);
+        if new_capacity > MAX_ARRAY_ELEMENTS {
+            return Err(array_bound_error(new_capacity as u128));
+        }
+        self.mutable_collections
+            .set_capacity(marker.to_owned(), new_capacity, vector);
+        Ok(())
     }
 
     /// A map's `keySet()`/`values()`/`entrySet()`: Java caches one view per
@@ -4036,6 +4072,19 @@ impl StdHost {
     pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
         self.game_block_classes = classes;
         self
+    }
+
+    /// Seed the closure generated from the player's prepared 26.3 resources.
+    /// The file is external data from that installation and is validated to
+    /// contain internal names before any `instanceof` answer can use it.
+    pub fn with_game_block_classes_file(self, path: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(self.with_game_block_classes(game_block_classes::from_file(path.as_ref())?))
+    }
+
+    /// Seed from a prepared 26.3 resource root.  The game host and the census
+    /// runner use the same prepared-data contract.
+    pub fn with_prepared_game_block_classes(self, root: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(self.with_game_block_classes(game_block_classes::from_prepared(root.as_ref())?))
     }
 
     /// ItemLike.asItem() as vanilla answers it, for objects whose game
@@ -5120,6 +5169,47 @@ impl StdHost {
             _ => Ok(None),
         }
     }
+}
+
+pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), NativeError> {
+    let capacity = args.first().and_then(|value| match value {
+        Value::Int(value) => Some(*value),
+        _ => None,
+    });
+    let Some(capacity) = capacity else {
+        return Ok(());
+    };
+    let array_capacity = |value: i32| {
+        if value as i64 > i64::from(MAX_ARRAY_ELEMENTS as i32) {
+            Err(array_bound_error(value as u128))
+        } else {
+            Ok(())
+        }
+    };
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("java/util/ArrayList", "<init>", "(I)V") | ("java/util/Vector", "<init>", "(I)V") => {
+            if capacity < 0 {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!("Illegal Capacity: {capacity}")),
+                    frame: None,
+                });
+            }
+            array_capacity(capacity)?;
+        }
+        ("java/lang/StringBuilder" | "java/lang/StringBuffer", "<init>", "(I)V") => {
+            if capacity < 0 {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NegativeArraySizeException".into(),
+                    message: Some(capacity.to_string()),
+                    frame: None,
+                });
+            }
+            array_capacity(capacity)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 impl Host for StdHost {
@@ -7332,11 +7422,37 @@ impl Host for StdHost {
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
+        check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
         if let Some(value) = registry_lookup::instance_call(self, r, receiver, args) {
             return value;
+        }
+        if matches!(
+            (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()),
+            (
+                "java/util/ArrayList" | "java/util/Vector",
+                "ensureCapacity",
+                "(I)V"
+            )
+        ) {
+            let minimum = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+            if minimum > 0 {
+                let marker = expect_ref(receiver).to_owned();
+                let vector = r.owner == "java/util/Vector";
+                if let Some(marker) = marker {
+                    if self.mutable_collections.capacity(marker).is_none() {
+                        self.mutable_collections.set_capacity(
+                            marker.clone(),
+                            if vector { 10 } else { 0 },
+                            vector,
+                        );
+                    }
+                    self.ensure_collection_capacity(marker, minimum as usize)?;
+                }
+            }
+            return Ok(Value::Void);
         }
         // ItemStack.EMPTY is a canonical host value even before a client frame
         // exists, so its bootstrap isEmpty() answer must stay exact.
@@ -8243,16 +8359,36 @@ impl Host for StdHost {
                         }
                         source = unique;
                     }
-                    self.mutable_collections.insert(marker.to_owned(), source);
+                    self.mutable_collections
+                        .insert(marker.to_owned(), source.clone());
+                    if owner == "java/util/ArrayList" || owner == "java/util/Vector" {
+                        self.mutable_collections.set_capacity(
+                            marker.to_owned(),
+                            source.len(),
+                            owner == "java/util/Vector",
+                        );
+                    }
                     return Ok(Value::Void);
                 }
                 // The JDK collection's constructor: on a jar subclass
                 // (emotecraft's `UUIDMap extends ConcurrentHashMap`) it is the
                 // `super()` call, and the object is that collection from here on.
-                (_, "<init>", _) => {
+                (owner, "<init>", descriptor) => {
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default();
+                    if matches!(owner, "java/util/ArrayList" | "java/util/Vector") {
+                        let vector = owner == "java/util/Vector";
+                        let capacity = if descriptor == "()V" {
+                            if vector { 10 } else { 0 }
+                        } else if descriptor == "(I)V" {
+                            expect_int(r, args.first().unwrap_or(&Value::Int(0)))?.max(0) as usize
+                        } else {
+                            0
+                        };
+                        self.mutable_collections
+                            .set_capacity(marker.to_owned(), capacity, vector);
+                    }
                     return Ok(Value::Void);
                 }
                 (owner, "offer" | "offerLast" | "addLast", "(Ljava/lang/Object;)Z")
@@ -8399,6 +8535,11 @@ impl Host for StdHost {
                 }
                 (owner, "add", "(Ljava/lang/Object;)Z") if is_list_like_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
+                    let needed = self
+                        .mutable_collections
+                        .get(marker)
+                        .map_or(1, |values| values.len() + 1);
+                    self.ensure_collection_capacity(marker, needed)?;
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -8408,6 +8549,8 @@ impl Host for StdHost {
                 (owner, "add", "(ILjava/lang/Object;)V") if is_list_like_owner(owner) => {
                     let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let value = Self::argument(r, args, 1)?.clone();
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + 1)?;
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
@@ -8420,6 +8563,8 @@ impl Host for StdHost {
                     let source = Self::argument(r, args, 0)?;
                     let additions = host_collection_values(self, source)?;
                     let changed = !additions.is_empty();
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + additions.len())?;
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -8430,6 +8575,8 @@ impl Host for StdHost {
                     let at = expect_int(r, Self::argument(r, args, 0)?)?;
                     let source = Self::argument(r, args, 1)?;
                     let additions = host_collection_values(self, source)?;
+                    let current = self.mutable_collections.get(marker).map_or(0, Vec::len);
+                    self.ensure_collection_capacity(marker, current + additions.len())?;
                     let values = self
                         .mutable_collections
                         .entry(marker.to_owned())
@@ -18238,6 +18385,18 @@ impl NativeJar {
         host
     }
 
+    /// Seed a game host from the same prepared 26.3 resource root used by the
+    /// Horizon game. This keeps the game and census paths on one exact table;
+    /// callers that do not have prepared resources retain the counted default.
+    pub fn seed_host_from_prepared(
+        &self,
+        host: StdHost,
+        root: impl AsRef<Path>,
+    ) -> Result<StdHost, String> {
+        let host = host.with_prepared_game_block_classes(root)?;
+        Ok(self.seed_host(host))
+    }
+
     /// Return the resource paths discovered in the jar in deterministic order.
     /// Entries are metadata only; callers must use the bounded host contract
     /// rather than opening the jar through an arbitrary filesystem path.
@@ -18318,6 +18477,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -18524,6 +18684,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -18686,6 +18847,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -20965,6 +21127,10 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// The current backing capacity of each modelled StringBuilder. Its
+    /// growth is `(old << 1) + 2`, so ensureCapacity can refuse the actual
+    /// array length rather than only the requested minimum.
+    string_builder_capacities: BTreeMap<String, usize>,
     /// Text each `java.io.StringReader` (and each modelled file or stream
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
@@ -27425,6 +27591,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        client_surface::text::runtime_call(self, receiver.as_ref(), &r, &args)
+                            .transpose()
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         dfu_pair_ops::runtime_call(
                             self,
                             &r,
@@ -32683,6 +32855,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -32748,6 +32921,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -39847,6 +40021,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40007,6 +40182,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40190,6 +40366,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40549,6 +40726,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -40852,6 +41030,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -46083,6 +46262,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -46136,6 +46316,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_paths: BTreeMap::new(),
