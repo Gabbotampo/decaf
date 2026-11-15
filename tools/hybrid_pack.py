@@ -44,6 +44,7 @@ across corpora is run once and shares its outcome.
 from __future__ import annotations
 
 import argparse
+from functools import cmp_to_key
 import hashlib
 import io
 import json
@@ -238,106 +239,153 @@ class Declaration:
 
 
 _VERSION_TOKEN = re.compile(r"\d+|[A-Za-z]+")
+_MAVEN_SET = re.compile(r"([\[(])\s*([^,\]]*)\s*,\s*([^\])]*)\s*([\])])")
 
 
-def _version_parts(version: str) -> tuple[object, ...]:
-    """A bounded Maven/Fabric version ordering key."""
-    parts: list[object] = []
-    for token in _VERSION_TOKEN.findall(version):
-        parts.append(int(token) if token.isdigit() else token.lower())
-    return tuple(parts or [0])
+def _fabric_version(value: str) -> tuple[tuple[int, ...], str | None]:
+    """Fabric's SemanticVersion components, with build metadata discarded."""
+    core = value.strip().split("+", 1)[0]
+    base, _, prerelease = core.partition("-")
+    try:
+        return tuple(int(component) for component in base.split(".")), prerelease or None
+    except ValueError:
+        raise ValueError(f"invalid semantic version {value!r}")
 
 
-def _compare_versions(left: str, right: str) -> int:
-    a, b = _version_parts(left), _version_parts(right)
+def _compare_prerelease(left: str | None, right: str | None) -> int:
+    if left == right:
+        return 0
+    if left is None:
+        return 1
+    if right is None:
+        return -1
+    for a, b in zip(left.split("."), right.split(".")):
+        if a == b:
+            continue
+        if a.isdigit() and b.isdigit():
+            return 1 if int(a) > int(b) else -1
+        if a.isdigit() != b.isdigit():
+            return -1 if a.isdigit() else 1
+        return 1 if a < b else -1
+    return (len(left.split(".")) > len(right.split("."))) - (
+        len(left.split(".")) < len(right.split(".")))
+
+
+def _compare_fabric_versions(left: str, right: str) -> int:
+    left_components, left_pre = _fabric_version(left)
+    right_components, right_pre = _fabric_version(right)
+    for index in range(max(len(left_components), len(right_components))):
+        a = left_components[index] if index < len(left_components) else 0
+        b = right_components[index] if index < len(right_components) else 0
+        if a != b:
+            return 1 if a > b else -1
+    return _compare_prerelease(left_pre, right_pre)
+
+
+def _maven_tokens(version: str) -> tuple[object, ...]:
+    """The useful ComparableVersion ordering for corpus version strings."""
+    value = version.strip().lower().replace("_", "-")
+    tokens: list[object] = []
+    for token in re.findall(r"\d+|[a-z]+", value):
+        tokens.append(int(token) if token.isdigit() else token)
+    return tuple(tokens or [0])
+
+
+def _compare_maven_versions(left: str, right: str) -> int:
+    a, b = _maven_tokens(left), _maven_tokens(right)
+    qualifier_order = {"alpha": 1, "a": 1, "beta": 2, "b": 2, "milestone": 3,
+                       "m": 3, "rc": 4, "cr": 4, "snapshot": 5, "": 6,
+                       "sp": 7}
     for index in range(max(len(a), len(b))):
-        missing = 0
-        x = a[index] if index < len(a) else missing
-        y = b[index] if index < len(b) else missing
+        x = a[index] if index < len(a) else 0
+        y = b[index] if index < len(b) else 0
         if x == y:
             continue
-        # Numeric release components sort after a textual qualifier at the
-        # same position (`1.0` is newer than `1.0-rc1`).
         if isinstance(x, int) and isinstance(y, str):
-            return 1
-        if isinstance(x, str) and isinstance(y, int):
-            return -1
+            y = qualifier_order.get(y, 8)
+        elif isinstance(x, str) and isinstance(y, int):
+            x = qualifier_order.get(x, 8)
+        elif isinstance(x, str) and isinstance(y, str):
+            x = qualifier_order.get(x, 8)
+            y = qualifier_order.get(y, 8)
         return 1 if x > y else -1
     return 0
 
 
-def _numeric_prefix(value: str) -> tuple[int, ...]:
-    return tuple(int(item) for item in re.findall(r"\d+", value))
-
-
-def version_satisfies(version: str, requirement: str) -> bool:
-    """Match the Fabric/NeoForge ranges used in corpus metadata.
-
-    Fabric uses comparator expressions, wildcards, caret/tilde and ``||``;
-    NeoForge uses Maven intervals such as ``[1.20,1.21)``. An empty or ``*``
-    requirement is unconstrained. Unknown syntax is rejected so a census row
-    cannot become a false closure win.
-    """
-    expression = (requirement or "*").strip()
-    if expression in ("", "*", "+"):
+def _fabric_predicate(version: str, expression: str) -> bool:
+    expression = expression.strip()
+    if expression in ("", "*"):
         return True
-    for alternative in expression.split("||"):
-        if _version_satisfies_one(version, alternative.strip()):
-            return True
-    return False
-
-
-def _version_satisfies_one(version: str, expression: str) -> bool:
-    if expression.startswith(("[", "(")) and expression.endswith(("]", ")")):
-        if "," not in expression:
-            return _compare_versions(version, expression[1:-1]) == 0
-        lower, upper = expression[1:-1].split(",", 1)
-        if lower and (_compare_versions(version, lower) < 0 or
-                      (expression[0] == "(" and _compare_versions(version, lower) == 0)):
+    operator = "="
+    for candidate in (">=", "<=", ">", "<", "=", "~", "^"):
+        if expression.startswith(candidate):
+            operator, expression = candidate, expression[len(candidate):].strip()
+            break
+    wildcard = any(part.lower() in ("x", "*") for part in expression.split("."))
+    if wildcard:
+        if operator != "=":
             return False
-        if upper and (_compare_versions(version, upper) > 0 or
-                      (expression[-1] == ")" and _compare_versions(version, upper) == 0)):
+        try:
+            candidate, _ = _fabric_version(version)
+        except ValueError:
             return False
-        return True
-    if expression.startswith("^") or expression.startswith("~"):
-        operator, raw = expression[0], expression[1:].strip()
-        if not re.fullmatch(r"\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?", raw):
-            return False
-        lower = _numeric_prefix(raw)
-        if not lower or _compare_versions(version, raw) < 0:
-            return False
-        upper = list(lower)
-        if operator == "~":
-            if len(upper) == 1:
-                upper[0] += 1
-            else:
-                upper[-2] += 1
-                upper[-1:] = [0]
-        elif lower[0] != 0:
-            upper[0] += 1
-            upper[1:] = [0] * (len(upper) - 1)
-        elif len(lower) == 1 or lower[1] != 0:
-            upper[0:2] = [0, lower[1] + 1 if len(lower) > 1 else 1]
-            upper[2:] = [0] * (len(upper) - 2)
-        else:
-            upper = list(lower)
-            upper[-1] += 1
-        return _compare_versions(version, ".".join(map(str, upper))) < 0
-    if "*" in expression or "x" in expression.lower():
-        prefix = expression.lower().replace("x", "*").split("*")[0].rstrip(".")
-        return version == prefix or version.startswith(prefix + ".")
-    comparators = re.findall(r"(>=|<=|>|<|=)?\s*([0-9][0-9A-Za-z.+-]*)", expression)
-    if not comparators or "".join(op + value for op, value in comparators).replace("=", "") not in re.sub(r"\s+", "", expression).replace("=", ""):
+        parts = expression.split(".")
+        return all(part.lower() in ("x", "*") or int(part) == candidate[index]
+                   for index, part in enumerate(parts))
+    try:
+        reference, _ = _fabric_version(expression)
+    except ValueError:
         return False
-    for operator, bound in comparators:
-        comparison = _compare_versions(version, bound)
-        if operator in (">", ">=") and (comparison < 0 or operator == ">" and comparison == 0):
+    comparison = _compare_fabric_versions(version, expression)
+    if operator == "=":
+        return comparison == 0
+    if operator == ">=":
+        return comparison >= 0
+    if operator == "<=":
+        return comparison <= 0
+    if operator == ">":
+        return comparison > 0
+    if operator == "<":
+        return comparison < 0
+    if operator == "^":
+        upper = f"{reference[0] + 1}.0"
+        return comparison >= 0 and _compare_fabric_versions(version, upper) < 0
+    # Fabric's tilde always advances the minor component; a one-component
+    # reference therefore has an implicit `.0` before the upper bound.
+    upper = f"{reference[0]}.{(reference[1] if len(reference) > 1 else 0) + 1}"
+    return comparison >= 0 and _compare_fabric_versions(version, upper) < 0
+
+
+def _maven_interval(version: str, expression: str) -> bool:
+    match = _MAVEN_SET.fullmatch(expression.strip())
+    if not match:
+        return _compare_maven_versions(version, expression.strip()) == 0
+    opening, lower, upper, closing = match.groups()
+    lower, upper = lower.strip(), upper.strip()
+    if lower:
+        comparison = _compare_maven_versions(version, lower)
+        if comparison < 0 or comparison == 0 and opening == "(":
             return False
-        if operator in ("<", "<=") and (comparison > 0 or operator == "<" and comparison == 0):
-            return False
-        if operator in ("", "=") and comparison != 0:
+    if upper:
+        comparison = _compare_maven_versions(version, upper)
+        if comparison > 0 or comparison == 0 and closing == ")":
             return False
     return True
+
+
+def version_satisfies(version: str, requirement: str | tuple[str, ...]) -> bool:
+    """Match Fabric Loader 0.19.5 or NeoForge Maven version predicates."""
+    if isinstance(requirement, (tuple, list)):
+        return any(version_satisfies(version, item) for item in requirement)
+    expression = (requirement or "*").strip()
+    if expression in ("", "*"):
+        return True
+    # NeoForge's VersionRange permits a comma-separated list of complete sets;
+    # Fabric's comma-separated predicate terms are also OR alternatives.
+    if expression.startswith(("[", "(")):
+        intervals = [item for item in re.findall(r"[\[(][^\])]+[\])]", expression)]
+        return any(_maven_interval(version, item) for item in intervals) if intervals else False
+    return any(_fabric_predicate(version, item) for item in expression.split(","))
 
 
 def _lenient_json(text: str) -> str:
@@ -380,7 +428,9 @@ def _requirements(value: object) -> tuple[tuple[str, str], ...]:
     rows = []
     for ident, requirement in value.items():
         if isinstance(ident, str):
-            rows.append((ident, str(requirement) if requirement is not None else "*"))
+            values = requirement if isinstance(requirement, list) else [requirement]
+            values = values or ["*"]
+            rows.extend((ident, str(item) if item is not None else "*") for item in values)
     return tuple(sorted(set(rows)))
 
 
@@ -1642,14 +1692,19 @@ def _provider_index(jars: list[PackJar]) -> dict[str, list[PackJar]]:
         for ident in ids:
             index.setdefault(ident, []).append(jar)
     for ident, providers in index.items():
-        # A jar whose own mod id *is* the dependency is the canonical provider;
-        # then a jar that carries the id as a nested module (fabric-api carries
-        # 44 submodules, but so do mods bundling a single one); only then does
-        # the newest version win.
-        providers.sort(key=lambda jar: (jar.mod_id.lower() == ident,
-                                        len(jar.declaration.nested_ids),
-                                        _version_key(jar.declaration.version), jar.name),
-                       reverse=True)
+        # The loader chooses the newest provider that satisfies the predicate.
+        # Prefer an actual module over a `provides` alias only as a deterministic
+        # tie-break; nested-id count is never a version-selection signal.
+        def compare(left: PackJar, right: PackJar) -> int:
+            own = (left.mod_id.lower() == ident) - (right.mod_id.lower() == ident)
+            if own:
+                return -own
+            version = _compare_maven_versions(left.declaration.version,
+                                               right.declaration.version)
+            if version:
+                return -version
+            return (left.name > right.name) - (left.name < right.name)
+        providers.sort(key=cmp_to_key(compare))
     return index
 
 
@@ -1665,15 +1720,19 @@ def _closure(batch: list[PackJar], index: dict[str, list[PackJar]]) -> list[Pack
         requirements = jar.declaration.requirements or tuple(
             (dependency, "*") for dependency in jar.declaration.depends
         )
+        by_id: dict[str, list[str]] = {}
         for dependency, requirement in requirements:
+            by_id.setdefault(dependency.lower(), []).append(requirement)
+        for dependency in jar.declaration.depends:
             key = dependency.lower()
             if key in PLATFORM_IDS or key in ids:
                 continue
             providers = [provider for provider in index.get(key, [])
                          if provider.path not in chosen
                          and provider.mod_id.lower() not in ids]
+            predicates = tuple(by_id.get(key, ("*",)))
             providers = [provider for provider in providers
-                         if version_satisfies(provider.declaration.version, requirement)]
+                         if version_satisfies(provider.declaration.version, predicates)]
             if not providers:
                 continue
             provider = providers[0]

@@ -170,6 +170,7 @@ def result_row(jar: Path, kind: str, result: dict, deps: list[Path],
             calls = []
         row = {
             "jar": jar.name, "mode": mode, "verdict": row_verdict(result),
+            "classification": "alone-result" if mode == "alone" else "closure-result",
             "kind": kind, "unknown": unknown, "calls": calls,
             "parked_threads": result.get("parked_threads") or [],
             "deps": [dep.name for dep in deps], "missing": missing,
@@ -179,6 +180,7 @@ def result_row(jar: Path, kind: str, result: dict, deps: list[Path],
         return row
     row = {
         "jar": jar.name, "mode": mode, "verdict": "refused", "kind": kind,
+        "classification": "alone-result" if mode == "alone" else "closure-result",
         "stage": result.get("stage"), "error": str(result.get("error"))[:400],
         "deps": [dep.name for dep in deps], "missing": missing,
     }
@@ -188,6 +190,40 @@ def result_row(jar: Path, kind: str, result: dict, deps: list[Path],
     if result.get("parked_threads"):
         row["parked_threads"] = result["parked_threads"]
     return row
+
+
+VERDICT_RANK = {"ran-clean": 0, "ran-hollow": 1, "ran-partial": 2,
+                "refused": 3, "skipped": 4}
+
+
+def mark_closure_regressions(rows: list[dict]) -> list[dict]:
+    """Mark valid dependency-induced failures without changing census totals."""
+    by_jar: dict[str, dict[str, dict]] = defaultdict(dict)
+    for row in rows:
+        by_jar[row.get("jar", "")][row.get("mode", "")] = row
+    regressions = []
+    for modes in by_jar.values():
+        alone, closure = modes.get("alone"), modes.get("closure")
+        if not alone or not closure or closure.get("stage") == "dependency":
+            continue
+        if not closure.get("deps"):
+            continue
+        alone_rank = VERDICT_RANK.get(alone.get("verdict"), 99)
+        closure_rank = VERDICT_RANK.get(closure.get("verdict"), 99)
+        alone_unknown = alone.get("unknown") or 0
+        closure_unknown = closure.get("unknown") or 0
+        if closure_rank > alone_rank or (closure_rank == alone_rank and
+                                         closure_unknown > alone_unknown):
+            closure["classification"] = "closure-regression"
+            closure["failure"] = closure.get("error", "")
+            regressions.append({
+                "jar": closure.get("jar"), "alone_verdict": alone.get("verdict"),
+                "closure_verdict": closure.get("verdict"),
+                "alone_unknown": alone_unknown, "closure_unknown": closure_unknown,
+                "failure": closure.get("failure", ""),
+                "deps": closure.get("deps", []),
+            })
+    return regressions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -269,7 +305,9 @@ def main(argv: list[str] | None = None) -> int:
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
             rows.extend(pool.map(run, todo))
-        report[name] = {"directory": str(directory), "rows": rows}
+        regressions = mark_closure_regressions(rows)
+        report[name] = {"directory": str(directory), "rows": rows,
+                        "closure_regressions": regressions}
 
     rows_by_corpus = {name: data["rows"] for name, data in report.items()}
     modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
@@ -279,6 +317,10 @@ def main(argv: list[str] | None = None) -> int:
     for mode in modes:
         selected = {name: [row for row in rows if row.get("mode") == mode]
                     for name, rows in rows_by_corpus.items()}
+        if mode == "closure":
+            selected = {name: [row for row in rows
+                               if row.get("classification") != "closure-regression"]
+                        for name, rows in selected.items()}
         totals[mode], ranked[mode] = aggregate(selected)
         parked[mode] = parked_summary(selected)
     payload = {"dependency_mode": args.dependency_mode, "totals": totals,

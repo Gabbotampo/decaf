@@ -511,7 +511,7 @@ class DependencyClosureTests(unittest.TestCase):
 
     def test_version_ranges_choose_only_a_compatible_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
-            app = self._fabric(tmp, "app.jar", "app", depends={"library": ">=2 <3"})
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": ["^2"]})
             self._fabric(tmp, "old.jar", "library", version="1.9")
             good = self._fabric(tmp, "good.jar", "library-new", version="2.4")
             # The provider id must match; an alias can carry the compatible version.
@@ -528,13 +528,30 @@ class DependencyClosureTests(unittest.TestCase):
         self.assertEqual(tuple(path.name for path in closure.jars), ("good.jar",))
         self.assertEqual(closure.missing, ())
 
+    def test_fabric_dependency_arrays_are_or_predicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app",
+                               depends={"library": ["^2", "~1.8"]})
+            self._fabric(tmp, "old.jar", "library", version="1.8.9")
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("old.jar",))
+
+    def test_newest_satisfying_provider_beats_a_larger_older_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": "*"})
+            self._fabric(tmp, "old.jar", "library", version="1.0")
+            self._fabric(tmp, "new.jar", "library", version="2.0",
+                         nested=(("one", ()), ("two", ()), ("three", ())))
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("new.jar",))
+
     def test_incompatible_only_provider_is_a_missing_dependency(self):
         with tempfile.TemporaryDirectory() as tmp:
-            app = self._fabric(tmp, "app.jar", "app", depends={"library": "[2,3)"})
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": ["^2"]})
             self._fabric(tmp, "old.jar", "library", version="1.9")
             closure = self._closure(tmp, app)
         self.assertEqual(closure.missing, (("library", "app"),))
-        self.assertEqual(closure.missing_requirements, (("library", "app", "[2,3)"),))
+        self.assertEqual(closure.missing_requirements, (("library", "app", "^2"),))
 
     def test_dependency_cycles_terminate_and_keep_each_provider_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,12 +564,12 @@ class DependencyClosureTests(unittest.TestCase):
 
     def test_fabric_and_neoforge_range_syntax_is_exactly_bounded(self):
         accepts = (
-            ("1.5", ">=1 <2"), ("1.5", "[1,2)"), ("2.0", "[2,)"),
-            ("1.4.9", "^1.4"), ("1.9", "~1.8"), ("1.2.3", "1.2.x"),
+            ("1.5", ">=1"), ("1.5", "[1,2)"), ("2.0", "[2,)"),
+            ("1.4.9", "^1.4"), ("1.8.9", "~1.8"), ("1.2.3", "1.2.x"),
         )
         rejects = (
-            ("2.0", ">=1 <2"), ("2.0", "[1,2)"), ("1.9", "[2,)"),
-            ("2.0", "^1.4"), ("2.0", "~1.8"), ("1.3.0", "1.2.x"),
+            ("0.9", ">=1"), ("2.0", "[1,2)"), ("1.9", "[2,)"),
+            ("2.0", "^1.4"), ("1.9", "~1.8"), ("1.3.0", "1.2.x"),
         )
         for version, requirement in accepts:
             self.assertTrue(LEDGER.hybrid_pack.version_satisfies(version, requirement),

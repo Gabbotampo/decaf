@@ -169,6 +169,20 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(report["totals"]["alone"]["wide"]["ran-hollow"], 1)
         self.assertEqual(report["totals"]["closure"]["wide"]["refused"], 1)
 
+    def test_dependency_failure_is_a_regression_outside_closure_totals(self):
+        rows = [
+            {"jar": "app.jar", "mode": "alone", "verdict": "ran-hollow",
+             "unknown": 1, "calls": [["a", 1]]},
+            {"jar": "app.jar", "mode": "closure", "verdict": "refused",
+             "stage": "execute", "error": "at dep/Config#<clinit> +7",
+             "deps": ["dep.jar"], "unknown": 0, "calls": []},
+        ]
+        regressions = TOOL.mark_closure_regressions(rows)
+        self.assertEqual(len(regressions), 1)
+        self.assertEqual(rows[1]["classification"], "closure-regression")
+        totals, _ = TOOL.aggregate({"wide": [rows[0]]})
+        self.assertEqual(totals["wide"]["ran-hollow"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
