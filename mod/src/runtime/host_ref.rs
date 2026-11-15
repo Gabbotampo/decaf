@@ -437,8 +437,16 @@ pub enum HostKind {
     /// jar's `new ArrayList()` (a [`HostKind::JarObject`]), whose row it
     /// shares.
     Collection,
+    /// Kotlin's declaration-order enum entries view.
+    KotlinEnumEntries,
+    /// A Kotlin lazy holder.
+    KotlinLazy,
+    /// Kotlin's canonical empty list, set, or map singleton.
+    KotlinEmptyCollection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
+    /// A RoundingMode constant keyed by name.
+    RoundingMode,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
     /// A `StackWalker.Option` enum constant: key its name.
@@ -567,6 +575,11 @@ pub(crate) trait Nested {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError>;
     /// `Objects.equals(a, b)`.
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError>;
+    /// The held values of a Java collection, when the host keeps its entries.
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        let _ = value;
+        None
+    }
     /// `String.valueOf(value)`.
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError>;
     /// The vanilla JSON a chat component holds now (its host's state,
@@ -2016,12 +2029,40 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::KotlinEnumEntries,
+        tag: "kentries",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::enum_entries_class),
+        canonical: never_canonical,
+        methods: &crate::runtime::kotlin_stdlib::ENUM_ENTRIES_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinLazy,
+        tag: "klazy",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::lazy_class),
+        canonical: never_canonical,
+        methods: &crate::runtime::kotlin_stdlib::LAZY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinEmptyCollection,
+        tag: "kempty",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::empty_class),
+        canonical: always_canonical,
+        methods: &crate::runtime::kotlin_stdlib::EMPTY_COLLECTION_METHODS,
+    },
+    KindInfo {
         kind: HostKind::TimeUnit,
         tag: "tunit",
         class: ClassRule::Fixed("java/util/concurrent/TimeUnit"),
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::TIME_UNIT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RoundingMode,
+        tag: "rmode",
+        class: ClassRule::Fixed("java/math/RoundingMode"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_jdk_constant::ROUNDING_MODE_METHODS,
     },
     KindInfo {
         kind: HostKind::CodingErrorAction,
