@@ -1946,6 +1946,7 @@ impl NativeJar {
             linked,
             host: &mut wrapped,
             calls: 0,
+            instructions: 0,
             fields: state.fields.clone(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,

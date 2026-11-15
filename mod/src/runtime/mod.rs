@@ -15533,7 +15533,6 @@ pub struct ExecutionReport {
 pub struct ExecutionBudget {
     deadline: Option<(std::time::Instant, std::time::Duration)>,
     instruction_limit: Option<usize>,
-    instructions: std::cell::Cell<usize>,
 }
 
 impl ExecutionBudget {
@@ -15541,7 +15540,6 @@ impl ExecutionBudget {
     pub const UNBOUNDED: Self = Self {
         deadline: None,
         instruction_limit: None,
-        instructions: std::cell::Cell::new(0),
     };
 
     /// A wall-clock budget for existing callers that do not need deterministic steps.
@@ -15551,7 +15549,6 @@ impl ExecutionBudget {
                 .checked_add(limit)
                 .map(|at| (at, limit)),
             instruction_limit: None,
-            instructions: std::cell::Cell::new(0),
         }
     }
 
@@ -15562,7 +15559,6 @@ impl ExecutionBudget {
                 .checked_add(wall_cap)
                 .map(|at| (at, wall_cap)),
             instruction_limit: Some(instructions),
-            instructions: std::cell::Cell::new(0),
         }
     }
 
@@ -15582,19 +15578,6 @@ impl ExecutionBudget {
             .is_some_and(|(deadline, _)| std::time::Instant::now() >= deadline)
     }
 
-    /// Charge one interpreter instruction and report whether the deterministic bound is spent.
-    pub fn charge_instruction(&self) -> bool {
-        let next = self.instructions.get().saturating_add(1);
-        self.instructions.set(next);
-        self.instruction_limit.is_some_and(|limit| next > limit)
-    }
-
-    /// Whether either the deterministic bound or wall guard has passed.
-    pub fn expired(&self) -> bool {
-        self.instruction_limit
-            .is_some_and(|limit| self.instructions.get() >= limit)
-            || self.wall_expired()
-    }
 }
 
 // How deep jar frames may nest (as deep as the thread's stack holds) lives in
@@ -18290,6 +18273,7 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,
@@ -18496,6 +18480,7 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields,
             initialized_classes,
@@ -18658,6 +18643,7 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields,
             initialized_classes,
@@ -21262,6 +21248,8 @@ struct Runtime<'a, H> {
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
+    /// Instructions charged by this invocation, shared by all nested frames.
+    instructions: usize,
 }
 /// A `Class.isAssignableFrom` answer (`Runtime::class_assignable`).
 enum Assignable {
@@ -26396,7 +26384,12 @@ impl<H: Host> Runtime<'_, H> {
                 limit: self.depth,
             });
         }
-        if self.budget.expired() {
+        if self.budget.wall_expired()
+            || self
+                .budget
+                .instruction_limit()
+                .is_some_and(|limit| self.instructions >= limit)
+        {
             return Err(self.budget_exceeded(class, method));
         }
         if method != "<clinit>" {
@@ -26667,7 +26660,11 @@ impl<H: Host> Runtime<'_, H> {
         }
         while pc < code.len() {
             budget_ticks = budget_ticks.wrapping_add(1);
-            if self.budget.charge_instruction()
+            self.instructions = self.instructions.saturating_add(1);
+            if self
+                .budget
+                .instruction_limit()
+                .is_some_and(|limit| self.instructions > limit)
                 || (budget_ticks & (BUDGET_CHECK_INSTRUCTIONS - 1) == 0
                     && self.budget.wall_expired())
             {
@@ -33100,6 +33097,7 @@ mod tests {
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -33158,6 +33156,7 @@ mod tests {
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -40313,6 +40312,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -40473,6 +40473,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -40656,6 +40657,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -41007,6 +41009,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -41318,6 +41321,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -46549,6 +46553,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -46602,6 +46607,7 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),

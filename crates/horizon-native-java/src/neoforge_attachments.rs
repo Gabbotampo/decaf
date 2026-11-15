@@ -1329,6 +1329,7 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
+            instructions: 0,
             fields: BTreeMap::new(),
             static_fields,
             initialized_classes,
