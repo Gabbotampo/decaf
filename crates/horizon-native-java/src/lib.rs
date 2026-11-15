@@ -100,6 +100,7 @@ mod host_jdk;
 mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
+mod host_log4j_level;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
@@ -3254,6 +3255,8 @@ pub struct StdHost {
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
     heap: heap::JavaHeap,
+    /// Log4j custom levels registered by `Level.forName`, keyed by normalized name.
+    log4j_levels: crate::host_log4j_level::CustomLevels,
     /// Values the embedder holds between invocations (`StdHost::retain`),
     /// with their hold counts: roots of the heap's collections.
     retained: BTreeMap<String, usize>,
@@ -3409,6 +3412,7 @@ impl StdHost {
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
+            log4j_levels: crate::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
@@ -5785,6 +5789,9 @@ impl Host for StdHost {
         }
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
+        }
+        if let Some(value) = crate::host_log4j_level::static_call(r, args, &mut self.log4j_levels) {
+            return value;
         }
         if let Some(value) = client_reload::static_call(self, r, args) {
             return value;
@@ -22252,6 +22259,12 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn materialize_host_value(&mut self, value: Value) -> Value {
+        crate::host_log4j_level::array_values(&value).map_or(value, |values| {
+            self.new_array_value("[Lorg/apache/logging/log4j/Level;", values)
+        })
+    }
+
     /// The key of a new array of `class` (`[I`, `[Ljava/lang/String;`); its
     /// elements go in `arrays` under it, and its handle is
     /// [`host_array::handle`] of it, made once (`host_array.rs`).
@@ -25069,6 +25082,20 @@ impl<H: Host> Runtime<'_, H> {
         }))
     }
 
+    fn gson_write_target(&mut self, target: &str, text: &str) -> Result<(), NativeError> {
+        if let Some(key) = self.io_sink_key(target) {
+            self.io_writers.entry(key).or_default().push_str(text);
+            return Ok(());
+        }
+        if let Some(builder) = self.string_builders.get_mut(target) {
+            builder.push_str(text);
+            return Ok(());
+        }
+        Err(NativeError::Metadata(
+            "Gson Appendable is not modeled".into(),
+        ))
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -25102,6 +25129,10 @@ impl<H: Host> Runtime<'_, H> {
                 ("close", "()V") => Ok(Some(Value::Void)),
                 _ => Ok(None),
             };
+        }
+        // JsonWriter state/options are not modeled; count every call.
+        if r.owner == "com/google/gson/stream/JsonWriter" {
+            return self.host.unknown_operand_call(r).map(Some);
         }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
@@ -25153,6 +25184,11 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
+                    ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
+                    }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
                     // all write the same value, so the descriptor only has to
@@ -25176,6 +25212,15 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some),
                         }
+                    }
+                    (name, descriptor)
+                        if name == "toJson"
+                            && descriptor.ends_with(")V")
+                            && descriptor.contains("JsonWriter") =>
+                    {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
                     }
                     (name, descriptor)
                         if name == "toJson"
@@ -25209,17 +25254,15 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if let Some(key) = self.io_sink_key(target) {
-                            self.io_writers.entry(key).or_default().push_str(&text);
-                            return Ok(Some(Value::Void));
+                        if self.io_sink_key(target).is_none()
+                            && !self.string_builders.contains_key(target)
+                        {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
                         }
-                        let builder = self.string_builders.get_mut(target).ok_or_else(|| {
-                            NativeError::Metadata(format!(
-                                "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
-                             StringWriter or file writer"
-                            ))
-                        })?;
-                        builder.push_str(&text);
+                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
@@ -27898,6 +27941,7 @@ impl<H: Host> Runtime<'_, H> {
                             r.owner, r.name, r.descriptor
                         )));
                     };
+                    let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {
