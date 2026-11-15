@@ -168,8 +168,8 @@ fn server_values_answer_as_java() {
 
     // What the model cannot know is counted, never answered as Java's
     // opposite silently: two firings' positions may be one object or two
-    // (Java: `pos_eq=false`), and a jar's own `LevelResource` is no handle
-    // (Java: `res_equals_new=true`).
+    // (Java: `pos_eq=false`). A jar's own `LevelResource` equals the game's
+    // constant by its `id` (Java: `res_equals_new=true`, #245).
     fire(&mut host, GameEvent::ServerTickEnd, EventContext::default());
     let counted: Vec<String> = host
         .unknown_host_calls()
@@ -178,9 +178,9 @@ fn server_values_answer_as_java() {
         .collect();
     assert_eq!(
         counted,
-        [
-            "java/lang/Object#equals(Ljava/lang/Object;)Z",
-            "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z",
-        ]
+        ["java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z"]
     );
+    // `a1 == a2` is the counted comparison above, which keeps the value
+    // answer (Java: `false`); the resource's `equals` is Java's `true`.
+    assert_eq!(statics(&host, "counted"), "true,true");
 }
