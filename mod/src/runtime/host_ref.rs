@@ -2040,6 +2040,8 @@ const KINDS: &[KindInfo] = &[
         // A value: equal entries may be different objects.
         canonical: |_| false,
         methods: &crate::runtime::host_entry::METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
         tag: "rmh",
         class: ClassRule::Unknown {
