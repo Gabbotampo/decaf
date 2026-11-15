@@ -1,9 +1,14 @@
 //! `UnmodifiableList.subList` delegates before wrapping (#251).
 //!
-//! Java 25 bytecode: `Collections$UnmodifiableList.subList`, offsets 4–15,
-//! calls the backing `List.subList` then constructs an unmodifiable wrapper.
-//! Dispatch the backing call through the runtime so array windows, jar list
-//! bodies and range exceptions keep their own behavior.
+//! Java 25 bytecode: `Collections$UnmodifiableList.subList` (and
+//! `$UnmodifiableRandomAccessList.subList`) is
+//! `new <its own class>(list.subList(from, to))`. The backing call goes
+//! through the runtime, so array windows, jar list bodies and range
+//! exceptions keep their own behavior. The wrapper is then made with `new`,
+//! not through `Collections.unmodifiableList`: its class is the receiver's
+//! own, whether or not the part is `RandomAccess`, and it is a new object even
+//! when the part already is an unmodifiable list (where the factory would
+//! hand the part back).
 
 use super::*;
 
@@ -24,15 +29,13 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
-        if !matches!(
-            crate::runtime::jar_object::object_class(receiver),
+        let class = match crate::runtime::jar_object::object_class(receiver) {
             Some(
-                "java/util/Collections$UnmodifiableList"
-                    | "java/util/Collections$UnmodifiableRandomAccessList"
-            )
-        ) {
-            return Ok(None);
-        }
+                class @ ("java/util/Collections$UnmodifiableList"
+                | "java/util/Collections$UnmodifiableRandomAccessList"),
+            ) => class.to_owned(),
+            _ => return Ok(None),
+        };
         let Some(source) =
             expect_ref(receiver).and_then(|key| self.host.unmodifiable_view_source(key))
         else {
@@ -52,12 +55,18 @@ impl<H: Host> Runtime<'_, H> {
             }
             result => result?,
         };
-        self.call_static(
-            "java/util/Collections",
-            "unmodifiableList",
-            "(Ljava/util/List;)Ljava/util/List;",
-            &[part],
-        )
-        .map(Some)
+        // `new UnmodifiableList(null)` throws NPE in `UnmodifiableCollection`'s
+        // constructor: a jar `subList` that answers `null` gets Java's error.
+        if matches!(part, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        match self.host.unmodifiable_list_view_as(&class, &part) {
+            Some(view) => Ok(Some(view)),
+            None => self.host.unknown_operand_call(r).map(Some),
+        }
     }
 }

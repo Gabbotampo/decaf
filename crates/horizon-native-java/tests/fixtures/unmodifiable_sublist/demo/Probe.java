@@ -25,9 +25,41 @@ public class Probe {
             return e.getClass().getName() + ":" + e.getMessage();
         }
     }
+    // The wrapper `subList` makes is `new <the receiver's class>(part)`, never
+    // `Collections.unmodifiableList(part)`: its class does not follow the
+    // part's `RandomAccess`, it is new even when the part already is an
+    // unmodifiable list, and a `null` part throws NPE (#251).
+    static List<String> last;
+    static class Seq extends AbstractList<String> {
+        final int mode;
+        Seq(int mode) { this.mode = mode; }
+        public String get(int i) { return "s" + i; }
+        public int size() { return 4; }
+        public List<String> subList(int from, int to) {
+            if (mode == 0) return last = new ArrayList<>(List.of("x", "y"));
+            if (mode == 1) return last = Collections.unmodifiableList(new ArrayList<>(List.of("x")));
+            return last = null;
+        }
+    }
+    static class Ra extends Seq implements RandomAccess {
+        Ra() { super(0); }
+        public List<String> subList(int from, int to) { return last = new LinkedList<>(List.of("x")); }
+    }
+    public static String wrap(int op) {
+        try {
+            List<String> view = Collections.unmodifiableList(op == 3 ? new Ra() : new Seq(op));
+            List<String> part = view.subList(0, 1);
+            return view.getClass().getSimpleName() + "|" + part.getClass().getSimpleName() + "|"
+                + (part instanceof RandomAccess) + "|" + (part == last) + "|" + part.size();
+        } catch (RuntimeException e) {
+            return e.getClass().getName() + ":" + e.getMessage();
+        }
+    }
     public static void main(String[] args) {
         for (int kind = 0; kind < 3; kind++)
             for (int op = 0; op < 5; op++)
                 System.out.println(kind + "." + op + "=" + probe(kind, op));
+        for (int op = 0; op < 4; op++)
+            System.out.println("w." + op + "=" + wrap(op));
     }
 }

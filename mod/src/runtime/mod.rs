@@ -2416,6 +2416,14 @@ pub trait Host {
         None
     }
 
+    /// A new `Collections$UnmodifiableList` or `$UnmodifiableRandomAccessList`
+    /// (`class`) reading `source` live: what `UnmodifiableList.subList` makes
+    /// with `new` (#251), whatever `source`'s own class. `None` when the host
+    /// keeps no views, so the call is counted.
+    fn unmodifiable_list_view_as(&mut self, _class: &str, _source: &Value) -> Option<Value> {
+        None
+    }
+
     /// Whether `marker` is a JDK `List.of`/`List.copyOf` list (`List12`/
     /// `ListN`), whose search members reject `null` (`list_equality.rs`).
     fn is_jdk_list_of(&self, _marker: &str) -> bool {
@@ -4916,6 +4924,10 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {
+        self.unmodifiable_view_as(class, source)
     }
 
     fn is_jdk_list_of(&self, marker: &str) -> bool {
