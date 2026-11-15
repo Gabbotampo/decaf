@@ -53,6 +53,7 @@ mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
 mod executors;
+mod fabric_api_slice2;
 mod fabric_mods;
 mod fabric_registry;
 mod facade_saved_data;
@@ -5947,6 +5948,9 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_static(r) {
             return Ok(value);
         }
+        if let Some(value) = fabric_api_slice2::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = self.game_event_static(r) {
             return Ok(value);
         }
@@ -7529,6 +7533,9 @@ impl Host for StdHost {
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
+        if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
+            return value;
+        }
         if let Some(value) = self.item_like_call(r, receiver, args) {
             return Ok(value);
         }
@@ -9069,9 +9076,20 @@ impl Host for StdHost {
                 _ => {}
             }
         }
-        if r.owner == "net/fabricmc/fabric/api/event/Event" {
+        if r.owner == "net/fabricmc/fabric/api/event/Event"
+            && host_events::fabric_event_name(receiver).is_some()
+        {
             match r.name.as_str() {
-                "register" => return Ok(Value::Void),
+                "register" => {
+                    // The narrowed Fabric hook owns register(phase, listener).
+                    // If it refused a wrong-typed phase, do not let this
+                    // generic Event arm answer it silently.
+                    let phase_is_valid =
+                        args.len() < 2 || args.first().and_then(host_ids::identifier_key).is_some();
+                    if phase_is_valid {
+                        return Ok(Value::Void);
+                    }
+                }
                 "invoker" => return Ok(host_events::fabric_invoker(receiver)),
                 _ => {}
             }
@@ -32443,6 +32461,27 @@ mod tests {
             &Value::Ref(Some("door#1".into())),
             &[Value::Ref(Some("properties#1".into()))],
         );
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    #[test]
+    fn real_fabric_event_wrong_phase_stays_counted_through_generic_arm() {
+        let mut host = StdHost::new().with_strict_unknown_host_calls();
+        let receiver = Value::Host(HostRef::new(HostKind::FabricEvent, "array,0"));
+        let call = MethodRef {
+            owner: "net/fabricmc/fabric/api/event/Event".into(),
+            name: "register".into(),
+            descriptor: "(Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)V".into(),
+        };
+        let result = host.invoke_instance(
+            &call,
+            &receiver,
+            &[
+                Value::Ref(Some("fabric:default".into())),
+                Value::Ref(Some("listener".into())),
+            ],
+        );
+        assert!(matches!(result, Err(NativeError::UnknownHostCall(_))));
         assert_eq!(host.unknown_host_call_count(), 1);
     }
 
