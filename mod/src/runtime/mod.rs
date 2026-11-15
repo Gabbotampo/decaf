@@ -176,7 +176,6 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
-mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
 mod reference_identity;
@@ -26403,11 +26402,6 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
                     {
