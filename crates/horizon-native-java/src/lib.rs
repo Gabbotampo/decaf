@@ -13332,16 +13332,34 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
     usize::try_from(value).map_err(|_| array_bound_error(u128::from(u32::MAX) + 1))
 }
 
-/// Check the total number of arrays' elements a `multianewarray` will create.
-/// Only the supplied dimensions count: a partial array leaves its remaining
-/// dimensions null and does not materialize their elements.
+/// Most array objects one `multianewarray` may create. Each sub-array is its
+/// own entry in the runtime's array table, with a cost well above its element
+/// slots, so `new int[1 << 23][1]` must not pass on its 2^24 slots alone.
+pub(crate) const MAX_MULTIANEWARRAY_ARRAYS: u128 = 1 << 20;
+
+/// Check what a `multianewarray` will materialise before any of it exists:
+/// every level's element slots (the outer array's too, not only the leaves)
+/// against [`MAX_ARRAY_ELEMENTS`], and the number of array objects against
+/// [`MAX_MULTIANEWARRAY_ARRAYS`]. Only the supplied dimensions count: a partial
+/// array leaves its remaining dimensions null and creates nothing for them.
 fn array_total_elements(counts: &[usize]) -> Result<(), NativeError> {
-    let total = counts
-        .iter()
-        .fold(1_u128, |total, &count| total.saturating_mul(count as u128));
-    (total <= MAX_ARRAY_ELEMENTS as u128)
-        .then_some(())
-        .ok_or_else(|| array_bound_error(total))
+    // Level k holds prod(counts[..k]) arrays of counts[k] slots each.
+    let (mut arrays_at_level, mut arrays, mut slots) = (1_u128, 0_u128, 0_u128);
+    for &count in counts {
+        arrays = arrays.saturating_add(arrays_at_level);
+        arrays_at_level = arrays_at_level.saturating_mul(count as u128);
+        slots = slots.saturating_add(arrays_at_level);
+    }
+    if slots > MAX_ARRAY_ELEMENTS as u128 {
+        return Err(array_bound_error(slots));
+    }
+    if arrays > MAX_MULTIANEWARRAY_ARRAYS {
+        return Err(NativeError::Metadata(format!(
+            "multianewarray of {arrays} arrays exceeds the runtime's bound of \
+             {MAX_MULTIANEWARRAY_ARRAYS} arrays"
+        )));
+    }
+    Ok(())
 }
 
 /// Allocate repeated array elements without allowing Rust's allocator failure

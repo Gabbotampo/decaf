@@ -43,6 +43,11 @@ public final class Probe {
         catch (Throwable t) { return "caught:" + t.getClass().getName(); }
     }
 
+    public static String manyArrays() {
+        try { int[][] ignored = new int[1 << 21][1]; return "caught"; }
+        catch (Throwable t) { return "caught:" + t.getClass().getName(); }
+    }
+
     public static String dimensions() {
         int[][][] zero = new int[0][7][9];
         int[][][] partial = new int[2][3][];
@@ -109,7 +114,7 @@ fn array_lengths_match_java_25() {
         failures.join("\n")
     );
 
-    for method in ["overBound", "multidimOverBound"] {
+    for method in ["overBound", "multidimOverBound", "manyArrays"] {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let result = fixture.jar.invoke_method_with_args(
             "demo/Probe",
@@ -122,7 +127,10 @@ fn array_lengths_match_java_25() {
         let expected = match method {
             "overBound" => "array of 16777217 elements exceeds the runtime's bound of 16777216",
             "multidimOverBound" => {
-                "array of 4294967296 elements exceeds the runtime's bound of 16777216"
+                "array of 4295032832 elements exceeds the runtime's bound of 16777216"
+            }
+            "manyArrays" => {
+                "multianewarray of 2097153 arrays exceeds the runtime's bound of 1048576 arrays"
             }
             _ => unreachable!(),
         };
