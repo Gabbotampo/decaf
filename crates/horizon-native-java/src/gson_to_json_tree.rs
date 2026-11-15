@@ -30,5 +30,9 @@ pub(crate) fn instance_call<H: Host>(
         Some(text) => text,
         None => return runtime.host.invoke_instance(r, receiver, args).map(Some),
     };
-    crate::gson_tree::parse_text(runtime, &text).map(Some)
+    if style.special_floats() {
+        crate::gson_tree::parse_text_with_special(runtime, &text).map(Some)
+    } else {
+        crate::gson_tree::parse_text(runtime, &text).map(Some)
+    }
 }

@@ -20,9 +20,8 @@
 //! * `disableHtmlEscaping`: the HTML-unsafe set (`<`, `>`, `&`, `=`, `'`) is
 //!   escaped unless this was called.
 //! * `serializeNulls`: jar-object fields with a null value are written.
-//! * `setFieldNamingPolicy`: every `FieldNamingPolicy` constant's transform
-//!   (`separateCamelCase` + `upperCaseFirstLetter`) names the JSON keys, both
-//!   when writing and when reading a jar object.
+//! * `setFieldNamingPolicy` is a required counted boundary; arbitrary
+//!   reflective naming is never silently approximated.
 //! * `excludeFieldsWithModifiers`: `Excluder.withModifiers` **replaces** its
 //!   default `STATIC|TRANSIENT` mask with the arguments' OR, so
 //!   `excludeFieldsWithModifiers(0)` really does write static and transient
@@ -333,7 +332,7 @@ impl GsonStyle {
         self.long_strings
     }
 
-    fn special_floats(&self) -> bool {
+    pub(crate) fn special_floats(&self) -> bool {
         self.special_floats
     }
 
@@ -623,13 +622,13 @@ impl<H: Host> Runtime<'_, H> {
                 "setFieldNamingPolicy",
                 "(Lcom/google/gson/FieldNamingPolicy;)Lcom/google/gson/GsonBuilder;",
             ) => {
+                if args.iter().any(|value| matches!(value, Value::Ref(None))) {
+                    return Err(npe());
+                }
+                // Naming policies are a required counted boundary: this
+                // model does not claim to reproduce arbitrary reflective names.
                 let mut style = self.gson_style(&marker);
-                style.naming = args
-                    .first()
-                    .and_then(expect_ref)
-                    .and_then(|policy| policy.rsplit_once('/').map(|(_, name)| name))
-                    .and_then(Naming::from_name)
-                    .unwrap_or_default();
+                style.counted = true;
                 self.set_gson_style(&marker, style);
                 answer()
             }
@@ -816,7 +815,7 @@ impl<H: Host> Runtime<'_, H> {
             }),
             Value::Float(value) => {
                 if value.is_finite() {
-                    Some(format!("{value}"))
+                    Some(format_java_float(*value))
                 } else if style.special_floats() {
                     Some(if value.is_nan() {
                         "NaN".into()
@@ -853,8 +852,13 @@ impl<H: Host> Runtime<'_, H> {
                             .strip_prefix("enum/")
                             .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
                     });
+                let enum_name = enum_name.and_then(|name| {
+                    crate::runtime::jar_object::object_class(value)
+                        .and_then(|class| self.gson_enum_name(class, name))
+                        .or_else(|| Some(name.to_owned()))
+                });
                 if let Some(name) = enum_name {
-                    Some(format!("\"{}\"", style.escape(name)))
+                    Some(format!("\"{}\"", style.escape(&name)))
                 } else if let Some(kind) = gson_marker_kind(self.host, value) {
                     let values = runtime_collection_values(self.host, value)?;
                     if kind == "map" {
@@ -949,6 +953,9 @@ impl<H: Host> Runtime<'_, H> {
         style: &GsonStyle,
         depth: usize,
     ) -> Result<Option<String>, NativeError> {
+        if self.class(class).is_some_and(ClassFile::is_record) {
+            return Ok(None);
+        }
         let mut members: Vec<(String, Value)> = Vec::new();
         for (declaring, name, descriptor, access) in self.gson_fields(class) {
             if !style.includes_field(access) {
@@ -996,6 +1003,23 @@ impl<H: Host> Runtime<'_, H> {
         out.push_str(&style.line(depth));
         out.push('}');
         Ok(Some(out))
+    }
+
+    fn gson_enum_name(&self, class: &str, name: &str) -> Option<String> {
+        let file = self.class(class)?;
+        let field = file
+            .fields
+            .iter()
+            .find(|field| field.name == name && field.descriptor == format!("L{class};"))?;
+        file.field_annotations(&field.name, &field.descriptor)
+            .into_iter()
+            .find(|annotation| {
+                annotation.descriptor == "Lcom/google/gson/annotations/SerializedName;"
+            })
+            .and_then(|annotation| match annotation.values.get("value") {
+                Some(crate::runtime::AnnotationValue::String(value)) => Some(value.clone()),
+                _ => None,
+            })
     }
 
     fn gson_field_name(

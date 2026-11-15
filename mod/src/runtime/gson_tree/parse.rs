@@ -53,10 +53,19 @@ struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     pos: usize,
+    allow_special: bool,
 }
 
 impl<'a> Parser<'a> {
     fn parse(text: &'a str) -> Parsed {
+        Self::parse_with(text, false)
+    }
+
+    fn parse_special(text: &'a str) -> Parsed {
+        Self::parse_with(text, true)
+    }
+
+    fn parse_with(text: &'a str, allow_special: bool) -> Parsed {
         if text.len() > MAX_GSON_JSON_BYTES {
             return Parsed::Unsupported;
         }
@@ -64,6 +73,7 @@ impl<'a> Parser<'a> {
             bytes: text.as_bytes(),
             text,
             pos: 0,
+            allow_special,
         };
         let parsed = (|| {
             parser.skip_space()?;
@@ -196,6 +206,11 @@ impl<'a> Parser<'a> {
             b't' => self.keyword("true", Tree::Bool(true)),
             b'f' => self.keyword("false", Tree::Bool(false)),
             b'n' => self.keyword("null", Tree::Null),
+            b'N' if self.allow_special => self.special_number("NaN"),
+            b'I' if self.allow_special => self.special_number("Infinity"),
+            b'-' if self.allow_special && self.text[self.pos..].starts_with("-Infinity") => {
+                self.special_number("-Infinity")
+            }
             b'-' | b'0'..=b'9' => {
                 let start = self.pos;
                 while self.peek().is_some_and(|byte| {
@@ -217,6 +232,14 @@ impl<'a> Parser<'a> {
         }
         self.pos += word.len();
         self.at_delimiter().then_some(tree)
+    }
+
+    fn special_number(&mut self, word: &str) -> Option<Tree> {
+        if !self.text[self.pos..].starts_with(word) {
+            return None;
+        }
+        self.pos += word.len();
+        self.at_delimiter().then(|| Tree::Num(word.to_owned()))
     }
 
     /// A double-quoted string from its opening quote.
@@ -429,6 +452,21 @@ pub(super) fn parse_text<H: Host>(
     text: &str,
 ) -> Result<Value, NativeError> {
     match Parser::parse(text) {
+        Parsed::Empty => Ok(super::null_instance()),
+        Parsed::Value(tree) => runtime.materialize(tree),
+        Parsed::Unsupported => Err(NativeError::UnknownHostCall(MethodRef {
+            owner: JSON_PARSER.into(),
+            name: "parseString".into(),
+            descriptor: "(Ljava/lang/String;)Lcom/google/gson/JsonElement;".into(),
+        })),
+    }
+}
+
+pub(super) fn parse_text_with_special<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+) -> Result<Value, NativeError> {
+    match Parser::parse_special(text) {
         Parsed::Empty => Ok(super::null_instance()),
         Parsed::Value(tree) => runtime.materialize(tree),
         Parsed::Unsupported => Err(NativeError::UnknownHostCall(MethodRef {
