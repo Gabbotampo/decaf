@@ -72,9 +72,7 @@ pub(crate) fn event_call(
                         "Tried to register a listener for a null phase!",
                     ));
                 }
-                if identifier_key(args.first()?).is_none() {
-                    return None;
-                }
+                identifier_key(args.first()?)?;
                 if is_null(args.last()) {
                     return Some(thrown(
                         "java/lang/NullPointerException",
