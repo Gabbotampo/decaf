@@ -80,9 +80,12 @@ impl Fixture {
         )
     }
 
-
     /// Compile a probe against a string classpath for lightweight fixtures.
-    pub fn build_with_classpath<P: AsRef<Path>>(test: &str, sources: &[(&str, &str)], classpath: P) -> Self {
+    pub fn build_with_classpath<P: AsRef<Path>>(
+        test: &str,
+        sources: &[(&str, &str)],
+        classpath: P,
+    ) -> Self {
         Self::build_packed(
             test,
             sources,
