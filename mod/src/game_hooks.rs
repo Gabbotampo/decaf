@@ -476,8 +476,29 @@ fn note_late_player_tick_post(row: &mut crate::JarRow) {
 mod tests {
     use super::*;
     use mod_api::{
-        EntityRef, Hooks, HostSide, PlayerTickPostEvent, PlayerTickPreEvent, WorldEpoch,
+        Backend, BackendRef, EntityRef, Hooks, Host, HostSide, ModPhase, PhaseOwner, PlayerRef,
+        PlayerTickPostEvent, PlayerTickPreEvent, ServerHost, WorldEpoch,
     };
+
+    struct HookHost {
+        spectator: bool,
+    }
+
+    impl Host for HookHost {
+        fn backend(&self) -> Option<BackendRef<'_>> {
+            Some(BackendRef::of(self))
+        }
+    }
+    mod_api::impl_host_areas!(HookHost);
+    impl ServerHost for HookHost {}
+    mod_api::impl_server_host_areas!(HookHost);
+    impl mod_api::prelude::PlayersBackend for HookHost {
+        fn player_is_spectator(&self, _: PlayerRef) -> Option<bool> {
+            Some(self.spectator)
+        }
+    }
+    mod_api::impl_backend_areas!(HookHost, except(players));
+    impl Backend for HookHost {}
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -782,7 +803,8 @@ mod tests {
                 life: 0,
             },
         ];
-        let mut host = mod_api::testing::FakeHost::new();
+        let _phase = PhaseOwner::scope(ModPhase::World);
+        let mut host = HookHost { spectator: false };
         for (uuid, entity) in [(alice, 7), (bob, 8)] {
             let player = mod_api::__private::game::player_ref(
                 EntityRef::new(WorldEpoch::new(1), entity),
@@ -869,7 +891,8 @@ mod tests {
             session: 1,
             life: 0,
         });
-        let mut host = mod_api::testing::FakeHost::new();
+        let _phase = PhaseOwner::scope(ModPhase::World);
+        let mut host = HookHost { spectator: true };
         let player =
             mod_api::__private::game::player_ref(EntityRef::new(WorldEpoch::new(1), 7), 0xa1);
         crate::HorizonJava::player_tick_pre(
@@ -885,7 +908,7 @@ mod tests {
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.skipped, 0);
         assert_eq!(state.jars[0].row.game_hooks.ran, 2);
-        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
+        assert_eq!(state.jars[0].row.game_hooks.failed, 3);
         assert_eq!(stdout(&mut state, 0), ["pre", "post"]);
     }
 
