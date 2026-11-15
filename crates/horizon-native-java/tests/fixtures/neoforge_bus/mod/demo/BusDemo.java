@@ -47,6 +47,23 @@ public class BusDemo {
         bus.addListener(false, ServerTickEvent.Post.class, e -> System.out.println("plain-typed"));
     }
 
+    /// Parameterized superclass and chained type-variable Consumer signatures.
+    public static void generic(IEventBus bus) {
+        bus.addListener(new ChildGenericTickConsumer());
+        bus.addListener(new ViaVarTickConsumer<>());
+    }
+
+    /// Typetools failures: a raw lambda throws NPE; an erased Consumer has an unstable toString.
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static void failures(IEventBus bus, int which) {
+        if (which == 0) {
+            Consumer raw = (Consumer) (Object value) -> {};
+            bus.addListener(raw);
+        } else {
+            bus.addListener(new ErasedConsumer());
+        }
+    }
+
     /// Cancellation on a cancellable event, with and without `receiveCanceled`.
     public static void cancel(IEventBus bus) {
         bus.addListener(EventPriority.HIGH, (LivingDeathEvent e) -> {
