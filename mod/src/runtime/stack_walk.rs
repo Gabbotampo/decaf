@@ -93,7 +93,7 @@ impl<H: Host> Runtime<'_, H> {
                 // caller while retaining the bounded current-frame shape.
                 let snapshot = snapshot();
                 if snapshot.len() < 2 {
-                    self.host.unknown_operand_call(r)?;
+                    return Ok(Some(self.host.unknown_operand_call(r)?));
                 }
                 let frames = snapshot
                     .iter()
