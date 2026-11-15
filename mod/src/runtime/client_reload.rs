@@ -219,12 +219,10 @@ fn id_argument(value: Option<&Value>, message: &str) -> Result<Option<String>, N
     Ok(registration_id(value))
 }
 
+/// A collection handle's elements; nothing for any other value (a
+/// collection is a handle, #156 P14d2).
 fn collection_items<H: Host>(runtime: &Runtime<'_, H>, value: &Value) -> Option<Vec<Value>> {
-    runtime.host.mutable_collection_values(value).or_else(|| {
-        matches!(value, Value::Ref(Some(_)))
-            .then(|| crate::runtime::collection_values(value).ok())
-            .flatten()
-    })
+    runtime.host.mutable_collection_values(value)
 }
 
 fn invoke_dependency_method<H: Host>(
