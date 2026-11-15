@@ -42,6 +42,33 @@ class CensusCompareTests(unittest.TestCase):
         self.assertIn("EXACT/SILENT attribution", text)
         self.assertIn("| corpus | default | server | 2 | 0 |", text)
 
+    def test_count_only_change_in_a_still_hollow_row_is_reported(self):
+        # An exact model often removes some calls from a row that stays hollow: that must still be listed,
+        # with the per-call decrease, so it can be attributed EXACT or SILENT.
+        base = payload([{"jar": "pair.jar", "verdict": "ran-hollow", "unknown": 10,
+                         "calls": [["Pair#getFirst", 7], ["Other#x", 3]]}])
+        merged = payload([{"jar": "pair.jar", "verdict": "ran-hollow", "unknown": 5,
+                           "calls": [["Pair#getFirst", 2], ["Other#x", 3]]}])
+        report = tool.compare_payloads(base, merged, {"base": [base], "merged": [merged]}, "server")
+        self.assertEqual(len(report["moved"]), 1)
+        row = report["moved"][0]
+        self.assertEqual(row["vanished"], [{"call": "Pair#getFirst", "count": 5}])
+        self.assertEqual(row["appeared"], [])
+        self.assertEqual((row["base_unknown"], row["merged_unknown"]), (10, 5))
+
+    def test_identical_rows_are_not_reported(self):
+        same = {"jar": "same.jar", "verdict": "ran-hollow", "unknown": 1, "calls": [["x", 1]]}
+        report = tool.compare_payloads(payload([same]), payload([dict(same)]),
+                                       {"base": [payload([same])], "merged": [payload([same])]}, "server")
+        self.assertEqual(report["moved"], [])
+
+    def test_row_on_one_side_only_is_reported(self):
+        base = payload([])
+        merged = payload([{"jar": "new.jar", "verdict": "ran-hollow", "unknown": 2, "calls": [["y", 2]]}])
+        report = tool.compare_payloads(base, merged, {"base": [base], "merged": [merged]}, "server")
+        self.assertEqual(report["moved"][0]["base_verdict"], "(absent)")
+        self.assertEqual(report["moved"][0]["appeared"], [{"call": "y", "count": 2}])
+
 
 if __name__ == "__main__":
     unittest.main()

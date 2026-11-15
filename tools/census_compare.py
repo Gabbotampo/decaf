@@ -95,21 +95,34 @@ def totals(payload: dict, role: str, excluded: set[tuple[str, str, str, str]] = 
 
 
 def moved_jars(base: dict, merged: dict, role: str, flaky: set[tuple[str, str, str, str]]) -> list[dict]:
+    """Every deterministic row whose verdict, unknown count or counted-call multiset changed.
+
+    A count-only change matters as much as a verdict change: an exact model usually removes calls
+    from a row that stays hollow (#298's Pair calls did), and every vanished call must be attributed
+    EXACT or SILENT. A row present on only one side (a jar that started or stopped being censused) is
+    reported too, with a missing verdict.
+    """
     before, after = payload_rows(base, role), payload_rows(merged, role)
     moved = []
     for key in sorted(set(before) | set(after)):
         if key in flaky:
             continue
         left, right = before.get(key), after.get(key)
-        if left is None or right is None:
-            continue
-        if left.get("verdict") == right.get("verdict"):
-            continue
         old_calls, new_calls = call_counts(left), call_counts(right)
-        vanished = [{"call": call, "count": old_calls[call]} for call in sorted(old_calls.keys() - new_calls.keys())]
-        appeared = [{"call": call, "count": new_calls[call]} for call in sorted(new_calls.keys() - old_calls.keys())]
+        same_verdict = (left or {}).get("verdict") == (right or {}).get("verdict")
+        same_unknown = (left or {}).get("unknown") == (right or {}).get("unknown")
+        if left is not None and right is not None and same_verdict and same_unknown and old_calls == new_calls:
+            continue
+        # Per-call deltas: `vanished` holds calls counted fewer times after the merge (by how many),
+        # `appeared` calls counted more times; a call that disappears entirely is the full count.
+        vanished = [{"call": call, "count": old_calls[call] - new_calls.get(call, 0)}
+                    for call in sorted(old_calls) if old_calls[call] > new_calls.get(call, 0)]
+        appeared = [{"call": call, "count": new_calls[call] - old_calls.get(call, 0)}
+                    for call in sorted(new_calls) if new_calls[call] > old_calls.get(call, 0)]
         moved.append({"corpus": key[0], "mode": key[1], "role": key[2], "jar": key[3],
-                      "base_verdict": left.get("verdict"), "merged_verdict": right.get("verdict"),
+                      "base_verdict": (left or {}).get("verdict", "(absent)"),
+                      "merged_verdict": (right or {}).get("verdict", "(absent)"),
+                      "base_unknown": (left or {}).get("unknown"), "merged_unknown": (right or {}).get("unknown"),
                       "attribution": "", "vanished": vanished, "appeared": appeared})
     return moved
 
@@ -131,7 +144,7 @@ def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]
 
 def markdown(report: dict) -> str:
     lines = [f"Base SHA: `{report['base']['sha']}`", f"Merged SHA: `{report['merged']['sha']}`", "",
-             "## Unknown totals", "", "| Corpus | Mode | Role | Base unknown | Merged unknown | Base verdicts | Merged verdicts |", "|---|---|---|---:|---:|---|---|"]
+             "## Unknown totals (flaky rows excluded)", "", "| Corpus | Mode | Role | Base unknown | Merged unknown | Base verdicts | Merged verdicts |", "|---|---|---|---:|---:|---|---|"]
     groups = sorted(set(report["base"]["totals"]) | set(report["merged"]["totals"]))
     for group in groups:
         left, right = report["base"]["totals"].get(group, {}), report["merged"]["totals"].get(group, {})
@@ -139,13 +152,13 @@ def markdown(report: dict) -> str:
         def labels(data: dict) -> str:
             return ", ".join(f"{key}={data[key]}" for key in sorted(data) if key not in {"corpus", "mode", "role", "jars", "unknown_total"}) or "—"
         lines.append(f"| {source.get('corpus', group)} | {source.get('mode', '—')} | {source.get('role', '—')} | {left.get('unknown_total', 0)} | {right.get('unknown_total', 0)} | {labels(left)} | {labels(right)} |")
-    lines += ["", "## Deterministic moved jars", "", "| Corpus | Mode | Role | Jar | Base → merged | Vanished calls | Appeared calls | EXACT/SILENT attribution |", "|---|---|---|---|---|---|---|---|"]
+    lines += ["", "## Deterministic changed rows", "", "Every row whose verdict, unknown count or counted calls changed (flaky rows excluded). Vanished/appeared are per-call count deltas.", "", "| Corpus | Mode | Role | Jar | Base → merged | Unknown | Vanished calls | Appeared calls | EXACT/SILENT attribution |", "|---|---|---|---|---|---|---|---|---|"]
     for item in report["moved"]:
         def calls(values: list[dict]) -> str:
             return "<br>".join(f"`{entry['call']}` ({entry['count']})" for entry in values) or "—"
-        lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {item['attribution']} |")
+        lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {item['attribution']} |")
     if not report["moved"]:
-        lines.append("| — | — | — | — | — | — | — | — |")
+        lines.append("| — | — | — | — | — | — | — | — | — |")
     lines += ["", "## Flaky rows", ""]
     if report["flaky"]:
         lines += ["| Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|"]
@@ -164,7 +177,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus", action="append", required=True, metavar="NAME=DIR")
     p.add_argument("--fabric-loader", type=Path)
     p.add_argument("--provider-dir", type=Path, action="append", default=[])
-    p.add_argument("--role", choices=("server", "client"), default="server")
+    p.add_argument("--role", choices=("server", "client", "both"), default="both")
     p.add_argument("--dependency-mode", choices=("both", "alone", "closure"), default="both")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--repeat", type=int, default=2)
@@ -185,8 +198,8 @@ def build_probe(checkout: Path, target: Path, output: Path) -> None:
     output.chmod(output.stat().st_mode | 0o111)
 
 
-def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, path: Path) -> dict:
-    command = [sys.executable, str(base_checkout / "tools" / "unmodelled_calls.py"), "--probe", str(probe), "--json", str(path), "--jobs", str(args.jobs), "--role", args.role, "--dependency-mode", args.dependency_mode]
+def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role: str, path: Path) -> dict:
+    command = [sys.executable, str(base_checkout / "tools" / "unmodelled_calls.py"), "--probe", str(probe), "--json", str(path), "--jobs", str(args.jobs), "--role", role, "--dependency-mode", args.dependency_mode]
     for corpus in args.corpus:
         command += ["--corpus", corpus]
     if args.fabric_loader:
@@ -202,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.repeat < 1:
         raise SystemExit("--repeat must be at least 1")
     repo = ROOT
+    # Compare against the CURRENT main, not whatever this clone last fetched.
+    subprocess.run(["git", "fetch", "origin"], cwd=repo, check=False)
     base_ref, base_sha = resolve_head(repo, args.base)
     head_ref, head_sha = resolve_head(repo, args.head)
     print(f"Base SHA: {base_sha}")
@@ -230,20 +245,26 @@ def main(argv: list[str] | None = None) -> int:
     base_probe, merged_probe = root / "probe-base", root / "probe-merged"
     build_probe(base_checkout, root / "base", base_probe)
     build_probe(merged_checkout, root / "merged", merged_probe)
-    repetitions: dict[str, list[dict]] = {"base": [], "merged": []}
-    for label, checkout, probe in (("base", base_checkout, base_probe), ("merged", base_checkout, merged_probe)):
-        for number in range(args.repeat):
-            path = root / f"{label}-{number}.json"
-            payload = run_census(checkout, probe, args, path)
-            payload["sha"] = base_sha if label == "base" else merged_sha
-            repetitions[label].append(payload)
-    report = compare_payloads(repetitions["base"][0], repetitions["merged"][0], repetitions, args.role)
-    report["head_sha"] = head_sha
-    report["merged_sha"] = merged_sha
-    output = markdown(report)
+    roles = ["server", "client"] if args.role == "both" else [args.role]
+    reports: dict[str, dict] = {}
+    output = ""
+    for role in roles:
+        repetitions: dict[str, list[dict]] = {"base": [], "merged": []}
+        for label, probe in (("base", base_probe), ("merged", merged_probe)):
+            for number in range(args.repeat):
+                # Both probes run under the BASE checkout's driver, so the flags mean the same thing.
+                path = root / f"{role}-{label}-{number}.json"
+                payload = run_census(base_checkout, probe, args, role, path)
+                payload["sha"] = base_sha if label == "base" else merged_sha
+                repetitions[label].append(payload)
+        report = compare_payloads(repetitions["base"][0], repetitions["merged"][0], repetitions, role)
+        report["head_sha"] = head_sha
+        report["merged_sha"] = merged_sha
+        reports[role] = report
+        output += f"# Role: {role}\n\n" + markdown(report) + "\n"
     print(output, end="")
     if args.json:
-        args.json.write_text(json.dumps(report, indent=2) + "\n")
+        args.json.write_text(json.dumps({"head_sha": head_sha, "merged_sha": merged_sha, "roles": reports}, indent=2) + "\n")
     if args.markdown:
         args.markdown.write_text(output)
     return 0
