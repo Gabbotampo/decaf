@@ -14802,6 +14802,10 @@ struct BootstrapMethod {
 }
 
 impl ClassFile {
+    pub(crate) fn is_record(&self) -> bool {
+        self.super_name == "java/lang/Record"
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, NativeError> {
         Self::parse_with_warnings(bytes).map(|(class, _)| class)
     }

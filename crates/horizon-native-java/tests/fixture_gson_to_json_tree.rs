@@ -34,8 +34,11 @@ public final class Probe {
     int[] array = {4, 5};
     Kind kind = Kind.B;
     String someValue = "z";
+    double one = 1.0;
+    float fone = 1.0f;
   }
-  enum Kind { A, B }
+  enum Kind { A, @SerializedName("bee") B }
+  record Rec(int x, String s) {}
 
   public static String plain() {
     return new Gson().toJsonTree(new Child()).toString();
@@ -51,6 +54,18 @@ public final class Probe {
     Gson gson = new GsonBuilder().registerTypeAdapter(Child.class,
         (JsonSerializer<Child>) (value, type, context) -> new JsonPrimitive("custom")).create();
     return String.valueOf(gson.toJsonTree(new Child()));
+  }
+  public static String special() {
+    StringBuilder out = new StringBuilder();
+    try { out.append(new Gson().toJsonTree(Double.NaN)); }
+    catch (RuntimeException e) { out.append(e.getClass().getSimpleName()).append('|').append(e.getMessage()); }
+    out.append('|');
+    out.append(new GsonBuilder().serializeSpecialFloatingPointValues().create()
+        .toJsonTree(Double.NaN).toString());
+    return out.toString();
+  }
+  public static String record() {
+    return String.valueOf(new Gson().toJsonTree(new Rec(1, "s")));
   }
 }
 "#;
@@ -71,6 +86,7 @@ public final class Gson {
 public final class GsonBuilder {
   public GsonBuilder() {}
   public GsonBuilder serializeNulls() { return this; }
+  public GsonBuilder serializeSpecialFloatingPointValues() { return this; }
   public GsonBuilder setFieldNamingPolicy(FieldNamingPolicy policy) { return this; }
   public GsonBuilder registerTypeAdapter(Class<?> type, Object adapter) { return this; }
   public Gson create() { return null; }
@@ -248,36 +264,82 @@ fn gson_to_json_tree_matches_real_gson_or_signature_fallback() {
     for (method, expected) in [
         (
             "plain",
-            r#"{"boxed":2,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"B","someValue":"z","base":1,"renamed":"x","exposed":"e"}"#,
+            r#"{"boxed":2,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"bee","someValue":"z","one":1.0,"fone":1.0,"base":1,"renamed":"x","exposed":"e"}"#,
         ),
         (
             "nulls",
-            r#"{"boxed":2,"nullable":null,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"B","someValue":"z","base":1,"renamed":"x","exposed":"e"}"#,
+            r#"{"boxed":2,"nullable":null,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"bee","someValue":"z","one":1.0,"fone":1.0,"base":1,"renamed":"x","exposed":"e"}"#,
         ),
-        (
-            "naming",
-            r#"{"boxed":2,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"B","some_value":"z","base":1,"renamed":"x","exposed":"e"}"#,
-        ),
+        ("naming", r#"__counted__"#),
     ] {
         let mut host = jar.seed_host(StdHost::new());
-        let value = jar
-            .invoke_method_with_args(
-                "demo/Probe",
-                method,
-                "()Ljava/lang/String;",
-                None,
-                &[],
-                &mut host,
-            )
-            .unwrap();
-        assert_eq!(
-            value,
-            Value::Ref(Some(expected.into())),
-            "{method}: {:?}",
-            host.unknown_host_calls()
+        let result = jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
         );
-        assert!(host.unknown_host_calls().is_empty());
+        if method == "naming" {
+            assert!(matches!(
+                result,
+                Err(horizon_native_java::NativeError::UncaughtException { ref class, .. })
+                    if class == "java/lang/NullPointerException"
+            ));
+            assert!(
+                host.unknown_host_calls()
+                    .iter()
+                    .any(|(call, _)| call.contains("com/google/gson/Gson#toJsonTree"))
+            );
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                Value::Ref(Some(expected.into())),
+                "{method}: {:?}",
+                host.unknown_host_calls()
+            );
+            assert!(host.unknown_host_calls().is_empty());
+        }
     }
+    let mut host = jar.seed_host(StdHost::new());
+    let special = jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "special",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let expected_message = "NaN is not a valid double value as per JSON specification. To override this behavior, use GsonBuilder.serializeSpecialFloatingPointValues() method.";
+    assert_eq!(
+        special,
+        Value::Ref(Some(format!(
+            "IllegalArgumentException|{expected_message}|NaN"
+        ),))
+    );
+    assert!(host.unknown_host_calls().is_empty());
+
+    let mut host = jar.seed_host(StdHost::new());
+    let record = jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "record",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(record, Value::Ref(Some("null".into())));
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("com/google/gson/Gson#toJsonTree"))
+    );
+
     let mut host = jar.seed_host(StdHost::new());
     let value = jar
         .invoke_method_with_args(
