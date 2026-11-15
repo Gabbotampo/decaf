@@ -19,6 +19,19 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(receiver) = receiver
+            && let Some(value) = crate::kotlin_stdlib::instance(self, r, receiver, args)
+        {
+            return value.map(Some);
+        }
+        if receiver.is_none()
+            && let Some(value) = crate::kotlin_stdlib::invoke(self, r, args)
+        {
+            return value.map(Some);
+        }
+        if let Some(value) = string_constructors::value_of(self, r, args)? {
+            return Ok(Some(value));
+        }
         // Loggers named after a class (`jdk_model.rs`).
         if let Some(value) = self.invoke_logger_factory(r, args)? {
             return Ok(Some(value));
