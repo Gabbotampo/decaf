@@ -173,7 +173,6 @@ mod tests {
 
     /// Another owner, or a descriptor this module does not answer, is left
     /// to the host.
-    #[cfg(not(target_arch = "aarch64"))]
     #[test]
     fn other_calls_are_not_answered() {
         let r = MethodRef {
@@ -188,12 +187,14 @@ mod tests {
             descriptor: "(D)D".into(),
         };
         assert!(static_call(&r, &[Value::Float(0.0)]).is_none());
-        let r = MethodRef {
-            owner: "java/lang/Math".into(),
-            name: "pow".into(),
-            descriptor: "(DD)D".into(),
-        };
-        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+        if !cfg!(target_arch = "aarch64") {
+            let r = MethodRef {
+                owner: "java/lang/Math".into(),
+                name: "pow".into(),
+                descriptor: "(DD)D".into(),
+            };
+            assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

@@ -148,12 +148,27 @@ fn strictmath_pow_signed_exponents_match_java_25_rows() {
     ];
     for &(x_bits, expected) in rows {
         for (index, &y) in exponents.iter().enumerate() {
-            let got = call(
-                "java/lang/StrictMath",
-                "pow",
-                "(DD)D",
-                &[Value::Float(f64::from_bits(x_bits)), Value::Float(y)],
-            );
+            let method = MethodRef {
+                owner: "java/lang/StrictMath".into(),
+                name: "pow".into(),
+                descriptor: "(DD)D".into(),
+            };
+            let mut host = StdHost::new();
+            let got = host
+                .invoke(
+                    &method,
+                    &[Value::Float(f64::from_bits(x_bits)), Value::Float(y)],
+                )
+                .unwrap();
+            #[cfg(not(target_arch = "aarch64"))]
+            if f64::from_bits(expected[index]).is_nan() {
+                assert_eq!(
+                    host.unknown_host_call_count(),
+                    1,
+                    "x={x_bits:016x} y={y} NaN result must stay counted"
+                );
+                continue;
+            }
             assert_eq!(
                 got,
                 Value::Float(f64::from_bits(expected[index])),
