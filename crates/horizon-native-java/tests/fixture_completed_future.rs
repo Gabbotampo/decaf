@@ -48,6 +48,13 @@ public final class CompletedFutureProbe {
     CompletableFuture<String> recovered = bad.exceptionally(t -> "recovered:" + t.getMessage());
     CompletableFuture<String> handled = bad.handle((value, t) -> t.getClass().getSimpleName());
     CompletableFuture<String> observed = bad.whenComplete((value, t) -> seen.append(t.getMessage()));
+    String suppressed;
+    try {
+      bad.whenComplete((value, t) -> { throw new IllegalArgumentException("wc"); }).join();
+      suppressed = "none";
+    } catch (CompletionException e) {
+      suppressed = e.getCause().getSuppressed()[0].getMessage();
+    }
     String callback;
     try {
       CompletableFuture.completedFuture("x").thenApply(value -> { throw new RuntimeException("boom"); }).join();
@@ -55,7 +62,7 @@ public final class CompletedFutureProbe {
     } catch (CompletionException e) { callback = e.getCause().getMessage(); }
     return join + "|" + get + "|" + now + "|" + bad.isCompletedExceptionally()
         + "|" + recovered.join() + "|" + handled.join() + "|" + observed.isCompletedExceptionally()
-        + "|" + seen + "|" + callback;
+        + "|" + seen + "|" + suppressed + "|" + callback;
   }
 
   public static String alreadyWrapped() {
@@ -84,6 +91,29 @@ public final class CompletedFutureProbe {
     Future<String> future = CompletableFuture.completedFuture("y");
     return stage.thenApply(value -> value + "1").toCompletableFuture().join()
         + "|" + future.get() + "|" + future.isDone();
+  }
+
+  public static String allOf() {
+    return String.valueOf(CompletableFuture.allOf(
+        CompletableFuture.completedFuture("a"), CompletableFuture.completedFuture("b")).isDone());
+  }
+
+  public static String anyOf() {
+    return String.valueOf(CompletableFuture.anyOf(
+        CompletableFuture.completedFuture("a"), CompletableFuture.completedFuture("b")).join());
+  }
+
+  public static String obtrudeValue() {
+    CompletableFuture<String> future = CompletableFuture.failedFuture(new IllegalStateException("old"));
+    future.obtrudeValue("z");
+    return future.join() + "|" + future.isCompletedExceptionally();
+  }
+
+  public static String obtrudeException() {
+    CompletableFuture<String> future = CompletableFuture.completedFuture("x");
+    future.obtrudeException(new IllegalStateException("late"));
+    try { future.join(); return "none"; }
+    catch (CompletionException e) { return e.getCause().getMessage() + "|" + future.isCompletedExceptionally(); }
   }
 
   public static String async() {
@@ -187,6 +217,16 @@ fn future_to_string_remains_counted() {
     assert!(host.unknown_host_calls().iter().any(|(call, _)| {
         call == "java/util/concurrent/CompletableFuture#toString()Ljava/lang/String;"
     }));
+}
+
+#[test]
+fn unmodeled_combinators_and_obtrusion_remain_counted() {
+    let jar = fixture();
+    let mut host = StdHost::new().with_strict_unknown_host_calls();
+    for method in ["allOf", "anyOf", "obtrudeValue", "obtrudeException"] {
+        let error = call(&jar, method, &mut host).unwrap_err();
+        assert!(matches!(error, NativeError::UnknownHostCall(_)));
+    }
 }
 
 #[test]

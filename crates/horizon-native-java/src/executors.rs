@@ -543,7 +543,16 @@ fn invoke_future<H: Host>(
             let throwable = failure.clone().unwrap_or(Value::Ref(None));
             match invoke_callback_capturing(rt, callback, &[value.clone(), throwable])? {
                 Ok(None) => Ok(None),
-                Err(error) => Ok(Some(failed_future(rt, error))),
+                Err(error) => {
+                    if let Some(original) = failure.clone() {
+                        if let Some(key) = jar_object::instance_key(&original) {
+                            rt.suppressed.entry(key.to_owned()).or_default().push(error);
+                        }
+                        Ok(Some(failed_future(rt, original)))
+                    } else {
+                        Ok(Some(failed_future(rt, error)))
+                    }
+                }
                 Ok(Some(_)) => {
                     if let Some(failure) = failure {
                         Ok(Some(failed_future(rt, failure)))
