@@ -3,26 +3,80 @@
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 
 const ORACLE: &str = include_str!("fixtures/completed_future/java25.txt");
-use std::{fs, io::Write, path::PathBuf, process::Command};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 use zip::write::SimpleFileOptions;
+
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
 const SOURCE: &str = r#"
 package demo;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Future;
 
 public final class CompletedFutureProbe {
-  private static String seen;
-
   public static String chain() throws Exception {
+    StringBuilder seen = new StringBuilder();
     CompletableFuture<String> base = CompletableFuture.completedFuture("a");
     CompletableFuture<String> mapped = base.thenApply(value -> value + "b");
     CompletableFuture<String> composed = mapped.thenCompose(
         value -> CompletableFuture.completedFuture(value + "c"));
-    CompletableFuture<Void> accepted = composed.thenAccept(value -> seen = value);
+    CompletableFuture<Void> accepted = composed.thenAccept(seen::append);
     return base.isDone() + "|" + mapped.get() + "|" + composed.join()
         + "|" + accepted.isDone() + "|" + seen;
+  }
+
+  public static String exceptional() {
+    CompletableFuture<String> bad = CompletableFuture.failedFuture(new IllegalStateException("bad"));
+    StringBuilder seen = new StringBuilder();
+    String join;
+    try { bad.join(); join = "none"; }
+    catch (CompletionException e) { join = e.getClass().getSimpleName() + ":" + e.getCause().getClass().getSimpleName() + ":" + e.getCause().getMessage(); }
+    String get;
+    try { bad.get(); get = "none"; }
+    catch (Exception e) { get = e.getClass().getSimpleName() + ":" + e.getCause().getClass().getSimpleName() + ":" + e.getCause().getMessage(); }
+    String now;
+    try { bad.getNow("fallback"); now = "none"; }
+    catch (CompletionException e) { now = e.getClass().getSimpleName(); }
+    CompletableFuture<String> recovered = bad.exceptionally(t -> "recovered:" + t.getMessage());
+    CompletableFuture<String> handled = bad.handle((value, t) -> t.getClass().getSimpleName());
+    CompletableFuture<String> observed = bad.whenComplete((value, t) -> seen.append(t.getMessage()));
+    String callback;
+    try {
+      CompletableFuture.completedFuture("x").thenApply(value -> { throw new RuntimeException("boom"); }).join();
+      callback = "none";
+    } catch (CompletionException e) { callback = e.getCause().getMessage(); }
+    return join + "|" + get + "|" + now + "|" + bad.isCompletedExceptionally()
+        + "|" + recovered.join() + "|" + handled.join() + "|" + observed.isCompletedExceptionally()
+        + "|" + seen + "|" + callback;
+  }
+
+  public static String alreadyWrapped() {
+    CompletableFuture<String> bad = CompletableFuture.failedFuture(
+        new CompletionException(new IllegalStateException("wrapped")));
+    try { bad.join(); return "none"; }
+    catch (CompletionException e) {
+      return e.getClass().getSimpleName() + "|" + e.getCause().getClass().getSimpleName()
+          + "|" + e.getCause().getMessage();
+    }
+  }
+
+  public static String toStringCall() {
+    return CompletableFuture.completedFuture("x").toString();
+  }
+
+  public static String completeAlready() {
+    CompletableFuture<String> future = CompletableFuture.completedFuture("x");
+    boolean first = future.complete("y");
+    boolean second = future.completeExceptionally(new IllegalStateException("late"));
+    return first + "|" + second + "|" + future.getNow("z") + "|" + future.isCompletedExceptionally();
   }
 
   public static String interfaces() throws Exception {
@@ -45,8 +99,9 @@ fn javac() -> PathBuf {
 }
 
 fn fixture() -> NativeJar {
+    let serial = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
-        "horizon-native-java-completed-future-{}",
+        "horizon-native-java-completed-future-{}-{serial}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&root);
@@ -106,6 +161,32 @@ fn completed_future_chain_matches_java25_oracle() {
         call(&jar, "interfaces", &mut host).unwrap(),
         Value::Ref(Some(expected[1].into()))
     );
+}
+
+#[test]
+fn exceptional_future_semantics_match_java25_oracle() {
+    let jar = fixture();
+    let mut host = StdHost::new().with_strict_unknown_host_calls();
+    let expected: Vec<_> = ORACLE.lines().collect();
+    assert_eq!(
+        call(&jar, "exceptional", &mut host).unwrap(),
+        Value::Ref(Some(expected[2].into()))
+    );
+    assert_eq!(
+        call(&jar, "completeAlready", &mut host).unwrap(),
+        Value::Ref(Some(expected[3].into()))
+    );
+}
+
+#[test]
+fn future_to_string_remains_counted() {
+    let jar = fixture();
+    let mut host = StdHost::new().with_strict_unknown_host_calls();
+    let error = call(&jar, "toStringCall", &mut host).unwrap_err();
+    assert!(matches!(error, NativeError::UnknownHostCall(_)));
+    assert!(host.unknown_host_calls().iter().any(|(call, _)| {
+        call == "java/util/concurrent/CompletableFuture#toString()Ljava/lang/String;"
+    }));
 }
 
 #[test]

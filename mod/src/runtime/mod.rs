@@ -11402,6 +11402,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/StringIndexOutOfBoundsException"
         | "java/util/InputMismatchException" => "java/lang/IndexOutOfBoundsException",
         "java/lang/RuntimeException" => "java/lang/Exception",
+        "java/util/concurrent/CompletionException" => "java/lang/RuntimeException",
         "java/lang/ClassNotFoundException"
         | "java/lang/NoSuchMethodException"
         | "java/lang/NoSuchFieldException"
@@ -11415,6 +11416,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
+        "java/util/concurrent/ExecutionException" => "java/lang/Exception",
         "java/lang/ReflectiveOperationException"
         | "java/io/IOException"
         | "java/lang/InterruptedException"
