@@ -17898,7 +17898,6 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,
             arrays: BTreeMap::new(),
@@ -18105,7 +18104,6 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields,
             initialized_classes,
             arrays: BTreeMap::new(),
@@ -18268,7 +18266,6 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields,
             initialized_classes,
             arrays: BTreeMap::new(),
@@ -20796,8 +20793,6 @@ struct Runtime<'a, H> {
     host: &'a mut H,
     calls: usize,
     fields: BTreeMap<String, Value>,
-    /// Suppressed callback exceptions attached to a runtime throwable.
-    suppressed: BTreeMap<String, Vec<Value>>,
     static_fields: BTreeMap<String, Value>,
     initialized_classes: std::collections::BTreeSet<String>,
     arrays: BTreeMap<String, Vec<Value>>,
@@ -25993,7 +25988,12 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = receiver.and_then(jar_object::instance_key) else {
             return Ok(None);
         };
-        let values = self.suppressed.get(marker).cloned().unwrap_or_default();
+        // One store for every `addSuppressed`: the host's (#269's entrypoint failures,
+        // #278's `whenComplete`), which the heap collector traces. `None` (a throwable the
+        // host doesn't hold) falls through to the other paths.
+        let Some(values) = self.host.throwable_suppressed(marker) else {
+            return Ok(None);
+        };
         Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
     }
 
@@ -32303,7 +32303,6 @@ mod tests {
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([(
@@ -32362,7 +32361,6 @@ mod tests {
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
@@ -39472,7 +39470,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -39633,7 +39630,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -39817,7 +39813,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -40169,7 +40164,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
@@ -40481,7 +40475,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -45713,7 +45706,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -45767,7 +45759,6 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
-            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
