@@ -224,6 +224,9 @@ class Declaration:
     mod_id: str
     version: str = "?"
     depends: tuple[str, ...] = ()
+    # Required dependency ids paired with the loader-declared version range.
+    # `depends` remains the compatibility API used by pack partitioning.
+    requirements: tuple[tuple[str, str], ...] = ()
     breaks: tuple[str, ...] = ()
     content: tuple[tuple[str, str, str], ...] = ()
     # Ids the jar satisfies besides its own: jar-in-jar modules' ids and every
@@ -232,6 +235,109 @@ class Declaration:
     nested_ids: tuple[str, ...] = ()
     client_only: bool = False
     error: str = ""
+
+
+_VERSION_TOKEN = re.compile(r"\d+|[A-Za-z]+")
+
+
+def _version_parts(version: str) -> tuple[object, ...]:
+    """A bounded Maven/Fabric version ordering key."""
+    parts: list[object] = []
+    for token in _VERSION_TOKEN.findall(version):
+        parts.append(int(token) if token.isdigit() else token.lower())
+    return tuple(parts or [0])
+
+
+def _compare_versions(left: str, right: str) -> int:
+    a, b = _version_parts(left), _version_parts(right)
+    for index in range(max(len(a), len(b))):
+        missing = 0
+        x = a[index] if index < len(a) else missing
+        y = b[index] if index < len(b) else missing
+        if x == y:
+            continue
+        # Numeric release components sort after a textual qualifier at the
+        # same position (`1.0` is newer than `1.0-rc1`).
+        if isinstance(x, int) and isinstance(y, str):
+            return 1
+        if isinstance(x, str) and isinstance(y, int):
+            return -1
+        return 1 if x > y else -1
+    return 0
+
+
+def _numeric_prefix(value: str) -> tuple[int, ...]:
+    return tuple(int(item) for item in re.findall(r"\d+", value))
+
+
+def version_satisfies(version: str, requirement: str) -> bool:
+    """Match the Fabric/NeoForge ranges used in corpus metadata.
+
+    Fabric uses comparator expressions, wildcards, caret/tilde and ``||``;
+    NeoForge uses Maven intervals such as ``[1.20,1.21)``. An empty or ``*``
+    requirement is unconstrained. Unknown syntax is rejected so a census row
+    cannot become a false closure win.
+    """
+    expression = (requirement or "*").strip()
+    if expression in ("", "*", "+"):
+        return True
+    for alternative in expression.split("||"):
+        if _version_satisfies_one(version, alternative.strip()):
+            return True
+    return False
+
+
+def _version_satisfies_one(version: str, expression: str) -> bool:
+    if expression.startswith(("[", "(")) and expression.endswith(("]", ")")):
+        if "," not in expression:
+            return _compare_versions(version, expression[1:-1]) == 0
+        lower, upper = expression[1:-1].split(",", 1)
+        if lower and (_compare_versions(version, lower) < 0 or
+                      (expression[0] == "(" and _compare_versions(version, lower) == 0)):
+            return False
+        if upper and (_compare_versions(version, upper) > 0 or
+                      (expression[-1] == ")" and _compare_versions(version, upper) == 0)):
+            return False
+        return True
+    if expression.startswith("^") or expression.startswith("~"):
+        operator, raw = expression[0], expression[1:].strip()
+        if not re.fullmatch(r"\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?", raw):
+            return False
+        lower = _numeric_prefix(raw)
+        if not lower or _compare_versions(version, raw) < 0:
+            return False
+        upper = list(lower)
+        if operator == "~":
+            if len(upper) == 1:
+                upper[0] += 1
+            else:
+                upper[-2] += 1
+                upper[-1:] = [0]
+        elif lower[0] != 0:
+            upper[0] += 1
+            upper[1:] = [0] * (len(upper) - 1)
+        elif len(lower) == 1 or lower[1] != 0:
+            upper[0:2] = [0, lower[1] + 1 if len(lower) > 1 else 1]
+            upper[2:] = [0] * (len(upper) - 2)
+        else:
+            upper = list(lower)
+            upper[-1] += 1
+        return _compare_versions(version, ".".join(map(str, upper))) < 0
+    if "*" in expression or "x" in expression.lower():
+        prefix = expression.lower().replace("x", "*").split("*")[0].rstrip(".")
+        return version == prefix or version.startswith(prefix + ".")
+    comparators = re.findall(r"(>=|<=|>|<|=)?\s*([0-9][0-9A-Za-z.+-]*)", expression)
+    if not comparators or "".join(op + value for op, value in comparators).replace("=", "") not in re.sub(r"\s+", "", expression).replace("=", ""):
+        return False
+    for operator, bound in comparators:
+        comparison = _compare_versions(version, bound)
+        if operator in (">", ">=") and (comparison < 0 or operator == ">" and comparison == 0):
+            return False
+        if operator in ("<", "<=") and (comparison > 0 or operator == "<" and comparison == 0):
+            return False
+        if operator in ("", "=") and comparison != 0:
+            return False
+    return True
 
 
 def _lenient_json(text: str) -> str:
@@ -267,6 +373,17 @@ def _id_list(value: object) -> tuple[str, ...]:
     return ()
 
 
+def _requirements(value: object) -> tuple[tuple[str, str], ...]:
+    """Return dependency ids with their Fabric version expressions."""
+    if not isinstance(value, dict):
+        return tuple((ident, "*") for ident in _id_list(value))
+    rows = []
+    for ident, requirement in value.items():
+        if isinstance(ident, str):
+            rows.append((ident, str(requirement) if requirement is not None else "*"))
+    return tuple(sorted(set(rows)))
+
+
 def _native_content(raw: bytes) -> tuple[tuple[str, str, str], ...]:
     """Declared registry rows from `META-INF/horizon-native.json`."""
     value = json.loads(_lenient_json(raw.decode("utf-8", errors="replace")))
@@ -297,7 +414,9 @@ def _toml_value(raw: str) -> str:
     return text.split("#", 1)[0].strip()
 
 
-def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, tuple[str, ...], bool]:
+def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[
+    str, str, tuple[str, ...], tuple[tuple[str, str], ...], bool
+]:
     """Bounded NeoForge/Forge metadata: first mod id, required deps, client-only.
 
     The two formats disagree on what a dependency with no flag means. NeoForge's
@@ -309,19 +428,23 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
     """
     ident = version = ""
     required: list[str] = []
+    requirements: list[tuple[str, str]] = []
     client_only = False
     section = "none"
     dependency_id = ""
     dependency_required = neoforge
     dependency_client = False
+    dependency_range = "*"
 
     def flush() -> None:
-        nonlocal dependency_id, dependency_required, dependency_client
+        nonlocal dependency_id, dependency_required, dependency_client, dependency_range
         if dependency_id and dependency_required and not dependency_client:
             required.append(dependency_id)
+            requirements.append((dependency_id, dependency_range or "*"))
         dependency_id = ""
         dependency_required = neoforge
         dependency_client = False
+        dependency_range = "*"
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -358,8 +481,10 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
                 dependency_required = value.lower() == "true"
             elif key == "side":
                 dependency_client = value.upper() == "CLIENT"
+            elif key in ("versionRange", "version"):
+                dependency_range = value or "*"
     flush()
-    return ident, version, tuple(sorted(set(required))), client_only
+    return ident, version, tuple(sorted(set(required))), tuple(sorted(set(requirements))), client_only
 
 
 def _nested_ids(jar: zipfile.ZipFile) -> tuple[str, ...]:
@@ -417,22 +542,25 @@ def read_declaration(path: Path) -> Declaration:
                     raise ValueError("fabric.mod.json has no string id")
                 nested = tuple(sorted(set(nested) | set(_id_list(value.get("provides", [])))))
                 depends = _id_list(value.get("depends", {})) + _id_list(value.get("requires", {}))
+                requirements = _requirements(value.get("depends", {}))
+                requirements += _requirements(value.get("requires", {}))
                 breaks = _id_list(value.get("breaks", {})) + _id_list(value.get("conflicts", {}))
                 return Declaration(
                     path, ident, str(value.get("version", "?")),
-                    tuple(sorted(set(depends))), tuple(sorted(set(breaks))),
+                    tuple(sorted(set(depends))), tuple(sorted(set(requirements))),
+                    tuple(sorted(set(breaks))),
                     content, nested,
                     str(value.get("environment", "")).lower() == "client",
                 )
             for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
                 if name in names:
-                    ident, version, depends, client_only = _toml_declarations(
+                    ident, version, depends, requirements, client_only = _toml_declarations(
                         jar.read(name).decode("utf-8", errors="replace"),
                         neoforge=name == "META-INF/neoforge.mods.toml")
                     if not ident:
                         raise ValueError(f"{name} has no modId")
                     return Declaration(
-                        path, ident, version or "?", depends, (), content, nested,
+                        path, ident, version or "?", depends, requirements, (), content, nested,
                         client_only,
                     )
             if nested:
@@ -502,11 +630,15 @@ def load_pack(pack: Path, rows: dict[str, LedgerRow], *, no_metadata: bool = Fal
 
 def _dependency_targets(jar: PackJar, pack_by_id: dict[str, list[PackJar]]) -> list[PackJar]:
     targets: list[PackJar] = []
-    for dependency in jar.declaration.depends:
+    requirements = jar.declaration.requirements or tuple(
+        (dependency, "*") for dependency in jar.declaration.depends
+    )
+    for dependency, requirement in requirements:
         key = dependency.lower()
         if key in PLATFORM_IDS:
             continue
-        targets.extend(pack_by_id.get(key, []))
+        targets.extend(target for target in pack_by_id.get(key, [])
+                       if version_satisfies(target.declaration.version, requirement))
     return targets
 
 
@@ -1530,13 +1662,18 @@ def _closure(batch: list[PackJar], index: dict[str, list[PackJar]]) -> list[Pack
     queue = list(batch)
     while queue:
         jar = queue.pop(0)
-        for dependency in jar.declaration.depends:
+        requirements = jar.declaration.requirements or tuple(
+            (dependency, "*") for dependency in jar.declaration.depends
+        )
+        for dependency, requirement in requirements:
             key = dependency.lower()
             if key in PLATFORM_IDS or key in ids:
                 continue
             providers = [provider for provider in index.get(key, [])
                          if provider.path not in chosen
                          and provider.mod_id.lower() not in ids]
+            providers = [provider for provider in providers
+                         if version_satisfies(provider.declaration.version, requirement)]
             if not providers:
                 continue
             provider = providers[0]

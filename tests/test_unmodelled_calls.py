@@ -1,6 +1,11 @@
 import importlib.util
+import contextlib
+import io
+import json
+import tempfile
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -125,6 +130,44 @@ class UnmodelledCallsTests(unittest.TestCase):
                                            "unknown_host_call_count": 0}), "ran-partial")
         self.assertEqual(TOOL.row_verdict({"unknown_host_call_count": 0}), "ran-clean")
         self.assertEqual(TOOL.row_verdict({"unknown_host_call_count": 3}), "ran-hollow")
+
+    @staticmethod
+    def _jar(directory, name, ident, depends=None):
+        path = Path(directory) / name
+        metadata = {"schemaVersion": 1, "id": ident, "version": "1",
+                    "entrypoints": {"main": ["demo.Entry"]}}
+        if depends is not None:
+            metadata["depends"] = depends
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("fabric.mod.json", json.dumps(metadata))
+        return path
+
+    def test_both_modes_are_reported_and_missing_closure_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._jar(root, "app.jar", "app", {"absent": ">=2"})
+            probe = root / "probe"
+            probe.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in *--link*) n=2 ;; *) n=1 ;; esac\n"
+                "printf '{\"status\":\"ok\",\"unknown_host_call_count\":%s,\"unknown_host_calls\":[]}\\n' \"$n\"\n",
+                encoding="utf-8")
+            probe.chmod(0o755)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(TOOL.main([
+                    "--corpus", f"wide={root}", "--probe", str(probe),
+                    "--dependency-mode", "both", "--jobs", "1",
+                ]), 0)
+            report = json.loads(output.getvalue())
+        rows = report["corpora"]["wide"]["rows"]
+        by_mode = {row["mode"]: row for row in rows}
+        self.assertEqual(by_mode["alone"]["verdict"], "ran-hollow")
+        self.assertEqual(by_mode["alone"]["unknown"], 1)
+        self.assertEqual(by_mode["closure"]["verdict"], "refused")
+        self.assertIn("missing dependency absent", by_mode["closure"]["error"])
+        self.assertEqual(report["totals"]["alone"]["wide"]["ran-hollow"], 1)
+        self.assertEqual(report["totals"]["closure"]["wide"]["refused"], 1)
 
 
 if __name__ == "__main__":

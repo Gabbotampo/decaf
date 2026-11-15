@@ -3,11 +3,13 @@
 
     unmodelled_calls.py [--corpus name=DIR]... [--probe PATH] [--json OUT]
                         [--game-version 26.3] [--limit N] [--jobs N]
+                        [--dependency-mode both|alone|closure]
 
-Runs `horizon-native-java --json --game-version 26.3 --link <dep>... <jar> <kind>`
-once per jar, with the jar's declared dependency closure resolved against the other
-corpus jars (the same resolution `java_mod_server_ledger.py --with-deps` uses), and
-aggregates the probe's `unknown_host_calls`:
+Runs the probe once per jar alone and once with the jar's declared dependency
+closure (unless `--dependency-mode` selects one), resolved against the other
+corpus jars (the same resolution `java_mod_server_ledger.py --with-deps` uses),
+and aggregates the probe's `unknown_host_calls`. The modes are reported as
+separate rows and totals so a closure win cannot be mistaken for an interpreter win:
 
     call           owner#name descriptor, as the probe reports it
     jars           how many jars hit the call at least once
@@ -22,7 +24,8 @@ the game's mod gives (`verdict.rs`): `ran-clean` when every stage ran with no
 unknown host call, `ran-hollow` with at least one, `ran-partial` when a stage
 failed and another ran, `refused` when nothing ran. A jar with no server-side
 entrypoint is `skipped` (client-only or a library, out of scope for a server
-run).
+run). A closure with an absent or incompatible required provider is refused with
+`missing dependency X` and is never run.
 
 Default corpora: the Fabric `~/horizon-corpus/{corpus-xl,mega}` and the NeoForge
 jars pinned by `tools/real_mod_fixtures/neoforge_corpus.lock.json`. Nothing is
@@ -146,6 +149,47 @@ def probe_one(probe: Path, jar: Path, kind: str, deps: list[Path],
             "error": (result.stderr or result.stdout).strip()[-400:]}
 
 
+def missing_reason(missing: list[tuple[str, str]],
+                   requirements: tuple[tuple[str, str, str], ...] = ()) -> str:
+    ranges = {key: requirement for key, _, requirement in requirements}
+    names = []
+    for key, by in missing:
+        suffix = f" [{ranges[key]}]" if ranges.get(key) not in (None, "", "*") else ""
+        names.append(f"{key}{suffix}" if not by else f"{key}{suffix} (needed by {by})")
+    return "missing dependency " + ", ".join(names)
+
+
+def result_row(jar: Path, kind: str, result: dict, deps: list[Path],
+               missing: list[tuple[str, str]],
+               requirements: tuple[tuple[str, str, str], ...], mode: str) -> dict:
+    """Normalize one census mode while retaining probe evidence."""
+    if result.get("status") == "ok":
+        unknown = result.get("unknown_host_call_count")
+        calls = result.get("unknown_host_calls")
+        if not isinstance(unknown, int) or not isinstance(calls, list):
+            calls = []
+        row = {
+            "jar": jar.name, "mode": mode, "verdict": row_verdict(result),
+            "kind": kind, "unknown": unknown, "calls": calls,
+            "parked_threads": result.get("parked_threads") or [],
+            "deps": [dep.name for dep in deps], "missing": missing,
+        }
+        if result.get("failed"):
+            row["failed"] = [str(item)[:400] for item in result["failed"]]
+        return row
+    row = {
+        "jar": jar.name, "mode": mode, "verdict": "refused", "kind": kind,
+        "stage": result.get("stage"), "error": str(result.get("error"))[:400],
+        "deps": [dep.name for dep in deps], "missing": missing,
+    }
+    before = result.get("unknown_host_calls")
+    if isinstance(before, list) and before:
+        row["counted_before_error"] = before
+    if result.get("parked_threads"):
+        row["parked_threads"] = result["parked_threads"]
+    return row
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--corpus", action="append", type=parse_corpus,
@@ -157,6 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0,
                         help="probe at most N jars per corpus (0 = all)")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--dependency-mode", choices=("both", "alone", "closure"),
+                        default="both", help="run alone, closure, or both (default: both)")
     return parser
 
 
@@ -197,67 +243,50 @@ def main(argv: list[str] | None = None) -> int:
         for jar in jars:
             kind = entrypoint_kind(jar, name)
             if kind is None:
-                rows.append({"jar": jar.name, "verdict": "skipped",
-                             "reason": "no server entrypoint"})
+                for mode in (("alone", "closure") if args.dependency_mode == "both"
+                             else (args.dependency_mode,)):
+                    rows.append({"jar": jar.name, "mode": mode, "verdict": "skipped",
+                                 "reason": "no server entrypoint"})
                 continue
             closure = ledger.dependency_closure(jar, index)
-            todo.append((jar, kind, list(closure.jars), [key for key, _ in closure.missing]))
+            missing = list(closure.missing)
+            requirements = closure.missing_requirements
+            modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
+            for mode in modes:
+                if mode == "alone":
+                    todo.append((jar, kind, [], [], (), mode))
+                else:
+                    todo.append((jar, kind, list(closure.jars), missing, requirements, mode))
 
         def run(item):
-            jar, kind, deps, missing = item
-            return jar, kind, deps, missing, probe_one(probe, jar, kind, deps,
-                                                      args.game_version)
+            jar, kind, deps, missing, requirements, mode = item
+            if missing:
+                result = {"status": "refused", "stage": "dependency",
+                          "error": missing_reason(missing, requirements)}
+            else:
+                result = probe_one(probe, jar, kind, deps, args.game_version)
+            return result_row(jar, kind, result, deps, missing, requirements, mode)
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            for jar, kind, deps, missing, result in pool.map(run, todo):
-                status = result.get("status")
-                if status == "ok":
-                    unknown = result.get("unknown_host_call_count")
-                    calls = result.get("unknown_host_calls")
-                    if not isinstance(unknown, int) or not isinstance(calls, list):
-                        calls = []
-                    row = {
-                        "jar": jar.name,
-                        "verdict": row_verdict(result),
-                        "kind": kind,
-                        "unknown": unknown,
-                        "calls": calls,
-                        "parked_threads": result.get("parked_threads") or [],
-                        "deps": [dep.name for dep in deps],
-                        "missing": missing,
-                    }
-                    if result.get("failed"):
-                        row["failed"] = [str(item)[:400] for item in result["failed"]]
-                    rows.append(row)
-                else:
-                    row = {
-                        "jar": jar.name,
-                        "verdict": "refused",
-                        "kind": kind,
-                        "stage": result.get("stage"),
-                        "error": str(result.get("error"))[:400],
-                        "deps": [dep.name for dep in deps],
-                        "missing": missing,
-                    }
-                    # The calls the jar counted before it stopped. Kept for
-                    # reading why it was refused; the ranking and totals stay
-                    # over runs that finished, so they are not aggregated.
-                    before = result.get("unknown_host_calls")
-                    if isinstance(before, list) and before:
-                        row["counted_before_error"] = before
-                    if result.get("parked_threads"):
-                        row["parked_threads"] = result["parked_threads"]
-                    rows.append(row)
+            rows.extend(pool.map(run, todo))
         report[name] = {"directory": str(directory), "rows": rows}
 
     rows_by_corpus = {name: data["rows"] for name, data in report.items()}
-    totals, ranked = aggregate(rows_by_corpus)
-    parked = parked_summary(rows_by_corpus)
-    print(json.dumps({"totals": totals, "ranked": ranked[:MAX_REPORTED], "parked": parked,
-                      "corpora": report}, indent=2))
+    modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
+    totals = {}
+    ranked = {}
+    parked = {}
+    for mode in modes:
+        selected = {name: [row for row in rows if row.get("mode") == mode]
+                    for name, rows in rows_by_corpus.items()}
+        totals[mode], ranked[mode] = aggregate(selected)
+        parked[mode] = parked_summary(selected)
+    payload = {"dependency_mode": args.dependency_mode, "totals": totals,
+               "ranked": {mode: rows[:MAX_REPORTED] for mode, rows in ranked.items()},
+               "parked": parked, "corpora": report}
+    print(json.dumps(payload, indent=2))
     if args.json:
-        args.json.write_text(json.dumps({"totals": totals, "ranked": ranked, "parked": parked,
-                                        "corpora": report}, indent=2))
+        args.json.write_text(json.dumps(payload, indent=2))
     return 0
 
 

@@ -382,6 +382,7 @@ class Closure:
     jars: tuple[Path, ...] = ()
     ids: tuple[str, ...] = ()
     missing: tuple[tuple[str, str], ...] = ()
+    missing_requirements: tuple[tuple[str, str, str], ...] = ()
 
 
 def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
@@ -437,27 +438,35 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
     `neoforge`, ...), by an id the closure already holds (the jar's own id, its
     `provides` aliases and jar-in-jar modules, and the same for each provider it
     pulled in), or by the best provider in the index; anything else is missing.
-    Version ranges are not checked: the newest provider stands in for the range,
-    which is what the corpus can offer.
+    Providers are filtered by the declared Fabric or NeoForge version range. A
+    provider with the wrong version is missing from this closure; it is never
+    linked as a host and the census reports the unresolved id.
     """
     root = declaration or hybrid_pack.read_declaration(jar)
     target = hybrid_pack.PackJar(jar, None, root)
     held = {target.mod_id.lower()} | {ident.lower() for ident in root.nested_ids}
     chosen: dict[Path, hybrid_pack.PackJar] = {}
     missing: dict[str, str] = {}
+    missing_requirements: dict[str, tuple[str, str]] = {}
     queue = [target]
     while queue:
         current = queue.pop(0)
-        for dependency in current.declaration.depends:
+        requirements = current.declaration.requirements or tuple(
+            (dependency, "*") for dependency in current.declaration.depends
+        )
+        for dependency, requirement in requirements:
             key = dependency.lower()
             if key in hybrid_pack.PLATFORM_IDS or key in held:
                 continue
             providers = [provider for provider in index.get(key, [])
                          if provider.path.resolve() != jar.resolve()
                          and provider.path not in chosen
-                         and provider.mod_id.lower() not in held]
+                         and provider.mod_id.lower() not in held
+                         and hybrid_pack.version_satisfies(provider.declaration.version,
+                                                           requirement)]
             if not providers:
                 missing.setdefault(key, current.mod_id)
+                missing_requirements.setdefault(key, (current.mod_id, requirement))
                 continue
             provider = canonical_provider(providers)
             chosen[provider.path] = provider
@@ -467,16 +476,25 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
     # An id first missed and then provided by a later provider's nested module
     # is not missing after all.
     missing = {key: by for key, by in missing.items() if key not in held}
+    missing_requirements = {
+        key: value for key, value in missing_requirements.items() if key not in held
+    }
     deps = sorted(chosen.values(), key=lambda item: item.name)
     return Closure(tuple(item.path for item in deps), tuple(item.mod_id for item in deps),
-                   tuple(sorted(missing.items())))
+                   tuple(sorted(missing.items())),
+                   tuple(sorted((key, by, requirement)
+                                for key, (by, requirement) in missing_requirements.items())))
 
 
 def missing_dependency_row(jar: Path, closure: Closure) -> Row:
     """The row of a jar the ledger did not start: its closure cannot be completed."""
     ident, version = metadata(jar)
-    named = ", ".join(key if by.lower() == ident.lower() else f"{key} (needed by {by})"
-                      for key, by in closure.missing)
+    ranges = {key: requirement for key, _, requirement in closure.missing_requirements}
+    named = ", ".join(
+        (key if by.lower() == ident.lower() else f"{key} (needed by {by})")
+        + (f" [{ranges[key]}]" if key in ranges and ranges[key] not in ("", "*") else "")
+        for key, by in closure.missing
+    )
     return Row(jar.name, ident, version, "unresolved", "", "?", reason=bounded(
         f"missing-dependency: {named}", MAX_CAUSE), recommend=MISSING_DEPENDENCY,
         deps=closure.ids)
