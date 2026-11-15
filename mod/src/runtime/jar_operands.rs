@@ -600,7 +600,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether a jar object's class implements `java.util.Map.Entry`.
-    fn jar_map_entry(&self, value: &Value) -> bool {
+    pub(crate) fn jar_map_entry(&self, value: &Value) -> bool {
         crate::runtime::jar_object::object_class(value)
             .is_some_and(|class| self.class_is_instance(class, "java/util/Map$Entry"))
     }

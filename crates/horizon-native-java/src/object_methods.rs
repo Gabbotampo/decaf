@@ -459,6 +459,35 @@ impl<H: Host> Runtime<'_, H> {
                 // give (two equal keys from different constructions of an
                 // identity-`equals` kind) is counted and never replaced by
                 // key equality: the two stay distinct (§2.1).
+                // A host map entry and a jar's own `Map.Entry`:
+                // `KeyValueHolder.equals`/`HashMap.Node.equals` read the other
+                // entry's `getKey`, then (keys equal) its `getValue`, and compare
+                // with `Objects.equals`.
+                if let Some((key, value)) = crate::host_entry::parts(a)
+                    && self.jar_map_entry(b)
+                {
+                    let descriptor = "()Ljava/lang/Object;";
+                    let theirs = self.call_virtual(
+                        crate::jdk_call::Site::Interface,
+                        "java/util/Map$Entry",
+                        "getKey",
+                        descriptor,
+                        b,
+                        &[],
+                    )?;
+                    if !self.objects_equals(&key, &theirs)? {
+                        return Ok(false);
+                    }
+                    let theirs = self.call_virtual(
+                        crate::jdk_call::Site::Interface,
+                        "java/util/Map$Entry",
+                        "getValue",
+                        descriptor,
+                        b,
+                        &[],
+                    )?;
+                    return self.objects_equals(&value, &theirs);
+                }
                 if let Value::Host(handle) = a
                     && !crate::jar_object::is_object_handle(handle)
                 {
@@ -746,6 +775,18 @@ impl<H: Host> Runtime<'_, H> {
         // An object's methods are its class's: dispatched like any call.
         if !matches!(opcode, 0xb6 | 0xb9) || crate::jar_object::is_object_handle(handle) {
             return Ok(None);
+        }
+        // A host map entry's `equals`: `KeyValueHolder.equals` asks the other
+        // object's `getKey`/`getValue`, which a jar's own `Map.Entry` runs
+        // here (`java_equals`), not the kind's row.
+        if handle.kind() == crate::host_ref::HostKind::MapEntry
+            && r.name == "equals"
+            && r.descriptor == EQUALS
+            && let [other] = args
+        {
+            let receiver = Value::Host(handle.clone());
+            let equal = self.java_equals(&receiver, other)?;
+            return Ok(Some(Value::Int(i32::from(equal))));
         }
         // A callback's `toString`: counted, a text answered (`host_ref_text`).
         if handle.kind() == crate::host_ref::HostKind::Callback

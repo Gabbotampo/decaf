@@ -124,7 +124,7 @@ fn calls_to<'a>(host: &'a StdHost, owner: &str, name: &str) -> Vec<&'a HostInvoc
 }
 
 /// The callback target a registration recorded in its `@indy:` marker
-/// (`@indy:<tag>:<class>#<method>:<index>:<interface>:<target>:<captures>`).
+/// (`@indy:<class>#<method>:<site>:<interfaces>:<target>:<captures>`).
 fn indy_target(invocation: &HostInvocation) -> String {
     let marker = invocation
         .args
@@ -138,10 +138,11 @@ fn indy_target(invocation: &HostInvocation) -> String {
         })
         .find(|marker| marker.starts_with("@indy:"))
         .unwrap_or_else(|| panic!("no invokedynamic marker in {invocation:?}"));
-    // The target never contains `:`, so the captures after it cannot shift it.
+    // `@indy:<source>:<site>:<interfaces>:<target>:<captures>`: the target
+    // never contains `:`, so the captures after it cannot shift it.
     marker
         .split(':')
-        .nth(5)
+        .nth(4)
         .unwrap_or_else(|| panic!("malformed @indy marker {marker}"))
         .to_owned()
 }
