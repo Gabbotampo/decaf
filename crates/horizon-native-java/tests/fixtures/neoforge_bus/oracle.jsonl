@@ -1,4 +1,4 @@
-{"case":"order","out":["highest","captured","high-typed","static","typed","object","receives","plain-typed","bound","lowest"]}
+{"case":"order","out":["highest","captured","high-typed","static","typed","object","bounded","receives","plain-typed","bound","lowest"]}
 {"case":"cancel","out":["cancels","uncancels","runs-again","cancels-last"],"canceled":true}
 {"case":"cancel_two_mods","out":["cancels","uncancels","skipped","uncancels","runs-again","runs-again","cancels-last"],"canceled":true}
 {"case":"unregister","out":["kept"]}

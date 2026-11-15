@@ -180,6 +180,7 @@ fn listeners_run_in_the_real_buses_order() {
             "static",
             "typed",
             "object",
+            "bounded",
             "receives",
             "plain-typed",
             "bound",

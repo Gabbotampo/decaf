@@ -516,11 +516,7 @@ impl<H: Host> Runtime<'_, H> {
 /// The class a generic class signature's `Consumer<X>` supertype names, when `X` is a class type
 /// (`Lpkg/Event;` or `Lpkg/Event<..>;`). A type variable or wildcard argument answers `None`.
 fn consumer_argument(signature: &str) -> Option<String> {
-    let mut rest = signature;
-    // Formal type parameters: `<T:Ljava/lang/Object;>`.
-    if rest.starts_with('<') {
-        rest = &rest[matching_angle(rest)? + 1..];
-    }
+    let (bounds, mut rest) = signature_bounds(signature)?;
     while !rest.is_empty() {
         let end = class_type_end(rest)?;
         let (one, after) = rest.split_at(end);
@@ -529,13 +525,74 @@ fn consumer_argument(signature: &str) -> Option<String> {
             .and_then(|s| s.strip_prefix(CONSUMER))
             .and_then(|s| s.strip_prefix('<'))
         {
-            let argument = arguments.strip_prefix('L')?;
-            let stop = argument.find([';', '<'])?;
-            return Some(argument[..stop].to_owned());
+            let argument = arguments.strip_suffix(">;")?;
+            return signature_type_name(argument, &bounds, 0);
         }
         rest = after;
     }
     None
+}
+
+/// The first bound of each formal type variable in a class Signature.
+/// TypeResolver.resolveBound uses exactly this bound when no concrete type
+/// argument is available (and treats an Object-only bound as unknown).
+fn signature_bounds(signature: &str) -> Option<(std::collections::BTreeMap<&str, &str>, &str)> {
+    if !signature.starts_with('<') {
+        return Some((std::collections::BTreeMap::new(), signature));
+    }
+    let close = matching_angle(signature)?;
+    let mut bounds = std::collections::BTreeMap::new();
+    let mut at = 1;
+    while at < close {
+        let colon = signature[at..close].find(':')? + at;
+        let variable = &signature[at..colon];
+        at = colon + 1;
+        let bound_start = at;
+        if at < close && signature.as_bytes()[at] == b'L' {
+            at = bound_end(signature, at)?;
+            bounds.insert(variable, &signature[bound_start..at]);
+        } else {
+            // An empty class bound means Object; interface bounds follow the
+            // remaining :L...; entries and are not the first bound.
+            bounds.insert(variable, "Ljava/lang/Object;");
+        }
+        while at < close && signature.as_bytes()[at] == b':' {
+            at += 1;
+            if at < close && signature.as_bytes()[at] == b'L' {
+                at = bound_end(signature, at)?;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some((bounds, &signature[close + 1..]))
+}
+
+/// End of one reference type in a formal bound, including nested arguments.
+fn bound_end(signature: &str, start: usize) -> Option<usize> {
+    let end = class_type_end(&signature[start..])?;
+    Some(start + end)
+}
+
+/// Resolve a Consumer type argument, including a type variable's first bound.
+fn signature_type_name(
+    argument: &str,
+    bounds: &std::collections::BTreeMap<&str, &str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(name) = argument.strip_prefix('L') {
+        let stop = name.find([';', '<'])?;
+        return Some(name[..stop].to_owned());
+    }
+    let variable = argument.strip_prefix('T')?.strip_suffix(';')?;
+    let bound = bounds.get(variable).copied()?;
+    if bound == "Ljava/lang/Object;" {
+        return None;
+    }
+    signature_type_name(bound, bounds, depth + 1)
 }
 
 /// The index of the `>` that closes the `<` at `text[0]`.
@@ -633,9 +690,17 @@ mod tests {
         assert_eq!(
             consumer_argument(
                 "<T:Lnet/neoforged/bus/api/Event;>Ljava/lang/Object;Ljava/util/function/Consumer<TT;>;"
-            ),
-            None,
-            "a type variable is left to typetools' bound resolution, which is counted"
+            )
+            .as_deref(),
+            Some("net/neoforged/bus/api/Event"),
+            "a bounded type variable resolves like typetools' resolveBound"
+        );
+        assert_eq!(
+            consumer_argument(
+                "<T:Lnet/neoforged/neoforge/event/tick/ServerTickEvent$Post;>Ljava/lang/Object;Ljava/util/function/Consumer<TT;>;"
+            )
+            .as_deref(),
+            Some("net/neoforged/neoforge/event/tick/ServerTickEvent$Post")
         );
         assert_eq!(
             consumer_argument(

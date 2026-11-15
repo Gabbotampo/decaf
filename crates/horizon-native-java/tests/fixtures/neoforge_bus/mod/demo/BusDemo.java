@@ -39,6 +39,7 @@ public class BusDemo {
         bus.addListener(EventPriority.HIGH, (ServerTickEvent.Post e) -> System.out.println(captured));
         bus.addListener(ServerTickEvent.Post.class, e -> System.out.println("typed"));
         bus.addListener(new TickConsumer("object"));
+        bus.addListener(new BoundedTickConsumer<>());
         bus.addListener(EventPriority.HIGHEST, false, ServerTickEvent.Post.class, e -> System.out.println("highest"));
         bus.addListener(true, (ServerTickEvent.Post e) -> System.out.println("receives"));
         bus.addListener(EventPriority.LOWEST, true, (ServerTickEvent.Post e) -> System.out.println("lowest"));
