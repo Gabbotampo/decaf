@@ -341,9 +341,10 @@ impl<H: Host> Runtime<'_, H> {
         };
         let access = access.unwrap_or(ACC_PUBLIC);
         if !class_path {
-            if self.host.jar_module_descriptor() == Some(true) {
-                // An explicit module lists providers in `module-info` and may
-                // build them with a static `provider()` method.
+            // An explicit module lists providers in `module-info` and may
+            // build them with a static `provider()` method; a jar the host
+            // does not know (`None`) may be one. Counted either way.
+            if self.host.jar_module_descriptor() != Some(false) {
                 self.count_guess(provider, "<service-provider>", "()Ljava/lang/Object;")?;
                 return Ok(Lookup::Opaque);
             }

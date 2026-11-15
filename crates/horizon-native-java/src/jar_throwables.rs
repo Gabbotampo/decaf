@@ -127,7 +127,7 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(key) = crate::jar_object::object_key(value)
             && crate::jar_object::key_class(key).is_some_and(|class| self.jar_throwable(class))
         {
-            return self.host.throwable_message(key);
+            return self.host.throwable_message(key).flatten();
         }
         expect_ref(value)?;
         thrown_message(value, self.host)
@@ -249,7 +249,12 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("getMessage", "()Ljava/lang/String;") => {
                 let marker = expect_ref(receiver).cloned().unwrap_or_default();
-                Ok(Some(Value::Ref(self.host.throwable_message(&marker))))
+                match self.host.throwable_message(&marker) {
+                    Some(message) => Ok(Some(Value::Ref(message))),
+                    // No message recorded for this object: not known to be
+                    // `null`, so counted (a host that counts nothing refuses).
+                    None => self.host.unknown_operand_call(r).map(Some),
+                }
             }
             _ => Ok(None),
         }

@@ -359,9 +359,18 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(receiver) = &heap.receiver {
             let live = self.collection_elements(receiver)?;
             let marker = expect_ref(receiver).cloned().unwrap_or_default();
-            if live != heap.es || self.mod_stamp(&marker) != heap.mc {
+            let verdict = self.mod_stamp(&marker).verdict(heap.mc);
+            if live != heap.es || verdict == crate::runtime::mod_count::ModVerdict::Changed {
                 heap.es = live;
                 return Err(thrown("java/util/ConcurrentModificationException"));
+            }
+            if verdict == crate::runtime::mod_count::ModVerdict::Unknown {
+                // The predicate may have changed the queue's `modCount`.
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/util/PriorityQueue".into(),
+                    name: "removeIf".into(),
+                    descriptor: "(Ljava/util/function/Predicate;)Z".into(),
+                })?;
             }
         }
         if !doomed.contains(&true) {
