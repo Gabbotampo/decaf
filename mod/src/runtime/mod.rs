@@ -10880,6 +10880,16 @@ impl Host for StdHost {
         file_bytes: BTreeMap<String, Vec<u8>>,
         dirs: BTreeSet<String>,
     ) -> Result<(), NativeError> {
+        let entries = files.len()
+            + dirs
+                .iter()
+                .filter(|path| !files.contains_key(*path))
+                .count();
+        let bytes = files.values().map(String::len).sum::<usize>()
+            + file_bytes.values().map(Vec::len).sum::<usize>();
+        if entries > MAX_PERSISTENT_IO_ENTRIES || bytes > MAX_PERSISTENT_IO_BYTES {
+            return Err(Runtime::<Self>::io_capacity_error(entries, bytes));
+        }
         self.io_paths = paths;
         self.io_files = files;
         self.io_file_bytes = file_bytes;
@@ -24137,11 +24147,16 @@ impl<H: Host> Runtime<'_, H> {
     /// A `File`/`FileInputStream`/`FileWriter` marker resolves through
     /// [`Runtime::io_paths`]; a `Path` is its handle's text; anything else is
     /// a plain string path.
-    pub(crate) fn io_store_file(&mut self, path: String, text: String) {
-        self.io_store_encoded_file(path, text, "UTF-8");
+    pub(crate) fn io_store_file(&mut self, path: String, text: String) -> Result<(), NativeError> {
+        self.io_store_encoded_file(path, text, "UTF-8")
     }
 
-    pub(crate) fn io_store_encoded_file(&mut self, path: String, text: String, charset: &str) {
+    pub(crate) fn io_store_encoded_file(
+        &mut self,
+        path: String,
+        text: String,
+        charset: &str,
+    ) -> Result<(), NativeError> {
         let bytes = Self::encode_io_text(&text, charset).unwrap_or_else(|| {
             let _ = self.host.unknown_operand_call(&MethodRef {
                 owner: "java/nio/file/Files".into(),
@@ -24151,8 +24166,10 @@ impl<H: Host> Runtime<'_, H> {
             });
             text.as_bytes().to_vec()
         });
+        self.ensure_io_capacity(&path, text.len() + bytes.len())?;
         self.io_file_bytes.insert(path.clone(), bytes);
         self.io_files.insert(path, text);
+        Ok(())
     }
 
     pub(crate) fn io_store_file_with_charset_args(
@@ -24160,18 +24177,54 @@ impl<H: Host> Runtime<'_, H> {
         path: String,
         text: String,
         args: &[Value],
-    ) {
+    ) -> Result<(), NativeError> {
         let charset = args
             .iter()
             .rev()
             .find_map(|value| expect_ref(value).and_then(|text| text.strip_prefix("charset/")));
-        self.io_store_encoded_file(path, text, charset.unwrap_or("UTF-8"));
+        self.io_store_encoded_file(path, text, charset.unwrap_or("UTF-8"))
     }
 
-    pub(crate) fn io_store_bytes(&mut self, path: String, bytes: Vec<u8>) {
+    pub(crate) fn io_store_bytes(
+        &mut self,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), NativeError> {
         let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.ensure_io_capacity(&path, text.len() + bytes.len())?;
         self.io_file_bytes.insert(path.clone(), bytes);
         self.io_files.insert(path, text);
+        Ok(())
+    }
+
+    fn io_entries(&self) -> usize {
+        self.io_files.len()
+            + self
+                .io_dirs
+                .iter()
+                .filter(|path| !self.io_files.contains_key(*path))
+                .count()
+    }
+
+    fn io_bytes(&self) -> usize {
+        self.io_files.values().map(String::len).sum::<usize>()
+            + self.io_file_bytes.values().map(Vec::len).sum::<usize>()
+            + self.io_writers.values().map(String::len).sum::<usize>()
+    }
+
+    fn io_capacity_error(entries: usize, bytes: usize) -> NativeError {
+        NativeError::Metadata(format!(
+            "persistent virtual file state exceeds bounds: entries={entries} (max {MAX_PERSISTENT_IO_ENTRIES}), bytes={bytes} (max {MAX_PERSISTENT_IO_BYTES})"
+        ))
+    }
+
+    fn ensure_io_capacity(&self, path: &str, added_bytes: usize) -> Result<(), NativeError> {
+        let entries = self.io_entries() + usize::from(!self.io_files.contains_key(path));
+        let bytes = self.io_bytes().saturating_add(added_bytes);
+        if entries > MAX_PERSISTENT_IO_ENTRIES || bytes > MAX_PERSISTENT_IO_BYTES {
+            return Err(Self::io_capacity_error(entries, bytes));
+        }
+        Ok(())
     }
 
     fn io_path_of(&self, value: &Value) -> Option<String> {
@@ -24242,16 +24295,30 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    fn io_open_writer(&mut self, marker: &str, path: Option<String>, truncate: bool) {
+    fn io_open_writer(
+        &mut self,
+        marker: &str,
+        path: Option<String>,
+        truncate: bool,
+    ) -> Result<(), NativeError> {
         let key = match path {
             Some(path) => {
                 self.io_paths.insert(marker.to_owned(), path.clone());
+                if truncate {
+                    self.ensure_io_capacity(&path, 0)?;
+                    self.io_files.insert(path.clone(), String::new());
+                    self.io_file_bytes.insert(path.clone(), Vec::new());
+                    self.io_dirs.remove(&path);
+                }
                 format!("file:{path}")
             }
             None => format!("mem:{marker}"),
         };
         if truncate {
             self.io_writers.insert(key.clone(), String::new());
+        } else if let Some(path) = key.strip_prefix("file:") {
+            let initial = self.io_files.get(path).cloned().unwrap_or_default();
+            self.io_writers.entry(key.clone()).or_insert(initial);
         } else {
             self.io_writers.entry(key.clone()).or_default();
         }
@@ -24557,7 +24624,7 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
                         self.watch_whole_write(&path, text.is_empty());
-                        self.io_store_file_with_charset_args(path, text, args);
+                        self.io_store_file_with_charset_args(path, text, args)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("write", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
@@ -24584,7 +24651,7 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_change(&path, watch_service::Change::Unmodelled);
                         }
-                        self.io_store_file(path, text);
+                        self.io_store_file(path, text)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)
@@ -24657,7 +24724,7 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         let value = self.new_object("java/io/BufferedWriter");
                         if let Some(writer) = expect_ref(&value) {
-                            self.io_open_writer(writer, Some(path), true);
+                            self.io_open_writer(writer, Some(path), true)?;
                             self.io_set_writer_charset(writer, args);
                         }
                         value
@@ -24698,10 +24765,10 @@ impl<H: Host> Runtime<'_, H> {
                     expect_ref(value).is_some_and(|marker| self.io_paths.contains_key(marker))
                 }) {
                     let path = self.io_path_of(wrapped);
-                    self.io_open_writer(&marker, path, false);
+                    self.io_open_writer(&marker, path, false)?;
                 } else {
                     let path = args.first().and_then(|value| self.io_path_of(value));
-                    self.io_open_writer(&marker, path, !appending);
+                    self.io_open_writer(&marker, path, !appending)?;
                 }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
@@ -24711,7 +24778,7 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false);
+                self.io_open_writer(&marker, path, false)?;
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -24720,7 +24787,7 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false);
+                self.io_open_writer(&marker, path, false)?;
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -25552,9 +25619,11 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if self.io_sink_key(target).is_none()
-                            && !self.string_builders.contains_key(target)
-                        {
+                        if self.io_sink_key(target).is_some() {
+                            self.io_write(target, &text)?;
+                            return Ok(Some(Value::Void));
+                        }
+                        if !self.string_builders.contains_key(target) {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
