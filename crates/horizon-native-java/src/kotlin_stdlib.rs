@@ -342,50 +342,66 @@ pub(crate) fn invoke<H: crate::Host>(
                         .map(|v| Value::Int(i32::from(v))),
                 );
             }
-            ("checkNotNull", "(Ljava/lang/Object;)V") if is_null(value) => {
-                return Some(Err(null_exception("java/lang/NullPointerException", None)));
+            ("checkNotNull", "(Ljava/lang/Object;)V") => {
+                return Some(if is_null(value) {
+                    Err(null_exception("java/lang/NullPointerException", None))
+                } else {
+                    Ok(Value::Void)
+                });
             }
-            ("checkNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V") if is_null(value) => {
-                return Some(Err(null_exception(
-                    "java/lang/NullPointerException",
-                    Some(crate::expect_ref(args.get(1)?)?.clone()),
-                )));
+            ("checkNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V") => {
+                return Some(if is_null(value) {
+                    Err(null_exception(
+                        "java/lang/NullPointerException",
+                        Some(crate::expect_ref(args.get(1)?)?.clone()),
+                    ))
+                } else {
+                    Ok(Value::Void)
+                });
             }
-            ("checkNotNullParameter", "(Ljava/lang/Object;Ljava/lang/String;)V")
-                if is_null(value) =>
-            {
-                let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
-                return Some(Err(null_exception(
-                    "java/lang/NullPointerException",
-                    Some(parameter_message(&name)),
-                )));
+            ("checkNotNullParameter", "(Ljava/lang/Object;Ljava/lang/String;)V") => {
+                return Some(if is_null(value) {
+                    let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
+                    Err(null_exception(
+                        "java/lang/NullPointerException",
+                        Some(parameter_message(&name)),
+                    ))
+                } else {
+                    Ok(Value::Void)
+                });
             }
-            ("checkParameterIsNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V")
-                if is_null(value) =>
-            {
-                let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
-                return Some(Err(null_exception(
-                    "java/lang/IllegalArgumentException",
-                    Some(parameter_message(&name)),
-                )));
+            ("checkParameterIsNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V") => {
+                return Some(if is_null(value) {
+                    let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
+                    Err(null_exception(
+                        "java/lang/IllegalArgumentException",
+                        Some(parameter_message(&name)),
+                    ))
+                } else {
+                    Ok(Value::Void)
+                });
             }
-            ("checkNotNullExpressionValue", "(Ljava/lang/Object;Ljava/lang/String;)V")
-                if is_null(value) =>
-            {
-                let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
-                return Some(Err(null_exception(
-                    "java/lang/NullPointerException",
-                    Some(format!("{name} must not be null")),
-                )));
+            ("checkNotNullExpressionValue", "(Ljava/lang/Object;Ljava/lang/String;)V") => {
+                return Some(if is_null(value) {
+                    let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
+                    Err(null_exception(
+                        "java/lang/NullPointerException",
+                        Some(format!("{name} must not be null")),
+                    ))
+                } else {
+                    Ok(Value::Void)
+                });
             }
-            ("checkExpressionValueIsNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V")
-                if is_null(value) =>
-            {
-                let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
-                return Some(Err(null_exception(
-                    "java/lang/IllegalStateException",
-                    Some(format!("{name} must not be null")),
-                )));
+            ("checkExpressionValueIsNotNull", "(Ljava/lang/Object;Ljava/lang/String;)V") => {
+                return Some(if is_null(value) {
+                    let name = crate::expect_ref(args.get(1)?).cloned().unwrap_or_default();
+                    Err(null_exception(
+                        "java/lang/IllegalStateException",
+                        Some(format!("{name} must not be null")),
+                    ))
+                } else {
+                    Ok(Value::Void)
+                });
             }
             ("throwUninitializedPropertyAccessException", "(Ljava/lang/String;)V") => {
                 let name = crate::expect_ref(args.first()?)

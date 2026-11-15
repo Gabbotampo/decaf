@@ -45,6 +45,12 @@ public final class Probe {
     }
 
     public static String intrinsics() {
+        Intrinsics.checkNotNull("ok");
+        Intrinsics.checkNotNull("ok", "message");
+        Intrinsics.checkNotNullParameter("ok", "arg");
+        Intrinsics.checkParameterIsNotNull("ok", "arg");
+        Intrinsics.checkNotNullExpressionValue("ok", "expr");
+        Intrinsics.checkExpressionValueIsNotNull("ok", "expr");
         return Intrinsics.areEqual((Object)null, (Object)null) + "|"
             + Intrinsics.areEqual((Object)null, (Object)"x") + "|"
             + Intrinsics.areEqual((Object)"x", (Object)"x") + "|"
