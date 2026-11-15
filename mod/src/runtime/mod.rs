@@ -118,6 +118,7 @@ mod host_service;
 mod host_services;
 mod host_type_token;
 mod host_watch;
+mod http_client;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -5642,6 +5643,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = http_client::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
+        }
         if let Some(value) = client_reload::static_field(&r.owner, &r.name, &r.descriptor) {
             return Ok(value);
         }
@@ -5846,6 +5850,9 @@ impl Host for StdHost {
         }
         // Command builders, argument types and a running command's getters.
         if let Some(value) = self.brigadier_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = http_client::static_call(self, r, args) {
             return value;
         }
         if let Some(result) = guava_model::sized_factory_class(r, args) {
@@ -7199,6 +7206,9 @@ impl Host for StdHost {
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = http_client::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = client_reload::host_instance_call(self, r, receiver, args) {
@@ -11366,7 +11376,7 @@ fn duration_seconds_nanos(nanos: i128) -> (i128, i128) {
 /// `Duration.toString()` (Java 25): `PT` and the hours, minutes and seconds of the duration's
 /// seconds (one less for a negative duration with nanos), the nanos as a fraction with trailing
 /// zeros dropped, so `ofSeconds(-1, 500_000_000)` is `PT-0.5S`.
-fn duration_text(total: i128) -> String {
+pub(crate) fn duration_text(total: i128) -> String {
     let seconds = total.div_euclid(1_000_000_000) as i64;
     let nanos = total.rem_euclid(1_000_000_000) as i64;
     if seconds == 0 && nanos == 0 {
