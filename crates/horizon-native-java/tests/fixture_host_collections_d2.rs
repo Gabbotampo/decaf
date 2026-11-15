@@ -68,6 +68,16 @@ const STUBS: &[(&str, &str)] = &[
         include_str!("fixtures/host_collections_d2/stubs/com/google/gson/Gson.java"),
     ),
     (
+        "com/google/gson/GsonBuilder.java",
+        include_str!("fixtures/host_collections_d2/stubs/com/google/gson/GsonBuilder.java"),
+    ),
+    (
+        "com/google/gson/annotations/SerializedName.java",
+        include_str!(
+            "fixtures/host_collections_d2/stubs/com/google/gson/annotations/SerializedName.java"
+        ),
+    ),
+    (
         "com/google/common/collect/ImmutableMap.java",
         include_str!(
             "fixtures/host_collections_d2/stubs/com/google/common/collect/ImmutableMap.java"
@@ -206,9 +216,20 @@ fn line_of(oracle: &'static str, method: &str) -> &'static str {
 ///   `boolean`/`char`/`float`/`byte`/`short` fields written and read back;
 /// - a `String` spelled `<collection class>#<word>` is a `String`: no
 ///   collection type's `instanceof`, a `List` cast throws;
+/// - round 3: a read's `LinkedTreeMap` is `public final`, extends
+///   `AbstractMap`, implements `Serializable`, is a `Map` to `instanceof`,
+///   `isInstance`, `isAssignableFrom` and a pattern `switch`, and refuses a
+///   `null` key with "key == null" (B5); a JSON string read as a jar enum is
+///   the jar's own constant by `name()`, `@SerializedName` value or
+///   alternate, else `null`, in arrays and fields too (B6); a NaN or infinite
+///   `float`, `double` or `Float` field is `checkValidFloatingPoint`'s
+///   `IllegalArgumentException` naming the value, or a literal under
+///   `serializeSpecialFloatingPointValues` (B7);
 /// - counted, where Java throws or makes a class not modelled here:
 ///   `Iterable[]` (`JsonIOException`), a `TreeSet` of a `String` and a number
 ///   (`ClassCastException`), a `Queue` (`ArrayDeque`), a repeated name
+///   (`JsonSyntaxException`), an enum read by an overridden `toString()`'s
+///   text, a JSON string for a jar class that is no enum
 ///   (`JsonSyntaxException`).
 #[test]
 fn recheck_gson_reads_are_javas_or_counted() {
@@ -227,12 +248,21 @@ fn recheck_gson_reads_are_javas_or_counted() {
         "gsonTypedFields",
         "gsonPrimitiveFields",
         "forgedCollectionText",
+        "gsonTreeMapSurface",
+        "gsonTreeMapNested",
+        "gsonTreeMapNullKey",
+        "gsonEnumRead",
+        "gsonEnumNameWithToString",
+        "gsonNonFiniteFields",
+        "gsonNonFiniteSpecial",
     ];
     let counted = [
         "gsonIterableArray",
         "gsonTreeSetMixed",
         "gsonQueue",
         "gsonDuplicateKey",
+        "gsonEnumToStringText",
+        "gsonStringForPlainClass",
     ];
     let mut failures = Vec::new();
     for (method, must_count) in exact

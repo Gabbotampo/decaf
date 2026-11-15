@@ -7800,6 +7800,37 @@ impl Host for StdHost {
             {
                 return self.unknown_host_call(r);
             }
+            // Gson's `LinkedTreeMap` (a `fromJson` read's map) orders its keys
+            // by `Comparable.compareTo`: `put` of a `null` key throws its own
+            // NPE ("key == null"), and a key that is no `String` (a
+            // comparison with the document's names) is counted (#253
+            // re-check B5). Every other write is the host's map model.
+            if jar_object::collection_key(marker)
+                .is_some_and(|_| jar_object::collection_class(marker) == gson_tree::TREE_MAP)
+                && matches!(
+                    r.name.as_str(),
+                    "put"
+                        | "putIfAbsent"
+                        | "compute"
+                        | "computeIfAbsent"
+                        | "computeIfPresent"
+                        | "merge"
+                        | "putAll"
+                )
+            {
+                match args.first() {
+                    Some(Value::Ref(None)) if matches!(r.name.as_str(), "put" | "putIfAbsent") => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("key == null".into()),
+                            frame: None,
+                        });
+                    }
+                    Some(Value::Ref(Some(key)))
+                        if r.name != "putAll" && value_class::is_plain_string(key) => {}
+                    _ => return self.unknown_host_call(r),
+                }
+            }
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
             if let Some(answer) = self.fixed_size_member(r, marker) {
@@ -22437,6 +22468,14 @@ impl<H: Host> Runtime<'_, H> {
                 .map(|name| (*name).to_owned())
                 .collect(),
             (None, None) if crate::jdk_closure::in_jdk_package(&name) => return None,
+            // A Guava class the host makes, or Gson's `LinkedTreeMap`: the
+            // interfaces its class file declares.
+            (None, None) if crate::java_immutable::guava_superclass(&name).is_some() => {
+                crate::java_immutable::guava_interfaces(&name)
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            }
             (None, None) => Vec::new(),
         };
         let values = interfaces

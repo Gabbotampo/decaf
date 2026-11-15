@@ -253,12 +253,18 @@ pub(crate) fn guava_superclass(class: &str) -> Option<&'static str> {
         // interfaces of its own (26.3 `javap`), the inventory list's class
         // (#253 re-check).
         crate::client_surface::NON_NULL_LIST => "java/util/AbstractList",
+        // gson-2.14.0's `public final class LinkedTreeMap<K, V> extends
+        // AbstractMap<K, V> implements Serializable` (`javap`): the map
+        // `ObjectTypeAdapter` and a `Map<String, ?>` read make (#253 re-check
+        // B5).
+        crate::gson_tree::TREE_MAP => "java/util/AbstractMap",
         _ => return None,
     })
 }
 
-/// The interfaces those Guava classes declare directly, and Guava's `BiMap`'s.
-fn guava_interfaces(class: &str) -> &'static [&'static str] {
+/// The interfaces those Guava classes (and Gson's `LinkedTreeMap`) declare
+/// directly, and Guava's `BiMap`'s.
+pub(crate) fn guava_interfaces(class: &str) -> &'static [&'static str] {
     match class {
         "com/google/common/collect/ImmutableMap" => &["java/util/Map", "java/io/Serializable"],
         "com/google/common/collect/ImmutableBiMap" => &["com/google/common/collect/BiMap"],
@@ -266,6 +272,7 @@ fn guava_interfaces(class: &str) -> &'static [&'static str] {
         "com/google/common/collect/ImmutableSet" => &["java/util/Set"],
         "com/google/common/collect/ImmutableList" => &["java/util/List", "java/util/RandomAccess"],
         "com/google/common/collect/ImmutableCollection" => &["java/io/Serializable"],
+        crate::gson_tree::TREE_MAP => &["java/io/Serializable"],
         _ => &[],
     }
 }
@@ -434,8 +441,15 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/util/AbstractList",
         "java/util/AbstractCollection",
     ];
+    // Gson's `LinkedTreeMap extends AbstractMap implements Serializable`.
+    const GSON_TREE_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "java/util/AbstractMap",
+    ];
     match class {
         crate::client_surface::NON_NULL_LIST => NON_NULL_LIST,
+        crate::gson_tree::TREE_MAP => GSON_TREE_MAP,
         crate::array_views::CLASS => ARRAYS_LIST,
         crate::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
