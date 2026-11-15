@@ -6740,6 +6740,15 @@ impl Host for StdHost {
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
+        // ItemStack.EMPTY is a canonical host value even before a client frame
+        // exists, so its bootstrap isEmpty() answer must stay exact.
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "isEmpty"
+            && r.descriptor == "()Z"
+            && crate::runtime::game_object::handle_key(receiver) == Some("client/stack/empty")
+        {
+            return Ok(Value::Int(1));
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -23247,9 +23256,6 @@ impl<H: Host> Runtime<'_, H> {
         let text = expect_ref(value)?;
         if let Some(path) = self.io_paths.get(text) {
             return Some(path.clone());
-        }
-        if text == "java/io/File#game-directory" {
-            return Some("/horizon/game".into());
         }
         Some(text.to_owned())
     }

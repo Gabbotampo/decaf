@@ -106,6 +106,7 @@ fn client_kind(rest: &str) -> HostKind {
         "item" | "block" | "mob-effect" | "effect-holder" => HostKind::GameRegistryObject,
         "style" | "text-color" | "vec3" | "awt-color" => HostKind::GameValue,
         "input-key" => HostKind::GameValue,
+        "stack" if key == "empty" => HostKind::GameValue,
         // `stack`, `effect`, and the per-frame `gui-graphics`, `pose`,
         // `delta-tracker`, `tooltip-context`.
         _ => HostKind::GameTransient,
@@ -196,7 +197,10 @@ pub(crate) fn server_value(marker: String) -> Value {
 pub(crate) fn handle_only_class(class: &str) -> bool {
     matches!(
         class,
-        "net/minecraft/network/chat/Style"
+        "com/mojang/blaze3d/platform/InputConstants$Key"
+            | "net/minecraft/client/KeyMapping"
+            | "net/minecraft/world/item/ItemStack"
+            | "net/minecraft/network/chat/Style"
             | "net/minecraft/network/chat/TextColor"
             | "net/minecraft/client/KeyMapping$Category"
             | "net/minecraft/world/phys/Vec3"
@@ -566,7 +570,10 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
 /// constants and `LevelResource`'s are (`client_values::canonical`,
 /// `server_values::canonical`); any other value is per producer.
 pub(crate) fn value_canonical(key: &str) -> bool {
-    crate::runtime::client_values::canonical(key) || crate::runtime::server_values::canonical(key)
+    crate::runtime::client_values::canonical(key)
+        || crate::runtime::server_values::canonical(key)
+        || key.starts_with("client/input-key/")
+        || key == "client/stack/empty"
 }
 
 /// A registry entry (`Item`, `Block`, `BlockState`, `GameRule`...): identity

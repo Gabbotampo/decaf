@@ -1148,7 +1148,10 @@ impl StdHost {
                     .map_or(Value::Ref(None), |_| marker(GAME_MODE)),
                 "gameRenderer" => marker(GAME_RENDERER),
                 "debugEntries" => marker(DEBUG),
-                "gameDirectory" => marker("java/io/File#game-directory"),
+                // The launcher's configured java.io.File is outside this
+                // bounded host. Count it instead of forging a String-shaped
+                // File marker.
+                "gameDirectory" => return refuse(),
                 _ if frame.is_some() => return refuse(),
                 _ => return None,
             })),
@@ -1263,7 +1266,22 @@ impl StdHost {
                 if r.descriptor
                     == "(Ljava/lang/String;)Lcom/mojang/blaze3d/platform/InputConstants$Key;" =>
             {
-                let name = crate::runtime::game_object::text(args.first()?)?;
+                let value = args.first()?;
+                let name = match value {
+                    // 26.3 dereferences the name before looking it up. Preserve
+                    // that exact Java 25 NPE instead of counting a null input.
+                    Value::Ref(None) => {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                r#"Cannot invoke "String.startsWith(String)" because "name" is null"#
+                                    .into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    _ => crate::runtime::game_object::text(value)?,
+                };
                 Some(match input_key_from_name(name) {
                     Ok(key) => Ok(marker(key)),
                     Err(message) if message.starts_with("Unknown key name:") => {
@@ -1346,8 +1364,16 @@ impl StdHost {
                 .map(|()| receiver.clone()),
             });
         }
-        let text = crate::runtime::game_object::text(receiver)?.clone();
-        if let Some((mouse, code)) = input_key_parts(&text) {
+        // Only a runtime-created input-key handle can enter this dispatch.
+        // A jar String that happens to spell the handle marker remains a
+        // String for casts, instanceof, collections and every member call.
+        let input_key = match receiver {
+            Value::Host(handle) if handle.kind() == crate::runtime::HostKind::GameValue => {
+                input_key_parts(handle.key())
+            }
+            _ => None,
+        };
+        if let Some((mouse, code)) = input_key {
             return Some(match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getType", "()Lcom/mojang/blaze3d/platform/InputConstants$Type;") => {
                     Ok(marker(format!(
@@ -1360,15 +1386,18 @@ impl StdHost {
                     Ok(Value::Ref(Some(input_key_name(mouse, code))))
                 }
                 ("equals", "(Ljava/lang/Object;)Z") => Ok(flag(
-                    args.first()
-                        .and_then(crate::runtime::game_object::text)
-                        .and_then(|other| input_key_parts(other))
-                        == Some((mouse, code)),
+                    args.first().and_then(|value| match value {
+                        Value::Host(handle) if handle.kind() == crate::runtime::HostKind::GameValue => {
+                            input_key_parts(handle.key())
+                        }
+                        _ => None,
+                    }) == Some((mouse, code)),
                 )),
                 ("hashCode", "()I") => Err(NativeError::UnknownHostCall(r.clone())),
                 _ => return None,
             });
         }
+        let text = crate::runtime::game_object::text(receiver)?.clone();
         if (text == format!("enum/{INPUT_TYPE}/KEYBOARD")
             || text == format!("enum/{INPUT_TYPE}/MOUSE"))
             && matches!(r.name.as_str(), "name" | "toString")
@@ -1484,7 +1513,9 @@ impl StdHost {
             }
             return Some(refuse());
         }
-        if self.client.key_inits.contains_key(&text) {
+        if self.client.key_inits.contains_key(&text)
+            && crate::runtime::jar_object::object_class(receiver) == Some(KEY_MAPPING)
+        {
             return self.key_mapping_call(&text, r, args);
         }
         // `equals`, `hashCode` and `toString` of a client handle are its
@@ -1637,7 +1668,8 @@ impl StdHost {
             ("hashCode", "()I") => return Some(Err(NativeError::UnknownHostCall(r.clone()))),
             ("equals", "(Ljava/lang/Object;)Z") => flag(
                 args.first()
-                    .and_then(crate::runtime::game_object::text)
+                    .filter(|value| crate::runtime::jar_object::object_class(value) == Some(KEY_MAPPING))
+                    .and_then(crate::runtime::jar_object::object_key)
                     .is_some_and(|o| o == object),
             ),
             ("getDefaultKey", "()Lcom/mojang/blaze3d/platform/InputConstants$Key;") => {
@@ -1648,19 +1680,23 @@ impl StdHost {
             }
             ("same", "(Lnet/minecraft/client/KeyMapping;)Z") => flag(
                 args.first()
-                    .and_then(crate::runtime::game_object::text)
+                    .filter(|value| crate::runtime::jar_object::object_class(value) == Some(KEY_MAPPING))
+                    .and_then(crate::runtime::jar_object::object_key)
                     .and_then(|other| state.key_inits.get(other))
                     .is_some_and(|other| other.key == init.key),
             ),
             ("setKey", "(Lcom/mojang/blaze3d/platform/InputConstants$Key;)V") => {
-                let Some(key) = args.first().and_then(crate::runtime::game_object::text) else {
+                let Some(Value::Host(handle)) = args.first() else {
                     return Some(Err(NativeError::UnknownHostCall(r.clone())));
                 };
-                if input_key_parts(key).is_none() {
+                let Some((_, _)) = input_key_parts(handle.key()) else {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                };
+                if handle.kind() != crate::runtime::HostKind::GameValue {
                     return Some(Err(NativeError::UnknownHostCall(r.clone())));
                 }
                 if let Some(stored) = state.key_inits.get_mut(object) {
-                    stored.key = key.to_owned();
+                    stored.key = handle.key().to_owned();
                 }
                 Value::Void
             }

@@ -3,7 +3,7 @@
 //! the probe, so execution crosses the native host model.
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
-use horizon_native_java::StdHost;
+use horizon_native_java::{NativeError, StdHost};
 const ORACLE: &str = include_str!("fixtures/client_keys/java25.txt");
 const PROBE: &str = include_str!("fixtures/client_keys/demo/Probe.java");
 const STUBS: &[(&str, &str)] = &[
@@ -38,7 +38,7 @@ public class KeyMapping {
     ),
     (
         "net/minecraft/world/item/ItemStack.java",
-        "package net.minecraft.world.item; public final class ItemStack { public static final ItemStack EMPTY = null; }",
+        "package net.minecraft.world.item; public final class ItemStack { public static final ItemStack EMPTY = null; public boolean isEmpty(){return false;} }",
     ),
 ];
 fn fixture() -> javac_fixture::Fixture {
@@ -58,6 +58,49 @@ fn client_keys_match_java25() {
         host.unknown_host_calls()
     );
 }
+#[test]
+fn canonical_identity_has_no_counted_reference_comparisons() {
+    let f = fixture();
+    for method in ["idKey", "idCreate", "idUnknown", "idEmpty"] {
+        let mut host = f.jar.seed_host(StdHost::new());
+        assert_eq!(f.text_on(&mut host, method), "true", "{method}");
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{method}: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}
+
+#[test]
+fn game_directory_is_counted_without_a_file_handle() {
+    let f = fixture();
+    let mut host = f.jar.seed_host(StdHost::new());
+    let outcome = f.jar.invoke_method_with_args(
+        "demo/Probe",
+        "dir",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(matches!(
+        outcome,
+        Err(NativeError::UnknownHostCall(r))
+            if r.owner == "net/minecraft/client/Minecraft" && r.name == "gameDirectory"
+    ));
+}
+
+#[test]
+fn null_key_name_matches_java_exception() {
+    let f = fixture();
+    let mut host = f.jar.seed_host(StdHost::new());
+    assert_eq!(
+        f.text_on(&mut host, "badNull"),
+        "java.lang.NullPointerException|Cannot invoke \"String.startsWith(String)\" because \"name\" is null"
+    );
+}
+
 #[test]
 fn unknown_key_name_is_counted_as_java_exception() {
     let f = fixture();
