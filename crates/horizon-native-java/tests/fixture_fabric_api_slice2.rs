@@ -18,7 +18,7 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
-const JAVA25: &str = "Tried to register a null listener!|Tried to register a listener for a null phase!|Tried to add an ordering for a null phase.|Tried to add a phase that depends on itself.|cycle-ok";
+const JAVA25: &str = "fabric:content|fabric:styling|fabric:recipe_sync;Tried to register a null listener!|Tried to register a listener for a null phase!|Tried to add an ordering for a null phase.|Tried to add a phase that depends on itself.|cycle-ok";
 
 macro_rules! sources {
     ($($path:literal => $body:expr),* $(,)?) => {{
@@ -100,6 +100,21 @@ public final class EventFactory {
   }
 }
 "#,
+        "net/fabricmc/fabric/api/message/v1/ServerMessageDecoratorEvent.java" => r#"
+package net.fabricmc.fabric.api.message.v1;
+import net.minecraft.resources.Identifier;
+public final class ServerMessageDecoratorEvent {
+  public static final Identifier CONTENT_PHASE = null;
+  public static final Identifier STYLING_PHASE = null;
+}
+"#,
+        "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization.java" => r#"
+package net.fabricmc.fabric.api.recipe.v1.sync;
+import net.minecraft.resources.Identifier;
+public final class RecipeSynchronization {
+  public static final Identifier RECIPE_SYNC_EVENT_PHASE = null;
+}
+"#,
         "net/fabricmc/api/ModInitializer.java" => r#"
 package net.fabricmc.api;
 public interface ModInitializer { void onInitialize(); }
@@ -122,6 +137,12 @@ public final class PhaseProbe implements ModInitializer {
   private static String run() {
     Event<Listener> event = EventFactory.createArrayBacked(Listener.class, null);
     StringBuilder result = new StringBuilder();
+    result.append(net.fabricmc.fabric.api.message.v1.ServerMessageDecoratorEvent.CONTENT_PHASE)
+        .append("|")
+        .append(net.fabricmc.fabric.api.message.v1.ServerMessageDecoratorEvent.STYLING_PHASE)
+        .append("|")
+        .append(net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.RECIPE_SYNC_EVENT_PHASE)
+        .append(";");
     try { event.register((Listener) null); }
     catch (NullPointerException e) { result.append(e.getMessage()).append("|"); }
     try { event.register(null, () -> {}); }

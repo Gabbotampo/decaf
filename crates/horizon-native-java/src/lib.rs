@@ -7220,7 +7220,7 @@ impl Host for StdHost {
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
-        if let Some(value) = fabric_api_slice2::event_call(r, args) {
+        if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
             return value;
         }
         if let Some(value) = self.item_like_call(r, receiver, args) {
@@ -8686,7 +8686,9 @@ impl Host for StdHost {
                 _ => {}
             }
         }
-        if r.owner == "net/fabricmc/fabric/api/event/Event" {
+        if r.owner == "net/fabricmc/fabric/api/event/Event"
+            && host_events::fabric_event_name(receiver).is_some()
+        {
             match r.name.as_str() {
                 "register" => return Ok(Value::Void),
                 "invoker" => return Ok(host_events::fabric_invoker(receiver)),
