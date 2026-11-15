@@ -23288,11 +23288,21 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("getBoolean", "(Ljava/lang/Object;I)Z") => {
                 let array = StdHost::argument(r, args, 0)?;
-                if value_class::array_component(array).as_deref() != Some("boolean") {
+                let component = value_class::array_component(array);
+                if component
+                    .as_deref()
+                    .is_some_and(|component| primitive_descriptor(component).is_some())
+                    && component.as_deref() != Some("boolean")
+                {
                     return Err(argument_type_mismatch());
                 }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                self.array_data(array)?.boolean_load(index).ok_or_else(|| {
+                let value = if component.as_deref() == Some("boolean") {
+                    self.array_data(array)?.boolean_load(index)
+                } else {
+                    self.array_data(array)?.load(index)
+                };
+                value.ok_or_else(|| {
                     NativeError::Metadata(format!("array index {index} out of bounds"))
                 })?
             }
@@ -23334,6 +23344,19 @@ impl<H: Host> Runtime<'_, H> {
                 let valid = match component.as_deref() {
                     Some("byte") => matches!(value, Value::Boxed(crate::runtime::Boxed::Byte(_))),
                     Some("boolean") => matches!(value, Value::Boxed(crate::runtime::Boxed::Boolean(_))),
+                    Some(component) if primitive_descriptor(component).is_none() => {
+                        match self.store_fits(component, &value) {
+                            Some(true) => true,
+                            Some(false) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/IllegalArgumentException".into(),
+                                    message: Some("array element type mismatch".into()),
+                                    frame: None,
+                                });
+                            }
+                            None => return Ok(None),
+                        }
+                    }
                     _ => true,
                 };
                 if !valid {
@@ -23391,7 +23414,11 @@ impl<H: Host> Runtime<'_, H> {
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
                 let component =
                     value_class::component_of_array_class(host_array::class_of_key(marker));
-                if component.as_deref() != Some("boolean") {
+                if component
+                    .as_deref()
+                    .is_some_and(|component| primitive_descriptor(component).is_some())
+                    && component.as_deref() != Some("boolean")
+                {
                     return Err(argument_type_mismatch());
                 }
                 let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)? & 1);
@@ -23432,8 +23459,30 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Void
             }
+            ("setLong", "(Ljava/lang/Object;IJ)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                let stored = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
+                Value::Void
+            }
             ("setShort", "(Ljava/lang/Object;IS)V")
-            | ("setLong", "(Ljava/lang/Object;IJ)V")
             | ("setFloat", "(Ljava/lang/Object;IF)V")
             | ("setDouble", "(Ljava/lang/Object;ID)V") => {
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;

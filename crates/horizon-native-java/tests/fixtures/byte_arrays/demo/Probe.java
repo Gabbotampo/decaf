@@ -126,6 +126,8 @@ public final class Probe {
     public static String reflection() {
         byte[] b = {1};
         boolean[] z = {false};
+        String[] strings = new String[1];
+        Object[] objects = new Object[1];
         return t(() -> { Array.setByte(b, 0, (byte) 200); return b[0]; })
             + "|" + t(() -> { Array.setInt(b, 0, 300); return "ok"; })
             + "|" + t(() -> { Array.setShort(b, 0, (short) 2); return "ok"; })
@@ -143,7 +145,11 @@ public final class Probe {
             + "|" + t(() -> { Array.setInt(z, 0, 1); return "ok"; })
             + "|" + t(() -> { Array.set(z, 0, Integer.valueOf(1)); return "ok"; })
             + "|" + Array.getBoolean(z, 0)
-            + "|" + t(() -> Array.getByte(z, 0)) + "|" + t(() -> Array.getInt(z, 0));
+            + "|" + t(() -> Array.getByte(z, 0)) + "|" + t(() -> Array.getInt(z, 0))
+            + "|" + t(() -> { Array.set(strings, 0, "ok"); return strings[0]; })
+            + "|" + t(() -> { Array.set(strings, 0, Integer.valueOf(1)); return "bad"; })
+            + "|" + t(() -> { Array.set(strings, 0, null); return "null"; })
+            + "|" + t(() -> { Array.set(objects, 0, Integer.valueOf(2)); return objects[0]; });
     }
 
     /** The shared `bastore`/`baload` opcodes on a boolean[] mask to one bit. */
