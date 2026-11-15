@@ -5810,7 +5810,6 @@ impl Host for StdHost {
                 let codec = host_codec::static_codec(declared, owner, name);
                 self.unknown_host_call(r).map(|_| codec)
             }
-            }
             _ => self.unknown_host_call(r),
         }
     }
@@ -22471,7 +22470,6 @@ impl<H: Host> Runtime<'_, H> {
         }
         if generic_type_instance_of(marker, wanted) {
             return true;
-        }
         }
         // Collections and optionals keep their kind in the marker prefix.
         let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
