@@ -1380,6 +1380,7 @@ mod tests {
             "resource_marks",
             "classes",
             "linked_classes",
+            "game_block_classes",
             "service_providers",
             "current_time_millis",
             "mods",

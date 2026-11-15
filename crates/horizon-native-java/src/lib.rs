@@ -2653,6 +2653,12 @@ pub trait Host {
         None
     }
 
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// Up to `limit` bytes (all that are left when `None`) of a bounded
     /// input-stream marker the host holds, consumed from the stream.
     ///
@@ -3058,6 +3064,10 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Each vanilla block's full internal-name transitive class/interface closure
+    /// (`minecraft:fire` → `net/minecraft/world/level/block/FireBlock`, ...),
+    /// which a game host seeds from its prepared `block-behaviours.json`.
+    game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
     /// Objects a game `Item` constructor built (a mod's item subclasses
     /// included), and the `BlockItem` built for each block: vanilla's
     /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
@@ -3345,6 +3355,7 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            game_block_classes: Arc::default(),
             constructed_items: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
@@ -3914,6 +3925,13 @@ impl StdHost {
         classes: impl IntoIterator<Item = ClassFile>,
     ) -> Result<usize, NativeError> {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
+    }
+
+    /// Seed each vanilla block's full binary-name transitive class/interface closure, so
+    /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
+    pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
+        self.game_block_classes = classes;
+        self
     }
 
     /// ItemLike.asItem() as vanilla answers it, for objects whose game
@@ -4971,6 +4989,16 @@ impl StdHost {
                 }
                 Ok(None)
             }
+            // Vanilla subclass constructors carry class-specific arguments
+            // (BlockSetType, TreeGrower, base state, ...). Until each argument
+            // family is decoded exactly, keep the constructor counted.
+            owner
+                if r.name == "<init>"
+                    && owner != BLOCK_CLASS
+                    && owner.starts_with("net/minecraft/world/level/block/") =>
+            {
+                self.unknown_host_call(r).map(Some)
+            }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
                     return Ok(None);
@@ -5476,6 +5504,16 @@ impl Host for StdHost {
         Some(text)
     }
 
+    fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
+        let block_id = marker.strip_prefix("game/block/")?;
+        let classes = self.game_block_classes.get(block_id)?;
+        // The game seed must contain the full binary-name transitive closure
+        // (`BlockBehaviour`, inherited interfaces such as `BucketPickup`, ...).
+        // Anything absent is unknown and therefore counted.
+        (wanted == "java/lang/Object" || classes.iter().any(|class| class == wanted))
+            .then_some(true)
+    }
+
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let start = (*index).min(bytes.len());
@@ -5652,6 +5690,17 @@ impl Host for StdHost {
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
         if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
             return Ok(value);
+        }
+        // `Blocks.<FIELD>` is already a game registry handle in the current
+        // P16 API. The 26.3 field table is the authority: an absent field is
+        // a real `NoSuchFieldError` path and remains counted.
+        if r.owner == "net/minecraft/world/level/block/Blocks"
+            && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
+        {
+            return match crate::vanilla_blocks::field_id(&r.name) {
+                Some(id) => Ok(crate::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
         }
         // Registry statics are handles instead of a null constant so
         // registration calls downstream can name their target registry. The
@@ -32060,6 +32109,96 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// A vanilla subclass constructor is not modelled without an exact argument
+    /// decoder; the call stays counted instead of selecting a wrong template.
+    #[test]
+    fn subclass_constructors_stay_counted() {
+        let mut host = StdHost::new();
+        host.set_strict_unknown_host_calls(true);
+        let call = MethodRef {
+            owner: "net/minecraft/world/level/block/DoorBlock".into(),
+            name: "<init>".into(),
+            descriptor: "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+                .into(),
+        };
+        let _ = host.invoke_instance(
+            &call,
+            &Value::Ref(Some("door#1".into())),
+            &[Value::Ref(Some("properties#1".into()))],
+        );
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    /// With the game's block classes seeded, a vanilla block constant answers
+    /// `instanceof` for its real class chain and interfaces, and only those.
+    #[test]
+    fn seeded_block_classes_answer_instanceof() {
+        let classes = BTreeMap::from([(
+            "minecraft:fire".to_owned(),
+            vec![
+                "net/minecraft/world/level/block/FireBlock".into(),
+                "net/minecraft/world/level/block/BaseFireBlock".into(),
+                "net/minecraft/world/level/block/Block".into(),
+                "net/minecraft/world/level/block/state/BlockBehaviour".into(),
+                "net/minecraft/world/level/ItemLike".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let fire = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/Blocks".into(),
+                name: "FIRE".into(),
+                descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
+            })
+            .unwrap();
+        let marker = match &fire {
+            Value::Host(handle) => handle.key().to_owned(),
+            other => panic!("expected a game handle, got {other:?}"),
+        };
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/ItemLike"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
+            None
+        );
+        assert_eq!(
+            host.game_instance_of(
+                &marker,
+                "net/minecraft/world/level/block/state/BlockBehaviour"
+            ),
+            Some(true)
+        );
+        // Simple names and unrelated interfaces remain counted.
+        assert_eq!(host.game_instance_of(&marker, "FireBlock"), None);
+        assert_eq!(host.game_instance_of(&marker, "java/lang/Cloneable"), None);
+        // An unseeded block keeps the interpreter's own answer.
+        assert_eq!(
+            host.game_instance_of(
+                "net/minecraft/world/level/block/Block#net/minecraft/world/level/block/Blocks.STONE",
+                "net/minecraft/world/level/block/FireBlock"
+            ),
+            None
+        );
+    }
+
+    /// Non-block game constants remain counted until an exact family model exists.
+    #[test]
+    fn non_block_game_constants_stay_counted() {
+        let mut host = StdHost::new();
+        let _ = host.get_static(&MethodRef {
+            owner: "net/minecraft/world/level/block/SoundType".into(),
+            name: "WOOD".into(),
+            descriptor: "Lnet/minecraft/world/level/block/SoundType;".into(),
+        });
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
 
     /// `asItem()` is answered only for receivers the host knows: a vanilla
     /// `Items.X` constant is itself, and an object it never saw built keeps the
