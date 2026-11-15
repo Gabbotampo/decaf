@@ -109,4 +109,15 @@ public final class Containers {
         return out.toString();
     }
 
+    public static String dependencyAccessors() {
+        var m = mod("probe-fixture").getMetadata();
+        StringBuilder out = new StringBuilder();
+        for (var d : m.getDependencies()) {
+            out.append(d.getKind()).append(':').append(d.getModId()).append(':');
+            out.append(d.getVersionRequirements().size()).append(':');
+            out.append(d.getVersionIntervals().size()).append(';');
+        }
+        return out.toString();
+    }
+
 }
