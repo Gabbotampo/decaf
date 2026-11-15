@@ -27,16 +27,13 @@ pub struct ClientOptions {
 }
 
 fn vec3_value(coords: [f64; 3]) -> Value {
-    crate::game_object::client_value(
-        format!(
-            "{}{}, {}, {}",
-            crate::client_values::VEC3,
-            coords[0],
-            coords[1],
-            coords[2]
-        )
-        .replace(", ", ","),
-    )
+    crate::game_object::client_value(format!(
+        "{}{},{},{}",
+        crate::client_values::VEC3,
+        crate::client_values::coord_text(coords[0]),
+        crate::client_values::coord_text(coords[1]),
+        crate::client_values::coord_text(coords[2]),
+    ))
 }
 
 fn vec3_key(value: &Value) -> Option<[f64; 3]> {
@@ -161,6 +158,22 @@ pub(crate) fn block_pos_value(pos: [i32; 3]) -> Value {
     crate::game_object::server_value(format!("block-pos/{},{},{}", pos[0], pos[1], pos[2]))
 }
 
+/// `BlockPos.containing(double, double, double)`, using vanilla `Mth.floor`.
+pub(crate) fn block_pos_static(r: &MethodRef, args: &[Value]) -> Option<Value> {
+    if r.owner != "net/minecraft/core/BlockPos"
+        || r.name != "containing"
+        || r.descriptor != "(DDD)Lnet/minecraft/core/BlockPos;"
+    {
+        return None;
+    }
+    let coords = [
+        double(args.first()?)?,
+        double(args.get(1)?)?,
+        double(args.get(2)?)?,
+    ];
+    Some(block_pos_value(coords.map(floor)))
+}
+
 pub(crate) fn block_pos_call(text: &str, r: &MethodRef) -> Option<Value> {
     let mut coords = text.strip_prefix("block-pos/")?.split(',');
     let x = coords.next()?.parse().ok()?;
@@ -177,6 +190,7 @@ pub(crate) fn block_pos_call(text: &str, r: &MethodRef) -> Option<Value> {
     }
 }
 
+/// `Mth.floor`: `(int) d`, one less when the truncating cast rounded up.
 pub(crate) fn floor(value: f64) -> i32 {
     let truncated = value as i32;
     if value < f64::from(truncated) {
@@ -259,10 +273,43 @@ pub(crate) fn options_call(option: &str, values: &ClientOptions, r: &MethodRef) 
     match option {
         "particles" => values.particles.as_ref().map(|status| {
             crate::game_object::client_value(format!(
-                "enum/net/minecraft/server/level/ParticleStatus/{status}"
+                "enum/net/minecraft/client/ParticleStatus/{status}"
             ))
         }),
         "sensitivity" => values.sensitivity.map(Value::Float),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vec3_handle_preserves_nan_payload_through_arithmetic() {
+        let input = 0x7ff0_0000_0000_0001u64;
+        let key = format!(
+            "{}{},{},{}",
+            crate::client_values::VEC3,
+            crate::client_values::coord_text(f64::from_bits(input)),
+            0.0,
+            0.0
+        );
+        let method = MethodRef {
+            owner: "net/minecraft/world/phys/Vec3".into(),
+            name: "add".into(),
+            descriptor: "(DDD)Lnet/minecraft/world/phys/Vec3;".into(),
+        };
+        let result = vec3_call(
+            &key,
+            &method,
+            &[Value::Float(0.0), Value::Float(0.0), Value::Float(0.0)],
+        )
+        .expect("Vec3 add is modelled");
+        let text = crate::game_object::text(&result).expect("Vec3 handle text");
+        let coords =
+            crate::client_values::vec3(text.strip_prefix(crate::client_values::VEC3).unwrap())
+                .expect("Vec3 coordinates");
+        assert_eq!(coords[0].to_bits(), 0x7ff8_0000_0000_0001);
     }
 }

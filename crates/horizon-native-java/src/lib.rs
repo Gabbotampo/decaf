@@ -5716,6 +5716,9 @@ impl Host for StdHost {
         if let Some(value) = self.mixin_platform_invoke(r) {
             return Ok(value);
         }
+        if let Some(value) = client_frame::block_pos_static(r, args) {
+            return Ok(value);
+        }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
         if let Some(value) = self.client_invoke(r, args) {
             return value;
@@ -11563,6 +11566,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
         "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
+        "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],

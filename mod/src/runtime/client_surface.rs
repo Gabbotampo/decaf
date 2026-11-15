@@ -437,7 +437,8 @@ pub struct ClientSnapshot {
     pub gui_size: [i32; 2],
     /// `Window.getWidth/Height`, in pixels.
     pub window_size: [i32; 2],
-    pub gui_scale: f64,
+    /// `Window.getGuiScale`, filled by the game for a frame; absent stays counted.
+    pub gui_scale: Option<i32>,
     /// `DeltaTracker.getGameTimeDeltaPartialTick`.
     pub partial_tick: f32,
     pub fps: i32,
@@ -1538,18 +1539,15 @@ impl StdHost {
             return Some(value);
         }
         if let Some(coords) = object.strip_prefix(VEC3) {
-            let v: Vec<f64> = coords.split(',').filter_map(|c| c.parse().ok()).collect();
-            let [x, y, z] = <[f64; 3]>::try_from(v).ok()?;
+            let [x, y, z] = crate::runtime::client_values::vec3(coords)?;
             return match (name, returns) {
                 ("x", "D") => double(x),
                 ("y", "D") => double(y),
                 ("z", "D") => double(z),
                 ("distanceTo", "D") | ("distanceToSqr", "D") => {
                     let o = crate::runtime::game_object::text(args.first()?)?.strip_prefix(VEC3)?;
-                    let o: Vec<f64> = o.split(',').filter_map(|c| c.parse().ok()).collect();
-                    let d2 = (x - o.first()?).powi(2)
-                        + (y - o.get(1)?).powi(2)
-                        + (z - o.get(2)?).powi(2);
+                    let [ox, oy, oz] = crate::runtime::client_values::vec3(o)?;
+                    let d2 = (x - ox).powi(2) + (y - oy).powi(2) + (z - oz).powi(2);
                     double(if name == "distanceTo" { d2.sqrt() } else { d2 })
                 }
                 _ => None,
@@ -1642,7 +1640,7 @@ impl StdHost {
                 ("getGuiScaledHeight", "I") => int(frame.gui_size[1]),
                 ("getWidth" | "getScreenWidth", "I") => int(frame.window_size[0]),
                 ("getHeight" | "getScreenHeight", "I") => int(frame.window_size[1]),
-                ("getGuiScale", "I") => int(frame.gui_scale as i32),
+                ("getGuiScale", "I") => frame.gui_scale.map(Value::Int),
                 _ => None,
             },
             GUI | HUD => match (name, returns) {
@@ -2079,7 +2077,12 @@ impl ClientState {
 
 /// A position the façade hands out as a `Vec3`.
 fn vec3([x, y, z]: [f64; 3]) -> Value {
-    marker(format!("{VEC3}{x},{y},{z}"))
+    marker(format!(
+        "{VEC3}{},{},{}",
+        crate::runtime::client_values::coord_text(x),
+        crate::runtime::client_values::coord_text(y),
+        crate::runtime::client_values::coord_text(z),
+    ))
 }
 
 fn uuid_text(uuid: u128) -> String {
