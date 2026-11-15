@@ -23148,6 +23148,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(path) = self.io_paths.get(text) {
             return Some(path.clone());
         }
+        if text == "java/io/File#game-directory" {
+            return Some("/horizon/game".into());
+        }
         Some(text.to_owned())
     }
 
@@ -23330,7 +23333,7 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     return Ok(Some(Value::Void));
                 }
-                let Some(path) = self.io_paths.get(&marker).cloned() else {
+                let Some(path) = self.io_path_of(&Value::Ref(Some(marker.clone()))) else {
                     return Ok(None);
                 };
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
