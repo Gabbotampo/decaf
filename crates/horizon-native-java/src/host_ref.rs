@@ -467,6 +467,11 @@ pub enum HostKind {
     /// `ItemStack`, a hit result, a placeholder for an object the hook did not
     /// give): key its marker, never canonical.
     GameTransient,
+    /// A Fabric-created `ParticleType`: a fresh object carrying its limiter
+    /// flag. Its key starts with `simple/` or `complex/` and a serial.
+    ParticleType,
+    /// Vanilla's immutable `DebugScreenEntries.PROFILES` maps.
+    DebugProfilesMap,
     /// A collection's `iterator()`: key `iterator/<n>`, the host's table key, or
     /// `iterator/empty` for `Collections.emptyIterator()` (`host_iterator.rs`).
     Iterator,
@@ -708,6 +713,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::GameEvent,
         &crate::host_game_event::EVENT_CLASS_SIDE,
     ),
+    (HostKind::ParticleType, &PARTICLE_TYPE_CLASS_SIDE),
     (
         HostKind::LifecycleEvent,
         &crate::host_game_event::LIFECYCLE_CLASS_SIDE,
@@ -803,6 +809,144 @@ pub(crate) fn instance_of_class(
         .any(|class| proves_not_instance(wanted, class))
         .then_some(false)
 }
+
+fn particle_identity_equals(
+    handle: &HostRef,
+    other: &Value,
+    _nested: &mut dyn Nested,
+) -> Result<Option<bool>, NativeError> {
+    Ok(match other {
+        Value::Host(other) => handle.same_object(other),
+        _ => Some(false),
+    })
+}
+
+const PARTICLE_TYPE: &str = "net/minecraft/core/particles/ParticleType";
+const SIMPLE_PARTICLE_TYPE: &str = "net/minecraft/core/particles/SimpleParticleType";
+const PARTICLE_OPTIONS: &str = "net/minecraft/core/particles/ParticleOptions";
+const FABRIC_SIMPLE_PARTICLE_TYPE: &str =
+    "net/fabricmc/fabric/api/particle/v1/FabricParticleTypes$1";
+const FABRIC_COMPLEX_PARTICLE_TYPE: &str =
+    "net/fabricmc/fabric/api/particle/v1/FabricParticleTypes$2";
+const FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE: &str =
+    "net/fabricmc/fabric/api/particle/v1/FabricParticleTypes$3";
+
+fn particle_type_class(key: &str) -> &'static str {
+    if key.starts_with("simple/") {
+        FABRIC_SIMPLE_PARTICLE_TYPE
+    } else if key.starts_with("complex-function/") {
+        FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE
+    } else {
+        FABRIC_COMPLEX_PARTICLE_TYPE
+    }
+}
+
+fn particle_type_instance_of(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    particle_class_instance_of(particle_type_class(handle.key()), wanted, hierarchy)
+}
+
+fn particle_class_instance_of(
+    class: &str,
+    wanted: &str,
+    _hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if wanted == "java/lang/Object" {
+        return Some(true);
+    }
+    Some(match class {
+        FABRIC_SIMPLE_PARTICLE_TYPE => matches!(
+            wanted,
+            FABRIC_SIMPLE_PARTICLE_TYPE | SIMPLE_PARTICLE_TYPE | PARTICLE_TYPE | PARTICLE_OPTIONS
+        ),
+        FABRIC_COMPLEX_PARTICLE_TYPE | FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE => {
+            matches!(wanted, PARTICLE_TYPE)
+        }
+        SIMPLE_PARTICLE_TYPE => matches!(
+            wanted,
+            SIMPLE_PARTICLE_TYPE | PARTICLE_TYPE | PARTICLE_OPTIONS
+        ),
+        PARTICLE_TYPE => wanted == PARTICLE_TYPE,
+        _ => return None,
+    })
+}
+
+pub(crate) const PARTICLE_TYPE_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: particle_identity_equals,
+    instance_of: particle_type_instance_of,
+    crosses_jars: |_, _| true,
+    compare_to: None,
+};
+
+/// The class-side answers for `ParticleType` and `SimpleParticleType`.
+pub(crate) const PARTICLE_TYPE_CLASS_SIDE: ClassSide = ClassSide {
+    owns: |class| {
+        matches!(
+            class,
+            PARTICLE_TYPE
+                | SIMPLE_PARTICLE_TYPE
+                | FABRIC_SIMPLE_PARTICLE_TYPE
+                | FABRIC_COMPLEX_PARTICLE_TYPE
+                | FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE
+        )
+    },
+    instance_of: particle_class_instance_of,
+    superclass: |class| match class {
+        FABRIC_SIMPLE_PARTICLE_TYPE => Some(SIMPLE_PARTICLE_TYPE.to_owned()),
+        FABRIC_COMPLEX_PARTICLE_TYPE | FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE => {
+            Some(PARTICLE_TYPE.to_owned())
+        }
+        SIMPLE_PARTICLE_TYPE => Some(PARTICLE_TYPE.to_owned()),
+        PARTICLE_TYPE => Some("java/lang/Object".to_owned()),
+        _ => None,
+    },
+    is_interface: |class| {
+        matches!(
+            class,
+            PARTICLE_TYPE
+                | SIMPLE_PARTICLE_TYPE
+                | FABRIC_SIMPLE_PARTICLE_TYPE
+                | FABRIC_COMPLEX_PARTICLE_TYPE
+                | FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE
+        )
+        .then_some(false)
+    },
+    classes: || {
+        vec![
+            PARTICLE_TYPE.to_owned(),
+            SIMPLE_PARTICLE_TYPE.to_owned(),
+            FABRIC_SIMPLE_PARTICLE_TYPE.to_owned(),
+            FABRIC_COMPLEX_PARTICLE_TYPE.to_owned(),
+            FABRIC_COMPLEX_FUNCTION_PARTICLE_TYPE.to_owned(),
+        ]
+    },
+};
+
+fn debug_profiles_map_class(_key: &str) -> &'static str {
+    "java/util/ImmutableCollections$MapN"
+}
+
+fn debug_profiles_equals(
+    _handle: &HostRef,
+    _other: &Value,
+    _nested: &mut dyn Nested,
+) -> Result<Option<bool>, NativeError> {
+    Ok(None)
+}
+
+pub(crate) const DEBUG_PROFILES_MAP_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: debug_profiles_equals,
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| true,
+    compare_to: None,
+};
 
 /// Every kind: its tag, its class, its identity, its methods.
 const KINDS: &[KindInfo] = &[
@@ -1965,6 +2109,20 @@ const KINDS: &[KindInfo] = &[
         // Its own object each time the game makes one.
         canonical: never_canonical,
         methods: &crate::game_object::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ParticleType,
+        tag: "ptype",
+        class: ClassRule::FromKey(particle_type_class),
+        canonical: never_canonical,
+        methods: &PARTICLE_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DebugProfilesMap,
+        tag: "dpm",
+        class: ClassRule::FromKey(debug_profiles_map_class),
+        canonical: always_canonical,
+        methods: &DEBUG_PROFILES_MAP_METHODS,
     },
     KindInfo {
         kind: HostKind::Iterator,
