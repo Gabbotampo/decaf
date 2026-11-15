@@ -101,7 +101,7 @@ fn real_classpath(root: &Path) -> Option<String> {
     paths.push(stub_classes);
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).ok()?;
-        let name = entry.name().ok()?.to_owned();
+        let name = entry.name().ok()?.into_owned();
         if !name.starts_with("META-INF/jars/") || !name.ends_with(".jar") {
             continue;
         }
