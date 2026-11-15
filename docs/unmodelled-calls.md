@@ -28,6 +28,13 @@ python3 tools/unmodelled_calls.py \
   --json /tmp/census-before.json
 ```
 
+By default the census records two explicit modes: `alone` runs only the target
+jar, while `closure` links its required Fabric/NeoForge dependency closure from
+the same corpus. Use `--dependency-mode alone` or `--dependency-mode closure` to
+request one mode. A missing or version-incompatible required provider is refused
+as `missing dependency X`; it is never treated as a host model. Nested
+`META-INF/jars/` and NeoForge Jar-in-Jar providers are included in the closure.
+
 `tools/unmodelled_calls.py` prints and can save, per corpus, one row per jar
 (`verdict`, `unknown`, `calls`) and the ranked table. A single jar can be reproduced by
 hand:
