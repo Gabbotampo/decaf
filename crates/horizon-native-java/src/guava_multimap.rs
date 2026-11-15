@@ -124,8 +124,11 @@ fn values_for_key<H: Host>(
         &map,
         std::slice::from_ref(key),
     )?;
-    if !matches!(get, Value::Ref(None)) || !create {
+    if !matches!(get, Value::Ref(None)) {
         return Ok(Some(get));
+    }
+    if !create {
+        return Ok(None);
     }
     let map_kind = source_kind(this, source).unwrap_or_else(|| "array".into());
     let values = this
