@@ -7548,6 +7548,17 @@ impl Host for StdHost {
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
+        if self.is_set_from_map(receiver) {
+            if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                return answer;
+            }
+        }
         check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
