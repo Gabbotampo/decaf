@@ -66,6 +66,7 @@
 use super::*;
 
 mod parse;
+mod typed;
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";

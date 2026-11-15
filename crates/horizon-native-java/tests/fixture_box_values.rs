@@ -7,6 +7,9 @@
 //! `%b` was refused as ambiguous. Every expected string is what this class
 //! printed on Java 25 (OpenJDK 25.0.5, `javac --release 17`, run twice).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -248,7 +251,7 @@ fn javac() -> PathBuf {
 
 /// Compile `source` (class `demo.<class>`) into a jar of its own.
 fn jar(class: &str, source_text: &str) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-boxes-{class}-{}",
         std::process::id()
     ));

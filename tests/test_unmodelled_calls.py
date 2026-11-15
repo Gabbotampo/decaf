@@ -126,6 +126,32 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(TOOL.parse_corpus("neoforge=/tmp/x"),
                          ("neoforge", Path("/tmp/x")))
 
+    def test_default_game_block_table_discovers_exact_prepared_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            table = root / "vanilla-block-classes.json"
+            table.write_text('{"blocks":{"minecraft:fire":["net/minecraft/world/level/block/FireBlock"]}}')
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"HORIZON_RESOURCES": str(root)}, clear=False):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    found = TOOL.default_game_block_classes("26.3")
+            self.assertEqual(found, table.resolve())
+            self.assertIn("using prepared vanilla block class table", stderr.getvalue())
+
+    def test_default_game_block_table_rejects_simple_name_behaviour_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "block-behaviours.json").write_text(
+                '{"blocks":[{"name":"minecraft:fire","class":["FireBlock"],'
+                '"interfaces":["FeatureElement"]}]}'
+            )
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"HORIZON_RESOURCES": str(root)}, clear=False):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    found = TOOL.default_game_block_classes("26.3")
+            self.assertIsNone(found)
+            self.assertIn("prepared vanilla block class table absent", stderr.getvalue())
+
     def test_locked_neoforge_reads_the_committed_file_names(self):
         locked = TOOL.locked_neoforge()
         self.assertTrue(locked)
