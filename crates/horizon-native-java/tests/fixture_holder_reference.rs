@@ -2,6 +2,8 @@
 //! The host probe exercises the pre-freeze state. The committed oracle records
 //! both states from a real writable 26.3 MappedRegistry run.
 
+use horizon_native_java::{StdHost, Value};
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
