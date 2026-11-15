@@ -89,8 +89,8 @@ impl<H: Host> Runtime<'_, H> {
                 // `walk`'s own frame is the JDK's, not the caller's; the first
                 // frame the function sees is the method that called `walk`.
                 // A top-level native entrypoint has no interpreter caller frame
-                // to stand in for Java's launcher/main frame. Count the missing
-                // caller while retaining the bounded current-frame shape.
+                // to stand in for Java's launcher/main frame. Count that boundary
+                // instead of returning a shortened stream.
                 let snapshot = snapshot();
                 if snapshot.len() < 2 {
                     return Ok(Some(self.host.unknown_operand_call(r)?));
