@@ -29,6 +29,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+mod client_reload;
 pub mod client_surface;
 mod client_values;
 mod collection_base;
@@ -5535,6 +5536,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = client_reload::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
+        }
         if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
             return Ok(value);
         }
@@ -5727,6 +5731,9 @@ impl Host for StdHost {
         }
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
+        }
+        if let Some(value) = client_reload::static_call(self, r, args) {
+            return value;
         }
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
@@ -7028,6 +7035,9 @@ impl Host for StdHost {
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = client_reload::host_instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
@@ -26024,6 +26034,11 @@ impl<H: Host> Runtime<'_, H> {
                 name: method.to_owned(),
                 descriptor: desc.to_owned(),
             };
+            if let Some(receiver) = receiver.as_ref()
+                && let Some(value) = client_reload::runtime_instance_call(self, &r, receiver, args)
+            {
+                return value;
+            }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
                 None => self.host.invoke(&r, args),
@@ -27699,7 +27714,16 @@ impl<H: Host> Runtime<'_, H> {
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         )
                                     }
                                 } else {
@@ -27731,13 +27755,28 @@ impl<H: Host> Runtime<'_, H> {
                                         ),
                                         None => invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         ),
                                     }
                                 } else {
                                     invoke_or_catch!(
                                         at,
-                                        self.host.invoke_instance(&resolved, receiver, &args)
+                                        if let Some(value) = client_reload::runtime_instance_call(
+                                            self, &resolved, receiver, &args
+                                        ) {
+                                            value
+                                        } else {
+                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                        }
                                     )
                                 }
                             } else {
