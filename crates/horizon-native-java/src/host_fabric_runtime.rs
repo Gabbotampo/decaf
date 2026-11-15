@@ -137,6 +137,7 @@ pub(crate) struct ContainerParts {
     pub(crate) provider: String,
     /// The type `getEntrypointContainers` was asked for (internal name).
     pub(crate) requested: Option<String>,
+    pub(crate) ordinal: usize,
 }
 
 /// The entrypoint container for entry `class` of kind `kind`, provided by
@@ -149,6 +150,7 @@ pub(crate) fn entrypoint_container(parts: &ContainerParts) -> Value {
             text(&parts.class),
             text(&parts.provider),
             Value::Ref(parts.requested.clone()),
+            Value::Int(parts.ordinal as i32),
         ],
     ))
 }
@@ -163,11 +165,13 @@ pub(crate) fn entrypoint_container_parts(value: &Value) -> Option<ContainerParts
                     Value::Ref(Some(class)),
                     Value::Ref(Some(provider)),
                     Value::Ref(requested),
+                    Value::Int(ordinal),
                 ] => Some(ContainerParts {
                     kind: kind.clone(),
                     class: class.clone(),
                     provider: provider.clone(),
                     requested: requested.clone(),
+                    ordinal: usize::try_from(*ordinal).ok()?,
                 }),
                 _ => None,
             }
@@ -362,6 +366,7 @@ mod tests {
                 class: class.clone(),
                 provider: provider.clone(),
                 requested: (index % 2 == 0).then(|| provider.clone()),
+                ordinal: index,
             };
             let container = entrypoint_container(&parts);
             assert_eq!(entrypoint_container_parts(&container), Some(parts.clone()));

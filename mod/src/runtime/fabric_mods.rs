@@ -153,9 +153,7 @@ impl StdHost {
                         class: entry.class.clone(),
                         provider: id.clone(),
                     };
-                    if !self.fabric_entrypoint_containers.contains(&row) {
-                        self.fabric_entrypoint_containers.push(row);
-                    }
+                    self.fabric_entrypoint_containers.push(row);
                 }
             }
         }
@@ -265,13 +263,13 @@ impl StdHost {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/Collection;") => {
                 let containers = self.fabric_containers();
-                // `FabricLoaderImpl.setup` stores the one
-                // `Collections.unmodifiableList(mods)` wrapper and returns
-                // that same object on every query. The backing list is fixed
-                // after setup, so a shared immutable host row is exact here.
-                Some(Ok(self.shared_unmodifiable(
-                    "fabric-loader-all-mods",
-                    "java/util/Collections$UnmodifiableRandomAccessList",
+                // Fabric calls `Collections.unmodifiableList(mods)` inside
+                // `getAllMods`, so each query creates a fresh wrapper over the
+                // same backing list.
+                Some(Ok(self.unmodifiable_from(
+                    "java/util/Collections",
+                    "unmodifiableList",
+                    "list",
                     containers,
                 )))
             }

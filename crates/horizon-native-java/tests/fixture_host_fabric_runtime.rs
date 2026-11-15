@@ -37,8 +37,8 @@ payloads=truefalsefalsetruetruepnulltrue
 resources=truefalsetruetruednull
 entrypoints=1trueprobe-fixturetrue0true
 invokeAll=demo.Probe;
-invokeWrong=EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'
-invokeFailure=EntrypointException:Exception while invoking entrypoint 'main' provided by 'probe-fixture'
+invokeWrong=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:EntrypointException
+invokeFailure=RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:1
 otherTypes=false|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|falsefalsefalse
 spelled=Stringtrue-1040676293falsefalsefalsefalsefalsefalsefalsefalsefabric-loader!,Stringtrue-1221724595falsefalsefalsefalsefalsefalsefalsefalsefabric-mapping-resolver!,Stringtrue1990584267falsefalsefalsefalsefalsefalsefalsefalseCLIENT!,Stringtrue-1852497085falsefalsefalsefalsefalsefalsefalsefalseSERVER!,Stringtrue3145783falsefalsefalsefalsefalsefalsefalsefalsefli:!,Stringtrue-952377214falsefalsefalsefalsefalsefalsefalsefalsefenv:rSERVER!,Stringtrue1041408092falsefalsefalsefalsefalsefalsefalsefalsefpt:rplayToClient!,Stringtrue-116919410falsefalsefalsefalsefalsefalsefalsefalsefrl:rSERVER_DATA!,falsefalsefalsefabric-entrypoint/main/demo/Probe/probe-fixture!,falsefalsefalsefabric-payload-types/playToClient!,falsefalsefalsefabric-resource-loader/SERVER_DATA!,falsefalsefalsefabric-entrypoint-instance/demo/Probe!,12sfalse
 forged=CCECCE
@@ -250,4 +250,32 @@ fn a_string_cast_to_a_singleton_type_is_never_the_object() {
             assert!(!text.contains(spelled), "{text} {unknown:?}");
         }
     }
+}
+
+#[test]
+fn duplicate_entrypoint_rows_are_invoked_and_failures_continue() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("duplicate-entrypoints", &sources);
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    host = host.with_fabric_entrypoint("main", "demo.Probe", "probe-fixture");
+    let text = fixture.text_on(&mut host, "invokeFailure");
+    assert_eq!(
+        text,
+        "RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:2"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
