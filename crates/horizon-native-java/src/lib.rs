@@ -20903,7 +20903,7 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
 
-pub(crate) struct Runtime<'a, H> {
+struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     /// Each class a jar `@Mixin` targets, with the mixin classes naming it,
     /// built once on first use from `classes` (which this runtime only
@@ -25700,7 +25700,7 @@ impl<H: Host> Runtime<'_, H> {
         self.arrays.get(host_array::array_key(value)?)
     }
 
-    pub(crate) fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
+    fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
         let key = expect_array_key(value)?;
         if host_array::is_shared_empty(key) {
             return Ok(&EMPTY_ARRAY_VALUES);

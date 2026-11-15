@@ -59,7 +59,7 @@ pub(crate) use items::NON_NULL_LIST;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]
-pub(crate) mod text;
+pub(super) mod text;
 // Config libraries' defaults (`AutoConfig`, YACL), for the interpreter's
 // library dispatch.
 #[path = "client_registrations.rs"]
