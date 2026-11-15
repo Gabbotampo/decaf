@@ -1680,6 +1680,28 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.store_persistent_class_state(fields, initialized)
     }
 
+    fn persistent_io_state(
+        &self,
+    ) -> (
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeSet<String>,
+    ) {
+        self.inner.persistent_io_state()
+    }
+
+    fn store_persistent_io_state(
+        &mut self,
+        paths: BTreeMap<String, String>,
+        files: BTreeMap<String, String>,
+        file_bytes: BTreeMap<String, Vec<u8>>,
+        dirs: BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        self.inner
+            .store_persistent_io_state(paths, files, file_bytes, dirs)
+    }
+
     fn take_persistent_heap(&mut self) -> Option<JavaHeap> {
         self.inner.take_persistent_heap()
     }
@@ -1954,6 +1976,7 @@ impl NativeJar {
         );
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut wrapped = GameHookHost {
             inner: host,
             context,
@@ -1981,11 +2004,14 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
-            io_paths: BTreeMap::new(),
-            io_files: BTreeMap::new(),
-            io_dirs: BTreeSet::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
             watch: Default::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
@@ -2140,6 +2166,7 @@ impl NativeJar {
             // a failed firing keeps nothing, as before the heap.
             outcome?;
             runtime.persist_class_state()?;
+            runtime.persist_io_state()?;
             state.fields = std::mem::take(&mut runtime.fields);
             state.arrays = std::mem::take(&mut runtime.arrays);
         } else {
@@ -2174,9 +2201,11 @@ impl NativeJar {
                 .filter_map(|value| crate::heap::value_text(value).map(str::to_owned))
                 .collect();
             let persistence = runtime.persist_class_state();
+            let io_persistence = runtime.persist_io_state();
             let heap = runtime.persist_resident_heap_with(roots);
             outcome?;
             persistence?;
+            io_persistence?;
             heap?;
         }
         state.next_object = runtime.next_object;

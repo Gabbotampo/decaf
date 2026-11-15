@@ -73,7 +73,7 @@ impl<H: Host> Runtime<'_, H> {
                 // commons-io may make parent folders and opens its own stream:
                 // not events the model can name (`watch_service.rs`).
                 self.watch_change(&path, crate::watch_service::Change::Unmodelled);
-                self.io_files.insert(path, text.clone());
+                self.io_store_file_with_charset_args(path, text.clone(), args)?;
                 Ok(Some(Value::Void))
             }
             _ => Ok(None),
