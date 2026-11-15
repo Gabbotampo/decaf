@@ -13287,7 +13287,9 @@ fn array_operand_error(
 
 /// An array creation's length. A negative one is the JVM's
 /// `NegativeArraySizeException` (its message is the length), which a jar's
-/// handler may catch; one over the runtime's bound is refused.
+/// handler may catch. Positive lengths are kept intact; allocation below uses
+/// `try_reserve_exact` so an array the host cannot represent is an explicit
+/// `OutOfMemoryError`, rather than the old artificial one-megabyte refusal.
 fn array_length(value: i32) -> Result<usize, NativeError> {
     if value < 0 {
         return Err(NativeError::UncaughtException {
@@ -13296,10 +13298,30 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
             frame: None,
         });
     }
-    usize::try_from(value)
-        .ok()
-        .filter(|length| *length <= 1 << 20)
-        .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+    usize::try_from(value).map_err(|_| array_out_of_memory())
+}
+
+/// The error a Java array allocation reports when the host cannot reserve its
+/// element storage. The exact threshold is host-memory dependent on HotSpot;
+/// this is therefore a refusal with the real Java exception type, never a
+/// fabricated metadata error.
+fn array_out_of_memory() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/OutOfMemoryError".into(),
+        message: None,
+        frame: None,
+    }
+}
+
+/// Allocate repeated array elements without allowing Rust's allocator failure
+/// to abort the whole probe process.
+fn repeated_array_values(value: Value, length: usize) -> Result<Vec<Value>, NativeError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| array_out_of_memory())?;
+    values.resize(length, value);
+    Ok(values)
 }
 
 /// The null checks a method reference's adapter makes before its target runs
@@ -21508,17 +21530,26 @@ impl<H: Host> Runtime<'_, H> {
     /// reference that would fail a `TypeMismatch`.
     /// `descriptor` is the array class of this level (`[[I`); each nested
     /// level is an array of its component (`[I`).
-    fn new_multidim_array(&mut self, descriptor: &str, counts: &[usize]) -> Value {
+    fn new_multidim_array(
+        &mut self,
+        descriptor: &str,
+        counts: &[usize],
+    ) -> Result<Value, NativeError> {
         let length = counts.first().copied().unwrap_or(0);
         let component = &descriptor[1..];
         let values = if counts.len() <= 1 {
-            vec![Value::default_for(component); length]
+            repeated_array_values(Value::default_for(component), length)?
         } else {
-            (0..length)
-                .map(|_| self.new_multidim_array(component, &counts[1..]))
-                .collect()
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(length)
+                .map_err(|_| array_out_of_memory())?;
+            for _ in 0..length {
+                values.push(self.new_multidim_array(component, &counts[1..])?);
+            }
+            values
         };
-        self.new_array_value(descriptor, values)
+        Ok(self.new_array_value(descriptor, values))
     }
 
     /// Materialize a `java.lang.reflect.Type[]` for the generic reflection
@@ -22012,7 +22043,10 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let class = value_class::array_class_marker(&component.replace('.', "/"));
                 // Each slot holds the component's zero (`0` for `int.class`).
-                self.new_array_value(&class, vec![Value::default_for(&class[1..]); length])
+                self.new_array_value(
+                    &class,
+                    repeated_array_values(Value::default_for(&class[1..]), length)?,
+                )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
                 Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
@@ -25980,7 +26014,10 @@ impl<H: Host> Runtime<'_, H> {
                     let component = value_class::primitive_array_component(atype)
                         .ok_or(NativeError::InvalidClass("invalid newarray type"))?;
                     let class = value_class::array_class_marker(component);
-                    stack.push(self.new_array_value(&class, vec![empty; length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(empty, length)),
+                    ));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
@@ -25988,7 +26025,10 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?;
                     let class = value_class::array_class_marker(&component);
-                    stack.push(self.new_array_value(&class, vec![Value::Ref(None); length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(Value::Ref(None), length)),
+                    ));
                 }
                 0xbe => {
                     self.pull_array_views();
@@ -26089,7 +26129,10 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|count| array_length(*count))
                             .collect::<Result<Vec<_>, _>>()
                     );
-                    stack.push(self.new_multidim_array(&descriptor, &counts));
+                    stack.push(invoke_or_catch!(
+                        at,
+                        self.new_multidim_array(&descriptor, &counts)
+                    ));
                 }
                 0xc0 => {
                     // The reference stays on the stack; a cast to a class the
@@ -44542,7 +44585,7 @@ mandatory = true
             depth: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
-        let grid = runtime.new_multidim_array("[[I", &[2, 3]);
+        let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
         assert_eq!(host_array::exact_class(&grid), Some("[[I"));
         let outer = runtime.array(&grid).unwrap().clone();
         assert_eq!(outer.len(), 2);
