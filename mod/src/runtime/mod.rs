@@ -14904,18 +14904,18 @@ pub enum NativeError {
         /// The jar frames already on the chain when the next was refused.
         limit: usize,
     },
-    /// A jar ran past the wall-clock budget its caller allowed.
+    /// A jar exceeded its deterministic instruction budget or distant wall cap.
     ///
-    /// Checked as frames are entered and periodically inside a frame, so a jar
-    /// that loops without calling anything still stops. The caller decides the
-    /// budget; an unbounded one ([`ExecutionBudget::UNBOUNDED`]) never raises
-    /// this.
+    /// The instruction bound is the normal refusal; the wall cap is a final
+    /// hang guard for host code that never reaches an instruction check.
     ExecutionBudgetExceeded {
         /// The frame the check ran in.
         class: String,
         method: String,
-        /// How long the budget allowed.
+        /// How long the distant wall cap allowed.
         budget: std::time::Duration,
+        /// The deterministic instruction bound, when this budget had one.
+        instructions: Option<usize>,
     },
     /// The fail-closed host mode rejected a call with no bounded model.
     UnknownHostCall(MethodRef),
@@ -14969,11 +14969,19 @@ impl std::fmt::Display for NativeError {
                 class,
                 method,
                 budget,
-            } => write!(
-                f,
-                "native interpreter exceeded its {:.1}s execution budget at {class}#{method}",
-                budget.as_secs_f64()
-            ),
+                instructions,
+            } => match instructions {
+                Some(instructions) => write!(
+                    f,
+                    "native interpreter exceeded its deterministic {instructions}-instruction budget at {class}#{method} (wall cap {:.1}s)",
+                    budget.as_secs_f64()
+                ),
+                None => write!(
+                    f,
+                    "native interpreter exceeded its {:.1}s execution budget at {class}#{method}",
+                    budget.as_secs_f64()
+                ),
+            },
             _ => write!(f, "{self:?}"),
         }
     }
@@ -15438,45 +15446,77 @@ pub struct ExecutionReport {
     pub calls: usize,
 }
 
-/// The wall-clock bound one jar's native execution may consume.
+/// The deterministic instruction and distant wall bounds one jar execution may consume.
 ///
-/// The bound is cooperative: [`NativeJar::execute_with_budget`] hands it to the
-/// interpreter, which checks it as each jar frame is entered and every
-/// [`BUDGET_CHECK_INSTRUCTIONS`] bytecode instructions inside a frame. A jar
-/// that runs past it fails with [`NativeError::ExecutionBudgetExceeded`] and its
-/// caller can skip that jar while the rest of the batch runs.
-///
-/// [`Self::UNBOUNDED`] is the library and probe default, so a caller that says
-/// nothing about time keeps the pre-budget behaviour.
-#[derive(Debug, Clone, Copy)]
+/// The instruction bound is charged by the interpreter, including nested jar
+/// frames. A distant wall cap remains as a final hang guard for host paths that
+/// do not reach an instruction check. [`Self::UNBOUNDED`] keeps library callers
+/// on the historical unbounded path.
+#[derive(Debug, Clone)]
 pub struct ExecutionBudget {
-    /// When the budget expires, and how long it allowed, so the diagnostic can
-    /// name the bound rather than only the frame.
     deadline: Option<(std::time::Instant, std::time::Duration)>,
+    instruction_limit: Option<usize>,
+    instructions: std::cell::Cell<usize>,
 }
 
 impl ExecutionBudget {
-    /// No wall-clock bound; only the stack bound (`frame_bound.rs`) applies.
-    pub const UNBOUNDED: Self = Self { deadline: None };
+    /// No wall-clock or instruction bound; only the stack bound applies.
+    pub const UNBOUNDED: Self = Self {
+        deadline: None,
+        instruction_limit: None,
+        instructions: std::cell::Cell::new(0),
+    };
 
-    /// A budget that expires `limit` from now.
+    /// A wall-clock budget for existing callers that do not need deterministic steps.
     pub fn within(limit: std::time::Duration) -> Self {
         Self {
             deadline: std::time::Instant::now()
                 .checked_add(limit)
                 .map(|at| (at, limit)),
+            instruction_limit: None,
+            instructions: std::cell::Cell::new(0),
         }
     }
 
-    /// The bound the budget was built with; `None` for [`Self::UNBOUNDED`].
+    /// A deterministic instruction budget with a distant wall-clock hang cap.
+    pub fn deterministic(instructions: usize, wall_cap: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now()
+                .checked_add(wall_cap)
+                .map(|at| (at, wall_cap)),
+            instruction_limit: Some(instructions),
+            instructions: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The distant wall cap; `None` for the unbounded budget.
     pub fn limit(&self) -> Option<std::time::Duration> {
         self.deadline.map(|(_, limit)| limit)
     }
 
-    /// Whether the wall-clock bound has passed. An unbounded budget never does.
-    pub fn expired(&self) -> bool {
+    /// The deterministic instruction bound, if any.
+    pub fn instruction_limit(&self) -> Option<usize> {
+        self.instruction_limit
+    }
+
+    /// Whether the wall-clock hang guard has passed.
+    pub fn wall_expired(&self) -> bool {
         self.deadline
             .is_some_and(|(deadline, _)| std::time::Instant::now() >= deadline)
+    }
+
+    /// Charge one interpreter instruction and report whether the deterministic bound is spent.
+    pub fn charge_instruction(&self) -> bool {
+        let next = self.instructions.get().saturating_add(1);
+        self.instructions.set(next);
+        self.instruction_limit.is_some_and(|limit| next > limit)
+    }
+
+    /// Whether either the deterministic bound or wall guard has passed.
+    pub fn expired(&self) -> bool {
+        self.instruction_limit
+            .is_some_and(|limit| self.instructions.get() >= limit)
+            || self.wall_expired()
     }
 }
 
@@ -26053,6 +26093,10 @@ impl<H: Host> Runtime<'_, H> {
     /// [`Self::invoke_stream_calls`], recording which stream interface a
     /// new stream is (its call's declared result: `IntStream.range` answers an
     /// `IntStream`), for `instanceof` and casts (`stream_pipeline.rs`).
+    fn is_live_stream_value(&self, value: &Value) -> bool {
+        expect_ref(value).is_some_and(|marker| self.is_live_stream(marker))
+    }
+
     fn invoke_stream(
         &mut self,
         r: &MethodRef,
@@ -26307,6 +26351,7 @@ impl<H: Host> Runtime<'_, H> {
             class: class.to_owned(),
             method: method.to_owned(),
             budget: self.budget.limit().unwrap_or_default(),
+            instructions: self.budget.instruction_limit(),
         }
     }
 
@@ -26548,7 +26593,10 @@ impl<H: Host> Runtime<'_, H> {
         }
         while pc < code.len() {
             budget_ticks = budget_ticks.wrapping_add(1);
-            if budget_ticks & (BUDGET_CHECK_INSTRUCTIONS - 1) == 0 && self.budget.expired() {
+            if self.budget.charge_instruction()
+                || (budget_ticks & (BUDGET_CHECK_INSTRUCTIONS - 1) == 0
+                    && self.budget.wall_expired())
+            {
                 return Err(self.budget_exceeded(class, method));
             }
             let at = pc;
@@ -27665,6 +27713,18 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if receiver
+                        .as_ref()
+                        .is_some_and(|value| self.is_live_stream_value(value))
+                        && (r.owner == "java/lang/String"
+                            || (r.owner == "java/lang/Object"
+                                && matches!(r.name.as_str(), "hashCode" | "toString")))
+                    {
+                        // A live stream is an object whose identity hash and Object.toString
+                        // are nondeterministic. Its marker is an internal capability, never a
+                        // String receiver; count every accidental text/hash path instead of
+                        // exposing marker text or hashing it as Java String content.
+                        invoke_or_catch!(at, self.host.unknown_operand_call(&r))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
@@ -34618,12 +34678,58 @@ modId="minecraft"
                 class,
                 method,
                 budget,
+                instructions,
             } => {
                 assert_eq!(class, "demo/Spin");
                 assert_eq!(method, "spin");
                 assert_eq!(budget, limit);
+                assert_eq!(instructions, None);
             }
             other => panic!("expected the execution budget, got {other:?}"),
+        }
+    }
+
+    /// The deterministic budget refuses a loop by instruction count before its
+    /// distant wall guard can vary with host load.
+    #[test]
+    fn deterministic_budget_names_its_instruction_bound() {
+        let class = ClassFile {
+            name: "demo/DeterministicSpin".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![Method {
+                name: "spin".into(),
+                descriptor: "()V".into(),
+                access: 9,
+                code: Some(vec![0xa7, 0x00, 0x00]),
+                max_locals: 0,
+                max_stack: 0,
+                annotations: Vec::new(),
+            }],
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let limit = 1_024;
+        let budget = ExecutionBudget::deterministic(limit, std::time::Duration::from_secs(60));
+        let started = std::time::Instant::now();
+        let error = NativeJar::from_classes([class])
+            .execute_with_budget(
+                "demo.DeterministicSpin",
+                Some("spin"),
+                "main",
+                &mut NullHost,
+                &budget,
+            )
+            .expect_err("the deterministic instruction budget must stop the loop");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        match error {
+            NativeError::ExecutionBudgetExceeded {
+                instructions: Some(actual),
+                ..
+            } => assert_eq!(actual, limit),
+            other => panic!("expected the deterministic budget, got {other:?}"),
         }
     }
 

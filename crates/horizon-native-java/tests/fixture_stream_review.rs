@@ -423,6 +423,14 @@ fn a_streams_text_is_counted_and_never_its_marker() {
                 !unknown.is_empty(),
                 "path {path} (builder {builder}) answered {answer:?} uncounted"
             );
+            if !builder && path >= 19 {
+                assert!(
+                    unknown.iter().any(|(call, _)| {
+                        call.contains("hashCode") || call.contains("identityHashCode")
+                    }),
+                    "stream identity hash path {path} was not counted: {unknown:?}"
+                );
+            }
         }
     }
 }

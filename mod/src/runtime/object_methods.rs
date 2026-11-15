@@ -305,6 +305,12 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     pub(crate) fn java_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // A stream's marker is an internal capability, not a Java String. Its
+        // Object.hashCode is an identity hash no run can reproduce, so any
+        // collection/table path must stay unknown and be counted by its caller.
+        if self.is_live_stream_value(value) {
+            return Ok(None);
+        }
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::runtime::host_recursion::enter()?;
