@@ -8,6 +8,9 @@
 //! leaves its class half-initialized for a later entrypoint or callback (the
 //! shape jamlib's `Event#listeners` hit in a strict game-hook firing).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -234,7 +237,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-class-init-{test}-{}-{unique}",
             std::process::id()
         ));

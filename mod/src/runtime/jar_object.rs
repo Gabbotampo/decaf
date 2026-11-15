@@ -199,29 +199,11 @@ fn split_key(key: &str) -> Option<(&str, &str)> {
 /// handle's key: not an array's (`[I#0`), and no `:`, space, `.`, `,` or `\`
 /// (no class name has one; a host marker may). Whatever the class's package:
 /// `map/Thing#0` is a jar class's key, so a `String` spelling it is a
-/// `String`. No host collection text is shaped like this
-/// ([`unspell_key`]).
+/// `String`.
 pub(crate) fn parse_key(text: &str) -> Option<(&str, &str)> {
     let (class, number) = split_key(text)?;
     (!crate::runtime::host_array::handle_only_class(class) && !class.contains([':', ' ', '.', ',', '\\']))
         .then_some((class, number))
-}
-
-/// A host collection's text (`list/<element markers>`, collections #156
-/// P14) as no `String` can be confused with: a one-element literal whose
-/// element ends in `#<digits>` (`list/rfoo#3`, the String `foo#3`) is
-/// [`parse_key`]-shaped, like a jar class `list/rfoo`'s key, so its last `#`
-/// is escaped (`list/rfoo\#3`), which the element splitter reads back as
-/// `#`.
-pub(crate) fn unspell_key(text: String) -> String {
-    if parse_key(&text).is_none() {
-        return text;
-    }
-    let mut text = text;
-    if let Some(at) = text.rfind('#') {
-        text.insert(at, '\\');
-    }
-    text
 }
 
 /// The class of a handle's key (`class#n`), `None` for a text with no
@@ -310,27 +292,13 @@ mod tests {
     use super::*;
 
     /// A jar class in a package named like a host collection (`map`, `list`,
-    /// `set`) has keys a `String` can spell; no collection literal is shaped
-    /// like one, and a literal whose element ends like a key reads back its
-    /// element.
+    /// `set`) has keys like any other class.
     #[test]
-    fn no_collection_literal_spells_a_key() {
+    fn a_class_in_a_collection_named_package_has_keys() {
         assert_eq!(parse_key("map/Thing#0"), Some(("map/Thing", "0")));
         assert_eq!(
             parse_key("list/render/Thing#2"),
             Some(("list/render/Thing", "2"))
-        );
-        let literal = crate::runtime::collection_value("set", &[Value::Ref(Some("foo#3".into()))]);
-        assert_eq!(literal, Value::Ref(Some("set/rfoo\\#3".into())));
-        assert_eq!(parse_key(crate::runtime::expect_string(&literal)), None);
-        assert_eq!(
-            crate::runtime::collection_values(&literal).unwrap(),
-            [Value::Ref(Some("foo#3".into()))]
-        );
-        // Any other literal is unchanged.
-        assert_eq!(
-            crate::runtime::collection_value("list", &[Value::Ref(Some("a#1".into())), Value::Int(2)]),
-            Value::Ref(Some("list/ra#1,i2".into()))
         );
     }
 
@@ -376,9 +344,7 @@ mod tests {
         // A handle's key is the runtime's: its class is the split, even in a
         // package named like a host collection.
         assert_eq!(object_class(&handle("map/Foo#3".into())), Some("map/Foo"));
-        // A host collection marker a model kept stays that marker: a
-        // literal is never key-shaped (`unspell_key`), so its text reads back
-        // as the `Ref` it was.
+        // Text no key is shaped like reads back as the `Ref` it was.
         assert_eq!(
             stored_value("list/r\\#3"),
             Value::Ref(Some("list/r\\#3".into()))

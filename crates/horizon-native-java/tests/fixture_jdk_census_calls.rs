@@ -1,6 +1,9 @@
 //! JDK calls the unmodelled-call census ranks by `sole`, run from a compiled
 //! jar so the descriptors are `javac`'s, not hand-written.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
@@ -31,7 +34,7 @@ fn build_jar(
     resources: &[(&str, &str)],
     excluded: &[&str],
 ) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-jdk-census-{name}-{}",
         std::process::id()
     ));

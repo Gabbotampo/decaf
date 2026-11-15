@@ -22,6 +22,17 @@ use std::{
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// A path under [`std::env::temp_dir`] no other call in this process gets:
+/// `<name>-<n>`, `n` counted per process (the same counter [`Scratch::new`]
+/// uses). It creates and removes nothing, for a fixture that manages its own
+/// directory: a name built from the process id and the clock alone repeated
+/// between two parallel tests on a coarse clock (macOS), and one test's
+/// cleanup then deleted the other's half-built jar (`Truncated`, `NotFound`;
+/// #255 round 4, S3).
+pub fn unique_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{name}-{}", NEXT.fetch_add(1, Ordering::Relaxed)))
+}
+
 /// A fresh, empty directory under [`std::env::temp_dir`], deleted with
 /// everything in it when this guard drops.
 ///
