@@ -11295,8 +11295,12 @@ impl Host for StdHost {
                 // jar object's is its class's body or `Object`'s identity
                 // hash, neither the host's: counted, never its key (#217).
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
-                    if jar_object::object_key(receiver).is_some() {
-                        return self.unknown_host_call(r);
+                    if jar_object::object_key(receiver).is_some()
+                        || expect_ref(receiver)
+                            .is_some_and(|text| stream_pipeline::is_stream_marker(text))
+                    {
+                        self.unknown_host_call(r)?;
+                        return Ok(Value::Ref(Some(stream_pipeline::STREAM_TEXT.into())));
                     }
                     return Ok(Value::Ref(Some(value_text(receiver))));
                 }
@@ -11620,6 +11624,10 @@ fn builder_append_text<H: Host>(
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
             // `append(Object)` is `String.valueOf`: an object a model owns
             // prints its `toString`, and a box prints its value.
+            Value::Ref(Some(text)) if stream_pipeline::is_stream_marker(text) => {
+                host.unknown_operand_call(&crate::runtime::jar_text::object_to_string())?;
+                stream_pipeline::STREAM_TEXT.into()
+            }
             Value::Ref(Some(text)) => {
                 crate::runtime::java_tostring::modelled_marker(host, value).unwrap_or_else(|| text.clone())
             }
@@ -11779,8 +11787,19 @@ fn slice_utf16(text: &str, start: i32, length: i32) -> String {
 /// Java prints a `boolean` as `true`/`false` and a `char` as the character,
 /// while both are `Value::Int` here; a `float` component prints its `f32`
 /// digits and a `double` its `f64` digits.
-fn java_value_text(value: &Value, desc: &str) -> String {
-    match value {
+fn java_value_text<H: Host>(
+    host: &mut H,
+    value: &Value,
+    desc: &str,
+) -> Result<String, NativeError> {
+    if matches!(value, Value::Ref(Some(text)) if stream_pipeline::is_stream_marker(text)) {
+        // Object.toString uses the pipeline object's identity hash, which this
+        // interpreter cannot reproduce. Count the observable call and never
+        // expose the random marker text to the jar.
+        host.unknown_operand_call(&crate::runtime::jar_text::object_to_string())?;
+        return Ok(stream_pipeline::STREAM_TEXT.into());
+    }
+    Ok(match value {
         Value::Int(value) if desc == "Z" => (*value != 0).to_string(),
         Value::Int(value) if desc == "C" => {
             char::from_u32(*value as u32).map_or_else(|| value.to_string(), String::from)
@@ -11789,16 +11808,12 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        // A stream never prints its marker (`stream_pipeline.rs`).
-        Value::Ref(Some(value)) if stream_pipeline::is_stream_marker(value) => {
-            stream_pipeline::STREAM_TEXT.into()
-        }
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
-    }
+    })
 }
 
 fn utf16_index_of(haystack: &str, needle: &str, from: i32) -> i32 {
@@ -25242,10 +25257,10 @@ impl<H: Host> Runtime<'_, H> {
                             || descriptor.ends_with(")Ljava/io/BufferedWriter;")
                             || descriptor.ends_with(")Ljava/io/StringWriter;") =>
                     {
-                        let text = args
-                            .first()
-                            .map(|value| java_value_text(value, descriptor))
-                            .unwrap_or_default();
+                        let text = match args.first() {
+                            Some(value) => java_value_text(&mut *self.host, value, descriptor)?,
+                            None => String::new(),
+                        };
                         self.io_write(&marker, &text)?;
                         // `return this`: the writer itself.
                         jar_object::stored_value(&marker)
@@ -25261,7 +25276,7 @@ impl<H: Host> Runtime<'_, H> {
                                     .first()
                                     .cloned()
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
-                                java_value_text(value, &argument)
+                                java_value_text(&mut *self.host, value, &argument)?
                             }
                             None => String::new(),
                         };
@@ -28623,10 +28638,10 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         let mut joined = String::new();
                         let (mut next_arg, mut next_constant) = (0, 0);
-                        let expand = |placeholder: u8,
-                                      joined: &mut String,
-                                      next_arg: &mut usize,
-                                      next_constant: &mut usize|
+                        let mut expand = |placeholder: u8,
+                                          joined: &mut String,
+                                          next_arg: &mut usize,
+                                          next_constant: &mut usize|
                          -> Result<(), NativeError> {
                             match placeholder {
                                 1 => {
@@ -28638,7 +28653,11 @@ impl<H: Host> Runtime<'_, H> {
                                     let argument = arguments
                                         .get(*next_arg)
                                         .map_or("Ljava/lang/Object;", String::as_str);
-                                    joined.push_str(&java_value_text(value, argument));
+                                    joined.push_str(&java_value_text(
+                                        &mut *self.host,
+                                        value,
+                                        argument,
+                                    )?);
                                     *next_arg += 1;
                                 }
                                 _ => {
@@ -28660,7 +28679,11 @@ impl<H: Host> Runtime<'_, H> {
                                 let argument = arguments
                                     .get(position)
                                     .map_or("Ljava/lang/Object;", String::as_str);
-                                joined.push_str(&java_value_text(value, argument));
+                                joined.push_str(&java_value_text(
+                                    &mut *self.host,
+                                    value,
+                                    argument,
+                                )?);
                             }
                         } else {
                             for ch in recipe.chars() {

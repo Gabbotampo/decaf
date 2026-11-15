@@ -512,6 +512,13 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn java_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
         // One level of a nested `equals` (#250).
         let _level = crate::runtime::host_recursion::enter()?;
+        // A stream is an identity object. Its marker is an internal capability,
+        // never a String whose text can participate in Java equality.
+        if expect_ref(a).is_some_and(|text| crate::runtime::stream_pipeline::is_stream_marker(text))
+            || expect_ref(b).is_some_and(|text| crate::runtime::stream_pipeline::is_stream_marker(text))
+        {
+            return Ok(a == b);
+        }
         if let Some(equal) = self.subclass_token_equals(a, b) {
             return match equal {
                 Some(equal) => Ok(equal),
