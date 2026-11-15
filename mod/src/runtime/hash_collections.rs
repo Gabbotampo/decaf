@@ -450,17 +450,19 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     match handle.equals(&stored, &mut object_methods::RuntimeNested::new(self))? {
-                        // Gson's elements break `equals`/`hashCode` (`JsonPrimitive` `1` and `1.0`
-                        // are equal with different hashes), so an equal element whose hash is
-                        // unknown here may sit in another bucket in Java: unknown, unless it is
-                        // the very same object (#221 re-check 4, B9).
+                        // An equal key whose hash is unknown here is found only where Java's
+                        // hashes surely agree: the very same object, or a kind whose equal
+                        // values always hash alike. Anything that may hold a Gson element
+                        // (`JsonPrimitive` `1` and `1.0` are equal with different hashes),
+                        // directly or inside a list, entry or `Optional`, may sit in another
+                        // bucket in Java: unknown (#221 review 5, B9).
                         Some(true)
-                            if crate::runtime::gson_tree::is_tree_element(key)
-                                && !object_methods::identical(key, &stored) =>
+                            if object_methods::identical(key, &stored)
+                                || keeps_hash_contract(handle.kind()) =>
                         {
-                            unknown = true;
+                            return Ok(Lookup::Found(stored));
                         }
-                        Some(true) => return Ok(Lookup::Found(stored)),
+                        Some(true) => unknown = true,
                         Some(false) => {}
                         None => unknown = true,
                     }
@@ -1689,4 +1691,44 @@ fn concurrent_modification_or_npe(cme: bool) -> NativeError {
         message: None,
         frame: None,
     }
+}
+
+/// Whether two equal host values of `kind` always have equal Java hashes, whatever they hold:
+/// values (types, tokens, reflective members, ids and keys, `UUID`, `Duration`...) whose
+/// `equals` and `hashCode` read the same fields of the same consistent types. A kind that can
+/// hold arbitrary objects (a collection, an entry, an `Optional`, a pair, a Gson element, a jar
+/// or game object) is not: an equal one may hash differently in Java (#221 review 5, B9).
+fn keeps_hash_contract(kind: crate::runtime::host_ref::HostKind) -> bool {
+    use crate::runtime::host_ref::HostKind as K;
+    matches!(
+        kind,
+        K::Path
+            | K::FmlPath
+            | K::Identifier
+            | K::ResourceKey
+            | K::TagKey
+            | K::BlockItemId
+            | K::MethodType
+            | K::ReflectField
+            | K::ReflectMethod
+            | K::ReflectConstructor
+            | K::Class
+            | K::ReflectType
+            | K::AnnotatedType
+            | K::GsonType
+            | K::TypeToken
+            | K::GsonTypeToken
+            | K::Collector
+            | K::Uuid
+            | K::Duration
+            | K::Uri
+            | K::Locale
+            | K::TimeUnit
+            | K::CodingErrorAction
+            | K::UnicodeBlock
+            | K::ArtifactVersion
+            | K::WorldVersion
+            | K::StackTraceElement
+            | K::Module
+    )
 }

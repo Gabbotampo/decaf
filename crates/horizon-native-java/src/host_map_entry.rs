@@ -832,10 +832,21 @@ impl StdHost {
                 let (_, value) = self.entry_map_value(map, &state.key, 0)?;
                 Some((state.key.clone(), value))
             }
-            // A map the host keeps no row for (an immutable literal) cannot have changed;
-            // a kept one must still hold what was read, with no structural change since.
-            Life::Opaque { map, stamp, .. } => (!self.mutable_collections.contains_key(map)
+            // A map the host keeps no row for (an immutable literal) cannot have changed. A
+            // kept one answers only while its row is untouched since the reading (#221 review 5,
+            // B8): its generation moves on every write, and Gson's in-place replace and its
+            // removal move nothing else. A replaced, removed and re-added node holds exactly the
+            // object the reading saw, so neither the stamp nor the value can show that the
+            // reading's node is gone; after any write the read is counted. The same holds for an
+            // earlier reading's state (`entry_state`), which keeps the generation it read at.
+            Life::Opaque {
+                map,
+                stamp,
+                generation,
+                ..
+            } => (!self.mutable_collections.contains_key(map)
                 || self.mod_stamp_of(map) == *stamp
+                    && self.mutable_collections.generation(map) == *generation
                     && self
                         .entry_map_value(map, &state.key, 0)
                         .is_some_and(|(_, value)| value == state.value))

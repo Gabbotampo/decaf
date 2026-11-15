@@ -27,6 +27,12 @@ gsonRemoveReadd=falsetruefalse\n\
 equalJsonKeys=2|32|32|{\"a\":\"b\"}{\"c\":\"d\"}[3, 2]true3\n\
 gsonHashKeys=221truetrue|1|1072693248|96|1072693345\n\
 gsonRemovedEntry=1|5|2\n\
+x01ReplaceRemoveReadd=2|a=2|false\n\
+d02ReplaceRemoveReadd=3|false|98|2|false\n\
+h17ListKeys=2|true|2\n\
+c02ArrayListKeys=2\n\
+c03EntryKeys=2\n\
+c08LinkedHashMap=2|[3, 2]\n\
 ";
 
 const IMMUTABLE_MAP_STUB: &str = "package com.google.common.collect;\n\
@@ -40,8 +46,12 @@ const JSON_PRIMITIVE_STUB: &str = "package com.google.gson;\n\
 public final class JsonPrimitive extends JsonElement {\n\
 public JsonPrimitive(Number n) { throw new AssertionError(); }\n}\n";
 
+const JSON_NULL_STUB: &str = "package com.google.gson;\n\
+public final class JsonNull extends JsonElement { public static final JsonNull INSTANCE = null; }\n";
+
 const JSON_OBJECT_STUB: &str = "package com.google.gson;\n\
 public final class JsonObject extends JsonElement {\n\
+public void add(String p, JsonElement v) { throw new AssertionError(); }\n\
 public void addProperty(String p, Number v) { throw new AssertionError(); }\n\
 public void addProperty(String p, String v) { throw new AssertionError(); }\n\
 public JsonElement remove(String p) { throw new AssertionError(); }\n\
@@ -50,6 +60,8 @@ public java.util.Set<java.util.Map.Entry<String, JsonElement>> entrySet() { thro
 const PROBE: &str = r##"package demo;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import java.util.*;
@@ -168,6 +180,78 @@ public final class Probe {
         return e1.getValue() + "|" + e2.getValue() + "|" + new HashSet<Object>(List.of(e1, e2)).size();
     }
 
+    static Map.Entry<String, JsonElement> ent(JsonObject o, String k) {
+        for (var e : o.entrySet()) if (e.getKey().equals(k)) return e;
+        return null;
+    }
+
+    static JsonPrimitive p(Number n) {
+        return new JsonPrimitive(n);
+    }
+
+    // Review 5, B8 (`x01`): replaced in place, removed (the node keeps `2`), the first value
+    // object re-added as a new node.
+    public static String x01ReplaceRemoveReadd() {
+        JsonObject o = new JsonObject();
+        o.addProperty("a", 1);
+        o.addProperty("b", 9);
+        var e1 = ent(o, "a");
+        JsonElement first = e1.getValue();
+        o.addProperty("a", 2);
+        o.remove("a");
+        o.add("a", first);
+        return e1.getValue() + "|" + e1 + "|" + (e1.getValue() == first);
+    }
+
+    // Review 5, B8 (`d02`): the same with `add`, then a new reading.
+    public static String d02ReplaceRemoveReadd() {
+        JsonObject o = new JsonObject();
+        o.addProperty("a", 1);
+        var e1 = ent(o, "a");
+        JsonElement first = e1.getValue();
+        o.add("a", p(3));
+        o.remove("a");
+        o.add("a", first);
+        var e2 = ent(o, "a");
+        return e1.getValue() + "|" + e1.equals(e2) + "|" + e1.hashCode() + "|"
+            + new HashSet<Object>(List.of(e1, e2)).size() + "|" + List.of(e1).contains(e2);
+    }
+
+    // Review 5, B9: containers of Gson elements with an identity-hashed member are equal with
+    // different hashes, as `1` and `1.0` are.
+    public static String h17ListKeys() {
+        Object o = new Object();
+        Set<Object> s = new HashSet<>();
+        s.add(List.of(p(1), o));
+        s.add(List.of(p(1.0), o));
+        Set<Object> t = new HashSet<>();
+        t.add(List.of(JsonNull.INSTANCE, p(1)));
+        t.add(List.of(JsonNull.INSTANCE, p(1.0)));
+        return s.size() + "|" + s.contains(List.of(p(1), o)) + "|" + t.size();
+    }
+
+    public static String c02ArrayListKeys() {
+        Set<Object> s = new HashSet<>();
+        s.add(new ArrayList<>(List.of(JsonNull.INSTANCE, p(1))));
+        s.add(new ArrayList<>(List.of(JsonNull.INSTANCE, p(1.0))));
+        return "" + s.size();
+    }
+
+    public static String c03EntryKeys() {
+        Set<Object> s = new HashSet<>();
+        s.add(Map.entry(JsonNull.INSTANCE, p(1)));
+        s.add(Map.entry(JsonNull.INSTANCE, p(1.0)));
+        return "" + s.size();
+    }
+
+    public static String c08LinkedHashMap() {
+        Map<Object, Integer> m = new LinkedHashMap<>();
+        m.put(List.of(JsonNull.INSTANCE, p(1)), 1);
+        m.put(List.of(JsonNull.INSTANCE, p(1.0)), 2);
+        m.put(List.of(JsonNull.INSTANCE, p(1)), 3);
+        return m.size() + "|" + m.values();
+    }
+
     // B4: `unmodifiableMap` wraps a new `UnmodifiableEntry` per `next()`.
     public static String wrappedEntries() {
         Map<String, Integer> u = Collections.unmodifiableMap(fill(new HashMap<>()));
@@ -233,6 +317,7 @@ fn fixture() -> javac_fixture::Fixture {
                 IMMUTABLE_MAP_STUB,
             ),
             ("com/google/gson/JsonElement.java", JSON_ELEMENT_STUB),
+            ("com/google/gson/JsonNull.java", JSON_NULL_STUB),
             ("com/google/gson/JsonObject.java", JSON_OBJECT_STUB),
             ("com/google/gson/JsonPrimitive.java", JSON_PRIMITIVE_STUB),
             ("demo/Probe.java", PROBE),
@@ -309,6 +394,11 @@ fn readings_across_a_gson_remove_and_re_put_are_counted() {
 /// the removed node's own value, `1`) or kept with a new value cannot be told after a write by
 /// Gson's own paths, so its value and the `HashSet` of both entries are counted, never the
 /// re-added node's `5`.
+///
+/// A node replaced in place before it is removed (Java: the removed node holds the replacement)
+/// while the first value object is re-added holds exactly what the reading saw, so the reading
+/// answers only while its map's row is untouched since: after any write it is counted (#221
+/// review 5, B8: `x01`, `d02`).
 #[test]
 fn an_entry_read_before_a_gson_remove_keeps_its_own_state() {
     let fixture = fixture();
@@ -320,4 +410,39 @@ fn an_entry_read_before_a_gson_remove_keeps_its_own_state() {
             .any(|(call, _)| call.starts_with("java/util/Map$Entry#getValue")),
         "{unknown:?}"
     );
+    for method in ["x01ReplaceRemoveReadd", "d02ReplaceRemoveReadd"] {
+        let (text, unknown) = run(&fixture, method);
+        assert!(
+            text == expected(method) || !unknown.is_empty(),
+            "{method}: silent {text}, Java {}",
+            expected(method)
+        );
+        assert!(
+            !text.starts_with("1|"),
+            "{method}: the re-added value, {text}"
+        );
+    }
+}
+
+/// An equal key whose hash is unknown is found only where Java's hashes surely agree (the same
+/// object, or a kind whose equal values always hash alike). A list, entry or map key holding a
+/// Gson element beside an identity-hashed member is equal to another with `1.0` for `1` and
+/// hashes differently in Java (two keys): answered as Java or counted, never merged silently
+/// (#221 review 5, B9: `h17`, `c02`, `c03`, `c08`).
+#[test]
+fn equal_keys_with_unknown_hashes_are_never_merged_silently() {
+    let fixture = fixture();
+    for method in [
+        "h17ListKeys",
+        "c02ArrayListKeys",
+        "c03EntryKeys",
+        "c08LinkedHashMap",
+    ] {
+        let (text, unknown) = run(&fixture, method);
+        assert!(
+            text == expected(method) || !unknown.is_empty(),
+            "{method}: silent {text}, Java {}",
+            expected(method)
+        );
+    }
 }
