@@ -885,9 +885,9 @@ mod tests {
         let java = crate::HorizonJava::default();
         java.lock().jars.push(state.jars.remove(0));
         let players = [
-            (0xa1_u128, 7, "Spectator"),
-            (0xb2, 8, "Survival"),
-            (0xc3, 9, "Unavailable"),
+            (0xa1_u128, 7_u32, "Spectator"),
+            (0xb2, 8_u32, "Survival"),
+            (0xc3, 9_u32, "Unavailable"),
         ];
         java.lock().players = players
             .iter()
@@ -895,7 +895,7 @@ mod tests {
                 uuid,
                 name: name.into(),
                 level: None,
-                entity_id: Some(entity_id),
+                entity_id: Some(entity_id as i32),
                 session: 1,
                 life: 0,
             })
