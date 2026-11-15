@@ -9988,12 +9988,16 @@ impl Host for StdHost {
                     .get(1)
                     .and_then(host_class::class_name)
                     .map(str::to_owned);
-                let entries = self
+                let mut entries = self
                     .fabric_entrypoint_containers
                     .iter()
                     .filter(|entry| entry.kind == kind)
                     .cloned()
                     .collect::<Vec<_>>();
+                // Resolver selection presents providers by mod id while
+                // retaining each provider's declaration order. `invoke` uses
+                // the same stable ordering below through `fabric_entrypoints`.
+                entries.sort_by(|left, right| left.provider.cmp(&right.provider));
                 if entries.is_empty() {
                     // `EntrypointStorage.getEntrypoints` of a key no mod
                     // declares: `Collections.emptyList()`, one shared object.
