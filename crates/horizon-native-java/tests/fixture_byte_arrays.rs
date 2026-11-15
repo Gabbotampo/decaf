@@ -79,6 +79,7 @@ fn byte_arrays_answer_as_java_25() {
         "grid",
         "reflection",
         "rawBoolean",
+        "reflectionMatrix",
     ] {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let text = fixture.text_on(&mut host, method);

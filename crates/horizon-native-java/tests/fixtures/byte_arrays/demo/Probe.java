@@ -157,8 +157,42 @@ public final class Probe {
         return String.valueOf(RawBoolean.raw(300));
     }
 
+    private static Object reflect(String operation, Object array) {
+        switch (operation) {
+            case "setByte": Array.setByte(array, 0, (byte) 1); return "ok";
+            case "setShort": Array.setShort(array, 0, (short) 1); return "ok";
+            case "setInt": Array.setInt(array, 0, 1); return "ok";
+            case "setLong": Array.setLong(array, 0, 1L); return "ok";
+            case "setFloat": Array.setFloat(array, 0, 1F); return "ok";
+            case "setDouble": Array.setDouble(array, 0, 1D); return "ok";
+            case "setChar": Array.setChar(array, 0, 'a'); return "ok";
+            case "getByte": return Array.getByte(array, 0);
+            case "getShort": return Array.getShort(array, 0);
+            case "getInt": return Array.getInt(array, 0);
+            case "getLong": return Array.getLong(array, 0);
+            case "getFloat": return Array.getFloat(array, 0);
+            case "getDouble": return Array.getDouble(array, 0);
+            case "getChar": return Array.getChar(array, 0);
+            default: return "unknown";
+        }
+    }
+
+    /** Java 25's catchable mismatch table for every non-boolean typed accessor. */
+    public static String reflectionMatrix() {
+        Object[] arrays = {new int[1], new long[1], new Object[1], new String[1], new byte[1], new boolean[1]};
+        String[] names = {"setByte", "setShort", "setInt", "setLong", "setFloat", "setDouble", "setChar",
+            "getByte", "getShort", "getInt", "getLong", "getFloat", "getDouble", "getChar"};
+        StringBuilder out = new StringBuilder();
+        for (String name : names) {
+            for (Object array : arrays) {
+                out.append(t(() -> reflect(name, array))).append('|');
+            }
+        }
+        return out.toString();
+    }
+
     public static void main(String[] args) throws Exception {
-        for (String m : new String[] {"basics", "overlap", "copyErrors", "copies", "big", "grid", "reflection", "rawBoolean"}) {
+        for (String m : new String[] {"basics", "overlap", "copyErrors", "copies", "big", "grid", "reflection", "rawBoolean", "reflectionMatrix"}) {
             System.out.println(m + "=" + Probe.class.getMethod(m).invoke(null));
         }
     }

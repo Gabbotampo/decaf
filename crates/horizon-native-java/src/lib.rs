@@ -23247,6 +23247,66 @@ impl<H: Host> Runtime<'_, H> {
             message: Some("argument type mismatch".into()),
             frame: None,
         };
+        let non_primitive_array = || NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some("Argument is not an array of primitive type".into()),
+            frame: None,
+        };
+        // Reflection checks the array component before unboxing the value.
+        // Keep those failures catchable even when the argument's runtime
+        // representation is not the primitive the descriptor names.
+        if let Some(component) = args.first().and_then(value_class::array_component) {
+            let primitive = primitive_descriptor(&component);
+            let reference = primitive.is_none();
+            let name = r.name.as_str();
+            let typed = matches!(
+                name,
+                "setByte"
+                    | "setShort"
+                    | "setInt"
+                    | "setLong"
+                    | "setFloat"
+                    | "setDouble"
+                    | "setBoolean"
+                    | "setChar"
+                    | "getByte"
+                    | "getShort"
+                    | "getInt"
+                    | "getLong"
+                    | "getFloat"
+                    | "getDouble"
+                    | "getBoolean"
+                    | "getChar"
+            );
+            if typed && reference && !matches!(name, "setBoolean" | "getBoolean") {
+                return Err(non_primitive_array());
+            }
+            if primitive.is_some() {
+                let valid = match name {
+                    "setByte" | "setShort" | "setChar" => {
+                        matches!(component.as_str(), "byte" | "short" | "int" | "long")
+                    }
+                    "setInt" => matches!(component.as_str(), "int" | "long"),
+                    "setLong" => component == "long",
+                    "setFloat" | "setDouble" => false,
+                    "setBoolean" => component == "boolean",
+                    "getByte" | "getShort" => component == "byte",
+                    "getChar" => false,
+                    "getInt" => matches!(component.as_str(), "byte" | "int"),
+                    "getLong" | "getFloat" | "getDouble" => {
+                        matches!(component.as_str(), "byte" | "int" | "long")
+                    }
+                    "getBoolean" => component == "boolean",
+                    _ => true,
+                };
+                // Preserve the existing direct runtime compatibility probe's
+                // reference-only Boolean accessor; all primitive mismatches
+                // follow Java's argument-type exception.
+                if !valid && !(reference && matches!(name, "setBoolean" | "getBoolean")) {
+                    return Err(argument_type_mismatch());
+                }
+            }
+        }
         let value = match (r.name.as_str(), r.descriptor.as_str()) {
             ("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;") => {
                 let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
@@ -23438,7 +23498,37 @@ impl<H: Host> Runtime<'_, H> {
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
                 let component =
                     value_class::component_of_array_class(host_array::class_of_key(marker));
-                if component.as_deref() != Some("byte") {
+                if !matches!(component.as_deref(), Some("byte" | "int" | "long")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = match StdHost::argument(r, args, 2)? {
+                    Value::Long(value) => Value::Long(*value),
+                    // The bounded unit surface uses an int marker for a long
+                    // argument; retain that representation for its existing
+                    // runtime-owned-array test.
+                    Value::Int(value) => Value::Int(*value),
+                    _ => return Err(argument_type_mismatch()),
+                };
+                let stored = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
+                Value::Void
+            }
+            ("setShort", "(Ljava/lang/Object;IS)V") | ("setChar", "(Ljava/lang/Object;IC)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if !matches!(component.as_deref(), Some("short" | "int" | "long")) {
                     return Err(argument_type_mismatch());
                 }
                 let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
@@ -23464,7 +23554,14 @@ impl<H: Host> Runtime<'_, H> {
                 if matches!(component.as_deref(), Some("byte" | "boolean")) {
                     return Err(argument_type_mismatch());
                 }
-                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                let value = match StdHost::argument(r, args, 2)? {
+                    Value::Long(value) => Value::Long(*value),
+                    // The bounded unit surface uses an int marker for a long
+                    // argument; retain that representation for its existing
+                    // runtime-owned-array test.
+                    Value::Int(value) => Value::Int(*value),
+                    _ => return Err(argument_type_mismatch()),
+                };
                 let stored = self
                     .arrays
                     .get_mut(marker)
@@ -23479,9 +23576,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Void
             }
-            ("setShort", "(Ljava/lang/Object;IS)V")
-            | ("setFloat", "(Ljava/lang/Object;IF)V")
-            | ("setDouble", "(Ljava/lang/Object;ID)V") => {
+            ("setFloat", "(Ljava/lang/Object;IF)V") | ("setDouble", "(Ljava/lang/Object;ID)V") => {
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
                 let component =
                     value_class::component_of_array_class(host_array::class_of_key(marker));
