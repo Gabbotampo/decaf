@@ -62,9 +62,19 @@ pub(crate) enum ModVerdict {
 }
 
 impl ModStamp {
+    /// The stamp of a collection whose `modCount` the host keeps no count of
+    /// (`Host::mod_stamp`'s default): every check against it is unknown and
+    /// counted, never a silent "unchanged".
+    pub(crate) const UNKEPT: ModStamp = ModStamp {
+        count: u64::MAX,
+        uncertain: u64::MAX,
+    };
+
     /// The check of `expected` against this (live) stamp.
     pub(crate) fn verdict(self, expected: ModStamp) -> ModVerdict {
-        if self == expected {
+        if self == Self::UNKEPT || expected == Self::UNKEPT {
+            ModVerdict::Unknown
+        } else if self == expected {
             ModVerdict::Same
         } else if self.uncertain != expected.uncertain {
             ModVerdict::Unknown
@@ -74,6 +84,9 @@ impl ModStamp {
     }
 
     fn bumped(self, uncertain: bool) -> Self {
+        if self == Self::UNKEPT {
+            return self;
+        }
         ModStamp {
             count: self.count + 1,
             uncertain: self.uncertain + u64::from(uncertain),

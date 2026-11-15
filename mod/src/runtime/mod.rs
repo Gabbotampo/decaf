@@ -81,6 +81,9 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+#[cfg(test)]
+mod host_defaults_tests;
+mod host_deferred_register;
 mod host_entry;
 mod host_events;
 mod host_executors;
@@ -2560,9 +2563,10 @@ pub trait Host {
         None
     }
 
-    /// A collection's `modCount` (`mod_count.rs`).
+    /// A collection's `modCount` (`mod_count.rs`). A host that keeps none
+    /// answers [`mod_count::ModStamp::UNKEPT`], whose every check is counted.
     fn mod_stamp(&self, _marker: &str) -> mod_count::ModStamp {
-        mod_count::ModStamp::default()
+        mod_count::ModStamp::UNKEPT
     }
 
     fn store_mod_stamp(&mut self, _marker: &str, _stamp: mod_count::ModStamp) {}
@@ -2723,13 +2727,16 @@ pub trait Host {
         false
     }
 
-    /// Message a host recorded for one bounded Throwable marker.
+    /// Message a host recorded for one bounded Throwable marker: `Some(None)`
+    /// for a throwable recorded without one (`getMessage()` is `null`), `None`
+    /// when the host recorded nothing for `marker`, so its message is not
+    /// known (a caller answering `getMessage` counts it, never `null`).
     ///
     /// The interpreter keeps objects as markers, so a host that answers
     /// `Throwable#getMessage` can report the same text an `athrow` carries.
     /// Hosts that do not model exceptions keep the default: an uncaught throw
     /// is still diagnosed, just without a message.
-    fn throwable_message(&self, _marker: &str) -> Option<String> {
+    fn throwable_message(&self, _marker: &str) -> Option<Option<String>> {
         None
     }
 
@@ -3085,9 +3092,13 @@ pub struct StdHost {
     /// marker. A constructor answers `void`, so this is where the id lives.
     identifier_objects: BTreeMap<String, String>,
     /// What each `DeferredRegister.create` was made from (registry key,
-    /// namespace), by the register's marker; `None` when two registers share
-    /// the marker or the namespace was not text (`host_ids.rs`).
+    /// namespace), by the register handle's key; `None` when the namespace
+    /// was not text (`host_ids.rs`).
     deferred_registers: BTreeMap<String, Option<(Value, String)>>,
+    /// The registries this jar built and registered itself
+    /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
+    /// every entry the host saw registered (`registry_contents.rs`).
+    jar_registries: BTreeSet<String>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3311,6 +3322,7 @@ impl StdHost {
             packet_types: BTreeMap::new(),
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
+            jar_registries: BTreeSet::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -5327,11 +5339,17 @@ impl Host for StdHost {
 
     /// Read back what the bounded `Throwable.<init>` surface recorded, so an
     /// `athrow` diagnostic names the same message `getMessage` would return.
-    fn throwable_message(&self, marker: &str) -> Option<String> {
-        self.throwable_messages.get(marker).cloned().flatten()
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
+        self.throwable_messages.get(marker).cloned()
     }
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
+        // A throw the runtime raised carries no cause (its `getCause()` is
+        // `null`), except the initializer error that wraps the `<clinit>`
+        // throw, whose cause this host never held: left unrecorded, counted.
+        if !marker.starts_with("java/lang/ExceptionInInitializerError#") {
+            self.throwable_causes.insert(marker.to_owned(), None);
+        }
         self.throwable_messages.insert(marker.to_owned(), message);
     }
 
@@ -5723,12 +5741,13 @@ impl Host for StdHost {
                     Some(key) => key.clone(),
                     None => Value::Ref(None),
                 };
-                self.record_deferred_register(
+                // A new register per call (#182 P1).
+                Ok(self.new_deferred_register(
+                    owner,
                     &marker,
                     &registry_key,
                     args.get(1).and_then(expect_ref),
-                );
-                Ok(Value::Ref(Some(marker)))
+                ))
             }
             ("net/fabricmc/fabric/api/event/EventFactory", "createArrayBacked", descriptor)
                 if descriptor.ends_with("Lnet/fabricmc/fabric/api/event/Event;") =>
@@ -6989,6 +7008,24 @@ impl Host for StdHost {
                 self.throwable_messages.insert(marker.clone(), message);
                 self.throwable_causes.insert(marker.clone(), cause);
                 return Ok(Value::Void);
+            }
+            // A throwable whose constructor this host never saw (its message
+            // and cause were not recorded): `getMessage`, `getCause` and
+            // `toString` are not known to be `null`, so they are counted.
+            if matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("getMessage", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;")
+            ) && !self.throwable_messages.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
+            }
+            // The cause is its own record: a throw the runtime raised has its
+            // message but, for an `ExceptionInInitializerError`, a cause the
+            // host never held (#257's review), so that one is counted.
+            if (r.name.as_str(), r.descriptor.as_str()) == ("getCause", "()Ljava/lang/Throwable;")
+                && !self.throwable_causes.contains_key(&marker)
+            {
+                return self.unknown_host_call(r);
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getMessage", "()Ljava/lang/String;") => {
@@ -9733,7 +9770,8 @@ impl Host for StdHost {
             // `Registry.iterator()` walks the values registered in the
             // registry. The host holds the entries the jar registered
             // (`registry_contents`), not the game's own: the game's entries
-            // have no objects to hand out.
+            // have no objects to hand out, so walking a registry the jar did
+            // not build is counted (#182 P3), and walks the jar's own entries.
             (owner, "iterator", "()Ljava/util/Iterator;")
                 if registry_contents::is_registry_owner(owner)
                     && host_registry::registry_id(receiver).is_some() =>
@@ -9741,6 +9779,9 @@ impl Host for StdHost {
                 let id = host_registry::registry_id(receiver)
                     .unwrap_or_default()
                     .to_owned();
+                if !self.jar_registries.contains(&id) {
+                    self.unknown_host_call(r)?;
+                }
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
@@ -10194,17 +10235,22 @@ impl Host for StdHost {
                     .first()
                     .and_then(expect_ref)
                     .map_or("entry", String::as_str);
-                let register = expect_ref(receiver)
-                    .map_or("deferred-register/registry/default", String::as_str)
-                    .to_owned();
+                // Only a register this runtime made (a `String` spelled like
+                // its text is none): anything else is counted.
+                let Some((register, text)) = host_deferred_register::parts(receiver)
+                    .map(|(key, text)| (key.to_owned(), text.to_owned()))
+                else {
+                    return self.unknown_host_call(r);
+                };
                 // `Identifier.fromNamespaceAndPath(namespace, name)` (Forge:
                 // `new ResourceLocation(modid, name)`): bad text throws here.
                 let forge = r.owner.starts_with("net/minecraftforge/");
                 let made = self.deferred_register_id(forge, &register, id)?;
                 // One holder object per `register` call (`host_registry.rs`).
                 let (holder, value) = self.new_holder(&register, forge, made);
+                self.add_register_entry(receiver, &holder);
                 self.registrations.push(RegistryEntry {
-                    registry: register,
+                    registry: text,
                     id: id.to_owned(),
                     value,
                     declaration: None,
@@ -10216,19 +10262,14 @@ impl Host for StdHost {
                 | "net/minecraftforge/registries/DeferredRegister",
                 "getEntries",
                 "()Ljava/util/Collection;",
-            ) => {
-                // The register's one entries view (`entriesView`), holding
-                // its holders now.
-                let register = expect_ref(receiver).map_or("", String::as_str).to_owned();
-                let holders = self.register_holders(&register);
-                Ok(self.cached_collection(
-                    receiver,
-                    "getEntries",
-                    stand_in_class("list"),
-                    true,
-                    holders,
-                ))
-            }
+            ) => match host_deferred_register::parts(receiver) {
+                Some((register, _)) => {
+                    let register = register.to_owned();
+                    Ok(self.register_entries(receiver, &register))
+                }
+                // No register this runtime made: what it holds is unknown.
+                None => self.unknown_host_call(r),
+            },
             // A holder's `get`/`value`/`isBound`/... are `holder_call`'s
             // (`host_registry.rs`).
             (
@@ -11523,7 +11564,7 @@ fn thrown_message<H: Host>(value: &Value, host: &H) -> Option<String> {
     if !is_throwable_marker(marker) {
         return None;
     }
-    host.throwable_message(marker)
+    host.throwable_message(marker).flatten()
 }
 
 fn capability_text(value: &Value) -> String {
@@ -11753,6 +11794,20 @@ fn stand_in_class(kind: &str) -> &'static str {
         "set" => "java/util/LinkedHashSet",
         _ => "java/util/ArrayList",
     }
+}
+
+/// A reader constructor's operand that is not a reader this model holds: a
+/// `null` throws `Reader(Object lock)`'s bare `NullPointerException`, any
+/// other value is left to the host (`Ok(None)`), which counts it.
+fn null_reader_operand(args: &[Value]) -> Result<Option<Value>, NativeError> {
+    if matches!(args.first(), Some(Value::Ref(None))) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(None)
 }
 
 fn value_text(value: &Value) -> String {
@@ -23669,9 +23724,16 @@ impl<H: Host> Runtime<'_, H> {
                         Some(text) => text,
                         // A jar resource opened by the host is read here, so a
                         // config loader's `getResourceAsStream` reaches Gson.
-                        None => self.host.resource_stream_text(stream).unwrap_or_default(),
+                        // A stream the host holds no text for is not empty:
+                        // the reader is left to the host, which counts it.
+                        None => match self.host.resource_stream_text(stream) {
+                            Some(text) => text,
+                            None => return Ok(None),
+                        },
                     },
-                    None => String::new(),
+                    // `Reader(Object lock)` throws a bare NPE for a `null`
+                    // stream (#257's review); any other operand is not ours.
+                    None => return null_reader_operand(args),
                 };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
@@ -23680,11 +23742,16 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let text = args
-                    .first()
-                    .and_then(expect_ref)
-                    .and_then(|reader| self.string_readers.remove(reader))
-                    .unwrap_or_default();
+                // Only a reader this model holds the text of; a `null` reader
+                // is `Reader(lock)`'s NPE, and any other is left to the host,
+                // which counts it (#257's review: an empty reader made
+                // `readLine()` a silent `null`).
+                let Some(reader) = args.first().and_then(expect_ref) else {
+                    return null_reader_operand(args);
+                };
+                let Some(text) = self.string_readers.remove(reader) else {
+                    return Ok(None);
+                };
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }

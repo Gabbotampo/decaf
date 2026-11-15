@@ -1419,6 +1419,8 @@ mod tests {
             "next_fabric_event",
             "next_iterator",
             "next_neutral_collection",
+            // Registry ids the jar built (`registry_contents.rs`): names, no objects.
+            "jar_registries",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug

@@ -495,9 +495,30 @@ struct MixinModel {
     /// `class#name descriptor` (the interpreter's field-key suffix) of every
     /// `@Shadow` field of a Mixin class.
     shadow_fields: BTreeSet<String>,
+    /// Mixin class that extends a game class (`abstract class M extends
+    /// Player`) → the fields (`name descriptor`) its own chain declares: any
+    /// other field it reads or writes as `M#field` is the game superclass's.
+    game_heirs: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// How far a Mixin class's own superclass chain is followed.
+const MAX_HEIR_CHAIN: usize = 32;
+
 impl MixinModel {
+    /// Whether the field key suffix `owner#name descriptor` names a field of
+    /// the game object itself: a game class's, or one a Mixin class inherits
+    /// from the game class it extends. The model holds none of them.
+    fn game_field(&self, field: &str) -> bool {
+        let Some((owner, member)) = field.split_once('#') else {
+            return false;
+        };
+        is_game_class(owner)
+            || self
+                .game_heirs
+                .get(owner)
+                .is_some_and(|declared| !declared.contains(member))
+    }
+
     fn build(classes: &BTreeMap<String, ClassFile>) -> Self {
         let mut model = Self::default();
         for (name, class) in classes {
@@ -526,6 +547,26 @@ impl MixinModel {
             model
                 .interfaces
                 .insert(name.clone(), class.interface_names());
+            // The fields this class's own chain declares, if that chain
+            // leaves the jar at a game class.
+            let mut declared = BTreeSet::new();
+            let mut current = Some(class);
+            let mut exit = String::new();
+            for _ in 0..MAX_HEIR_CHAIN {
+                let Some(file) = current else {
+                    break;
+                };
+                declared.extend(
+                    file.fields
+                        .iter()
+                        .map(|field| format!("{}{}", field.name, field.descriptor)),
+                );
+                exit = file.super_name.clone();
+                current = classes.get(&exit);
+            }
+            if current.is_none() && is_game_class(&exit) {
+                model.game_heirs.insert(name.clone(), declared);
+            }
             let (fields, methods) = member_annotations(class).unwrap_or_default();
             for (member, descriptors) in fields {
                 if descriptors.iter().any(|d| d == MIXIN_SHADOW_DESCRIPTOR) {
@@ -1260,6 +1301,20 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         {
             return self.get_static(r);
         }
+        // A game class's own field read on a game object (`player.connection`): the model
+        // holds none, so the read refuses as a `@Shadow` one does, never the bootstrap host's
+        // `null` (#248's review: cpm's `ServerPlayer.connection` read answered null, and the
+        // NPE that followed looked like cpm's own).
+        if Self::is_game_object(receiver).is_some()
+            && self
+                .model
+                .game_field(&format!("{}#{}{}", r.owner, r.name, r.descriptor))
+        {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback reads the game's field {}#{} on a game object, which is not modelled",
+                r.owner, r.name
+            )));
+        }
         self.inner.get_field(receiver, r)
     }
 
@@ -1505,7 +1560,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.models_class(name)
     }
 
-    fn throwable_message(&self, marker: &str) -> Option<String> {
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         self.inner.throwable_message(marker)
     }
 
@@ -1928,16 +1983,22 @@ impl NativeJar {
                     break;
                 }
             }
-            // A write to a `@Shadow` field is a write to the game object's own
-            // field, which the host never sees: that callback did not do what
-            // it meant to, so the firing fails instead of keeping the write.
-            if let Some(key) = runtime.fields.keys().find(|key| {
-                key.split_once('|').is_some_and(|(object, field)| {
-                    object.starts_with(GAME_OBJECT_PREFIX) && model.shadow_fields.contains(field)
-                })
+            // A write to a `@Shadow` field, a game class's field or one a
+            // Mixin inherits from the game class it extends is a write to the
+            // game object's own field, which the host never sees: that
+            // callback did not do what it meant to, so the firing fails
+            // instead of keeping the write (#248's review).
+            if let Some((key, shadow)) = runtime.fields.keys().find_map(|key| {
+                let (object, field) = key.split_once('|')?;
+                if !object.starts_with(GAME_OBJECT_PREFIX) {
+                    return None;
+                }
+                let shadow = model.shadow_fields.contains(field);
+                (shadow || model.game_field(field)).then_some((key, shadow))
             }) {
+                let through = if shadow { " through @Shadow" } else { "" };
                 return Err(NativeError::Metadata(format!(
-                    "game hook callback writes the game's field {key} through @Shadow, which the host does not apply"
+                    "game hook callback writes the game's field {key}{through}, which the host does not apply"
                 )));
             }
             if !resident
