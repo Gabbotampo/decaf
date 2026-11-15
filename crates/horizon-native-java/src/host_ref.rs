@@ -377,6 +377,10 @@ pub enum HostKind {
     FabricPayloadTypes,
     /// A `ResourceLoader`: key its `PackType`.
     FabricResourceLoader,
+    /// Fabric biome modification phase singleton.
+    FabricModificationPhase,
+    /// Fabric static Identifier initialized once by its owner.
+    FabricStaticIdentifier,
     /// An object `new` (or a model) allocated: key `class#n`
     /// (`jar_object.rs`), one key per allocation.
     JarObject,

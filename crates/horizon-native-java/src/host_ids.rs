@@ -60,6 +60,14 @@ pub(crate) fn identifier(namespace: &str, path: &str) -> Value {
 
 /// An `Identifier` for `namespace:path` text the host already holds (a bare
 /// path is `minecraft`'s, as `Identifier.parse` reads it).
+/// A canonical static Identifier owned by a Fabric/Minecraft class.
+pub(crate) fn static_identifier(id: &str) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::FabricStaticIdentifier,
+        id.to_owned(),
+    ))
+}
+
 pub(crate) fn identifier_of_text(id: &str) -> Value {
     let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
     identifier(namespace, path)
@@ -68,7 +76,14 @@ pub(crate) fn identifier_of_text(id: &str) -> Value {
 /// The `namespace:path` an `Identifier` handle names.
 pub(crate) fn identifier_key(value: &Value) -> Option<&str> {
     match value {
-        Value::Host(handle) if handle.kind() == HostKind::Identifier => Some(handle.key()),
+        Value::Host(handle)
+            if matches!(
+                handle.kind(),
+                HostKind::Identifier | HostKind::FabricStaticIdentifier
+            ) =>
+        {
+            Some(handle.key())
+        }
         _ => None,
     }
 }
