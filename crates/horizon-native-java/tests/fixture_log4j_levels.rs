@@ -1,24 +1,9 @@
-//! Log4j 2.26.0 Level fixture. The source is compiled with javac --release 21
-//! against the real Log4j API jar on arcweld; only demo.Probe ships in the jar.
+//! Log4j 2.26.0 Level fixture compiled against the real shipped API jar.
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
 use javac_fixture::Fixture;
 
-const LEVEL: &str = r#"
-package org.apache.logging.log4j;
-public final class Level implements Comparable<Level> {
-  public static final Level OFF=null,FATAL=null,ERROR=null,WARN=null,INFO=null,DEBUG=null,TRACE=null,ALL=null;
-  public int intLevel(){return 0;} public String name(){return null;}
-  public boolean isMoreSpecificThan(Level x){return false;}
-  public boolean isLessSpecificThan(Level x){return false;}
-  public boolean isInRange(Level a,Level b){return false;}
-  public int compareTo(Level x){return 0;}
-  public static Level getLevel(String x){return null;} public static Level valueOf(String x){return null;}
-  public static Level toLevel(String x){return null;} public static Level toLevel(String x,Level d){return null;}
-  public static Level forName(String x,int i){return null;} public static Level[] values(){return null;}
-}
-"#;
 const PROBE: &str = r#"
 package demo;
 import org.apache.logging.log4j.Level;
@@ -44,13 +29,14 @@ public final class Probe {
 fn real_log4j_level_surface_matches_java25_oracle() {
     // Java 25.0.5 + Log4j API 2.26.0 output:
     // true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|custom|350|true|true|TRACE:600,ALL:2147483647,custom:350,ERROR:200,INFO:400,FATAL:100,DEBUG:500,OFF:0,WARN:300,|java.lang.String|true
-    let fixture = Fixture::build(
-        "log4j-levels",
-        &[
-            ("org/apache/logging/log4j/Level.java", LEVEL),
-            ("demo/Probe.java", PROBE),
-        ],
+    let api_jar = std::env::var("LOG4J_API_JAR")
+        .expect("LOG4J_API_JAR must point to Minecraft 26.3 log4j-api-2.26.0.jar");
+    assert!(
+        std::path::Path::new(&api_jar).is_file(),
+        "missing real Log4j API jar: {api_jar}"
     );
+    let fixture =
+        Fixture::build_with_classpath("log4j-levels", &[("demo/Probe.java", PROBE)], &api_jar);
     assert_eq!(
         fixture.text("levels"),
         "true|INFO|400|INFO|true|true|true|-1|true|DEBUG|WARN|yes|custom|350|true|true|TRACE:600,ALL:2147483647,custom:350,ERROR:200,INFO:400,FATAL:100,DEBUG:500,OFF:0,WARN:300,|java.lang.String|true"

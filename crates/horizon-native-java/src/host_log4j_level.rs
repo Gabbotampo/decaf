@@ -1,11 +1,26 @@
 //! Canonical Log4j 2 `Level` objects and its process-local level registry.
 
-use std::collections::BTreeMap;
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CustomLevels {
+    entries: Vec<(String, (String, i32))>,
+}
 
+impl CustomLevels {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, key: &str) -> Option<(String, i32)> {
+        self.entries
+            .iter()
+            .find(|(known, _)| known == key)
+            .map(|(_, value)| value.clone())
+    }
+    fn insert(&mut self, key: String, value: (String, i32)) {
+        self.entries.push((key, value));
+    }
+}
 use crate::host_ref::{HostKind, HostRef, Methods, Nested, instance_of_class};
 use crate::{MethodRef, NativeError, Value, expect_ref};
-
-pub(crate) type CustomLevels = BTreeMap<String, (String, i32)>;
 
 const OWNER: &str = "org/apache/logging/log4j/Level";
 const LEVEL_DESC: &str = "Lorg/apache/logging/log4j/Level;";
@@ -60,7 +75,7 @@ fn lookup(name: &str, custom: &CustomLevels) -> Option<(String, i32)> {
     if let Some((known, int_level)) = standard(name) {
         return Some((known.into(), int_level));
     }
-    custom.get(&normalized(name)).cloned()
+    custom.get(&normalized(name))
 }
 
 fn illegal(message: impl Into<String>) -> NativeError {
@@ -146,12 +161,13 @@ fn custom_order(custom: &CustomLevels) -> Vec<(String, i32)> {
         .iter()
         .map(|(name, int)| ((*name).into(), *int))
         .collect::<Vec<_>>();
-    levels.extend(custom.values().cloned());
-    let size = (levels.len().saturating_mul(4) / 3 + 1)
-        .next_power_of_two()
-        .max(16);
+    levels.extend(custom.entries.iter().map(|(_, value)| value.clone()));
+    let mut size = 16usize;
+    while levels.len() > size - size / 4 {
+        size *= 2;
+    }
     levels.sort_by_key(|(name, _)| {
-        let hash = name.encode_utf16().fold(0u32, |hash, unit| {
+        let hash = normalized(name).encode_utf16().fold(0u32, |hash, unit| {
             hash.wrapping_mul(31).wrapping_add(u32::from(unit))
         });
         ((hash ^ (hash >> 16)) as usize) & (size - 1)
@@ -195,12 +211,15 @@ pub(crate) fn static_call(
             }
             let key = normalized(raw);
             if let Some((name, int)) = custom.get(&key) {
-                return Some(Ok(level_value(name, *int)));
+                return Some(Ok(level_value(&name, int)));
             }
             let int = match args.get(1) {
                 Some(Value::Int(int)) => *int,
                 _ => return None,
             };
+            if int < 0 {
+                return Some(Err(illegal("Illegal Level int less than zero.")));
+            }
             custom.insert(key, (raw.clone(), int));
             Some(Ok(level_value(raw, int)))
         }

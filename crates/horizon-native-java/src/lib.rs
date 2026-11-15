@@ -3334,7 +3334,7 @@ impl StdHost {
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
-            log4j_levels: BTreeMap::new(),
+            log4j_levels: crate::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
