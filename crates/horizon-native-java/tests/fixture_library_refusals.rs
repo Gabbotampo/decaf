@@ -815,7 +815,7 @@ impl Host for Tracing {
     fn platform_class_present(&self, name: &str) -> bool {
         Host::platform_class_present(&self.inner, name)
     }
-    fn throwable_message(&self, marker: &str) -> Option<String> {
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         Host::throwable_message(&self.inner, marker)
     }
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
