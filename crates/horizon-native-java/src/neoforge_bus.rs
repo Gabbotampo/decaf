@@ -189,13 +189,8 @@ fn illegal_null_pointer() -> NativeError {
 }
 
 fn raw_consumer_lambda(consumer: &Value) -> bool {
-    let Some(text) = expect_ref(consumer) else {
-        return false;
-    };
-    let Some(marker) = text
-        .strip_prefix("@indy:")
-        .and_then(|_| parse_callback_marker(text).ok())
-    else {
+    // A lambda is a callback handle (`callback_marker.rs`), never text.
+    let Some(marker) = crate::callback_marker::lambda_of(consumer) else {
         return false;
     };
     crate::descriptor_arguments(&marker.target.descriptor)
