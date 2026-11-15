@@ -21043,7 +21043,7 @@ fn gson_json_kind(json: &serde_json::Value) -> &'static str {
     }
 }
 
-struct Runtime<'a, H> {
+pub(crate) struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     /// Each class a jar `@Mixin` targets, with the mixin classes naming it,
     /// built once on first use from `classes` (which this runtime only
