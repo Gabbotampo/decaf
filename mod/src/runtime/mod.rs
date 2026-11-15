@@ -11730,6 +11730,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/StringIndexOutOfBoundsException"
         | "java/util/InputMismatchException" => "java/lang/IndexOutOfBoundsException",
         "java/lang/RuntimeException" => "java/lang/Exception",
+        "java/util/concurrent/CompletionException" => "java/lang/RuntimeException",
         "java/lang/ClassNotFoundException"
         | "java/lang/NoSuchMethodException"
         | "java/lang/NoSuchFieldException"
@@ -11743,6 +11744,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
+        "java/util/concurrent/ExecutionException" => "java/lang/Exception",
         "java/lang/ReflectiveOperationException"
         | "java/io/IOException"
         | "java/lang/InterruptedException"
@@ -22587,6 +22589,13 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(file) = self.class(&current) {
                 queue.extend(file.interface_names());
+            } else if current.starts_with("java/")
+                && host_ref::ClassHierarchy::is_instance(&host_ref::JdkHierarchy, &current, wanted)
+                    == Some(true)
+            {
+                // A JDK interface the jar names (`implements List`): Java 25's
+                // table knows its superinterfaces (`Collection`, #242).
+                return true;
             }
         }
         false
@@ -25964,6 +25973,29 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// One jar frame, executed instruction by instruction.
+    fn invoke_throwable_suppressed(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "getSuppressed"
+            || r.descriptor != "()[Ljava/lang/Throwable;"
+            || !is_throwable_owner(&r.owner)
+        {
+            return Ok(None);
+        }
+        let Some(marker) = receiver.and_then(jar_object::instance_key) else {
+            return Ok(None);
+        };
+        // One store for every `addSuppressed`: the host's (#269's entrypoint failures,
+        // #278's `whenComplete`), which the heap collector traces. `None` (a throwable the
+        // host doesn't hold) falls through to the other paths.
+        let Some(values) = self.host.throwable_suppressed(marker) else {
+            return Ok(None);
+        };
+        Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -27278,6 +27310,11 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A jar's own `BlockPos`/`LevelResource`: the game's
                         // members on its fields (`jar_server_values.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_throwable_suppressed(&r, receiver.as_ref())
+                    ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
