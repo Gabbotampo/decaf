@@ -462,7 +462,7 @@ pub(super) fn parse_text<H: Host>(
     }
 }
 
-pub(super) fn parse_text_with_special<H: Host>(
+pub(crate) fn parse_text_with_special<H: Host>(
     runtime: &mut Runtime<'_, H>,
     text: &str,
 ) -> Result<Value, NativeError> {

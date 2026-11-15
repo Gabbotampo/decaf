@@ -135,6 +135,8 @@ pub enum GameEvent {
     /// NeoForge/Forge `RegisterCommandsEvent`): the listener registers on the
     /// Brigadier façade (`brigadier.rs`).
     RegisterCommands,
+    /// The client builds its Brigadier command tree (Fabric ClientCommandRegistrationCallback).
+    ClientRegisterCommands,
     // Client events: the window's own points fire them, never a server
     // (`client_surface` holds the façade they see).
     /// The client finished starting, before its first tick (Fabric
@@ -167,11 +169,13 @@ pub enum GameEvent {
     /// An item's tooltip is being built (Fabric `ItemTooltipCallback.EVENT`,
     /// NeoForge `ItemTooltipEvent`): the listener edits its lines.
     ClientItemTooltip,
+    /// NeoForge's client mod-bus reload-listener registration event.
+    ClientReloadListeners,
 }
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 41] = [
+    pub const ALL: [GameEvent; 43] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -202,6 +206,7 @@ impl GameEvent {
         GameEvent::PlayerCopy,
         GameEvent::PlayerChangeLevel,
         GameEvent::RegisterCommands,
+        GameEvent::ClientRegisterCommands,
         GameEvent::ClientStarted,
         GameEvent::ClientStopping,
         GameEvent::ClientTickStart,
@@ -213,6 +218,7 @@ impl GameEvent {
         GameEvent::ClientRegisterKeyMappings,
         GameEvent::ClientRegisterGuiLayers,
         GameEvent::ClientItemTooltip,
+        GameEvent::ClientReloadListeners,
     ];
 
     /// The stable name logs and reports use.
@@ -248,6 +254,7 @@ impl GameEvent {
             GameEvent::PlayerCopy => "player_copy",
             GameEvent::PlayerChangeLevel => "player_change_level",
             GameEvent::RegisterCommands => "register_commands",
+            GameEvent::ClientRegisterCommands => "client_register_commands",
             GameEvent::ClientStarted => "client_started",
             GameEvent::ClientStopping => "client_stopping",
             GameEvent::ClientTickStart => "client_tick_start",
@@ -259,6 +266,7 @@ impl GameEvent {
             GameEvent::ClientRegisterKeyMappings => "client_register_key_mappings",
             GameEvent::ClientRegisterGuiLayers => "client_register_gui_layers",
             GameEvent::ClientItemTooltip => "client_item_tooltip",
+            GameEvent::ClientReloadListeners => "client_reload_listeners",
         }
     }
 
@@ -290,7 +298,8 @@ impl GameEvent {
     pub fn is_client(self) -> bool {
         matches!(
             self,
-            GameEvent::ClientStarted
+            GameEvent::ClientRegisterCommands
+                | GameEvent::ClientStarted
                 | GameEvent::ClientStopping
                 | GameEvent::ClientTickStart
                 | GameEvent::ClientTickEnd
@@ -301,6 +310,7 @@ impl GameEvent {
                 | GameEvent::ClientRegisterKeyMappings
                 | GameEvent::ClientRegisterGuiLayers
                 | GameEvent::ClientItemTooltip
+                | GameEvent::ClientReloadListeners
         )
     }
 }
@@ -353,6 +363,8 @@ enum Shape {
     ChangeLevel,
     /// `(CommandDispatcher, CommandBuildContext, Commands.CommandSelection)`
     Commands,
+    /// (CommandDispatcher, CommandBuildContext)
+    ClientCommands,
     /// `(Minecraft)`
     Minecraft,
     /// `(ClientLevel)`
@@ -664,6 +676,17 @@ const FABRIC_FIELDS: &[FabricField] = &[
     },
     // Client events (`fabric-lifecycle-events-v1`, `fabric-networking-api-v1`
     // of the same Fabric API), fired by the window only.
+    // Client command callbacks build the same Brigadier tree as the server
+    // command callback; the client census records the tree but never executes
+    // a command or a renderer.
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/command/v2/ClientCommandRegistrationCallback",
+        field: "EVENT",
+        method: "register",
+        descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;)V",
+        event: GameEvent::ClientRegisterCommands,
+        shape: Shape::ClientCommands,
+    },
     fabric(
         client_lifecycle!("ClientTickEvents"),
         "END_CLIENT_TICK",
@@ -854,6 +877,10 @@ const CLIENT_BUS_EVENTS: &[(&str, GameEvent)] = &[
         GameEvent::ClientRegisterKeyMappings,
     ),
     ("RegisterGuiLayersEvent", GameEvent::ClientRegisterGuiLayers),
+    (
+        "AddClientReloadListenersEvent",
+        GameEvent::ClientReloadListeners,
+    ),
 ];
 const NEOFORGE_CLIENT_EVENT_ROOT: &str = "net/neoforged/neoforge/client/event/";
 const FORGE_CLIENT_EVENT_ROOT: &str = "net/minecraftforge/client/event/";
@@ -1335,7 +1362,7 @@ impl StdHost {
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
         if r.owner == FABRIC_EVENT && r.name == "DEFAULT_PHASE" {
-            return Some(crate::host_ids::identifier_of_text(order::DEFAULT_PHASE));
+            return Some(crate::host_ids::static_identifier(order::DEFAULT_PHASE));
         }
         if order::PRIORITY_CLASSES.contains(&r.owner.as_str())
             && order::PRIORITIES.contains(&r.name.as_str())
@@ -2462,6 +2489,10 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
                 )),
             ]
         }
+        Shape::ClientCommands => vec![
+            crate::host_brigadier::dispatcher(),
+            crate::host_brigadier::build_context(),
+        ],
         Shape::Minecraft => vec![crate::game_object::client_value(
             crate::client_surface::MINECRAFT.into(),
         )],

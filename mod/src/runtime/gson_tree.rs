@@ -65,20 +65,13 @@
 
 use super::*;
 
-mod parse;
+pub(crate) mod parse;
 
 pub(crate) fn parse_text<H: Host>(
     runtime: &mut Runtime<'_, H>,
     text: &str,
 ) -> Result<Value, NativeError> {
     parse::parse_text(runtime, text)
-}
-
-pub(crate) fn parse_text_with_special<H: Host>(
-    runtime: &mut Runtime<'_, H>,
-    text: &str,
-) -> Result<Value, NativeError> {
-    parse::parse_text_with_special(runtime, text)
 }
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
