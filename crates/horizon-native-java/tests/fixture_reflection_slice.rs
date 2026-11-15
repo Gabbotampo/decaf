@@ -14,6 +14,8 @@ const PROBE: &str = r#"package demo;
 import java.lang.reflect.Field;
 
 public final class Probe {
+  interface Marker {}
+  @interface Note {}
   enum Plain { A, B }
   enum Body {
     A { @Override public String toString() { return "A"; } },
@@ -52,7 +54,10 @@ public final class Probe {
     return Plain.class.isEnum() + "|" + Body.class.isEnum() + "|"
         + Body.A.getClass().isEnum() + "|" + String.class.isEnum() + "|"
         + Thread.State.class.isEnum() + "|" + java.time.DayOfWeek.class.isEnum() + "|"
-        + Class.class.isInstance(classText) + "|" + cast(Class.class, classText) + "|"
+        + Enum.class.isEnum() + "|" + Marker.class.isEnum() + "|" + Note.class.isEnum() + "|"
+        + int.class.isEnum() + "|" + void.class.isEnum() + "|" + String[].class.isEnum() + "|"
+        + Plain[].class.isEnum() + "|" + Class.class.isInstance(classText) + "|"
+        + cast(Class.class, classText) + "|"
         + Field.class.isInstance(fieldText) + "|" + cast(Field.class, fieldText);
   }
 
@@ -94,7 +99,7 @@ fn class_is_enum_uses_held_jdk_and_jar_models_and_rejects_forged_strings() {
     let (value, unknown) = run("enums");
     assert_eq!(
         value,
-        "true|true|false|false|true|true|false|ClassCastException|false|ClassCastException"
+        "true|true|false|false|true|true|false|false|false|false|false|false|false|false|ClassCastException|false|ClassCastException"
     );
     assert!(unknown.is_empty(), "counted: {unknown:?}");
 }

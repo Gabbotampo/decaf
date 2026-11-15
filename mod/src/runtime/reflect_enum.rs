@@ -41,9 +41,15 @@ impl<H: Host> Runtime<'_, H> {
         });
         let jdk_enum = crate::runtime::jdk_closure::class_is_enum(&class);
         let game_constants = game_enum_constants(&class);
-        let known_enum = held_enum
-            .or(jdk_enum)
-            .or_else(|| game_constants.map(|_| true));
+        // Primitive and array Class objects are never enum classes; Java
+        // answers this without consulting class metadata.
+        let known_enum = if crate::runtime::host_class::is_primitive(&class) || class.starts_with('[') {
+            Some(false)
+        } else {
+            held_enum
+                .or(jdk_enum)
+                .or_else(|| game_constants.map(|_| true))
+        };
         if is_enum_query {
             return Ok(known_enum.map(|is_enum| Value::Int(i32::from(is_enum))));
         }
