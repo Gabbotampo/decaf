@@ -146,6 +146,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod kotlin_stdlib;
 mod lambda_boxing;
 mod library_dispatch;
 mod linked_resources;
@@ -26004,6 +26005,24 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<Value>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // Kotlin stdlib facades and holder methods are registration/runtime
+        // surfaces: the native interpreter records their exact bounded result
+        // without executing the bundled implementation.
+        let kotlin_call = MethodRef {
+            owner: class.to_owned(),
+            name: method.to_owned(),
+            descriptor: desc.to_owned(),
+        };
+        if let Some(receiver) = receiver.as_ref()
+            && let Some(value) = kotlin_stdlib::instance(self, &kotlin_call, receiver, args)
+        {
+            return value;
+        }
+        if receiver.is_none()
+            && let Some(value) = kotlin_stdlib::invoke(self, &kotlin_call, args)
+        {
+            return value;
+        }
         // Snapshot the table so the frame's class reference outlives the
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);

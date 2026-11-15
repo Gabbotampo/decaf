@@ -839,6 +839,12 @@ impl<H: Host> Runtime<'_, H> {
         if !matches!(opcode, 0xb6 | 0xb9) || crate::jar_object::is_object_handle(handle) {
             return Ok(None);
         }
+        if handle.kind() == crate::host_ref::HostKind::KotlinLazy
+            && let Some(value) =
+                crate::kotlin_stdlib::instance(self, r, receiver.unwrap_or(&Value::Ref(None)), args)
+        {
+            return value.map(Some);
+        }
         let mut nested = RuntimeNested {
             runtime: self,
             class,

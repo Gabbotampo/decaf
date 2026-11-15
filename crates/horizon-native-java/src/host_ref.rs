@@ -429,6 +429,12 @@ pub enum HostKind {
     /// jar's `new ArrayList()` (a [`HostKind::JarObject`]), whose row it
     /// shares.
     Collection,
+    /// Kotlin's declaration-order enum entries view.
+    KotlinEnumEntries,
+    /// A Kotlin lazy holder.
+    KotlinLazy,
+    /// Kotlin's canonical empty list, set, or map singleton.
+    KotlinEmptyCollection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
@@ -1817,6 +1823,27 @@ const KINDS: &[KindInfo] = &[
         // An object: the runtime and the host's collection models answer
         // for it by its key, as for a jar's `new ArrayList()`.
         methods: &crate::jar_object::JAR_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::KotlinEnumEntries,
+        tag: "kentries",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::enum_entries_class),
+        canonical: never_canonical,
+        methods: &crate::kotlin_stdlib::ENUM_ENTRIES_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinLazy,
+        tag: "klazy",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::lazy_class),
+        canonical: never_canonical,
+        methods: &crate::kotlin_stdlib::LAZY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinEmptyCollection,
+        tag: "kempty",
+        class: ClassRule::FromKey(crate::kotlin_stdlib::empty_class),
+        canonical: always_canonical,
+        methods: &crate::kotlin_stdlib::EMPTY_COLLECTION_METHODS,
     },
     KindInfo {
         kind: HostKind::TimeUnit,
