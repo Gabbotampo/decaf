@@ -57,6 +57,11 @@ const RETIRED_PREFIXES: &[&str] = &[
     // StackWalker.Option moved to a typed host handle; old marker-shaped
     // text remains an ordinary String.
     "enum/java/lang/StackWalker$Option/",
+    // Reflective handles moved to typed host values in P10; their old
+    // marker-shaped text remains an ordinary String.
+    "reflect-field/",
+    "reflect-method/",
+    "reflect-constructor/",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
