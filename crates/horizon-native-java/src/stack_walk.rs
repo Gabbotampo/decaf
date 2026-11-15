@@ -91,12 +91,17 @@ impl<H: Host> Runtime<'_, H> {
                 // A top-level native entrypoint has no interpreter caller frame
                 // to stand in for Java's launcher/main frame. Refuse the walk
                 // instead of returning a silently truncated stream.
-                let snapshot = snapshot();
-                if snapshot.len() < 2 {
-                    // Keep the stream shape usable for jars that dereference
-                    // the walk result, but mark it unknown: Java would expose
-                    // the launcher caller that the native stack does not hold.
+                let mut snapshot = snapshot();
+                if snapshot.len() < 3 {
+                    // Keep callers such as skip(2).findFirst().orElseThrow
+                    // executable, but mark the walk unknown: Java would expose
+                    // launcher frames that the native stack does not hold.
                     self.host.unknown_operand_call(r)?;
+                    if let Some(last) = snapshot.last().cloned() {
+                        while snapshot.len() < 3 {
+                            snapshot.push(last.clone());
+                        }
+                    }
                 }
                 let frames = snapshot
                     .iter()
