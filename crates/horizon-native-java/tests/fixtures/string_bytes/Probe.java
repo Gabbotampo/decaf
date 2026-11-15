@@ -24,7 +24,6 @@ public final class Probe {
         byte[] utf8 = {'c', 'a', 'f', (byte) 0xC3, (byte) 0xA9};
         byte[] latin = {'c', (byte) 0xE9};
         byte[] none = null;
-        String noText = null;
         Charset noCharset = null;
         String noName = null;
         return t(() -> new String(utf8)) + "|" + t(() -> new String(utf8, 1, 4)) + "|"
@@ -34,8 +33,23 @@ public final class Probe {
             + t(() -> new String(utf8, 3, 5)) + "|" + t(() -> new String(none)) + "|"
             + t(() -> new String(none, 0, 1, StandardCharsets.UTF_8)) + "|"
             + t(() -> new String(utf8, noCharset)) + "|" + t(() -> new String(none, noName)) + "|"
-            + t(() -> new String(utf8, 1, 9, noCharset)) + "|" + t(() -> new String(noText)) + "|"
-            + t(() -> new String()) + "|" + t(() -> new String("copy"));
+            + t(() -> new String(utf8, 1, 9, noCharset));
+    }
+
+    public static String malformed() {
+        byte[] surrogate = {(byte) 0xED, (byte) 0xA0, (byte) 0x80};
+        byte[] overlong = {(byte) 0xE0, (byte) 0x80, (byte) 0x80};
+        byte[] badTail = {(byte) 0xF0, (byte) 0x90, (byte) 0x80, 0x41};
+        byte[] split = {(byte) 0xE2, (byte) 0x82, (byte) 0xE2, 0x28, (byte) 0xA1};
+        return t(() -> new String(surrogate, StandardCharsets.UTF_8)) + "|"
+            + t(() -> new String(overlong, StandardCharsets.UTF_8)) + "|"
+            + t(() -> new String(badTail, StandardCharsets.UTF_8)) + "|"
+            + t(() -> new String(split, StandardCharsets.UTF_8));
+    }
+
+    public static String unknownName() {
+        byte[] bytes = {104, 105};
+        return t(() -> new String(bytes, "default"));
     }
 
     public static void main(String[] args) { System.out.println(run()); }

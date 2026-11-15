@@ -139,9 +139,6 @@ fn modelled_constructors_answer_java_25() {
         ("bytesRangeCharset", "bc"),
         ("bytesName", "ab"),
         ("bytesRangeName", "ab"),
-        ("empty", "0"),
-        ("copy", "xy"),
-        ("supplier", "0"),
     ];
     for (name, expected) in cases {
         let mut host = StdHost::new();
@@ -175,6 +172,9 @@ fn every_string_constructor_is_counted_until_it_is_modelled() {
     // (method, the constructor descriptor it must be counted under)
     let cases = [
         ("hibyte", "([BI)V"),
+        ("empty", "()V"),
+        ("copy", "(Ljava/lang/String;)V"),
+        ("supplier", "()V"),
         ("hibyteRange", "([BIII)V"),
         ("builder", "(Ljava/lang/StringBuilder;)V"),
         ("buffer", "(Ljava/lang/StringBuffer;)V"),

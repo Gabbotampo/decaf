@@ -24,8 +24,15 @@ fn byte_constructors_decode_like_jdk_25() {
          StringIndexOutOfBoundsException:Range [3, 3 + 5) out of bounds for length 5|\
          NullPointerException:Cannot read the array length because \"bytes\" is null|\
          NullPointerException:Cannot read the array length because \"bytes\" is null|\
-         NullPointerException:null|NullPointerException:null|NullPointerException:null|\
-         NullPointerException:Cannot read field \"value\" because \"original\" is null||copy"
+         NullPointerException:null|NullPointerException:null|NullPointerException:null"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "malformed"),
+        "+65533|+65533+65533+65533|+65533A|+65533+65533(+65533"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "unknownName"),
+        "UnsupportedEncodingException:default"
     );
     assert_eq!(
         host.unknown_host_call_count(),
@@ -51,9 +58,7 @@ public final class Probe {
 }
 "#;
 
-/// A charset the host does not decode exactly (UTF-16), and a name JDK 25
-/// does not know (`default`, which throws `UnsupportedEncodingException`
-/// there), are counted, not answered.
+/// A known charset the host does not decode exactly (UTF-16) stays counted.
 #[test]
 fn other_charsets_stay_counted() {
     let fixture = Fixture::build("string-bytes-counted", &[("demo/Probe.java", COUNTED)]);
@@ -63,7 +68,7 @@ fn other_charsets_stay_counted() {
     assert!(
         counted.iter().any(|(call, count)| call
             == "java/lang/String#<init>([BLjava/lang/String;)V"
-            && *count == 2),
+            && *count == 1),
         "{counted:?}"
     );
 }

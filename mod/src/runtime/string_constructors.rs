@@ -29,9 +29,8 @@
 //!   same way (`"codePoints"` in the NPE), then each code point: an invalid one
 //!   throws `IllegalArgumentException` with the code point in decimal.
 //!
-//! * `String()` is empty and `String(String original)` copies `original`; a
-//!   null `original` throws `NullPointerException: Cannot read field "value"
-//!   because "original" is null`.
+//! * `String()` and `String(String)` remain counted because each constructs a
+//!   distinct object whose identity the text value cannot preserve.
 //! * The `byte[]` constructors decode with the charset they name, or UTF-8
 //!   (the default charset since JDK 18) when they name none. The charset is
 //!   checked first: a null `Charset` or name throws `NullPointerException`
@@ -40,16 +39,14 @@
 //!   because "bytes" is null`, and a bad range the same
 //!   `StringIndexOutOfBoundsException` as above.
 //!
-//! The `byte[]` constructors are answered only where the decoding is exact
-//! here: ISO-8859-1 (one byte, one char), US-ASCII (a byte over 0x7F is
-//! U+FFFD) and well-formed UTF-8. Malformed UTF-8 is counted, because JDK 25
-//! does not replace it the way Rust's `from_utf8_lossy` does (`ED A0 80` is
-//! one U+FFFD in Java, three in Rust); so is any other charset (UTF-16, a
-//! name the host does not model), which also covers the unknown names Java
-//! throws on.
+//! The `byte[]` constructors are answered for ISO-8859-1 (one byte, one
+//! char), US-ASCII (a byte over 0x7F is U+FFFD) and UTF-8. UTF-8 malformed
+//! input uses JDK 25's replacement lengths; other charsets (UTF-16 and a name
+//! the host does not model) stay counted.
 //!
-//! Every other constructor (`StringBuilder`/`StringBuffer`, the deprecated
-//! hibyte `(byte[], int)` pair) is still counted. So is a `char[]`/`int[]`
+//! Every other constructor (`String()`, `String(String)`, `StringBuilder`/
+//! `StringBuffer`, and the deprecated hibyte `(byte[], int)` pair) is still
+//! counted. So is a `char[]`/`int[]`
 //! constructor whose text has an unpaired surrogate, which the runtime's
 //! strings cannot hold. A `String` constructor reached through a
 //! `MethodHandle` (`String::new`) is answered or counted the same way.
@@ -95,25 +92,130 @@ impl ExactCharset {
         }
     }
 
-    /// The text, or `None` for malformed UTF-8 (see the module comment).
-    fn decode(self, bytes: &[u8]) -> Option<String> {
+    fn decode(self, bytes: &[u8]) -> String {
         match self {
-            Self::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_owned),
-            Self::UsAscii => Some(
-                bytes
-                    .iter()
-                    .map(|byte| {
-                        if byte.is_ascii() {
-                            char::from(*byte)
-                        } else {
-                            '\u{FFFD}'
-                        }
-                    })
-                    .collect(),
-            ),
-            Self::Latin1 => Some(bytes.iter().map(|byte| char::from(*byte)).collect()),
+            Self::Utf8 => decode_utf8_java(bytes),
+            Self::UsAscii => bytes
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii() {
+                        char::from(*byte)
+                    } else {
+                        '\u{FFFD}'
+                    }
+                })
+                .collect(),
+            Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
         }
     }
+}
+
+/// Decode UTF-8 with the JDK's malformed-sequence lengths and replacement.
+/// A malformed lead consumes one byte, a bad third/fourth byte consumes the
+/// valid prefix, and a structurally complete surrogate sequence consumes all
+/// three bytes. This is the `sun.nio.cs.UTF_8` decoder's replacement contract.
+fn decode_utf8_java(bytes: &[u8]) -> String {
+    fn continuation(byte: u8) -> bool {
+        byte & 0xc0 == 0x80
+    }
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let first = bytes[index];
+        if first <= 0x7f {
+            out.push(char::from(first));
+            index += 1;
+            continue;
+        }
+        let (needed, min_second, max_second) = match first {
+            0xc2..=0xdf => (2, 0x80, 0xbf),
+            0xe0 => (3, 0xa0, 0xbf),
+            0xed => (3, 0x80, 0x9f),
+            0xe1..=0xec | 0xee..=0xef => (3, 0x80, 0xbf),
+            0xf0 => (4, 0x90, 0xbf),
+            0xf4 => (4, 0x80, 0x8f),
+            0xf1..=0xf3 => (4, 0x80, 0xbf),
+            _ => {
+                out.push('\u{FFFD}');
+                index += 1;
+                continue;
+            }
+        };
+        if index + 1 >= bytes.len() {
+            out.push('\u{FFFD}');
+            index += 1;
+            continue;
+        }
+        let second = bytes[index + 1];
+        if first == 0xed && second >= 0xa0 {
+            out.push('\u{FFFD}');
+            index += if index + 2 < bytes.len() && continuation(bytes[index + 2]) {
+                3
+            } else {
+                2
+            };
+            continue;
+        }
+        if second < min_second || second > max_second || !continuation(second) {
+            out.push('\u{FFFD}');
+            index += 1;
+            continue;
+        }
+        if needed == 2 {
+            let code = (u32::from(first & 0x1f) << 6) | u32::from(second & 0x3f);
+            out.push(char::from_u32(code).unwrap());
+            index += 2;
+            continue;
+        }
+        if needed == 3 {
+            if index + 2 >= bytes.len() {
+                out.push('\u{FFFD}');
+                index += 2;
+                continue;
+            }
+            let third = bytes[index + 2];
+            if !continuation(third) {
+                out.push('\u{FFFD}');
+                index += 2;
+                continue;
+            }
+            let code = (u32::from(first & 0x0f) << 12)
+                | (u32::from(second & 0x3f) << 6)
+                | u32::from(third & 0x3f);
+            out.push(char::from_u32(code).unwrap());
+            index += 3;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            out.push('\u{FFFD}');
+            index += bytes.len() - index;
+            continue;
+        }
+        let third = bytes[index + 2];
+        if !continuation(third) {
+            out.push('\u{FFFD}');
+            index += 2;
+            continue;
+        }
+        if index + 3 >= bytes.len() {
+            out.push('\u{FFFD}');
+            index += 3;
+            continue;
+        }
+        let fourth = bytes[index + 3];
+        if !continuation(fourth) {
+            out.push('\u{FFFD}');
+            index += 3;
+            continue;
+        }
+        let code = (u32::from(first & 0x07) << 18)
+            | (u32::from(second & 0x3f) << 12)
+            | (u32::from(third & 0x3f) << 6)
+            | u32::from(fourth & 0x3f);
+        out.push(char::from_u32(code).unwrap());
+        index += 4;
+    }
+    out
 }
 
 /// The charset argument of a `byte[]` constructor: a `Charset` (`charset/<name>`
@@ -127,11 +229,15 @@ fn byte_charset(value: &Value, by_name: bool) -> Result<Option<ExactCharset>, Na
         });
     };
     let canonical = if by_name {
-        jdk_model::canonical_charset(marker)
+        jdk_model::canonical_charset(marker).ok_or_else(|| NativeError::UncaughtException {
+            class: "java/io/UnsupportedEncodingException".into(),
+            message: Some(marker.clone()),
+            frame: None,
+        })?
     } else {
-        marker.strip_prefix("charset/")
+        marker.strip_prefix("charset/").unwrap_or("")
     };
-    Ok(canonical.and_then(ExactCharset::named))
+    Ok(ExactCharset::named(canonical))
 }
 
 /// The text a `byte[]` constructor builds, after its charset (if any) was
@@ -144,7 +250,7 @@ fn decode_bytes<H: Host>(
     charset: ExactCharset,
 ) -> Result<Option<String>, NativeError> {
     let values = match args.first() {
-        Some(array @ Value::Ref(Some(_))) => runtime.array(array)?.clone(),
+        Some(array @ (Value::Host(_) | Value::Ref(Some(_)))) => runtime.array(array)?.clone(),
         _ => {
             return Err(thrown(
                 "java/lang/NullPointerException",
@@ -171,7 +277,7 @@ fn decode_bytes<H: Host>(
     } else {
         &bytes[..]
     };
-    Ok(charset.decode(bytes))
+    Ok(Some(charset.decode(bytes)))
 }
 
 /// The text a `String` constructor builds; `Ok(None)` for a constructor
@@ -204,19 +310,6 @@ pub(crate) fn build<H: Host>(
         expect_int(r, StdHost::argument(r, args, index)?)
     };
     let text = match r.descriptor.as_str() {
-        "()V" => Some(String::new()),
-        "(Ljava/lang/String;)V" => match args.first() {
-            Some(Value::Ref(Some(original))) if value_class::is_plain_string(original) => {
-                Some(original.clone())
-            }
-            Some(Value::Ref(None)) | None => {
-                return Err(thrown(
-                    "java/lang/NullPointerException",
-                    "Cannot read field \"value\" because \"original\" is null".into(),
-                ));
-            }
-            Some(_) => None,
-        },
         "([B)V" | "([BII)V" => {
             return decode_bytes(
                 runtime,
