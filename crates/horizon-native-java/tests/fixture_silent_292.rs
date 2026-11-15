@@ -12,10 +12,7 @@ public final class Probe {
  static Object OY;
  public static String optional1000() { return deepOptional(1000); }
  public static String optional100000() { return deepOptional(100000); }
- static <T> T helper(Supplier<T> s) { return s.get(); }
- public static String capturingSupplier() { String a="left", b="right"; return helper(() -> a+":"+b); }
- public static String capturingInts() { int a=4, b=5; return helper(() -> ""+(a+b)); }
- public static String capturingLargeSupplier() { Object a0=Optional.empty(); for(int i=0;i<1000;i++) a0=Optional.of(a0); final Object a=a0; final String b="x"; return helper(() -> String.valueOf(a).length()+b); }
+ public static String optionalStringForgery() { Object x="deep-empty:1000"; try { return ((Optional<?>) x).toString(); } catch (ClassCastException e) { return e.getClass().getSimpleName(); } }
 }
 "#;
 #[test]
@@ -25,9 +22,7 @@ fn silent_292_rows_match_java_25() {
     let cases = [
         ("optional1000", "10014,0,true", false),
         ("optional100000", "SOE,SOE,SOE", true),
-        ("capturingSupplier", "left:right", false),
-        ("capturingInts", "9", false),
-        ("capturingLargeSupplier", "10014x", false),
+        ("optionalStringForgery", "ClassCastException", false),
     ];
     for (method, expected, counted) in cases {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());

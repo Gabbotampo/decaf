@@ -167,6 +167,30 @@ public final class JdkSupertypes {
     "java.util.concurrent.atomic.DoubleAdder", "java.util.concurrent.atomic.LongAccumulator",
     "java.util.concurrent.atomic.DoubleAccumulator", "java.util.zip.Adler32",
     "java.util.zip.CRC32C",
+    // The functional interfaces a callback's call site makes: a lambda is an instance of its
+    // own interface and that interface's supertypes (#156 P15a).
+    "java.util.function.BiConsumer", "java.util.function.BiFunction",
+    "java.util.function.BinaryOperator", "java.util.function.BiPredicate",
+    "java.util.function.BooleanSupplier", "java.util.function.Consumer",
+    "java.util.function.DoubleBinaryOperator", "java.util.function.DoubleConsumer",
+    "java.util.function.DoubleFunction", "java.util.function.DoublePredicate",
+    "java.util.function.DoubleSupplier", "java.util.function.DoubleToIntFunction",
+    "java.util.function.DoubleToLongFunction", "java.util.function.DoubleUnaryOperator",
+    "java.util.function.Function", "java.util.function.IntBinaryOperator",
+    "java.util.function.IntConsumer", "java.util.function.IntFunction",
+    "java.util.function.IntPredicate", "java.util.function.IntSupplier",
+    "java.util.function.IntToDoubleFunction", "java.util.function.IntToLongFunction",
+    "java.util.function.IntUnaryOperator", "java.util.function.LongBinaryOperator",
+    "java.util.function.LongConsumer", "java.util.function.LongFunction",
+    "java.util.function.LongPredicate", "java.util.function.LongSupplier",
+    "java.util.function.LongToDoubleFunction", "java.util.function.LongToIntFunction",
+    "java.util.function.LongUnaryOperator", "java.util.function.ObjDoubleConsumer",
+    "java.util.function.ObjIntConsumer", "java.util.function.ObjLongConsumer",
+    "java.util.function.Predicate", "java.util.function.Supplier",
+    "java.util.function.ToDoubleBiFunction", "java.util.function.ToDoubleFunction",
+    "java.util.function.ToIntBiFunction", "java.util.function.ToIntFunction",
+    "java.util.function.ToLongBiFunction", "java.util.function.ToLongFunction",
+    "java.util.function.UnaryOperator", "java.util.Comparator",
     // The host's map entries (`host_map_entry.rs`, #156 P14e).
     "java.util.HashMap$Node", "java.util.LinkedHashMap$Entry", "java.util.TreeMap$Entry",
     "java.util.KeyValueHolder", "java.util.Hashtable$Entry", "java.util.WeakHashMap$Entry",
@@ -232,6 +256,7 @@ public final class JdkSupertypes {
             if (c == null || c.isInterface() || !Modifier.isPublic(c.getModifiers())) continue;
             String own = overrides(c);
             StringBuilder flags = new StringBuilder();
+            if (c.isEnum()) flags.append("E");
             for (String member : own.split(",")) if (!member.equals("-")) flags.append(member.charAt(0));
             entries.add(simple + "=" + (flags.length() == 0 ? "-" : flags));
           }

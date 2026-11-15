@@ -148,7 +148,9 @@ fn record_components(file: &ClassFile, index: u16) -> Option<Vec<Component>> {
     let mut components = Vec::new();
     for (name, getter) in names.zip(getters) {
         let field = match file.pool.get(*getter as usize) {
-            Some(Cp::MethodHandle { reference_index }) => file.field_ref(*reference_index).ok()?,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => file.field_ref(*reference_index).ok()?,
             _ => return None,
         };
         components.push(Component {
@@ -963,6 +965,15 @@ impl<H: Host> Runtime<'_, H> {
         {
             return value.map(Some);
         }
+        // A callback's `toString`: counted, a text answered (`host_ref_text`).
+        if handle.kind() == crate::runtime::host_ref::HostKind::Callback
+            && r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && args.is_empty()
+        {
+            let text = self.host_ref_text(handle, class, method)?;
+            return Ok(text.map(|text| Value::Ref(Some(text))));
+        }
         let mut nested = RuntimeNested {
             runtime: self,
             class,
@@ -1005,6 +1016,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<String>, NativeError> {
+        // A callback's text is its hidden class and identity hash: counted,
+        // and a text answered (`callback_marker::CALLBACK_TEXT`), never the
+        // `null` a jar would dereference where Java never fails.
+        if handle.kind() == crate::runtime::host_ref::HostKind::Callback {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "toString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            })?;
+            return Ok(Some(crate::runtime::callback_marker::CALLBACK_TEXT.into()));
+        }
         handle.to_string(&mut RuntimeNested {
             runtime: self,
             class,
@@ -1291,16 +1313,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(crate::runtime::jar_object::collection_class(handle.key()).to_owned());
         }
+        // No text is a collection (#156 P14d2): only an object `new` made of
+        // a JDK collection class, or of a jar subclass of one, has a row.
         let marker = expect_ref(value)?;
-        let (head, _) = marker
-            .split_once(['#', '/'])
-            .unwrap_or((marker.as_str(), ""));
-        match head {
-            "list" => return Some("java/util/ArrayList".into()),
-            "set" => return Some("java/util/LinkedHashSet".into()),
-            "map" => return Some("java/util/LinkedHashMap".into()),
-            _ => {}
-        }
         let mut class = crate::runtime::jar_object::key_class(marker)
             .or_else(|| marker.split_once('#').map(|(class, _)| class))?
             .to_owned();

@@ -140,14 +140,19 @@ mod tests {
         assert!(take_refusals().is_empty());
     }
 
-    /// A composed predicate as deep as a jar builds it (`p = p.negate()` in a loop) ends in a
-    /// `StackOverflowError`, not a native overflow; a shallow one answers.
+    /// A composed predicate as deep as a jar builds it (`p = p.negate()` in a loop) is one row
+    /// per link (`callback_marker.rs`): building, tracing and dropping it never overflows the
+    /// native stack. Running it ends in a `StackOverflowError` (`fixture_callbacks_p15b.rs`,
+    /// `deepNegate`).
     #[test]
-    fn a_deep_predicate_chain_is_refused() {
-        let deep = format!("{}@indy:x", "@fn:predicate.not:".repeat(200_000));
-        let error = crate::predicate_marker_value(&deep).unwrap_err();
-        assert!(is_stack_overflow(&error), "{error:?}");
-        let shallow = format!("{}@indy:x", "@fn:predicate.not:".repeat(3));
-        assert_eq!(crate::predicate_marker_value(&shallow).ok(), Some(false));
+    fn a_deep_predicate_chain_is_built_traced_and_dropped() {
+        let mut chain = crate::callback_marker::test_token("x");
+        for _ in 0..200_000 {
+            chain = crate::callback_marker::composite("predicate.not", &[&chain]);
+        }
+        // The collector's walk reaches every link (#261 round-3 S2): the
+        // chain's 200,000 rows and the token at its end.
+        assert_eq!(crate::heap::value_texts(&chain).len(), 200_001);
+        drop(chain);
     }
 }
