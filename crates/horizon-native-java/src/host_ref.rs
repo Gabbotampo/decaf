@@ -477,6 +477,12 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A lambda or method reference (`invokedynamic`, a reflective
+    /// `metafactory`), a functional combinator's result (`p.and(q)`,
+    /// `c.andThen(d)`) or `Function.identity()`: key its marker text
+    /// (`callback_marker.rs`, #156 P15a). A handle, never a `String`: no
+    /// String model reads it, so its text cannot be read out or forged.
+    Callback,
 }
 
 /// How a kind's Java class follows from its key.
@@ -601,6 +607,14 @@ pub(crate) trait ClassHierarchy {
     /// Whether `class` is an interface; `None` when unknown.
     fn is_interface(&self, class: &str) -> Option<bool> {
         crate::jdk_closure::class(class).map(|row| row.is_interface)
+    }
+
+    /// The interfaces a held class or interface declares directly
+    /// (`getInterfaces()`), `None` when the class is not held: a lambda's
+    /// `instanceof` walks its functional interface's superinterfaces with it
+    /// (`callback_marker.rs`).
+    fn declared_interfaces(&self, _class: &str) -> Option<Vec<String>> {
+        None
     }
 
     /// What the host's own description of the object keyed `key` says about `wanted` (a
@@ -1990,6 +2004,18 @@ const KINDS: &[KindInfo] = &[
         canonical: always_canonical,
         methods: &crate::host_service::METHODS,
     },
+    KindInfo {
+        kind: HostKind::Callback,
+        tag: "cb",
+        // A hidden class the metafactory spins (or the JDK's lambda class
+        // for a combinator): never known; `instance_of` answers from the
+        // interfaces it implements (`callback_marker::METHODS`).
+        class: ClassRule::Unknown {
+            declared: crate::callback_marker::declared_types,
+        },
+        canonical: crate::callback_marker::canonical,
+        methods: &crate::callback_marker::METHODS,
+    },
 ];
 
 impl HostKind {
@@ -2207,7 +2233,13 @@ impl HostRef {
     /// Read [`Self::encode`] back.
     pub(crate) fn decode(text: &str) -> Option<Self> {
         let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
-        Some(Self::new(HostKind::from_tag(tag)?, key))
+        let kind = HostKind::from_tag(tag)?;
+        // A callback's key carries the run's tag, which no jar text can
+        // spell (`callback_marker.rs`).
+        if kind == HostKind::Callback && !crate::callback_marker::is_key(key) {
+            return None;
+        }
+        Some(Self::new(kind, key))
     }
 }
 
@@ -2231,12 +2263,28 @@ mod tests {
                 "{:?}",
                 info.kind
             );
-            let handle = HostRef::new(info.kind, "a,b\\c:d");
+            // A callback decodes only from a key carrying the run's tag
+            // (`callback_marker::is_key`).
+            let key = match info.kind {
+                HostKind::Callback => {
+                    let callback = crate::callback_marker::test_token("a,b\\c:d");
+                    crate::callback_marker::callback_text(&callback)
+                        .unwrap()
+                        .to_owned()
+                }
+                _ => "a,b\\c:d".to_owned(),
+            };
+            let handle = HostRef::new(info.kind, key);
             assert_eq!(HostRef::decode(&handle.encode()), Some(handle.clone()));
             if let ClassRule::Fixed(class) = info.class {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
         }
+        // A callback's text without the run's tag decodes to nothing.
+        assert_eq!(
+            HostRef::decode("hcb:@indy:x:demo/A#m:0:java/lang/Runnable:?:"),
+            None
+        );
     }
 
     /// A kind whose runtime class is unknown is never found through a type it

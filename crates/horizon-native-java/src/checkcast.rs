@@ -258,20 +258,6 @@ impl<H: Host> Runtime<'_, H> {
             self.count_cast(value, target)?;
             return Err(cast_failed_counted(target));
         }
-        // A lambda's class implements its call site's functional interface
-        // and that interface's supertypes only (`callback_marker.rs`): any
-        // other cast fails, naming a hidden class the runtime does not model
-        // (counted); one it cannot decide is counted and passes.
-        if let Some(text) = crate::callback_marker::callback_text(value) {
-            return match self.callback_instance_of(text, target) {
-                Some(true) => Ok(()),
-                Some(false) => {
-                    self.count_cast(value, target)?;
-                    Err(cast_failed_counted(target))
-                }
-                None => self.count_cast(value, target),
-            };
-        }
         // A plain `String`, or a `stream/...` text that is no live stream (a
         // jar `String` spelled like one), is never a stream: Java's CCE.
         if crate::stream_pipeline::is_stream_interface(target)
@@ -405,6 +391,11 @@ impl<H: Host> Runtime<'_, H> {
                     Some(class) => HostCast::Throws(class.to_owned()),
                     None => HostCast::FailsCounted,
                 },
+                // A callback no answer covers (its functional interface is
+                // not held) fails counted, never passes: Java's verdict is
+                // unknown, and a passed cast would hand the jar an object it
+                // may not hold (#261 review B2).
+                None if handle.kind() == HostKind::Callback => HostCast::FailsCounted,
                 None => HostCast::Unknown,
             });
         }
@@ -488,8 +479,10 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
         }
-        if let Some(text) = crate::callback_marker::callback_text(value) {
-            return self.callback_instance_of(text, target);
+        if let Value::Host(handle) = value
+            && handle.kind() == HostKind::Callback
+        {
+            return handle.instance_of(target, self);
         }
         let target_is_interface = self
             .class(target)
@@ -890,6 +883,10 @@ impl<H: Host> Runtime<'_, H> {
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
     fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
         self.host.described_instance_of(key, wanted)
+    }
+
+    fn declared_interfaces(&self, class: &str) -> Option<Vec<String>> {
+        self.class(class).map(|file| file.interface_names())
     }
 
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {

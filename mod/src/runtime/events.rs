@@ -1910,9 +1910,9 @@ fn context_subject(facade: &EventFacade, context: &EventContext) -> Option<Value
 
 /// The last `@indy:` argument of a registration call: its listener.
 pub(crate) fn indy_argument(args: &[Value]) -> Option<&str> {
-    args.iter().rev().find_map(|value| match value {
-        Value::Ref(Some(text)) if crate::runtime::callback_marker::is_callback(text) => Some(text.as_str()),
-        _ => None,
+    args.iter().rev().find_map(|value| {
+        crate::runtime::callback_marker::callback_text(value)
+            .filter(|text| crate::runtime::callback_marker::is_callback(text))
     })
 }
 
@@ -2495,7 +2495,10 @@ impl NativeJar {
             if self.classes.contains_key(&target.owner) {
                 break;
             }
-            let Some(Value::Ref(Some(inner))) = captures.first() else {
+            let Some(inner) = captures
+                .first()
+                .and_then(crate::runtime::callback_marker::callback_text)
+            else {
                 break;
             };
             let Ok(inner) = parse_callback_marker(inner) else {

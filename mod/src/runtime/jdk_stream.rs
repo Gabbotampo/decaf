@@ -251,9 +251,13 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         a: &Value,
         b: &Value,
     ) -> Result<i32, NativeError> {
-        // `sorted(null)` and `List.sort(null)` mean natural order.
-        let Some(marker) = expect_ref(comparator).cloned() else {
-            return self.natural_order(a, b);
+        // A lambda or a combinator result (`callback_marker.rs`) runs its
+        // `compare`.
+        let marker = match expect_ref(comparator) {
+            _ if crate::runtime::callback_marker::callback_text(comparator).is_some() => String::new(),
+            Some(marker) => marker.clone(),
+            // `sorted(null)` and `List.sort(null)` mean natural order.
+            None => return self.natural_order(a, b),
         };
         let Some(body) = marker.strip_prefix(COMPARATOR_PREFIX) else {
             let result = self.apply_callback(comparator, &[a.clone(), b.clone()])?;

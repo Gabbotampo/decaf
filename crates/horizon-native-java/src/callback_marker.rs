@@ -1,26 +1,30 @@
-//! A lambda or method reference as the interpreter names it (`invokedynamic`
-//! through `LambdaMetafactory`, and a reflective `metafactory` call): one text
-//! form, one constructor, one parser, one classifier (#156 P15a).
+//! Lambdas, method references and functional combinators as the interpreter
+//! holds them: [`HostKind::Callback`] handles keyed by one text form, with
+//! one constructor, one parser and one `instanceof` (#156 P15a).
 //!
-//! `@indy:<tag>:<class#method>:<cp index>:<SAM interface>:<target>:<captures>`
+//! A callback is a handle, never a `Value::Ref`: no `String` model (`charAt`,
+//! a natural-order compare, `String.join`) reads it, so its key cannot be
+//! read out, and no jar `String` is one, however it is spelled (#261 review
+//! B1–B3). P15b replaces the key with a resident row (captures as values,
+//! identity per evaluation).
 //!
-//! * `<tag>` is a per-process random value. A jar `String` cannot spell a
-//!   live callback, because the tag is never printed: every path that would
-//!   show a callback's text answers [`CALLBACK_TEXT`] and counts it (Java's
-//!   text is the hidden class and an identity hash, which no run
-//!   reproduces). A `String` spelled `@indy:…` without the tag is the
-//!   `String` it is: never a callback, never cast to `Runnable` and run.
-//! * `<SAM interface>` is the call site's own type (the `invokedynamic`
-//!   descriptor's return type): a lambda's class implements exactly that
-//!   interface (javap and HotSpot 25: `instanceof Runnable` true,
-//!   `instanceof Comparable`/`Serializable` false), so `instanceof` and casts
-//!   answer from it (`instance_of`).
-//! * `<captures>` are escaped value markers (`value_marker`), split back by
-//!   `split_capture_markers`.
+//! Keys:
 //!
-//! P15b moves callbacks onto `HostKind::Callback` handles; until then this
-//! module is the only place that knows the text form.
+//! * a lambda: `@indy:<tag>:<class#method>:<cp index>:<interfaces>:<target>:<captures>`;
+//! * a combinator's result: `@fn:<tag>:<op>:<operands>` (`predicate.and`,
+//!   `consumer.then`, `identity/function`...).
+//!
+//! `<tag>` is random per process and never printed; a handle decoded from
+//! text (`HostRef::decode`) must carry it ([`is_key`]). `<interfaces>` are
+//! the call site's functional interface (the `invokedynamic` descriptor's
+//! return type) and `altMetafactory`'s marker interfaces, `,`-joined: a
+//! lambda's class implements exactly those (javap and HotSpot 25:
+//! `instanceof Runnable` true, `Comparable`/`Serializable` false). Captures
+//! and operands are escaped value markers (`value_marker`), split back by
+//! `split_capture_markers`, so a nested callback or a captured `|` reads back
+//! whole.
 
+use crate::host_ref::{ClassHierarchy, HostKind, HostRef, JdkHierarchy, Methods};
 use crate::{MethodRef, NativeError, Value};
 
 /// What [`crate::split_capture_markers`] returns for one callback.
@@ -47,9 +51,14 @@ fn tag() -> &'static str {
     })
 }
 
-/// `@indy:<tag>:`, the start of every live callback's text.
+/// `@indy:<tag>:`, the start of every lambda's key.
 fn prefix() -> String {
     format!("@indy:{}:", tag())
+}
+
+/// `@fn:<tag>:`, the start of every combinator result's key.
+fn composite_prefix() -> String {
+    format!("@fn:{}:", tag())
 }
 
 /// What a callback prints where its text is counted (`toString`, string
@@ -57,37 +66,88 @@ fn prefix() -> String {
 /// the tag to the jar.
 pub(crate) const CALLBACK_TEXT: &str = "null";
 
-/// The text of a new callback from `source` (`class#method`), call site
-/// `index`, making `sam`, implemented by `target` (`owner#name(desc)`, or
-/// `?` when the bootstrap names none), with `captures` already escaped.
-pub(crate) fn make(source: &str, index: u16, sam: &str, target: &str, captures: &str) -> String {
-    format!("{}{source}:{index}:{sam}:{target}:{captures}", prefix())
+/// The key of a new lambda from `source` (`class#method`), call site
+/// `index`, implementing `interfaces` (`,`-joined), run by `target`
+/// (`owner#name(desc)`, or `?` when the bootstrap names none), with
+/// `captures` already escaped.
+pub(crate) fn make(
+    source: &str,
+    index: u16,
+    interfaces: &str,
+    target: &str,
+    captures: &str,
+) -> String {
+    format!(
+        "{}{source}:{index}:{interfaces}:{target}:{captures}",
+        prefix()
+    )
 }
 
-/// Whether `text` is a live callback of this process.
+/// A new lambda's handle ([`make`]'s key).
+pub(crate) fn lambda(
+    source: &str,
+    index: u16,
+    interfaces: &str,
+    target: &str,
+    captures: &str,
+) -> Value {
+    handle(make(source, index, interfaces, target, captures))
+}
+
+fn handle(key: String) -> Value {
+    Value::Host(HostRef::new(HostKind::Callback, key))
+}
+
+/// Whether `text` is a lambda's key of this process.
 pub(crate) fn is_callback(text: &str) -> bool {
     text.starts_with(&prefix())
 }
 
-/// The text of `value` when it is a live callback.
+/// Whether `text` is a callback key of this process (a lambda's or a
+/// combinator result's): the only keys a `Callback` handle decodes from.
+pub(crate) fn is_key(text: &str) -> bool {
+    is_callback(text) || text.starts_with(&composite_prefix())
+}
+
+/// The key of `value` when it is a callback handle.
 pub(crate) fn callback_text(value: &Value) -> Option<&str> {
     match value {
-        Value::Ref(Some(text)) if is_callback(text) => Some(text),
+        Value::Host(handle) if handle.kind() == HostKind::Callback => Some(handle.key()),
         _ => None,
     }
 }
 
-/// Whether `text` holds a live callback anywhere (a composition marker
-/// embeds them): such text is never printed.
+/// Whether `text` holds a callback's key anywhere (a collection marker
+/// embeds a handle's text form): such text is never printed.
 pub(crate) fn holds_callback(text: &str) -> bool {
-    text.contains(&prefix())
+    text.contains(&prefix()) || text.contains(&composite_prefix())
 }
 
-/// The functional interface a live callback's call site made.
-pub(crate) fn sam(text: &str) -> Option<&str> {
-    let rest = text.strip_prefix(&prefix())?;
-    let sam = rest.split(':').nth(2)?;
-    (!sam.is_empty()).then_some(sam)
+/// The interfaces a callback keyed `key` implements: a lambda's call site
+/// interface and markers, a combinator's own interface.
+pub(crate) fn interfaces(key: &str) -> Vec<&str> {
+    if let Some(rest) = key.strip_prefix(&prefix()) {
+        return rest
+            .split(':')
+            .nth(2)
+            .map(|list| list.split(',').filter(|name| !name.is_empty()).collect())
+            .unwrap_or_default();
+    }
+    let op = key
+        .strip_prefix(&composite_prefix())
+        .and_then(|rest| rest.split_once(':'))
+        .map_or("", |(op, _)| op);
+    match op {
+        "predicate.and" | "predicate.or" | "predicate.not" => vec!["java/util/function/Predicate"],
+        "consumer.then" => vec!["java/util/function/Consumer"],
+        "biconsumer.then" => vec!["java/util/function/BiConsumer"],
+        "function.then" | "function.compose" | IDENTITY_FUNCTION => {
+            vec!["java/util/function/Function"]
+        }
+        "bifunction.then" => vec!["java/util/function/BiFunction"],
+        IDENTITY_UNARY => vec!["java/util/function/UnaryOperator"],
+        _ => Vec::new(),
+    }
 }
 
 /// Read a live callback's text back.
@@ -101,7 +161,7 @@ pub(crate) fn parse(text: &str) -> Result<Callback, NativeError> {
     let mut parts = rest.splitn(5, ':');
     let _source = parts.next().ok_or_else(|| malformed("source"))?;
     let _index = parts.next().ok_or_else(|| malformed("call-site index"))?;
-    let sam = parts.next().ok_or_else(|| malformed("interface"))?;
+    let interfaces = parts.next().ok_or_else(|| malformed("interface"))?;
     let target = parts.next().ok_or_else(|| malformed("target"))?;
     let captures = parts.next().ok_or_else(|| malformed("captures"))?;
     let (owner, method_and_descriptor) = target
@@ -124,78 +184,118 @@ pub(crate) fn parse(text: &str) -> Result<Callback, NativeError> {
             name: method_and_descriptor[..descriptor_at].to_owned(),
             descriptor: method_and_descriptor[descriptor_at..].to_owned(),
         },
-        sam: sam.to_owned(),
+        sam: interfaces.split(',').next().unwrap_or_default().to_owned(),
         captures,
     })
 }
 
-impl<H: crate::Host> crate::Runtime<'_, H> {
-    /// `callback instanceof wanted` for a live callback's `text`: its class
-    /// implements its call site's functional interface and that interface's
-    /// superinterfaces, and nothing else (HotSpot 25: a `Runnable` lambda is
-    /// no `Comparable` and no `Serializable`). `None` where the interface's
-    /// supertypes are not known (a game or library interface the run does
-    /// not hold): the caller counts it.
-    pub(crate) fn callback_instance_of(&self, text: &str, wanted: &str) -> Option<bool> {
-        let sam = sam(text)?;
-        if wanted == "java/lang/Object" {
-            return Some(true);
-        }
-        let mut queue = vec![sam.to_owned()];
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(interface) = queue.pop() {
-            if seen.len() >= 64 || !seen.insert(interface.clone()) {
-                continue;
-            }
-            if interface == wanted {
-                return Some(true);
-            }
-            if let Some(file) = self.class(&interface) {
-                queue.extend(file.interface_names());
-            } else if crate::jdk_closure::in_jdk_package(&interface) {
-                match crate::host_ref::ClassHierarchy::is_instance(
-                    &crate::host_ref::JdkHierarchy,
-                    &interface,
-                    wanted,
-                ) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => return None,
-                }
-            } else {
-                return None;
-            }
-        }
-        Some(false)
-    }
+/// `Function.identity()`'s and `UnaryOperator.identity()`'s operations: one
+/// object each (JDK 25: non-capturing lambdas in static methods).
+pub(crate) const IDENTITY_FUNCTION: &str = "identity/function";
+pub(crate) const IDENTITY_UNARY: &str = "identity/unary";
+
+/// A combinator's result: `op` over `operands` (`p.and(q)`: `predicate.and`
+/// over `p`, `q`). The operands are held as value markers in the key, which
+/// only the runtime writes, so a side reads back as the value it was (a
+/// handle the jar holds, a nested composite) and never from jar text.
+pub(crate) fn composite(op: &str, operands: &[&Value]) -> Value {
+    let markers = operands
+        .iter()
+        .map(|value| crate::value_marker(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    handle(format!("{}{op}:{markers}", composite_prefix()))
 }
 
-/// The text of a two-sided combinator's result (`p.and(q)`, `c.andThen(d)`,
-/// `f.compose(g)`): `@fn:<op>:<n>:<left><right>`, `n` the byte length of
-/// `left`. The length makes a side that is itself a composite, or holds a
-/// `|`, read back whole: the old `left|right` form cut
-/// `c1.andThen(c2).andThen(c3)` at the inner composite's bar, so the chain
-/// ran nothing (#258). P15c holds the sides by reference instead.
-pub(crate) fn composite(op: &str, left: &str, right: &str) -> String {
-    format!("@fn:{op}:{}:{left}{right}", left.len())
-}
-
-/// The two sides of a [`composite`] whose combinator is `op`.
-pub(crate) fn composite_sides<'a>(text: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
-    let rest = text
-        .strip_prefix("@fn:")?
+/// The operands of `value` when it is a combinator result of `op`.
+pub(crate) fn composite_operands(value: &Value, op: &str) -> Option<Vec<Value>> {
+    let rest = callback_text(value)?
+        .strip_prefix(&composite_prefix())?
         .strip_prefix(op)?
         .strip_prefix(':')?;
-    let (length, sides) = rest.split_once(':')?;
-    let length: usize = length.parse().ok()?;
-    Some((sides.get(..length)?, sides.get(length..)?))
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    crate::split_capture_markers(rest)
+        .ok()?
+        .iter()
+        .map(|marker| crate::parse_value_marker(marker).ok())
+        .collect()
 }
 
-/// A live callback token naming `name` and nothing a call could run, for
-/// tests that hand a host a listener without a jar behind it.
+/// Whether two callbacks with key `key` are one object: a lambda that
+/// captures nothing is one per call site (HotSpot 25 links a constant call
+/// site), as are the `identity()` singletons; a capturing lambda and every
+/// combinator result are new per evaluation.
+pub(crate) fn canonical(key: &str) -> bool {
+    if let Some(rest) = key.strip_prefix(&prefix()) {
+        return rest.splitn(5, ':').nth(4).is_some_and(str::is_empty);
+    }
+    key.strip_prefix(&composite_prefix()).is_some_and(|rest| {
+        rest == format!("{IDENTITY_FUNCTION}:") || rest == format!("{IDENTITY_UNARY}:")
+    })
+}
+
+/// The types a callback surely is, for the class rule: `Object` (its
+/// interfaces depend on the key; [`instance_of`] reads them).
+pub(crate) fn declared_types(_: &str) -> &'static [&'static str] {
+    &["java/lang/Object"]
+}
+
+/// `callback instanceof wanted`: its class implements its interfaces and
+/// their superinterfaces, and is a final hidden class extending `Object`,
+/// so it is no other class (`String`, `Number`: an exact `false`). `None`
+/// where an interface's supertypes are not known (a game or library
+/// interface the run does not hold): the caller counts it.
+fn instance_of(handle: &HostRef, wanted: &str, hierarchy: &dyn ClassHierarchy) -> Option<bool> {
+    if wanted == "java/lang/Object" {
+        return Some(true);
+    }
+    let mut queue: Vec<String> = interfaces(handle.key())
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let mut unknown = queue.is_empty();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(interface) = queue.pop() {
+        if seen.len() >= 64 || !seen.insert(interface.clone()) {
+            continue;
+        }
+        if interface == wanted || hierarchy.is_instance(&interface, wanted) == Some(true) {
+            return Some(true);
+        }
+        if let Some(supers) = hierarchy.declared_interfaces(&interface) {
+            queue.extend(supers);
+        } else if !crate::jdk_closure::in_jdk_package(&interface)
+            || JdkHierarchy.is_instance(&interface, wanted).is_none()
+        {
+            unknown = true;
+        }
+    }
+    if hierarchy.is_interface(wanted) == Some(false) {
+        return Some(false);
+    }
+    (!unknown).then_some(false)
+}
+
+/// A callback's object methods: identity `equals`; `toString` and
+/// `hashCode` name its hidden class and identity hash, which no run
+/// reproduces (counted).
+pub(crate) const METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |handle, other, _| Ok(crate::host_path::identity_equals(handle, other)),
+    instance_of,
+    // Its target is a class of the jar that made it.
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// A live callback naming `name` and nothing a call could run, for tests
+/// that hand a host a listener without a jar behind it.
 #[doc(hidden)]
-pub fn test_token(name: &str) -> String {
-    format!("{}{name}", prefix())
+pub fn test_token(name: &str) -> Value {
+    handle(format!("{}{name}", prefix()))
 }
 
 #[cfg(test)]
@@ -212,7 +312,7 @@ mod tests {
             "i5",
         );
         assert!(is_callback(&live));
-        assert_eq!(sam(&live), Some("java/lang/Runnable"));
+        assert_eq!(interfaces(&live), ["java/lang/Runnable"]);
         let parsed = parse(&live).unwrap();
         assert_eq!(parsed.target.name, "lambda$0");
         assert_eq!(parsed.captures, [Value::Int(5)]);
@@ -224,17 +324,21 @@ mod tests {
 
     #[test]
     fn a_nested_composite_reads_back_whole() {
-        let inner = composite("consumer.then", "a|1", "b");
-        let outer = composite("consumer.then", &inner, "c");
+        let left = test_token("left");
+        let pipe = Value::Ref(Some("a|1,b\\".into()));
+        let inner = composite("consumer.then", &[&left, &pipe]);
+        let outer = composite("consumer.then", &[&inner, &left]);
         assert_eq!(
-            composite_sides(&outer, "consumer.then"),
-            Some((inner.as_str(), "c"))
+            composite_operands(&outer, "consumer.then"),
+            Some(vec![inner.clone(), left.clone()])
         );
-        assert_eq!(composite_sides(&inner, "consumer.then"), Some(("a|1", "b")));
-        assert_eq!(composite_sides(&outer, "function.then"), None);
         assert_eq!(
-            composite_sides("@fn:consumer.then:9:ab", "consumer.then"),
-            None
+            composite_operands(&inner, "consumer.then"),
+            Some(vec![left, pipe])
         );
+        assert_eq!(composite_operands(&outer, "function.then"), None);
+        // A `String` spelled like a composite's key is no composite.
+        let spelled = Value::Ref(Some(callback_text(&outer).unwrap().to_owned()));
+        assert_eq!(composite_operands(&spelled, "consumer.then"), None);
     }
 }

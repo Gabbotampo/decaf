@@ -4282,7 +4282,8 @@ impl StdHost {
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
                 && invocation.args.iter().any(|value| {
-                    matches!(value, Value::Ref(Some(marker)) if crate::callback_marker::is_callback(marker))
+                    crate::callback_marker::callback_text(value)
+                        .is_some_and(callback_marker::is_callback)
                 })
         })
     }
@@ -7228,9 +7229,7 @@ impl Host for StdHost {
             .or_else(|| host_iterator::marker(receiver))
             .or_else(|| host_service::stream_marker(receiver))
             .cloned();
-        if let Some(marker) = callback_text(receiver)
-            && let Some(value) = functional_composition_marker(r, &marker, args)
-        {
+        if let Some(value) = functional_composition_marker(r, receiver, args) {
             return value;
         }
         // A `Field`/`Method` handle's own facts (`host_reflect.rs`); its
@@ -9657,12 +9656,12 @@ impl Host for StdHost {
             // callback (#156 P15a: `apply` used to answer its argument,
             // `test` true for any lambda, `get` null, uncounted).
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
-                if let Some(marker) = receiver_marker.as_deref()
-                    && let Some((left, right)) =
-                        callback_marker::composite_sides(marker, "consumer.then") =>
+                if let Some(sides) =
+                    callback_marker::composite_operands(receiver, "consumer.then") =>
             {
-                self.invoke_instance(r, &composed_callback(left), args)?;
-                self.invoke_instance(r, &composed_callback(right), args)?;
+                for side in &sides {
+                    self.invoke_instance(r, side, args)?;
+                }
                 Ok(Value::Void)
             }
             (
@@ -11069,8 +11068,11 @@ fn bounded_captured_markers(values: &[Value]) -> String {
         let marker = value_marker(value);
         let room = MAX_MARKER_CHARS.saturating_sub(text.chars().count());
         if marker.chars().count() > room {
+            // The cut value is no value any more: an element no capture
+            // parser accepts follows it, so running the callback is counted
+            // rather than handing it the cut text (#261 review).
             text.extend(marker.chars().take(room));
-            text.push('\u{2026}');
+            text.push_str(",\u{2026}");
             break;
         }
         text.push_str(&marker);
@@ -12401,7 +12403,7 @@ fn box_callback_result<H: Host>(
         // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
         return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
-    let Some(marker) = expect_ref(receiver) else {
+    let Some(marker) = callback_marker::callback_text(receiver) else {
         return Ok(value);
     };
     let Ok(callback) = parse_callback_marker(marker) else {
@@ -13828,6 +13830,57 @@ impl ClassFile {
             }
         };
         Ok(Some(self.method_ref(handle)?))
+    }
+
+    /// The interfaces `LambdaMetafactory.altMetafactory` adds to a lambda's
+    /// class beyond its call site's own (an intersection cast,
+    /// `(Runnable & Serializable) () -> {}`): `Serializable` for
+    /// `FLAG_SERIALIZABLE`, then the `FLAG_MARKERS` classes, in the order the
+    /// static arguments list them. Empty for `metafactory` and any other
+    /// bootstrap.
+    fn lambda_marker_interfaces(&self, index: u16) -> Vec<String> {
+        const FLAG_SERIALIZABLE: i32 = 1;
+        const FLAG_MARKERS: i32 = 2;
+        let Some(Cp::InvokeDynamic { bootstrap, .. }) = self.pool.get(index as usize) else {
+            return Vec::new();
+        };
+        let Some(bootstrap) = self.bootstrap_methods.get(*bootstrap as usize) else {
+            return Vec::new();
+        };
+        let is_alt = match self.pool.get(bootstrap.method_ref as usize) {
+            Some(Cp::MethodHandle { reference_index }) => {
+                self.method_ref(*reference_index).is_ok_and(|r| {
+                    r.owner == "java/lang/invoke/LambdaMetafactory" && r.name == "altMetafactory"
+                })
+            }
+            _ => false,
+        };
+        let int = |at: usize| match bootstrap
+            .arguments
+            .get(at)
+            .and_then(|index| self.pool.get(*index as usize))
+        {
+            Some(Cp::Integer(value)) => Some(*value),
+            _ => None,
+        };
+        let Some(flags) = int(3).filter(|_| is_alt) else {
+            return Vec::new();
+        };
+        let mut interfaces = Vec::new();
+        if flags & FLAG_SERIALIZABLE != 0 {
+            interfaces.push("java/io/Serializable".to_owned());
+        }
+        if flags & FLAG_MARKERS != 0 {
+            let count = int(4).unwrap_or(0).max(0) as usize;
+            for at in 5..5 + count {
+                if let Some(index) = bootstrap.arguments.get(at)
+                    && let Ok(name) = class_name(&self.pool, *index)
+                {
+                    interfaces.push(name);
+                }
+            }
+        }
+        interfaces
     }
 
     /// The recipe a `StringConcatFactory` call site joined its arguments with.
@@ -19527,11 +19580,9 @@ impl NativeJar {
             .args
             .iter()
             .rev()
-            .find_map(|value| match value {
-                Value::Ref(Some(value)) if crate::callback_marker::is_callback(value) => {
-                    Some(value.as_str())
-                }
-                _ => None,
+            .find_map(|value| {
+                crate::callback_marker::callback_text(value)
+                    .filter(|key| callback_marker::is_callback(key))
             })
             .ok_or_else(|| {
                 NativeError::Metadata("event listener has no invokedynamic marker".into())
@@ -19593,126 +19644,81 @@ fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
     callback_marker::parse(marker)
 }
 
-/// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
+/// The callback a `Predicate`/`Consumer`/`Function` combinator answers
+/// (`p.and(q)`, `c.andThen(d)`, `p.negate()`), `None` for any other method.
 ///
 /// Java's default combinators close over both sides instead of producing an
-/// object. The interpreter represents that closure as an `@fn:` marker, and
-/// both the host surface and a jar callback's own combinator call read it the
+/// object. The interpreter holds that closure as a combinator callback over
+/// the receiver and the argument (`callback_marker::composite`), and both
+/// the host surface and a jar callback's own combinator call build it the
 /// same way: composing two callbacks must not execute the receiver as if it
-/// were the argument (which is what a callback marker otherwise means).
-/// A callback's text inside a composition marker: its marker, or a host
-/// handle's encoded form (a `Stream.Builder` is a `Consumer`), which
-/// [`composed_callback`] reads back.
-fn callback_text(value: &Value) -> Option<String> {
-    match value {
-        // A jar `String` spelled like a handle's encoding is no callback, and
-        // never becomes the handle (`composed_callback`).
-        Value::Ref(Some(marker)) if HostRef::decode(marker).is_some() => None,
-        Value::Ref(Some(marker)) => Some(marker.clone()),
-        Value::Host(handle) => Some(handle.encode()),
-        _ => None,
-    }
-}
-
-/// One side of a composition marker as the callback it was.
-fn composed_callback(text: &str) -> Value {
-    match HostRef::decode(text) {
-        Some(handle) => Value::Host(handle),
-        None => Value::Ref(Some(text.to_owned())),
-    }
-}
-
+/// were the argument (which is what calling a callback otherwise means).
 fn functional_composition_marker(
     r: &MethodRef,
-    receiver_marker: &str,
+    receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    let other_text = args.first().and_then(callback_text);
-    let other = || other_text.as_deref();
-    let composed = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+    let op = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (
             "java/util/function/Predicate",
             "and",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "predicate.and",
-            receiver_marker,
-            other().unwrap_or("@fn:predicate.false"),
-        )))),
+        ) => "predicate.and",
         (
             "java/util/function/Predicate",
             "or",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "predicate.or",
-            receiver_marker,
-            other().unwrap_or("@fn:predicate.false"),
-        )))),
-        ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => Some(
-            Value::Ref(Some(format!("@fn:predicate.not:{receiver_marker}"))),
-        ),
+        ) => "predicate.or",
+        ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => {
+            "predicate.not"
+        }
         (
             "java/util/function/Consumer",
             "andThen",
             "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "consumer.then",
-            receiver_marker,
-            other().unwrap_or("@fn:consumer.empty"),
-        )))),
+        ) => "consumer.then",
         (
             "java/util/function/Function",
             "compose",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "function.compose",
-            receiver_marker,
-            other().unwrap_or("@fn:function.empty"),
-        )))),
+        ) => "function.compose",
         (
             "java/util/function/Function",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "function.then",
-            receiver_marker,
-            other().unwrap_or("@fn:function.empty"),
-        )))),
+        ) => "function.then",
         // The two-argument forms compose the same way: running the composite
         // hands both arguments to each consumer, and a `BiFunction`'s result to
-        // the `Function` after it. Without these the combinator ran the
-        // receiver with the second callback as its only argument.
+        // the `Function` after it.
         (
             "java/util/function/BiConsumer",
             "andThen",
             "(Ljava/util/function/BiConsumer;)Ljava/util/function/BiConsumer;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "consumer.then",
-            receiver_marker,
-            other().unwrap_or("@fn:consumer.empty"),
-        )))),
+        ) => "biconsumer.then",
         (
             "java/util/function/BiFunction",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/BiFunction;",
-        ) => Some(Value::Ref(Some(crate::callback_marker::composite(
-            "function.then",
-            receiver_marker,
-            other().unwrap_or("@fn:function.empty"),
-        )))),
-        _ => None,
-    }?;
-    // `Objects.requireNonNull(other)`: every combinator taking another
-    // callback refuses `null` before it builds anything (Java 25: a
-    // `NullPointerException` with no message).
-    if matches!(args.first(), Some(Value::Ref(None))) {
-        return Some(Err(NativeError::UncaughtException {
-            class: "java/lang/NullPointerException".into(),
-            message: None,
-            frame: None,
-        }));
+        ) => "bifunction.then",
+        _ => return None,
+    };
+    let mut operands = vec![receiver];
+    if op != "predicate.not" {
+        // `Objects.requireNonNull(other)`: every combinator taking another
+        // callback refuses `null` before it builds anything (Java 25: a
+        // `NullPointerException` with no message).
+        match args.first() {
+            Some(Value::Ref(None)) | None => {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                }));
+            }
+            Some(other) => operands.push(other),
+        }
     }
-    Some(Ok(composed))
+    Some(Ok(callback_marker::composite(op, &operands)))
 }
 
 fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
@@ -21059,109 +21065,108 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// Run a combinator's composite (`callback_marker::composite`) the way
-    /// its JDK default method does: both sides in the combinator's order,
-    /// `and`/`or` short-circuiting, `negate` flipping (#258: predicates were
-    /// never run here, and a left-nested chain was cut at the wrong bar).
-    /// `None` when `marker` is no composite.
+    /// Run a combinator's result (`callback_marker::composite`) the way its
+    /// JDK default method does: the sides in the combinator's order,
+    /// `and`/`or` short-circuiting, `negate` flipping, `identity()` answering
+    /// its argument (#258: predicates were never run here). `None` when
+    /// `callback` is no combinator result.
     fn run_composite(
         &mut self,
-        marker: &str,
+        callback: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        use callback_marker::composite_sides;
-        let sam = |owner: &str, name: &str, descriptor: &str| MethodRef {
-            owner: owner.into(),
-            name: name.into(),
-            descriptor: descriptor.into(),
-        };
-        let test = || {
-            sam(
-                "java/util/function/Predicate",
-                "test",
-                "(Ljava/lang/Object;)Z",
-            )
-        };
-        let apply = || {
-            sam(
-                "java/util/function/Function",
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-            )
-        };
-        // `BiConsumer.andThen` and `BiFunction.andThen` hand both arguments
-        // to the first side.
-        let (accept, first_apply) = if args.len() == 2 {
-            (
-                sam(
-                    "java/util/function/BiConsumer",
-                    "accept",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)V",
-                ),
-                sam(
-                    "java/util/function/BiFunction",
-                    "apply",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                ),
-            )
-        } else {
-            (
-                sam(
-                    "java/util/function/Consumer",
-                    "accept",
-                    "(Ljava/lang/Object;)V",
-                ),
-                apply(),
-            )
-        };
-        if let Some((left, right)) = composite_sides(marker, "consumer.then") {
-            self.run_composite_side(left, &accept, args)?;
-            self.run_composite_side(right, &accept, args)?;
-            return Ok(Some(Value::Void));
+        use callback_marker::composite_operands as operands;
+        const PREDICATE: (&str, &str, &str) = (
+            "java/util/function/Predicate",
+            "test",
+            "(Ljava/lang/Object;)Z",
+        );
+        const FUNCTION: (&str, &str, &str) = (
+            "java/util/function/Function",
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        const CONSUMER: (&str, &str, &str) = (
+            "java/util/function/Consumer",
+            "accept",
+            "(Ljava/lang/Object;)V",
+        );
+        const BICONSUMER: (&str, &str, &str) = (
+            "java/util/function/BiConsumer",
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        );
+        const BIFUNCTION: (&str, &str, &str) = (
+            "java/util/function/BiFunction",
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        let first = |value: &[Value]| value.first().cloned().unwrap_or(Value::Ref(None));
+        for op in [
+            callback_marker::IDENTITY_FUNCTION,
+            callback_marker::IDENTITY_UNARY,
+        ] {
+            if operands(callback, op).is_some() {
+                return Ok(Some(first(args)));
+            }
         }
-        if let Some((left, right)) = composite_sides(marker, "function.then") {
-            let value = self.run_composite_side(left, &first_apply, args)?;
-            return self.run_composite_side(right, &apply(), &[value]).map(Some);
+        for (op, sam) in [("consumer.then", CONSUMER), ("biconsumer.then", BICONSUMER)] {
+            if let Some(sides) = operands(callback, op) {
+                for side in &sides {
+                    self.run_composite_side(side, sam, args)?;
+                }
+                return Ok(Some(Value::Void));
+            }
         }
-        if let Some((left, right)) = composite_sides(marker, "function.compose") {
+        for (op, sam) in [("function.then", FUNCTION), ("bifunction.then", BIFUNCTION)] {
+            if let Some([left, right]) = operands(callback, op).as_deref() {
+                let value = self.run_composite_side(left, sam, args)?;
+                return self.run_composite_side(right, FUNCTION, &[value]).map(Some);
+            }
+        }
+        if let Some([left, right]) = operands(callback, "function.compose").as_deref() {
             // `f.compose(g)` applies `g` first, then `f`.
-            let value = self.run_composite_side(right, &apply(), args)?;
-            return self.run_composite_side(left, &apply(), &[value]).map(Some);
+            let value = self.run_composite_side(right, FUNCTION, args)?;
+            return self.run_composite_side(left, FUNCTION, &[value]).map(Some);
         }
         let truth = |value: &Value| matches!(value, Value::Int(flag) if *flag != 0);
         for (op, short_circuit) in [("predicate.and", false), ("predicate.or", true)] {
-            if let Some((left, right)) = composite_sides(marker, op) {
-                let first = truth(&self.run_composite_side(left, &test(), args)?);
-                let answer = if first == short_circuit {
-                    first
+            if let Some([left, right]) = operands(callback, op).as_deref() {
+                let left = truth(&self.run_composite_side(left, PREDICATE, args)?);
+                let answer = if left == short_circuit {
+                    left
                 } else {
-                    truth(&self.run_composite_side(right, &test(), args)?)
+                    truth(&self.run_composite_side(right, PREDICATE, args)?)
                 };
                 return Ok(Some(Value::Int(i32::from(answer))));
             }
         }
-        if let Some(inner) = marker.strip_prefix("@fn:predicate.not:") {
-            let inner = truth(&self.run_composite_side(inner, &test(), args)?);
+        if let Some([inner]) = operands(callback, "predicate.not").as_deref() {
+            let inner = truth(&self.run_composite_side(inner, PREDICATE, args)?);
             return Ok(Some(Value::Int(i32::from(!inner))));
         }
         Ok(None)
     }
 
-    /// One side of a composite run as `sam` (`Predicate.test`...): its own
-    /// body, or, where the runtime cannot run it, the host's call, which
-    /// counts it. A side is never skipped or answered `null` silently.
+    /// One side of a combinator result run as its interface's method
+    /// (`Predicate.test`...), the way the JDK's default method calls it: a
+    /// callback's body, a jar object's own method, or the host's call, which
+    /// counts what it cannot run. A side is never skipped or answered `null`
+    /// silently.
     fn run_composite_side(
         &mut self,
-        side: &str,
-        sam: &MethodRef,
+        side: &Value,
+        (owner, name, descriptor): (&str, &str, &str),
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        // A side may be a host handle's encoded form (`callback_text`).
-        let side = composed_callback(side);
-        match self.invoke_callback(&side, args)? {
-            Some(value) => box_callback_result(self, &side, value, &sam.descriptor),
-            None => self.host.invoke_instance(sam, &side, args),
-        }
+        self.call_virtual(
+            crate::jdk_call::Site::Interface,
+            owner,
+            name,
+            descriptor,
+            side,
+            args,
+        )
     }
 
     fn invoke_callback(
@@ -21174,21 +21179,17 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.stream_callback(marker, args)? {
             return Ok(Some(value));
         }
-        let Some(marker) = expect_ref(marker) else {
-            return Ok(None);
-        };
-        // `Function.identity()` / `UnaryOperator.identity()` (`string_code_points.rs`).
-        if marker == string_code_points::FUNCTION_IDENTITY
-            || marker == string_code_points::UNARY_IDENTITY
-        {
-            return Ok(Some(args.first().cloned().unwrap_or(Value::Ref(None))));
-        }
-        // A composition marker closes over the callbacks it joined. Running
+        // A combinator's result closes over the callbacks it joined. Running
         // it means running them, in the order the combinator defines — not
-        // answering the marker itself.
+        // answering the callback itself.
         if let Some(value) = self.run_composite(marker, args)? {
             return Ok(Some(value));
         }
+        // Only a callback handle is a callback: a `String` spelled like one
+        // is the `String` it is.
+        let Some(marker) = callback_marker::callback_text(marker) else {
+            return Ok(None);
+        };
         let Ok(callback) = parse_callback_marker(marker) else {
             return Ok(None);
         };
@@ -26183,12 +26184,14 @@ impl<H: Host> Runtime<'_, H> {
                     let index = read_u16(code, &mut pc)?;
                     let wanted = class_name(&file.pool, index)?;
                     let value = pop(&mut stack, class, method, at)?;
-                    // A lambda is an instance of its functional interface's
+                    // A callback is an instance of its interfaces and their
                     // supertypes only (`callback_marker.rs`); one the run
-                    // cannot decide falls through and is counted below.
-                    if let Some(answer) = callback_marker::callback_text(&value)
-                        .and_then(|text| self.callback_instance_of(text, &wanted))
+                    // cannot decide is counted, never answered from the
+                    // generic paths below.
+                    if let Value::Host(handle) = &value
+                        && handle.kind() == HostKind::Callback
                     {
+                        let answer = invoke_or_catch!(at, self.handle_instance_of(handle, &wanted));
                         stack.push(Value::Int(i32::from(answer)));
                         continue;
                     }
@@ -26941,11 +26944,9 @@ impl<H: Host> Runtime<'_, H> {
                                     // callback as its argument and answer the
                                     // callback's void, which loses the value the
                                     // combinator returns.
-                                    if let Some(value) = functional_composition_marker(
-                                        &resolved,
-                                        callback_text(receiver).as_deref().unwrap_or(""),
-                                        &args,
-                                    ) {
+                                    if let Some(value) =
+                                        functional_composition_marker(&resolved, receiver, &args)
+                                    {
                                         invoke_or_catch!(at, value)
                                     } else if let Some(value) =
                                         invoke_or_catch!(at, self.invoke_callback(receiver, &args))
@@ -27195,20 +27196,26 @@ impl<H: Host> Runtime<'_, H> {
                         format!("{}#{}{}", target.owner, target.name, target.descriptor)
                     });
                     // The call site's own type is the functional interface the
-                    // lambda's class implements (`callback_marker.rs`).
-                    let sam = return_desc(&descriptor)
+                    // lambda's class implements, with `altMetafactory`'s
+                    // markers after it (`callback_marker.rs`).
+                    let mut interfaces = return_desc(&descriptor)
                         .strip_prefix('L')
                         .and_then(|class| class.strip_suffix(';'))
-                        .unwrap_or("");
-                    let marker = callback_marker::make(
+                        .unwrap_or("")
+                        .to_owned();
+                    for marker in file.lambda_marker_interfaces(index) {
+                        interfaces.push(',');
+                        interfaces.push_str(&marker);
+                    }
+                    let callback = callback_marker::lambda(
                         &format!("{class}#{method}"),
                         index,
-                        sam,
+                        &interfaces,
                         target.as_deref().unwrap_or("?"),
                         &bounded_captured_markers(&captured),
                     );
                     if return_desc(&descriptor) != "V" {
-                        stack.push(Value::Ref(Some(marker)));
+                        stack.push(callback);
                     }
                 }
                 0xbf => {
@@ -30731,14 +30738,14 @@ pub fn dispatch_payload_frame_with(
     // A type can have a row per direction, and only the receiving side's row
     // has a handler (the payload type registry records the others).
     let Some(registration) = registrations.iter().find(|registration| {
-        matches!(registration.handler, Value::Ref(Some(_)))
+        callback_marker::callback_text(&registration.handler).is_some()
             // The `CustomPacketPayload.Type` object the jar built.
             && jar_object::object_key(&registration.payload_type)
                 .is_some_and(|marker| host.packet_types.get(marker).is_some_and(|known| known == id))
     }) else {
         return Ok(false);
     };
-    let Value::Ref(Some(marker)) = &registration.handler else {
+    let Some(marker) = callback_marker::callback_text(&registration.handler) else {
         return Ok(false);
     };
     let Some((target, captures)) = parse_dynamic_handler(marker) else {
@@ -31504,10 +31511,17 @@ mod tests {
         let captured = bounded_captured_markers(&[Value::Ref(Some("x".repeat(1 << 20)))]);
         assert_eq!(
             captured.chars().count(),
-            4097,
-            "4096 transcribed + ellipsis"
+            4098,
+            "4096 transcribed + an unparsable `…` element"
         );
-        assert!(captured.ends_with('\u{2026}'), "{captured}");
+        assert!(captured.ends_with(",\u{2026}"), "{captured}");
+        assert!(
+            crate::split_capture_markers(&captured).is_ok_and(|markers| {
+                markers
+                    .iter()
+                    .any(|marker| crate::parse_value_marker(marker).is_err())
+            })
+        );
 
         // A concat site captures the previous concat's marker text, so a real
         // chain nests. Each link adds one bounded prefix instead of doubling:
@@ -31515,12 +31529,10 @@ mod tests {
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
             let captured = bounded_captured_markers(std::slice::from_ref(&value));
-            value = Value::Ref(Some(crate::callback_marker::make(
-                "demo/C#m", 0, "", "?", &captured,
-            )));
+            value = crate::callback_marker::lambda("demo/C#m", 0, "", "?", &captured);
         }
-        let Value::Ref(Some(marker)) = &value else {
-            panic!("expected a marker");
+        let Some(marker) = crate::callback_marker::callback_text(&value) else {
+            panic!("expected a callback");
         };
         assert!(
             marker.chars().count() < 64 * (4096 + 128),
@@ -35370,9 +35382,7 @@ mandatory = true
             .invoke_instance(
                 &map,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "identity",
-                )))],
+                &[crate::callback_marker::test_token("identity")],
             )
             .unwrap();
         // The host runs no callback: `apply` is counted (#156 P15a), never the
@@ -35413,9 +35423,7 @@ mandatory = true
             host.invoke_instance(
                 &filter,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "predicate"
-                )))],
+                &[crate::callback_marker::test_token("predicate")],
             )
             .unwrap(),
             // The host runs no predicate: `test` is counted (#156 P15a).
@@ -35439,9 +35447,7 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "unused-supplier"
-                )))],
+                &[crate::callback_marker::test_token("unused-supplier")],
             )
             .unwrap(),
             optional_wrap(Value::Ref(Some("demo".into())))
@@ -35450,9 +35456,7 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &Value::Ref(None),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "empty-supplier"
-                )))],
+                &[crate::callback_marker::test_token("empty-supplier")],
             )
             .unwrap(),
             empty_optional()
@@ -35466,9 +35470,7 @@ mandatory = true
             host.invoke_instance(
                 &if_present,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "consumer"
-                )))],
+                &[crate::callback_marker::test_token("consumer")],
             )
             .unwrap(),
             Value::Void
@@ -35508,9 +35510,7 @@ mandatory = true
             .invoke_instance(
                 &or_else_throw_supplier,
                 &Value::Ref(None),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "optional-error",
-                )))],
+                &[crate::callback_marker::test_token("optional-error")],
             )
             .unwrap_err();
         assert!(
@@ -35725,9 +35725,7 @@ mandatory = true
             host.invoke_instance(
                 &collection_for_each,
                 &list,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "list-consumer"
-                )))],
+                &[crate::callback_marker::test_token("list-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -35905,9 +35903,7 @@ mandatory = true
             host.invoke_instance(
                 &for_each_remaining,
                 &remaining_iterator,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "remaining-consumer"
-                )))],
+                &[crate::callback_marker::test_token("remaining-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -35994,7 +35990,7 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list,
-                &[Value::Ref(Some(crate::callback_marker::test_token("list-predicate")))],
+                &[crate::callback_marker::test_token("list-predicate")],
             ),
             Err(NativeError::UncaughtException { class, .. })
                 if class == "java/lang/UnsupportedOperationException"
@@ -36018,9 +36014,7 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list_copy,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "list-predicate"
-                )))],
+                &[crate::callback_marker::test_token("list-predicate")],
             )
             .unwrap(),
             Value::Int(0)
@@ -36043,10 +36037,8 @@ mandatory = true
         let combined = host
             .invoke_instance(
                 &predicate,
-                &Value::Ref(Some(crate::callback_marker::test_token("left"))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "right",
-                )))],
+                &crate::callback_marker::test_token("left"),
+                &[crate::callback_marker::test_token("right")],
             )
             .unwrap();
         let test = MethodRef {
@@ -36083,10 +36075,8 @@ mandatory = true
         let chained = host
             .invoke_instance(
                 &consumer,
-                &Value::Ref(Some(crate::callback_marker::test_token("first"))),
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "second",
-                )))],
+                &crate::callback_marker::test_token("first"),
+                &[crate::callback_marker::test_token("second")],
             )
             .unwrap();
         let accept = MethodRef {
@@ -36206,13 +36196,13 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some(crate::callback_marker::make(
+                    crate::callback_marker::lambda(
                         "demo#0",
                         0,
                         "",
                         "demo/Factory#make()Ljava/lang/Object;",
                         ""
-                    ))),
+                    ),
                 ],
             )
             .unwrap(),
@@ -36237,7 +36227,7 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some(crate::callback_marker::test_token("compute-present"))),
+                    crate::callback_marker::test_token("compute-present"),
                 ],
             )
             .unwrap(),
@@ -36258,7 +36248,7 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("merged-value".into())),
-                    Value::Ref(Some(crate::callback_marker::test_token("merge"))),
+                    crate::callback_marker::test_token("merge"),
                 ],
             )
             .unwrap(),
@@ -36276,7 +36266,7 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("updated-value".into())),
-                    Value::Ref(Some(crate::callback_marker::test_token("merge-existing"))),
+                    crate::callback_marker::test_token("merge-existing"),
                 ],
             )
             .unwrap(),
@@ -36344,9 +36334,7 @@ mandatory = true
             host.invoke_instance(
                 &replace_all,
                 &map,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "map-replace"
-                )))],
+                &[crate::callback_marker::test_token("map-replace")],
             )
             .unwrap(),
             Value::Void
@@ -36419,9 +36407,7 @@ mandatory = true
             host.invoke_instance(
                 &for_each,
                 &map,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "map-consumer"
-                )))],
+                &[crate::callback_marker::test_token("map-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -37807,9 +37793,7 @@ mandatory = true
             .invoke_instance(
                 &with_path,
                 &id,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "path-transform",
-                )))],
+                &[crate::callback_marker::test_token("path-transform")],
             )
             .unwrap();
         // The operator is a jar lambda the host boundary cannot run; the call
@@ -37910,9 +37894,7 @@ mandatory = true
             host.invoke_instance(
                 &add_listener,
                 &bus,
-                &[Value::Ref(Some(crate::callback_marker::test_token(
-                    "listener"
-                )))],
+                &[crate::callback_marker::test_token("listener")],
             )
             .unwrap(),
             bus
@@ -37943,7 +37925,7 @@ mandatory = true
                 &register,
                 &[
                     Value::Ref(Some("entry".into())),
-                    Value::Ref(Some(crate::callback_marker::test_token("supplier"))),
+                    crate::callback_marker::test_token("supplier"),
                 ],
             )
             .unwrap();
@@ -38092,15 +38074,13 @@ mandatory = true
         assert_eq!(host.invocations().len(), 18);
         assert_eq!(
             host.invocations()[2].args[0],
-            Value::Ref(Some(crate::callback_marker::test_token("listener")))
+            crate::callback_marker::test_token("listener")
         );
         let dispatches = host.dispatch_event(Value::Ref(Some("RegisterEvent".into())));
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some(crate::callback_marker::test_token(
-                "listener"
-            ))))
+            Some(&crate::callback_marker::test_token("listener"))
         );
         assert_eq!(
             dispatches[0].event,
@@ -38176,7 +38156,7 @@ mandatory = true
                     descriptor: "(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/minecraftforge/registries/RegistryObject;".into(),
                 },
                 &register,
-                &[Value::Ref(Some("entry".into())), Value::Ref(Some(crate::callback_marker::test_token("supplier")))],
+                &[Value::Ref(Some("entry".into())), crate::callback_marker::test_token("supplier")],
             )
             .unwrap();
         // A Forge `RegistryObject` handle (`host_registry.rs`).
@@ -38257,9 +38237,7 @@ mandatory = true
             &[
                 host_ids::resource_key_named("minecraft:root", "minecraft:item"),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some(crate::callback_marker::test_token(
-                    "ruby-wand-supplier",
-                ))),
+                crate::callback_marker::test_token("ruby-wand-supplier"),
             ],
         )
         .unwrap();
@@ -38268,9 +38246,7 @@ mandatory = true
         assert_eq!(entry.key(), "minecraft:item/ruby:wand");
         assert_eq!(
             entry.value,
-            Value::Ref(Some(crate::callback_marker::test_token(
-                "ruby-wand-supplier"
-            )))
+            crate::callback_marker::test_token("ruby-wand-supplier")
         );
     }
 
@@ -38334,13 +38310,13 @@ mandatory = true
             .unwrap();
         assert_eq!(
             value,
-            Value::Ref(Some(crate::callback_marker::make(
+            crate::callback_marker::lambda(
                 "demo/Lambda#make",
                 1,
                 "java/lang/Object",
                 "demo/Target#callback(Ljava/lang/Object;)V",
                 "rcapture"
-            ),))
+            )
         );
     }
 
@@ -38907,9 +38883,7 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some(crate::callback_marker::test_token(
-                        "stream-predicate"
-                    )))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
@@ -38986,9 +38960,7 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some(crate::callback_marker::test_token(
-                        "stream-predicate"
-                    )))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
@@ -39005,9 +38977,7 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some(crate::callback_marker::test_token(
-                        "stream-predicate"
-                    )))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
@@ -39649,13 +39619,13 @@ mandatory = true
             raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
-        let marker = Value::Ref(Some(crate::callback_marker::make(
+        let marker = crate::callback_marker::lambda(
             "demo/Caller#make",
             0,
             "",
             "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
             "",
-        )));
+        );
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo/Caller",
@@ -39676,13 +39646,13 @@ mandatory = true
                 None,
                 &[
                     optional_wrap(Value::Ref(Some("input".into()))),
-                    Value::Ref(Some(crate::callback_marker::make(
+                    crate::callback_marker::lambda(
                         "demo/Caller#make",
                         0,
                         "",
                         "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
                         ""
-                    ),)),
+                    ),
                 ],
                 &mut NullHost,
             )
@@ -39736,13 +39706,13 @@ mandatory = true
                         .into(),
                 },
                 receiver: Some(Value::Ref(Some("event-bus".into()))),
-                args: vec![Value::Ref(Some(crate::callback_marker::make(
+                args: vec![crate::callback_marker::lambda(
                     "demo/Mod#wire",
                     1,
                     "",
                     "demo/Target#callback(Ljava/lang/Object;)V",
                     "rTarget",
-                )))],
+                )],
             },
             event: Value::Ref(Some("register-event".into())),
         };
@@ -40112,7 +40082,7 @@ mandatory = true
                     descriptor: "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;".into(),
                 },
                 &optional,
-                &[Value::Ref(Some(crate::callback_marker::test_token("identity-map")))],
+                &[crate::callback_marker::test_token("identity-map")],
             )
             .unwrap();
         assert_eq!(
@@ -40136,9 +40106,7 @@ mandatory = true
                 descriptor: "(Ljava/util/function/Consumer;)V".into(),
             },
             &mapped,
-            &[Value::Ref(Some(crate::callback_marker::test_token(
-                "capability-consumer",
-            )))],
+            &[crate::callback_marker::test_token("capability-consumer")],
         )
         .unwrap();
         // `mapped` holds nothing (its function was counted): no consumer runs.
@@ -40221,13 +40189,13 @@ mandatory = true
                 &create,
                 &[
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some(crate::callback_marker::make(
+                    crate::callback_marker::lambda(
                         "demo/Mod#event",
                         0,
                         "",
                         "demo/Mod#combine()Ljava/lang/Object;",
                         "",
-                    ))),
+                    ),
                 ],
             )
             .unwrap();
@@ -40237,13 +40205,13 @@ mandatory = true
             name: "register".into(),
             descriptor: "(Ljava/lang/Object;)V".into(),
         };
-        let listener = Value::Ref(Some(crate::callback_marker::make(
+        let listener = crate::callback_marker::lambda(
             "demo/Mod#wire",
             1,
             "",
             "demo/Mod#onEvent(Ljava/lang/Object;)V",
             "",
-        )));
+        );
         assert!(matches!(
             host.invoke_instance(&register, &event, &[listener]),
             Ok(Value::Void)
@@ -40308,9 +40276,7 @@ mandatory = true
         host.invoke_instance(
             &register,
             &bus,
-            &[Value::Ref(Some(crate::callback_marker::test_token(
-                "forge-static-handler",
-            )))],
+            &[crate::callback_marker::test_token("forge-static-handler")],
         )
         .unwrap();
         let dispatches = host.dispatch_event(Value::Ref(Some("forge-event".into())));
@@ -40333,18 +40299,14 @@ mandatory = true
         host.invoke_instance(
             &add_listener,
             &bus,
-            &[Value::Ref(Some(crate::callback_marker::test_token(
-                "default-listener",
-            )))],
+            &[crate::callback_marker::test_token("default-listener")],
         )
         .unwrap();
         host.invoke_instance(
             &add_listener,
             &bus,
             &[
-                Value::Ref(Some(crate::callback_marker::test_token(
-                    "cancelled-listener",
-                ))),
+                crate::callback_marker::test_token("cancelled-listener"),
                 Value::Int(1),
             ],
         )
@@ -40353,9 +40315,7 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args[0],
-            Value::Ref(Some(crate::callback_marker::test_token(
-                "cancelled-listener"
-            )))
+            crate::callback_marker::test_token("cancelled-listener")
         );
     }
 
@@ -40376,7 +40336,7 @@ mandatory = true
                     Value::Ref(Some("NORMAL".into())),
                     Value::Int(1),
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some(crate::callback_marker::test_token("typed-listener"))),
+                    crate::callback_marker::test_token("typed-listener"),
                 ],
             )
             .unwrap();
@@ -40385,9 +40345,7 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some(crate::callback_marker::test_token(
-                "typed-listener"
-            ))))
+            Some(&crate::callback_marker::test_token("typed-listener"))
         );
     }
 
@@ -40400,7 +40358,7 @@ mandatory = true
             name: "addListener".into(),
             descriptor: "(Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some(crate::callback_marker::test_token("remove-me")));
+        let listener = crate::callback_marker::test_token("remove-me");
         host.invoke_instance(&add_listener, &bus, std::slice::from_ref(&listener))
             .unwrap();
         let unregister = MethodRef {
@@ -40478,7 +40436,7 @@ mandatory = true
             descriptor:
                 "(Ljava/util/function/Consumer;)Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some(crate::callback_marker::test_token("forge-listener")));
+        let listener = crate::callback_marker::test_token("forge-listener");
         assert_eq!(
             host.invoke_instance(&add, &bus, std::slice::from_ref(&listener))
                 .unwrap(),
@@ -44332,7 +44290,7 @@ mandatory = true
             },
         )
         .unwrap();
-        let value = Value::Ref(Some(crate::callback_marker::test_token("ruby-wand")));
+        let value = crate::callback_marker::test_token("ruby-wand");
         assert_eq!(
             Host::invoke(
                 &mut host,
@@ -44357,7 +44315,7 @@ mandatory = true
             &[
                 Value::Ref(None),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some(crate::callback_marker::test_token("ruby-wand"))),
+                crate::callback_marker::test_token("ruby-wand"),
             ],
         )
         .unwrap();

@@ -1263,13 +1263,13 @@ impl<H: Host> Runtime<'_, H> {
             .strip_prefix('L')
             .and_then(|class| class.strip_suffix(';'))
             .unwrap_or("");
-        Ok(Value::Ref(Some(crate::runtime::callback_marker::make(
+        Ok(crate::runtime::callback_marker::lambda(
             METAFACTORY_SITE,
             0,
             sam,
             &target,
             &bounded_captured_markers(&captures),
-        ))))
+        ))
     }
 
     /// Run one member on arguments of the handle's type (the receiver first

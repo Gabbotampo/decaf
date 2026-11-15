@@ -426,7 +426,7 @@ impl<H: Host> Runtime<'_, H> {
     /// typetools' `resolveRawArgument(Consumer.class, consumer.getClass())`, where the runtime can
     /// follow it; `None` where it cannot (counted, departure B3).
     fn consumer_event_class(&self, consumer: &Value) -> Option<String> {
-        if let Some(text) = expect_ref(consumer)
+        if let Some(text) = crate::runtime::callback_marker::callback_text(consumer)
             && crate::runtime::callback_marker::is_callback(text)
         {
             let marker = parse_callback_marker(text).ok()?;
@@ -479,7 +479,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `accept` of a jar object (its typed `accept(Event)` when it declares one, so the bridge's
     /// cast of a game event is not needed).
     fn consumer_callback(&self, consumer: &Value, class: &str) -> Option<ListenerCallback> {
-        if let Some(text) = expect_ref(consumer)
+        if let Some(text) = crate::runtime::callback_marker::callback_text(consumer)
             && crate::runtime::callback_marker::is_callback(text)
         {
             let marker = parse_callback_marker(text).ok()?;

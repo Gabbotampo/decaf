@@ -132,8 +132,9 @@ impl<H: Host> Runtime<'_, H> {
         if class == "java/lang/String" || class == "java/lang/CharSequence" {
             let claimed = class_of_value(value).is_some()
                 || marker.contains('#') && !value_class::is_plain_string(marker)
-                || crate::callback_marker::is_callback(marker)
-                || (marker.starts_with('@') && !marker.starts_with("@indy:"))
+                || (marker.starts_with('@')
+                    && !marker.starts_with("@indy:")
+                    && !marker.starts_with("@fn:"))
                 || ["enum/", "game/"]
                     .iter()
                     .any(|prefix| marker.starts_with(prefix));

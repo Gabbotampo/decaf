@@ -130,7 +130,10 @@ fn indy_target(invocation: &HostInvocation) -> String {
         .args
         .iter()
         .filter_map(|value| match value {
-            Value::Ref(Some(marker)) => Some(marker.as_str()),
+            // A lambda is a callback handle keyed by its marker (#156 P15a).
+            Value::Host(handle) if handle.kind() == horizon_native_java::HostKind::Callback => {
+                Some(handle.key())
+            }
             _ => None,
         })
         .find(|marker| marker.starts_with("@indy:"))

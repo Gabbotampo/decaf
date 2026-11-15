@@ -98,10 +98,10 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
     // The last separator-free markers (`guava-cache-builder`,
     // `mixin-environment`) became handles in #179 and #180, so a text with no
     // `/`, `#`, `@` or `:` is never a runtime marker any more.
-    // A callback is this run's tagged text (`callback_marker.rs`); a `String`
-    // spelled `@indy:…` without the tag is that `String`.
-    if marker.starts_with("@indy:") {
-        return !crate::callback_marker::is_callback(marker);
+    // A callback is a handle (`callback_marker.rs`): text spelled like its
+    // key, tag and all, is a `String`.
+    if marker.starts_with("@indy:") || marker.starts_with("@fn:") {
+        return true;
     }
     if marker.starts_with('@') {
         return false;
@@ -363,13 +363,14 @@ mod tests {
             "[Ljava/lang/String;",
             "[I",
             "int",
-            // A `String` spelled like a callback without this run's tag.
+            // A `String` spelled like a callback's key, with or without this
+            // run's tag: callbacks are handles.
             "@indy:demo/Main#main:0:java/lang/Runnable:demo/Main#lambda$0()V:",
+            "@fn:identity/function",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
-        // A live callback is no `String`.
-        assert!(!is_plain_string(&crate::callback_marker::make(
+        assert!(is_plain_string(&crate::callback_marker::make(
             "demo/Main#main",
             0,
             "java/lang/Runnable",

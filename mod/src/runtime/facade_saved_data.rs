@@ -301,7 +301,7 @@ mod tests {
         let init = call(TYPE_CLASS, "<init>", TYPE_INIT);
         let args = [
             crate::runtime::host_ids::identifier_of_text(id),
-            marker(&crate::runtime::callback_marker::test_token("demo/Data::new")),
+            crate::runtime::callback_marker::test_token("demo/Data::new"),
             crate::runtime::host_codec::opaque_codec("com/mojang/serialization/Codec"),
             Value::Ref(None),
         ];

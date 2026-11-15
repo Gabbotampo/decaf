@@ -803,7 +803,7 @@ mod tests {
             &register,
             &[
                 Value::Ref(Some(name.into())),
-                Value::Ref(Some(crate::runtime::callback_marker::test_token("supplier"))),
+                crate::runtime::callback_marker::test_token("supplier"),
             ],
         )
     }

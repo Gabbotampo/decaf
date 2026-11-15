@@ -2052,7 +2052,8 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
             return false;
         }
-        let Some(text) = expect_ref(receiver).filter(|t| crate::runtime::callback_marker::is_callback(t))
+        let Some(text) = crate::runtime::callback_marker::callback_text(receiver)
+            .filter(|t| crate::runtime::callback_marker::is_callback(t))
         else {
             return false;
         };
@@ -2090,7 +2091,10 @@ impl NativeJar {
             if self.classes.contains_key(&target.owner) {
                 break;
             }
-            let Some(Value::Ref(Some(inner))) = captures.first() else {
+            let Some(inner) = captures
+                .first()
+                .and_then(crate::runtime::callback_marker::callback_text)
+            else {
                 break;
             };
             let Ok(inner) = parse_callback_marker(inner) else {
@@ -2120,7 +2124,7 @@ impl NativeJar {
                 "a null {method} callback was called"
             )));
         }
-        if let Some(text) = expect_ref(callback)
+        if let Some(text) = crate::runtime::callback_marker::callback_text(callback)
             && crate::runtime::callback_marker::is_callback(text)
         {
             let parsed = parse_callback_marker(text)?;
@@ -2542,7 +2546,7 @@ mod tests {
             "executes",
             EXECUTES,
             &child,
-            &[marker(crate::runtime::callback_marker::test_token("late"))],
+            &[crate::runtime::callback_marker::test_token("late")],
         );
         register(&mut h, &root);
         let tree = h.command_tree();
@@ -2564,14 +2568,7 @@ mod tests {
             let root = literal(&mut h, "home");
             let leaf = literal(&mut h, child);
             call(&mut h, BUILDER, "then", THEN, &root, &[leaf]);
-            call(
-                &mut h,
-                BUILDER,
-                "executes",
-                EXECUTES,
-                &root,
-                &[marker(command)],
-            );
+            call(&mut h, BUILDER, "executes", EXECUTES, &root, &[command]);
             register(&mut h, &root);
         }
         let tree = h.command_tree();
@@ -2580,7 +2577,7 @@ mod tests {
         let home = roots[0].1;
         assert_eq!(
             home.command,
-            Some(marker(crate::runtime::callback_marker::test_token("second")))
+            Some(crate::runtime::callback_marker::test_token("second"))
         );
         let names: Vec<_> = home
             .children

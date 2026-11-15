@@ -998,13 +998,17 @@ mod tests {
     fn markers_embedded_in_a_lambda_or_an_entry_keep_their_objects() {
         // A static lambda capturing node 3, and node 1 only as a map entry's
         // value inside a list the host keeps for a static.
-        let (mut host, mut heap) = graph(&crate::runtime::callback_marker::make(
-            "demo/Mod#init",
-            4,
-            "",
-            "demo/Mod#lambda$0(Ldemo/Node;)V",
-            "rdemo/Node#3",
-        ));
+        let (mut host, mut heap) = graph("demo/Mod#unused");
+        host.persistent_static_fields.insert(
+            "demo/Mod#ROOTLjava/lang/Object;".into(),
+            crate::runtime::callback_marker::lambda(
+                "demo/Mod#init",
+                4,
+                "",
+                "demo/Mod#lambda$0(Ldemo/Node;)V",
+                "rdemo/Node#3",
+            ),
+        );
         host.persistent_static_fields.insert(
             "demo/Mod#MAPLjava/util/List;".into(),
             text("java/util/ArrayList#7"),
@@ -1247,8 +1251,9 @@ mod tests {
     fn numbers_are_read_from_every_key_a_text_names() {
         let mut out = Vec::new();
         note_numbers("demo/Lock#5", &mut out);
+        let callback = crate::runtime::callback_marker::test_token("demo/Main#lambda|demo/Cell#12|x#|#");
         note_numbers(
-            &crate::runtime::callback_marker::test_token("demo/Main#lambda|demo/Cell#12|x#|#"),
+            crate::runtime::callback_marker::callback_text(&callback).unwrap(),
             &mut out,
         );
         note_numbers("HostRef { key: \"demo/A#7\" } #neutral3", &mut out);

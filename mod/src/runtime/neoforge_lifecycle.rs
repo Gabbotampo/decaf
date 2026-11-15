@@ -70,7 +70,7 @@
 
 use crate::runtime::events::ListenerCallback;
 use crate::runtime::neoforge_bus::BusListener;
-use crate::runtime::{ExecutionBudget, MethodRef, NativeJar, StdHost, Value, expect_ref};
+use crate::runtime::{ExecutionBudget, MethodRef, NativeJar, StdHost, Value};
 
 const LIFECYCLE: &str = "net/neoforged/fml/event/lifecycle/";
 const CONSTRUCT: &str = "net/neoforged/fml/event/lifecycle/FMLConstructModEvent";
@@ -364,7 +364,7 @@ impl NativeJar {
     /// How a queued `Runnable#run` or `Supplier#get` is reached: a lambda or method reference, or
     /// a jar object's method.
     fn work_callback(&self, task: &DeferredTask) -> Option<ListenerCallback> {
-        if let Some(text) = expect_ref(&task.work)
+        if let Some(text) = crate::runtime::callback_marker::callback_text(&task.work)
             && crate::runtime::callback_marker::is_callback(text)
         {
             let marker = crate::runtime::parse_callback_marker(text).ok()?;

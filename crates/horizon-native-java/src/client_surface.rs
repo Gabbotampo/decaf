@@ -913,7 +913,7 @@ impl StdHost {
         let mut layers = Vec::new();
         let mut refused = Vec::new();
         for (id, element, source) in &self.client.layers {
-            let callback = match expect_ref(element) {
+            let callback = match crate::callback_marker::callback_text(element) {
                 Some(text) if crate::callback_marker::is_callback(text) => {
                     match parse_callback_marker(text) {
                         Ok(marker) => Some(ListenerCallback::Indy {
@@ -2027,7 +2027,7 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<(), NativeError> {
-        let callback = match expect_ref(task) {
+        let callback = match crate::callback_marker::callback_text(task) {
             Some(text) if crate::callback_marker::is_callback(text) => parse_callback_marker(text)
                 .ok()
                 .map(|marker| ListenerCallback::Indy {

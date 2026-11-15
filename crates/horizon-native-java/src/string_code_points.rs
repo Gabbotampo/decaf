@@ -29,11 +29,6 @@
 
 use super::*;
 
-/// The callback markers of `Function.identity()` and `UnaryOperator.identity()`,
-/// which `Runtime::invoke_callback` answers with their argument.
-pub(crate) const FUNCTION_IDENTITY: &str = "@fn:identity/function";
-pub(crate) const UNARY_IDENTITY: &str = "@fn:identity/unary";
-
 /// The class and method a fresh `codePoints` stream's marker carries. A jar
 /// frame's own stages name the jar's class, never `java/lang/String`.
 const SOURCE: (&str, &str) = ("java/lang/String", "codePoints");
@@ -69,13 +64,21 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(Some(stream))
             }
             ("java/util/function/Function", "identity", "()Ljava/util/function/Function;") => {
-                Ok(Some(Value::Ref(Some(FUNCTION_IDENTITY.into()))))
+                // One object each, which `Runtime::run_composite` answers with
+                // its argument (`callback_marker.rs`).
+                Ok(Some(crate::callback_marker::composite(
+                    crate::callback_marker::IDENTITY_FUNCTION,
+                    &[],
+                )))
             }
             (
                 "java/util/function/UnaryOperator",
                 "identity",
                 "()Ljava/util/function/UnaryOperator;",
-            ) => Ok(Some(Value::Ref(Some(UNARY_IDENTITY.into())))),
+            ) => Ok(Some(crate::callback_marker::composite(
+                crate::callback_marker::IDENTITY_UNARY,
+                &[],
+            ))),
             ("java/lang/Character", "toChars", "(I)[C") => {
                 let point = expect_int(r, StdHost::argument(r, args, 0)?)?;
                 let Some(c) = u32::try_from(point).ok().and_then(char::from_u32) else {

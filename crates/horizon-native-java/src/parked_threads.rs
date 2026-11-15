@@ -80,12 +80,14 @@ fn runnable_name(value: &Value) -> String {
     if let Some(class) = crate::jar_object::object_class(value) {
         return class.to_owned();
     }
+    if let Some(key) = crate::callback_marker::callback_text(value)
+        && let Ok(callback) = crate::callback_marker::parse(key)
+    {
+        return format!("{}#{}", callback.target.owner, callback.target.name);
+    }
     let Some(marker) = expect_ref(value) else {
         return "null".into();
     };
-    if let Ok(callback) = crate::callback_marker::parse(marker) {
-        return format!("{}#{}", callback.target.owner, callback.target.name);
-    }
     // A host model's own object (`java/lang/Thread#neutral2`) names its class.
     marker
         .split_once('#')

@@ -61,7 +61,7 @@ fn lambdas_and_forged_callback_text_answer_as_java() {
 #[test]
 fn the_host_counts_a_callbacks_method_it_cannot_run() {
     let mut host = StdHost::new();
-    let callback = Value::Ref(Some(callback_test_token("demo/Probe#lambda")));
+    let callback = callback_test_token("demo/Probe#lambda");
     let call = |owner: &str, name: &str, descriptor: &str| MethodRef {
         owner: owner.into(),
         name: name.into(),
