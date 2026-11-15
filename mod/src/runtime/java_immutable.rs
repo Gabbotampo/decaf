@@ -174,6 +174,7 @@ pub(crate) fn member_class_names(name: &str) -> Option<(String, String)> {
         "java.util.Collections$SingletonMap",
         "java.util.Collections$UnmodifiableList",
         "java.util.Collections$UnmodifiableRandomAccessList",
+        "java.util.Collections$UnmodifiableCollection",
         "java.util.Collections$UnmodifiableSet",
         "java.util.Collections$UnmodifiableMap",
         "java.util.ReverseOrderListView$Rand",
@@ -244,6 +245,11 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/io/Serializable",
     ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
+    const COLLECTION: &[&str] = &[
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/io/Serializable",
+    ];
     // `Arrays$ArrayList extends AbstractList implements RandomAccess,
     // Serializable` (`array_views.rs`).
     const ARRAYS_LIST: &[&str] = &[
@@ -276,6 +282,7 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         | "java/util/Collections$EmptyList"
         | "java/util/Collections$SingletonList" => LIST,
         "java/util/Collections$UnmodifiableList" => SEQUENTIAL_LIST,
+        "java/util/Collections$UnmodifiableCollection" => COLLECTION,
         "java/util/ImmutableCollections$SetN"
         | "java/util/ImmutableCollections$Set12"
         | "java/util/Collections$UnmodifiableSet"
@@ -298,7 +305,7 @@ impl StdHost {
     /// A new unmodifiable collection of the JDK (or Guava) class `class`
     /// holding `values`: an object of its own (#156 P14c), keyed
     /// `<class>#immutable<n>`.
-    fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
+    pub(crate) fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
         let marker = crate::runtime::jar_object::collection_key_for(
             class,
             crate::runtime::jar_object::CollectionFamily::Immutable,
@@ -612,6 +619,17 @@ impl StdHost {
         }
         if (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z") {
             return None;
+        }
+        // Fabric's metadata uses `Collections.unmodifiableCollection`, whose
+        // wrapper inherits Object.equals/hashCode rather than a collection
+        // contract. It delegates only toString and iteration.
+        if crate::runtime::jar_object::collection_class(marker)
+            == "java/util/Collections$UnmodifiableCollection"
+        {
+            return Some(Ok(Value::Int(i32::from(crate::runtime::object_methods::identical(
+                &crate::runtime::jar_object::collection(marker.to_owned()),
+                args.first()?,
+            )))));
         }
         let receiver = crate::runtime::jar_object::stored_value(marker);
         let mine = self.elements(&receiver).ok()?;

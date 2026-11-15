@@ -151,6 +151,81 @@ fn each_mod_container_keeps_its_own_collections() {
     }
 }
 
+/// The expected `UUUUUU` comes from Fabric Loader's bytecode: metadata's
+/// collection fields are assigned through `Collections.unmodifiableCollection`
+/// and `ModContainerImpl.getRootPaths` returns `Collections.singletonList`.
+/// Both wrappers throw `UnsupportedOperationException` from every mutator.
+#[test]
+fn metadata_collections_reject_mutation() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("metadata-mutators", &sources);
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("moda", "1.0")
+            .with_mod("modb", "1.0"),
+    );
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "mutators",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(matches!(
+        &result,
+        Ok(horizon_native_java::Value::Ref(Some(text))) if text == "UUUUUU"
+    ));
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn unmodifiable_collection_keeps_object_equality_and_delegates_text() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("metadata-wrapper", &sources);
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("moda", "1.0")
+            .with_mod("modb", "1.0"),
+    );
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "wrapperSemantics",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(
+            &result,
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "TFT[]"
+        ),
+        "result={result:?}"
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.ends_with("#hashCode()I")),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
 /// The loader and its mapping resolver are one object each (`==`, `equals`,
 /// `IdentityHashMap`, host lists, `instanceof`); `getEnvironmentType()` is the
 /// `EnvType` constant itself; `EnvType`'s constants are one object each in

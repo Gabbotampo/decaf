@@ -43,4 +43,34 @@ public final class Containers {
             + b(license == c.getMetadata().getLicense()) + b(license == a.getMetadata().getLicense())
             + a.getMetadata().getLicense() + c.getMetadata().getLicense();
     }
+
+    /** Fabric Loader 0.19.5 wraps these fields; every mutator throws UOE. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static String mutators() {
+        ModContainer a = mod("moda");
+        StringBuilder out = new StringBuilder();
+        try { ((Collection) a.getMetadata().getLicense()).add("MIT"); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        try { ((Collection) a.getMetadata().getAuthors()).add(null); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        try { ((Collection) a.getMetadata().getContributors()).add(null); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        try { ((Collection) a.getMetadata().getProvides()).add("alias"); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        try { a.getMetadata().getDependencies().add(new Object()); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        try { a.getRootPaths().add(Path.of("x")); out.append('N'); }
+        catch (UnsupportedOperationException e) { out.append('U'); }
+        return out.toString();
+    }
+
+    /** `UnmodifiableCollection` keeps Object identity equals/hashCode and delegates toString. */
+    public static String wrapperSemantics() {
+        ModContainer a = mod("moda");
+        Collection<String> first = a.getMetadata().getLicense();
+        Collection<String> same = a.getMetadata().getLicense();
+        Collection<String> other = mod("modb").getMetadata().getLicense();
+        return b(first.equals(same)) + b(first.equals(other))
+            + b(first.hashCode() == same.hashCode()) + first.toString();
+    }
 }

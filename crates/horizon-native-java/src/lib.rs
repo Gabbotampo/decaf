@@ -3553,6 +3553,31 @@ impl StdHost {
         made
     }
 
+    /// The loader wraps metadata collections in a fresh unmodifiable view,
+    /// cached per receiver and getter just like the mutable stand-ins.
+    fn cached_unmodifiable_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        values: Vec<Value>,
+    ) -> Value {
+        let Some(identity) = cache_identity(of) else {
+            return self.unmodifiable_as(class, values);
+        };
+        let cache = (identity, member.to_owned());
+        if let Some(marker) = self.cached_collections.get(&cache)
+            && self.mutable_collections.contains_key(marker)
+        {
+            return jar_object::collection(marker.clone());
+        }
+        let made = self.unmodifiable_as(class, values);
+        if let Some(marker) = expect_ref(&made) {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        made
+    }
+
     /// The system property `key`: once `System.getProperties()` made its
     /// object, that object is the run's properties (a `put` on it is what
     /// `System.getProperty` reads, as on a JVM); before, the host's own.
@@ -10014,11 +10039,10 @@ impl Host for StdHost {
                 // The container keeps its root paths: one list per container.
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
                 let roots = vec![path_value(&format!("/horizon/mods/{id}"))];
-                Ok(self.cached_collection(
+                Ok(self.cached_unmodifiable_collection(
                     receiver,
                     "getRootPaths",
-                    stand_in_class("list"),
-                    false,
+                    "java/util/Collections$SingletonList",
                     roots,
                 ))
             }
@@ -10059,11 +10083,10 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides" | "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
-            ) => Ok(self.cached_collection(
+            ) => Ok(self.cached_unmodifiable_collection(
                 receiver,
                 &r.name,
-                stand_in_class("list"),
-                false,
+                "java/util/Collections$UnmodifiableCollection",
                 Vec::new(),
             )),
             (
@@ -10074,12 +10097,21 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
-                "()Ljava/util/Map;",
-            ) => Ok(self.cached_collection(
+                "()Ljava/util/Collection;",
+            ) => Ok(self.cached_unmodifiable_collection(
                 receiver,
                 "getDependencies",
-                stand_in_class("map"),
-                false,
+                "java/util/Collections$UnmodifiableCollection",
+                Vec::new(),
+            )),
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getDependencies",
+                "()Ljava/util/Map;",
+            ) => Ok(self.cached_unmodifiable_collection(
+                receiver,
+                "getDependencies",
+                "java/util/Collections$UnmodifiableMap",
                 Vec::new(),
             )),
             (
