@@ -210,6 +210,7 @@ mod stream_pipeline;
 mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
+mod thread_local;
 mod tim_sort;
 mod tree_map;
 mod type_switch;
@@ -24176,9 +24177,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = thread_local::call(self, r, receiver, args) {
+            return value.map(Some);
+        }
         // A game codec factory whose result a class only stores.
         if let Some(value) = stream_codec::static_call(r, args) {
             return Ok(Some(value));
+        }
+        if let Some(value) =
+            receiver.and_then(|receiver| stream_codec::instance_call(r, receiver, args))
+        {
+            return value.map(Some);
         }
         if let Some(value) = self.invoke_game_codec_factory(r) {
             return Ok(Some(value));

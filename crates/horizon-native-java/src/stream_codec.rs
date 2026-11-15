@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
 };
-use crate::{MethodRef, Value};
+use crate::{MethodRef, NativeError, Value};
 
 pub(crate) const STREAM_CODEC: &str = "net/minecraft/network/codec/StreamCodec";
 const STREAM_ENCODER: &str = "net/minecraft/network/codec/StreamEncoder";
@@ -36,6 +36,12 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Value> {
                     args,
                 ));
             }
+        }
+        if r.owner == STREAM_CODEC && r.name == "of" {
+            return Some(codec(&format!("{STREAM_CODEC_PREFIX}1"), args));
+        }
+        if r.owner == STREAM_CODEC && r.name == "ofMember" {
+            return Some(codec(&format!("{STREAM_CODEC_PREFIX}2"), args));
         }
         if r.owner == "net/minecraft/network/protocol/common/custom/CustomPacketPayload"
             && r.name == "codec"
@@ -68,6 +74,28 @@ fn codec(class: &str, args: &[Value]) -> Value {
     values.push(Value::Ref(Some(class.to_owned())));
     values.extend_from_slice(args);
     Value::Host(HostRef::of_values(HostKind::StreamCodec, &values))
+}
+
+/// The default `map` method allocates StreamCodec$4 and retains its receiver
+/// and both callback handles. Its encode/decode behavior remains counted.
+pub(crate) fn instance_call(
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if r.owner != STREAM_CODEC
+        || r.name != "map"
+        || r.descriptor
+            != "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;"
+        || !is_stream_codec(receiver)
+        || args.len() != 2
+    {
+        return None;
+    }
+    let mut values = Vec::with_capacity(3);
+    values.push(receiver.clone());
+    values.extend_from_slice(args);
+    Some(Ok(codec(&format!("{STREAM_CODEC_PREFIX}4"), &values)))
 }
 
 /// Whether a value is a modeled network codec handle.
