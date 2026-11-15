@@ -171,6 +171,19 @@ impl<H: Host> Runtime<'_, H> {
             kind = table_kind_of(&class);
         }
         let kind = kind?;
+        // The Guava factory hands out a host Collection handle. Keep its
+        // exact ConcurrentHashMap semantics, but do not turn every jar-owned
+        // ConcurrentHashMap constructor into a synthetic hash table: those
+        // objects still need the ordinary counted path used before this PR.
+        if class == "java/util/concurrent/ConcurrentHashMap"
+            && !matches!(
+                value,
+                Value::Host(handle)
+                    if handle.kind() == crate::runtime::host_ref::HostKind::Collection
+            )
+        {
+            return None;
+        }
         self.host.has_mutable_collection(marker).then_some(kind)
     }
 

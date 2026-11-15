@@ -123,6 +123,30 @@ pub(crate) fn sized_factory_class(
             frame: None,
         }));
     }
+    let backing = if class == "java/util/ArrayList" {
+        if label == "arraySize" {
+            (size as u128)
+                .saturating_add(5)
+                .saturating_add((size / 10) as u128)
+        } else {
+            size as u128
+        }
+    } else {
+        // Guava's Maps.capacity feeds HashMap's tableSizeFor.  The table
+        // starts at one for expected sizes below three, then ceil(n/.75),
+        // and caps at the JDK's maximum table size.
+        let capacity = if size < 3 {
+            (size + 1) as u128
+        } else if size < (1 << 30) {
+            ((size as u128) * 4).div_ceil(3)
+        } else {
+            1u128 << 30
+        };
+        capacity.next_power_of_two()
+    };
+    if backing > crate::MAX_ARRAY_ELEMENTS as u128 {
+        return Some(Err(crate::array_bound_error(backing)));
+    }
     Some(Ok(class))
 }
 
