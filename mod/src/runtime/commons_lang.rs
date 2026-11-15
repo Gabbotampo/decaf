@@ -350,8 +350,7 @@ fn region_matches_ignore_case(haystack: &[u16], needle: &[u16]) -> bool {
         }
         let left_upper = simple_upper(*left);
         let right_upper = simple_upper(*right);
-        left_upper == right_upper
-            || simple_lower(left_upper) == simple_lower(right_upper)
+        left_upper == right_upper || simple_lower(left_upper) == simple_lower(right_upper)
     })
 }
 
