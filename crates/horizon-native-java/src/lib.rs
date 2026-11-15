@@ -4789,6 +4789,53 @@ impl StdHost {
     }
 }
 
+pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), NativeError> {
+    let capacity = args.first().and_then(|value| match value {
+        Value::Int(value) => Some(*value),
+        _ => None,
+    });
+    let Some(capacity) = capacity else {
+        return Ok(());
+    };
+    let array_capacity = |value: i32| {
+        if value as i64 > i64::from(MAX_ARRAY_ELEMENTS as i32) {
+            Err(array_bound_error(value as u128))
+        } else {
+            Ok(())
+        }
+    };
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("java/util/ArrayList", "<init>", "(I)V") | ("java/util/Vector", "<init>", "(I)V") => {
+            if capacity < 0 {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!("Illegal Capacity: {capacity}")),
+                    frame: None,
+                });
+            }
+            array_capacity(capacity)?;
+        }
+        ("java/lang/StringBuilder" | "java/lang/StringBuffer", "<init>", "(I)V") => {
+            if capacity < 0 {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NegativeArraySizeException".into(),
+                    message: Some(capacity.to_string()),
+                    frame: None,
+                });
+            }
+            array_capacity(capacity)?;
+        }
+        ("java/util/ArrayList" | "java/util/Vector", "ensureCapacity", "(I)V")
+        | ("java/lang/StringBuilder" | "java/lang/StringBuffer", "ensureCapacity", "(I)V")
+            if capacity > 0 =>
+        {
+            array_capacity(capacity)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl Host for StdHost {
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.unknown_host_call(r)
@@ -6756,6 +6803,7 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }

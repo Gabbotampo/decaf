@@ -681,6 +681,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        crate::check_jdk_capacity(r, args)?;
         // A `String` spelling a builder's key is no builder (`jar_object.rs`).
         if receiver.is_some_and(crate::jar_object::spells_key) {
             return Ok(None);

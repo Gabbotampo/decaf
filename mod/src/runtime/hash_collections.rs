@@ -1008,6 +1008,12 @@ impl<H: Host> Runtime<'_, H> {
                 format_java_float32(f64::from(load_factor))
             )));
         }
+        if let Some(cap) = capacity {
+            let table = hash_table_capacity(cap);
+            if table > crate::runtime::MAX_ARRAY_ELEMENTS {
+                return Err(crate::runtime::array_bound_error(table as u128));
+            }
+        }
         // The host's empty row.
         let empty = MethodRef {
             owner: r.owner.clone(),
@@ -1692,6 +1698,12 @@ impl<H: Host> Runtime<'_, H> {
             ModVerdict::Unknown => Ok(Value::Void),
         }
     }
+}
+
+/// The backing table size `HashMap.tableSizeFor` computes for an initial
+/// capacity. The shared table model is the JDK 25 implementation.
+fn hash_table_capacity(capacity: i32) -> usize {
+    hash_table::table_size_for(i64::from(capacity)) as usize
 }
 
 fn concurrent_modification() -> NativeError {
