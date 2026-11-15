@@ -208,7 +208,7 @@ impl Decimal {
                             class: "java/lang/ArithmeticException".into(),
                             message: Some("Rounding necessary".into()),
                             frame: None,
-                        })
+                        });
                     }
                     _ => false,
                 }
