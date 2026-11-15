@@ -24272,6 +24272,44 @@ impl<H: Host> Runtime<'_, H> {
         }))
     }
 
+    /// A `JsonWriter` created by Gson or by a jar wraps a host writer. Keep
+    /// that relationship in the invocation field table so the same sink used
+    /// by `StringWriter`/`FileWriter` receives tree output.
+    const GSON_JSON_WRITER_FIELD: &str = "|#gsonJsonWriter";
+
+    fn set_gson_json_writer(&mut self, marker: &str, writer: &Value) {
+        self.fields.insert(
+            format!("{marker}{}", Self::GSON_JSON_WRITER_FIELD),
+            writer.clone(),
+        );
+    }
+
+    fn gson_json_writer_target(&self, marker: &str) -> Option<String> {
+        self.fields
+            .get(&format!("{marker}{}", Self::GSON_JSON_WRITER_FIELD))
+            .and_then(expect_ref)
+            .cloned()
+    }
+
+    fn gson_write_target(&mut self, target: &str, text: &str) -> Result<(), NativeError> {
+        let target = self
+            .gson_json_writer_target(target)
+            .unwrap_or_else(|| target.to_owned());
+        if let Some(key) = self.io_sink_key(&target) {
+            self.io_writers.entry(key).or_default().push_str(text);
+            return Ok(());
+        }
+        if let Some(builder) = self.string_builders.get_mut(&target) {
+            builder.push_str(text);
+            return Ok(());
+        }
+        Err(NativeError::UncaughtException {
+            class: "com/google/gson/JsonIOException".into(),
+            message: Some("I/O operation failed for Appendable".into()),
+            frame: None,
+        })
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -24303,6 +24341,30 @@ impl<H: Host> Runtime<'_, H> {
                     Ok(Some(Value::Void))
                 }
                 ("close", "()V") => Ok(Some(Value::Void)),
+                _ => Ok(None),
+            };
+        }
+        if r.owner == "com/google/gson/stream/JsonWriter" {
+            let Some(marker) = receiver.and_then(expect_ref) else {
+                return Ok(None);
+            };
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("<init>", "(Ljava/io/Writer;)V") => {
+                    let Some(writer) = args.first() else {
+                        return Ok(None);
+                    };
+                    self.set_gson_json_writer(marker, writer);
+                    Ok(Some(Value::Void))
+                }
+                ("flush", "()V") | ("close", "()V") => {
+                    if let Some(writer) = self.gson_json_writer_target(marker) {
+                        self.io_commit(&writer);
+                    }
+                    Ok(Some(Value::Void))
+                }
+                ("setHtmlSafe", "(Z)V")
+                | ("setSerializeNulls", "(Z)V")
+                | ("setIndent", "(Ljava/lang/String;)V") => Ok(Some(Value::Void)),
                 _ => Ok(None),
             };
         }
@@ -24356,6 +24418,16 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
+                    ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
+                        let writer = args.first().ok_or_else(|| {
+                            NativeError::Metadata("Gson.newJsonWriter needs a Writer".into())
+                        })?;
+                        let json_writer = self.new_object("com/google/gson/stream/JsonWriter");
+                        if let Some(marker) = expect_ref(&json_writer) {
+                            self.set_gson_json_writer(marker, writer);
+                        }
+                        Ok(Some(json_writer))
+                    }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
                     // all write the same value, so the descriptor only has to
@@ -24383,7 +24455,8 @@ impl<H: Host> Runtime<'_, H> {
                     (name, descriptor)
                         if name == "toJson"
                             && descriptor.ends_with(")V")
-                            && descriptor.contains("Appendable") =>
+                            && (descriptor.contains("Appendable")
+                                || descriptor.contains("JsonWriter")) =>
                     {
                         let Some(text) = self.gson_to_json(
                             args.first().unwrap_or(&Value::Ref(None)),
@@ -24412,17 +24485,7 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if let Some(key) = self.io_sink_key(target) {
-                            self.io_writers.entry(key).or_default().push_str(&text);
-                            return Ok(Some(Value::Void));
-                        }
-                        let builder = self.string_builders.get_mut(target).ok_or_else(|| {
-                            NativeError::Metadata(format!(
-                                "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
-                             StringWriter or file writer"
-                            ))
-                        })?;
-                        builder.push_str(&text);
+                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
