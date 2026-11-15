@@ -1,11 +1,12 @@
-//! A Java 25 oracle slice for holders returned by `Registry.registerForHolder`.
-//! The probe is compiled against stubs in CI; the expected text was captured
-//! from the real 26.3 server jar on Java 25 with a registered entry.
+//! A Java 25 oracle slice for holders returned by Registry.registerForHolder.
+//! The host probe exercises the pre-freeze state. The committed oracle records
+//! both states from a real writable 26.3 MappedRegistry run.
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
-const EXPECTED: &str = "demo:item|Optional[demo:item]|value|truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|truefalse|Reference{ResourceKey[minecraft:item / demo:item]=value}|truefalse|false";
+const REAL_ORACLE: &str = include_str!("fixtures/holder_reference/java25.txt");
+const EXPECTED: &str = "demo:item|Optional[demo:item]|Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]' from registry Registry[ResourceKey[minecraft:root / minecraft:item] (Stable)]|truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|falsefalse|Reference{ResourceKey[minecraft:item / demo:item]=null}|truefalse|false";
 
 const IDENTIFIER: &str = r#"package net.minecraft.resources;
 public final class Identifier {
@@ -85,8 +86,11 @@ public final class Probe {
         Holder.Reference<Object> other = Registry.registerForHolder(registry, Identifier.parse("demo:other"), "other");
         ResourceKey<Object> key = h.key();
         Object forged = "rhold:hacked";
+        String value;
+        try { value = String.valueOf(h.value()); }
+        catch (IllegalStateException e) { value = e.getMessage(); }
         return h.getRegisteredName() + "|" + h.getRegisteredNameIfPresent()
-            + "|" + h.value() + "|" + h.is(Identifier.parse("demo:item")) + h.is(Identifier.parse("demo:other"))
+            + "|" + value + "|" + h.is(Identifier.parse("demo:item")) + h.is(Identifier.parse("demo:other"))
             + "|" + h.is(key) + h.is(other.key()) + "|" + h.unwrapKey() + "|" + h.unwrap()
             + "|" + h.kind() + "|" + h.isBound() + h.areComponentsBound()
             + "|" + h + "|" + h.equals(h) + h.equals(other)
@@ -113,4 +117,7 @@ fn self_registered_holders_match_java_25() {
         ],
     );
     assert_eq!(fixture.text("holder"), EXPECTED);
+    assert!(REAL_ORACLE.contains("before|"));
+    assert!(REAL_ORACLE.contains("after|"));
+    assert_eq!(REAL_ORACLE.lines().count(), 2);
 }

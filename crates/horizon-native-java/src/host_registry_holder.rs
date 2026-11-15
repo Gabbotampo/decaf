@@ -1,8 +1,11 @@
 //! `Holder.Reference` handles produced by a jar's own
 //! `Registry.registerForHolder` calls.
 //!
-//! A registration carries the registry key, entry id and registered value. A
-//! jar can only obtain one of these handles from the host call; spelling the
+//! A registration carries the registry key, entry id, registered value and
+//! binding state. MappedRegistry.register creates an unbound reference; this
+//! host has no game freeze hook yet, so these handles remain unbound and
+//! value() throws Java's catchable IllegalStateException. A jar can only
+//! obtain one of these handles from the host call; spelling the
 //! old marker text in a `String` never aliases it. Vanilla holders whose
 //! registry contents or tags belong to the game stay outside this model.
 
@@ -19,10 +22,11 @@ const HOLDER_TYPES: &[&str] = &[OWNER, HOLDER, "java/lang/Object"];
 /// A holder reference is a concrete game object. Its object hash is the
 /// identity hash and therefore remains counted; the identity itself is exact
 /// because each registration key is one host-created allocation.
-fn holder(registry_key: Value, id: Value, value: Value) -> Value {
+/// The bound flag starts false at registration; only a future real registry-freeze hook may set it true.
+fn holder(registry_key: Value, id: Value, value: Value, bound: bool) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::RegistryHolder,
-        &[registry_key, id, value],
+        &[registry_key, id, value, Value::Int(i32::from(bound))],
     ))
 }
 
@@ -30,6 +34,7 @@ struct Parts {
     registry_key: Value,
     id: String,
     value: Value,
+    bound: bool,
 }
 
 fn parts(value: &Value) -> Option<Parts> {
@@ -39,13 +44,19 @@ fn parts(value: &Value) -> Option<Parts> {
     if handle.kind() != HostKind::RegistryHolder {
         return None;
     }
-    let [registry_key, id, value] = <[Value; 3]>::try_from(handle.values()?).ok()?;
+    let [registry_key, id, value, bound] = <[Value; 4]>::try_from(handle.values()?).ok()?;
     let id = host_ids::identifier_key(&id)?.to_owned();
     host_ids::resource_key_parts(&registry_key)?;
+    let bound = match bound {
+        Value::Int(0) => false,
+        Value::Int(1) => true,
+        _ => return None,
+    };
     Some(Parts {
         registry_key,
         id,
         value,
+        bound,
     })
 }
 
@@ -83,6 +94,7 @@ fn make_for_identifier(registry: &Value, id: &Value, value: &Value) -> Option<Va
         registry_key,
         host_ids::identifier_of_text(&id_text),
         value.clone(),
+        false,
     ))
 }
 
@@ -91,7 +103,7 @@ fn make_for_key(registry: &Value, key: &Value, value: &Value) -> Option<Value> {
     if !same_registry(registry, &registry_key) {
         return None;
     }
-    Some(holder(registry_key, id, value.clone()))
+    Some(holder(registry_key, id, value.clone(), false))
 }
 
 /// `Registry.registerForHolder`'s two 26.3 overloads. An unmodelled registry,
@@ -135,10 +147,28 @@ fn holder_to_string(
     let parts =
         parts(&value).ok_or_else(|| NativeError::Metadata("malformed registry holder".into()))?;
     let key = nested.text(&entry_key(&parts))?;
-    let value = nested.text(&parts.value)?;
+    let value = if parts.bound {
+        nested.text(&parts.value)?
+    } else {
+        Some("null".into())
+    };
     Ok(key
         .zip(value)
         .map(|(key, value)| format!("Reference{{{key}={value}}}")))
+}
+
+fn unbound_value(parts: &Parts) -> NativeError {
+    let registry =
+        host_ids::registry_name(&parts.registry_key).unwrap_or_else(|| "unknown:registry".into());
+    let key = format!("ResourceKey[{registry} / {}]", parts.id);
+    let owner = format!("Registry[ResourceKey[minecraft:root / {registry}] (Stable)]");
+    NativeError::UncaughtException {
+        class: "java/lang/IllegalStateException".into(),
+        message: Some(format!(
+            "Trying to access unbound value '{key}' from registry {owner}"
+        )),
+        frame: None,
+    }
 }
 
 fn identity_equals(
@@ -179,7 +209,13 @@ pub(crate) fn instance_call(
     let parts = parts(receiver)?;
     let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (HOLDER | OWNER, "key", "()Lnet/minecraft/resources/ResourceKey;") => Ok(entry_key(&parts)),
-        (HOLDER | OWNER, "value", "()Ljava/lang/Object;") => Ok(parts.value.clone()),
+        (HOLDER | OWNER, "value", "()Ljava/lang/Object;") => {
+            if parts.bound {
+                Ok(parts.value.clone())
+            } else {
+                Err(unbound_value(&parts))
+            }
+        }
         (HOLDER | OWNER, "getRegisteredName", "()Ljava/lang/String;") => {
             Ok(Value::Ref(Some(parts.id.clone())))
         }
@@ -195,7 +231,7 @@ pub(crate) fn instance_call(
         (HOLDER | OWNER, "kind", "()Lnet/minecraft/core/Holder$Kind;") => {
             Ok(Value::Ref(Some(format!("enum/{KIND}/REFERENCE"))))
         }
-        (HOLDER | OWNER, "isBound", "()Z") => Ok(Value::Int(1)),
+        (HOLDER | OWNER, "isBound", "()Z") => Ok(Value::Int(i32::from(parts.bound))),
         (HOLDER | OWNER, "areComponentsBound", "()Z") => Ok(Value::Int(0)),
         (HOLDER | OWNER, "is", "(Lnet/minecraft/resources/Identifier;)Z") => {
             let Some(id) = args.first().and_then(|value| is_id(&parts, value)) else {
@@ -259,8 +295,8 @@ mod tests {
             .unwrap(),
             Value::Ref(Some("demo:item".into()))
         );
-        assert_eq!(
-            host.invoke_instance(
+        let error = host
+            .invoke_instance(
                 &MethodRef {
                     owner: HOLDER.into(),
                     name: "value".into(),
@@ -269,8 +305,30 @@ mod tests {
                 &holder,
                 &[],
             )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NativeError::UncaughtException {
+                ref class,
+                ref message,
+                ..
+            } if class == "java/lang/IllegalStateException"
+                && message.as_deref().is_some_and(|text| text.contains(
+                    "Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]'"
+                ))
+        ));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "isBound".into(),
+                    descriptor: "()Z".into(),
+                },
+                &holder,
+                &[],
+            )
             .unwrap(),
-            Value::Ref(Some("value".into()))
+            Value::Int(0)
         );
         assert!(matches!(
             host.invoke_instance(
@@ -285,5 +343,42 @@ mod tests {
             .unwrap(),
             Value::Int(1)
         ));
+    }
+
+    #[test]
+    fn a_bound_reference_answers_value_and_prints_it() {
+        let mut host = StdHost::new();
+        let bound = holder(
+            crate::host_ids::registry_key_of("minecraft:item"),
+            crate::host_ids::identifier("demo", "item"),
+            Value::Ref(Some("value".into())),
+            true,
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "value".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &bound,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("value".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "isBound".into(),
+                    descriptor: "()Z".into(),
+                },
+                &bound,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
     }
 }
