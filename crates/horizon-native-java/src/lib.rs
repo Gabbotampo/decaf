@@ -27,6 +27,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+mod client_reload;
 pub mod client_surface;
 mod client_values;
 mod collection_base;
@@ -34,6 +35,7 @@ mod collection_callback;
 mod collection_store;
 mod color_collection;
 mod commons_io;
+mod commons_lang;
 mod commons_pair;
 mod concurrent_sync;
 pub mod content;
@@ -98,6 +100,7 @@ mod host_jdk;
 mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
+mod host_log4j_level;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
@@ -188,6 +191,7 @@ mod reflect_names;
 mod reflect_override;
 mod regex_calls;
 mod registry_contents;
+mod registry_lookup;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
@@ -2851,6 +2855,11 @@ pub trait Host {
         None
     }
 
+    /// A fresh immutable JDK collection with the exact unmodifiable class.
+    fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
+        None
+    }
+
     /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
     /// from `offset`) holding `values`: a fixed-size view that the runtime
     /// keeps in step with the array (`array_views.rs`), for a host that
@@ -3246,6 +3255,8 @@ pub struct StdHost {
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
     heap: heap::JavaHeap,
+    /// Log4j custom levels registered by `Level.forName`, keyed by normalized name.
+    log4j_levels: crate::host_log4j_level::CustomLevels,
     /// Values the embedder holds between invocations (`StdHost::retain`),
     /// with their hold counts: roots of the heap's collections.
     retained: BTreeMap<String, usize>,
@@ -3400,6 +3411,7 @@ impl StdHost {
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
+            log4j_levels: crate::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
@@ -5300,6 +5312,16 @@ impl Host for StdHost {
         }
     }
 
+    fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
+        let owner = match kind {
+            "list" => "java/util/List",
+            "set" => "java/util/Set",
+            "map" => "java/util/Map",
+            _ => return None,
+        };
+        Some(self.unmodifiable_from(owner, "of", kind, values))
+    }
+
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
@@ -5536,6 +5558,9 @@ impl Host for StdHost {
         if let Some(value) = bigdecimal_slice::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = client_reload::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
+        }
         if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
             return Ok(value);
         }
@@ -5564,6 +5589,19 @@ impl Host for StdHost {
             return Ok(Value::Ref(Some(format!("enum/{}/{}", r.owner, r.name))));
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            // Fabric Biome API's four shared modification phases are opaque
+            // singleton values. Their identity is all this map needs.
+            (
+                "net/fabricmc/fabric/api/biome/v1/ModificationPhase",
+                "ADDITIONS" | "REMOVALS" | "REPLACEMENTS" | "POST_PROCESSING",
+                "Lnet/fabricmc/fabric/api/biome/v1/ModificationPhase;",
+            ) => host_fabric_runtime::modification_phase(&r.name)
+                .ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
+            (
+                "net/fabricmc/fabric/api/resource/v1/reloader/ResourceReloaderKeys$Server",
+                "FUNCTIONS",
+                "Lnet/minecraft/resources/Identifier;",
+            ) => Ok(host_ids::static_identifier("minecraft:functions")),
             ("java/time/Duration", "ZERO", "Ljava/time/Duration;") => Ok(duration_value(0)),
             // TimeUnit constants carry their name; the conversion accessors
             // multiply by that unit's nanosecond factor.
@@ -5705,6 +5743,9 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, None, args) {
             return value;
         }
+        if let Some(value) = commons_lang::static_call(self, r, args) {
+            return value;
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -5728,6 +5769,12 @@ impl Host for StdHost {
         }
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
+        }
+        if let Some(value) = crate::host_log4j_level::static_call(r, args, &mut self.log4j_levels) {
+            return value;
+        }
+        if let Some(value) = client_reload::static_call(self, r, args) {
+            return value;
         }
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
@@ -6959,6 +7006,18 @@ impl Host for StdHost {
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
+        if let Some(value) = registry_lookup::instance_call(self, r, receiver, args) {
+            return value;
+        }
+        // ItemStack.EMPTY is a canonical host value even before a client frame
+        // exists, so its bootstrap isEmpty() answer must stay exact.
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "isEmpty"
+            && r.descriptor == "()Z"
+            && crate::game_object::handle_key(receiver) == Some("client/stack/empty")
+        {
+            return Ok(Value::Int(1));
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -7029,6 +7088,9 @@ impl Host for StdHost {
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = client_reload::host_instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
@@ -7803,6 +7865,13 @@ impl Host for StdHost {
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -7813,6 +7882,13 @@ impl Host for StdHost {
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -7821,6 +7897,13 @@ impl Host for StdHost {
                 }
                 (owner, "push", "(Ljava/lang/Object;)Z") if is_queue_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -10961,6 +11044,7 @@ fn resource_key_identifier(value: &Value) -> Option<(String, String)> {
 /// the same registry id here. This is a lookup table only: no class is loaded
 /// and no game registry is inspected.
 const REGISTRY_STATICS: &[(&str, &str)] = &[
+    ("REGISTRY", "minecraft:root"),
     ("ITEM", "minecraft:item"),
     ("BLOCK", "minecraft:block"),
     ("ENTITY_TYPE", "minecraft:entity_type"),
@@ -12564,10 +12648,21 @@ fn is_list_like_owner(owner: &str) -> bool {
 /// `peek` and `push` are the queue-only members modelled above them; the
 /// table is FIFO, which is what a `PriorityQueue`'s own iteration order is not,
 /// but is a bounded order the interpreter can reproduce deterministically.
+fn queue_rejects_null(owner: &str) -> bool {
+    matches!(
+        owner,
+        "java/util/ArrayDeque"
+            | "java/util/concurrent/ConcurrentLinkedQueue"
+            | "java/util/concurrent/ConcurrentLinkedDeque"
+    )
+}
+
+/// Every queue a jar constructs directly.
 fn is_queue_owner(owner: &str) -> bool {
     matches!(
         owner,
-        "java/util/Queue"
+        "java/util/LinkedList"
+            | "java/util/Queue"
             | "java/util/Deque"
             | "java/util/BlockingQueue"
             | "java/util/BlockingDeque"
@@ -22139,6 +22234,12 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn materialize_host_value(&mut self, value: Value) -> Value {
+        crate::host_log4j_level::array_values(&value).map_or(value, |values| {
+            self.new_array_value("[Lorg/apache/logging/log4j/Level;", values)
+        })
+    }
+
     /// The key of a new array of `class` (`[I`, `[Ljava/lang/String;`); its
     /// elements go in `arrays` under it, and its handle is
     /// [`host_array::handle`] of it, made once (`host_array.rs`).
@@ -24014,7 +24115,7 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     return Ok(Some(Value::Void));
                 }
-                let Some(path) = self.io_paths.get(&marker).cloned() else {
+                let Some(path) = self.io_path_of(&Value::Ref(Some(marker.clone()))) else {
                     return Ok(None);
                 };
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
@@ -24956,6 +25057,20 @@ impl<H: Host> Runtime<'_, H> {
         }))
     }
 
+    fn gson_write_target(&mut self, target: &str, text: &str) -> Result<(), NativeError> {
+        if let Some(key) = self.io_sink_key(target) {
+            self.io_writers.entry(key).or_default().push_str(text);
+            return Ok(());
+        }
+        if let Some(builder) = self.string_builders.get_mut(target) {
+            builder.push_str(text);
+            return Ok(());
+        }
+        Err(NativeError::Metadata(
+            "Gson Appendable is not modeled".into(),
+        ))
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -24989,6 +25104,10 @@ impl<H: Host> Runtime<'_, H> {
                 ("close", "()V") => Ok(Some(Value::Void)),
                 _ => Ok(None),
             };
+        }
+        // JsonWriter state/options are not modeled; count every call.
+        if r.owner == "com/google/gson/stream/JsonWriter" {
+            return self.host.unknown_operand_call(r).map(Some);
         }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
@@ -25040,6 +25159,11 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
+                    ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
+                    }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
                     // all write the same value, so the descriptor only has to
@@ -25063,6 +25187,15 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some),
                         }
+                    }
+                    (name, descriptor)
+                        if name == "toJson"
+                            && descriptor.ends_with(")V")
+                            && descriptor.contains("JsonWriter") =>
+                    {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
                     }
                     (name, descriptor)
                         if name == "toJson"
@@ -25096,17 +25229,15 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if let Some(key) = self.io_sink_key(target) {
-                            self.io_writers.entry(key).or_default().push_str(&text);
-                            return Ok(Some(Value::Void));
+                        if self.io_sink_key(target).is_none()
+                            && !self.string_builders.contains_key(target)
+                        {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
                         }
-                        let builder = self.string_builders.get_mut(target).ok_or_else(|| {
-                            NativeError::Metadata(format!(
-                                "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
-                             StringWriter or file writer"
-                            ))
-                        })?;
-                        builder.push_str(&text);
+                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
@@ -25276,6 +25407,11 @@ impl<H: Host> Runtime<'_, H> {
     /// constants were declared in supplies the position. A receiver that is not
     /// such a marker, or a class this invocation never initialized, stays with
     /// the host's answer.
+    pub(crate) fn enum_ordinal_of(&self, value: &Value) -> Option<i32> {
+        let marker = expect_ref(value)?;
+        self.enum_constants.get(marker).map(|(_, ordinal)| *ordinal)
+    }
+
     fn declared_enum_ordinal(&mut self, marker: &str) -> Result<Option<Value>, NativeError> {
         let Some((class, name)) = marker
             .strip_prefix("enum/")
@@ -26051,6 +26187,11 @@ impl<H: Host> Runtime<'_, H> {
                 name: method.to_owned(),
                 descriptor: desc.to_owned(),
             };
+            if let Some(receiver) = receiver.as_ref()
+                && let Some(value) = client_reload::runtime_instance_call(self, &r, receiver, args)
+            {
+                return value;
+            }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
                 None => self.host.invoke(&r, args),
@@ -27736,7 +27877,16 @@ impl<H: Host> Runtime<'_, H> {
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         )
                                     }
                                 } else {
@@ -27768,13 +27918,28 @@ impl<H: Host> Runtime<'_, H> {
                                         ),
                                         None => invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         ),
                                     }
                                 } else {
                                     invoke_or_catch!(
                                         at,
-                                        self.host.invoke_instance(&resolved, receiver, &args)
+                                        if let Some(value) = client_reload::runtime_instance_call(
+                                            self, &resolved, receiver, &args
+                                        ) {
+                                            value
+                                        } else {
+                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                        }
                                     )
                                 }
                             } else {
@@ -27787,6 +27952,7 @@ impl<H: Host> Runtime<'_, H> {
                             r.owner, r.name, r.descriptor
                         )));
                     };
+                    let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {
