@@ -157,75 +157,19 @@ fn map_keys<H: Host>(this: &mut Runtime<'_, H>, source: &str) -> Result<Vec<Valu
     crate::runtime::runtime_collection_values(&*this.host, &keys)
 }
 
-fn pairs<H: Host>(
-    this: &mut Runtime<'_, H>,
-    source: &str,
-) -> Result<Vec<(Value, Value)>, NativeError> {
-    let Some(map) = backing(this, source) else {
-        return Ok(Vec::new());
-    };
-    let map_kind = source_kind(this, source).unwrap_or_else(|| "array".into());
-    if map_kind == "linked"
-        && let Some(order) = field(this, source, "order")
-        && let Some(markers) = this.host.mutable_collection_values(&order)
-    {
-        let mut out = Vec::new();
-        for marker in markers {
-            let Ok((key, value)) = crate::runtime::map_entry_parts(&marker) else {
-                continue;
-            };
-            if invoke_instance(
-                this,
-                &map_ref("containsKey", "(Ljava/lang/Object;)Z"),
-                &map,
-                std::slice::from_ref(&key),
-            )? == Value::Int(0)
-            {
-                continue;
-            }
-            if let Some(values) = values_for_key(this, source, &key, false)? {
-                let contains = invoke_instance(
-                    this,
-                    &collection_ref("contains", "(Ljava/lang/Object;)Z"),
-                    &values,
-                    std::slice::from_ref(&value),
-                )?;
-                if contains != Value::Int(0) {
-                    out.push((key, value));
-                }
-            }
-        }
-        return Ok(out);
-    }
-    let mut out = Vec::new();
+fn size<H: Host>(this: &mut Runtime<'_, H>, source: &str) -> Result<i32, NativeError> {
+    let mut total = 0;
     for key in map_keys(this, source)? {
         let Some(values) = values_for_key(this, source, &key, false)? else {
             continue;
         };
-        let _ = invoke_instance(this, &collection_ref("size", "()I"), &values, &[])?;
-        for value in crate::runtime::runtime_collection_values(&*this.host, &values)? {
-            out.push((key.clone(), value));
+        if let Value::Int(count) =
+            invoke_instance(this, &collection_ref("size", "()I"), &values, &[])?
+        {
+            total += count;
         }
     }
-    Ok(out)
-}
-
-fn append_order<H: Host>(
-    this: &mut Runtime<'_, H>,
-    source: &str,
-    key: &Value,
-    value: &Value,
-) -> Result<(), NativeError> {
-    let Some(order) = field(this, source, "order") else {
-        return Ok(());
-    };
-    invoke_instance(
-        this,
-        &collection_ref("add", "(Ljava/lang/Object;)Z"),
-        &order,
-        &[crate::runtime::map_entry_value(key, value)],
-    )?;
-    Ok(())
+    Ok(total)
 }
 
 fn make_multimap<H: Host>(
@@ -246,13 +190,6 @@ fn make_multimap<H: Host>(
         .empty_mutable_collection(map_class)
         .ok_or_else(|| NativeError::Metadata("Guava backing map unavailable".into()))?;
     put_field(this, &key, "backing", map);
-    if kind == "linked" {
-        let order = this
-            .host
-            .empty_mutable_collection("java/util/ArrayList")
-            .ok_or_else(|| NativeError::Metadata("Guava order list unavailable".into()))?;
-        put_field(this, &key, "order", order);
-    }
     Ok(value)
 }
 
@@ -296,9 +233,6 @@ fn put_one<H: Host>(
     )?;
     if kind == "hash" {
         this.resync_hash_table(&values)?;
-    }
-    if added == Value::Int(1) && kind == "linked" {
-        append_order(this, source, key, value)?;
     }
     Ok(added)
 }
@@ -419,7 +353,7 @@ fn invoke_multimap<H: Host>(
         ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
             Ok(Some(remove_one(this, &source, &args[0], &args[1])?))
         }
-        ("size", "()I") => Ok(Some(Value::Int(pairs(this, &source)?.len() as i32))),
+        ("size", "()I") => Ok(Some(Value::Int(size(this, &source)?))),
         _ => this.host.unknown_operand_call(r).map(Some),
     }
 }
