@@ -463,8 +463,10 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
                 let mut pairs = ordered
-                    .chunks_exact(2)
-                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[key, value]| (key.clone(), value.clone()))
                     .collect::<Vec<_>>();
                 pairs.sort_by_key(|(key, _)| {
                     self.enum_ordinal_of(key)
