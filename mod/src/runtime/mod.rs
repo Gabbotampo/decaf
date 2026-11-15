@@ -74,6 +74,7 @@ mod game_hooks;
 mod game_object;
 mod game_rules;
 mod gson_model;
+mod gson_to_json_tree;
 mod gson_tree;
 mod gson_type_token;
 mod guava_model;
@@ -15034,7 +15035,11 @@ impl ClassFile {
     /// the way [`Self::field_signature`] does. Only `RuntimeVisibleAnnotations`
     /// is read: a `CLASS`-retention annotation is invisible to reflection on
     /// the JVM too. A malformed table answers no annotations.
-    fn field_annotations(&self, field_name: &str, field_descriptor: &str) -> Vec<Annotation> {
+    pub(crate) fn field_annotations(
+        &self,
+        field_name: &str,
+        field_descriptor: &str,
+    ) -> Vec<Annotation> {
         self.read_field_annotations(field_name, field_descriptor)
             .unwrap_or_default()
     }
@@ -28318,6 +28323,16 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, executors::invoke(self, &r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        gson_to_json_tree::instance_call(
+                            self,
+                            &r,
+                            receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                            &args,
+                        )
+                    ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))

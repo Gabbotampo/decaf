@@ -68,6 +68,13 @@ use super::*;
 mod parse;
 mod typed;
 
+pub(crate) fn parse_text<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+) -> Result<Value, NativeError> {
+    parse::parse_text(runtime, text)
+}
+
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";
 pub(crate) const JSON_ARRAY: &str = "com/google/gson/JsonArray";

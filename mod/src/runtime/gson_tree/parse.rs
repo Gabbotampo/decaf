@@ -438,6 +438,21 @@ impl<H: Host> Runtime<'_, H> {
 }
 
 /// Whether `r` is a `JsonParser` call.
+pub(super) fn parse_text<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+) -> Result<Value, NativeError> {
+    match Parser::parse(text) {
+        Parsed::Empty => Ok(super::null_instance()),
+        Parsed::Value(tree) => runtime.materialize(tree),
+        Parsed::Unsupported => Err(NativeError::UnknownHostCall(MethodRef {
+            owner: JSON_PARSER.into(),
+            name: "parseString".into(),
+            descriptor: "(Ljava/lang/String;)Lcom/google/gson/JsonElement;".into(),
+        })),
+    }
+}
+
 pub(super) fn is_parser(r: &MethodRef) -> bool {
     r.owner == JSON_PARSER
 }
