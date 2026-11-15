@@ -1,0 +1,14 @@
+gsonMapArray=com.google.gson.internal.LinkedTreeMap{b=1.0, a=2.0}|bDouble
+gsonHashMapArray=java.util.HashMap{b=1.0}
+gsonSortedMapArrays=java.util.TreeMap{a=2.0, b=1.0}|java.util.TreeMap{a=2.0, b=1.0}
+gsonListArray=[1.0, true][x]|DoubleBooleanjava.util.ArrayList
+gsonCollectionArray=java.util.ArrayList[1.0]
+gsonIterableArray=JsonIOException
+gsonSortedSetNumbers=Double[1.0, 3.0]
+gsonMapValues=com.google.gson.internal.LinkedTreeMap{b=1.0, a=true, n={y=1.0, x=2.0}, l=[2.0]}|DoubleBooleanLinkedTreeMapArrayListy
+gsonLinkedHashMap={b=1.0, a=2.0}b
+gsonTypedFields=com.google.gson.internal.LinkedTreeMap{z=1, a=2}Integer|[1.0, 2.5]Double|java.util.LinkedHashSet[t, s]|12|java.util.LinkedHashMap{2=b, 1=a}Integer|[[1], [2, 3]]Long
+gsonTreeSetMixed=ClassCastException
+gsonQueue=java.util.ArrayDeque[1.0]
+gsonDuplicateKey=JsonSyntaxException
+forgedCollectionText=FFFStringTCCE|FFFStringTCCE|FFFStringTCCE|FFFStringTCCE|

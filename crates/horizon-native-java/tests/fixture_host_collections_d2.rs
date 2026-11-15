@@ -177,3 +177,187 @@ fn guava_and_gson_collections_are_javas() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// What `demo.Recheck`'s `main` printed on Java 25 (Temurin 25.0.5, `javac
+/// --release 21`) with Gson 2.14.0, the same on two runs.
+const RECHECK_ORACLE: &str = include_str!("fixtures/host_collections_d2/recheck25.txt");
+
+const RECHECK: &str = include_str!("fixtures/host_collections_d2/demo/Recheck.java");
+
+/// One oracle line of `oracle`.
+fn line_of(oracle: &'static str, method: &str) -> &'static str {
+    oracle
+        .lines()
+        .find_map(|line| line.strip_prefix(method)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no oracle line for {method}"))
+}
+
+/// #253's re-check, `Gson.fromJson` into collections:
+/// - exact, nothing counted: a `Map[]`'s maps are `LinkedTreeMap`s in
+///   document order holding `Double`s, `HashMap[]`/`TreeMap[]`/`SortedMap[]`
+///   their own classes, `List[]`/`Collection[]` `ArrayList`s of `Double` and
+///   `Boolean`, a `SortedSet`'s numbers `Double`s, a raw `Map`'s values
+///   `ObjectTypeAdapter`'s (a nested `LinkedTreeMap` in document order), a
+///   `LinkedHashMap` target in document order, and a jar class's
+///   `Map<String, Integer>`, `List<Double>`, `Set<String>`, `int[]`,
+///   `Map<Integer, String>` and `List<List<Long>>` fields as declared;
+/// - a `String` spelled `<collection class>#<word>` is a `String`: no
+///   collection type's `instanceof`, a `List` cast throws;
+/// - counted, where Java throws or makes a class not modelled here:
+///   `Iterable[]` (`JsonIOException`), a `TreeSet` of a `String` and a number
+///   (`ClassCastException`), a `Queue` (`ArrayDeque`), a repeated name
+///   (`JsonSyntaxException`).
+#[test]
+fn recheck_gson_reads_are_javas_or_counted() {
+    let mut sources = vec![("demo/Recheck.java", RECHECK)];
+    sources.extend_from_slice(STUBS);
+    let fixture = javac_fixture::Fixture::build("host-collections-d2-recheck", &sources);
+    let exact = [
+        "gsonMapArray",
+        "gsonHashMapArray",
+        "gsonSortedMapArrays",
+        "gsonListArray",
+        "gsonCollectionArray",
+        "gsonSortedSetNumbers",
+        "gsonMapValues",
+        "gsonLinkedHashMap",
+        "gsonTypedFields",
+        "forgedCollectionText",
+    ];
+    let counted = [
+        "gsonIterableArray",
+        "gsonTreeSetMixed",
+        "gsonQueue",
+        "gsonDuplicateKey",
+    ];
+    let mut failures = Vec::new();
+    for (method, must_count) in exact
+        .iter()
+        .map(|method| (*method, false))
+        .chain(counted.iter().map(|method| (*method, true)))
+    {
+        let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+        let answer = fixture.jar.invoke_method_with_args(
+            "demo/Recheck",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        let text = match answer {
+            Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+            other => format!("{other:?}"),
+        };
+        let unknown = host.unknown_host_calls();
+        let ok = if must_count {
+            unknown
+                .iter()
+                .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson"))
+        } else {
+            text == line_of(RECHECK_ORACLE, method) && unknown.is_empty()
+        };
+        if !ok {
+            failures.push(format!(
+                "{method}\n  java:   {}\n  native: {text}\n  unknown: {unknown:?}",
+                line_of(RECHECK_ORACLE, method)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// What `demo.Inv`'s `main` printed on Java 25 with 26.3's real
+/// `net.minecraft.core.NonNullList` (from `server-game.jar`) held as
+/// `Inventory.items` is (the `fakes/` classes), the same on two runs.
+const INV_ORACLE: &str = include_str!("fixtures/host_collections_d2/inv25.txt");
+
+const INV: &str = include_str!("fixtures/host_collections_d2/demo/Inv.java");
+
+/// `demo.Inv`'s compile-time classes: the game's client classes as the
+/// oracle's fakes (only `demo/` is packed, so the host answers them) and a
+/// `NonNullList` stub.
+const INV_SOURCES: &[(&str, &str)] = &[
+    ("demo/Inv.java", INV),
+    (
+        "net/minecraft/client/Minecraft.java",
+        include_str!("fixtures/host_collections_d2/fakes/net/minecraft/client/Minecraft.java"),
+    ),
+    (
+        "net/minecraft/client/player/LocalPlayer.java",
+        include_str!(
+            "fixtures/host_collections_d2/fakes/net/minecraft/client/player/LocalPlayer.java"
+        ),
+    ),
+    (
+        "net/minecraft/world/entity/player/Inventory.java",
+        include_str!(
+            "fixtures/host_collections_d2/fakes/net/minecraft/world/entity/player/Inventory.java"
+        ),
+    ),
+    (
+        "net/minecraft/core/NonNullList.java",
+        include_str!("fixtures/host_collections_d2/stubs/net/minecraft/core/NonNullList.java"),
+    ),
+];
+
+/// #253's re-check on the inventory's list, inside a client frame:
+/// - `surface`: its class is `NonNullList`, whose superclass is
+///   `AbstractList`, a `List` and an `AbstractList` to `isAssignableFrom`,
+///   no `RandomAccess`, no interfaces of its own: Java 25's answer, nothing
+///   counted;
+/// - every `subList` (through `NonNullList` or `List`): Java's is an
+///   `AbstractList$SubList` with `NonNullList`'s rules (`add`/`clear`/
+///   `remove` throw, `set(null)` throws, `set` writes through), which is not
+///   modelled: counted, never a writable copy.
+#[test]
+fn the_inventory_list_has_its_class_surface_and_its_sublists_are_counted() {
+    use horizon_native_java::client_surface::{ClientPlayer, ClientSnapshot};
+    let fixture = javac_fixture::Fixture::build("host-collections-d2-inventory", INV_SOURCES);
+    let mut failures = Vec::new();
+    for method in [
+        "surface",
+        "subListClass",
+        "subListSet",
+        "subListAdd",
+        "subListClear",
+        "subListRemove",
+        "subListSetNull",
+        "listSubListSet",
+        "listSubListClear",
+    ] {
+        let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+        host.begin_client_frame(
+            std::sync::Arc::new(ClientSnapshot {
+                player: Some(ClientPlayer::default()),
+                ..ClientSnapshot::default()
+            }),
+            &[],
+        );
+        let answer = fixture.jar.invoke_method_with_args(
+            "demo/Inv",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        let text = match answer {
+            Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+            other => format!("{other:?}"),
+        };
+        let unknown = host.unknown_host_calls();
+        let ok = if method == "surface" {
+            text == line_of(INV_ORACLE, method) && unknown.is_empty()
+        } else {
+            unknown.iter().any(|(call, _)| call.contains("#subList("))
+        };
+        if !ok {
+            failures.push(format!(
+                "{method}\n  java:   {}\n  native: {text}\n  unknown: {unknown:?}",
+                line_of(INV_ORACLE, method)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
