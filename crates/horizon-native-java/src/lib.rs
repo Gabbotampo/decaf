@@ -19,6 +19,7 @@ mod array_deque;
 mod array_store;
 mod array_views;
 mod attachment_codec;
+mod bigdecimal_slice;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -26,6 +27,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+pub mod client_frame;
 mod client_reload;
 pub mod client_surface;
 mod client_values;
@@ -5755,6 +5757,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = bigdecimal_slice::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = http_client::static_field(&r.owner, &r.name, &r.descriptor) {
             return Ok(value);
         }
@@ -5965,6 +5970,9 @@ impl Host for StdHost {
         }
         // Mixin's environment and MixinExtras' bootstrap (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_invoke(r) {
+            return Ok(value);
+        }
+        if let Some(value) = client_frame::block_pos_static(r, args) {
             return Ok(value);
         }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
@@ -12013,6 +12021,8 @@ fn marker_id(value: &str) -> Option<String> {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
+        "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
@@ -26437,6 +26447,32 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn invoke_bigdecimal_static(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        match bigdecimal_slice::static_call(self, r, args) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn invoke_bigdecimal_instance(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        match bigdecimal_slice::instance_call(self, r, receiver, args) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// One jar frame, executed instruction by instruction.
     fn invoke_throwable_suppressed(
         &mut self,
@@ -27838,6 +27874,15 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         dfu_either::runtime_call(self, &r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_bigdecimal_instance(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
