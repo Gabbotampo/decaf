@@ -23401,6 +23401,20 @@ impl<H: Host> Runtime<'_, H> {
             "java/io/FileInputStream" if r.name == "<init>" || r.name == "read" => {
                 self.host.unknown_operand_call(r).map(Some)
             }
+            "java/nio/file/Files"
+                if matches!(
+                    r.name.as_str(),
+                    "newOutputStream"
+                        | "newBufferedWriter"
+                        | "newBufferedReader"
+                        | "readString"
+                        | "writeString"
+                        | "write"
+                        | "createFile"
+                ) =>
+            {
+                self.host.unknown_operand_call(r).map(Some)
+            }
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
