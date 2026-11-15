@@ -333,7 +333,7 @@ fn all_mods_is_the_loader_owned_unmodifiable_wrapper() {
     let mut host = host(&run, Some("26.3"));
     assert_eq!(
         text(&run, &mut host, "allModsCollection"),
-        "same=true,unmodifiable"
+        "java.util.Collections$UnmodifiableRandomAccessList,same=false,unmodifiable"
     );
     assert_eq!(
         host.unknown_host_call_count(),

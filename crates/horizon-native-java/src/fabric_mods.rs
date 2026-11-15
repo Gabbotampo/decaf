@@ -153,9 +153,10 @@ impl StdHost {
                         class: entry.class.clone(),
                         provider: id.clone(),
                     };
-                    if !self.fabric_entrypoint_containers.contains(&row) {
-                        self.fabric_entrypoint_containers.push(row);
-                    }
+                    // EntrypointStorage.add appends a fresh Entry for every
+                    // declaration. Fabric does not deduplicate identical
+                    // kind/class/provider rows.
+                    self.fabric_entrypoint_containers.push(row);
                 }
             }
         }
@@ -265,15 +266,15 @@ impl StdHost {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/Collection;") => {
                 let containers = self.fabric_containers();
-                // `FabricLoaderImpl.setup` stores the one
-                // `Collections.unmodifiableList(mods)` wrapper and returns
-                // that same object on every query. The backing list is fixed
-                // after setup, so a shared immutable host row is exact here.
-                Some(Ok(self.shared_unmodifiable(
-                    "fabric-loader-all-mods",
-                    "java/util/Collections$UnmodifiableRandomAccessList",
-                    containers,
-                )))
+                // Fabric calls Collections.unmodifiableList(mods) inside
+                // getAllMods, so each query makes a fresh wrapper over the
+                // same loader-owned list. The private backing list is not
+                // exposed to the jar; the view exists only to preserve the
+                // JDK wrapper class and identity contract.
+                let source = self.fresh_list(containers);
+                Some(Ok(self
+                    .unmodifiable_view("list", &source)
+                    .expect("fresh list is a host collection")))
             }
             (MOD_METADATA, ..) => {
                 let id = loader::metadata_id(receiver)?;

@@ -102,17 +102,20 @@ public final class Loader {
             l.invokeEntrypoints("main", Runnable.class, value -> { });
             return "none";
         } catch (Throwable e) {
-            return e.getClass().getSimpleName() + ":" + e.getMessage();
+            return e.getClass().getSimpleName() + ":" + e.getMessage() + ":"
+                + e.getCause().getClass().getSimpleName();
         }
     }
 
     public static String invokeFailure(FabricLoader l) {
+        int[] count = {0};
         try {
             l.invokeEntrypoints("main", ModInitializer.class,
-                value -> { throw new IllegalStateException("boom"); });
+                value -> { count[0]++; throw new IllegalStateException("boom"); });
             return "none";
         } catch (Throwable e) {
-            return e.getClass().getSimpleName() + ":" + e.getMessage();
+            return e.getClass().getSimpleName() + ":" + e.getMessage() + ":"
+                + e.getCause().getClass().getSimpleName() + ":" + count[0];
         }
     }
 

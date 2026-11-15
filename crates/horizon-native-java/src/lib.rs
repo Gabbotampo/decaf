@@ -2669,6 +2669,7 @@ pub trait Host {
         _kind: &str,
         _class: &str,
         _requested: &str,
+        _ordinal: usize,
     ) -> Option<Value> {
         None
     }
@@ -2724,6 +2725,18 @@ pub trait Host {
     /// interpreter allocates one and registers the message here. `getMessage`
     /// and `toString` then answer through the host's existing Throwable model.
     fn record_throwable(&mut self, _marker: &str, _message: Option<String>) {}
+
+    /// Record the cause of a host-created wrapper throwable. The default host
+    /// has no throwable table, so it keeps the older message-only behavior.
+    fn record_throwable_cause(&mut self, _marker: &str, _cause: Value) {}
+
+    /// A wrapper throwable whose cause is known before its marker is created.
+    fn record_wrapped_cause(&mut self, _class: &str, _message: Option<&str>, _cause: Value) {}
+
+    /// Take a cause staged for the next throwable with this class/message.
+    fn take_wrapped_cause(&mut self, _class: &str, _message: &Option<String>) -> Option<Value> {
+        None
+    }
 
     /// Return jar-owned class state retained across native callback invocations.
     /// Hosts that do not keep a resident jar instance use an empty snapshot.
@@ -3479,6 +3492,7 @@ impl StdHost {
         kind: &str,
         class: &str,
         requested: Option<&str>,
+        ordinal: usize,
     ) -> Option<Value> {
         if class.contains("::") || requested.is_none() {
             return None;
@@ -3490,9 +3504,23 @@ impl StdHost {
         // One object per entrypoint key (Fabric Loader 0.19.5's
         // `EntrypointStorage.add`: a new `NewEntry`, with its own instance
         // map, per key).
-        self.constructed_entrypoints
-            .get(&(kind.to_owned(), internal))
-            .cloned()
+        let object = self
+            .constructed_entrypoints
+            .get(&(kind.to_owned(), internal.clone()))
+            .cloned()?;
+        if ordinal == 0 {
+            Some(object)
+        } else {
+            // Fabric's storage creates a distinct Entry (and therefore a
+            // distinct cached instance) for every duplicate declaration. The
+            // native entrypoint runner has one constructed object for the
+            // class, so give later duplicate rows distinct handles while
+            // retaining the normal object for the first row.
+            Some(jar_object::handle(format!(
+                "{internal}#{}",
+                1_000_000 + ordinal
+            )))
+        }
     }
 
     fn empty_collection(&mut self, kind: &str) -> Value {
@@ -4202,8 +4230,7 @@ impl StdHost {
     }
 
     /// Add one bounded Fabric entrypoint container to the loader view.
-    /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
-    /// deterministic when a launcher seeds the same jar more than once.
+    /// Fabric stores every declaration, including duplicate rows.
     pub fn with_fabric_entrypoint(
         mut self,
         kind: impl Into<String>,
@@ -4215,9 +4242,7 @@ impl StdHost {
             class: class.into(),
             provider: provider.into(),
         };
-        if !self.fabric_entrypoint_containers.contains(&entry) {
-            self.fabric_entrypoint_containers.push(entry);
-        }
+        self.fabric_entrypoint_containers.push(entry);
         self
     }
 
@@ -4886,8 +4911,14 @@ impl Host for StdHost {
         rows
     }
 
-    fn fabric_entrypoint_object(&self, kind: &str, class: &str, requested: &str) -> Option<Value> {
-        self.fabric_entrypoint_object(kind, class, Some(requested))
+    fn fabric_entrypoint_object(
+        &self,
+        kind: &str,
+        class: &str,
+        requested: &str,
+        ordinal: usize,
+    ) -> Option<Value> {
+        self.fabric_entrypoint_object(kind, class, Some(requested), ordinal)
     }
 
     fn note_content_builder(&mut self, event: ContentBuilderEvent) {
@@ -5301,6 +5332,23 @@ impl Host for StdHost {
             self.throwable_causes.insert(marker.to_owned(), None);
         }
         self.throwable_messages.insert(marker.to_owned(), message);
+    }
+
+    fn record_throwable_cause(&mut self, marker: &str, cause: Value) {
+        self.throwable_causes.insert(marker.to_owned(), Some(cause));
+    }
+
+    fn record_wrapped_cause(&mut self, class: &str, message: Option<&str>, cause: Value) {
+        self.throwable_causes.insert(
+            wrapped_cause_key(class, &message.map(str::to_owned)),
+            Some(cause),
+        );
+    }
+
+    fn take_wrapped_cause(&mut self, class: &str, message: &Option<String>) -> Option<Value> {
+        self.throwable_causes
+            .remove(&wrapped_cause_key(class, message))
+            .flatten()
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
@@ -9913,7 +9961,7 @@ impl Host for StdHost {
                     ));
                 }
                 let mut values = Vec::new();
-                for entry in entries {
+                for (ordinal, entry) in entries.into_iter().enumerate() {
                     if r.name == "getEntrypointContainers" {
                         values.push(host_fabric_runtime::entrypoint_container(
                             &host_fabric_runtime::ContainerParts {
@@ -9921,6 +9969,7 @@ impl Host for StdHost {
                                 class: entry.class,
                                 provider: entry.provider,
                                 requested: requested.clone(),
+                                ordinal,
                             },
                         ));
                     } else {
@@ -9928,6 +9977,7 @@ impl Host for StdHost {
                             &kind,
                             &entry.class,
                             requested.as_deref(),
+                            ordinal,
                         ) {
                             Some(object) => values.push(object),
                             None => return self.unknown_host_call(r),
@@ -10007,6 +10057,7 @@ impl Host for StdHost {
                             &parts.kind,
                             &parts.class,
                             parts.requested.as_deref(),
+                            parts.ordinal,
                         )
                     });
                 match object {
@@ -11380,6 +11431,10 @@ fn is_throwable_marker(marker: &str) -> bool {
     jar_object::marker_class(marker).is_some_and(is_throwable_owner)
 }
 
+fn wrapped_cause_key(class: &str, message: &Option<String>) -> String {
+    format!("@wrapped-cause/{class}/{message:?}")
+}
+
 /// The superclass of the JDK throwable types a mod catch block can name.
 ///
 /// A jar's own classes carry their `super_class`, but `java/lang/*` classes
@@ -12725,9 +12780,11 @@ fn object_text(host: &mut StdHost, value: &Value) -> String {
 impl<H: Host> Runtime<'_, H> {
     /// `FabricLoaderImpl.invokeEntrypoints` walks the entrypoint rows in the
     /// same order as `getEntrypointContainers`, obtains each cached instance,
-    /// and passes it to the supplied `Consumer`. Loader failures are wrapped
-    /// in Fabric's `EntrypointException`; they must not turn into a neutral
-    /// `null`/`void` answer because callers commonly catch this exact type.
+    /// and passes it to the supplied `Consumer`. Fabric catches `Throwable`
+    /// for every row, wraps it with the stage/provider/definition message,
+    /// gathers later failures, and continues before throwing the first
+    /// wrapper. An entrypoint loading/type error is itself an
+    /// `EntrypointException` with its original cause.
     fn invoke_fabric_entrypoints(
         &mut self,
         r: &MethodRef,
@@ -12755,16 +12812,43 @@ impl<H: Host> Runtime<'_, H> {
             .get(2)
             .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Consumer".into()))?
             .clone();
-        for (class, provider) in self.host.fabric_entrypoints(&kind) {
-            let object = self.host.fabric_entrypoint_object(&kind, &class, requested);
+        let entries = self.host.fabric_entrypoints(&kind);
+        if entries.is_empty() {
+            // The standalone host does not know the run's loader rows. Keep
+            // this counted, as the old host path did, rather than silently
+            // answering an empty invocation.
+            self.host.unknown_operand_call(r)?;
+            return Ok(Some(Value::Void));
+        }
+        let mut first_failure: Option<(String, Value)> = None;
+        for (ordinal, (entry_class, provider)) in entries.into_iter().enumerate() {
+            let object =
+                self.host
+                    .fabric_entrypoint_object(&kind, &entry_class, requested, ordinal);
             let Some(object) = object else {
-                return Err(NativeError::UncaughtException {
-                    class: "net/fabricmc/loader/api/EntrypointException".into(),
-                    message: Some(format!(
-                        "Exception while loading entries for entrypoint '{kind}' provided by '{provider}'"
+                let loading_message = format!(
+                    "Exception while loading entries for entrypoint '{kind}' provided by '{provider}'"
+                );
+                let cast_cause = self.caught_throwable(
+                    "java/lang/ClassCastException",
+                    Some(format!(
+                        "entrypoint {entry_class} is not assignable to {requested}"
                     )),
-                    frame: None,
-                });
+                    None,
+                );
+                let loading = self.caught_throwable(
+                    "net/fabricmc/loader/api/EntrypointException",
+                    Some(loading_message),
+                    None,
+                );
+                if let Some(marker) = jar_object::instance_key(&loading) {
+                    self.host.record_throwable_cause(marker, cast_cause);
+                }
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                first_failure.get_or_insert((stage_message, loading));
+                continue;
             };
             let accepted = match self.run_functional(
                 (
@@ -12776,25 +12860,41 @@ impl<H: Host> Runtime<'_, H> {
                 &[object],
             ) {
                 Ok(accepted) => accepted,
-                Err(_) => {
-                    return Err(NativeError::UncaughtException {
-                        class: "net/fabricmc/loader/api/EntrypointException".into(),
-                        message: Some(format!(
-                            "Exception while invoking entrypoint '{kind}' provided by '{provider}'"
-                        )),
-                        frame: None,
-                    });
+                Err(NativeError::UncaughtException {
+                    class: thrown_class,
+                    message,
+                    frame,
+                }) => {
+                    let cause = self.caught_throwable(&thrown_class, message, frame.as_deref());
+                    let stage_message = format!(
+                        "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                    );
+                    first_failure.get_or_insert((stage_message, cause));
+                    continue;
                 }
+                Err(error) => return Err(error),
             };
             if !accepted {
-                return Err(NativeError::UncaughtException {
-                    class: "net/fabricmc/loader/api/EntrypointException".into(),
-                    message: Some(format!(
-                        "Exception while invoking entrypoint '{kind}' provided by '{provider}'"
-                    )),
-                    frame: None,
-                });
+                self.host.unknown_operand_call(r)?;
+                let cause = self.caught_throwable(
+                    "java/lang/RuntimeException",
+                    Some("entrypoint consumer was not executable".into()),
+                    None,
+                );
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                first_failure.get_or_insert((stage_message, cause));
             }
+        }
+        if let Some((message, cause)) = first_failure {
+            self.host
+                .record_wrapped_cause("java/lang/RuntimeException", Some(&message), cause);
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/RuntimeException".into(),
+                message: Some(message),
+                frame: None,
+            });
         }
         Ok(Some(Value::Void))
     }
@@ -17247,14 +17347,19 @@ impl NativeJar {
         for declaration in &self.native_declarations {
             host.declared_registrations.insert(declaration.key());
         }
-        let provider = self
-            .fabric_id
-            .as_deref()
-            .or(self.neoforge_id.as_deref())
-            .unwrap_or("unknown");
-        for (kind, entries) in &self.fabric_entrypoints {
-            for entry in entries {
-                host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+        // `record_fabric_metadata` already copied declarations from a real
+        // fabric.mod.json. Synthetic class-only jars have no metadata bytes,
+        // so retain the explicit builder path for their unit fixtures.
+        if !self.resource_bytes.contains_key("fabric.mod.json") {
+            let provider = self
+                .fabric_id
+                .as_deref()
+                .or(self.neoforge_id.as_deref())
+                .unwrap_or("unknown");
+            for (kind, entries) in &self.fabric_entrypoints {
+                for entry in entries {
+                    host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+                }
             }
         }
         host
@@ -24953,9 +25058,13 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.caught_object(class, &message, frame) {
             return value;
         }
+        let pending_cause = self.host.take_wrapped_cause(class, &message);
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
+            if let Some(cause) = pending_cause {
+                self.host.record_throwable_cause(marker, cause);
+            }
         }
         value
     }

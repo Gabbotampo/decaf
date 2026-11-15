@@ -105,11 +105,12 @@ public final class Probe {
     public static String allModsCollection() {
         java.util.Collection<ModContainer> first = FabricLoader.getInstance().getAllMods();
         java.util.Collection<ModContainer> second = FabricLoader.getInstance().getAllMods();
+        String className = first.getClass().getName();
         try {
             first.clear();
-            return "same=" + (first == second) + ",mutable";
+            return className + ",same=" + (first == second) + ",mutable";
         } catch (UnsupportedOperationException e) {
-            return "same=" + (first == second) + ",unmodifiable";
+            return className + ",same=" + (first == second) + ",unmodifiable";
         }
     }
 }

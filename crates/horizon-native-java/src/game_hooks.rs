@@ -1380,8 +1380,15 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.fabric_entrypoints(kind)
     }
 
-    fn fabric_entrypoint_object(&self, kind: &str, class: &str, requested: &str) -> Option<Value> {
-        self.inner.fabric_entrypoint_object(kind, class, requested)
+    fn fabric_entrypoint_object(
+        &self,
+        kind: &str,
+        class: &str,
+        requested: &str,
+        ordinal: usize,
+    ) -> Option<Value> {
+        self.inner
+            .fabric_entrypoint_object(kind, class, requested, ordinal)
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
@@ -1543,6 +1550,18 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
         self.inner.record_throwable(marker, message);
+    }
+
+    fn record_throwable_cause(&mut self, marker: &str, cause: Value) {
+        self.inner.record_throwable_cause(marker, cause);
+    }
+
+    fn record_wrapped_cause(&mut self, class: &str, message: Option<&str>, cause: Value) {
+        self.inner.record_wrapped_cause(class, message, cause);
+    }
+
+    fn take_wrapped_cause(&mut self, class: &str, message: &Option<String>) -> Option<Value> {
+        self.inner.take_wrapped_cause(class, message)
     }
 
     fn persistent_class_state(&self) -> (BTreeMap<String, Value>, BTreeSet<String>) {
