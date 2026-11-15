@@ -195,6 +195,16 @@ impl Style {
         Some(self)
     }
 
+    /// Style.applyTo: fields explicitly set by this style win; an unset
+    /// field inherits from the argument style.
+    pub(crate) fn apply_to(self, other: Self) -> Self {
+        Self {
+            colour: self.colour.or(other.colour),
+            flags: std::array::from_fn(|i| self.flags[i].or(other.flags[i])),
+            extra: self.extra || other.extra,
+        }
+    }
+
     fn text(&self) -> Option<String> {
         if self.extra {
             return None;

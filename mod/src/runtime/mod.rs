@@ -26023,7 +26023,7 @@ impl<H: Host> Runtime<'_, H> {
         self.arrays.get(host_array::array_key(value)?)
     }
 
-    fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
+    pub(crate) fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
         let key = expect_array_key(value)?;
         if host_array::is_shared_empty(key) {
             return Ok(&EMPTY_ARRAY_VALUES);
@@ -27684,6 +27684,12 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A jar's copy of a loader class its run's loader
                         // lacks (`class_precedence.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        client_surface::text::runtime_call(self, receiver.as_ref(), &r, &args)
+                            .transpose()
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
