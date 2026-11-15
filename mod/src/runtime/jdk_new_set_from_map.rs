@@ -72,17 +72,34 @@ impl StdHost {
             .map(|(class, _)| class == "java/util/IdentityHashMap")
             .unwrap_or(false);
         let values = self.mutable_collections.get_mut(&map)?;
-        let same = |left: &Value, right: &Value| {
+        let identity_equal = |left: &Value, right: &Value| -> Option<bool> {
+            match (left, right) {
+                (Value::Host(left), Value::Host(right)) => left.same_object(right),
+                (Value::Ref(None), Value::Ref(None)) => Some(true),
+                _ => None,
+            }
+        };
+        let position = |values: &[Value], key: &Value| -> Option<Option<usize>> {
             if identity {
-                crate::runtime::object_methods::identical(left, right)
+                for (index, pair) in values.chunks_exact(2).enumerate() {
+                    match identity_equal(&pair[0], key) {
+                        Some(true) => return Some(Some(index)),
+                        Some(false) => {}
+                        None => return None,
+                    }
+                }
+                Some(None)
             } else {
-                left == right
+                Some(values.chunks_exact(2).position(|pair| pair[0] == *key))
             }
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
                 let key = args.first()?.clone();
-                if values.chunks_exact(2).any(|pair| same(&pair[0], &key)) {
+                let Some(position) = position(values, &key) else {
+                    return Some(self.unknown_host_call(r));
+                };
+                if position.is_some() {
                     return Some(Ok(Value::Int(0)));
                 }
                 values.extend([key, Value::Int(1)]);
@@ -90,8 +107,10 @@ impl StdHost {
             }
             ("remove", "(Ljava/lang/Object;)Z") => {
                 let key = args.first()?;
-                let Some(index) = values.chunks_exact(2).position(|pair| same(&pair[0], key))
-                else {
+                let Some(position) = position(values, key) else {
+                    return Some(self.unknown_host_call(r));
+                };
+                let Some(index) = position else {
                     return Some(Ok(Value::Int(0)));
                 };
                 values.drain(index * 2..index * 2 + 2);
