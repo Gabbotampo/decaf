@@ -82,7 +82,7 @@ impl Fixture {
 
 
     /// Compile a probe against a string classpath for lightweight fixtures.
-    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+    pub fn build_with_classpath<P: AsRef<Path>>(test: &str, sources: &[(&str, &str)], classpath: P) -> Self {
         Self::build_packed(
             test,
             sources,
@@ -90,7 +90,7 @@ impl Fixture {
             false,
             "demo",
             None,
-            Some(Path::new(classpath)),
+            Some(classpath.as_ref()),
         )
     }
 
