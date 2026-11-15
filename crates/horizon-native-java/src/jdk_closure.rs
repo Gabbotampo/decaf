@@ -4,7 +4,11 @@
 //! `jdk_supertypes_25.txt` is generated, never edited: `tests/fixtures/jdk_supertypes/
 //! JdkSupertypes.java` run on OpenJDK 25 prints, for each class the runtime's JDK answers read,
 //! whether it is final or an interface and its whole supertype set (`getSuperclass()` and
-//! `getInterfaces()`, transitively), then every package of every system module. A JDK class's
+//! `getInterfaces()`, transitively) and which of `equals`/`hashCode`/`toString`/`compareTo` its
+//! objects run a JDK body of rather than `Object`'s (`jdk_object_methods.rs`, #217); then that
+//! last fact for every public class of every package the system modules export (`object` rows,
+//! [`object_members`]); then every package of every system module with the module
+//! that holds it (`module_of`). A JDK class's
 //! supertypes can only come from those packages: the boot and platform loaders that define JDK
 //! classes cannot see a class path, so a JDK class never extends or implements a jar's or a game's
 //! type. That is a proof; "a JDK class is not an `org.w3c.dom.Element`" is not one (`IIOMetadataNode`
@@ -24,11 +28,24 @@ pub(crate) struct JdkClass {
     /// [`Self::supertypes`] without `java/lang/Object`: what `jdk_model::platform_supertypes`
     /// lists.
     pub(crate) below_object: Vec<&'static str>,
+    /// `getSuperclass()`: `None` for an interface and for `Object`.
+    pub(crate) superclass: Option<&'static str>,
+    /// `getInterfaces()`, in declaration order.
+    pub(crate) interfaces: Vec<&'static str>,
+    /// Which of `equals`, `hashCode`, `toString` and `compareTo` the class declares or inherits
+    /// from a superclass other than `Object` (`compareTo`: it is `Comparable`). Empty for an
+    /// interface.
+    pub(crate) overrides: Vec<&'static str>,
 }
 
 struct Table {
     classes: HashMap<&'static str, JdkClass>,
     packages: HashSet<&'static str>,
+    /// The system module holding each package.
+    modules: HashMap<&'static str, &'static str>,
+    /// Every public class of an exported package: the letters of the `Object` members it runs
+    /// a JDK body of (`e`quals, `h`ashCode, `t`oString, `c`ompareTo), `-` for none.
+    objects: HashMap<String, &'static str>,
 }
 
 fn table() -> &'static Table {
@@ -36,10 +53,25 @@ fn table() -> &'static Table {
     TABLE.get_or_init(|| {
         let mut classes = HashMap::new();
         let mut packages = HashSet::new();
+        let mut modules = HashMap::new();
+        let mut objects = HashMap::new();
+        let names = |text: Option<&'static str>| -> Vec<&'static str> {
+            text.unwrap_or_default()
+                .split(' ')
+                .filter(|name| !name.is_empty())
+                .collect()
+        };
         for line in DATA.lines().filter(|line| !line.starts_with('#')) {
             let mut fields = line.split('\t');
             match (fields.next(), fields.next(), fields.next(), fields.next()) {
                 (Some("class"), Some(name), Some(flags), supertypes) => {
+                    let superclass = fields.next().filter(|name| *name != "-");
+                    let interfaces = names(fields.next());
+                    let overrides = fields
+                        .next()
+                        .filter(|members| *members != "-")
+                        .map(|members| members.split(',').collect())
+                        .unwrap_or_default();
                     let supertypes: Vec<&str> = supertypes
                         .unwrap_or_default()
                         .split(' ')
@@ -57,22 +89,53 @@ fn table() -> &'static Table {
                             is_interface: flags == "interface",
                             supertypes,
                             below_object,
+                            superclass,
+                            interfaces,
+                            overrides,
                         },
                     );
                 }
-                (Some("package"), Some(name), None, None) => {
+                (Some("object"), Some(package), Some(entries), None) => {
+                    for entry in entries.split(' ') {
+                        let Some((simple, flags)) = entry.split_once('=') else {
+                            panic!("malformed jdk_supertypes_25.txt object entry: {entry:?}");
+                        };
+                        objects.insert(format!("{package}/{simple}"), flags);
+                    }
+                }
+                (Some("package"), Some(name), Some(module), None) => {
                     packages.insert(name);
+                    modules.insert(name, module);
                 }
                 _ => panic!("malformed jdk_supertypes_25.txt line: {line:?}"),
             }
         }
-        Table { classes, packages }
+        Table {
+            classes,
+            packages,
+            modules,
+            objects,
+        }
     })
+}
+
+/// Which of `Object`'s members (and `compareTo`) the public JDK class `name` runs a JDK body
+/// of, as `object` rows spell them (`e`, `h`, `t`, `c`; `-` for none). `None` for a class no
+/// exported package of the system modules holds publicly.
+pub(crate) fn object_members(name: &str) -> Option<&'static str> {
+    table().objects.get(name).copied()
 }
 
 /// The generated row of JDK class `name`.
 pub(crate) fn class(name: &str) -> Option<&'static JdkClass> {
     table().classes.get(name)
+}
+
+/// The system module (Java 25's) holding class `name`'s package
+/// (`java/util/logging/Logger` → `java.logging`), `None` outside the JDK.
+pub(crate) fn module_of(name: &str) -> Option<&'static str> {
+    let (package, _) = name.rsplit_once('/')?;
+    table().modules.get(package).copied()
 }
 
 /// Whether `name`'s package belongs to a system module (`java/util/List`, `org/w3c/dom/Node`,

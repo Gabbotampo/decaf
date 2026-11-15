@@ -69,12 +69,7 @@ pub(crate) struct SavedDataState {
 }
 
 fn id_of(value: &Value) -> Option<String> {
-    let text = expect_ref(value)?.strip_prefix("identifier/")?;
-    Some(if text.contains(':') {
-        text.to_owned()
-    } else {
-        format!("minecraft:{text}")
-    })
+    crate::host_ids::identifier_key(value).map(str::to_owned)
 }
 
 impl SavedDataState {
@@ -109,7 +104,7 @@ impl SavedDataState {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        let text = expect_ref(receiver)?;
+        let text = crate::game_object::text(receiver)?;
         let name = r.name.as_str();
         let descriptor = r.descriptor.as_str();
         if r.owner == TYPE_CLASS && name == "<init>" {
@@ -243,7 +238,7 @@ impl<H: Host> Runtime<'_, H> {
         let (Some(storage), [saved_type]) = (receiver, args) else {
             return Ok(None);
         };
-        if expect_ref(storage).map(String::as_str) != Some(STORAGE) {
+        if crate::game_object::text(storage).map(String::as_str) != Some(STORAGE) {
             return Ok(None);
         }
         let call = |name: &str, descriptor: &str, owner: &str| MethodRef {
@@ -297,16 +292,17 @@ mod tests {
         }
     }
 
+    /// A game object's handle (`game/…`), else the text (a jar object).
     fn marker(text: &str) -> Value {
-        Value::Ref(Some(text.into()))
+        crate::game_object::value(text).unwrap_or_else(|| Value::Ref(Some(text.into())))
     }
 
     fn build(state: &mut SavedDataState, object: &str, id: &str) {
         let init = call(TYPE_CLASS, "<init>", TYPE_INIT);
         let args = [
-            marker(&format!("identifier/{id}")),
+            crate::host_ids::identifier_of_text(id),
             marker("@indy:demo/Data::new"),
-            marker("codec/opaque"),
+            crate::host_codec::opaque_codec("com/mojang/serialization/Codec"),
             Value::Ref(None),
         ];
         assert_eq!(

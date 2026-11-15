@@ -1,16 +1,16 @@
-//! `java.util.Comparator` values and the stream stages config and service
-//! code reaches beyond `map`/`filter`/`collect`.
+//! `java.util.Comparator` values and the stream sources and value-list
+//! terminals config and service code reaches beyond `map`/`filter`/`collect`.
 //!
-//! The runtime's streams are eager: a stream marker owns the list of its
-//! elements (`Runtime::streams`), and every stage answers a new marker. This
-//! module adds the sources and stages real jars stopped on:
+//! A stream source owns the list of its elements (`Runtime::streams`); the
+//! stages and the per-element terminals run lazily over it
+//! (`stream_pipeline.rs`). This module adds the sources and terminals real
+//! jars stopped on:
 //!
-//! * `IntStream.range`/`rangeClosed`/`of` and the `LongStream` ranges, with
-//!   `mapToObj`, `mapToInt`/`Long`/`Double`, `boxed` and `sum` (Xaero's
-//!   config options enumerate their indices with
+//! * `IntStream.range`/`rangeClosed`/`of` and the `LongStream` ranges, and
+//!   `sum` (Xaero's config options enumerate their indices with
 //!   `IntStream.rangeClosed(min, max).mapToObj(...)`).
-//! * `sorted`, `max`, `min`, `findFirst`, `findAny` and `reduce` (rrls picks
-//!   its highest-priority service with `stream.max(COMPARATOR)`).
+//! * The comparators `sorted`, `max` and `min` take (rrls picks its
+//!   highest-priority service with `stream.max(COMPARATOR)`).
 //!
 //! A comparator is a marker in the runtime's string vocabulary, built by the
 //! host from `Comparator`'s factories and combinators and evaluated here,
@@ -37,6 +37,17 @@ use crate::{Boxed, MethodRef, NativeError, Value, expect_ref};
 
 /// Prefix of a modelled `Comparator` marker.
 const COMPARATOR_PREFIX: &str = "@cmp:";
+
+/// The streams whose JDK spliterator reports SIZED (#166 F3): the lazy
+/// pipeline (`stream_pipeline.rs`) reads it, so `count()` of a SIZED
+/// pipeline answers the size without traversing (JDK 25's
+/// `ReduceOps.makeRefCounting`): no `peek` or `map` runs, and a `sorted()`
+/// never compares, so `Stream.of(new int[0], new int[0]).sorted().count()`
+/// is `2`, not the `ClassCastException` of comparing two arrays.
+#[derive(Default)]
+pub(crate) struct StreamPlan {
+    sized: std::collections::BTreeSet<String>,
+}
 
 fn comparator(body: &str) -> Value {
     Value::Ref(Some(format!("{COMPARATOR_PREFIX}{body}")))
@@ -102,9 +113,13 @@ pub(crate) fn comparator_instance(
         return None;
     }
     match (r.name.as_str(), r.descriptor.as_str()) {
-        ("reversed", "()Ljava/util/Comparator;") => {
-            Some(comparator(&format!("reverse:{}", escaped(&[receiver]))))
-        }
+        // `ReverseComparator2.reversed()` answers the comparator it reverses, and
+        // `Collections.reverseOrder().reversed()` is `naturalOrder()`: reversing a reversal is
+        // the original, never one more level to recurse through (#250).
+        ("reversed", "()Ljava/util/Comparator;") => Some(
+            reversed_inner(receiver)
+                .unwrap_or_else(|| comparator(&format!("reverse:{}", escaped(&[receiver])))),
+        ),
         ("thenComparing", "(Ljava/util/Comparator;)Ljava/util/Comparator;") => {
             let other = args.first()?;
             Some(comparator(&format!("then:{}", escaped(&[receiver, other]))))
@@ -122,6 +137,14 @@ pub(crate) fn comparator_instance(
         }
         _ => None,
     }
+}
+
+/// The comparator a `reverse:` marker reverses.
+fn reversed_inner(comparator: &Value) -> Option<Value> {
+    let body = expect_ref(comparator)?
+        .strip_prefix(COMPARATOR_PREFIX)?
+        .strip_prefix("reverse:")?;
+    operands(body).ok()?.into_iter().next()
 }
 
 /// An integral boxed or primitive value, widened to `long`.
@@ -190,6 +213,33 @@ pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> 
             }
         }
     }
+    // `((Comparable) a).compareTo(b)`: a handle whose kind is known not to
+    // be `Comparable` (an array) fails the cast, as `ComparableTimSort` does.
+    if let Value::Host(handle) = a
+        && handle.instance_of("java/lang/Comparable", &crate::host_ref::JdkHierarchy) == Some(false)
+        && let Some(class) = handle.class()
+    {
+        return Err(crate::checkcast::class_cast_exception(
+            class,
+            "java/lang/Comparable",
+        ));
+    }
+    // `String.compareTo(Object)`/`Integer.compareTo(Object)`... are bridges
+    // that cast the argument to their own class: a handle of another known
+    // class fails that cast (`"s".compareTo(new int[0])`).
+    let own = match a {
+        Value::Ref(Some(text)) if crate::value_class::is_plain_string(text) => {
+            Some("java/lang/String")
+        }
+        Value::Boxed(boxed) => Some(boxed.class()),
+        _ => None,
+    };
+    if let (Some(own), Value::Host(other)) = (own, b)
+        && other.instance_of(own, &crate::host_ref::JdkHierarchy) == Some(false)
+        && let Some(class) = other.class()
+    {
+        return Err(crate::checkcast::class_cast_exception(class, own));
+    }
     Err(NativeError::Metadata(format!(
         "natural order of {} and {} is not modelled",
         super::describe_value(a),
@@ -213,6 +263,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         a: &Value,
         b: &Value,
     ) -> Result<i32, NativeError> {
+        // One level of a composed comparator (#250): a chain as deep as a jar builds it ends
+        // in a `StackOverflowError`, as Java's lambda chain does.
+        let _level = crate::host_recursion::enter()?;
         // `sorted(null)` and `List.sort(null)` mean natural order.
         let Some(marker) = expect_ref(comparator).cloned() else {
             return self.natural_order(a, b);
@@ -279,26 +332,6 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         }
     }
 
-    /// Run a `Consumer` on one element: a jar callback, else the host's
-    /// `Consumer.accept`.
-    fn apply_consumer(&mut self, consumer: &Value, value: &Value) -> Result<(), NativeError> {
-        if self
-            .invoke_callback(consumer, std::slice::from_ref(value))?
-            .is_none()
-        {
-            self.host.invoke_instance(
-                &MethodRef {
-                    owner: "java/util/function/Consumer".into(),
-                    name: "accept".into(),
-                    descriptor: "(Ljava/lang/Object;)V".into(),
-                },
-                consumer,
-                std::slice::from_ref(value),
-            )?;
-        }
-        Ok(())
-    }
-
     /// `Comparator.compare(a, b)` called by jar code on a modelled marker.
     pub(crate) fn invoke_modelled_comparator(
         &mut self,
@@ -356,10 +389,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let Some(items) = self.host.mutable_collection_values(&list) else {
             return Ok(None);
         };
-        let mut values = items
-            .iter()
-            .map(|item| super::parse_collection_value(item))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = items.clone();
         // `ArrayList.sort` sorts its own array, which a comparator that
         // throws leaves part-merged; `List.sort`'s default sorts a copy and
         // writes nothing back then.
@@ -373,7 +403,8 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let changed_under = |this: &mut Self| -> Result<Option<bool>, NativeError> {
             let structural = this.capture_mod_count(&list) != expected;
             let now = this.host.mutable_collection_values(&list);
-            Ok((structural || now.as_ref() != Some(&items)).then_some(structural))
+            let same = now.is_some_and(|now| crate::same_items(&now, &items));
+            Ok((structural || !same).then_some(structural))
         };
         let sorted = match self.sort_in_place(&mut values, &comparator) {
             Ok(()) => values,
@@ -399,6 +430,15 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             name: name.into(),
             descriptor: descriptor.into(),
         };
+        // `Arrays.asList`'s view sorts its array in place: no structural
+        // change (`array_views.rs`).
+        if matches!(
+            self.host_collection_class(&list).as_deref(),
+            Some(crate::array_views::CLASS | crate::array_views::WINDOW_CLASS)
+        ) {
+            self.host.replace_mutable_collection(&list, sorted);
+            return Ok(Some(Value::Void));
+        }
         self.host
             .invoke_instance(&method("clear", "()V"), &list, &[])?;
         let add = method("add", "(Ljava/lang/Object;)Z");
@@ -485,98 +525,21 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             ("empty", _) => Vec::new(),
             _ => return Ok(None),
         };
-        Ok(Some(self.new_stream(class, method, values)))
+        // `range`, `of` and `empty` are SIZED.
+        let stream = self.new_stream(class, method, values);
+        self.mark_sized(&stream);
+        Ok(Some(stream))
     }
 
-    /// The stream stages beyond the interpreter's core set, applied to the
-    /// receiver stream's `values`.
+    /// The value-list terminals beyond the interpreter's core set, applied to
+    /// the receiver stream's output `values` (the stages and per-element
+    /// terminals are `stream_pipeline.rs`'s).
     pub(crate) fn more_stream_stages(
         &mut self,
         r: &MethodRef,
         values: &[Value],
-        args: &[Value],
-        class: &str,
-        method: &str,
     ) -> Result<Option<Value>, NativeError> {
-        let argument = || args.first().cloned().unwrap_or(Value::Ref(None));
-        let returns = r.descriptor.rsplit_once(')').map_or("", |(_, ret)| ret);
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("sorted", "()Ljava/util/stream/Stream;") => {
-                let sorted = self.sort_values(values.to_vec(), &Value::Ref(None))?;
-                self.new_stream(class, method, sorted)
-            }
-            ("sorted", "(Ljava/util/Comparator;)Ljava/util/stream/Stream;") => {
-                let sorted = self.sort_values(values.to_vec(), &argument())?;
-                self.new_stream(class, method, sorted)
-            }
-            ("sorted", "()Ljava/util/stream/IntStream;" | "()Ljava/util/stream/LongStream;") => {
-                let sorted = self.sort_values(values.to_vec(), &Value::Ref(None))?;
-                self.new_stream(class, method, sorted)
-            }
-            // `BinaryOperator.maxBy`/`minBy`: the first of equal extremes wins.
-            ("max" | "min", "(Ljava/util/Comparator;)Ljava/util/Optional;") => {
-                let comparator = argument();
-                let mut best: Option<Value> = None;
-                for value in values {
-                    best = Some(match best {
-                        None => value.clone(),
-                        Some(current) => {
-                            let order = self.compare_with(&comparator, &current, value)?;
-                            let keep = if r.name == "max" {
-                                order >= 0
-                            } else {
-                                order <= 0
-                            };
-                            if keep { current } else { value.clone() }
-                        }
-                    });
-                }
-                best.map_or_else(super::empty_optional, super::optional_wrap)
-            }
-            ("findFirst" | "findAny", "()Ljava/util/Optional;") => values
-                .first()
-                .cloned()
-                .map_or_else(super::empty_optional, super::optional_wrap),
-            ("reduce", "(Ljava/util/function/BinaryOperator;)Ljava/util/Optional;") => {
-                let operator = argument();
-                let mut acc: Option<Value> = None;
-                for value in values {
-                    acc = Some(match acc {
-                        None => value.clone(),
-                        Some(current) => {
-                            self.apply_callback(&operator, &[current, value.clone()])?
-                        }
-                    });
-                }
-                acc.map_or_else(super::empty_optional, super::optional_wrap)
-            }
-            (
-                "reduce",
-                "(Ljava/lang/Object;Ljava/util/function/BinaryOperator;)Ljava/lang/Object;",
-            ) => {
-                let operator = args.get(1).cloned().unwrap_or(Value::Ref(None));
-                let mut acc = argument();
-                for value in values {
-                    acc = self.apply_callback(&operator, &[acc, value.clone()])?;
-                }
-                acc
-            }
-            (
-                "mapToObj" | "mapToInt" | "mapToLong" | "mapToDouble" | "boxed" | "asLongStream",
-                _,
-            ) if returns.starts_with("Ljava/util/stream/") => {
-                let mapped = if r.name == "boxed" || r.name == "asLongStream" {
-                    values.to_vec()
-                } else {
-                    let function = argument();
-                    let mut mapped = Vec::with_capacity(values.len());
-                    for value in values {
-                        mapped.push(self.apply_callback(&function, std::slice::from_ref(value))?);
-                    }
-                    mapped
-                };
-                self.new_stream(class, method, mapped)
-            }
             // The stream's elements through the host's iterator table, the
             // same iterator a `List.iterator()` over them answers.
             ("iterator", "()Ljava/util/Iterator;") => self.host.invoke_instance(
@@ -588,13 +551,6 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 &super::collection_value("list", values),
                 &[],
             )?,
-            ("forEachOrdered", "(Ljava/util/function/Consumer;)V") => {
-                let consumer = argument();
-                for value in values {
-                    self.apply_consumer(&consumer, value)?;
-                }
-                Value::Void
-            }
             ("sum", "()I") => Value::Int(
                 values
                     .iter()
@@ -611,6 +567,21 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             _ => return Ok(None),
         };
         Ok(Some(result))
+    }
+}
+
+impl<H: crate::Host> crate::Runtime<'_, H> {
+    /// A stream built from a source whose spliterator reports SIZED
+    /// (`Stream.of`, an array, a collection, `IntStream.range`).
+    pub(crate) fn mark_sized(&mut self, stream: &Value) {
+        if let Some(marker) = expect_ref(stream) {
+            self.stream_plan.sized.insert(marker.clone());
+        }
+    }
+
+    /// Whether a stream's pipeline reports SIZED.
+    pub(crate) fn stream_is_sized(&self, marker: &str) -> bool {
+        self.stream_plan.sized.contains(marker)
     }
 }
 

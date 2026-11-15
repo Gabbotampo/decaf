@@ -12,7 +12,7 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use horizon_native_java::{ExecutionReport, NativeError, NativeJar, StdHost, Value};
+use horizon_native_java::{ExecutionReport, GameObject, NativeError, NativeJar, StdHost};
 use std::{
     fs,
     io::Write,
@@ -175,7 +175,10 @@ public final class Duck {
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let mut host = StdHost::new();
-    let entity = Value::Ref(Some("net/minecraft/world/entity/Entity#1".into()));
+    // A game object the host hands a jar (`game_hooks.rs`), whose class the
+    // runtime does not hold: a handle (#156 P16e; the `game/entity/1` text
+    // it once was is a `String` now, whose cast throws).
+    let entity = GameObject::entity(1, "minecraft:zombie", true).value();
     let value = jar
         .invoke_method_with_args(
             "demo.Duck",

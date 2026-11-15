@@ -1,27 +1,29 @@
 //! What a registry marker iterates over.
 //!
-//! The host models a game registry as one `registry/<id>` marker (the key and
-//! the registry are the same value, see `vanilla_registries`), and records the
-//! entries a jar registers into it. A real `MappedRegistry.iterator()` yields
+//! The host models a game registry as a `Registry` handle keyed by its id
+//! (`host_registry.rs`), and records the entries a jar registers into it. A real `MappedRegistry.iterator()` yields
 //! every value registered in that registry; the only entries this runtime has
 //! values for are the ones the jar registered, so that is what the iterator
 //! yields, in registration order.
 //!
-//! This is a deliberate bound, named here and in the PR: the game's own
-//! entries (vanilla's ~140 entity types for `minecraft:entity_type`) are not
-//! materialised, because the host has no `EntityType` objects to hand out and
-//! inventing them would be worse than an empty iteration. A jar that walks a
-//! registry to initialise its own per-type table therefore initialises nothing
-//! for the game's types, while still seeing every entry it registered itself.
+//! The game's own entries (vanilla's ~140 entity types for
+//! `minecraft:entity_type`) are not materialised, because the host has no
+//! `EntityType` objects to hand out and inventing them would be worse than an
+//! empty iteration. So walking a registry the jar did not build itself
+//! (`StdHost::jar_registries`: every vanilla one, and any other jar's) is
+//! counted, never answered as complete (#182 P3: Java 25 answers `true` for
+//! `BuiltInRegistries.ITEM.iterator().hasNext()`), and still walks the
+//! entries the jar registered, so the entrypoint goes on. A registry the jar
+//! built and registered holds only what the jar registers into it: its walk
+//! is exact.
 //! Before this, the call answered null, and `Iterator.hasNext` on it failed the
 //! whole entrypoint (`entity-view-distance`'s `main`), which is what
 //! `docs/in-game-survey.md` records.
 
 use crate::StdHost;
 
-/// The values registered into one registry marker, in registration order.
-pub(crate) fn values(host: &StdHost, registry_marker: &str) -> Vec<crate::Value> {
-    let id = registry_marker.trim_start_matches("registry/");
+/// The values registered into registry `id`, in registration order.
+pub(crate) fn values(host: &StdHost, id: &str) -> Vec<crate::Value> {
     host.registrations
         .iter()
         .filter(|entry| entry.registry == id)

@@ -65,7 +65,7 @@ impl<H: Host> Runtime<'_, H> {
             Value::Void => return Arg::Opaque,
             Value::Ref(Some(marker)) => marker,
         };
-        if let Some(text) = self.string_builders.get(marker) {
+        if let Some(text) = self.builder_text(value) {
             return Arg::Str(text.clone());
         }
         if value_class::is_plain_string(marker) {
@@ -74,7 +74,7 @@ impl<H: Host> Runtime<'_, H> {
         // A jar object prints its own `toString` (`jar_text.rs`); one that
         // throws, or that only the JVM can print (an identity hash), is
         // refused here and counted by the host.
-        if jar_text::object_marker_class(marker).is_some() {
+        if crate::runtime::jar_object::packaged_object_class(value).is_some() {
             return match self.runtime_value_of(value, "java/util/Formatter", "format") {
                 Ok(Some(Value::Ref(Some(text)))) => Arg::Str(text),
                 Ok(Some(Value::Ref(None))) => Arg::Null,
@@ -108,9 +108,10 @@ fn boxed_arg(boxed: Boxed) -> Arg {
 fn formats_like_us(locale: &Value) -> bool {
     match locale {
         Value::Ref(None) => true,
-        Value::Ref(Some(marker)) => matches!(
-            marker.as_str(),
-            "locale/US" | "locale/ROOT" | "locale/ENGLISH" | "locale/en_US" | "locale/en_"
+        // `Locale.US`, `ROOT`, `ENGLISH` (`host_jdk_constant.rs`).
+        value @ Value::Host(_) => matches!(
+            crate::runtime::host_jdk_constant::locale_parts(value),
+            Some(("en", "US" | "") | ("", ""))
         ),
         _ => false,
     }
