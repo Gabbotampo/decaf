@@ -936,7 +936,14 @@ fn command_summary(
         .game_listeners(jar, server)
         .listeners
         .into_iter()
-        .filter(|l| l.event == GameEvent::RegisterCommands)
+        .filter(|l| {
+            l.event
+                == if server {
+                    GameEvent::RegisterCommands
+                } else {
+                    GameEvent::ClientRegisterCommands
+                }
+        })
         .collect();
     if listeners.is_empty() {
         return serde_json::Value::Null;

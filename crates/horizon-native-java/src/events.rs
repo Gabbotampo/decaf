@@ -135,6 +135,8 @@ pub enum GameEvent {
     /// NeoForge/Forge `RegisterCommandsEvent`): the listener registers on the
     /// Brigadier façade (`brigadier.rs`).
     RegisterCommands,
+    /// The client builds its Brigadier command tree (Fabric ClientCommandRegistrationCallback).
+    ClientRegisterCommands,
     // Client events: the window's own points fire them, never a server
     // (`client_surface` holds the façade they see).
     /// The client finished starting, before its first tick (Fabric
@@ -171,7 +173,7 @@ pub enum GameEvent {
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 41] = [
+    pub const ALL: [GameEvent; 42] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -202,6 +204,7 @@ impl GameEvent {
         GameEvent::PlayerCopy,
         GameEvent::PlayerChangeLevel,
         GameEvent::RegisterCommands,
+        GameEvent::ClientRegisterCommands,
         GameEvent::ClientStarted,
         GameEvent::ClientStopping,
         GameEvent::ClientTickStart,
@@ -248,6 +251,7 @@ impl GameEvent {
             GameEvent::PlayerCopy => "player_copy",
             GameEvent::PlayerChangeLevel => "player_change_level",
             GameEvent::RegisterCommands => "register_commands",
+            GameEvent::ClientRegisterCommands => "client_register_commands",
             GameEvent::ClientStarted => "client_started",
             GameEvent::ClientStopping => "client_stopping",
             GameEvent::ClientTickStart => "client_tick_start",
@@ -290,7 +294,8 @@ impl GameEvent {
     pub fn is_client(self) -> bool {
         matches!(
             self,
-            GameEvent::ClientStarted
+            GameEvent::ClientRegisterCommands
+                | GameEvent::ClientStarted
                 | GameEvent::ClientStopping
                 | GameEvent::ClientTickStart
                 | GameEvent::ClientTickEnd
@@ -674,7 +679,7 @@ const FABRIC_FIELDS: &[FabricField] = &[
         field: "EVENT",
         method: "register",
         descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;)V",
-        event: GameEvent::RegisterCommands,
+        event: GameEvent::ClientRegisterCommands,
         shape: Shape::ClientCommands,
     },
     fabric(
