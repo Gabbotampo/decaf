@@ -55,6 +55,7 @@ use crate::runtime::{
 // submodule so the crate root's module list stays the interpreter's.
 #[path = "client_items.rs"]
 mod items;
+pub(crate) use items::NON_NULL_LIST;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]
@@ -1229,7 +1230,16 @@ impl StdHost {
                     ))
                 })
                 .collect();
-                Some(Ok(crate::runtime::collection_value("list", &slots)))
+                // `List.of(values())`: one `ListN` for the run.
+                let made = self.shared_unmodifiable(
+                    "EquipmentSlot.VALUES",
+                    "java/util/ImmutableCollections$ListN",
+                    slots,
+                );
+                if let Some(key) = crate::runtime::expect_ref(&made) {
+                    self.jdk_list_of.insert(key.clone());
+                }
+                Some(Ok(made))
             }
             ("net/minecraft/world/item/ItemStack", "EMPTY") => {
                 Some(Ok(marker(format!("{}empty", items::STACK))))

@@ -44,6 +44,7 @@ pub(super) fn invoke(
     r: &MethodRef,
     receiver: Option<&Value>,
     _args: &[Value],
+    host: &mut impl crate::Host,
 ) -> Result<Option<Value>, NativeError> {
     let Some(receiver) = receiver else {
         return Ok(None);
@@ -85,7 +86,19 @@ pub(super) fn invoke(
             if kind != "path" {
                 return Err(unsupported(&format!("kind {named} doesn't have paths")));
             }
-            collection_value("list", &[path_value(&root_path(argument))])
+            // `ModOriginImpl.getPaths()` returns its `paths` field: the same
+            // list on every call (#156 P14d2).
+            let paths = vec![path_value(&root_path(argument))];
+            match host.owned_collection(
+                receiver,
+                "getPaths",
+                crate::stand_in_class("list"),
+                false,
+                paths,
+            ) {
+                Some(list) => list,
+                None => return host.unknown_operand_call(r).map(Some),
+            }
         }
         ("getParentModId", "()Ljava/lang/String;") => {
             if kind != "nested" {

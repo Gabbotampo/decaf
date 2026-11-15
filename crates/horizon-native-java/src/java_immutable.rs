@@ -90,6 +90,26 @@ fn made_class(owner: &str, name: &str, kind: &str, size: usize) -> &'static str 
         ("java/util/Collections", "singletonList", _) => "java/util/Collections$SingletonList",
         ("java/util/Collections", "singleton", _) => "java/util/Collections$SingletonSet",
         ("java/util/Collections", "singletonMap", _) => "java/util/Collections$SingletonMap",
+        // Guava 33.6.0 (`javap`): `Sets.immutableEnumSet` is `ImmutableSet.of()`/
+        // `of(e)` for none or one element, else an `ImmutableEnumSet` in
+        // ordinal order; `ImmutableMap`'s are `SingletonImmutableBiMap` for one
+        // entry, else `RegularImmutableMap`; `ImmutableBiMap`'s likewise.
+        ("com/google/common/collect/Sets", "immutableEnumSet", _) => match size {
+            0 => "com/google/common/collect/RegularImmutableSet",
+            1 => "com/google/common/collect/SingletonImmutableSet",
+            _ => "com/google/common/collect/ImmutableEnumSet",
+        },
+        (
+            "com/google/common/collect/ImmutableMap" | "com/google/common/collect/ImmutableBiMap",
+            _,
+            _,
+        ) if size == 1 => "com/google/common/collect/SingletonImmutableBiMap",
+        ("com/google/common/collect/ImmutableMap", _, _) => {
+            "com/google/common/collect/RegularImmutableMap"
+        }
+        ("com/google/common/collect/ImmutableBiMap", _, _) => {
+            "com/google/common/collect/RegularImmutableBiMap"
+        }
         ("com/google/common/collect/ImmutableList", _, _) if size == 1 => {
             "com/google/common/collect/SingletonImmutableList"
         }
@@ -110,7 +130,11 @@ fn made_class(owner: &str, name: &str, kind: &str, size: usize) -> &'static str 
         ("java/util/Set", "of" | "copyOf", _) if matches!(size, 1 | 2) => {
             "java/util/ImmutableCollections$Set12"
         }
-        ("java/util/Map", "of" | "copyOf", _) if size == 1 => "java/util/ImmutableCollections$Map1",
+        ("java/util/Map", "of" | "copyOf" | "ofEntries", _) if size == 1 => {
+            "java/util/ImmutableCollections$Map1"
+        }
+        // A view over a set no jar holds (a registry's ids, #156 P14d2).
+        ("java/util/Collections", "unmodifiableSet", _) => "java/util/Collections$UnmodifiableSet",
         (_, _, "set") => "java/util/ImmutableCollections$SetN",
         (_, _, "map") => "java/util/ImmutableCollections$MapN",
         _ => "java/util/ImmutableCollections$ListN",
@@ -131,13 +155,16 @@ fn shared_empty(owner: &str, name: &str, kind: &str) -> Option<&'static str> {
             "ImmutableCollections.EMPTY_LIST"
         }
         ("java/util/Set", "of" | "copyOf", _) => "ImmutableCollections.EMPTY_SET",
-        ("java/util/Map", "of" | "copyOf", _) => "ImmutableCollections.EMPTY_MAP",
+        ("java/util/Map", "of" | "copyOf" | "ofEntries", _) => "ImmutableCollections.EMPTY_MAP",
         ("java/util/stream/Stream", "toList", _) => "ImmutableCollections.EMPTY_LIST_NULLS",
         ("java/util/Collections", "emptyList", _) => "Collections.EMPTY_LIST",
         ("java/util/Collections", "emptySet", _) => "Collections.EMPTY_SET",
         ("java/util/Collections", "emptyMap", _) => "Collections.EMPTY_MAP",
         ("com/google/common/collect/ImmutableList", _, _) => "RegularImmutableList.EMPTY",
-        ("com/google/common/collect/ImmutableSet", _, _) => "RegularImmutableSet.EMPTY",
+        ("com/google/common/collect/ImmutableSet", _, _)
+        | ("com/google/common/collect/Sets", "immutableEnumSet", _) => "RegularImmutableSet.EMPTY",
+        ("com/google/common/collect/ImmutableMap", _, _) => "RegularImmutableMap.EMPTY",
+        ("com/google/common/collect/ImmutableBiMap", _, _) => "RegularImmutableBiMap.EMPTY",
         _ => return None,
     })
 }
@@ -192,6 +219,113 @@ pub(crate) fn member_class_names(name: &str) -> Option<(String, String)> {
         let simple = name.rsplit('$').next().unwrap_or(name).to_owned();
         (simple, name.replace('$', "."))
     })
+}
+
+/// Guava 33.6.0's direct superclass (`javap`) of an immutable class the
+/// host makes, and of its abstract ancestors, up to the JDK class Guava
+/// leaves at; `None` for any other class.
+pub(crate) fn guava_superclass(class: &str) -> Option<&'static str> {
+    Some(match class {
+        "com/google/common/collect/RegularImmutableMap" => "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/SingletonImmutableBiMap"
+        | "com/google/common/collect/RegularImmutableBiMap" => {
+            "com/google/common/collect/ImmutableBiMap"
+        }
+        "com/google/common/collect/ImmutableBiMap" => "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/ImmutableMap" => "java/lang/Object",
+        "com/google/common/collect/RegularImmutableSet" => {
+            "com/google/common/collect/ImmutableSet$CachingAsList"
+        }
+        "com/google/common/collect/ImmutableEnumSet"
+        | "com/google/common/collect/SingletonImmutableSet"
+        | "com/google/common/collect/ImmutableSet$CachingAsList" => {
+            "com/google/common/collect/ImmutableSet"
+        }
+        "com/google/common/collect/RegularImmutableList"
+        | "com/google/common/collect/SingletonImmutableList" => {
+            "com/google/common/collect/ImmutableList"
+        }
+        "com/google/common/collect/ImmutableSet" | "com/google/common/collect/ImmutableList" => {
+            "com/google/common/collect/ImmutableCollection"
+        }
+        "com/google/common/collect/ImmutableCollection" => "java/util/AbstractCollection",
+        // The game's `NonNullList<E> extends AbstractList<E>` with no
+        // interfaces of its own (26.3 `javap`), the inventory list's class
+        // (#253 re-check).
+        crate::client_surface::NON_NULL_LIST => "java/util/AbstractList",
+        // gson-2.14.0's `public final class LinkedTreeMap<K, V> extends
+        // AbstractMap<K, V> implements Serializable` (`javap`): the map
+        // `ObjectTypeAdapter` and a `Map<String, ?>` read make (#253 re-check
+        // B5).
+        crate::gson_tree::TREE_MAP => "java/util/AbstractMap",
+        _ => return None,
+    })
+}
+
+/// The interfaces those Guava classes (and Gson's `LinkedTreeMap`) declare
+/// directly, and Guava's `BiMap`'s.
+pub(crate) fn guava_interfaces(class: &str) -> &'static [&'static str] {
+    match class {
+        "com/google/common/collect/ImmutableMap" => &["java/util/Map", "java/io/Serializable"],
+        "com/google/common/collect/ImmutableBiMap" => &["com/google/common/collect/BiMap"],
+        "com/google/common/collect/BiMap" => &["java/util/Map"],
+        "com/google/common/collect/ImmutableSet" => &["java/util/Set"],
+        "com/google/common/collect/ImmutableList" => &["java/util/List", "java/util/RandomAccess"],
+        "com/google/common/collect/ImmutableCollection" => &["java/io/Serializable"],
+        crate::gson_tree::TREE_MAP => &["java/io/Serializable"],
+        _ => &[],
+    }
+}
+
+/// `target.isAssignableFrom(source)` for a Guava class [`guava_superclass`]
+/// knows: its whole chain and interfaces are known, Guava's and the JDK's
+/// (#253 review). `None` for any other source, or where the JDK's table
+/// cannot tell.
+pub(crate) fn guava_assignable(target: &str, source: &str) -> Option<bool> {
+    guava_superclass(source)?;
+    let interface_reaches = |interface: &str| -> Option<bool> {
+        let mut pending = vec![interface];
+        while let Some(current) = pending.pop() {
+            if current == target {
+                return Some(true);
+            }
+            if current.starts_with("java/") {
+                if crate::host_ref::ClassHierarchy::is_instance(
+                    &crate::host_ref::JdkHierarchy,
+                    current,
+                    target,
+                ) == Some(true)
+                {
+                    return Some(true);
+                }
+            } else {
+                pending.extend(guava_interfaces(current));
+            }
+        }
+        Some(false)
+    };
+    let mut current = source;
+    loop {
+        if current == target {
+            return Some(true);
+        }
+        for interface in guava_interfaces(current) {
+            if interface_reaches(interface) == Some(true) {
+                return Some(true);
+            }
+        }
+        match guava_superclass(current) {
+            Some(parent) => current = parent,
+            // Left Guava at a JDK class: the JDK's table decides.
+            None => {
+                return crate::host_ref::ClassHierarchy::is_instance(
+                    &crate::host_ref::JdkHierarchy,
+                    current,
+                    target,
+                );
+            }
+        }
+    }
 }
 
 /// The supertypes `instanceof` sees for one of the classes above, the
@@ -252,6 +386,27 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/lang/Iterable",
         "java/io/Serializable",
     ];
+    const GUAVA_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "com/google/common/collect/ImmutableMap",
+    ];
+    const GUAVA_BI_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "com/google/common/collect/ImmutableMap",
+        "com/google/common/collect/BiMap",
+        "com/google/common/collect/ImmutableBiMap",
+    ];
+    const GUAVA_ENUM_SET: &[&str] = &[
+        "java/util/Set",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/io/Serializable",
+        "java/util/AbstractCollection",
+        "com/google/common/collect/ImmutableCollection",
+        "com/google/common/collect/ImmutableSet",
+    ];
     const MAP: &[&str] = &["java/util/Map", "java/io/Serializable"];
     // `Arrays$ArrayList extends AbstractList implements RandomAccess,
     // Serializable` (`array_views.rs`).
@@ -276,7 +431,25 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "java/util/AbstractList",
         "java/util/AbstractCollection",
     ];
+    // The game's `NonNullList extends AbstractList` (26.3, `javap`): no
+    // `RandomAccess`.
+    const NON_NULL_LIST: &[&str] = &[
+        "java/util/List",
+        "java/util/SequencedCollection",
+        "java/util/Collection",
+        "java/lang/Iterable",
+        "java/util/AbstractList",
+        "java/util/AbstractCollection",
+    ];
+    // Gson's `LinkedTreeMap extends AbstractMap implements Serializable`.
+    const GSON_TREE_MAP: &[&str] = &[
+        "java/util/Map",
+        "java/io/Serializable",
+        "java/util/AbstractMap",
+    ];
     match class {
+        crate::client_surface::NON_NULL_LIST => NON_NULL_LIST,
+        crate::gson_tree::TREE_MAP => GSON_TREE_MAP,
         crate::array_views::CLASS => ARRAYS_LIST,
         crate::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
@@ -299,6 +472,10 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         | "com/google/common/collect/SingletonImmutableList" => GUAVA_LIST,
         "com/google/common/collect/SingletonImmutableSet" => GUAVA_SET,
         "com/google/common/collect/RegularImmutableSet" => GUAVA_REGULAR_SET,
+        "com/google/common/collect/ImmutableEnumSet" => GUAVA_ENUM_SET,
+        "com/google/common/collect/RegularImmutableMap" => GUAVA_MAP,
+        "com/google/common/collect/SingletonImmutableBiMap"
+        | "com/google/common/collect/RegularImmutableBiMap" => GUAVA_BI_MAP,
         _ => crate::sequenced::supertypes(class),
     }
 }
@@ -307,7 +484,7 @@ impl StdHost {
     /// A new unmodifiable collection of the JDK (or Guava) class `class`
     /// holding `values`: an object of its own (#156 P14c), keyed
     /// `<class>#immutable<n>`.
-    fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
+    pub(crate) fn unmodifiable_as(&mut self, class: &str, values: Vec<Value>) -> Value {
         let marker = crate::jar_object::collection_key_for(
             class,
             crate::jar_object::CollectionFamily::Immutable,
