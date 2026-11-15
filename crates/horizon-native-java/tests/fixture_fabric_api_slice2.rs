@@ -105,7 +105,7 @@ fn real_classpath(root: &Path) -> Option<String> {
         if !name.starts_with("META-INF/jars/") || !name.ends_with(".jar") {
             continue;
         }
-        let out = lib.join(Path::new(name.as_ref()).file_name()?);
+        let out = lib.join(Path::new(&name).file_name()?);
         let mut file = File::create(&out).ok()?;
         std::io::copy(&mut entry, &mut file).ok()?;
         paths.push(out);
