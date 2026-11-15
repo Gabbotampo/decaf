@@ -46,6 +46,11 @@ fn strictmath_fdlibm_specials_and_values() {
         unary("java/lang/StrictMath", "cbrt", nan).to_bits(),
         nan.to_bits()
     );
+    let negative_nan = f64::from_bits(0xfff0_0000_0000_0001);
+    assert_eq!(
+        unary("java/lang/StrictMath", "log", negative_nan).to_bits(),
+        0xfff8_0000_0000_0001
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -61,6 +66,15 @@ fn math_fdlibm_is_enabled_on_aarch64() {
         Value::Float(1024.0)
     );
     assert_eq!(unary("java/lang/Math", "log", 1.0), 0.0);
+    assert_eq!(
+        unary(
+            "java/lang/Math",
+            "log",
+            f64::from_bits(0xfff0_0000_0000_0001)
+        )
+        .to_bits(),
+        0x7ff8_0000_0000_0000
+    );
 }
 
 #[cfg(not(target_arch = "aarch64"))]
