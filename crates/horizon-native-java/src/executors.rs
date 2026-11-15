@@ -39,6 +39,8 @@ const EXECUTOR_SERVICE: &str = "java/util/concurrent/ExecutorService";
 const SCHEDULED_EXECUTOR_SERVICE: &str = "java/util/concurrent/ScheduledExecutorService";
 const SCHEDULED_FUTURE: &str = "java/util/concurrent/ScheduledFuture";
 const FUTURE: &str = "java/util/concurrent/Future";
+const COMPLETABLE_FUTURE: &str = "java/util/concurrent/CompletableFuture";
+const COMPLETION_STAGE: &str = "java/util/concurrent/CompletionStage";
 const RUNNABLE_RUN: &str = "()V";
 const CALLABLE_CALL: &str = "()Ljava/lang/Object;";
 
@@ -59,15 +61,35 @@ pub(super) fn invoke<H: Host>(
 ) -> Result<Option<Value>, NativeError> {
     match r.owner.as_str() {
         "java/util/concurrent/Executors" => invoke_executors(rt, r, args),
+        COMPLETABLE_FUTURE if receiver.is_none() => invoke_completed_future(rt, r, args),
         "java/util/concurrent/Callable" => invoke_callable(rt, r, receiver),
         EXECUTOR | EXECUTOR_SERVICE | SCHEDULED_EXECUTOR_SERVICE => {
             invoke_executor(rt, r, receiver, args)
         }
-        FUTURE | SCHEDULED_FUTURE | "java/util/concurrent/RunnableFuture" => {
-            invoke_future(rt, r, receiver)
-        }
+        FUTURE
+        | SCHEDULED_FUTURE
+        | COMPLETABLE_FUTURE
+        | COMPLETION_STAGE
+        | "java/util/concurrent/RunnableFuture" => invoke_future(rt, r, receiver, args),
         _ => Ok(None),
     }
+}
+
+fn invoke_completed_future<H: Host>(
+    rt: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    if r.name == "completedFuture"
+        && r.descriptor == "(Ljava/lang/Object;)Ljava/util/concurrent/CompletableFuture;"
+    {
+        return Ok(Some(complete_future(
+            rt,
+            args.first().cloned().unwrap_or(Value::Ref(None)),
+        )));
+    }
+    // Async factories require a real executor and stay counted.
+    Ok(None)
 }
 
 fn invoke_executors<H: Host>(
@@ -375,23 +397,70 @@ fn invoke_future<H: Host>(
     rt: &mut Runtime<'_, H>,
     r: &MethodRef,
     receiver: Option<&Value>,
+    args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
     let Some(marker) = state_marker(rt, receiver, HostKind::ExecutorFuture)? else {
         return Ok(None);
     };
-    Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
+    let value = rt
+        .fields
+        .get(&format!("{marker}|{FUTURE_VALUE}"))
+        .cloned()
+        .unwrap_or(Value::Ref(None));
+    match (r.name.as_str(), r.descriptor.as_str()) {
         ("get", "()Ljava/lang/Object;")
-        | ("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;") => rt
-            .fields
-            .get(&format!("{marker}|{FUTURE_VALUE}"))
-            .cloned()
-            .unwrap_or(Value::Ref(None)),
-        // The task ran before the future was answered, so it is always done
-        // and cannot be cancelled any more.
-        ("isDone", "()Z") => Value::Int(1),
-        ("isCancelled", "()Z") | ("cancel", "(Z)Z") => Value::Int(0),
-        _ => return Ok(None),
-    }))
+        | ("get", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;")
+        | ("join", "()Ljava/lang/Object;") => Ok(Some(value)),
+        ("isDone", "()Z") => Ok(Some(Value::Int(1))),
+        ("isCancelled", "()Z") | ("cancel", "(Z)Z") => Ok(Some(Value::Int(0))),
+        ("toCompletableFuture", "()Ljava/util/concurrent/CompletableFuture;") => {
+            Ok(receiver.cloned())
+        }
+        (
+            "thenApply",
+            "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"
+            | "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
+        ) => {
+            let Some(callback) = args.first() else {
+                return Err(native_npe());
+            };
+            let Some(result) = rt.invoke_callback(callback, &[value])? else {
+                return Ok(None);
+            };
+            Ok(Some(complete_future(rt, result)))
+        }
+        (
+            "thenAccept",
+            "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletableFuture;"
+            | "(Ljava/util/function/Consumer;)Ljava/util/concurrent/CompletionStage;",
+        ) => {
+            let Some(callback) = args.first() else {
+                return Err(native_npe());
+            };
+            let Some(_) = rt.invoke_callback(callback, &[value])? else {
+                return Ok(None);
+            };
+            Ok(Some(complete_future(rt, Value::Ref(None))))
+        }
+        (
+            "thenCompose",
+            "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletableFuture;"
+            | "(Ljava/util/function/Function;)Ljava/util/concurrent/CompletionStage;",
+        ) => {
+            let Some(callback) = args.first() else {
+                return Err(native_npe());
+            };
+            let Some(result) = rt.invoke_callback(callback, &[value])? else {
+                return Ok(None);
+            };
+            if host_executors::allocation(&result, HostKind::ExecutorFuture).is_some() {
+                Ok(Some(result))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn reject_after_shutdown<H: Host>(rt: &Runtime<'_, H>, marker: &str) -> Result<(), NativeError> {
