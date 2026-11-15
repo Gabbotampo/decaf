@@ -64,6 +64,15 @@ pub(crate) fn sandbox_absolute(path: &str) -> String {
     }
 }
 
+/// Recover the caller-facing spelling for an absolute sandbox path in an
+/// exception message. Absolute paths outside the sandbox stay absolute.
+pub(crate) fn sandbox_display(path: &str) -> String {
+    path.strip_prefix(SANDBOX_CWD)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
+        .to_owned()
+}
+
 pub(crate) fn unix_normal(path: &str) -> String {
     let mut normal = String::with_capacity(path.len());
     for c in path.chars() {

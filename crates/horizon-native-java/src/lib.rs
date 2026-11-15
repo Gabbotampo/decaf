@@ -24116,7 +24116,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 return Err(NativeError::UncaughtException {
                     class: "java/nio/file/NoSuchFileException".into(),
-                    message: Some(path.to_string()),
+                    message: Some(host_path::sandbox_display(path)),
                     frame: None,
                 });
             }
@@ -24127,7 +24127,7 @@ impl<H: Host> Runtime<'_, H> {
             };
             return Err(NativeError::UncaughtException {
                 class: class.into(),
-                message: Some(path.to_string()),
+                message: Some(host_path::sandbox_display(path)),
                 frame: None,
             });
         };

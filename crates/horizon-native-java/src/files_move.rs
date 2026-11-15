@@ -63,6 +63,16 @@ impl<H: Host> Runtime<'_, H> {
         ) else {
             return Ok(None);
         };
+        let source_display = args
+            .first()
+            .map(crate::host_path::path_text)
+            .unwrap_or_default()
+            .to_owned();
+        let target_display = args
+            .get(1)
+            .map(crate::host_path::path_text)
+            .unwrap_or_default()
+            .to_owned();
         let options = match args.get(2) {
             Some(value @ Value::Host(_)) => self.array(value)?.clone(),
             _ => Vec::new(),
@@ -101,9 +111,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.unknown_operand_call(r).map(Some);
             }
             let message = if atomic {
-                format!("{source} -> {target}")
+                format!("{source_display} -> {target_display}")
             } else {
-                source
+                source_display
             };
             return Err(thrown("java/nio/file/NoSuchFileException", Some(message)));
         };
@@ -115,7 +125,7 @@ impl<H: Host> Runtime<'_, H> {
             if !replace {
                 return Err(thrown(
                     "java/nio/file/FileAlreadyExistsException",
-                    Some(target),
+                    Some(target_display.clone()),
                 ));
             }
         }
