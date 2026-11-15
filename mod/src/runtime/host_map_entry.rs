@@ -273,8 +273,17 @@ pub struct Entries {
     /// Maps whose nodes this model lost: their entries' identity is counted.
     lost_maps: BTreeSet<String>,
     before: BTreeMap<String, Before>,
+    /// Earlier readings of an opaque entry, by key: each reading's own state, under its
+    /// handle's origin (#221 re-check 4, B8). A reading after a change is a new state; the
+    /// one before keeps what it read, never rewritten. At most [`MAX_EARLIER_READINGS`] per key;
+    /// a handle older than those reads as unknown (counted).
+    earlier: HashMap<String, Vec<(u64, EntryState)>>,
     next: u64,
 }
+
+/// Earlier readings kept per opaque entry (a map changed and read again in a loop keeps
+/// only the last few; an older handle's reads are counted).
+const MAX_EARLIER_READINGS: usize = 8;
 
 impl Entries {
     /// Every key and value an entry holds (heap reachability).
@@ -282,6 +291,13 @@ impl Entries {
         self.states
             .get(key)
             .into_iter()
+            .chain(
+                self.earlier
+                    .get(key)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, state)| state),
+            )
             .flat_map(|state| [&state.key, &state.value])
     }
 
@@ -308,6 +324,7 @@ impl Entries {
     /// Drop the entries the heap collected, and every row of a map it collected.
     pub(crate) fn retain(&mut self, keep: impl Fn(&str) -> bool) {
         self.states.retain(|key, _| keep(key));
+        self.earlier.retain(|key, _| keep(key));
         self.nodes.retain(|map, _| keep(map));
         self.followed.retain(|map, _| keep(map));
         self.lost_maps.retain(|map| keep(map));
@@ -539,23 +556,28 @@ impl StdHost {
                 .flatten()
                 .filter(|entry_key| self.map_entries.states.contains_key(entry_key));
             if let Some(entry_key) = known {
-                let known = self
-                    .map_entries
-                    .states
-                    .get_mut(&entry_key)
-                    .expect("checked");
-                let same = reading == OpaqueReading::Stored && known.life == life;
-                known.value = value.clone();
-                known.life = life;
-                // The stored entry while the map is unchanged. After any change (its node may
-                // have been removed and put again), or for a class whose readings are not known,
-                // the same key with a fresh origin, so `==` with an earlier reading is counted;
-                // that reading's handle is the one later unchanged readings get (B6).
-                if same {
+                let known = self.map_entries.states.get(&entry_key).expect("checked");
+                // The stored entry while the map is unchanged.
+                if reading == OpaqueReading::Stored && known.life == life {
                     return known.handle.clone();
                 }
-                let fresh = Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key));
-                known.handle = fresh.clone();
+                // After any change (its node may have been removed and put again, or kept with a
+                // new value), or for a class whose readings are not known: the same key with a
+                // fresh origin, so `==` with an earlier reading is counted (B6), and a state of
+                // its own. The earlier reading keeps the state it read, never rewritten (B8): a
+                // removed Gson node keeps its fields, and what an earlier reading holds now (its
+                // node's or a removed node's value) is not this model's to tell, so it is counted.
+                let fresh = Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key.clone()));
+                let reading = state(life, &fresh);
+                if let Some(earlier) = self.map_entries.states.insert(entry_key.clone(), reading)
+                    && let Value::Host(handle) = &earlier.handle
+                {
+                    let kept = self.map_entries.earlier.entry(entry_key).or_default();
+                    kept.push((handle.origin(), earlier));
+                    if kept.len() > MAX_EARLIER_READINGS {
+                        kept.remove(0);
+                    }
+                }
                 return fresh;
             }
             let entry_key = self.mint_key(OPAQUE, true);
@@ -755,12 +777,29 @@ impl StdHost {
         crate::runtime::Host::mod_stamp(self, map)
     }
 
+    /// The state `handle` reads: its key's, or for an opaque entry, the state of the reading
+    /// that made this very handle (by origin); `None` for an earlier reading no longer kept.
+    fn entry_state(&self, handle: &HostRef) -> Option<&EntryState> {
+        let current = self.map_entries.states.get(handle.key())?;
+        if handle.kind() != HostKind::OpaqueMapEntry
+            || matches!(&current.handle, Value::Host(own) if own.origin() == handle.origin())
+        {
+            return Some(current);
+        }
+        self.map_entries
+            .earlier
+            .get(handle.key())?
+            .iter()
+            .find(|(origin, _)| *origin == handle.origin())
+            .map(|(_, state)| state)
+    }
+
     /// The key and value `entry` holds now; `None` for any other value, or when unknown.
     pub(crate) fn map_entry_now(&self, entry: &Value) -> Option<(Value, Value)> {
         let Value::Host(handle) = entry else {
             return None;
         };
-        let state = self.map_entries.states.get(handle.key())?;
+        let state = self.entry_state(handle)?;
         match &state.life {
             Life::Fixed | Life::Detached => Some((state.key.clone(), state.value.clone())),
             Life::Live {
@@ -815,7 +854,7 @@ impl StdHost {
         let Value::Host(handle) = entry else {
             return self.unknown_host_call(r);
         };
-        let Some(state) = self.map_entries.states.get(handle.key()).cloned() else {
+        let Some(state) = self.entry_state(handle).cloned() else {
             return self.unknown_host_call(r);
         };
         let unsupported = |message: Option<&str>| NativeError::UncaughtException {

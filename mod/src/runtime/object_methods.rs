@@ -308,6 +308,14 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     pub(crate) fn java_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // A Gson tree element hashes as `JsonElement.hashCode` (`gson_tree::element_hash`,
+        // Gson 2.14's bytecode: an integral `JsonPrimitive` by its `long`, any other number by
+        // `doubleToLongBits`), consistent with the `equals` `java_equals` answers for it: equal
+        // elements with different hashes (`1` and `1.0`) stay two keys, as in Java (#221 re-check
+        // 4, B9). An element it cannot hash (`JsonNull`'s identity hash) is unknown.
+        if crate::runtime::gson_tree::is_tree_element(value) {
+            return self.element_hash(value);
+        }
         match self.equality_of(value) {
             Equality::Null => Ok(Some(0)),
             Equality::Identity

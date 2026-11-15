@@ -2151,6 +2151,12 @@ impl HostRef {
     /// sides), are one object. `None` for two equal handles of a kind that
     /// is not canonical from different constructions: maybe two objects,
     /// maybe one Java object a model wrapped twice. The caller counts it.
+    /// Which construction this handle came from: two handles with one key and different
+    /// origins may be two objects (`host_map_entry.rs` keeps each one's own state by it).
+    pub(crate) fn origin(&self) -> u64 {
+        self.origin
+    }
+
     pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
         if self != other {
             return Some(false);

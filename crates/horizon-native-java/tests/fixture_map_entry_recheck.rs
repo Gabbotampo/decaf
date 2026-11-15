@@ -25,6 +25,8 @@ removeAfterWalk=[a=7, b=2, c=3]|falsetrue|2b=8{a=7, b=5, c=3}\n\
 unknownReadings=false\n\
 gsonRemoveReadd=falsetruefalse\n\
 equalJsonKeys=2|32|32|{\"a\":\"b\"}{\"c\":\"d\"}[3, 2]true3\n\
+gsonHashKeys=221truetrue|1|1072693248|96|1072693345\n\
+gsonRemovedEntry=1|5|2\n\
 ";
 
 const IMMUTABLE_MAP_STUB: &str = "package com.google.common.collect;\n\
@@ -33,6 +35,10 @@ public static <K, V> ImmutableMap<K, V> of(K k, V v) { throw new AssertionError(
 public static <K, V> ImmutableMap<K, V> of(K k, V v, K k2, V v2) { throw new AssertionError(); }\n}\n";
 
 const JSON_ELEMENT_STUB: &str = "package com.google.gson;\npublic abstract class JsonElement {}\n";
+
+const JSON_PRIMITIVE_STUB: &str = "package com.google.gson;\n\
+public final class JsonPrimitive extends JsonElement {\n\
+public JsonPrimitive(Number n) { throw new AssertionError(); }\n}\n";
 
 const JSON_OBJECT_STUB: &str = "package com.google.gson;\n\
 public final class JsonObject extends JsonElement {\n\
@@ -45,6 +51,7 @@ const PROBE: &str = r##"package demo;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonPrimitive;
 import java.util.*;
 import java.util.function.Supplier;
 
@@ -129,6 +136,38 @@ public final class Probe {
         return m.size() + "|" + walked + "|" + each + "|" + keys + m.values() + m.containsKey(j("c", "d")) + m.get(j("a", "b"));
     }
 
+    // B9: `JsonPrimitive.hashCode` hashes an integral number by its `long` and any other by
+    // `doubleToLongBits`, so `1` and `1.0` are equal keys in two buckets: two keys.
+    public static String gsonHashKeys() {
+        Map<Object, Integer> m = new HashMap<>();
+        m.put(new JsonPrimitive(1), 1);
+        m.put(new JsonPrimitive(1.0), 2);
+        JsonObject a = new JsonObject();
+        a.addProperty("a", 1);
+        JsonObject b = new JsonObject();
+        b.addProperty("a", 1.0);
+        Map<Object, Integer> n = new HashMap<>();
+        n.put(a, 1);
+        n.put(b, 2);
+        Map<Object, Integer> same = new HashMap<>();
+        same.put(new JsonPrimitive(3), 1);
+        same.put(new JsonPrimitive(3L), 2);
+        return "" + m.size() + n.size() + same.size() + new JsonPrimitive(1).equals(new JsonPrimitive(1.0))
+            + a.equals(b) + "|" + new JsonPrimitive(1).hashCode() + "|" + new JsonPrimitive(1.0).hashCode()
+            + "|" + a.hashCode() + "|" + b.hashCode();
+    }
+
+    // B8: Gson's `remove` unlinks the node, which keeps its fields; a re-add is a new node.
+    public static String gsonRemovedEntry() {
+        JsonObject o = new JsonObject();
+        o.addProperty("a", 1);
+        Map.Entry e1 = o.entrySet().iterator().next();
+        o.remove("a");
+        o.addProperty("a", 5);
+        Map.Entry e2 = o.entrySet().iterator().next();
+        return e1.getValue() + "|" + e2.getValue() + "|" + new HashSet<Object>(List.of(e1, e2)).size();
+    }
+
     // B4: `unmodifiableMap` wraps a new `UnmodifiableEntry` per `next()`.
     public static String wrappedEntries() {
         Map<String, Integer> u = Collections.unmodifiableMap(fill(new HashMap<>()));
@@ -195,6 +234,7 @@ fn fixture() -> javac_fixture::Fixture {
             ),
             ("com/google/gson/JsonElement.java", JSON_ELEMENT_STUB),
             ("com/google/gson/JsonObject.java", JSON_OBJECT_STUB),
+            ("com/google/gson/JsonPrimitive.java", JSON_PRIMITIVE_STUB),
             ("demo/Probe.java", PROBE),
         ],
     )
@@ -224,6 +264,7 @@ fn entries_and_entry_views_answer_as_java_25() {
         "identityEntries",
         "removeAfterWalk",
         "equalJsonKeys",
+        "gsonHashKeys",
     ] {
         let (text, unknown) = run(&fixture, method);
         assert_eq!(text, expected(method), "{method}: {unknown:?}");
@@ -259,6 +300,24 @@ fn readings_across_a_gson_remove_and_re_put_are_counted() {
             "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z".to_owned(),
             2
         )],
+        "{unknown:?}"
+    );
+}
+
+/// A Gson entry read before its key was removed and put again keeps the state it read: it is
+/// never rewritten by a later reading (#221 re-check 4, B8). Whether it was removed (Java keeps
+/// the removed node's own value, `1`) or kept with a new value cannot be told after a write by
+/// Gson's own paths, so its value and the `HashSet` of both entries are counted, never the
+/// re-added node's `5`.
+#[test]
+fn an_entry_read_before_a_gson_remove_keeps_its_own_state() {
+    let fixture = fixture();
+    let (text, unknown) = run(&fixture, "gsonRemovedEntry");
+    assert!(!text.starts_with("5|"), "{text}");
+    assert!(
+        unknown
+            .iter()
+            .any(|(call, _)| call.starts_with("java/util/Map$Entry#getValue")),
         "{unknown:?}"
     );
 }

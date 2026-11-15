@@ -1721,7 +1721,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `JsonElement.hashCode()`; `None` for a `JsonNull` anywhere (an
     /// identity hash) or an untypeable number.
-    fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+    pub(crate) fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
         let Some(kind) = value_kind(value) else {
             return Ok(None);
         };

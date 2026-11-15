@@ -450,6 +450,16 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     match handle.equals(&stored, &mut object_methods::RuntimeNested::new(self))? {
+                        // Gson's elements break `equals`/`hashCode` (`JsonPrimitive` `1` and `1.0`
+                        // are equal with different hashes), so an equal element whose hash is
+                        // unknown here may sit in another bucket in Java: unknown, unless it is
+                        // the very same object (#221 re-check 4, B9).
+                        Some(true)
+                            if crate::gson_tree::is_tree_element(key)
+                                && !object_methods::identical(key, &stored) =>
+                        {
+                            unknown = true;
+                        }
                         Some(true) => return Ok(Lookup::Found(stored)),
                         Some(false) => {}
                         None => unknown = true,
