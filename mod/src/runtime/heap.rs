@@ -1345,6 +1345,7 @@ mod tests {
             "capability_requests",
             "throwable_messages",
             "throwable_causes",
+            "throwable_suppressed",
             "persistent_static_fields",
             "heap",
             "retained",
