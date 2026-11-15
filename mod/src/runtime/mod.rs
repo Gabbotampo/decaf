@@ -24329,8 +24329,10 @@ impl<H: Host> Runtime<'_, H> {
         self.io_writer_charsets
             .entry(key.clone())
             .or_insert_with(|| "UTF-8".into());
-        if let Some(path) = key.strip_prefix("file:") {
-            self.watch_writer_opened(path, truncate);
+        if !truncate {
+            if let Some(path) = key.strip_prefix("file:") {
+                self.watch_writer_opened(path, false);
+            }
         }
         Ok(())
     }
