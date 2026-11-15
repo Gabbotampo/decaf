@@ -237,6 +237,9 @@ pub(crate) fn opaque_codec_type(value: &Value) -> Option<String> {
 
 /// A codec's label in a content declaration (`declarations_content.rs`): what it is.
 pub(crate) fn codec_label(value: &Value) -> Option<String> {
+    if let Some(declared) = crate::stream_codec::codec_type(value) {
+        return Some(declared.to_owned());
+    }
     if let Some(declared) = opaque_codec_type(value) {
         return Some(declared);
     }

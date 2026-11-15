@@ -212,7 +212,6 @@ impl StdHost {
             | "java/util/Collections$SingletonList"
             | "com/google/common/collect/RegularImmutableList"
             | "com/google/common/collect/SingletonImmutableList" => RANDOM_ACCESS_VIEW,
-            _ if marker == "list" || marker.starts_with("list/") => RANDOM_ACCESS_VIEW,
             _ => return None,
         };
         let modifiable = !self.unmodifiable_collections.contains_key(marker);

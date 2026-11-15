@@ -722,19 +722,10 @@ impl<H: Host> Runtime<'_, H> {
         }
         // A JDK value the runtime builds itself (a collection, a stream, a
         // builder): JDK classes never extend or implement a jar type.
-        let jdk_kind = [
-            "string-builder/",
-            "stream/",
-            "list/",
-            "set/",
-            "map/",
-        ]
-        .iter()
-        .any(|prefix| marker.starts_with(prefix))
-            || matches!(
-                marker,
-                                "list" | "set" | "map" | "true" | "false"
-            )
+        let jdk_kind = ["string-builder/", "stream/"]
+            .iter()
+            .any(|prefix| marker.starts_with(prefix))
+            || matches!(marker, "true" | "false")
             // An object `new` made of a JDK class (`java/util/ArrayList#3`).
             || crate::runtime::jar_object::value_marker_class(value).is_some_and(|class| class.starts_with("java/"));
         if jdk_kind {

@@ -7,6 +7,9 @@
 //! These fixtures pin down exactly what a real mod sees, so the suite never claims more than the
 //! interpreter does.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -267,7 +270,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-reflect-{test}-{}-{unique}",
             std::process::id()
         ));
