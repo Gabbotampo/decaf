@@ -206,16 +206,19 @@ def default_game_block_classes(game_version: str) -> Path | None:
     prepared root used by the corpus machines. Absence is deliberately loud:
     the probe must keep vanilla-block instanceof calls counted.
     """
-    roots: list[Path] = []
-    if configured := os.environ.get("HORIZON_RESOURCES"):
-        roots.append(Path(configured).expanduser())
-    roots.extend((
-        Path.cwd() / ".local" / "horizon-client" / game_version,
-        ROOT / ".local" / "horizon-client" / game_version,
-        Path.home() / ".local" / "share" / "horizon" / "game-files"
-        / "horizon-client" / game_version,
-        Path.home() / "ava" / "resources" / game_version,
-    ))
+    configured = os.environ.get("HORIZON_RESOURCES")
+    if configured:
+        # An explicit game root is authoritative. Falling through to another
+        # machine's prepared root would make a missing table look present.
+        roots = [Path(configured).expanduser()]
+    else:
+        roots = [
+            Path.cwd() / ".local" / "horizon-client" / game_version,
+            ROOT / ".local" / "horizon-client" / game_version,
+            Path.home() / ".local" / "share" / "horizon" / "game-files"
+            / "horizon-client" / game_version,
+            Path.home() / "ava" / "resources" / game_version,
+        ]
     seen: set[Path] = set()
     searched: list[str] = []
     for root in roots:
