@@ -11,29 +11,32 @@ use crate::host_ref::{
 };
 use crate::{MethodRef, NativeError, StdHost, Value};
 
+pub(crate) fn is_bit_conversion(r: &MethodRef) -> bool {
+    matches!(
+        (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()),
+        ("java/lang/Double", "doubleToRawLongBits", "(D)J")
+            | ("java/lang/Double", "longBitsToDouble", "(J)D")
+            | ("java/lang/Float", "floatToRawIntBits", "(F)I")
+            | ("java/lang/Float", "intBitsToFloat", "(I)F")
+    )
+}
+
 pub(crate) fn bit_conversion(
-    host: &StdHost,
+    host: &mut StdHost,
     r: &MethodRef,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    // These conversions are a small implementation detail of the seeded
-    // RandomSource fixture: Java evaluates the random draw immediately before
-    // the raw-bit conversion. Do not turn the JDK's global Double/Float
-    // methods into a fabricated host model for unrelated calls.
-    let previous = host.invocations.iter().rev().nth(1)?;
-    let Value::Host(receiver) = previous.receiver.as_ref()? else {
-        return None;
-    };
-    if receiver.kind() != HostKind::RandomSource {
-        return None;
-    }
+    // These conversions are a one-shot implementation detail of a seeded
+    // RandomSource draw. Never turn the JDK's global Double/Float methods
+    // into a fabricated host model for unrelated calls or later callbacks.
+    let previous = host.random_bit_scope.take()?;
     let follows = matches!(
         (
             r.owner.as_str(),
             r.name.as_str(),
             r.descriptor.as_str(),
-            previous.method.name.as_str(),
-            previous.method.descriptor.as_str(),
+            previous.name.as_str(),
+            previous.descriptor.as_str(),
         ),
         (
             "java/lang/Double",
@@ -211,6 +214,7 @@ impl StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        self.random_bit_scope = None;
         // A direct constructor is reached on a JarObject before any state row
         // exists; random_new allocated the row at the new opcode.
         let (key, mut state) = self.random_state_mut(receiver)?;
@@ -392,6 +396,12 @@ impl StdHost {
             _ => return None,
         };
         self.save_random(key, state);
+        if matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("nextInt", "()I") | ("nextLong", "()J") | ("nextFloat", "()F") | ("nextDouble", "()D")
+        ) {
+            self.random_bit_scope = Some(r.clone());
+        }
         Some(result)
     }
 
@@ -651,6 +661,31 @@ pub(crate) const CLASS_SIDE: ClassSide = ClassSide {
 mod tests {
     use super::*;
     use crate::Host;
+
+    #[test]
+    fn random_bit_conversion_scope_is_one_shot() {
+        let mut host = StdHost::new();
+        let source = host.random_seeded(LEGACY, 123).unwrap();
+        let next_double = MethodRef {
+            owner: RANDOM_SOURCE.into(),
+            name: "nextDouble".into(),
+            descriptor: "()D".into(),
+        };
+        let raw = MethodRef {
+            owner: "java/lang/Double".into(),
+            name: "doubleToRawLongBits".into(),
+            descriptor: "(D)J".into(),
+        };
+        let value = host.invoke_instance(&next_double, &source, &[]).unwrap();
+        let exact = host.invoke(&raw, &[value]).unwrap();
+        assert!(matches!(exact, Value::Long(_)));
+        let counted = host.invoke(&raw, &[Value::Float(1.25)]).unwrap();
+        assert!(matches!(counted, Value::Long(0)));
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![("java/lang/Double#doubleToRawLongBits(D)J".into(), 1),]
+        );
+    }
 
     #[test]
     fn random_state_never_aliases_a_non_random_host_handle() {
