@@ -170,7 +170,7 @@ fn every_rc261_case_answers_as_java_or_is_named() {
 fn what_callbacks_hold_survives_collections() {
     let fixture = javac_fixture::Fixture::build("callbacks-rc261-gc", &[("demo/Rv.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
-    let mut call = |method: &str, host: &mut StdHost| {
+    let call = |method: &str, host: &mut StdHost| {
         shown(fixture.jar.invoke_method_with_args(
             "demo/Rv",
             method,

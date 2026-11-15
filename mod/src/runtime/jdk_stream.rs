@@ -67,7 +67,7 @@ fn made_comparator(value: &Value) -> Option<(String, Vec<Value>)> {
 /// `Objects.requireNonNull(value)`: a `NullPointerException` with no
 /// message, as every `Comparator` factory throws for a `null` argument.
 fn require_non_null(values: &[Value]) -> Result<(), NativeError> {
-    if values.iter().any(|value| *value == Value::Ref(None)) {
+    if values.contains(&Value::Ref(None)) {
         return Err(NativeError::UncaughtException {
             class: "java/lang/NullPointerException".into(),
             message: None,
