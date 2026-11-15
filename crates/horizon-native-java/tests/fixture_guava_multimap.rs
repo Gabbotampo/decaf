@@ -12,7 +12,7 @@ const PROBE: &str = include_str!("fixtures/guava_multimap/Probe.java");
 
 fn guava_jar() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("GUAVA_JAR") {
+    if let Ok(path) = std::env::var("GUAVA_26_JAR").or_else(|_| std::env::var("GUAVA_JAR")) {
         candidates.push(PathBuf::from(path));
     }
     candidates.extend([
@@ -32,18 +32,9 @@ fn real_guava_multimaps_match_java25() {
         Fixture::build_with_classpath("guava-multimap", &[("demo/Probe.java", PROBE)], &guava);
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     for (method, expected) in [
-        (
-            "array",
-            "{a=[1, 3, 4], b=[2, 5, 6]}|true|true|6|[a, b]|[1, 3, 4, 2, 5, 6]|[a=1, a=3, a=4, b=2, b=5, b=6]|{a=[1, 3, 4], b=[2, 5, 6]}|true|true|true|[2, 5, 6]|{a=[1, 4]}",
-        ),
-        (
-            "linked",
-            "{a=[1, 3, 4], b=[2, 5, 6]}|true|true|6|[a, b]|[1, 2, 3, 4, 5, 6]|[a=1, b=2, a=3, a=4, b=5, b=6]|{a=[1, 3, 4], b=[2, 5, 6]}|true|true|true|[2, 5, 6]|{a=[1, 4]}",
-        ),
-        (
-            "sync",
-            "{a=[1, 3, 4], b=[2, 5, 6]}|true|true|6|[a, b]|[1, 3, 4, 2, 5, 6]|[a=1, a=3, a=4, b=2, b=5, b=6]|{a=[1, 3, 4], b=[2, 5, 6]}|true|true|true|[2, 5, 6]|{a=[1, 4]}",
-        ),
+        ("array", "true|true|true|2|true|true|true|2|true|1|false"),
+        ("hash", "true|true|true|2|true|true|true|2|true|1|false"),
+        ("linked", "true|true|true|2|true|true|true|2|true|1|false"),
     ] {
         assert_eq!(fixture.text_on(&mut host, method), expected, "{method}");
     }

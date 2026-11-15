@@ -207,55 +207,6 @@ fn pairs<H: Host>(
     Ok(out)
 }
 
-fn view_class<H: Host>(this: &Runtime<'_, H>, source: &str, view: &str) -> &'static str {
-    let wrapped = kind(this, source).as_deref() == Some("sync");
-    match (wrapped, view, source_kind(this, source).as_deref()) {
-        (true, "get", _) => "com/google/common/collect/Synchronized$SynchronizedRandomAccessList",
-        (true, "keyset", _) => "com/google/common/collect/Synchronized$SynchronizedSet",
-        (true, "values", _) => "com/google/common/collect/Synchronized$SynchronizedCollection",
-        (true, "entries", _) => "com/google/common/collect/Synchronized$SynchronizedCollection",
-        (true, "asmap", _) => "com/google/common/collect/Synchronized$SynchronizedAsMap",
-        (_, "get", Some("array")) => {
-            "com/google/common/collect/AbstractMapBasedMultimap$RandomAccessWrappedList"
-        }
-        (_, "get", Some("hash" | "linked")) => {
-            "com/google/common/collect/AbstractMapBasedMultimap$WrappedSet"
-        }
-        (_, "keyset", _) => "com/google/common/collect/AbstractMapBasedMultimap$KeySet",
-        (_, "values", _) => "com/google/common/collect/AbstractMultimap$Values",
-        (_, "entries", Some("hash")) => "com/google/common/collect/AbstractMultimap$EntrySet",
-        (_, "entries", _) => "com/google/common/collect/AbstractMultimap$Entries",
-        (_, "asmap", _) => "com/google/common/collect/AbstractMapBasedMultimap$AsMap",
-        _ => "java/util/ArrayList",
-    }
-}
-
-fn make_view<H: Host>(
-    this: &mut Runtime<'_, H>,
-    source: &str,
-    view: &str,
-    key: Option<Value>,
-) -> Value {
-    let class = view_class(this, source, view);
-    let value = handle(this.new_object_key(class));
-    let key_text = handle_key(&value).unwrap();
-    put_field(this, &key_text, "source", handle(source.to_owned()));
-    put_field(this, &key_text, "view", Value::Ref(Some(view.into())));
-    if let Some(key) = key {
-        put_field(this, &key_text, "key", key);
-    }
-    value
-}
-
-fn cached_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, view: &str) -> Value {
-    if let Some(value) = field(this, source, view) {
-        return value;
-    }
-    let value = make_view(this, source, view, None);
-    put_field(this, source, view, value.clone());
-    value
-}
-
 fn append_order<H: Host>(
     this: &mut Runtime<'_, H>,
     source: &str,
@@ -319,159 +270,6 @@ fn make_sync<H: Host>(
     Ok(value)
 }
 
-fn view_values<H: Host>(
-    this: &mut Runtime<'_, H>,
-    view_key: &str,
-) -> Result<Vec<Value>, NativeError> {
-    let source = handle_key(&field(this, view_key, "source").unwrap()).unwrap();
-    let view_value = field(this, view_key, "view").unwrap();
-    let view = ref_text(&view_value).unwrap_or_default();
-    let all = pairs(this, &target_key(this, &source))?;
-    if view == "get" {
-        let key = field(this, view_key, "key").unwrap();
-        return Ok(all
-            .into_iter()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, v)| v)
-            .collect());
-    }
-    if view == "keyset" {
-        let mut out = Vec::new();
-        for (key, _) in all {
-            if !out.contains(&key) {
-                out.push(key);
-            }
-        }
-        return Ok(out);
-    }
-    if view == "values" {
-        return Ok(all.into_iter().map(|(_, v)| v).collect());
-    }
-    if view == "entries" {
-        return Ok(all
-            .into_iter()
-            .map(|(k, v)| crate::runtime::map_entry_value(&k, &v))
-            .collect());
-    }
-    Ok(Vec::new())
-}
-
-fn snapshot<H: Host>(this: &mut Runtime<'_, H>, view_key: &str) -> Result<Value, NativeError> {
-    let values = view_values(this, view_key)?;
-    let view_value = field(this, view_key, "view").unwrap();
-    let view = ref_text(&view_value).unwrap_or_default();
-    let source = handle_key(&field(this, view_key, "source").unwrap()).unwrap();
-    let kind = if view == "get"
-        && source_kind(this, &source).as_deref() != Some("hash")
-        && source_kind(this, &source).as_deref() != Some("linked")
-    {
-        "list"
-    } else if view == "entries" && source_kind(this, &source).as_deref() == Some("hash")
-        || view == "keyset"
-    {
-        "set"
-    } else {
-        "list"
-    };
-    Ok(crate::runtime::collection_value(kind, &values))
-}
-
-fn invoke_view<H: Host>(
-    this: &mut Runtime<'_, H>,
-    r: &MethodRef,
-    _receiver: &Value,
-    args: &[Value],
-    key: &str,
-) -> Result<Option<Value>, NativeError> {
-    let view_value = field(this, key, "view").unwrap();
-    let view = ref_text(&view_value).unwrap_or_default();
-    if view == "asmap" {
-        let source = handle_key(&field(this, key, "source").unwrap()).unwrap();
-        let root = target_key(this, &source);
-        let pairs = pairs(this, &root)?;
-        return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-            ("size", "()I") => Value::Int(pairs.len() as i32),
-            ("isEmpty", "()Z") => Value::Int((pairs.is_empty()) as i32),
-            ("containsKey", "(Ljava/lang/Object;)Z") => {
-                Value::Int(pairs.iter().any(|(k, _)| *k == args[0]) as i32)
-            }
-            ("get", "(Ljava/lang/Object;)Ljava/util/Collection;") => {
-                make_view(this, &root, "get", Some(args[0].clone()))
-            }
-            ("keySet", "()Ljava/util/Set;") => cached_view(this, &root, "keyset"),
-            ("values", "()Ljava/util/Collection;") => cached_view(this, &root, "values"),
-            ("toString", "()Ljava/lang/String;") => {
-                let map = backing(this, &root).unwrap();
-                return Ok(Some(
-                    this.host
-                        .invoke_instance(&map_ref("toString", "()Ljava/lang/String;"), &map, &[])?
-                        .clone(),
-                ));
-            }
-            _ => return Ok(None),
-        }));
-    }
-    let values = view_values(this, key)?;
-    match (r.name.as_str(), r.descriptor.as_str()) {
-        ("size", "()I") => Ok(Some(Value::Int(values.len() as i32))),
-        ("isEmpty", "()Z") => Ok(Some(Value::Int(values.is_empty() as i32))),
-        ("contains", "(Ljava/lang/Object;)Z") => {
-            Ok(Some(Value::Int(values.contains(&args[0]) as i32)))
-        }
-        ("toString", "()Ljava/lang/String;") => {
-            let copy = snapshot(this, key)?;
-            Ok(Some(
-                this.host
-                    .invoke_instance(
-                        &collection_ref("toString", "()Ljava/lang/String;"),
-                        &copy,
-                        &[],
-                    )?
-                    .clone(),
-            ))
-        }
-        ("hashCode", "()I") => {
-            let copy = snapshot(this, key)?;
-            Ok(Some(
-                this.host
-                    .invoke_instance(&collection_ref("hashCode", "()I"), &copy, &[])?
-                    .clone(),
-            ))
-        }
-        ("iterator", d) if d.ends_with("Iterator;") => {
-            let copy = snapshot(this, key)?;
-            Ok(Some(this.invoke(
-                "java/util/Collection",
-                "iterator",
-                "()Ljava/util/Iterator;",
-                Some(copy),
-                &[],
-            )?))
-        }
-        ("add", "(Ljava/lang/Object;)Z") if view == "get" => {
-            let source = handle_key(&field(this, key, "source").unwrap()).unwrap();
-            let root = target_key(this, &source);
-            let k = field(this, key, "key").unwrap();
-            let out = put_one(this, &root, &k, &args[0])?;
-            Ok(Some(out))
-        }
-        ("remove", "(Ljava/lang/Object;)Z") if view == "get" => {
-            let source = handle_key(&field(this, key, "source").unwrap()).unwrap();
-            let root = target_key(this, &source);
-            let k = field(this, key, "key").unwrap();
-            Ok(Some(remove_one(this, &root, &k, &args[0])?))
-        }
-        ("clear", "()V") if view == "get" => {
-            let source = handle_key(&field(this, key, "source").unwrap()).unwrap();
-            let root = target_key(this, &source);
-            let k = field(this, key, "key").unwrap();
-            remove_all(this, &root, &k)?;
-            Ok(Some(Value::Void))
-        }
-        _ => Ok(None),
-    }
-}
-
 fn put_one<H: Host>(
     this: &mut Runtime<'_, H>,
     source: &str,
@@ -517,37 +315,18 @@ fn remove_one<H: Host>(
         &values,
         std::slice::from_ref(value),
     )?;
+    if out == Value::Int(1)
+        && invoke_instance(this, &collection_ref("isEmpty", "()Z"), &values, &[])? == Value::Int(1)
+        && let Some(map) = backing(this, source)
+    {
+        invoke_instance(
+            this,
+            &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            &map,
+            std::slice::from_ref(key),
+        )?;
+    }
     Ok(out)
-}
-
-fn remove_all<H: Host>(
-    this: &mut Runtime<'_, H>,
-    source: &str,
-    key: &Value,
-) -> Result<Value, NativeError> {
-    let Some(map) = backing(this, source) else {
-        return Ok(crate::runtime::collection_value("list", &[]));
-    };
-    let old = values_for_key(this, source, key, false)?
-        .unwrap_or_else(|| crate::runtime::collection_value("list", &[]));
-    let old_values = crate::runtime::runtime_collection_values(&*this.host, &old)?;
-    invoke_instance(
-        this,
-        &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-        &map,
-        std::slice::from_ref(key),
-    )?;
-    Ok(this
-        .host
-        .immutable_collection(
-            if source_kind(this, source).as_deref() == Some("hash") {
-                "set"
-            } else {
-                "list"
-            },
-            old_values,
-        )
-        .unwrap_or(old))
 }
 
 pub(crate) fn invoke<H: Host>(
@@ -560,45 +339,8 @@ pub(crate) fn invoke<H: Host>(
         && let Some(key) = handle_key(receiver)
         && (is_view(this, &key) || kind(this, &key).is_some())
     {
-        if is_view(this, &key) {
-            return invoke_view(this, r, receiver, args, &key);
-        }
-        let root = target_key(this, &key);
-        if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
-            let map = backing(this, &root).unwrap();
-            return Ok(Some(invoke_instance(
-                this,
-                &map_ref("toString", r.descriptor.as_str()),
-                &map,
-                &[],
-            )?));
-        }
-        if r.name == "hashCode" && r.descriptor == "()I" {
-            let map = backing(this, &root).unwrap();
-            return Ok(Some(invoke_instance(
-                this,
-                &map_ref("hashCode", r.descriptor.as_str()),
-                &map,
-                &[],
-            )?));
-        }
-        if r.name == "equals" && r.descriptor == "(Ljava/lang/Object;)Z" {
-            let Some(other_key) = args.first().and_then(handle_key) else {
-                return Ok(Some(Value::Int(0)));
-            };
-            let other_root = target_key(this, &other_key);
-            let Some(map) = backing(this, &root) else {
-                return Ok(Some(Value::Int(0)));
-            };
-            let Some(other) = backing(this, &other_root) else {
-                return Ok(Some(Value::Int(0)));
-            };
-            return Ok(Some(invoke_instance(
-                this,
-                &map_ref("equals", r.descriptor.as_str()),
-                &map,
-                &[other],
-            )?));
+        if kind(this, &key).as_deref() == Some("sync") || is_view(this, &key) {
+            return this.host.unknown_operand_call(r).map(Some);
         }
         return invoke_multimap(this, r, receiver, args, &key);
     }
@@ -636,33 +378,24 @@ fn invoke_multimap<H: Host>(
     key: &str,
 ) -> Result<Option<Value>, NativeError> {
     let source = target_key(this, key);
+    if args.iter().any(|value| matches!(value, Value::Ref(None))) {
+        return this.host.unknown_operand_call(r).map(Some);
+    }
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
             Ok(Some(put_one(this, &source, &args[0], &args[1])?))
         }
-        ("putAll", d) if d.starts_with("(Ljava/lang/Object;Ljava/lang/Iterable;") => {
-            let values = crate::runtime::runtime_collection_values(&*this.host, &args[1])?;
-            let mut changed = false;
-            for value in values {
-                changed |= put_one(this, &source, &args[0], &value)? == Value::Int(1);
-            }
-            Ok(Some(Value::Int(changed as i32)))
-        }
-        ("putAll", d) if d.contains("Multimap;") => {
-            let Some(other) = args.first().and_then(handle_key) else {
-                return Ok(None);
-            };
-            let other = target_key(this, &other);
-            let mut changed = false;
-            for (k, v) in pairs(this, &other)? {
-                changed |= put_one(this, &source, &k, &v)? == Value::Int(1);
-            }
-            Ok(Some(Value::Int(changed as i32)))
-        }
         ("get", "(Ljava/lang/Object;)Ljava/util/Collection;")
         | ("get", "(Ljava/lang/Object;)Ljava/util/List;")
         | ("get", "(Ljava/lang/Object;)Ljava/util/Set;") => {
-            Ok(Some(make_view(this, key, "get", Some(args[0].clone()))))
+            if let Some(values) = values_for_key(this, &source, &args[0], false)? {
+                return Ok(Some(values));
+            }
+            let kind = source_kind(this, &source).unwrap_or_else(|| "array".into());
+            let class = value_collection_class(&kind);
+            Ok(Some(this.host.empty_mutable_collection(class).ok_or_else(
+                || NativeError::Metadata("Guava value collection is unavailable".into()),
+            )?))
         }
         ("containsKey", "(Ljava/lang/Object;)Z") => Ok(Some(Value::Int(
             values_for_key(this, &source, &args[0], false)?.is_some_and(|v| {
@@ -683,24 +416,7 @@ fn invoke_multimap<H: Host>(
         ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
             Ok(Some(remove_one(this, &source, &args[0], &args[1])?))
         }
-        ("removeAll", "(Ljava/lang/Object;)Ljava/util/Collection;") => {
-            Ok(Some(remove_all(this, &source, &args[0])?))
-        }
-        ("keySet", "()Ljava/util/Set;") => Ok(Some(cached_view(this, key, "keyset"))),
-        ("values", "()Ljava/util/Collection;") => Ok(Some(cached_view(this, key, "values"))),
-        ("entries", "()Ljava/util/Collection;") | ("entries", "()Ljava/util/Set;") => {
-            Ok(Some(cached_view(this, key, "entries")))
-        }
-        ("asMap", "()Ljava/util/Map;") => Ok(Some(cached_view(this, key, "asmap"))),
         ("size", "()I") => Ok(Some(Value::Int(pairs(this, &source)?.len() as i32))),
-        ("isEmpty", "()Z") => Ok(Some(Value::Int(pairs(this, &source)?.is_empty() as i32))),
-        ("clear", "()V") => {
-            if let Some(map) = backing(this, &source) {
-                this.host
-                    .invoke_instance(&map_ref("clear", "()V"), &map, &[])?;
-            }
-            Ok(Some(Value::Void))
-        }
-        _ => Ok(None),
+        _ => this.host.unknown_operand_call(r).map(Some),
     }
 }
