@@ -40,6 +40,11 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.count_compare_to(),
             };
         }
+        // A jar's own `BlockPos`: `Vec3i.compareTo` of its fields
+        // (`jar_server_values.rs`), counted where they are not known.
+        if let Some(order) = self.jar_server_value_compare(a, b) {
+            return order;
+        }
         // A jar's `new UUID(msb, lsb)`: `UUID.compareTo` of the halves the host kept
         // (`host_jdk_value.rs`), counted where it kept none.
         if crate::runtime::host_jdk_value::is_uuid_object(a) {
@@ -110,7 +115,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Count `Comparable.compareTo` as unknown and answer "equal".
-    fn count_compare_to(&mut self) -> Result<i32, NativeError> {
+    pub(crate) fn count_compare_to(&mut self) -> Result<i32, NativeError> {
         self.host.unknown_operand_call(&MethodRef {
             owner: "java/lang/Comparable".into(),
             name: "compareTo".into(),

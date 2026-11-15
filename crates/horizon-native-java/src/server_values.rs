@@ -101,14 +101,11 @@ pub(crate) fn equals(key: &str, other_key: Option<&str>, other: &Value) -> Optio
     }
 }
 
-/// `Vec3i.compareTo`: by `y`, then `z`, then `x`, as differences (`int`
-/// arithmetic). `None` for another value (counted).
-pub(crate) fn compare_to(key: &str, other: &Value) -> Option<i32> {
+/// `Vec3i.compareTo` of two position keys: by `y`, then `z`, then `x`, as
+/// differences (`int` arithmetic). `None` for another key (counted).
+pub(crate) fn compare_keys(key: &str, other: &str) -> Option<i32> {
     let [x, y, z] = block_pos(key)?;
-    let [ox, oy, oz] = match other {
-        Value::Host(other) => block_pos(other.key())?,
-        _ => return None,
-    };
+    let [ox, oy, oz] = block_pos(other)?;
     Some(if y != oy {
         y.wrapping_sub(oy)
     } else if z != oz {
@@ -181,22 +178,9 @@ mod tests {
         assert_eq!(to_string("level-resource/data").as_deref(), Some("/data"));
         assert_eq!(hash_code("level-resource/data"), Some(3_076_010));
         // `pos_compare`: `-1,-1,1,0`.
-        let pos = |key: &str| crate::game_object::value(key).unwrap();
-        assert_eq!(
-            compare_to("block-pos/1,2,3", &pos("block-pos/1,2,4")),
-            Some(-1)
-        );
-        assert_eq!(
-            compare_to("block-pos/5,1,0", &pos("block-pos/0,2,0")),
-            Some(-1)
-        );
-        assert_eq!(
-            compare_to("block-pos/2,2,2", &pos("block-pos/1,2,2")),
-            Some(1)
-        );
-        assert_eq!(
-            compare_to("block-pos/1,2,3", &pos("block-pos/1,2,3")),
-            Some(0)
-        );
+        assert_eq!(compare_keys("block-pos/1,2,3", "block-pos/1,2,4"), Some(-1));
+        assert_eq!(compare_keys("block-pos/5,1,0", "block-pos/0,2,0"), Some(-1));
+        assert_eq!(compare_keys("block-pos/2,2,2", "block-pos/1,2,2"), Some(1));
+        assert_eq!(compare_keys("block-pos/1,2,3", "block-pos/1,2,3"), Some(0));
     }
 }

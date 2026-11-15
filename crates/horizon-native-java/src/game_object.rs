@@ -466,10 +466,21 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
         let key = handle.key();
         Ok(crate::client_values::hash_code(key).or_else(|| crate::server_values::hash_code(key)))
     },
-    equals: |handle, other, _| {
+    equals: |handle, other, nested| {
+        // A jar's own `BlockPos`/`LevelResource` compares by the key its
+        // fields spell (`jar_server_values.rs`); unread fields stay counted.
+        let jar_key = match crate::jar_object::is_object(other)
+            .then(|| nested.server_value_key(other))
+            .flatten()
+        {
+            Some(Some(key)) => Some(key),
+            // A jar's own position or resource whose fields are not known.
+            Some(None) => return Ok(None),
+            None => None,
+        };
         let other_key = match other {
             Value::Host(other) if other.kind() == handle.kind() => Some(other.key()),
-            _ => None,
+            _ => jar_key.as_deref(),
         };
         let key = handle.key();
         Ok(crate::client_values::equals(key, other_key, other)
@@ -479,11 +490,16 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
     // `Vec3i` is `Comparable`; another value's order is counted. Only a value of
     // this kind is read as a position: another handle whose key happens to spell
     // `block-pos/…` (a `Path`) is not one (#239's review B1).
-    compare_to: Some(|handle, other, _| {
+    compare_to: Some(|handle, other, nested| {
         Ok(match other {
             Value::Host(other_handle) if other_handle.kind() == handle.kind() => {
-                crate::server_values::compare_to(handle.key(), other)
+                crate::server_values::compare_keys(handle.key(), other_handle.key())
             }
+            // A jar's own `BlockPos` (`jar_server_values.rs`).
+            _ if crate::jar_object::is_object(other) => nested
+                .server_value_key(other)
+                .flatten()
+                .and_then(|other| crate::server_values::compare_keys(handle.key(), &other)),
             _ => None,
         })
     }),
