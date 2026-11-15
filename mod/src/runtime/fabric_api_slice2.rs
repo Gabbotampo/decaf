@@ -6,7 +6,7 @@
 //! canonical phase identifiers and the validation that Fabric performs before
 //! recording a registration.
 
-use crate::{MethodRef, NativeError, Value, host_ids};
+use crate::runtime::{MethodRef, NativeError, Value, host_ids};
 
 fn thrown(class: &str, message: &str) -> Result<Value, NativeError> {
     Err(NativeError::UncaughtException {
