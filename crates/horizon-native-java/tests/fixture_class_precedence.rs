@@ -13,6 +13,9 @@
 //! its registrations and records its constructor, while the host model counts
 //! the calls it has no answer for.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, RunLoader, StdHost, Value};
 use std::{
     fs,
@@ -138,7 +141,7 @@ impl Drop for Classes {
 
 impl Classes {
     fn compile(test: &str) -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-precedence-{test}-{}",
             std::process::id()
         ));

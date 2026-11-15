@@ -23,6 +23,9 @@
 //! read through `Future.get()` or after `shutdown()`; the runtime's departure
 //! (a task runs inline, before `execute` returns) cannot change these answers.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -144,7 +147,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-executors-{test}-{}-{unique}",
             std::process::id()
         ));

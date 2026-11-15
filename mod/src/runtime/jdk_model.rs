@@ -583,17 +583,17 @@ impl ToMap {
         }))
     }
 
-    /// The collected map.
-    pub(crate) fn finish(self) -> Value {
+    /// The collected map: the JDK collector's own `HashMap` (or supplied
+    /// map), or for Guava's `toImmutableMap` its entries in encounter order.
+    pub(crate) fn finish(self) -> Result<Value, Vec<Value>> {
         if let Some(map) = self.map {
-            return map;
+            return Ok(map);
         }
-        let flat = self
+        Err(self
             .entries
             .into_iter()
             .flat_map(|(key, value)| [key, value])
-            .collect::<Vec<_>>();
-        super::collection_value("map", &flat)
+            .collect())
     }
 }
 
@@ -677,62 +677,11 @@ impl crate::runtime::StdHost {
         } else {
             values
         };
-        Some(Ok(super::collection_value(kind, &values)))
-    }
-
-    /// `Map.Entry.setValue` on an entry `entrySet()` handed out.
-    ///
-    /// An entry marker is a value (`map-entry/k,v`), not a view, so the write
-    /// goes to the one host map that holds exactly this key and value: the
-    /// map the entry came from (`for (e : map.entrySet()) e.setValue(...)`,
-    /// icy-better-horses freezing its coat lists). The earlier value is the
-    /// answer, as on the JVM. An entry no mutable map holds is an immutable
-    /// `Map.entry`, which raises `UnsupportedOperationException`; one that
-    /// several maps hold is refused rather than written to a guess. The
-    /// entry marker itself keeps its old value: a later `getValue()` on the
-    /// same entry reads the value it was created with.
-    pub(crate) fn entry_set_value(
-        &mut self,
-        key: &Value,
-        old: &Value,
-        replacement: Value,
-    ) -> Result<Value, NativeError> {
-        let holders = self
-            .mutable_collections
-            .iter()
-            .filter(|(marker, _)| {
-                super::is_map_owner(
-                    marker
-                        .split_once('#')
-                        .map_or(marker.as_str(), |(class, _)| class),
-                )
-            })
-            .filter_map(|(marker, values)| {
-                values
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .position(|pair| &pair[0] == key && &pair[1] == old)
-                    .map(|pair| (marker.clone(), pair * 2 + 1))
-            })
-            .collect::<Vec<_>>();
-        match holders.as_slice() {
-            [] => Err(NativeError::UncaughtException {
-                class: "java/lang/UnsupportedOperationException".into(),
-                message: None,
-                frame: None,
-            }),
-            [(marker, index)] => {
-                let values = self
-                    .mutable_collections
-                    .get_mut(marker)
-                    .expect("the holder was just found");
-                Ok(std::mem::replace(&mut values[*index], replacement))
-            }
-            _ => Err(NativeError::Metadata(
-                "Map.Entry.setValue: several maps hold this entry".into(),
-            )),
-        }
+        // The class `List.copyOf`/`Set.copyOf`/`Map.copyOf` makes, its shared
+        // empty one included (#156 P14d2).
+        Some(Ok(
+            self.factory_unmodifiable(&r.owner, &r.name, kind, values)
+        ))
     }
 
     /// `List.subList(from, to)` on a list the host holds.
@@ -782,16 +731,7 @@ impl crate::runtime::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        let list = self.empty_collection("list");
-        match expect_ref(&list).and_then(|marker| self.mutable_collections.get_mut(marker)) {
-            Some(stored) => {
-                *stored = range;
-                Ok(list)
-            }
-            // Past the neutral-collection bound the host has no fresh mutable
-            // list to give; an immutable one still carries the elements.
-            None => Ok(super::collection_value("list", &range)),
-        }
+        Ok(self.new_collection(super::stand_in_class("list"), range))
     }
 }
 
@@ -1247,7 +1187,25 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         for element in values {
             self.accept_to_map(&mut state, element)?;
         }
-        Ok(Some(state.finish()))
+        Ok(Some(self.finish_to_map(state)?))
+    }
+
+    /// [`ToMap::finish`]: Guava's entries become its `ImmutableMap`
+    /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
+    /// none.
+    pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        match state.finish() {
+            Ok(map) => Ok(map),
+            Err(entries) => self.factory_or_count(
+                &crate::runtime::stream_pipeline::wanted(
+                    "com/google/common/collect/ImmutableMap",
+                    "toImmutableMap",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+                ),
+                "map",
+                entries,
+            ),
+        }
     }
 
     /// [`ToMap::begin`], and for `Collectors.toMap` the `HashMap::new` its
