@@ -4,3 +4,5 @@ copyErrors=ArrayStoreException:arraycopy: type mismatch: can not copy byte[] int
 copies=[-56, 9, 3, 0, 0]|[2, 3]|[-56, 2, 3]|[7, 2, 3]|truefalse|-23960
 big=4194304|-512|-56|[0, 0, 0, 0, 0, 0, 0, 0]|4194304
 grid=3|4|-1|[5]|[0, 0, -1, 0]
+reflection=-56|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|4|4:4:4:4:true:true|true|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch|true|IllegalArgumentException:argument type mismatch|IllegalArgumentException:argument type mismatch
+rawBoolean=0

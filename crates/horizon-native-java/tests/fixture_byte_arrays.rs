@@ -22,6 +22,33 @@ use horizon_native_java::StdHost;
 
 const ORACLE: &str = include_str!("fixtures/byte_arrays/java25.txt");
 
+const RAW_BOOLEAN: &str = r#"package demo;
+
+public final class RawBoolean {
+    public static int raw(int value) {
+        byte[] values = new byte[1];
+        values[0] = (byte) value;
+        return values[0];
+    }
+}
+"#;
+
+/// Turn javac's checked byte store into the shared JVM `bastore` with an
+/// unnarrowed int on the stack, and change its newarray operand from byte to
+/// boolean. The resulting method is the review's hand-written bytecode case.
+fn patch_raw_boolean(bytes: &mut [u8]) {
+    let newarray = bytes
+        .windows(2)
+        .position(|window| window == [0xbc, 8])
+        .expect("RawBoolean newarray byte opcode");
+    bytes[newarray + 1] = 4;
+    let store = bytes
+        .windows(2)
+        .position(|window| window == [0x91, 0x54])
+        .expect("RawBoolean i2b/bastore sequence");
+    bytes[store] = 0;
+}
+
 fn expected(method: &str) -> &'static str {
     ORACLE
         .lines()
@@ -31,15 +58,28 @@ fn expected(method: &str) -> &'static str {
 
 #[test]
 fn byte_arrays_answer_as_java_25() {
-    let fixture = javac_fixture::Fixture::build(
+    let fixture = javac_fixture::Fixture::build_with_patches(
         "byte-arrays",
-        &[(
-            "demo/Probe.java",
-            include_str!("fixtures/byte_arrays/demo/Probe.java"),
-        )],
+        &[
+            (
+                "demo/Probe.java",
+                include_str!("fixtures/byte_arrays/demo/Probe.java"),
+            ),
+            ("demo/RawBoolean.java", RAW_BOOLEAN),
+        ],
+        &[("demo/RawBoolean.class", patch_raw_boolean)],
     );
     let mut failures = Vec::new();
-    for method in ["basics", "overlap", "copyErrors", "copies", "big", "grid"] {
+    for method in [
+        "basics",
+        "overlap",
+        "copyErrors",
+        "copies",
+        "big",
+        "grid",
+        "reflection",
+        "rawBoolean",
+    ] {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let text = fixture.text_on(&mut host, method);
         let unknown = host.unknown_host_calls();

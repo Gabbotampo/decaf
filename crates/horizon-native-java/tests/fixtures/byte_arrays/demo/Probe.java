@@ -1,6 +1,7 @@
 package demo;
 
 import java.util.Arrays;
+import java.lang.reflect.Array;
 
 /**
  * {@code byte[]} end to end (#274): the runtime keeps one byte per element. Loads sign-extend,
@@ -121,8 +122,37 @@ public final class Probe {
         return g.length + "|" + g[0].length + "|" + g[1][2] + "|" + str(g[2]) + "|" + str(g[1]);
     }
 
+    /** Reflection only permits widening reads and exact primitive writes. */
+    public static String reflection() {
+        byte[] b = {1};
+        boolean[] z = {false};
+        return t(() -> { Array.setByte(b, 0, (byte) 200); return b[0]; })
+            + "|" + t(() -> { Array.setInt(b, 0, 300); return "ok"; })
+            + "|" + t(() -> { Array.setShort(b, 0, (short) 2); return "ok"; })
+            + "|" + t(() -> { Array.setLong(b, 0, 2L); return "ok"; })
+            + "|" + t(() -> { Array.setFloat(b, 0, 2f); return "ok"; })
+            + "|" + t(() -> { Array.setDouble(b, 0, 2d); return "ok"; })
+            + "|" + t(() -> { Array.setBoolean(b, 0, true); return "ok"; })
+            + "|" + t(() -> { Array.set(b, 0, Integer.valueOf(3)); return "ok"; })
+            + "|" + t(() -> { Array.set(b, 0, Byte.valueOf((byte) 4)); return b[0]; })
+            + "|" + Array.getByte(b, 0) + ":" + Array.getShort(b, 0) + ":" + Array.getInt(b, 0)
+            + ":" + Array.getLong(b, 0) + ":" + (Array.getFloat(b, 0) == 4f)
+            + ":" + (Array.getDouble(b, 0) == 4d)
+            + "|" + t(() -> { Array.setBoolean(z, 0, true); return z[0]; })
+            + "|" + t(() -> { Array.setByte(z, 0, (byte) 1); return "ok"; })
+            + "|" + t(() -> { Array.setInt(z, 0, 1); return "ok"; })
+            + "|" + t(() -> { Array.set(z, 0, Integer.valueOf(1)); return "ok"; })
+            + "|" + Array.getBoolean(z, 0)
+            + "|" + t(() -> Array.getByte(z, 0)) + "|" + t(() -> Array.getInt(z, 0));
+    }
+
+    /** The shared `bastore`/`baload` opcodes on a boolean[] mask to one bit. */
+    public static String rawBoolean() {
+        return String.valueOf(RawBoolean.raw(300));
+    }
+
     public static void main(String[] args) throws Exception {
-        for (String m : new String[] {"basics", "overlap", "copyErrors", "copies", "big", "grid"}) {
+        for (String m : new String[] {"basics", "overlap", "copyErrors", "copies", "big", "grid", "reflection", "rawBoolean"}) {
             System.out.println(m + "=" + Probe.class.getMethod(m).invoke(null));
         }
     }

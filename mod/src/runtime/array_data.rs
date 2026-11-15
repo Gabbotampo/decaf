@@ -78,6 +78,18 @@ impl ArrayData {
         }
     }
 
+    /// `boolean[]` shares the JVM's `baload` opcode with `byte[]`, but its
+    /// stored value is always the low bit and its load is always `0` or `1`.
+    pub(crate) fn boolean_load(&self, index: usize) -> Option<Value> {
+        match self {
+            Self::Ref(values) => values.get(index).and_then(|value| match value {
+                Value::Int(value) => Some(Value::Int(value & 1)),
+                _ => None,
+            }),
+            Self::Byte(_) => None,
+        }
+    }
+
     /// Store `value` at `index` as the JVM's store does (`bastore`: the low 8 bits). `false` when
     /// `index` is out of range, or the value is no `int` for a `byte[]` (the caller's type error).
     pub(crate) fn store(&mut self, index: usize, value: Value) -> bool {
@@ -96,6 +108,20 @@ impl ArrayData {
                 }
                 _ => false,
             },
+        }
+    }
+
+    /// Store the value of a `bastore` into a `boolean[]` (`value & 1`).
+    pub(crate) fn boolean_store(&mut self, index: usize, value: Value) -> bool {
+        match self {
+            Self::Ref(values) => match (values.get_mut(index), value) {
+                (Some(slot), Value::Int(value)) => {
+                    *slot = Value::Int(value & 1);
+                    true
+                }
+                _ => false,
+            },
+            Self::Byte(_) => false,
         }
     }
 
@@ -217,5 +243,14 @@ mod tests {
             ArrayData::of_class("[I", vec![Value::Int(300)]).load(0),
             Some(Value::Int(300))
         );
+    }
+
+    #[test]
+    fn boolean_array_bastore_masks_to_one() {
+        let mut array = ArrayData::of_class("[Z", vec![Value::Int(0)]);
+        assert!(array.boolean_store(0, Value::Int(300)));
+        assert_eq!(array.boolean_load(0), Some(Value::Int(0)));
+        assert!(array.boolean_store(0, Value::Int(301)));
+        assert_eq!(array.boolean_load(0), Some(Value::Int(1)));
     }
 }

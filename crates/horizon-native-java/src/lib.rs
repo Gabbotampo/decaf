@@ -23242,6 +23242,11 @@ impl<H: Host> Runtime<'_, H> {
         if r.owner != "java/lang/reflect/Array" {
             return Ok(None);
         }
+        let argument_type_mismatch = || NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some("argument type mismatch".into()),
+            frame: None,
+        };
         let value = match (r.name.as_str(), r.descriptor.as_str()) {
             ("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;") => {
                 let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
@@ -23262,50 +23267,89 @@ impl<H: Host> Runtime<'_, H> {
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
                 let array = StdHost::argument(r, args, 0)?;
+                let component = value_class::array_component(array);
+                if r.name == "getInt" && component.as_deref() == Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                let element = self.array(array)?.get(index).cloned().ok_or_else(|| {
+                let element = self.array_data(array)?.load(index).ok_or_else(|| {
                     NativeError::Metadata(format!("array index {index} out of bounds"))
                 })?;
                 // `Array.get` boxes a primitive element by the array's own
                 // component type (`float[]` → `Float`, `char[]` → `Character`).
-                let primitive = value_class::array_component(array)
-                    .and_then(|component| primitive_descriptor(&component));
+                let primitive = component.and_then(|component| primitive_descriptor(&component));
                 match primitive {
                     Some(descriptor) if r.name == "get" => box_by_descriptor(descriptor, element),
                     _ => element,
                 }
             }
             ("getBoolean", "(Ljava/lang/Object;I)Z") => {
+                let array = StdHost::argument(r, args, 0)?;
+                if value_class::array_component(array).as_deref() != Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                let value = self
-                    .array(StdHost::argument(r, args, 0)?)?
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                Value::Int(expect_int(r, &value)?)
+                self.array_data(array)?.boolean_load(index).ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?
             }
-            ("getLong", "(Ljava/lang/Object;I)J") => {
+            ("getByte", "(Ljava/lang/Object;I)B") => {
+                let array = StdHost::argument(r, args, 0)?;
+                if value_class::array_component(array).as_deref() != Some("byte") {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                self.array(StdHost::argument(r, args, 0)?)?
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?
+                let element = self.array_data(array)?.load(index).ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?;
+                match r.name.as_str() {
+                    "getLong" => Value::Long(i64::from(expect_int(r, &element)?)),
+                    "getFloat" => Value::Float(f64::from(expect_int(r, &element)?)),
+                    "getDouble" => Value::Float(f64::from(expect_int(r, &element)?)),
+                    _ => element,
+                }
+            }
+            ("getShort", "(Ljava/lang/Object;I)S")
+            | ("getLong", "(Ljava/lang/Object;I)J")
+            | ("getFloat", "(Ljava/lang/Object;I)F")
+            | ("getDouble", "(Ljava/lang/Object;I)D") => {
+                let array = StdHost::argument(r, args, 0)?;
+                if value_class::array_component(array).as_deref() == Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                self.array_data(array)?.load(index).ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?
             }
             ("set", "(Ljava/lang/Object;ILjava/lang/Object;)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
                 let value = StdHost::argument(r, args, 2)?.clone();
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                let valid = match component.as_deref() {
+                    Some("byte") => matches!(value, Value::Boxed(crate::Boxed::Byte(_))),
+                    Some("boolean") => matches!(value, Value::Boxed(crate::Boxed::Boolean(_))),
+                    _ => true,
+                };
+                if !valid {
+                    return Err(argument_type_mismatch());
+                }
+                let boolean_array = component.as_deref() == Some("boolean");
+                let stored_value = match (&value, boolean_array) {
+                    (Value::Boxed(crate::Boxed::Boolean(flag)), true) => {
+                        Value::Int(i32::from(*flag))
+                    }
+                    _ => value,
+                };
                 let stored = self
                     .arrays
                     .get_mut(marker)
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?
-                    .store(index, value);
+                    .store(index, stored_value);
                 if !stored {
                     return Err(NativeError::Metadata(format!(
                         "array index {index} out of bounds"
@@ -23319,6 +23363,11 @@ impl<H: Host> Runtime<'_, H> {
             ("setInt", "(Ljava/lang/Object;II)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
+                }
                 let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
                 let stored = self
                     .arrays
@@ -23337,6 +23386,34 @@ impl<H: Host> Runtime<'_, H> {
             ("setBoolean", "(Ljava/lang/Object;IZ)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if component.as_deref() != Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
+                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)? & 1);
+                let stored = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
+                Value::Void
+            }
+            ("setByte", "(Ljava/lang/Object;IB)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if component.as_deref() != Some("byte") {
+                    return Err(argument_type_mismatch());
+                }
                 let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
                 let stored = self
                     .arrays
@@ -23352,23 +23429,17 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Value::Void
             }
-            ("setLong", "(Ljava/lang/Object;IJ)V") => {
-                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+            ("setShort", "(Ljava/lang/Object;IS)V")
+            | ("setLong", "(Ljava/lang/Object;IJ)V")
+            | ("setFloat", "(Ljava/lang/Object;IF)V")
+            | ("setDouble", "(Ljava/lang/Object;ID)V") => {
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
-                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
-                let stored = self
-                    .arrays
-                    .get_mut(marker)
-                    .ok_or_else(|| {
-                        NativeError::Metadata("array is not owned by this invocation".into())
-                    })?
-                    .store(index, value);
-                if !stored {
-                    return Err(NativeError::Metadata(format!(
-                        "array index {index} out of bounds"
-                    )));
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
                 }
-                Value::Void
+                return Ok(None);
             }
             _ => return Ok(None),
         };
@@ -27466,10 +27537,15 @@ impl<H: Host> Runtime<'_, H> {
                         .array_data(&array)
                         .map_err(|error| array_operand_error(error, "xaload", class, method, at))?;
                     let length = data.len();
-                    let loaded = match usize::try_from(index)
-                        .ok()
-                        .and_then(|index| data.load(index))
-                    {
+                    let boolean_array = value_class::array_component(&array)
+                        .is_some_and(|component| component == "boolean");
+                    let loaded = match usize::try_from(index).ok().and_then(|index| {
+                        if boolean_array {
+                            data.boolean_load(index)
+                        } else {
+                            data.load(index)
+                        }
+                    }) {
                         Some(value) => Ok(value),
                         None => Err(array_index_out_of_bounds(index, length)),
                     };
@@ -27503,8 +27579,16 @@ impl<H: Host> Runtime<'_, H> {
                     let data = self.arrays.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?;
-                    // In bounds (checked above); a `bastore` keeps the low 8 bits.
-                    if !data.store(index as usize, value) {
+                    // In bounds (checked above); `bastore` keeps the low 8 bits
+                    // for byte[] and the low bit for boolean[].
+                    let boolean_array = value_class::array_component(&array)
+                        .is_some_and(|component| component == "boolean");
+                    let stored = if op == 0x54 && boolean_array {
+                        data.boolean_store(index as usize, value)
+                    } else {
+                        data.store(index as usize, value)
+                    };
+                    if !stored {
                         return Err(NativeError::Metadata(format!(
                             "xastore of a value its array cannot hold ({class}#{method} +{at})"
                         )));
