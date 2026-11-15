@@ -336,7 +336,10 @@ def _fabric_predicate(version: str, expression: str) -> bool:
         reference, _ = _fabric_version(expression)
     except ValueError:
         return False
-    comparison = _compare_fabric_versions(version, expression)
+    try:
+        comparison = _compare_fabric_versions(version, expression)
+    except ValueError:
+        return False
     if operator == "=":
         return comparison == 0
     if operator == ">=":
