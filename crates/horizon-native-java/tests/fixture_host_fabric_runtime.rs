@@ -177,10 +177,13 @@ fn metadata_collections_reject_mutation() {
         &[],
         &mut host,
     );
-    assert!(matches!(
-        &result,
-        Ok(horizon_native_java::Value::Ref(Some(text))) if text == "UUUUUU"
-    ));
+    assert!(
+        matches!(
+            &result,
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "UUUUUU"
+        ),
+        "result={result:?}"
+    );
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",
