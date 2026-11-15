@@ -9509,7 +9509,7 @@ impl Host for StdHost {
                         descriptor: "(Ljava/lang/Object;)Z".into(),
                     },
                     &predicate,
-                    &[value.clone()],
+                    std::slice::from_ref(&value),
                 )?;
                 Ok(if matches!(tested, Value::Int(flag) if flag != 0) {
                     receiver.clone()
@@ -38236,16 +38236,13 @@ mandatory = true
             .unwrap();
         assert_eq!(
             value,
-            Value::Ref(Some(
-                crate::callback_marker::make(
-                    "demo/Lambda#make",
-                    1,
-                    "java/lang/Object",
-                    "demo/Target#callback(Ljava/lang/Object;)V",
-                    "rcapture"
-                )
-                .into(),
-            ))
+            Value::Ref(Some(crate::callback_marker::make(
+                "demo/Lambda#make",
+                1,
+                "java/lang/Object",
+                "demo/Target#callback(Ljava/lang/Object;)V",
+                "rcapture"
+            ),))
         );
     }
 
@@ -39554,16 +39551,13 @@ mandatory = true
             raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
-        let marker = Value::Ref(Some(
-            crate::callback_marker::make(
-                "demo/Caller#make",
-                0,
-                "",
-                "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
-                "",
-            )
-            .into(),
-        ));
+        let marker = Value::Ref(Some(crate::callback_marker::make(
+            "demo/Caller#make",
+            0,
+            "",
+            "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+            "",
+        )));
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo/Caller",
@@ -39584,16 +39578,13 @@ mandatory = true
                 None,
                 &[
                     optional_wrap(Value::Ref(Some("input".into()))),
-                    Value::Ref(Some(
-                        crate::callback_marker::make(
-                            "demo/Caller#make",
-                            0,
-                            "",
-                            "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
-                            ""
-                        )
-                        .into(),
-                    )),
+                    Value::Ref(Some(crate::callback_marker::make(
+                        "demo/Caller#make",
+                        0,
+                        "",
+                        "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+                        ""
+                    ),)),
                 ],
                 &mut NullHost,
             )
@@ -39647,16 +39638,13 @@ mandatory = true
                         .into(),
                 },
                 receiver: Some(Value::Ref(Some("event-bus".into()))),
-                args: vec![Value::Ref(Some(
-                    crate::callback_marker::make(
-                        "demo/Mod#wire",
-                        1,
-                        "",
-                        "demo/Target#callback(Ljava/lang/Object;)V",
-                        "rTarget",
-                    )
-                    .into(),
-                ))],
+                args: vec![Value::Ref(Some(crate::callback_marker::make(
+                    "demo/Mod#wire",
+                    1,
+                    "",
+                    "demo/Target#callback(Ljava/lang/Object;)V",
+                    "rTarget",
+                )))],
             },
             event: Value::Ref(Some("register-event".into())),
         };

@@ -86,7 +86,7 @@ pub(crate) fn holds_callback(text: &str) -> bool {
 /// The functional interface a live callback's call site made.
 pub(crate) fn sam(text: &str) -> Option<&str> {
     let rest = text.strip_prefix(&prefix())?;
-    let sam = rest.splitn(4, ':').nth(2)?;
+    let sam = rest.split(':').nth(2)?;
     (!sam.is_empty()).then_some(sam)
 }
 

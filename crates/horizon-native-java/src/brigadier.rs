@@ -2570,7 +2570,7 @@ mod tests {
                 "executes",
                 EXECUTES,
                 &root,
-                &[marker(command.into())],
+                &[marker(command)],
             );
             register(&mut h, &root);
         }
