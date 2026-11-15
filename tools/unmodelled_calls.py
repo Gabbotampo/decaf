@@ -63,6 +63,8 @@ DEFAULT_CORPORA = (
 PROBE_TIMEOUT = 180.0
 MAX_REPORTED = 400
 FABRIC_LOADER_NAME = "fabric-loader-0.19.5.jar"
+GAME_BLOCK_TABLE_NAMES = ("vanilla-block-classes.json", "block-behaviours-classes.json",
+                          "block-behaviours.json")
 
 
 class FabricOracleUnavailable(RuntimeError):
@@ -173,6 +175,70 @@ def parse_corpus(value: str) -> tuple[str, Path]:
     if not name or not directory:
         raise argparse.ArgumentTypeError("a corpus is NAME=DIR")
     return name, Path(directory).expanduser()
+
+
+def _has_exact_behaviour_closure(path: Path) -> bool:
+    """Whether the prepared behaviour export carries internal-name closures.
+
+    Older Horizon resources have class/interfaces simple names only. They
+    must not be passed as the exact table: a jar class with the same simple name
+    would then forge a vanilla match.
+    """
+    try:
+        root = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    blocks = root.get("blocks") if isinstance(root, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    return all(
+        isinstance(block, dict)
+        and isinstance(block.get("class_closure", block.get("classClosure")), list)
+        for block in blocks
+    )
+
+
+def default_game_block_classes(game_version: str) -> Path | None:
+    """Find the exact table in Horizon's standard prepared-resource locations.
+
+    HORIZON_RESOURCES is the game's documented override. The other roots
+    are the normal checkout and installer locations; the last one is the shared
+    prepared root used by the corpus machines. Absence is deliberately loud:
+    the probe must keep vanilla-block instanceof calls counted.
+    """
+    roots: list[Path] = []
+    if configured := os.environ.get("HORIZON_RESOURCES"):
+        roots.append(Path(configured).expanduser())
+    roots.extend((
+        Path.cwd() / ".local" / "horizon-client" / game_version,
+        ROOT / ".local" / "horizon-client" / game_version,
+        Path.home() / ".local" / "share" / "horizon" / "game-files"
+        / "horizon-client" / game_version,
+        Path.home() / "ava" / "resources" / game_version,
+    ))
+    seen: set[Path] = set()
+    searched: list[str] = []
+    for root in roots:
+        root = root.absolute()
+        if root in seen:
+            continue
+        seen.add(root)
+        searched.append(str(root))
+        for name in GAME_BLOCK_TABLE_NAMES:
+            path = root / name
+            if not path.is_file():
+                continue
+            if name == "block-behaviours.json" and not _has_exact_behaviour_closure(path):
+                continue
+            path = path.resolve()
+            print(f"using prepared vanilla block class table: {path}", file=sys.stderr)
+            return path
+    print(
+        "warning: prepared vanilla block class table absent; vanilla block "
+        "instanceof calls remain counted (searched: " + ", ".join(searched) + ")",
+        file=sys.stderr,
+    )
+    return None
 
 
 def locked_neoforge() -> set[str]:
@@ -410,7 +476,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider-dir", type=Path, action="append", default=[],
                         help="providers-only directory for closure dependencies; rows are never scanned")
     parser.add_argument("--game-block-classes", type=Path,
-                        help="exact vanilla block closure JSON generated from the player's 26.3 install")
+                        help="exact vanilla block closure JSON generated from the player's 26.3 install "
+                             "(default: discover it in prepared resources)")
     parser.add_argument("--allow-missing-fabric-oracle", action="store_true",
                         help="run closure mode even without the Fabric Loader oracle; every Fabric "
                              "closure row is then refused (only for tests and partial machines)")
@@ -424,6 +491,14 @@ def main(argv: list[str] | None = None) -> int:
     if not probe.is_file():
         print(f"missing probe binary {probe}", file=sys.stderr)
         return 1
+    if args.game_block_classes:
+        game_block_classes = args.game_block_classes.expanduser().resolve()
+        if not game_block_classes.is_file():
+            print(f"error: game block class table is not a file: {game_block_classes}",
+                  file=sys.stderr)
+            return 1
+    else:
+        game_block_classes = default_game_block_classes(args.game_version)
 
     # Providers live in the corpora under test, the pools the mega corpus was
     # fetched with, and explicit providers-only directories. Explicit provider
@@ -525,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = probe_one(
                     probe, jar, kind, deps, args.game_version,
-                    args.game_block_classes.resolve() if args.game_block_classes else None,
+                    game_block_classes,
                 )
             return result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
 
