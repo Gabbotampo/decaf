@@ -94,6 +94,11 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 /// like their old markers ([`RETIRED_PREFIXES`]) or their keys (`[I#0`,
 /// `color-collection#0`) is a `String`.
 pub(crate) fn is_plain_string(marker: &str) -> bool {
+    // Only the process-local random-tagged stream marker is a runtime object.
+    // A jar String with the same public shape but another tag is still a String.
+    if marker.starts_with("stream/") {
+        return !crate::runtime::stream_pipeline::is_stream_marker(marker);
+    }
     if RETIRED_PREFIXES
         .iter()
         .any(|prefix| marker.starts_with(prefix))

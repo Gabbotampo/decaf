@@ -6686,6 +6686,11 @@ impl Host for StdHost {
             ),
             ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
+                if expect_ref(&value)
+                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
+                {
+                    return self.unknown_host_call(r);
+                }
                 Ok(Value::Int(match value {
                     Value::Ref(None) => 0,
                     _ => stable_hash(&value_text(value)),
@@ -7131,6 +7136,11 @@ impl Host for StdHost {
             }
             ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
+                if expect_ref(&value)
+                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
+                {
+                    return self.unknown_host_call(r);
+                }
                 Ok(Value::Int(match value {
                     Value::Ref(None) => 0,
                     _ => stable_hash(&value_text(value)),
@@ -15574,7 +15584,6 @@ impl ExecutionBudget {
         self.deadline
             .is_some_and(|(deadline, _)| std::time::Instant::now() >= deadline)
     }
-
 }
 
 // How deep jar frames may nest (as deep as the thread's stack holds) lives in
