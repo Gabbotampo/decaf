@@ -108,18 +108,45 @@ public final class Probe {
 "#,
     );
     sources.insert(
+        "demo/Helper.java",
+        r#"package demo;
+public final class Helper {
+    public static String caller() {
+        return StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE)
+            .getCallerClass().getName();
+    }
+}
+"#,
+    );
+    sources.insert(
         "demo/Main.java",
         r#"package demo;
 import java.util.Properties;
 public final class Main {
+    static boolean npe(Runnable action) {
+        try { action.run(); return false; }
+        catch (NullPointerException error) { return error.getMessage() == null; }
+    }
     public static void main() {
-        Properties properties = new Properties();
+        Properties defaults = new Properties();
+        defaults.setProperty("inherited", "D");
+        Properties properties = new Properties(defaults);
         Object first = properties.setProperty("mode", "fast");
         Object second = properties.setProperty("mode", "safe");
+        properties.setProperty("z", "1");
+        properties.setProperty("a", "2");
         Probe.check("set-new", first == null);
         Probe.check("set-old", "fast".equals(second));
         Probe.check("get", "safe".equals(properties.getProperty("mode")));
+        Probe.check("default", "D".equals(properties.getProperty("inherited")));
+        Probe.check("defaults-unchanged", "D".equals(defaults.getProperty("inherited")));
+        Probe.check("null-key", npe(() -> properties.setProperty(null, "x")));
+        Probe.check("null-value", npe(() -> properties.setProperty("null", null)));
         Probe.check("formatted", "%s-%d".formatted("tick", 20).equals("tick-20"));
+        "% ,d".replace(" ", "").formatted(1234567);
+        "%f".formatted(1.25);
+        "%s".formatted(java.util.Locale.US);
+        properties.stringPropertyNames();
         StackWalker.Option option = StackWalker.Option.RETAIN_CLASS_REFERENCE;
         Probe.check("option-same", option == StackWalker.Option.RETAIN_CLASS_REFERENCE);
         Probe.check("option-name", "RETAIN_CLASS_REFERENCE".equals(option.name()));
@@ -130,6 +157,7 @@ public final class Main {
         Probe.check("option-marker-hash", oldMarker.hashCode() == "enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE".hashCode());
         Probe.check("option-marker-concat", oldMarker.concat("!").equals("enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE!"));
         Probe.check("option-marker-map", java.util.Map.of(oldMarker, 1).get(oldMarker) == 1);
+        Probe.check("caller", "demo.Helper".equals(Helper.caller()));
         Probe.check("walker", StackWalker.getInstance(option) != null);
     }
 }
@@ -147,6 +175,10 @@ public final class Main {
                 "set-new",
                 "set-old",
                 "get",
+                "default",
+                "defaults-unchanged",
+                "null-key",
+                "null-value",
                 "formatted",
                 "option-same",
                 "option-name",
@@ -156,6 +188,7 @@ public final class Main {
                 "option-marker-hash",
                 "option-marker-concat",
                 "option-marker-map",
+                "caller",
                 "walker",
             ]
             .map(|label| (label.to_owned(), true))
@@ -167,7 +200,19 @@ public final class Main {
         .into_iter()
         .filter(|(call, _)| !call.starts_with("demo/Probe#"))
         .collect();
-    assert_eq!(unknown, Vec::new());
+    assert_eq!(
+        unknown,
+        vec![
+            (
+                "java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;".to_owned(),
+                3,
+            ),
+            (
+                "java/util/Properties#stringPropertyNames()Ljava/util/Set;".to_owned(),
+                1,
+            ),
+        ]
+    );
 }
 
 /// A `formatted` call the formatter refuses (`%a` is not modelled) is left to

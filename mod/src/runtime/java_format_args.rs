@@ -26,6 +26,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return None;
         }
+        // The player's default FORMAT locale is outside the bounded host.
+        // Keep only conversions whose output cannot observe it; grouping,
+        // floating-point decimal symbols, and `%s` of a localized host value
+        // are counted instead of silently using US symbols.
         // The parameter is a `String`, so any reference is its text; a null
         // format throws.
         let Value::Ref(Some(format)) = format else {
@@ -37,6 +41,9 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) => None,
             array => Some(self.array(array).ok()?.clone()),
         };
+        if locale.is_none() && default_locale_sensitive(format, args.as_deref()) {
+            return None;
+        }
         let args = args.map(|values| {
             values
                 .iter()
@@ -88,6 +95,48 @@ impl<H: Host> Runtime<'_, H> {
             None => Arg::Opaque,
         }
     }
+}
+
+/// Whether a no-locale format can observe the player's default FORMAT locale.
+fn default_locale_sensitive(format: &str, args: Option<&[Value]>) -> bool {
+    let localized = args.is_some_and(|values| {
+        values.iter().any(|value| {
+            matches!(value, Value::Host(_))
+                && crate::runtime::host_jdk_constant::locale_parts(value).is_some()
+        })
+    });
+    let bytes = format.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'%' {
+            at += 1;
+            continue;
+        }
+        at += 1;
+        if at >= bytes.len() {
+            break;
+        }
+        if bytes[at] == b'%' || bytes[at] == b'n' {
+            at += 1;
+            continue;
+        }
+        let mut grouped = false;
+        while at < bytes.len() && !bytes[at].is_ascii_alphabetic() {
+            grouped |= bytes[at] == b',';
+            at += 1;
+        }
+        let Some(&conversion) = bytes.get(at) else {
+            break;
+        };
+        if grouped
+            || matches!(conversion, b'e' | b'E' | b'f' | b'F' | b'g' | b'G')
+            || (localized && matches!(conversion, b's' | b'S'))
+        {
+            return true;
+        }
+        at += 1;
+    }
+    false
 }
 
 /// A boxed primitive's marker as its argument.
