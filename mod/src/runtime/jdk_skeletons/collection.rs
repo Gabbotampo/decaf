@@ -40,9 +40,6 @@ pub(super) const BODIES: &[(&str, &str, &str)] = &[
     (ABSTRACT_COLLECTION, "toString", "()Ljava/lang/String;"),
 ];
 
-/// `ArraysSupport.SOFT_MAX_ARRAY_LENGTH`.
-const SOFT_MAX_ARRAY_LENGTH: usize = i32::MAX as usize - 8;
-
 impl<H: Host> Runtime<'_, H> {
     /// An `AbstractCollection` member.
     pub(super) fn collection_body(
@@ -281,11 +278,8 @@ impl<H: Host> Runtime<'_, H> {
         while self.has_next(it)? {
             if i == len {
                 len += 1usize.max((len >> 1) + 1);
-                if len > SOFT_MAX_ARRAY_LENGTH {
-                    return Err(throw(
-                        "java/lang/OutOfMemoryError",
-                        Some("Required array length too large".into()),
-                    ));
+                if len > crate::runtime::MAX_ARRAY_ELEMENTS {
+                    return Err(crate::runtime::array_bound_error(len as u128));
                 }
                 r = self.copy_of(&r, len);
             }
@@ -309,10 +303,14 @@ impl<H: Host> Runtime<'_, H> {
 /// An array length from a `size()` answer: the JVM's
 /// `NegativeArraySizeException` (message: the length) for a negative one.
 fn array_size(size: i32) -> Result<usize, NativeError> {
-    usize::try_from(size).map_err(|_| {
+    let length = usize::try_from(size).map_err(|_| {
         throw(
             "java/lang/NegativeArraySizeException",
             Some(size.to_string()),
         )
-    })
+    })?;
+    if length > crate::runtime::MAX_ARRAY_ELEMENTS {
+        return Err(crate::runtime::array_bound_error(length as u128));
+    }
+    Ok(length)
 }
