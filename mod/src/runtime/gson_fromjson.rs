@@ -248,18 +248,115 @@ impl<H: Host> Runtime<'_, H> {
         None
     }
 
+    fn gson_json_io(message: String) -> NativeError {
+        NativeError::UncaughtException {
+            class: "com/google/gson/JsonIOException".into(),
+            message: Some(message),
+            frame: None,
+        }
+    }
+
+    fn gson_record(
+        &mut self,
+        fields: &[(String, Tree)],
+        class: &str,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(file) = self.class(class) else {
+            return Ok(None);
+        };
+        let components: Vec<_> = file
+            .fields
+            .iter()
+            .filter(|field| field.access & 0x0008 == 0)
+            .cloned()
+            .collect();
+        let has_constructor = file.methods.iter().any(|method| {
+            method.name == "<init>" && {
+                let descriptor = format!(
+                    "({})V",
+                    components
+                        .iter()
+                        .map(|field| field.descriptor.as_str())
+                        .collect::<String>()
+                );
+                method.descriptor == descriptor
+            }
+        });
+        if components.is_empty() {
+            return Ok(None);
+        }
+        let mut args = Vec::with_capacity(components.len());
+        for field in &components {
+            let names = self.gson_serialized_names(class, &field.name, &field.descriptor, style);
+            let raw = names.iter().find_map(|name| {
+                fields
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, value)| value)
+            });
+            let value = match raw {
+                Some(raw) => {
+                    let Some(type_) =
+                        self.gson_type_for_field(class, &field.name, &field.descriptor)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(value) = self.gson_materialize_type(raw, &type_, style)? else {
+                        return Ok(None);
+                    };
+                    value
+                }
+                None => Value::default_for(&field.descriptor),
+            };
+            args.push(value);
+        }
+        let descriptor = format!(
+            "({})V",
+            components
+                .iter()
+                .map(|field| field.descriptor.as_str())
+                .collect::<String>()
+        );
+        if !has_constructor {
+            return Ok(None);
+        }
+        self.ensure_initialized(class)?;
+        let value = self.new_object(class);
+        self.invoke(class, "<init>", &descriptor, Some(value.clone()), &args)?;
+        Ok(Some(value))
+    }
+
     fn gson_object(
         &mut self,
         fields: &[(String, Tree)],
         class: &str,
         style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
-        if class.starts_with("java/")
-            || !self.has_class(class)
-            || self.class(class).is_some_and(|file| {
-                crate::runtime::jdk_model::class_access_flags(file).is_some_and(|flags| flags & 0x1000 != 0)
-            })
-        {
+        if class.starts_with("java/") || !self.has_class(class) {
+            return Ok(None);
+        }
+        let Some(file) = self.class(class) else {
+            return Ok(None);
+        };
+        let flags = crate::runtime::jdk_model::class_access_flags(file).unwrap_or_default();
+        if flags & 0x0200 != 0 {
+            return Err(Self::gson_json_io(format!(
+                "Interfaces can't be instantiated! Register an InstanceCreator or a TypeAdapter for this type. Interface name: {}",
+                class.replace('/', ".")
+            )));
+        }
+        if flags & 0x0400 != 0 {
+            return Err(Self::gson_json_io(format!(
+                "Abstract classes can't be instantiated! Adjust the R8 configuration or register an InstanceCreator or a TypeAdapter for this type. Class name: {}",
+                class.replace('/', ".")
+            )));
+        }
+        let is_record = file.super_name == "java/lang/Record" || flags & 0x1000 != 0;
+        if is_record {
+            if let Some(value) = self.gson_record(fields, class, style)? {
+                return Ok(Some(value));
+            }
             return Ok(None);
         }
         let declared = self.gson_fields(class);

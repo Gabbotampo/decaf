@@ -73,6 +73,9 @@ public final class Probe {
         public String value;
         private UnsafeConfig(String ignored) { value = "constructor"; }
     }
+    public abstract static class Abs { public int x; }
+    public interface Intf {}
+    public record Rec(int x, String s) { public Rec { s = s + "|ctor"; } }
     public static final class NestedToken extends com.google.gson.reflect.TypeToken<List<Nested>> {
         public NestedToken() { super(); }
     }
@@ -97,6 +100,18 @@ public final class Probe {
     public static String element() {
         JsonElement element = com.google.gson.JsonParser.parseString("{\"name\":\"element\"}");
         return new Gson().fromJson(element, Config.class).name;
+    }
+    public static String abstractCase() {
+        try { new Gson().fromJson("{\"x\":1}", Abs.class); return "object"; }
+        catch (Throwable t) { return t.getClass().getName()+"|"+t.getMessage(); }
+    }
+    public static String interfaceCase() {
+        try { new Gson().fromJson("{}", Intf.class); return "object"; }
+        catch (Throwable t) { return t.getClass().getName()+"|"+t.getMessage(); }
+    }
+    public static String recordCase() {
+        Rec value = new Gson().fromJson("{\"x\":4,\"s\":\"ok\"}", Rec.class);
+        return value.x()+"|"+value.s();
     }
 }
 "#;
@@ -227,4 +242,24 @@ fn captured_type_tokens_keep_their_parameterized_element_type() {
 #[test]
 fn a_json_element_can_feed_the_reflective_adapter() {
     assert_eq!(Fixture::build("element").text("element"), "element");
+}
+#[test]
+fn abstract_and_interface_targets_throw_gsons_json_io_exception() {
+    let fixture = Fixture::build("abstract");
+    let abstract_error = fixture.text("abstractCase");
+    assert!(
+        abstract_error
+            .starts_with("com.google.gson.JsonIOException|Abstract classes can't be instantiated!"),
+        "{abstract_error}"
+    );
+    let interface_error = fixture.text("interfaceCase");
+    assert!(
+        interface_error
+            .starts_with("com.google.gson.JsonIOException|Interfaces can't be instantiated!"),
+        "{interface_error}"
+    );
+}
+#[test]
+fn records_run_the_canonical_constructor() {
+    assert_eq!(Fixture::build("record").text("recordCase"), "4|ok|ctor");
 }
