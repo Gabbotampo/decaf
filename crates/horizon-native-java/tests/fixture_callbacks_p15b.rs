@@ -73,3 +73,25 @@ fn what_a_lambda_captures_survives_collections() {
     );
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
+
+/// A predicate chain as deep as a jar builds it (`p = p.negate()` 200,000
+/// times) ends in Java's `StackOverflowError` when it runs: one of the
+/// runtime's bounds throws it, counted (the jar-frame bound or the host
+/// walk's, #260), never a native overflow, building or dropping it.
+#[test]
+fn a_deep_predicate_chain_overflows_as_java_does() {
+    let fixture =
+        javac_fixture::Fixture::build("callbacks-p15b-deep", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(
+        call(&fixture, &mut host, "deepNegate"),
+        ORACLE.lines().nth(4).unwrap()
+    );
+    assert!(
+        host.unknown_host_calls().iter().all(|(call, _)| call
+            .starts_with("java/lang/StackOverflowError#<frame-bound:")
+            || call.starts_with("java/lang/StackOverflowError#<host-walk-bound:")),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}

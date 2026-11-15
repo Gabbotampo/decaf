@@ -131,4 +131,19 @@ mod tests {
         assert_eq!(take_refusals(), [(before + levels, 1)]);
         assert!(take_refusals().is_empty());
     }
+
+    /// A composed predicate as deep as a jar builds it (`p = p.negate()` in a loop) is one row
+    /// per link (`callback_marker.rs`): building, tracing and dropping it never overflows the
+    /// native stack. Running it ends in a `StackOverflowError` (`fixture_callbacks_p15b.rs`,
+    /// `deepNegate`).
+    #[test]
+    fn a_deep_predicate_chain_is_built_traced_and_dropped() {
+        let mut chain = crate::runtime::callback_marker::test_token("x");
+        for _ in 0..200_000 {
+            chain = crate::runtime::callback_marker::composite("predicate.not", &[&chain]);
+        }
+        // The collector's walk of what it holds stops at its own bound.
+        assert!(crate::runtime::heap::value_texts(&chain).len() <= 65);
+        drop(chain);
+    }
 }

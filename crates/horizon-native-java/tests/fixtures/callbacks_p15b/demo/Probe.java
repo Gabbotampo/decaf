@@ -96,6 +96,17 @@ public final class Probe {
         return "held=" + held.getAsInt();
     }
 
+    /** A predicate chain as deep as a jar builds it: Java overflows its stack running it. */
+    public static String deepNegate() {
+        Predicate<String> p = s -> true;
+        for (int i = 0; i < 200_000; i++) p = p.negate();
+        try {
+            return "deep=" + p.test("x");
+        } catch (StackOverflowError e) {
+            return "deep=StackOverflowError";
+        }
+    }
+
     public static void main(String[] args) {
         System.out.println(identity());
         System.out.println(collections());
@@ -103,5 +114,6 @@ public final class Probe {
         setup();
         for (int i = 0; i < 5; i++) garbage();
         System.out.println(check());
+        System.out.println(deepNegate());
     }
 }

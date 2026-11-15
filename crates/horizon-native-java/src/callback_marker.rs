@@ -80,6 +80,29 @@ impl Row {
             Row::Composite { operands, .. } => operands,
         }
     }
+
+    fn take_values(&mut self) -> Vec<Value> {
+        match self {
+            Row::Lambda { callback, .. } => std::mem::take(&mut callback.captures),
+            Row::Composite { operands, .. } => std::mem::take(operands),
+        }
+    }
+}
+
+/// A chain a jar builds in a loop (`p = p.negate()` 200,000 times) nests one
+/// row per link: dropping it recursively would overflow the native stack.
+/// Each row hands the rows only it holds to one loop instead.
+impl Drop for Row {
+    fn drop(&mut self) {
+        let mut pending = self.take_values();
+        while let Some(value) = pending.pop() {
+            if let Value::Host(handle) = value
+                && let Some(mut row) = handle.into_unique_row()
+            {
+                pending.extend(row.take_values());
+            }
+        }
+    }
 }
 
 /// A number no other callback of this process has: the suffix that makes a
@@ -341,10 +364,12 @@ pub(crate) const IDENTITY_UNARY: &str = "identity/unary";
 /// object per call (`~<n>`); the operand-free `identity()` singletons are
 /// one object each.
 pub(crate) fn composite(op: &str, operands: &[&Value]) -> Value {
-    // Bounded like a lambda's captures: a chain's key no longer embeds its
-    // whole left side again at every link (#256's growth).
+    // The row holds the operands; the key's text is only the fallback for
+    // a result read back from another handle's key, so it is bounded short:
+    // a chain a jar builds in a loop (`p = p.negate()`) keeps one short key
+    // per link, never its whole left side again (#256's growth).
     let operands_owned: Vec<Value> = operands.iter().map(|value| (*value).clone()).collect();
-    let markers = crate::bounded_captured_markers(&operands_owned);
+    let markers = crate::bounded_markers(&operands_owned, 256);
     let op_field = if operands.is_empty() {
         op.to_owned()
     } else {

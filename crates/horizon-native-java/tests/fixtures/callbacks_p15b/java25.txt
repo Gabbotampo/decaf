@@ -2,3 +2,4 @@ identity=true,false,false,true,false,true,true,false,false,true,false
 collections=2,true,false,3,again
 dispatch=12,3,5,abc,true,8,42,7,42
 held=5042
+deep=StackOverflowError

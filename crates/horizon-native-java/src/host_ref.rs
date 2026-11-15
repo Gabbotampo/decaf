@@ -2140,6 +2140,12 @@ impl HostRef {
         }
     }
 
+    /// The row this handle alone holds, taken out of it (for
+    /// `callback_marker::Row`'s drop, which unwinds a deep chain in a loop).
+    pub(crate) fn into_unique_row(self) -> Option<crate::callback_marker::Row> {
+        Arc::try_unwrap(self.row?).ok()
+    }
+
     /// The row a callback handle carries, when it was made rather than
     /// decoded from text.
     pub(crate) fn row(&self) -> Option<&crate::callback_marker::Row> {

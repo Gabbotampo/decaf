@@ -11306,14 +11306,18 @@ fn enum_ordinal(value: &Value) -> i32 {
 /// hundred keys reached a gigabyte before the bound. Transcribing the head is
 /// enough to name the site, and the bound keeps the chain flat.
 fn bounded_captured_markers(values: &[Value]) -> String {
-    const MAX_MARKER_CHARS: usize = 4096;
+    bounded_markers(values, 4096)
+}
+
+/// [`bounded_captured_markers`] with a bound of `max_chars`.
+fn bounded_markers(values: &[Value], max_chars: usize) -> String {
     let mut text = String::new();
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             text.push(',');
         }
         let marker = value_marker(value);
-        let room = MAX_MARKER_CHARS.saturating_sub(text.chars().count());
+        let room = max_chars.saturating_sub(text.chars().count());
         if marker.chars().count() > room {
             // The cut value is no value any more: an element no capture
             // parser accepts follows it, so running the callback is counted
