@@ -120,9 +120,11 @@ fn review_expected(method: &str) -> &'static str {
 /// - `gsonGuavaJson`: a Guava map serializes as a JSON object;
 /// - `guavaClassSurface`: Guava's superclasses, and `isAssignableFrom`.
 ///
-/// Counted, never another value: a jar class's array (Gson's reflective
-/// adapter), a `byte` past 255 (`JsonSyntaxException`), `Short[]`/`Float[]`
-/// (boxes no value here carries) and a JDK enum's ordinal order.
+/// - `gsonForeign`, `gsonShortBox`, `gsonFloatBox`: a jar class's array
+///   (its objects through the reflective adapter), `Short[]` and `Float[]`.
+///
+/// Counted, never another value: a `byte` past 255 (`JsonSyntaxException`)
+/// and a JDK enum's ordinal order.
 #[test]
 fn guava_and_gson_collections_are_javas() {
     let mut sources = vec![("demo/Review.java", REVIEW)];
