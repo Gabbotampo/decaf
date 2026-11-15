@@ -444,6 +444,8 @@ pub enum HostKind {
     OpaqueCodec,
     /// A pure network StreamCodec factory result.
     StreamCodec,
+    /// An explicitly seeded Minecraft RandomSource or positional factory.
+    RandomSource,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -848,6 +850,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::StreamCodec,
         &crate::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
+    (HostKind::RandomSource, &crate::random_source::CLASS_SIDE),
 ];
 
 /// One row of the kind table.
@@ -2018,6 +2021,13 @@ const KINDS: &[KindInfo] = &[
         // Every factory call allocates a new implementation object.
         canonical: always_canonical,
         methods: &crate::stream_codec::STREAM_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RandomSource,
+        tag: "rand",
+        class: ClassRule::FromKey(crate::random_source::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::random_source::METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,
