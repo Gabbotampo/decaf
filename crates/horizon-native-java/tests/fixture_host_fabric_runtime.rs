@@ -285,3 +285,31 @@ fn a_string_cast_to_a_singleton_type_is_never_the_object() {
         }
     }
 }
+
+#[test]
+fn duplicate_entrypoint_rows_are_invoked_and_failures_continue() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("duplicate-entrypoints", &sources);
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    fixture
+        .jar
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap();
+    host = host.with_fabric_entrypoint("main", "demo.Probe", "probe-fixture");
+    let text = fixture.text_on(&mut host, "invokeFailure");
+    assert_eq!(
+        text,
+        "RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:2"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
