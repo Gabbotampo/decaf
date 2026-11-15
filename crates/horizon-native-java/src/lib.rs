@@ -29093,18 +29093,45 @@ fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, 
     })
 }
 
+/// How deep annotation values may nest (an array or annotation inside another). The JVM sets
+/// no limit, but the reader is Rust recursion over the class file's bytes, which a jar chooses:
+/// three bytes per nested array would otherwise overflow the native stack while the jar loads
+/// (#250). javac writes a handful of levels; a class nested deeper is refused as invalid.
+const MAX_ANNOTATION_DEPTH: usize = 64;
+
 fn read_annotation(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Annotation, NativeError> {
+    read_annotation_at(r, pool, 0)
+}
+
+fn read_annotation_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<Annotation, NativeError> {
     let descriptor = utf8(pool, r.u2()?)?;
     let pair_count = r.u2()? as usize;
     let mut values = BTreeMap::new();
     for _ in 0..pair_count {
         let name = utf8(pool, r.u2()?)?;
-        values.insert(name, read_annotation_value(r, pool)?);
+        values.insert(name, read_annotation_value_at(r, pool, depth + 1)?);
     }
     Ok(Annotation { descriptor, values })
 }
 
 fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationValue, NativeError> {
+    read_annotation_value_at(r, pool, 0)
+}
+
+fn read_annotation_value_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<AnnotationValue, NativeError> {
+    if depth > MAX_ANNOTATION_DEPTH {
+        return Err(NativeError::InvalidClass(
+            "annotation values nested too deeply",
+        ));
+    }
     match r.u1()? {
         b's' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
         b'Z' => match int_constant(pool, r.u2()?)? {
@@ -29127,14 +29154,16 @@ fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationVa
         // A class constant in an annotation is a field descriptor such as
         // `Lnet/minecraft/world/level/Level;`.
         b'c' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
-        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation(
-            r, pool,
+        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation_at(
+            r,
+            pool,
+            depth + 1,
         )?))),
         b'[' => {
             let count = r.u2()? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_annotation_value(r, pool)?);
+                items.push(read_annotation_value_at(r, pool, depth + 1)?);
             }
             Ok(AnnotationValue::Array(items))
         }
@@ -41612,6 +41641,36 @@ mandatory = true
             host_collection_values(&host, &entries).unwrap(),
             Vec::<Value>::new()
         );
+    }
+
+    /// Annotation values nested as deep as a class file's bytes allow are refused as an invalid
+    /// class, never read by recursion until the native stack overflows (#250); a few levels
+    /// read as ever.
+    #[test]
+    fn deeply_nested_annotation_values_are_refused() {
+        let pool = vec![Cp::Empty, Cp::Integer(7)];
+        let nested = |levels: usize| {
+            let mut bytes = Vec::with_capacity(levels * 3 + 3);
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 1]);
+            bytes
+        };
+        let deep = nested(100_000);
+        assert!(matches!(
+            read_annotation_value(&mut Reader::new(&deep), &pool),
+            Err(NativeError::InvalidClass(_))
+        ));
+        let shallow = nested(3);
+        let mut value = read_annotation_value(&mut Reader::new(&shallow), &pool).unwrap();
+        for _ in 0..3 {
+            let AnnotationValue::Array(mut items) = value else {
+                panic!("{value:?}")
+            };
+            value = items.remove(0);
+        }
+        assert_eq!(value, AnnotationValue::Int(7));
     }
 
     #[test]
