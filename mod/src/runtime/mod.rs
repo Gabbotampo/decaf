@@ -5310,7 +5310,13 @@ impl Host for StdHost {
     }
 
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
-        Some(self.unmodifiable_from("java/util/Map", "of", kind, values))
+        let owner = match kind {
+            "list" => "java/util/List",
+            "set" => "java/util/Set",
+            "map" => "java/util/Map",
+            _ => return None,
+        };
+        Some(self.unmodifiable_from(owner, "of", kind, values))
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
