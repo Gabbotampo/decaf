@@ -332,6 +332,41 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("--fabric-loader", errors.getvalue())
 
+    def test_provider_dir_filters_same_id_by_loader_for_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "deps-pool"
+            pool.mkdir()
+            with zipfile.ZipFile(pool / "shared-fabric.jar", "w") as archive:
+                archive.writestr("fabric.mod.json", json.dumps({
+                    "id": "shared", "version": "9",
+                }))
+            with zipfile.ZipFile(pool / "shared-neoforge.jar", "w") as archive:
+                archive.writestr("META-INF/neoforge.mods.toml", (
+                    '[[mods]]\nmodId="shared"\nversion="2"\n'))
+            with zipfile.ZipFile(root / "fabric-app.jar", "w") as archive:
+                archive.writestr("fabric.mod.json", json.dumps({
+                    "id": "fabric_app", "version": "1", "depends": {"shared": "*"},
+                }))
+            with zipfile.ZipFile(root / "neoforge-app.jar", "w") as archive:
+                archive.writestr("META-INF/neoforge.mods.toml", (
+                    '[[mods]]\nmodId="neoforge_app"\nversion="1"\n'
+                    '[[dependencies.neoforge_app]]\nmodId="shared"\n'
+                    'type="required"\n'))
+            fabric_index = TOOL.ledger.provider_index(
+                TOOL.provider_dir_jars(pool, "corpus-xl"))
+            neo_index = TOOL.ledger.provider_index(
+                TOOL.provider_dir_jars(pool, "neoforge"))
+            matcher = TOOL.hybrid_pack.maven_version_satisfies
+            fabric_closure = TOOL.ledger.dependency_closure(
+                root / "fabric-app.jar", fabric_index, version_matcher=matcher)
+            neo_closure = TOOL.ledger.dependency_closure(
+                root / "neoforge-app.jar", neo_index, version_matcher=matcher)
+        self.assertEqual([jar.name for jar in fabric_closure.jars],
+                         ["shared-fabric.jar"])
+        self.assertEqual([jar.name for jar in neo_closure.jars],
+                         ["shared-neoforge.jar"])
+
     def test_provider_dir_supplies_closure_only_and_is_not_a_row(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

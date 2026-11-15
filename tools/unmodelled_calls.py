@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -150,6 +151,20 @@ def fabric_pairs(index: dict[str, list]) -> set[tuple[str, str]]:
                 for candidate in index.get(dependency.lower(), []):
                     pairs.add((predicate, candidate.declaration.version))
     return pairs
+
+
+def provider_dir_jars(directory: Path, corpus_name: str) -> list[hybrid_pack.PackJar]:
+    """Read explicit providers, keeping each loader's metadata family separate."""
+    marker = "META-INF/neoforge.mods.toml" if corpus_name == "neoforge" else "fabric.mod.json"
+    jars = []
+    for jar in ledger.corpus_jars([directory]):
+        try:
+            with zipfile.ZipFile(jar.path) as archive:
+                if marker in archive.namelist():
+                    jars.append(jar)
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return jars
 
 
 def parse_corpus(value: str) -> tuple[str, Path]:
@@ -422,9 +437,14 @@ def main(argv: list[str] | None = None) -> int:
             provider_dirs = [path for other, path in corpora if other != "neoforge"]
             provider_dirs += [path for path in ledger.DEFAULT_DEP_DIRS
                               if str(path) not in {str(d) for d in provider_dirs}]
-        provider_dirs += [path for path in provider_dirs_arg
-                          if str(path) not in {str(d) for d in provider_dirs}]
-        indexes[name] = ledger.provider_index(ledger.corpus_jars(provider_dirs))
+        index_jars = ledger.corpus_jars(provider_dirs)
+        seen = {jar.path.resolve() for jar in index_jars}
+        for provider_dir in provider_dirs_arg:
+            for jar in provider_dir_jars(provider_dir, name):
+                if jar.path.resolve() not in seen:
+                    index_jars.append(jar)
+                    seen.add(jar.path.resolve())
+        indexes[name] = ledger.provider_index(index_jars)
 
     fabric_oracle: FabricPredicateOracle | None = None
     fabric_oracle_error = ""
