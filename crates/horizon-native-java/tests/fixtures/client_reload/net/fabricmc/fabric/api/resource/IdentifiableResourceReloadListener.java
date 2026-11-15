@@ -1,0 +1,1 @@
+package net.fabricmc.fabric.api.resource; import net.minecraft.resources.Identifier; public interface IdentifiableResourceReloadListener extends net.minecraft.server.packs.resources.PreparableReloadListener { Identifier getFabricId(); }
