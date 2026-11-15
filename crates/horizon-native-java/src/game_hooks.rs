@@ -1124,6 +1124,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.modelled_to_string(value)
     }
 
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        self.inner.modelled_to_string_checked(value)
+    }
+
     fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
         self.inner.mutable_collection_entries(value)
     }
