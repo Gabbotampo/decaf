@@ -25183,6 +25183,15 @@ impl<H: Host> Runtime<'_, H> {
         self.io_sink_key(target).is_some() || self.string_builders.contains_key(target)
     }
 
+    fn gson_host_object_marker(value: &Value) -> Option<String> {
+        match value {
+            Value::Host(handle) if crate::jar_object::is_object_handle(handle) => {
+                Some(handle.key_text().to_owned())
+            }
+            _ => None,
+        }
+    }
+
     fn gson_writer_fallback(
         &mut self,
         r: &MethodRef,
@@ -25205,7 +25214,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return self.gson_writer_fallback(r, receiver, args);
         };
-        let Some(marker) = expect_ref(receiver).cloned() else {
+        let Some(marker) = Self::gson_host_object_marker(receiver) else {
             return self.gson_writer_fallback(r, Some(receiver), args);
         };
         if r.name == "<init>" {
@@ -25222,12 +25231,12 @@ impl<H: Host> Runtime<'_, H> {
                     frame: None,
                 });
             }
-            let Some(target) =
-                expect_ref(argument).or_else(|| host_service::stream_marker(argument))
+            let Some(target) = Self::gson_host_object_marker(argument)
+                .or_else(|| host_service::stream_marker(argument).cloned())
             else {
                 return self.gson_writer_fallback(r, Some(receiver), args);
             };
-            if !self.gson_writer_target_supported(target) {
+            if !self.gson_writer_target_supported(&target) {
                 return self.gson_writer_fallback(r, Some(receiver), args);
             }
             self.gson_writers
@@ -25385,7 +25394,7 @@ impl<H: Host> Runtime<'_, H> {
                 self.gson_writers
                     .get_mut(&marker)
                     .expect("writer exists")
-                    .set_indent(indent);
+                    .set_indent(indent)?;
                 Ok(Some(Value::Void))
             }
             ("setFormattingStyle", "(Lcom/google/gson/FormattingStyle;)V") => {
@@ -25577,14 +25586,15 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
                         let Some(target) = args.first().and_then(|value| {
-                            expect_ref(value).or_else(|| host_service::stream_marker(value))
+                            Self::gson_host_object_marker(value)
+                                .or_else(|| host_service::stream_marker(value).cloned())
                         }) else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        if !self.gson_writer_target_supported(target) {
+                        if !self.gson_writer_target_supported(&target) {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
@@ -25628,13 +25638,14 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("JsonWriter") =>
                     {
-                        let Some(writer) = args.last().and_then(expect_ref) else {
+                        let Some(writer) = args.last().and_then(Self::gson_host_object_marker)
+                        else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        let Some(state) = self.gson_writers.get(writer).cloned() else {
+                        let Some(state) = self.gson_writers.get(&writer).cloned() else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
@@ -25660,7 +25671,7 @@ impl<H: Host> Runtime<'_, H> {
                         };
                         let target = state.target;
                         let fragment = {
-                            let writer = self.gson_writers.get_mut(writer).expect("writer exists");
+                            let writer = self.gson_writers.get_mut(&writer).expect("writer exists");
                             match tree {
                                 Some(text) => writer.raw_tree(text)?,
                                 None => {
@@ -25699,22 +25710,23 @@ impl<H: Host> Runtime<'_, H> {
                         let target = args
                             .last()
                             .and_then(|arg| {
-                                expect_ref(arg).or_else(|| host_service::stream_marker(arg))
+                                Self::gson_host_object_marker(arg)
+                                    .or_else(|| host_service::stream_marker(arg).cloned())
                             })
                             .ok_or_else(|| {
                                 NativeError::Metadata(
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if self.io_sink_key(target).is_none()
-                            && !self.string_builders.contains_key(target)
+                        if self.io_sink_key(&target).is_none()
+                            && !self.string_builders.contains_key(&target)
                         {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         }
-                        self.gson_write_target(target, &text)?;
+                        self.gson_write_target(&target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {

@@ -125,6 +125,14 @@ public final class Probe {
     StringWriter lenientOut = new StringWriter(); JsonWriter lenient = new JsonWriter(lenientOut); lenient.setLenient(true); lenient.value(Double.NaN).value(Double.POSITIVE_INFINITY);
     return out + "|lenient=" + lenientOut.toString();
   }
+  public static String writerReviewCases() {
+    StringBuilder out = new StringBuilder();
+    try { new JsonWriter(new StringWriter()).setIndent("x"); } catch (Exception e) { out.append("indent=").append(e.getClass().getName()).append(':').append(e.getMessage()); }
+    JsonWriter w = new JsonWriter(new StringWriter()); w.beginObject().name("x");
+    try { w.value(Double.NaN); } catch (Exception e) { out.append("|first=").append(e.getClass().getName()).append(':').append(e.getMessage()); }
+    try { w.name("y"); } catch (Exception e) { out.append("|after=").append(e.getClass().getName()).append(':').append(e.getMessage()); }
+    return out.toString();
+  }
   public static String writerValues() throws Exception {
     StringWriter out = new StringWriter(); JsonWriter w = new JsonWriter(out);
     w.beginArray().value(true).value(Boolean.FALSE).value(1.25f).value(2.5).value(3L).value(Integer.valueOf(4)).nullValue().endArray(); w.close();
@@ -275,6 +283,14 @@ fn exact_writer_output_and_options_match_real_gson() {
     assert_eq!(
         f.text("gsonWriter"),
         r#"{\n\t"s": "\\u003c\\u0026\\u003e\\u003d\\u0027\\u2028\\u2029",\n\t"b": false,\n\t"n": -0.0,\n\t"c": "x",\n\t"null": null\n}|after=false,true"#
+    );
+}
+
+#[test]
+fn review_writer_order_and_indent_validation_match_gson_214() {
+    assert_eq!(
+        Fixture::new().text("writerReviewCases"),
+        "indent=java.lang.IllegalArgumentException:Only combinations of spaces and tabs are allowed in indent.|first=java.lang.IllegalArgumentException:Numeric values must be finite, but was NaN|after=java.lang.IllegalStateException:Please begin an object before writing a name."
     );
 }
 
