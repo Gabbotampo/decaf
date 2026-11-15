@@ -72,6 +72,12 @@ fn json_long(text: &str) -> Option<i64> {
 /// `Double.parseDouble` of a JSON number's text. Text of any other shape is
 /// refused: Java's parser and Rust's accept different spellings beyond it.
 fn json_double(text: &str) -> Option<f64> {
+    match text {
+        "NaN" => return Some(f64::NAN),
+        "Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
     json_number(text)?;
     text.parse::<f64>().ok()
 }
@@ -202,7 +208,10 @@ impl<H: Host> Runtime<'_, H> {
         target: &GenericType,
         style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
-        match Parser::parse_noting_duplicates(text) {
+        match Parser::parse_noting_duplicates_with_special_floats(
+            text,
+            style.allows_special_floats(),
+        ) {
             // An empty document is `null`.
             (Parsed::Empty, _) => Ok(Some(Value::Ref(None))),
             (Parsed::Value(tree), false) => self.gson_read(&tree, target, style),
@@ -240,6 +249,19 @@ impl<H: Host> Runtime<'_, H> {
             _ => &[],
         };
         let class = class.to_owned();
+        // Gson's STRICT reader rejects non-finite values for every numeric
+        // adapter and ObjectTypeAdapter. StringAdapter still reads the token
+        // text, so retain that exact result.
+        if !style.allows_special_floats()
+            && class != "java/lang/String"
+            && matches!(
+                tree,
+                Tree::Num(text)
+                    if json_double(text).is_some_and(|value| !value.is_finite())
+            )
+        {
+            return Ok(None);
+        }
         if class == "java/lang/Object" {
             return self.gson_object_value(tree);
         }
