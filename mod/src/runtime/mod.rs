@@ -3195,6 +3195,9 @@ pub struct StdHost {
     game_version: Option<String>,
     development_environment: bool,
     calls: Vec<MethodRef>,
+    /// A one-shot raw-bit conversion may consume only the immediately
+    /// preceding seeded RandomSource draw; it is cleared by every other call.
+    random_bit_scope: Option<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
     /// Text the jar wrote to `System.out`, kept for callers that show it (the game's mod). The
@@ -3466,6 +3469,7 @@ impl StdHost {
             game_version: None,
             development_environment: false,
             calls: Vec::new(),
+            random_bit_scope: None,
             invocations: Vec::new(),
             posted_events: Vec::new(),
             console_out: String::new(),
@@ -6118,6 +6122,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if !random_source::is_bit_conversion(r) {
+            self.random_bit_scope = None;
+        }
         self.record(r, None, args);
         if let Some(result) = self.random_static(r, args) {
             return result;

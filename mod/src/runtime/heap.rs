@@ -1490,6 +1490,7 @@ mod tests {
             "environment_type",
             "game_version",
             "development_environment",
+            "random_bit_scope",
             "console_out",
             "inferred_declarations",
             "declared_registrations",
