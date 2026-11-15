@@ -39,9 +39,18 @@
 //! `IdentityHashMap` make a new entry per `next()` that reads and writes the map by its key;
 //! `ConcurrentHashMap` makes a new `MapEntry` per `next()` that keeps its own value and
 //! `put`s on `setValue`; `ConcurrentSkipListMap` hands out immutable snapshots. The entries of
-//! any other map (a host literal, `Collections.unmodifiableMap`, a library's) are
-//! [`HostKind::OpaqueMapEntry`], whose class is not known (`getClass()` counted): their key and
-//! value are as read while the map is unchanged, and `setValue` is counted.
+//! any other map (a host literal, a library's) are [`HostKind::OpaqueMapEntry`], whose class is
+//! not known (`getClass()` counted): their key and value are as read while the map is unchanged,
+//! and `setValue` is counted.
+//!
+//! **`Collections.unmodifiableMap`'s entries** are a new `UnmodifiableEntry` per `next()`
+//! wrapping the entry its source map hands out, which answers every read (`getKey`,
+//! `getValue`, `equals`, `hashCode`, `toString`) and refuses `setValue`. So a view's entry here
+//! is a wrapper ([`Life::Wrapped`]) around the very entry a direct read of the view's source
+//! (through any chain of views) mints: a live node, a Gson reading with its generation check, a
+//! `ConcurrentHashMap.MapEntry` with its own value, a snapshot. One code path answers both
+//! (#221 review 6, B10: the view used to read its source live, past writes its stamp did not
+//! see).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -153,8 +162,8 @@ fn entry_mode(map_class: &str) -> Option<(&'static str, Mode)> {
 /// libraries' own classes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpaqueReading {
-    /// A new entry per `next()`: `Collections.unmodifiableMap`'s `UnmodifiableEntry` and
-    /// `checkedMap`'s `CheckedEntry` wrap the map's entry afresh.
+    /// A new entry per `next()`: `checkedMap`'s `CheckedEntry` wraps the map's entry afresh
+    /// (`unmodifiableMap`'s are [`Life::Wrapped`]).
     New,
     /// The map's stored entry, one object while the map has no structural change:
     /// `Collections.singletonMap`'s cached `SimpleImmutableEntry`, a host literal (Guava's
@@ -165,9 +174,9 @@ enum OpaqueReading {
     Unknown,
 }
 
-fn opaque_reading(map: &str, view: bool) -> OpaqueReading {
+fn opaque_reading(map: &str) -> OpaqueReading {
     let class = class_of_marker(map);
-    if view || class.starts_with("java/util/Collections$Checked") {
+    if class.starts_with("java/util/Collections$Checked") {
         OpaqueReading::New
     } else if class == "java/util/Collections$SingletonMap"
         || class == crate::runtime::gson_tree::TREE_MAP
@@ -207,16 +216,17 @@ enum Life {
     Detached,
     /// A node this model lost track of.
     Lost,
-    /// An entry of a map whose entry class is not modelled, as read at `stamp`. `view`: `map` is
-    /// the map an unmodifiable view reads, whose entries the view's entries read live.
+    /// An entry of a map whose entry class is not modelled, as read at `stamp`.
     Opaque {
         map: String,
         stamp: ModStamp,
         /// The map's row generation as read: every write moves it, a removal through a path
         /// that keeps no `modCount` (Gson's) included (#221 review B6).
         generation: u64,
-        view: bool,
     },
+    /// `Collections.UnmodifiableEntry`: a new wrapper per reading around `inner`, the entry the
+    /// view's source map handed out, which answers its reads; `setValue` throws.
+    Wrapped { inner: Value },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,7 +308,13 @@ impl Entries {
                     .flatten()
                     .map(|(_, state)| state),
             )
-            .flat_map(|state| [&state.key, &state.value])
+            .flat_map(|state| {
+                let inner = match &state.life {
+                    Life::Wrapped { inner } => Some(inner),
+                    _ => None,
+                };
+                [&state.key, &state.value].into_iter().chain(inner)
+            })
     }
 
     /// How many entries the host keeps.
@@ -493,6 +509,20 @@ impl StdHost {
         }
     }
 
+    /// The map an unmodifiable view reads, through any chain of views; `None` for a map that
+    /// is no unmodifiable view. Bounded by the view table (a cycle cannot be built, but the
+    /// walk never trusts that).
+    fn view_root(&self, map: &str) -> Option<String> {
+        let mut source = crate::runtime::Host::unmodifiable_view_source(self, map)?;
+        for _ in 0..self.unmodifiable_collections.len() {
+            match crate::runtime::Host::unmodifiable_view_source(self, &source) {
+                Some(next) => source = next,
+                None => return Some(source),
+            }
+        }
+        None
+    }
+
     fn mint_key(&mut self, class: &str, node: bool) -> String {
         self.map_entries.next += 1;
         let serial = self.map_entries.next;
@@ -527,6 +557,23 @@ impl StdHost {
             EntryMade::Node => {}
         }
         let map = map.and_then(crate::runtime::expect_ref).cloned().unwrap_or_default();
+        // An unmodifiable view's entry wraps the one its source map hands out, minted here
+        // exactly as a direct read of the source mints it (B10).
+        if let Some(source) = self.view_root(&map) {
+            let inner = self.mint_map_entry(Some(&Value::Ref(Some(source))), key, value, made);
+            let entry_key = self.mint_key(OPAQUE, true);
+            let handle = Value::Host(HostRef::new(HostKind::OpaqueMapEntry, entry_key.clone()));
+            self.map_entries.states.insert(
+                entry_key,
+                EntryState {
+                    key: key.clone(),
+                    value: value.clone(),
+                    life: Life::Wrapped { inner },
+                    handle: handle.clone(),
+                },
+            );
+            return handle;
+        }
         let state = |life: Life, handle: &Value| EntryState {
             key: key.clone(),
             value: value.clone(),
@@ -534,19 +581,14 @@ impl StdHost {
             handle: handle.clone(),
         };
         let Some((class, mode)) = entry_mode(class_of_marker(&map)) else {
-            // A map whose entry class is not modelled. An unmodifiable view's entries read
-            // the map it wraps (`UnmodifiableEntry` delegates to that map's entry).
-            let source = crate::runtime::Host::unmodifiable_view_source(self, &map);
-            let view = source.is_some();
-            let reading = opaque_reading(&map, view);
-            let watched = source.unwrap_or_else(|| map.clone());
-            let stamp = self.mod_stamp_of(&watched);
-            let generation = self.mutable_collections.generation(&watched);
+            // A map whose entry class is not modelled.
+            let reading = opaque_reading(&map);
+            let stamp = self.mod_stamp_of(&map);
+            let generation = self.mutable_collections.generation(&map);
             let life = Life::Opaque {
-                map: watched,
+                map: map.clone(),
                 stamp,
                 generation,
-                view,
             };
             // One key per mapping (#221 review B4): a stored entry is one object across
             // readings, so a reading never makes a new key for it.
@@ -818,20 +860,8 @@ impl StdHost {
             // Its own value (`ConcurrentHashMap.MapEntry.val`).
             Life::Concurrent { .. } => Some((state.key.clone(), state.value.clone())),
             Life::Lost => None,
-            // An unmodifiable view's entry reads the wrapped map's node: live, while that map
-            // has had no structural change (a removed and re-put key would be another node).
-            Life::Opaque {
-                map,
-                stamp,
-                view: true,
-                ..
-            } => {
-                if self.mod_stamp_of(map) != *stamp {
-                    return None;
-                }
-                let (_, value) = self.entry_map_value(map, &state.key, 0)?;
-                Some((state.key.clone(), value))
-            }
+            // `UnmodifiableEntry`: what the source's entry holds now.
+            Life::Wrapped { inner } => self.map_entry_now(inner),
             // A map the host keeps no row for (an immutable literal) cannot have changed. A
             // kept one answers only while its row is untouched since the reading (#221 review 5,
             // B8): its generation moves on every write, and Gson's in-place replace and its
@@ -878,7 +908,7 @@ impl StdHost {
             Life::Fixed if entry_class(handle.key()) == KEY_VALUE_HOLDER => {
                 Err(unsupported(Some("not supported")))
             }
-            Life::Fixed => Err(unsupported(None)),
+            Life::Fixed | Life::Wrapped { .. } => Err(unsupported(None)),
             Life::Detached => {
                 let states = &mut self.map_entries.states;
                 let state = states.get_mut(handle.key()).expect("found above");

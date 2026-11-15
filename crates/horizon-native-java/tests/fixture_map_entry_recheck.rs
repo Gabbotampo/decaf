@@ -410,17 +410,31 @@ fn an_entry_read_before_a_gson_remove_keeps_its_own_state() {
             .any(|(call, _)| call.starts_with("java/util/Map$Entry#getValue")),
         "{unknown:?}"
     );
-    for method in ["x01ReplaceRemoveReadd", "d02ReplaceRemoveReadd"] {
+    // Each reading after the write counts the read that departs from Java.
+    let get_value = "java/util/Map$Entry#getValue()Ljava/lang/Object;";
+    for (method, calls) in [
+        ("x01ReplaceRemoveReadd", &[get_value][..]),
+        (
+            "d02ReplaceRemoveReadd",
+            &[
+                get_value,
+                "java/util/Map$Entry#equals(Ljava/lang/Object;)Z",
+                "java/util/Map$Entry#hashCode()I",
+            ][..],
+        ),
+    ] {
         let (text, unknown) = run(&fixture, method);
-        assert!(
-            text == expected(method) || !unknown.is_empty(),
-            "{method}: silent {text}, Java {}",
-            expected(method)
-        );
         assert!(
             !text.starts_with("1|"),
             "{method}: the re-added value, {text}"
         );
+        for call in calls {
+            assert!(
+                unknown.iter().any(|(counted, _)| counted == call),
+                "{method}: {call} in {unknown:?} (Java {}, here {text})",
+                expected(method)
+            );
+        }
     }
 }
 
@@ -432,17 +446,28 @@ fn an_entry_read_before_a_gson_remove_keeps_its_own_state() {
 #[test]
 fn equal_keys_with_unknown_hashes_are_never_merged_silently() {
     let fixture = fixture();
-    for method in [
-        "h17ListKeys",
-        "c02ArrayListKeys",
-        "c03EntryKeys",
-        "c08LinkedHashMap",
+    // Each counts the lookup that could not be placed: the set's `add`/`contains`, the map's
+    // `put`.
+    let add = "java/util/Set#add(Ljava/lang/Object;)Z";
+    for (method, calls) in [
+        (
+            "h17ListKeys",
+            &[add, "java/util/Set#contains(Ljava/lang/Object;)Z"][..],
+        ),
+        ("c02ArrayListKeys", &[add][..]),
+        ("c03EntryKeys", &[add][..]),
+        (
+            "c08LinkedHashMap",
+            &["java/util/Map#put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"][..],
+        ),
     ] {
         let (text, unknown) = run(&fixture, method);
-        assert!(
-            text == expected(method) || !unknown.is_empty(),
-            "{method}: silent {text}, Java {}",
-            expected(method)
-        );
+        for call in calls {
+            assert!(
+                unknown.iter().any(|(counted, _)| counted == call),
+                "{method}: {call} in {unknown:?} (Java {}, here {text})",
+                expected(method)
+            );
+        }
     }
 }
