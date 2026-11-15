@@ -806,11 +806,7 @@ impl Hooks for HorizonJava {
         let HostSide::Server(host) = host else {
             return;
         };
-        if host
-            .players()
-            .player_is_spectator(event.player)
-            .unwrap_or(false)
-        {
+        if event.player.is_spectator(host).unwrap_or(false) {
             game_hooks::skip_spectator(&mut self.lock(), "java_base_player_tick_head");
             return;
         }
@@ -829,11 +825,7 @@ impl Hooks for HorizonJava {
         let HostSide::Server(host) = host else {
             return;
         };
-        if host
-            .players()
-            .player_is_spectator(event.player)
-            .unwrap_or(false)
-        {
+        if event.player.is_spectator(host).unwrap_or(false) {
             game_hooks::skip_spectator(&mut self.lock(), "java_base_player_tick_tail");
             return;
         }
