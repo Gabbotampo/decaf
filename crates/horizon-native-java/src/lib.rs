@@ -2405,6 +2405,10 @@ pub trait Host {
         false
     }
 
+    fn set_from_map_source(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
     /// Whether [`Self::mutable_collection_values`] would answer for `value`,
     /// without copying the values out (#203).
     fn holds_collection(&self, value: &Value) -> bool {
@@ -4097,7 +4101,14 @@ impl StdHost {
     fn set_from_map_values(&self, marker: &str) -> Option<Vec<Value>> {
         let map = self.set_from_map_views.get(marker)?;
         let values = self.mutable_collections.get(map)?;
-        Some(values.chunks_exact(2).map(|pair| pair[0].clone()).collect())
+        Some(
+            values
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| pair[0].clone())
+                .collect(),
+        )
     }
 
     fn direct_collection<'a>(&'a self, marker: &'a str) -> Option<&'a str> {
@@ -5168,7 +5179,17 @@ impl Host for StdHost {
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {
-        expect_ref(value).is_some_and(|marker| self.set_from_map_views.contains_key(marker))
+        let Value::Host(handle) = value else {
+            return false;
+        };
+        handle.kind() == HostKind::Collection && self.set_from_map_views.contains_key(handle.key())
+    }
+
+    fn set_from_map_source(&self, value: &Value) -> Option<Value> {
+        let marker = crate::jar_object::object_key(value)?;
+        self.set_from_map_views
+            .get(marker)
+            .map(|map| crate::jar_object::stored(map))
     }
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
@@ -7722,10 +7743,14 @@ impl Host for StdHost {
             };
         }
         // An iterator-family handle reads its host table by its key (`host_iterator.rs`).
-        let receiver_marker = expect_ref(receiver)
-            .or_else(|| host_iterator::marker(receiver))
-            .or_else(|| host_service::stream_marker(receiver))
-            .cloned();
+        let receiver_marker = if crate::jar_object::spells_key(receiver) {
+            None
+        } else {
+            expect_ref(receiver)
+                .or_else(|| host_iterator::marker(receiver))
+                .or_else(|| host_service::stream_marker(receiver))
+                .cloned()
+        };
         if let Some(marker) = callback_text(receiver)
             && let Some(value) = functional_composition_marker(r, &marker, args)
         {
@@ -7975,6 +8000,14 @@ impl Host for StdHost {
             }
             if let Some(answer) = self.unmodifiable_member(r, marker, args) {
                 return answer;
+            }
+            if self.is_set_from_map(receiver) {
+                if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                    return answer;
+                }
+                if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                    return answer;
+                }
             }
             if let Some(answer) = self.set_from_map_member(r, marker, args) {
                 return answer;

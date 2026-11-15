@@ -1,7 +1,7 @@
 //! Exact bounded model of `Collections.newSetFromMap` over the host's
 //! existing mutable collection handles.
 
-use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_ref};
+use crate::runtime::{Host, MethodRef, NativeError, StdHost, Value, expect_ref};
 
 const SET_CLASS: &str = "java/util/Collections$SetFromMap";
 
@@ -43,6 +43,7 @@ impl StdHost {
             "java/util/WeakHashMap"
                 | "java/util/concurrent/ConcurrentHashMap"
                 | "java/util/concurrent/ConcurrentSkipListMap"
+                | "java/util/TreeMap"
         ) {
             return None;
         }
@@ -56,6 +57,85 @@ impl StdHost {
         self.set_from_map_views
             .insert(marker.clone(), map.to_owned());
         Some(Ok(crate::runtime::jar_object::collection(marker)))
+    }
+
+    pub(crate) fn set_from_map_remove_if(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if r.name != "removeIf" || r.descriptor != "(Ljava/util/function/Predicate;)Z" {
+            return None;
+        }
+        let marker = crate::runtime::jar_object::object_key(receiver)?.to_owned();
+        let map = self.set_from_map_views.get(&marker)?.clone();
+        let predicate = args.first()?.clone();
+        let keys: Vec<Value> = self
+            .mutable_collections
+            .get(&map)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| pair[0].clone())
+            .collect();
+        let mut removed = Vec::new();
+        for key in keys {
+            let result = match self.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/function/Predicate".into(),
+                    name: "test".into(),
+                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                },
+                &predicate,
+                std::slice::from_ref(&key),
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            if matches!(result, Value::Int(flag) if flag != 0) {
+                removed.push(key);
+            }
+        }
+        let values = self.mutable_collections.get_mut(&map)?;
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(values.len());
+        for pair in values.as_chunks::<2>().0 {
+            let keep = !removed.iter().any(|key| pair[0] == *key);
+            changed |= !keep;
+            if keep {
+                kept.extend(pair.iter().cloned());
+            }
+        }
+        *values = kept;
+        Some(Ok(Value::Int(changed as i32)))
+    }
+
+    pub(crate) fn set_from_map_retain_all(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if r.name != "retainAll" || r.descriptor != "(Ljava/util/Collection;)Z" {
+            return None;
+        }
+        let marker = crate::runtime::jar_object::object_key(receiver)?.to_owned();
+        let map = self.set_from_map_views.get(&marker)?.clone();
+        let source = args.first()?;
+        let retained = crate::runtime::runtime_collection_values(self, source).ok()?;
+        let values = self.mutable_collections.get_mut(&map)?;
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(values.len());
+        for pair in values.as_chunks::<2>().0 {
+            let keep = retained.iter().any(|value| value == &pair[0]);
+            changed |= !keep;
+            if keep {
+                kept.extend(pair.iter().cloned());
+            }
+        }
+        *values = kept;
+        Some(Ok(Value::Int(changed as i32)))
     }
 
     /// Mutators that SetFromMap must route to its backing map. Reads and
@@ -81,7 +161,7 @@ impl StdHost {
         };
         let position = |values: &[Value], key: &Value| -> Option<Option<usize>> {
             if identity {
-                for (index, pair) in values.chunks_exact(2).enumerate() {
+                for (index, pair) in values.as_chunks::<2>().0.iter().enumerate() {
                     match identity_equal(&pair[0], key) {
                         Some(true) => return Some(Some(index)),
                         Some(false) => {}
@@ -90,7 +170,13 @@ impl StdHost {
                 }
                 Some(None)
             } else {
-                Some(values.chunks_exact(2).position(|pair| pair[0] == *key))
+                Some(
+                    values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .position(|pair| pair[0] == *key),
+                )
             }
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
