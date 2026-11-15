@@ -5448,21 +5448,25 @@ impl Host for StdHost {
     }
 
     fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
-        let field = marker
-            .split_once('#')?
-            .1
-            .strip_prefix("net/minecraft/world/level/block/Blocks.")?;
-        let classes = self
-            .game_block_classes
-            .get(&format!("minecraft:{}", field.to_ascii_lowercase()))?;
+        let block_id = marker
+            .strip_prefix("game/block/")
+            .map(str::to_owned)
+            .or_else(|| {
+                marker
+                    .split_once('#')?
+                    .1
+                    .strip_prefix("net/minecraft/world/level/block/Blocks.")
+                    .map(|field| format!("minecraft:{}", field.to_ascii_lowercase()))
+            })?;
+        let classes = self.game_block_classes.get(&block_id)?;
         let simple = wanted.rsplit('/').next().unwrap_or(wanted);
         if wanted == "java/lang/Object" || classes.iter().any(|class| class == simple) {
             return Some(true);
         }
-        // The seeded chain runs from the block's own class up to `Block` (and
-        // its interfaces), so it can only rule out another class of the block
-        // package; anything else (`BlockBehaviour`, an outside interface)
-        // keeps the interpreter's own answer rather than a confident `false`.
+        // The seeded chain is the real 26.3 class chain through `BlockBehaviour`
+        // and its interfaces, so it can only rule out another class of the block
+        // package; an outside interface that is absent from the chain stays
+        // unknown rather than becoming a guessed `false`.
         let block_class = wanted
             .strip_prefix("net/minecraft/world/level/block/")
             .is_some_and(|name| !name.contains('/'));
@@ -5639,6 +5643,17 @@ impl Host for StdHost {
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
         if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
             return Ok(value);
+        }
+        // `Blocks.<FIELD>` is already a game registry handle in the current
+        // P16 API. The 26.3 field table is the authority: an absent field is
+        // a real `NoSuchFieldError` path and remains counted.
+        if r.owner == "net/minecraft/world/level/block/Blocks"
+            && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
+        {
+            return match crate::vanilla_blocks::field_id(&r.name) {
+                Some(id) => Ok(crate::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
         }
         // Registry statics are handles instead of a null constant so
         // registration calls downstream can name their target registry. The
