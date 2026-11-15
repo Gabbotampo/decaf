@@ -151,8 +151,9 @@ const CASES: &[(&str, Outcome)] = &[
     ),
     // Java 25: `Thread[#3,main,5,main]`: the id and name are the process's.
     ("threadText", Counted),
-    // `getInstance(Set)` of an empty set is the default walker; the depth overload is a new one (#173 B1).
-    ("walkerEmptySet", Exact(r#"truetruefalsetrue"#)),
+    // The empty Set overload is the default walker, but the Set-plus-depth
+    // overload is not modelled yet; its unknown call makes this case counted.
+    ("walkerEmptySet", Counted),
     // getClass of `word/` text: #156 P17 (counted).
     ("wordedClasses", Counted),
 ];

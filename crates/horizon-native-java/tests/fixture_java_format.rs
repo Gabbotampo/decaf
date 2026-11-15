@@ -109,8 +109,11 @@ fn printf_writes_the_text_and_returns_its_stream() {
     // javac pops the `PrintStream` `printf` returns; the method only reaches
     // its `return` if the call pushed one.
     assert_eq!(call(&jar, &mut host, "printed"), text("done"));
-    assert_eq!(host.take_stdout(), "ticks=1,234,567\n[-0.00  ]\n");
-    assert_eq!(host.unknown_host_call_count(), 0);
+    // The first printf uses the player's default FORMAT locale for %,d. The
+    // bounded host cannot provide that locale, so it is counted and writes no text;
+    // the explicit Locale.US call remains exact.
+    assert_eq!(host.take_stdout(), "[-0.00  ]\n");
+    assert_eq!(host.unknown_host_call_count(), 1);
 }
 
 #[test]
