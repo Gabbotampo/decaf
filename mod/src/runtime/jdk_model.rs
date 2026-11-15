@@ -136,7 +136,7 @@ pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
         // their reads stay unanswered and counted. The marker keeps the
         // enum's own name for `name()`/`toString`.
         "java/lang/StackWalker$Option" => (name == "RETAIN_CLASS_REFERENCE")
-            .then(|| Value::Ref(Some(format!("enum/java/lang/StackWalker$Option/{name}")))),
+            .then(|| crate::runtime::host_jdk_constant::stack_walker_option(name)),
         _ => None,
     }
 }
@@ -1471,8 +1471,8 @@ mod tests {
     fn only_retain_class_reference_is_answered() {
         assert_eq!(
             static_field("java/lang/StackWalker$Option", "RETAIN_CLASS_REFERENCE"),
-            Some(text(
-                "enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE"
+            Some(crate::runtime::host_jdk_constant::stack_walker_option(
+                "RETAIN_CLASS_REFERENCE"
             ))
         );
         for name in [

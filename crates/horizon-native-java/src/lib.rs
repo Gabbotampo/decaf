@@ -9329,6 +9329,33 @@ impl Host for StdHost {
             {
                 self.unknown_host_call(r)
             }
+            (owner, "name", "()Ljava/lang/String;")
+                if host_jdk_constant::stack_walker_option_name(receiver).is_some()
+                    && owner == "java/lang/StackWalker$Option" =>
+            {
+                Ok(Value::Ref(Some(
+                    host_jdk_constant::stack_walker_option_name(receiver)
+                        .expect("guarded StackWalker.Option")
+                        .to_owned(),
+                )))
+            }
+            (owner, "ordinal", "()I")
+                if host_jdk_constant::stack_walker_option_name(receiver).is_some()
+                    && owner == "java/lang/StackWalker$Option" =>
+            {
+                let name = host_jdk_constant::stack_walker_option_name(receiver)
+                    .expect("guarded StackWalker.Option");
+                let ordinal = [
+                    "RETAIN_CLASS_REFERENCE",
+                    "DROP_METHOD_INFO",
+                    "SHOW_REFLECT_FRAMES",
+                    "SHOW_HIDDEN_FRAMES",
+                ]
+                .iter()
+                .position(|candidate| *candidate == name)
+                .unwrap_or(0);
+                Ok(Value::Int(ordinal as i32))
+            }
             ("java/lang/Enum", "name", "()Ljava/lang/String;")
             | ("java/lang/Enum", "toString", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
@@ -10523,6 +10550,9 @@ fn class_of_text(marker: &str) -> Option<String> {
     // A text spelling an object's key (a host-made collection's included,
     // P14c) is a `String` (`jar_object.rs`).
     if jar_object::spells_key_text(marker) {
+        return Some("java/lang/String".into());
+    }
+    if marker.starts_with("enum/java/lang/StackWalker$Option/") {
         return Some("java/lang/String".into());
     }
     if let Some((class, _)) = marker.split_once('#') {

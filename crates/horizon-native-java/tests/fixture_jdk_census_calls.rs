@@ -50,7 +50,7 @@ fn build_jar(
     }
     let status = Command::new(javac())
         .arg("--release")
-        .arg("17")
+        .arg("21")
         .arg("-d")
         .arg(&classes)
         .args(paths)
@@ -123,6 +123,13 @@ public final class Main {
         StackWalker.Option option = StackWalker.Option.RETAIN_CLASS_REFERENCE;
         Probe.check("option-same", option == StackWalker.Option.RETAIN_CLASS_REFERENCE);
         Probe.check("option-name", "RETAIN_CLASS_REFERENCE".equals(option.name()));
+        Probe.check("option-ordinal", option.ordinal() == 0);
+        String oldMarker = "enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE";
+        Probe.check("option-marker-string", oldMarker.getClass() == String.class);
+        Probe.check("option-marker-equals", oldMarker.equals("enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE"));
+        Probe.check("option-marker-hash", oldMarker.hashCode() == "enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE".hashCode());
+        Probe.check("option-marker-concat", oldMarker.concat("!").equals("enum/java/lang/StackWalker$Option/RETAIN_CLASS_REFERENCE!"));
+        Probe.check("option-marker-map", java.util.Map.of(oldMarker, 1).get(oldMarker) == 1);
         Probe.check("walker", StackWalker.getInstance(option) != null);
     }
 }
@@ -143,6 +150,12 @@ public final class Main {
                 "formatted",
                 "option-same",
                 "option-name",
+                "option-ordinal",
+                "option-marker-string",
+                "option-marker-equals",
+                "option-marker-hash",
+                "option-marker-concat",
+                "option-marker-map",
                 "walker",
             ]
             .map(|label| (label.to_owned(), true))
