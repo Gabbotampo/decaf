@@ -12,6 +12,18 @@ const STATE: &str = "|#bigDecimal";
 const CACHE_ZERO: &str = "java/math/BigDecimal#18446744073709551610";
 const CACHE_ONE: &str = "java/math/BigDecimal#18446744073709551611";
 const CACHE_TEN: &str = "java/math/BigDecimal#18446744073709551612";
+// Java caches `valueOf(long)` (and the scale-zero overload) for every value in
+// this range.  These are explicit, unreachable allocation keys: never derive
+// them from a table length, which would make the identity depend on execution
+// order.
+const CACHE_TWO: &str = "java/math/BigDecimal#18446744073709551613";
+const CACHE_THREE: &str = "java/math/BigDecimal#18446744073709551614";
+const CACHE_FOUR: &str = "java/math/BigDecimal#18446744073709551615";
+const CACHE_FIVE: &str = "java/math/BigDecimal#18446744073709551616";
+const CACHE_SIX: &str = "java/math/BigDecimal#18446744073709551617";
+const CACHE_SEVEN: &str = "java/math/BigDecimal#18446744073709551618";
+const CACHE_EIGHT: &str = "java/math/BigDecimal#18446744073709551619";
+const CACHE_NINE: &str = "java/math/BigDecimal#18446744073709551620";
 
 #[derive(Clone, Debug)]
 struct Decimal {
@@ -105,15 +117,6 @@ impl Decimal {
     }
 
     fn string(&self) -> String {
-        if self.sign == 0 {
-            return if self.scale > 0 {
-                format!("0.{}", "0".repeat(self.scale as usize))
-            } else if self.scale < 0 {
-                format!("0E+{}", -self.scale)
-            } else {
-                "0".into()
-            };
-        }
         let adjusted = self.digits.len() as i64 - self.scale - 1;
         if self.scale >= 0 && adjusted >= -6 {
             return self.plain();
@@ -190,7 +193,28 @@ impl Decimal {
         let drop = (-delta) as usize;
         if drop >= self.digits.len() {
             let discarded = &self.digits;
-            let round = should_round(self.sign, "0", discarded, mode)?;
+            // The unscaled value may have fewer digits than the number being
+            // discarded.  Those implicit leading zeroes are significant to
+            // half-rounding: a value such as 5.7E-69 is below half of 1E-7,
+            // even though its first stored digit is 5.
+            let round = if drop > self.digits.len() {
+                match mode {
+                    "DOWN" => false,
+                    "UP" => true,
+                    "CEILING" => self.sign > 0,
+                    "FLOOR" => self.sign < 0,
+                    "UNNECESSARY" => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/ArithmeticException".into(),
+                            message: Some("Rounding necessary".into()),
+                            frame: None,
+                        });
+                    }
+                    _ => false,
+                }
+            } else {
+                should_round(self.sign, "0", discarded, mode)?
+            };
             self.digits = if round { "1".into() } else { "0".into() };
             self.sign = if self.digits == "0" { 0 } else { self.sign };
             self.scale = new_scale;
@@ -263,21 +287,30 @@ fn read<H: Host>(runtime: &Runtime<'_, H>, receiver: &Value) -> Option<Decimal> 
                 digits: parts.next()?.into(),
             })
         }
-        _ => match marker {
-            CACHE_ZERO => Some(Decimal::zero()),
-            CACHE_ONE => Some(Decimal {
-                sign: 1,
-                digits: "1".into(),
-                scale: 0,
-            }),
-            CACHE_TEN => Some(Decimal {
-                sign: 1,
-                digits: "10".into(),
-                scale: 0,
-            }),
-            _ => None,
-        },
+        _ => cached_decimal(marker),
     }
+}
+
+fn cached_decimal(key: &str) -> Option<Decimal> {
+    let digits = match key {
+        CACHE_ZERO => "0",
+        CACHE_ONE => "1",
+        CACHE_TWO => "2",
+        CACHE_THREE => "3",
+        CACHE_FOUR => "4",
+        CACHE_FIVE => "5",
+        CACHE_SIX => "6",
+        CACHE_SEVEN => "7",
+        CACHE_EIGHT => "8",
+        CACHE_NINE => "9",
+        CACHE_TEN => "10",
+        _ => return None,
+    };
+    Some(Decimal {
+        sign: if digits == "0" { 0 } else { 1 },
+        digits: digits.into(),
+        scale: 0,
+    })
 }
 fn write<H: Host>(runtime: &mut Runtime<'_, H>, receiver: &Value, value: &Decimal) -> Option<()> {
     let marker = crate::jar_object::object_key(receiver)?;
@@ -306,6 +339,14 @@ fn cached_value(value: &Decimal) -> Option<Value> {
     match (value.sign, value.digits.as_str()) {
         (0, "0") => Some(crate::jar_object::stored(CACHE_ZERO)),
         (1, "1") => Some(crate::jar_object::stored(CACHE_ONE)),
+        (1, "2") => Some(crate::jar_object::stored(CACHE_TWO)),
+        (1, "3") => Some(crate::jar_object::stored(CACHE_THREE)),
+        (1, "4") => Some(crate::jar_object::stored(CACHE_FOUR)),
+        (1, "5") => Some(crate::jar_object::stored(CACHE_FIVE)),
+        (1, "6") => Some(crate::jar_object::stored(CACHE_SIX)),
+        (1, "7") => Some(crate::jar_object::stored(CACHE_SEVEN)),
+        (1, "8") => Some(crate::jar_object::stored(CACHE_EIGHT)),
+        (1, "9") => Some(crate::jar_object::stored(CACHE_NINE)),
         (1, "10") => Some(crate::jar_object::stored(CACHE_TEN)),
         _ => None,
     }

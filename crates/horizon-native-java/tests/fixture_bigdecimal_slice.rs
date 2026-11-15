@@ -50,6 +50,33 @@ public final class Probe {
         out.append(BigDecimal.valueOf(Long.MIN_VALUE).hashCode());
         return out.toString();
     }
+
+    public static String zeroScaleRows() {
+        StringBuilder out = new StringBuilder();
+        for (int scale : new int[] {0, 1, 2, 6, 7, 8, -1, -7}) {
+            out.append(scale).append('=').append(BigDecimal.ZERO.setScale(scale).toString()).append('|');
+        }
+        BigDecimal x = BigDecimal.valueOf(-5736997553998261837L, 87);
+        for (RoundingMode mode : new RoundingMode[] {
+            RoundingMode.DOWN, RoundingMode.CEILING, RoundingMode.FLOOR,
+            RoundingMode.HALF_UP, RoundingMode.HALF_DOWN, RoundingMode.HALF_EVEN
+        }) {
+            out.append(mode).append('=').append(x.setScale(7, mode).toString()).append('|');
+        }
+        return out.toString();
+    }
+
+    public static String cacheRows() {
+        StringBuilder out = new StringBuilder();
+        for (long n = 0; n <= 10; n++) {
+            BigDecimal value = BigDecimal.valueOf(n);
+            out.append(n).append(':')
+                .append(value == BigDecimal.valueOf(n)).append(':')
+                .append(value == BigDecimal.valueOf(n, 0)).append(':')
+                .append(BigDecimal.valueOf(n, 0) == BigDecimal.valueOf(n, 0)).append('|');
+        }
+        return out.toString();
+    }
 }
 "#;
 
@@ -181,6 +208,64 @@ fn java25_review_edges_match_the_jdk() {
     assert_eq!(
         text,
         "NumberFormatException:Infinite or NaN|NumberFormatException:Infinite or NaN|NumberFormatException:Infinite or NaN|true|true|true|true|true|NullPointerException:Cannot read field \"oldMode\" because \"roundingMode\" is null|-2147483648"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn java25_zero_scale_rows_match_layout_chars() {
+    let fixture = Fixture::build();
+    let mut host = StdHost::new();
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "zeroScaleRows",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let Value::Ref(Some(text)) = answer else {
+        panic!("not text: {answer:?}")
+    };
+    assert_eq!(
+        text,
+        "0=0|1=0.0|2=0.00|6=0.000000|7=0E-7|8=0E-8|-1=0E+1|-7=0E+7|DOWN=0E-7|CEILING=0E-7|FLOOR=-1E-7|HALF_UP=0E-7|HALF_DOWN=0E-7|HALF_EVEN=0E-7|"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn java25_small_value_cache_identities_match_the_jdk() {
+    let fixture = Fixture::build();
+    let mut host = StdHost::new();
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "cacheRows",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let Value::Ref(Some(text)) = answer else {
+        panic!("not text: {answer:?}")
+    };
+    assert_eq!(
+        text,
+        "0:true:true:true|1:true:true:true|2:true:true:true|3:true:true:true|4:true:true:true|5:true:true:true|6:true:true:true|7:true:true:true|8:true:true:true|9:true:true:true|10:true:true:true|"
     );
     assert!(
         host.unknown_host_calls().is_empty(),
