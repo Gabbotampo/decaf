@@ -14949,6 +14949,10 @@ impl NativeJar {
                                     slice: None,
                                     shift: None,
                                 };
+                                if injection_metadata_requires_refusal(inject) {
+                                    unresolved.push(plan);
+                                    continue;
+                                }
                                 let (slice, shift) =
                                     match resolve_injection_modifiers(anchor, &inject_slices) {
                                         Ok(modifiers) => modifiers,
@@ -29694,6 +29698,26 @@ fn mixin_target_owners(mixin: &Annotation) -> Vec<String> {
 }
 
 /// A boolean annotation element; absent or non-boolean is false.
+/// The bounded injector does not implement Mixin's injection-count or local-capture metadata.
+/// Refuse non-default values so a game-hook plan is counted instead of silently claiming the
+/// loader would have accepted or warned about it.
+fn injection_metadata_requires_refusal(annotation: &Annotation) -> bool {
+    let nonzero = |key: &str| {
+        matches!(
+            annotation.values.get(key),
+            Some(AnnotationValue::Int(value)) if *value != 0
+        )
+    };
+    if nonzero("require") || nonzero("expect") {
+        return true;
+    }
+    match annotation.values.get("locals") {
+        None => false,
+        Some(AnnotationValue::String(value)) => value.rsplit('.').next() != Some("NO_CAPTURE"),
+        Some(_) => true,
+    }
+}
+
 fn annotation_bool(annotation: &Annotation, key: &str) -> bool {
     matches!(
         annotation.values.get(key),
