@@ -757,10 +757,11 @@ impl<H: Host> Runtime<'_, H> {
     /// Walk `class`'s superclasses and interfaces for `target`.
     ///
     /// Leaving the classes the runtime holds is definitive for a JDK class
-    /// (it never extends or implements a jar type) and for a class target (a
-    /// game or library class cannot extend a jar class); for an interface
-    /// target a Mixin may add the interface to the game superclass, so the
-    /// answer is unknown.
+    /// (it never extends or implements a jar type) and for a jar class target
+    /// (a game or library class cannot extend a jar class). It is unknown for
+    /// a JDK class target that is not final (the unheld class may extend it)
+    /// and for an interface target (a Mixin may add the interface to the game
+    /// superclass).
     fn hierarchy_verdict(
         &self,
         class: &str,
@@ -793,7 +794,19 @@ impl<H: Host> Runtime<'_, H> {
                         None => Verdict::Unknown,
                     };
                 }
+                // Every class is an `Object`, held or not.
+                if target == "java/lang/Object" {
+                    return Verdict::Yes;
+                }
                 if target_is_interface == Some(false) {
+                    // A JDK class target may be any superclass of the unheld
+                    // class (a `missing.Base extends Number`): only a final
+                    // one in Java 25's table is proved out (#267 review).
+                    if crate::runtime::jdk_closure::in_jdk_package(target)
+                        && !crate::runtime::jdk_closure::class(target).is_some_and(|class| class.is_final)
+                    {
+                        return Verdict::Unknown;
+                    }
                     return Verdict::No;
                 }
                 return Verdict::Unknown;

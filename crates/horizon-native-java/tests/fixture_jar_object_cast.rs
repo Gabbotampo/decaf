@@ -16,6 +16,15 @@ const ORACLE: &str = include_str!("fixtures/jar_object_cast/java25.txt");
 
 const PROBE: &str = include_str!("fixtures/jar_object_cast/demo/Probe.java");
 
+/// `Leaves`'s superclass: compiled with the probe, but left out of its jar
+/// (only `demo/` is packed).
+const UNHELD: &str = include_str!("fixtures/jar_object_cast/missing/UnheldBase.java");
+
+const SOURCES: &[(&str, &str)] = &[
+    ("demo/Probe.java", PROBE),
+    ("missing/UnheldBase.java", UNHELD),
+];
+
 fn expected(method: &str) -> &'static str {
     ORACLE
         .lines()
@@ -36,7 +45,7 @@ fn expected(method: &str) -> &'static str {
 ///   nothing else.
 #[test]
 fn a_jar_object_casts_as_its_class_chain_says() {
-    let fixture = javac_fixture::Fixture::build("jar-object-cast", &[("demo/Probe.java", PROBE)]);
+    let fixture = javac_fixture::Fixture::build("jar-object-cast", SOURCES);
     let mut failures = Vec::new();
     for method in ["klass", "myList", "color", "point", "square"] {
         let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
@@ -69,8 +78,7 @@ fn a_jar_object_casts_as_its_class_chain_says() {
 /// answers `ok|ok|CCE(…)|TF`.
 #[test]
 fn a_chain_through_an_undescribed_jdk_interface_is_counted() {
-    let fixture =
-        javac_fixture::Fixture::build("jar-object-cast-res", &[("demo/Probe.java", PROBE)]);
+    let fixture = javac_fixture::Fixture::build("jar-object-cast-res", SOURCES);
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     let answer = fixture.jar.invoke_method_with_args(
         "demo/Probe",
@@ -92,5 +100,48 @@ fn a_chain_through_an_undescribed_jdk_interface_is_counted() {
                 && counted("java/lang/AutoCloseable#<instanceof>")
                 && counted("java/lang/Runnable#<checkcast>")),
         "{text} {unknown:?}"
+    );
+}
+
+/// A jar class whose superclass the jar leaves out (`missing.UnheldBase
+/// extends Number`, #267 review): it may extend any JDK class that is not
+/// final, so the casts to `Number` and `Runnable` and their `instanceof`s are
+/// counted, never answered. Java 25 answers `ok|CCE(…)|CCE(…)|TFF`. `String`
+/// is final, so no unheld class extends it: its cast is Java's CCE and its
+/// `instanceof` false, uncounted.
+#[test]
+fn a_chain_through_an_unheld_superclass_is_counted() {
+    let fixture = javac_fixture::Fixture::build("jar-object-cast-leaves", SOURCES);
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let answer = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "leaves",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    let text = match answer {
+        Ok(horizon_native_java::Value::Ref(Some(text))) => text,
+        other => format!("{other:?}"),
+    };
+    let unknown = host.unknown_host_calls();
+    let counted = |call: &str| unknown.iter().any(|(counted, _)| counted.starts_with(call));
+    assert!(
+        counted("java/lang/Number#<checkcast>")
+            && counted("java/lang/Number#<instanceof>")
+            && counted("java/lang/Runnable#<checkcast>")
+            && counted("java/lang/Runnable#<instanceof>")
+            && !counted("java/lang/String#"),
+        "{text} {unknown:?}"
+    );
+    // The `String` parts are Java's: the third cast and the last flag.
+    let java: Vec<&str> = expected("leaves").split('|').collect();
+    let native: Vec<&str> = text.split('|').collect();
+    assert_eq!(native.get(2), java.get(2), "{text}");
+    assert_eq!(
+        native.get(3).and_then(|flags| flags.chars().nth(2)),
+        Some('F'),
+        "{text}"
     );
 }

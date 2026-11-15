@@ -36,6 +36,9 @@ public final class Probe {
         public void close() {}
     }
 
+    /** Its superclass is not in the jar (`missing.UnheldBase extends Number`). */
+    static final class Leaves extends missing.UnheldBase {}
+
     interface Step {
         Object run();
     }
@@ -103,6 +106,16 @@ public final class Probe {
             + b(o instanceof AutoCloseable) + b(o instanceof Runnable);
     }
 
+    /**
+     * A jar class whose superclass the jar leaves out: `Number` (not final) and `Runnable` are not known here;
+     * `String` is final, so no unheld class extends it.
+     */
+    public static String leaves() {
+        Object o = new Leaves();
+        return c(() -> (Number) o) + "|" + c(() -> (Runnable) o) + "|" + c(() -> (String) o) + "|"
+            + b(o instanceof Number) + b(o instanceof Runnable) + b(o instanceof String);
+    }
+
     public static void main(String[] args) {
         System.out.println("klass=" + klass());
         System.out.println("myList=" + myList());
@@ -110,5 +123,6 @@ public final class Probe {
         System.out.println("point=" + point());
         System.out.println("square=" + square());
         System.out.println("res=" + res());
+        System.out.println("leaves=" + leaves());
     }
 }
