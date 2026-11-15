@@ -196,6 +196,98 @@ fn compile_stubs(include_client_api: bool) -> (PathBuf, String) {
     (root, classpath)
 }
 
+fn collect_jars(root: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jars(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "jar") {
+            out.push(path);
+        }
+    }
+}
+
+fn real_client_classpath() -> Option<String> {
+    let explicit = std::env::var_os("MINECRAFT_CLIENT_JAR")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if explicit.len() > 1 {
+        return Some(
+            std::env::join_paths(explicit)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut client = explicit.first().cloned();
+    if client.is_none() {
+        let mut candidates = Vec::new();
+        collect_jars(&repo.join(".local"), &mut candidates);
+        client = candidates.into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "client.jar"
+                        || name == "minecraft-client.jar"
+                        || name == "minecraft-26.3-client.jar"
+                        || name == "26.3.jar"
+                })
+        });
+    }
+    let Some(client) = client else {
+        eprintln!("skipped real-client oracle: no MINECRAFT_CLIENT_JAR or .local 26.3 client jar");
+        return None;
+    };
+    if !client.is_file() {
+        eprintln!(
+            "skipped real-client oracle: client jar does not exist: {}",
+            client.display()
+        );
+        return None;
+    }
+
+    let mut jars = vec![client.clone()];
+    let mut roots = Vec::new();
+    for variable in ["MINECRAFT_CLIENT_LIBRARIES", "MINECRAFT_LIBRARIES"] {
+        if let Some(value) = std::env::var_os(variable) {
+            roots.extend(std::env::split_paths(&value));
+        }
+    }
+    if let Some(parent) = client.parent() {
+        roots.push(parent.join("libraries"));
+        if let Some(grandparent) = parent.parent() {
+            roots.push(grandparent.join("libraries"));
+        }
+    }
+    let mut discovered = Vec::new();
+    for root in roots.into_iter().filter(|root| root.is_dir()) {
+        collect_jars(&root, &mut discovered);
+    }
+    discovered.sort();
+    discovered.dedup();
+    jars.extend(discovered);
+    jars.sort();
+    jars.dedup();
+    if jars.len() == 1 {
+        eprintln!(
+            "skipped real-client oracle: no 26.3 client libraries found beside {}",
+            client.display()
+        );
+        return None;
+    }
+    Some(
+        std::env::join_paths(jars)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 fn assert_levels(classpath: &str, name: &str) {
     let fixture = Fixture::build_with_classpath(name, &[("demo/Probe.java", PROBE)], classpath);
     let mut host = fixture.jar.seed_host(StdHost::new());
@@ -232,16 +324,10 @@ fn client_frame_reads_match_java25_oracle() {
     assert_levels(&stub_classpath, "client-frame-stub");
     let _ = fs::remove_dir_all(stub_root);
 
-    if let Ok(client_jar) = std::env::var("MINECRAFT_CLIENT_JAR") {
-        assert!(
-            client_jar
-                .split(':')
-                .next()
-                .is_some_and(|path| std::path::Path::new(path).is_file()),
-            "missing real Minecraft client classpath: {client_jar}"
-        );
+    if let Some(client_classpath) = real_client_classpath() {
         let (jspecify_root, jspecify_classpath) = compile_stubs(false);
-        let classpath = format!("{jspecify_classpath}:{client_jar}");
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let classpath = format!("{jspecify_classpath}{separator}{client_classpath}");
         assert_levels(&classpath, "client-frame-real");
         let _ = fs::remove_dir_all(jspecify_root);
     }
