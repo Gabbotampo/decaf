@@ -24,7 +24,7 @@ pub(crate) fn bit_conversion(
     let Value::Host(receiver) = previous.receiver.as_ref()? else {
         return None;
     };
-    if receiver.kind() != HostKind::RandomSource || previous.method.owner != RANDOM_SOURCE {
+    if receiver.kind() != HostKind::RandomSource {
         return None;
     }
     let follows = matches!(
