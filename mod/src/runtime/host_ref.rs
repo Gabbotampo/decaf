@@ -782,9 +782,9 @@ pub(crate) fn instance_of_class(
     // can spell a game object's (a mod version `"game/server"`), and is no game
     // object (#246's re-check B4).
     if crate::runtime::game_object::is_game_kind(handle.kind)
-        && hierarchy.described_instance_of(handle.key(), wanted) == Some(true)
+        && let Some(answer) = hierarchy.described_instance_of(handle.key(), wanted)
     {
-        return Some(true);
+        return Some(answer);
     }
     // The object is a `declared`; `wanted` is final and provably not one, so
     // the object cannot be a `wanted`.

@@ -90,11 +90,15 @@ fn vanilla_block_constants_answer_instanceof_from_seeded_classes() {
     );
     sources.insert(
         "net/minecraft/world/level/block/Block.java",
-        "package net.minecraft.world.level.block; public class Block {}",
+        "package net.minecraft.world.level.block; public class Block extends net.minecraft.world.level.block.state.BlockBehaviour implements net.minecraft.world.level.ItemLike {}",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/BaseFireBlock.java",
+        "package net.minecraft.world.level.block; public abstract class BaseFireBlock extends Block {}",
     );
     sources.insert(
         "net/minecraft/world/level/block/FireBlock.java",
-        "package net.minecraft.world.level.block; public class FireBlock extends Block {}",
+        "package net.minecraft.world.level.block; public class FireBlock extends BaseFireBlock {}",
     );
     sources.insert(
         "net/minecraft/world/level/block/ChestBlock.java",
@@ -102,7 +106,19 @@ fn vanilla_block_constants_answer_instanceof_from_seeded_classes() {
     );
     sources.insert(
         "net/minecraft/world/level/block/Blocks.java",
-        "package net.minecraft.world.level.block; public final class Blocks { public static final Block FIRE = null; }",
+        "package net.minecraft.world.level.block; public final class Blocks { public static final Block FIRE = null; public static final Block CHEST = null; }",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/SoundType.java",
+        "package net.minecraft.world.level.block; public final class SoundType { public static final SoundType WOOD = new SoundType(); }",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/state/BlockBehaviour.java",
+        "package net.minecraft.world.level.block.state; public class BlockBehaviour {}",
+    );
+    sources.insert(
+        "net/minecraft/world/level/ItemLike.java",
+        "package net.minecraft.world.level; public interface ItemLike {}",
     );
     sources.insert(
         "demo/Main.java",
@@ -114,6 +130,11 @@ public final class Main {
     public static void main() {
         Probe.check("fire", Blocks.FIRE instanceof FireBlock);
         Probe.check("not-chest", !(Blocks.FIRE instanceof ChestBlock));
+        Probe.check("block-behaviour", Blocks.FIRE instanceof net.minecraft.world.level.block.state.BlockBehaviour);
+        Probe.check("item-like", Blocks.FIRE instanceof net.minecraft.world.level.ItemLike);
+        Probe.check("same-block", Blocks.FIRE == Blocks.FIRE);
+        Probe.check("different-block", Blocks.FIRE != Blocks.CHEST);
+        Probe.check("same-sound", net.minecraft.world.level.block.SoundType.WOOD == net.minecraft.world.level.block.SoundType.WOOD);
     }
 }
 "#,
@@ -125,7 +146,11 @@ public final class Main {
         &[
             "demo/Probe.class",
             "net/minecraft/world/level/block/Block.class",
-            "net/minecraft/world/level/block/FireBlock.class",
+            "net/minecraft/world/level/block/BaseFireBlock.class",
+        "net/minecraft/world/level/block/FireBlock.class",
+        "net/minecraft/world/level/block/SoundType.class",
+        "net/minecraft/world/level/block/state/BlockBehaviour.class",
+        "net/minecraft/world/level/ItemLike.class",
             "net/minecraft/world/level/block/ChestBlock.class",
             "net/minecraft/world/level/block/Blocks.class",
         ],
@@ -137,6 +162,8 @@ public final class Main {
             "FireBlock".to_owned(),
             "BaseFireBlock".to_owned(),
             "Block".to_owned(),
+            "BlockBehaviour".to_owned(),
+            "ItemLike".to_owned(),
         ],
     )]);
     let mut host = jar.seed_host(StdHost::new().with_game_block_classes(Arc::new(classes)));
@@ -153,6 +180,14 @@ public final class Main {
         .collect();
     assert_eq!(
         checks,
-        BTreeMap::from([("fire".to_owned(), true), ("not-chest".to_owned(), true)])
+        BTreeMap::from([
+            ("fire".to_owned(), true),
+            ("not-chest".to_owned(), true),
+            ("block-behaviour".to_owned(), true),
+            ("item-like".to_owned(), true),
+            ("same-block".to_owned(), true),
+            ("different-block".to_owned(), true),
+            ("same-sound".to_owned(), true),
+        ])
     );
 }

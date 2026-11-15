@@ -5451,21 +5451,25 @@ impl Host for StdHost {
     }
 
     fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
-        let field = marker
-            .split_once('#')?
-            .1
-            .strip_prefix("net/minecraft/world/level/block/Blocks.")?;
-        let classes = self
-            .game_block_classes
-            .get(&format!("minecraft:{}", field.to_ascii_lowercase()))?;
+        let block_id = marker
+            .strip_prefix("game/block/")
+            .map(str::to_owned)
+            .or_else(|| {
+                marker
+                    .split_once('#')?
+                    .1
+                    .strip_prefix("net/minecraft/world/level/block/Blocks.")
+                    .map(|field| format!("minecraft:{}", field.to_ascii_lowercase()))
+            })?;
+        let classes = self.game_block_classes.get(&block_id)?;
         let simple = wanted.rsplit('/').next().unwrap_or(wanted);
         if wanted == "java/lang/Object" || classes.iter().any(|class| class == simple) {
             return Some(true);
         }
-        // The seeded chain runs from the block's own class up to `Block` (and
-        // its interfaces), so it can only rule out another class of the block
-        // package; anything else (`BlockBehaviour`, an outside interface)
-        // keeps the interpreter's own answer rather than a confident `false`.
+        // The seeded chain is the real 26.3 class chain through `BlockBehaviour`
+        // and its interfaces, so it can only rule out another class of the block
+        // package; an outside interface that is absent from the chain stays
+        // unknown rather than becoming a guessed `false`.
         let block_class = wanted
             .strip_prefix("net/minecraft/world/level/block/")
             .is_some_and(|name| !name.contains('/'));
@@ -5642,6 +5646,17 @@ impl Host for StdHost {
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
         if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
             return Ok(value);
+        }
+        // `Blocks.<FIELD>` is already a game registry handle in the current
+        // P16 API. The 26.3 field table is the authority: an absent field is
+        // a real `NoSuchFieldError` path and remains counted.
+        if r.owner == "net/minecraft/world/level/block/Blocks"
+            && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
+        {
+            return match crate::runtime::vanilla_blocks::field_id(&r.name) {
+                Some(id) => Ok(crate::runtime::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
         }
         // Registry statics are handles instead of a null constant so
         // registration calls downstream can name their target registry. The
@@ -31843,6 +31858,7 @@ mod tests {
                 "FireBlock".into(),
                 "BaseFireBlock".into(),
                 "Block".into(),
+                "BlockBehaviour".into(),
                 "ItemLike".into(),
             ],
         )]);
@@ -31854,7 +31870,10 @@ mod tests {
                 descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
             })
             .unwrap();
-        let marker = expect_string(&fire).to_owned();
+        let marker = match &fire {
+            Value::Host(handle) => handle.key().to_owned(),
+            other => panic!("expected a game handle, got {other:?}"),
+        };
         assert_eq!(
             host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
             Some(true)
@@ -31867,14 +31886,15 @@ mod tests {
             host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
             Some(false)
         );
-        // Outside the block package the chain can't rule anything out.
         assert_eq!(
             host.game_instance_of(
                 &marker,
                 "net/minecraft/world/level/block/state/BlockBehaviour"
             ),
-            None
+            Some(true)
         );
+        // An unrelated interface is outside the seeded 26.3 chain.
+        assert_eq!(host.game_instance_of(&marker, "java/lang/Cloneable"), None);
         // An unseeded block keeps the interpreter's own answer.
         assert_eq!(
             host.game_instance_of(
@@ -31885,9 +31905,9 @@ mod tests {
         );
     }
 
-    /// A game constant (`SoundType.WOOD`, `Blocks.FIRE`) is a stable, typed
-    /// marker rather than null: the same field reads back the same object, so
-    /// `==` and the declared type's `instanceof` hold.
+    /// A game constant (`SoundType.WOOD`, `Blocks.FIRE`) is a stable value
+    /// (a current game handle for blocks, a typed marker for the remaining
+    /// constants) rather than null: the same field reads back the same object.
     #[test]
     fn game_constants_are_stable_typed_markers() {
         let field = |owner: &str, name: &str, descriptor: &str| MethodRef {
@@ -31914,13 +31934,16 @@ mod tests {
                 "Lnet/minecraft/world/level/block/Block;",
             ))
             .unwrap();
-        assert_eq!(
-            class_of_value(&fire).as_deref(),
-            Some("net/minecraft/world/level/block/Block")
-        );
+        assert!(matches!(
+            &fire,
+            Value::Host(handle)
+                if handle.kind() == HostKind::GameRegistryObject
+                    && handle.key() == "game/block/minecraft:fire"
+        ));
         assert_ne!(fire, first);
-        // Each opaque read is still recorded, so measurements stay honest.
-        assert_eq!(host.opaque_game_constant_count(), 3);
+        // Opaque reads remain recorded, while the block constant now uses the
+        // current game-registry handle path.
+        assert_eq!(host.opaque_game_constant_count(), 2);
         assert!(host.opaque_game_constant_reads().contains(&(
             "net/minecraft/world/level/block/SoundType#WOODLnet/minecraft/world/level/block/SoundType;"
                 .to_owned(),
