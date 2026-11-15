@@ -177,6 +177,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod sound_event;
 mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
@@ -5527,6 +5528,9 @@ impl Host for StdHost {
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
+        if let Some(value) = game_codecs::static_field(r) {
+            return Ok(value);
+        }
         // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
         if let Some(value) = self.mixin_platform_static(r) {
             return Ok(value);
@@ -5733,6 +5737,9 @@ impl Host for StdHost {
         }
         // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
         if let Some(value) = self.guava_text(r, None, args) {
+            return value;
+        }
+        if let Some(value) = sound_event::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = commons_lang::static_call(self, r, args) {
@@ -7077,6 +7084,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = java_identifier::invoke_instance(self, r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = sound_event::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.reference_member(r, Some(receiver), args) {

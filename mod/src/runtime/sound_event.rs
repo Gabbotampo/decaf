@@ -1,0 +1,157 @@
+//! Pure Minecraft 26.3 `SoundEvent` values.
+//!
+//! The factories allocate a record containing an Identifier and an optional
+//! fixed range.  The value is represented as a GameValue handle so record
+//! equality is by those fields while distinct factory calls remain distinct
+//! for identity operations.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_float};
+
+const PREFIX: &str = "sound-event/";
+const VARIABLE: &str = "variable";
+static NEXT_SOUND_EVENT: AtomicU64 = AtomicU64::new(0);
+
+fn key(location: &str, fixed: Option<f32>) -> String {
+    let range = fixed.map_or(VARIABLE.to_owned(), |value| {
+        let bits = if value.is_nan() {
+            f32::NAN.to_bits()
+        } else {
+            value.to_bits()
+        };
+        format!("fixed:{bits:08x}")
+    });
+    format!(
+        "{PREFIX}{location}/{range}#{}",
+        NEXT_SOUND_EVENT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+pub(crate) fn parse(key: &str) -> Option<(&str, Option<f32>)> {
+    let rest = key.strip_prefix(PREFIX)?;
+    let rest = rest.rsplit_once('#')?.0;
+    let (location, range) = rest.rsplit_once('/')?;
+    let fixed = if range == VARIABLE {
+        None
+    } else {
+        let bits = u32::from_str_radix(range.strip_prefix("fixed:")?, 16).ok()?;
+        Some(f32::from_bits(bits))
+    };
+    Some((location, fixed))
+}
+
+pub(crate) fn equals_keys(left: &str, right: &str) -> Option<bool> {
+    let (left_location, left_range) = parse(left)?;
+    let (right_location, right_range) = parse(right)?;
+    Some(
+        left_location == right_location
+            && match (left_range, right_range) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
+                _ => false,
+            },
+    )
+}
+
+pub(crate) fn to_string(key: &str) -> Option<String> {
+    let (location, fixed) = parse(key)?;
+    Some(format!(
+        "SoundEvent[location={location}, fixedRange={}]",
+        fixed.map_or_else(
+            || "Optional.empty".to_owned(),
+            |value| format!("Optional[{}]", crate::runtime::format_java_float32(value as f64))
+        )
+    ))
+}
+
+pub(crate) fn hash_code(key: &str) -> Option<i32> {
+    let (location, fixed) = parse(key)?;
+    let fixed_hash = fixed.map_or(0, |value| {
+        let bits = if value.is_nan() {
+            f32::NAN.to_bits()
+        } else {
+            value.to_bits()
+        };
+        bits as i32
+    });
+    Some(
+        crate::runtime::stable_hash(location)
+            .wrapping_mul(31)
+            .wrapping_add(fixed_hash),
+    )
+}
+
+fn game_value(key: String) -> Value {
+    crate::runtime::game_object::value(&key).expect("sound-event key is a GameValue")
+}
+
+pub(crate) fn static_call(
+    host: &mut StdHost,
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if r.owner != "net/minecraft/sounds/SoundEvent" {
+        return None;
+    }
+    let location = args
+        .first()
+        .and_then(|value| crate::runtime::java_identifier::id_text(host, value))?;
+    let fixed = match (r.name.as_str(), r.descriptor.as_str()) {
+        (
+            "createVariableRangeEvent",
+            "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/sounds/SoundEvent;",
+        ) => None,
+        (
+            "createFixedRangeEvent",
+            "(Lnet/minecraft/resources/Identifier;F)Lnet/minecraft/sounds/SoundEvent;",
+        ) => Some(
+            match expect_float(r, args.get(1).unwrap_or(&Value::Float(0.0))) {
+                Ok(value) => value as f32,
+                Err(error) => return Some(Err(error)),
+            },
+        ),
+        _ => return None,
+    };
+    Some(Ok(game_value(key(&location, fixed))))
+}
+
+pub(crate) fn instance_call(
+    host: &mut StdHost,
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let Value::Host(handle) = receiver else {
+        return None;
+    };
+    if handle.kind() != crate::runtime::host_ref::HostKind::GameValue {
+        return None;
+    }
+    let (location, fixed) = parse(handle.key())?;
+    if r.owner != "net/minecraft/sounds/SoundEvent" {
+        return None;
+    }
+    Some(match (r.name.as_str(), r.descriptor.as_str()) {
+        ("location", "()Lnet/minecraft/resources/Identifier;") => {
+            Ok(crate::runtime::host_ids::identifier_of_text(location))
+        }
+        ("getRange", "(F)F") => {
+            let distance = match expect_float(r, args.first().unwrap_or(&Value::Float(0.0))) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            Ok(Value::Float(f64::from(fixed.unwrap_or(
+                if distance > 1.0 {
+                    16.0 * distance as f32
+                } else {
+                    16.0
+                },
+            ))))
+        }
+        ("fixedRange", "()Ljava/util/Optional;") => Ok(crate::runtime::optional_wrap(
+            fixed.map_or(Value::Ref(None), |value| Value::Float(f64::from(value))),
+        )),
+        _ => host.unknown_host_call(r),
+    })
+}

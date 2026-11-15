@@ -8,7 +8,7 @@
 //! answers the object, not its encode/decode behaviour: those calls stay
 //! unmodelled and are still reported.
 
-use crate::{Host, MethodRef, Runtime, Value};
+use crate::{Host, MethodRef, Runtime, Value, host_codec};
 
 impl<H: Host> Runtime<'_, H> {
     /// The game codec factories this module answers; `None` for any other.
@@ -25,4 +25,13 @@ impl<H: Host> Runtime<'_, H> {
             _ => None,
         }
     }
+}
+
+/// A Minecraft-owned static StreamCodec is a canonical object in the game.
+/// Its encode/decode methods remain opaque network work, but reading the field
+/// itself is pure and must not be counted.
+pub(super) fn static_field(r: &MethodRef) -> Option<Value> {
+    let declared = r.descriptor.strip_prefix("L")?.strip_suffix(";")?;
+    (r.owner.starts_with("net/minecraft/") && declared == "net/minecraft/network/codec/StreamCodec")
+        .then(|| host_codec::static_codec(declared, &r.owner, &r.name))
 }
