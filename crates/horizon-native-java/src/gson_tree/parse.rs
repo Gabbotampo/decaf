@@ -72,7 +72,8 @@ impl<'a> Parser<'a> {
         let mut parser = Parser {
             bytes: text.as_bytes(),
             text,
-            pos: 0,
+            // `JsonReader`'s first fill skips one byte order mark.
+            pos: if text.starts_with('\u{feff}') { 3 } else { 0 },
             duplicate: false,
         };
         let parsed = (|| {

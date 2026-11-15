@@ -141,10 +141,10 @@ fn guava_and_gson_collections_are_javas() {
         ("gsonSorted", None),
         ("gsonGuavaJson", None),
         ("guavaClassSurface", None),
-        ("gsonForeign", Some("com/google/gson/Gson#fromJson")),
+        ("gsonForeign", None),
         ("gsonByteOverflow", Some("com/google/gson/Gson#fromJson")),
-        ("gsonShortBox", Some("com/google/gson/Gson#fromJson")),
-        ("gsonFloatBox", Some("com/google/gson/Gson#fromJson")),
+        ("gsonShortBox", None),
+        ("gsonFloatBox", None),
         (
             "guavaJdkEnum",
             Some("com/google/common/collect/Sets#immutableEnumSet"),
