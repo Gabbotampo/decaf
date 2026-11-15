@@ -1386,6 +1386,18 @@ impl StdHost {
                 .map(|()| receiver.clone()),
             });
         }
+        // `NonNullList` is a `List`: the inventory's lists (host collections,
+        // #156 P14d2) answer as one.
+        if r.owner == "net/minecraft/core/NonNullList"
+            && matches!(receiver, Value::Host(handle)
+                if handle.kind() == crate::runtime::host_ref::HostKind::Collection)
+        {
+            let as_list = MethodRef {
+                owner: "java/util/List".into(),
+                ..r.clone()
+            };
+            return Some(crate::runtime::Host::invoke_instance(self, &as_list, receiver, args));
+        }
         // Only a runtime-created input-key handle can enter this dispatch.
         // A jar String that happens to spell the handle marker remains a
         // String for casts, instanceof, collections and every member call.
@@ -1456,14 +1468,6 @@ impl StdHost {
         }
         if let Some(value) = crate::runtime::client_frame::hit_call(&text, r) {
             return Some(Ok(value));
-        }
-        // `NonNullList` is a `List`: the inventory's lists answer as one.
-        if r.owner == "net/minecraft/core/NonNullList" && text.starts_with("list") {
-            let as_list = MethodRef {
-                owner: "java/util/List".into(),
-                ..r.clone()
-            };
-            return Some(crate::runtime::Host::invoke_instance(self, &as_list, receiver, args));
         }
         // Constructors record their arguments against the new object.
         if r.name == "<init>" {
@@ -2393,6 +2397,32 @@ mod tests {
             }),
             ..ClientSnapshot::default()
         })
+    }
+
+    /// The inventory's lists are host collections (#156 P14d2): a call
+    /// through `NonNullList` answers as the `List` member.
+    #[test]
+    fn a_non_null_list_call_on_an_inventory_list_answers_as_a_list() {
+        let mut host = StdHost::new();
+        host.begin_client_frame(snapshot(), &[]);
+        let list = host.cached_collection(
+            &marker(items::INVENTORY),
+            "items",
+            NON_NULL_LIST,
+            true,
+            vec![Value::Int(1), Value::Int(2)],
+        );
+        let size = method(NON_NULL_LIST, "size", "()I");
+        assert_eq!(
+            crate::runtime::Host::invoke_instance(&mut host, &size, &list, &[]).unwrap(),
+            Value::Int(2)
+        );
+        assert!(host.unknown_host_calls().is_empty());
+        // A mutator follows `NonNullList`'s own rules (no `null`, a fixed
+        // size): counted.
+        let add = method(NON_NULL_LIST, "add", "(Ljava/lang/Object;)Z");
+        crate::runtime::Host::invoke_instance(&mut host, &add, &list, &[Value::Int(3)]).unwrap();
+        assert_eq!(host.unknown_host_calls().len(), 1);
     }
 
     #[test]

@@ -56,6 +56,16 @@ const RETIRED_PREFIXES: &[&str] = &[
     "game-rule/",
     // Every `game/…` object is a handle (#156 P16b, P16e).
     "game/",
+    // Collections are handles (#156 P14d2): the `list/…`, `set/…`, `map/…`
+    // literals are gone, and a text spelled like one is a `String`.
+    "list/",
+    "set/",
+    "map/",
+    // Their generation (`list#3/…`) and immutable (`list#i1/…`, `set#i0`)
+    // spellings too (#255 review).
+    "list#",
+    "set#",
+    "map#",
     // StackWalker.Option moved to a typed host handle; old marker-shaped
     // text remains an ordinary String.
     "enum/java/lang/StackWalker$Option/",
@@ -370,6 +380,11 @@ mod tests {
             "java/util/ArrayList#neutral0",
             "java/util/ImmutableCollections$ListN#immutable3",
             "java/util/ReverseOrderListView$Rand#reversed0",
+            // Spelled like the old collection literals (#156 P14d2): a
+            // collection is a handle.
+            "list/4",
+            "set/ra,rb",
+            "map/rk,rv",
             // A collection class with a suffix the host never writes: a
             // collection is a handle (#253 re-check).
             "java/util/ArrayList#weird0",
@@ -385,7 +400,6 @@ mod tests {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
         for marker in [
-            "list/4",
             "registry/minecraft:item",
             "string-builder/2",
             "@indy:demo/Main:0:demo/Main#lambda$0()V:",

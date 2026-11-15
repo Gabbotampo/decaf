@@ -250,7 +250,7 @@ pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> 
 fn operands(body: &str) -> Result<Vec<Value>, NativeError> {
     super::split_capture_markers(body)?
         .into_iter()
-        .map(|marker| super::parse_collection_value(&marker))
+        .map(|marker| super::parse_value_marker(&marker))
         .collect()
 }
 

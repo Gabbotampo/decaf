@@ -788,7 +788,6 @@ impl StdHost {
         let source = self.unmodifiable_collections.get(marker)?.as_ref()?;
         let source = crate::runtime::jar_object::stored_value(source);
         self.mutable_values(&source)
-            .or_else(|| crate::runtime::collection_values(&source).ok())
     }
 
     /// A collection member this module answers first: a mutator on an
