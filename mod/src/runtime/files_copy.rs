@@ -65,6 +65,11 @@ impl<H: Host> Runtime<'_, H> {
         let Some(target) = args.get(1).and_then(|value| self.io_path_of(value)) else {
             return Ok(None);
         };
+        let target_display = args
+            .get(1)
+            .map(crate::runtime::host_path::path_text)
+            .unwrap_or_default()
+            .to_owned();
         let options = match args.get(2) {
             Some(value @ Value::Host(_)) => self.array(value)?.clone(),
             _ => Vec::new(),
@@ -105,11 +110,12 @@ impl<H: Host> Runtime<'_, H> {
             // `deleteIfExists(target)` first (`watch_service.rs`).
             self.watch_deleted(&target);
             self.io_files.remove(&target);
+            self.io_file_bytes.remove(&target);
         }
         if self.io_files.contains_key(&target) {
             return Err(thrown(
                 "java/nio/file/FileAlreadyExistsException",
-                Some(target),
+                Some(target_display),
             ));
         }
         let Some(bytes) = self.host.resource_stream_bytes(&stream, None) else {
@@ -121,8 +127,7 @@ impl<H: Host> Runtime<'_, H> {
         if count > 0 {
             self.watch_change(&target, watch_service::Change::Modify);
         }
-        self.io_files
-            .insert(target, String::from_utf8_lossy(&bytes).into_owned());
+        self.io_store_bytes(target, bytes);
         Ok(Some(Value::Long(count)))
     }
 }

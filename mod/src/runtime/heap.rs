@@ -342,6 +342,7 @@ impl StdHost {
                 out.push(format!("{entry:?}"));
             }
         }
+        push(self.io_paths.get(marker), out);
         push(self.unmodifiable_collections.get(marker), out);
         push(self.reversed_views.get(marker), out);
         push(self.synchronized_views.get(marker), out);
@@ -366,8 +367,9 @@ impl StdHost {
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
     /// tables kept per object.
     fn keyed_table_keys(&self) -> impl Iterator<Item = &str> {
-        self.unmodifiable_collections
+        self.io_paths
             .keys()
+            .chain(self.unmodifiable_collections.keys())
             .chain(self.reversed_views.keys())
             .chain(self.synchronized_views.keys())
             .chain(self.view_copies.keys())
@@ -389,6 +391,7 @@ impl StdHost {
 
     /// Drop every per-object row of a collected object (`keep` false).
     fn prune_keyed_tables(&mut self, keep: impl Fn(&str) -> bool) {
+        self.io_paths.retain(|key, _| keep(key));
         self.unmodifiable_collections.retain(|key, _| keep(key));
         self.reversed_views.retain(|key, _| keep(key));
         self.synchronized_views.retain(|key, _| keep(key));
@@ -1347,6 +1350,7 @@ mod tests {
             "throwable_causes",
             "throwable_suppressed",
             "persistent_static_fields",
+            "io_paths",
             "heap",
             "retained",
             "freed_objects",
@@ -1378,6 +1382,9 @@ mod tests {
             "game_version",
             "development_environment",
             "console_out",
+            "io_files",
+            "io_file_bytes",
+            "io_dirs",
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",

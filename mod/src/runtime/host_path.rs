@@ -45,6 +45,34 @@ const PATH_TYPES: &[&str] = &[
 /// A path as `UnixPath` (and `java.io.File`'s `UnixFileSystem.normalize`)
 /// keeps it: repeated slashes collapsed and a trailing slash dropped, the
 /// root `/` kept.
+/// The virtual working directory used by the census backend. Relative paths
+/// are resolved here and never touch the process filesystem.
+pub(crate) const SANDBOX_CWD: &str = "/horizon/game";
+
+/// Resolve a path against the virtual sandbox cwd. This is the absolute path
+/// Java's File.getAbsolutePath/Path.toAbsolutePath sees for this host.
+/// The model has no links, so callers use the same value for canonical paths.
+pub(crate) fn sandbox_absolute(path: &str) -> String {
+    let path = unix_normal(path);
+    if path.is_empty() || path == "." {
+        return SANDBOX_CWD.into();
+    }
+    if path.starts_with('/') {
+        path
+    } else {
+        format!("{SANDBOX_CWD}/{path}")
+    }
+}
+
+/// Recover the caller-facing spelling for an absolute sandbox path in an
+/// exception message. Absolute paths outside the sandbox stay absolute.
+pub(crate) fn sandbox_display(path: &str) -> String {
+    path.strip_prefix(SANDBOX_CWD)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(path)
+        .to_owned()
+}
+
 pub(crate) fn unix_normal(path: &str) -> String {
     let mut normal = String::with_capacity(path.len());
     for c in path.chars() {
