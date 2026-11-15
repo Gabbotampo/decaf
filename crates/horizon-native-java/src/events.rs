@@ -167,11 +167,13 @@ pub enum GameEvent {
     /// An item's tooltip is being built (Fabric `ItemTooltipCallback.EVENT`,
     /// NeoForge `ItemTooltipEvent`): the listener edits its lines.
     ClientItemTooltip,
+    /// NeoForge's client mod-bus reload-listener registration event.
+    ClientReloadListeners,
 }
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 41] = [
+    pub const ALL: [GameEvent; 42] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -213,6 +215,7 @@ impl GameEvent {
         GameEvent::ClientRegisterKeyMappings,
         GameEvent::ClientRegisterGuiLayers,
         GameEvent::ClientItemTooltip,
+        GameEvent::ClientReloadListeners,
     ];
 
     /// The stable name logs and reports use.
@@ -259,6 +262,7 @@ impl GameEvent {
             GameEvent::ClientRegisterKeyMappings => "client_register_key_mappings",
             GameEvent::ClientRegisterGuiLayers => "client_register_gui_layers",
             GameEvent::ClientItemTooltip => "client_item_tooltip",
+            GameEvent::ClientReloadListeners => "client_reload_listeners",
         }
     }
 
@@ -301,6 +305,7 @@ impl GameEvent {
                 | GameEvent::ClientRegisterKeyMappings
                 | GameEvent::ClientRegisterGuiLayers
                 | GameEvent::ClientItemTooltip
+                | GameEvent::ClientReloadListeners
         )
     }
 }
@@ -854,6 +859,10 @@ const CLIENT_BUS_EVENTS: &[(&str, GameEvent)] = &[
         GameEvent::ClientRegisterKeyMappings,
     ),
     ("RegisterGuiLayersEvent", GameEvent::ClientRegisterGuiLayers),
+    (
+        "AddClientReloadListenersEvent",
+        GameEvent::ClientReloadListeners,
+    ),
 ];
 const NEOFORGE_CLIENT_EVENT_ROOT: &str = "net/neoforged/neoforge/client/event/";
 const FORGE_CLIENT_EVENT_ROOT: &str = "net/minecraftforge/client/event/";
