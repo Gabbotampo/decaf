@@ -11,6 +11,9 @@
 //! pool's, an array element, one producer inside a loop, two parameters) must
 //! be counted instead, whatever they answer.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -256,7 +259,7 @@ fn javac() -> PathBuf {
 /// Compile the fixture into a jar; each test passes its own tag so parallel
 /// tests never share a build root.
 fn jar(tag: &str) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-identity-{tag}-{}",
         std::process::id()
     ));

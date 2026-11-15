@@ -18,6 +18,9 @@
 //! runtime, with one thread, cannot tell that from a latch another thread
 //! would have counted down. It counts the call and answers the neutral `false`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -198,7 +201,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-concurrent-sync-{test}-{}-{unique}",
             std::process::id()
         ));

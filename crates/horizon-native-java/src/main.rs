@@ -30,6 +30,8 @@ struct Cli {
     /// `--game-version <version>`: the release the host reports to the
     /// loader and the game's own version detector.
     game_version: Option<String>,
+    /// `--game-block-classes <path>`: the exact prepared 26.3 closure table.
+    game_block_classes: Option<String>,
     path: String,
     kind: Option<String>,
     class: Option<String>,
@@ -42,6 +44,7 @@ impl Cli {
         let mut weave = None;
         let mut links = Vec::new();
         let mut game_version = None;
+        let mut game_block_classes = None;
         let mut positional = Vec::new();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -56,6 +59,8 @@ impl Cli {
                 links.push(args.next()?);
             } else if arg == "--game-version" {
                 game_version = Some(args.next()?);
+            } else if arg == "--game-block-classes" {
+                game_block_classes = Some(args.next()?);
             } else {
                 positional.push(arg);
             }
@@ -67,6 +72,7 @@ impl Cli {
             weave,
             links,
             game_version,
+            game_block_classes,
             path: positional.next()?,
             kind: positional.next(),
             class: positional.next(),
@@ -633,7 +639,7 @@ fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
             "usage: horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] \
-             [--link <jar>]... [--game-version <version>] <mod.jar> \
+             [--link <jar>]... [--game-version <version>] [--game-block-classes <path>] <mod.jar> \
              [main|client|server|neoforge] [class]"
         );
         return ExitCode::FAILURE;
@@ -644,6 +650,7 @@ fn main() -> ExitCode {
         weave,
         links,
         game_version,
+        game_block_classes,
         path,
         kind: requested_kind,
         class: explicit_class,
@@ -768,6 +775,22 @@ fn main() -> ExitCode {
     let mut seed = StdHost::new().with_environment_type(side);
     if let Some(version) = game_version {
         seed = seed.with_game_version(version);
+    }
+    if let Some(path) = game_block_classes {
+        seed = match seed.with_game_block_classes_file(path) {
+            Ok(seed) => seed,
+            Err(error) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "error", "stage": "game-data", "error": error})
+                    );
+                } else {
+                    eprintln!("error loading game block classes: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
     }
     let mut host = jar.seed_host(seed);
     for link in &links {
@@ -1173,6 +1196,7 @@ mod tests {
             weave: None,
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: Some("client".into()),
             class: Some("demo.Main".into()),
@@ -1195,6 +1219,7 @@ mod tests {
             weave: None,
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1211,6 +1236,7 @@ mod tests {
             weave: Some("out.jar".into()),
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1232,6 +1258,7 @@ mod tests {
             weave: None,
             links: vec!["a.jar".into(), "b.jar".into()],
             game_version: Some("26.3".into()),
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: Some("neoforge".into()),
             class: None,
@@ -1255,6 +1282,26 @@ mod tests {
     }
 
     #[test]
+    fn game_block_class_table_flag_takes_its_value() {
+        let expected = Cli {
+            json: false,
+            mixin_plans: false,
+            weave: None,
+            links: Vec::new(),
+            game_version: None,
+            game_block_classes: Some("classes.json".into()),
+            path: "mod.jar".into(),
+            kind: Some("server".into()),
+            class: None,
+        };
+        assert_eq!(
+            parse(&["--game-block-classes", "classes.json", "mod.jar", "server"]),
+            Some(expected)
+        );
+        assert_eq!(parse(&["mod.jar", "--game-block-classes"]), None);
+    }
+
+    #[test]
     fn bare_jar_is_a_valid_invocation() {
         assert_eq!(
             parse(&["mod.jar"]),
@@ -1264,6 +1311,7 @@ mod tests {
                 weave: None,
                 links: Vec::new(),
                 game_version: None,
+                game_block_classes: None,
                 path: "mod.jar".into(),
                 kind: None,
                 class: None,
