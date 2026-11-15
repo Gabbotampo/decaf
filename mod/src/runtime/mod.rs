@@ -25060,9 +25060,9 @@ impl<H: Host> Runtime<'_, H> {
         let Value::Host(handle) = value else {
             return None;
         };
-        if handle.kind() != HostKind::Writer || !modelled_writer_class(
-            crate::runtime::jar_object::packaged_object_class(value)?,
-        ) {
+        if handle.kind() != HostKind::Writer
+            || !modelled_writer_class(crate::runtime::jar_object::packaged_object_class(value)?)
+        {
             return None;
         }
         let marker = handle.key_text();
@@ -25487,9 +25487,10 @@ impl<H: Host> Runtime<'_, H> {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
                     ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
-                        let Some(target) = args.first().and_then(|value| {
-                            self.gson_writer_target_marker(value)
-                        }) else {
+                        let Some(target) = args
+                            .first()
+                            .and_then(|value| self.gson_writer_target_marker(value))
+                        else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
