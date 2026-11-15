@@ -4230,7 +4230,6 @@ impl StdHost {
             ("stringPropertyNames", "()Ljava/util/Set;")
             | ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
-            | ("entrySet", "()Ljava/util/Set;")
             | ("keySet", "()Ljava/util/Set;")
             | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
             // JDK 25's `store` writes a `#` line with `new Date().toString()`
