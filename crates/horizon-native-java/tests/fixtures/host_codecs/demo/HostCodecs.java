@@ -2,6 +2,7 @@ package demo;
 
 import com.mojang.datafixers.kinds.App;
 import com.mojang.datafixers.util.Pair;
+import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
 import net.minecraft.network.codec.ByteBufCodecs;
 import java.util.*;
@@ -53,6 +54,26 @@ public final class HostCodecs {
         + (o instanceof Pair) + (o instanceof App) + (o instanceof Integer) + o.getClass().getName()
         + o.getClass().getSuperclass().getName() + "|" + new HashSet<>(List.of(p)).contains(q)
         + new HashMap<>(Map.of(p, 7)).get(q) + List.of(s, q).indexOf(p);
+  }
+
+  /** The public constructor and map callbacks use the runtime callback path. */
+  public static String pairMaps() {
+    Pair<Integer, String> p = new Pair<>(2, "b");
+    Pair<Integer, String> q = p.mapFirst(x -> x + 1).mapSecond(String::toUpperCase);
+    return p + "|" + q + "|" + q.getFirst() + q.getSecond() + "|" + q.equals(Pair.of(3, "B"));
+  }
+
+  /** Either's selected branch maps, callbacks and Optional projections. */
+  public static String eithers() {
+    Either<String, Integer> left = Either.left("a");
+    Either<String, Integer> right = Either.right(2);
+    StringBuilder seen = new StringBuilder();
+    left.ifLeft(seen::append).ifRight(x -> seen.append("bad"));
+    right.ifLeft(x -> seen.append("bad")).ifRight(x -> seen.append(x + 1));
+    return left + "|" + right + "|" + left.map(String::toUpperCase, Object::toString) + "|"
+        + right.map(String::toUpperCase, Object::toString) + "|" + left.left().get() + "|"
+        + right.right().get() + "|" + left.right().isPresent() + "|" + right.left().isPresent()
+        + "|" + seen + "|" + left.swap();
   }
 
   /** Nested pairs compare and print through their values. */

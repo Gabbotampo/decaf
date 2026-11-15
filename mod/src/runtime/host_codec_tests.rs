@@ -107,6 +107,11 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
                 "1aa1|falsetruefalsetruefalsefalse2|(1, a)|(null, null)|1089,961|truetruefalsecom.mojang.datafixers.util.Pairjava.lang.Object|true71",
             ),
         ),
+        ("pairMaps", Exact("(2, b)|(3, B)|3B|true")),
+        (
+            "eithers",
+            Exact("Left[a]|Right[2]|A|2|a|2|false|false|a3|Right[a]"),
+        ),
         ("nested", Exact("((2, b), [3, 4])|36770|true")),
         // An identity hash held: counted.
         ("identityHeld", Counted),

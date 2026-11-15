@@ -390,6 +390,8 @@ pub enum HostKind {
     /// DataFixerUpper's `Pair.of(..)`: key `[serial, first, second]`
     /// (`host_codec.rs`).
     DfuPair,
+    /// DataFixerUpper Either values keyed by side and payload.
+    DfuEither,
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
@@ -1704,6 +1706,15 @@ const KINDS: &[KindInfo] = &[
         // A serial per allocation: one key, one object.
         canonical: always_canonical,
         methods: &crate::runtime::host_codec::PAIR_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DfuEither,
+        tag: "deither",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_either::either_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_either::EITHER_METHODS,
     },
     KindInfo {
         kind: HostKind::OpaqueCodec,
