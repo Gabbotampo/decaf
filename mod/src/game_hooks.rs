@@ -240,7 +240,13 @@ pub(crate) fn register(
             matches!(
                 plan.reason,
                 crate::runtime::MixinSkipReason::GameHookMismatch(_)
-            )
+            ) || matches!(plan.reason, crate::runtime::MixinSkipReason::Unresolved)
+                && crate::runtime::every_game_hook_site().any(|site| {
+                    site.target_owner == plan.target.owner
+                        && site.target_name == plan.target.name
+                        && (plan.target.descriptor.is_empty()
+                            || site.target_descriptor == plan.target.descriptor)
+                })
         })
         .count();
     let registrations = jar.register_game_hooks(&weave).unwrap_or_default();
