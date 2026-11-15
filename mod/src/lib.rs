@@ -88,10 +88,11 @@ use mod_api::{
     LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
     LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
     PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
-    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
-    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
-    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
+    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
+    ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
+    Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -792,6 +793,55 @@ impl Hooks for HorizonJava {
             Some((
                 Some(GameObject::server(state.dedicated)),
                 vec![has_time_supplier()],
+            ))
+        });
+    }
+
+    /// NeoForge's `PlayerTickEvent.Pre`: the exact head of `Player.tick` on the server. The
+    /// pinned hook is listen-only, so a Mixin callback that asks to cancel was refused at load.
+    /// Horizon currently emits the pair for spectators even when their box touches an unloaded
+    /// chunk and vanilla skips `super.tick()` (#4520); the API gives us game mode but not the
+    /// complete box/chunk test, so every spectator firing is skipped and counted.
+    fn player_tick_pre(&self, host: HostSide<'_>, event: &mut PlayerTickPreEvent) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        if host
+            .players()
+            .player_is_spectator(event.player)
+            .unwrap_or(false)
+        {
+            game_hooks::skip_spectator(&mut self.lock(), "java_base_player_tick_head");
+            return;
+        }
+        let player = event.player;
+        self.game_hooks(Some(host), "java_base_player_tick_head", |state| {
+            Some((
+                Some(game_hooks::player(state, player.uuid(), 0)?),
+                Vec::new(),
+            ))
+        });
+    }
+
+    /// NeoForge's `PlayerTickEvent.Post`: the exact tail of `Player.tick` on the server, with the
+    /// same player identity as `player_tick_pre`. See `player_tick_pre` for the spectator gap.
+    fn player_tick_post(&self, host: HostSide<'_>, event: &mut PlayerTickPostEvent) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        if host
+            .players()
+            .player_is_spectator(event.player)
+            .unwrap_or(false)
+        {
+            game_hooks::skip_spectator(&mut self.lock(), "java_base_player_tick_tail");
+            return;
+        }
+        let player = event.player;
+        self.game_hooks(Some(host), "java_base_player_tick_tail", |state| {
+            Some((
+                Some(game_hooks::player(state, player.uuid(), 0)?),
+                Vec::new(),
             ))
         });
     }

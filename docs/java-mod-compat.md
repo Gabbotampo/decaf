@@ -606,8 +606,9 @@ names start with `java_`, and they are fired only from `java_game_hooks.rs`. One
 |---|---|---|---|---|
 | `java_player_list_remove` | `PlayerList#remove` | `HEAD` | listen | `native_player_logged_out`, every leave; the player is already unlisted, so it carries its UUID and name only |
 | `java_server_stopped` | `MinecraftServer#stopServer` | `TAIL` | listen | an orderly stop, after the final save and the levels' close, before the stopped event |
-| `java_player_tick_head` | `ServerPlayer#tick` | `HEAD` | listen | `tick_guests`, where a living guest's tick starts (the population of `player_tick`) |
-| `java_base_player_tick_head` / `_tail` | `Player#tick` | `HEAD` / `TAIL` | listen | the same step: Horizon runs `ServerPlayer.tick` and `doTick`'s `Player.tick` as one, so these fire inside `ServerPlayer.tick`'s head and tail, server only |
+| `java_player_tick_head` | `ServerPlayer#tick` | `HEAD` | listen | **unbound:** no pinned hook fires at `ServerPlayer.tick`'s level entity-loop moment; `Player.tick`'s pair is a different moment (a native Mixin escape hatch is a separate option) |
+| `java_base_player_tick_head` | `Player#tick` | `HEAD` | listen | `player_tick_pre`, NeoForge's `PlayerTickEvent.Pre`, with the server player's state acting |
+| `java_base_player_tick_tail` | `Player#tick` | `TAIL` | listen | `player_tick_post`, NeoForge's `PlayerTickEvent.Post`, after body work and with the same player identity |
 | `java_destroy_speed` | `Player#getDestroySpeed(BlockState)F` | `RETURN`/`TAIL` | override | the speed `tick_mining` and `destroy_progress` compute; a cancellable callback's `setReturnValue` is the speed the progress divides by hardness |
 | `java_grow_crop` | `BoneMealItem#growCrop` (static) | `HEAD` | cancel with a value | a player's and a dispenser's bone meal (not a farmer villager's, which Horizon decides in its brain); a cancel returns its value without growing or using up the meal, and `false` goes on to `growWaterPlant` as vanilla's caller does |
 | `java_server_tick_head` / `_tail` | `MinecraftServer#tickServer(BooleanSupplier)V` | `HEAD` / `TAIL` | listen | `native_server_tick`'s start and end phases; `haveTime` is null (the host has no supplier) |
@@ -624,6 +625,13 @@ names start with `java_`, and they are fired only from `java_game_hooks.rs`. One
 
 A callback may also take the callback info alone, Mixin's simple form (`(CallbackInfo)V` on `tick(BooleanSupplier)`).
 A hook name can stand for several vanilla methods (`living_jump`); a plan registers at the row of its own target.
+
+The pinned `player_tick_pre`/`player_tick_post` hooks are listen-only and run on both logical sides; this
+server-side bridge binds the `Player#tick` rows to their server firing. Horizon currently emits the pair for a
+spectator whose box touches an unloaded chunk even though vanilla skips `super.tick()` there (#4520). The API
+exposes spectator mode but not the complete box/chunk test, so the bridge skips and counts all spectator
+player-tick firings until the pinned game includes that fix. `ServerPlayer#tick` remains unbound; a native
+`[[native.mixin]]` is the possible exact-moment route and is outside this binding.
 
 A callback on a value-returning target takes a `CallbackInfoReturnable`. At a `RETURN`/`TAIL` row the game hands
 the method's own result in (`NativeJar::run_game_hook_returning`'s `actual`), `getReturnValue` reads it, and a

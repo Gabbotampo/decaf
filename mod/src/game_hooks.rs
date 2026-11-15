@@ -55,6 +55,14 @@ pub(crate) const BOUND: &[(&str, &str)] = &[
         "java_server_tick_tail",
         "server_tick ServerTickEnd: tickServer TAIL (a RETURN callback, single player only: vanilla's empty pause returns early)",
     ),
+    (
+        "java_base_player_tick_head",
+        "player_tick_pre: NeoForge PlayerTickEvent.Pre at Player.tick HEAD; server-side player state is acting",
+    ),
+    (
+        "java_base_player_tick_tail",
+        "player_tick_post: NeoForge PlayerTickEvent.Post at Player.tick TAIL; server-side player state is acting",
+    ),
     ("attack_entity", "attack_entity: Player.attack HEAD"),
 ];
 
@@ -86,16 +94,11 @@ pub(crate) const UNBOUND: &[(&str, &str)] = &[
     ),
     (
         "player_tick",
-        "no player tick hook at the pin (entity_tick_* skip players)",
-    ),
-    ("java_player_tick_head", "no player tick hook at the pin"),
-    (
-        "java_base_player_tick_head",
-        "no player tick hook at the pin",
+        "no hook at ServerPlayer.tick's moment; Player.tick's pair is a different moment (a native Mixin escape hatch would be needed)",
     ),
     (
-        "java_base_player_tick_tail",
-        "no player tick hook at the pin",
+        "java_player_tick_head",
+        "no hook at ServerPlayer.tick's moment; Player.tick's pair is a different moment (a native Mixin escape hatch would be needed)",
     ),
     (
         "java_player_list_remove",
@@ -299,6 +302,21 @@ pub(crate) fn unlisted(state: &mut State, site: &str) {
             loaded.row.game_hooks.unlisted += 1;
             log::debug!(
                 "{LOG}: {}: {site} not fired: a player it hands over is not listed",
+                loaded.row.id
+            );
+        }
+    }
+}
+
+/// Count a player-tick firing that Horizon emits for a spectator touching an unloaded chunk.
+/// The PlayerRef API exposes game mode but not the player's bounding box, so the bridge cannot
+/// prove that only this spectator case is present; it skips and counts every spectator firing.
+pub(crate) fn skip_spectator(state: &mut State, site: &str) {
+    for loaded in &mut state.jars {
+        if !loaded.hooks.entries(site).is_empty() {
+            loaded.row.game_hooks.skipped += 1;
+            log::debug!(
+                "{LOG}: {}: {site} not fired: spectator Player.tick may touch an unloaded chunk",
                 loaded.row.id
             );
         }
@@ -668,7 +686,8 @@ mod tests {
             "net/minecraft/world/entity/player/Player.java",
             "package net.minecraft.world.entity.player; \
              public class Player extends net.minecraft.world.entity.LivingEntity { \
-             public void attack(net.minecraft.world.entity.Entity target) {} }",
+             public void attack(net.minecraft.world.entity.Entity target) {} \
+             public void tick() {} public java.util.UUID getUUID() { return null; } }",
         ),
         (
             "net/minecraft/server/MinecraftServer.java",
@@ -708,6 +727,111 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn player_tick_head_and_tail_run_once_per_player_in_order() {
+        let mut state = State::default();
+        state.jars.push(load(
+            "playertick",
+            "PlayerTickMixin",
+            "@Mixin(Player.class) public class PlayerTickMixin { \
+               @Inject(method = \"tick\", at = @At(\"HEAD\")) \
+               private void pre(CallbackInfo ci) { System.out.println(\"pre/\" + ((Player)(Object)this).getUUID()); } \
+               @Inject(method = \"tick\", at = @At(\"TAIL\")) \
+               private void post(CallbackInfo ci) { System.out.println(\"post/\" + ((Player)(Object)this).getUUID()); } }",
+        ));
+        assert_eq!(
+            (
+                state.jars[0].row.game_hooks.bound,
+                state.jars[0].row.game_hooks.unbound
+            ),
+            (2, 0)
+        );
+        let alice = 0xa1_u128;
+        let bob = 0xb2_u128;
+        state.players = vec![
+            FacadePlayer {
+                uuid: alice,
+                name: "Alice".into(),
+                level: None,
+                entity_id: Some(7),
+                session: 1,
+                life: 0,
+            },
+            FacadePlayer {
+                uuid: bob,
+                name: "Bob".into(),
+                level: None,
+                entity_id: Some(8),
+                session: 1,
+                life: 0,
+            },
+        ];
+        for uuid in [alice, bob] {
+            let player = player(&state, uuid, 0).unwrap();
+            fire(
+                &mut state,
+                "java_base_player_tick_head",
+                Some(player.clone()),
+                vec![],
+            );
+            fire(
+                &mut state,
+                "java_base_player_tick_tail",
+                Some(player),
+                vec![],
+            );
+        }
+        assert_eq!(
+            stdout(&mut state, 0),
+            [
+                "pre/00000000-0000-0000-0000-0000000000a1",
+                "post/00000000-0000-0000-0000-0000000000a1",
+                "pre/00000000-0000-0000-0000-0000000000b2",
+                "post/00000000-0000-0000-0000-0000000000b2",
+            ]
+        );
+        assert_eq!(state.jars[0].row.game_hooks.ran, 4);
+    }
+
+    #[test]
+    fn player_tick_cancellable_injection_is_refused_and_counted() {
+        let mut state = State::default();
+        state.jars.push(load(
+            "cancelplayertick",
+            "CancelPlayerTickMixin",
+            "@Mixin(Player.class) public class CancelPlayerTickMixin { \
+               @Inject(method = \"tick\", at = @At(\"HEAD\"), cancellable = true) \
+               private void pre(CallbackInfo ci) { ci.cancel(); } }",
+        ));
+        assert_eq!(state.jars[0].row.game_hooks.refused, 1);
+        assert_eq!(state.jars[0].row.game_hooks.bound, 0);
+        assert!(
+            state.jars[0]
+                .hooks
+                .entries("java_base_player_tick_head")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn spectator_player_tick_firings_are_skipped_and_counted() {
+        let mut state = State::default();
+        state.jars.push(load(
+            "spectatortick",
+            "SpectatorTickMixin",
+            "@Mixin(Player.class) public class SpectatorTickMixin { \
+               @Inject(method = \"tick\", at = @At(\"HEAD\")) \
+               private void pre(CallbackInfo ci) { System.out.println(\"pre\"); } \
+               @Inject(method = \"tick\", at = @At(\"TAIL\")) \
+               private void post(CallbackInfo ci) { System.out.println(\"post\"); } }",
+        ));
+        skip_spectator(&mut state, "java_base_player_tick_head");
+        skip_spectator(&mut state, "java_base_player_tick_tail");
+        assert_eq!(state.jars[0].row.game_hooks.skipped, 2);
+        assert_eq!(state.jars[0].row.game_hooks.ran, 0);
+        assert!(stdout(&mut state, 0).is_empty());
     }
 
     /// `Player.attack` returns once a HEAD callback cancels: a later jar's callback at that
