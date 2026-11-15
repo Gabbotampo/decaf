@@ -8315,6 +8315,12 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // A jar String that spells a SetFromMap handle is still a String.
+            // It must never enter the live-view dispatch or mutate the backing map.
+            if matches!(receiver, Value::Ref(Some(text)) if self.set_from_map_views.contains_key(text))
+            {
+                return self.unknown_host_call(r);
+            }
             // The game's `NonNullList` (an inventory's list): its own rules
             // (no `null`, a fixed size for `withSize`) are not modelled, so a
             // mutator is counted (#255 review), and so is `subList`, whose
