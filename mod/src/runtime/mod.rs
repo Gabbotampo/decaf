@@ -54,6 +54,7 @@ mod facade_saved_data;
 mod facade_server;
 mod facade_text;
 mod facade_world;
+mod fdlibm;
 mod field_access;
 mod field_get_set;
 mod file_attributes;

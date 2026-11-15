@@ -5,12 +5,11 @@
 //! `round`'s tie and saturation rules are spelled out below. The functions
 //! answered here were compared with JDK 25 on x86-64 and agree bit for bit.
 //!
-//! `pow` is left unmodelled on purpose. Java only requires it within one ulp,
-//! and the platform `pow` is not HotSpot's algorithm: it differs from the JDK
-//! in the last bit on some inputs, and between platform libms. An answer off
-//! by one ulp would turn a counted unknown into a false `ran-clean`, so `pow`
-//! stays counted until it is a port of HotSpot's own `dpow`.
+//! The fdlibm functions below are answered for `StrictMath` on every host.
+//! `Math` uses the same model only on AArch64, where HotSpot routes these
+//! methods through fdlibm; other `Math` architectures stay counted.
 
+use crate::runtime::fdlibm;
 use crate::runtime::{MethodRef, NativeError, Value, double_value, expect_float, float_value};
 
 /// `Math.round(double)`: the closest `long`, ties toward positive infinity.
@@ -40,9 +39,12 @@ fn round_float(value: f32) -> i32 {
 
 /// Answer a `Math` call on `double`/`float`, or `None` for any other call.
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
-    if r.owner != "java/lang/Math" {
+    let strict = r.owner == "java/lang/StrictMath";
+    let math = r.owner == "java/lang/Math";
+    if !strict && !math {
         return None;
     }
+    let fdlibm_math = strict || cfg!(target_arch = "aarch64");
     let argument = |index: usize| -> Result<f64, NativeError> {
         let value = args.get(index).ok_or_else(|| {
             NativeError::Metadata(format!("{}#{} missing argument {index}", r.owner, r.name))
@@ -57,8 +59,37 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         ("sqrt", "(D)D") => unary(f64::sqrt),
         ("abs", "(D)D") => unary(f64::abs),
         ("abs", "(F)F") => argument(0).map(|value| float_value(value.abs())),
-        ("round", "(D)J") => argument(0).map(|value| Value::Long(round_double(value))),
-        ("round", "(F)I") => argument(0).map(|value| Value::Int(round_float(value as f32))),
+        ("round", "(D)J") if math => argument(0).map(|value| Value::Long(round_double(value))),
+        ("round", "(F)I") if math => argument(0).map(|value| Value::Int(round_float(value as f32))),
+        ("pow", "(DD)D") if fdlibm_math => {
+            let base = match argument(0) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            let exponent = match argument(1) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            Ok(double_value(fdlibm::pow(base, exponent)))
+        }
+        ("tan", "(D)D") if fdlibm_math => unary(fdlibm::tan),
+        ("exp", "(D)D") if fdlibm_math => unary(fdlibm::exp),
+        ("log", "(D)D") if fdlibm_math => argument(0).map(|value| {
+            double_value(if math && value.is_nan() && value.is_sign_negative() {
+                f64::from_bits(0x7ff8_0000_0000_0000)
+            } else {
+                fdlibm::log(value)
+            })
+        }),
+        ("log10", "(D)D") if fdlibm_math => argument(0).map(|value| {
+            double_value(if math && value.is_nan() && value.is_sign_negative() {
+                f64::from_bits(0x7ff8_0000_0000_0000)
+            } else {
+                fdlibm::log10(value)
+            })
+        }),
+        ("cbrt", "(D)D") if fdlibm_math => unary(fdlibm::cbrt),
+        ("tanh", "(D)D") if fdlibm_math => unary(fdlibm::tanh),
         _ => return None,
     })
 }
@@ -154,6 +185,9 @@ mod tests {
             name: "pow".into(),
             descriptor: "(DD)D".into(),
         };
-        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+        assert_eq!(
+            static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_some(),
+            cfg!(target_arch = "aarch64")
+        );
     }
 }
