@@ -5444,9 +5444,7 @@ impl Host for StdHost {
         let Value::Host(handle) = value else {
             return false;
         };
-        let answer = handle.kind() == HostKind::Collection
-            && self.set_from_map_views.contains_key(handle.key());
-        answer
+        handle.kind() == HostKind::Collection && self.set_from_map_views.contains_key(handle.key())
     }
 
     fn set_from_map_source(&self, value: &Value) -> Option<Value> {
