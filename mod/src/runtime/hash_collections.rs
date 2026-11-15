@@ -63,6 +63,10 @@ fn table_kind_of(class: &str) -> Option<TableKind> {
             map: true,
             linked: true,
         },
+        "java/util/concurrent/ConcurrentHashMap" => TableKind {
+            map: true,
+            linked: false,
+        },
         "java/util/HashSet" => TableKind {
             map: false,
             linked: false,
@@ -73,6 +77,24 @@ fn table_kind_of(class: &str) -> Option<TableKind> {
         },
         _ => return None,
     })
+}
+
+/// `ConcurrentHashMap` rejects null keys and values before any hash-table
+/// mutation. The ordinary JDK map path accepts both, so this check is tied to
+/// the receiver's concrete class by the caller.
+fn concurrent_map_rejects_null(r: &MethodRef, args: &[Value]) -> bool {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("put" | "putIfAbsent" | "replace" | "merge" | "containsValue", _) => {
+            args.iter().any(|value| matches!(value, Value::Ref(None)))
+        }
+        ("remove" | "get" | "getOrDefault" | "containsKey", _) => args
+            .first()
+            .is_some_and(|value| matches!(value, Value::Ref(None))),
+        ("computeIfAbsent" | "computeIfPresent" | "compute", _) => args
+            .first()
+            .is_some_and(|value| matches!(value, Value::Ref(None))),
+        _ => false,
+    }
 }
 
 /// Where a key is, as `HashMap.getNode` would find it.
@@ -123,12 +145,23 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash collection `value` is: a host row of one of the four classes,
     /// or of a jar class extending one.
     pub(crate) fn hash_table_kind(&self, value: &Value) -> Option<TableKind> {
+        // A `String` is no table, whatever it spells.
+        if crate::runtime::jar_object::spells_key(value) {
+            return None;
+        }
         let marker = expect_ref(value)?;
+        // A map's `keySet()`/`values()`/`entrySet()` copy stands in for the
+        // map's view (`HashMap$KeySet`): its class is the host's stand-in, and
+        // its order is the map's, so it has no table of its own (#156 P14d1).
+        if self.host.is_view_copy(marker) {
+            return None;
+        }
         let (class, _) = marker.split_once('#')?;
         let mut class = class.to_owned();
         let mut kind = table_kind_of(&class);
         if kind.is_none() {
-            jvm_dispatch::constructed_object_class(marker)?;
+            // Only an object of a jar class extending one.
+            crate::runtime::jar_object::object_key(value)?;
             for _ in 0..MAX_SUPERCLASS_WALK {
                 match self.class(&class) {
                     Some(file) => class = file.super_name.clone(),
@@ -138,6 +171,19 @@ impl<H: Host> Runtime<'_, H> {
             kind = table_kind_of(&class);
         }
         let kind = kind?;
+        // The Guava factory hands out a host Collection handle. Keep its
+        // exact ConcurrentHashMap semantics, but do not turn every jar-owned
+        // ConcurrentHashMap constructor into a synthetic hash table: those
+        // objects still need the ordinary counted path used before this PR.
+        if class == "java/util/concurrent/ConcurrentHashMap"
+            && !matches!(
+                value,
+                Value::Host(handle)
+                    if handle.kind() == crate::runtime::host_ref::HostKind::Collection
+            )
+        {
+            return None;
+        }
         self.host.has_mutable_collection(marker).then_some(kind)
     }
 
@@ -161,9 +207,147 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(());
         };
         let mut table = self.take_table(&marker, kind);
+        // Nothing touched the list since the table last mirrored it
+        // (`collection_store.rs`): nothing to reconcile (#203).
+        let generation = self.host.collection_generation(&marker);
+        if generation.is_some() && table.synced == generation {
+            if table.linked && table.positions.is_none() {
+                self.index_positions(&marker, kind, &mut table);
+            }
+            self.host.store_hash_table(&marker, table);
+            return Ok(());
+        }
         let result = self.resync_with(value, kind, &mut table);
+        table.synced = if result.is_ok() {
+            self.host.collection_generation(&marker)
+        } else {
+            None
+        };
+        table.positions = None;
+        if table.linked && table.synced.is_some() {
+            self.index_positions(&marker, kind, &mut table);
+        }
         self.host.store_hash_table(&marker, table);
         result
+    }
+
+    /// An insertion-ordered table's key positions in its list (one pass).
+    fn index_positions(&self, marker: &str, kind: TableKind, table: &mut HashTable) {
+        let step = if kind.map { 2 } else { 1 };
+        table.positions = self.host.collection_slice(marker).map(|list| {
+            list.iter()
+                .step_by(step)
+                .enumerate()
+                .map(|(index, key)| (collection_item_marker(key), index))
+                .collect()
+        });
+    }
+
+    /// Where a stored key sits in the host's list (its first slot) when the
+    /// table mirrors the list in its own order, synced at the list's current
+    /// generation: its rank times the entry's width, without reading the
+    /// list. `None` otherwise (the caller searches the list).
+    pub(crate) fn synced_position(
+        &self,
+        marker: &str,
+        table: &HashTable,
+        stored: &Value,
+        step: usize,
+    ) -> Option<usize> {
+        let generation = self.host.collection_generation(marker)?;
+        if table.synced != Some(generation) {
+            return None;
+        }
+        if table.linked {
+            let positions = table.positions.as_ref()?;
+            return Some(positions.get(&collection_item_marker(stored))? * step);
+        }
+        if !table.ordered() {
+            return None;
+        }
+        Some(table.rank_of(&collection_item_marker(stored))? * step)
+    }
+
+    /// After this module changed the list and the table together: they
+    /// still mirror each other if they did before, at the list's new
+    /// generation.
+    pub(crate) fn keep_synced(&self, marker: &str, table: &mut HashTable, was_synced: bool) {
+        table.synced = if was_synced {
+            self.host.collection_generation(marker)
+        } else {
+            None
+        };
+    }
+
+    /// Whether the table mirrors the list now (see [`Self::keep_synced`]).
+    pub(crate) fn is_synced(&self, marker: &str, table: &HashTable) -> bool {
+        let generation = self.host.collection_generation(marker);
+        generation.is_some() && table.synced == generation
+    }
+
+    /// Put a new key's entry into the host's list where the table placed
+    /// it: at its rank when the list is kept in the table's order and no
+    /// resize reordered everything, else at the end (an insertion-ordered or
+    /// unknown-order table keeps it there; a resized one is reordered by the
+    /// next reconciliation). `capacity`: the table's before the insertion.
+    /// Answers whether the list still mirrors the table.
+    pub(crate) fn place_new_entry(
+        &mut self,
+        marker: &str,
+        table: &mut HashTable,
+        key: &Value,
+        entry: Vec<Value>,
+        capacity: usize,
+        was_synced: bool,
+    ) -> Result<bool, NativeError> {
+        // Where the entry goes, and whether the list then mirrors the table.
+        let (rank, mirrors) = if !was_synced {
+            (None, false)
+        } else if !table.ordered() {
+            // An insertion-ordered table, or one whose order is unknown: the
+            // reconciliation leaves the list's order as it is, at the end.
+            (None, true)
+        } else if table.capacity() == capacity {
+            match table.rank_of(&collection_item_marker(key)) {
+                Some(rank) => (Some(rank), true),
+                None => (None, false),
+            }
+        } else {
+            // A resize reordered the whole table: the next reconciliation
+            // sorts the list (once per doubling).
+            (None, false)
+        };
+        let step = entry.len();
+        let item = collection_item_marker(key);
+        let Some(list) = self.host.collection_vec_mut(marker) else {
+            return Err(NativeError::Metadata(format!(
+                "hash collection {marker} has no host list"
+            )));
+        };
+        // An insertion-ordered table's new key is its list's last entry.
+        if table.linked {
+            let at = list.len() / step;
+            match (&mut table.positions, rank, mirrors) {
+                (Some(positions), None, true) => {
+                    positions.insert(item, at);
+                }
+                _ => table.positions = None,
+            }
+        }
+        match rank {
+            Some(rank) if rank * step <= list.len() => {
+                list.splice(rank * step..rank * step, entry);
+                Ok(mirrors)
+            }
+            Some(_) => {
+                list.extend(entry);
+                Ok(false)
+            }
+            None => {
+                list.extend(entry);
+                Ok(mirrors)
+            }
+        }
     }
 
     fn resync_with(
@@ -187,6 +371,8 @@ impl<H: Host> Runtime<'_, H> {
         }
         for (index, key) in keys.iter().enumerate() {
             if table.contains(key) {
+                // The list's own value: the object the node stands for.
+                table.refresh_named(key, &entries[index * step]);
                 continue;
             }
             // Added by a path that did not run its `hashCode`: a pure key's
@@ -198,7 +384,7 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 None
             };
-            table.insert(key.clone(), hash);
+            table.insert(entry, hash);
         }
         if table.linked || table.order_unknown() {
             return Ok(());
@@ -228,6 +414,30 @@ impl<H: Host> Runtime<'_, H> {
         key: &Value,
         hash: Option<i32>,
     ) -> Result<Lookup, NativeError> {
+        self.table_lookup_with(table, key, hash, false)
+    }
+
+    /// [`Self::table_lookup`] for a member that only reads or removes
+    /// (`get`, `containsKey`, `contains`, `remove`): the same object stored
+    /// under the hash it had before it changed is a miss, as in the JDK. An
+    /// insert keeps it unknown instead (the host's list holds one entry per
+    /// object, and the JDK would add a second node).
+    pub(crate) fn table_lookup_read(
+        &mut self,
+        table: &HashTable,
+        key: &Value,
+        hash: Option<i32>,
+    ) -> Result<Lookup, NativeError> {
+        self.table_lookup_with(table, key, hash, true)
+    }
+
+    fn table_lookup_with(
+        &mut self,
+        table: &HashTable,
+        key: &Value,
+        hash: Option<i32>,
+        displaced_misses: bool,
+    ) -> Result<Lookup, NativeError> {
         let marker = collection_item_marker(key);
         let Some(hash) = hash else {
             // An identity-hashed (or unhashable) key. With `Object.equals`
@@ -245,18 +455,59 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return Ok(Lookup::Unknown);
             }
-            return Ok(if table.contains(&marker) {
-                Lookup::Found(key.clone())
-            } else {
-                Lookup::Absent
-            });
+            // A handle whose hash the row cannot give: Java's hash may still
+            // put it in a stored handle's bucket (two `Collector.of` records
+            // of the same lambdas are equal, with equal hashes). Its row's
+            // `equals` decides against every stored handle of its kind, an
+            // equal key never a match by itself; one the row cannot decide
+            // makes the lookup unknown (counted), never a silent split.
+            if let Value::Host(handle) = key {
+                // A chat component whose hash is unknown (styled, arguments):
+                // Java finds a stored component only where the hash it has now
+                // equals the one that component had when it was added, which
+                // no answer here can show. Counted among components.
+                if handle.kind() == crate::runtime::host_ref::HostKind::Component {
+                    let components = table.keys().iter().any(crate::runtime::host_component::is_component);
+                    return Ok(if components {
+                        Lookup::Unknown
+                    } else {
+                        Lookup::Absent
+                    });
+                }
+                let mut unknown = false;
+                // The stored handles themselves: the same object added
+                // twice is proved the same (`p.key == key`). Any handle: two
+                // kinds may be equal (Gson's canonical `ParameterizedType` and
+                // the JDK's, #209); the key's row answers for every other kind
+                // (`false`) quickly.
+                for stored in table.keys() {
+                    if !matches!(&stored, Value::Host(_)) {
+                        continue;
+                    }
+                    match handle.equals(&stored, &mut object_methods::RuntimeNested::new(self))? {
+                        Some(true) => return Ok(Lookup::Found(stored)),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                return Ok(if unknown {
+                    Lookup::Unknown
+                } else {
+                    Lookup::Absent
+                });
+            }
+            if !table.contains(&marker) {
+                return Ok(Lookup::Absent);
+            }
+            return Ok(Lookup::Found(key.clone()));
         };
         if table.lookups_unknown() && !self.pure_equality(key) {
             return Ok(Lookup::Unknown);
         }
-        for candidate in table.candidates(hash) {
-            let stored = parse_collection_value(&candidate)?;
-            if stored == *key && !matches!(stored, Value::Float(_)) {
+        for stored in table.candidates(hash) {
+            // `p.key == key`: identity, which the stored handle's origin
+            // proves and equal handle keys alone do not.
+            if object_methods::identical(&stored, key) {
                 return Ok(Lookup::Found(stored));
             }
             if *key != Value::Ref(None) && self.java_equals(key, &stored)? {
@@ -265,10 +516,29 @@ impl<H: Host> Runtime<'_, H> {
         }
         // The same object under another stored hash (a key mutated after it
         // was put): the JDK misses it, the host's list would find it.
-        if table.contains(&marker) {
+        if table.contains(&marker) && !displaced_misses {
             return Ok(Lookup::Unknown);
         }
         Ok(Lookup::Absent)
+    }
+
+    /// The value a map holds for its stored key `stored`: read at the key's
+    /// rank when the table mirrors the list (#203), else searched.
+    pub(crate) fn value_of(
+        &self,
+        receiver: &Value,
+        table: &HashTable,
+        stored: &Value,
+    ) -> Result<Value, NativeError> {
+        if let Some(marker) = expect_ref(receiver)
+            && let Some(position) = self.synced_position(marker, table, stored, 2)
+            && let Some(list) = self.host.collection_slice(marker)
+            && let Some(value) = list.get(position + 1)
+        {
+            return Ok(value.clone());
+        }
+        let entries = self.collection_elements(receiver)?;
+        Ok(Self::stored_value(&entries, stored))
     }
 
     /// The value stored for `key` in a map's host list.
@@ -350,6 +620,16 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
+        if self.host_collection_class(receiver).as_deref()
+            == Some("java/util/concurrent/ConcurrentHashMap")
+            && concurrent_map_rejects_null(r, args)
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
@@ -457,7 +737,7 @@ impl<H: Host> Runtime<'_, H> {
             )
         {
             let action = args.first().cloned().unwrap_or(Value::Ref(None));
-            let map = Value::Ref(Some(source));
+            let map = crate::runtime::jar_object::stored_value(&source);
             return match self.view_for_each(r, &map, &kind, &action)? {
                 Some(answer) => Ok(Some(Some(answer))),
                 None => Ok(None),
@@ -516,7 +796,7 @@ impl<H: Host> Runtime<'_, H> {
         if views.is_empty() {
             return;
         }
-        let Ok(entries) = self.collection_elements(&Value::Ref(Some(marker.to_owned()))) else {
+        let Ok(entries) = self.collection_elements(&crate::runtime::jar_object::stored_value(marker)) else {
             return;
         };
         for view in views {
@@ -533,7 +813,7 @@ impl<H: Host> Runtime<'_, H> {
                 _ => continue,
             };
             self.host
-                .replace_mutable_collection(&Value::Ref(Some(view)), contents);
+                .replace_mutable_collection(&crate::runtime::jar_object::stored_value(&view), contents);
         }
     }
 
@@ -654,10 +934,31 @@ impl<H: Host> Runtime<'_, H> {
     /// (whose own calls on the collection are checked one by one) and the
     /// helpers that only pass the reference on or compare it cannot.
     pub(crate) fn shows_argument_order(&self, r: &MethodRef) -> bool {
+        // An `IdentityHashMap` iterates by identity hash: the order its
+        // entries came in never shows.
+        if r.owner == "java/util/IdentityHashMap" && matches!(r.name.as_str(), "<init>" | "putAll")
+        {
+            return false;
+        }
+        // Guava's immutableEnumMap copies an enum keyed map into the
+        // enum's deterministic order; it does not expose Map.of's salted
+        // iteration order to the host model.
+        if r.owner == "com/google/common/collect/Maps" && r.name == "immutableEnumMap" {
+            return false;
+        }
         if self
             .member_owner(&r.owner, &r.name, &r.descriptor)
             .is_some_and(|(_, jar)| jar)
         {
+            return false;
+        }
+        // `List.add(Object)` stores the reference and never observes an
+        // argument collection's iteration order. In particular, a two-entry
+        // `MapN` is an opaque element here; counting its salt-dependent
+        // layout would both over-count and make a plain add look like a map
+        // traversal (#254). `addAll` remains order-sensitive because it
+        // copies the source's elements.
+        if r.name == "add" && r.descriptor == "(Ljava/lang/Object;)Z" {
             return false;
         }
         !matches!(
@@ -788,6 +1089,42 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         let hash = self.java_hash(key)?;
         let found = self.table_lookup(table, key, hash)?;
+        // The list and the table move together (#203): in place, at the
+        // key's rank, while the table mirrors the list.
+        if let Some(marker) = expect_ref(receiver).cloned()
+            && self.is_synced(&marker, table)
+        {
+            match &found {
+                Lookup::Unknown => return Ok(None),
+                Lookup::Found(stored) => {
+                    if let Some(position) = self.synced_position(&marker, table, stored, 2) {
+                        let list = self.host.collection_vec_mut(&marker).ok_or_else(|| {
+                            NativeError::Metadata(format!("hash map {marker} has no host list"))
+                        })?;
+                        let old = list[position + 1].clone();
+                        if !only_if_absent || old == Value::Ref(None) {
+                            list[position + 1] = value;
+                        }
+                        self.keep_synced(&marker, table, true);
+                        return Ok(Some(old));
+                    }
+                }
+                Lookup::Absent => {
+                    let capacity = table.capacity();
+                    table.insert(key, hash);
+                    let mirrors = self.place_new_entry(
+                        &marker,
+                        table,
+                        key,
+                        vec![key.clone(), value],
+                        capacity,
+                        true,
+                    )?;
+                    self.keep_synced(&marker, table, mirrors);
+                    return Ok(Some(Value::Ref(None)));
+                }
+            }
+        }
         let mut entries = self.collection_elements(receiver)?;
         match found {
             Lookup::Unknown => Ok(None),
@@ -809,7 +1146,7 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Absent => {
                 entries.extend([key.clone(), value]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(collection_item_marker(key), hash);
+                table.insert(key, hash);
                 Ok(Some(Value::Ref(None)))
             }
         }
@@ -828,10 +1165,26 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Unknown => Ok(None),
             Lookup::Found(_) => Ok(Some(false)),
             Lookup::Absent => {
+                if let Some(marker) = expect_ref(receiver).cloned()
+                    && self.is_synced(&marker, table)
+                {
+                    let capacity = table.capacity();
+                    table.insert(element, hash);
+                    let mirrors = self.place_new_entry(
+                        &marker,
+                        table,
+                        element,
+                        vec![element.clone()],
+                        capacity,
+                        true,
+                    )?;
+                    self.keep_synced(&marker, table, mirrors);
+                    return Ok(Some(true));
+                }
                 let mut entries = self.collection_elements(receiver)?;
                 entries.push(element.clone());
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(collection_item_marker(element), hash);
+                table.insert(element, hash);
                 Ok(Some(true))
             }
         }
@@ -847,7 +1200,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Lookup::Absent);
         }
         let hash = self.java_hash(key)?;
-        self.table_lookup(table, key, hash)
+        self.table_lookup_read(table, key, hash)
     }
 
     /// `removeNode(hash(key), ...)`: the hash runs even on an empty map.
@@ -863,7 +1216,7 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Option<Value>>, NativeError> {
         let hash = self.java_hash(key)?;
         let found = if table.allocated() {
-            self.table_lookup(table, key, hash)?
+            self.table_lookup_read(table, key, hash)?
         } else {
             Lookup::Absent
         };
@@ -872,8 +1225,37 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Absent => return Ok(Some(None)),
             Lookup::Found(stored) => stored,
         };
-        let mut entries = self.collection_elements(receiver)?;
         let step = if kind.map { 2 } else { 1 };
+        // In place at the key's rank while the table mirrors the list (#203);
+        // a removal keeps the others' order.
+        if let Some(marker) = expect_ref(receiver).cloned()
+            && let Some(position) = self.synced_position(&marker, table, &stored, step)
+        {
+            let value = if kind.map {
+                self.host
+                    .collection_slice(&marker)
+                    .and_then(|list| list.get(position + 1).cloned())
+                    .unwrap_or(Value::Ref(None))
+            } else {
+                Value::Int(1)
+            };
+            if let Some(wanted) = matching {
+                let matches = value == *wanted
+                    || (*wanted != Value::Ref(None) && self.java_equals(wanted, &value)?);
+                if !matches {
+                    return Ok(Some(None));
+                }
+            }
+            if let Some(list) = self.host.collection_vec_mut(&marker) {
+                list.drain(position..position + step);
+            }
+            table.remove(&collection_item_marker(&stored));
+            // The later entries moved up: rebuilt when next needed.
+            table.positions = None;
+            self.keep_synced(&marker, table, true);
+            return Ok(Some(Some(value)));
+        }
+        let mut entries = self.collection_elements(receiver)?;
         let marker = collection_item_marker(&stored);
         let Some(index) = entries
             .chunks(step)
@@ -915,6 +1297,16 @@ impl<H: Host> Runtime<'_, H> {
                 .put_value(receiver, table, key, value.clone(), false)?
                 .is_none()
             {
+                // A key whose lookup is unknown: counted, and the pair kept,
+                // never merged with an equal-looking key.
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/util/HashMap".into(),
+                    name: "put".into(),
+                    descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+                })?;
+                let mut stored = self.collection_elements(receiver)?;
+                stored.extend([key.clone(), value.clone()]);
+                self.host.replace_mutable_collection(receiver, stored);
                 table.tainted = true;
             }
         }
@@ -933,7 +1325,21 @@ impl<H: Host> Runtime<'_, H> {
         for element in &elements {
             match self.set_add(receiver, table, element)? {
                 Some(added) => changed |= added,
-                None => table.tainted = true,
+                None => {
+                    // `add` whose lookup is unknown (an `equals` that cannot
+                    // be answered): counted, and the element kept, never
+                    // merged with an equal-looking one.
+                    self.host.unknown_operand_call(&MethodRef {
+                        owner: "java/util/HashSet".into(),
+                        name: "add".into(),
+                        descriptor: "(Ljava/lang/Object;)Z".into(),
+                    })?;
+                    let mut entries = self.collection_elements(receiver)?;
+                    entries.push(element.clone());
+                    self.host.replace_mutable_collection(receiver, entries);
+                    table.tainted = true;
+                    changed = true;
+                }
             }
         }
         Ok(changed)
@@ -958,10 +1364,7 @@ impl<H: Host> Runtime<'_, H> {
         match (kind.map, r.name.as_str(), &*args) {
             (true, "get", [key]) if desc == "(Ljava/lang/Object;)Ljava/lang/Object;" => {
                 match self.get_node(table, key)? {
-                    Lookup::Found(stored) => {
-                        let entries = self.collection_elements(receiver)?;
-                        Ok(Some(Self::stored_value(&entries, &stored)))
-                    }
+                    Lookup::Found(stored) => Ok(Some(self.value_of(receiver, table, &stored)?)),
                     Lookup::Absent => Ok(Some(Value::Ref(None))),
                     Lookup::Unknown => self.count_and_continue(r),
                 }
@@ -969,10 +1372,7 @@ impl<H: Host> Runtime<'_, H> {
             (true, "getOrDefault", [key, default]) => {
                 let default = default.clone();
                 match self.get_node(table, key)? {
-                    Lookup::Found(stored) => {
-                        let entries = self.collection_elements(receiver)?;
-                        Ok(Some(Self::stored_value(&entries, &stored)))
-                    }
+                    Lookup::Found(stored) => Ok(Some(self.value_of(receiver, table, &stored)?)),
                     Lookup::Absent => Ok(Some(default)),
                     Lookup::Unknown => self.count_and_continue(r),
                 }
@@ -1129,8 +1529,9 @@ impl<H: Host> Runtime<'_, H> {
     fn key_signature(&self, value: &Value, kind: TableKind) -> Result<Vec<String>, NativeError> {
         let step = if kind.map { 2 } else { 1 };
         let mut keys: Vec<String> = runtime_collection_values(self.host, value)?
-            .into_iter()
+            .iter()
             .step_by(step)
+            .map(collection_item_marker)
             .collect();
         keys.sort();
         Ok(keys)

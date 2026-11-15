@@ -39,9 +39,8 @@
 //! before this surface existed; `player` and `level` read `null` then, which
 //! is true while the client is starting.
 //!
-//! Chat components are text markers (`component/literal/<text>` or
-//! `component/translatable/<key>`); a style (`withStyle`, `withColor`,
-//! `Style`) is kept as legacy codes inside that text (`client_text.rs`).
+//! Chat components are host handles of their vanilla JSON (`host_component.rs`); a
+//! style object (`withStyle(Style)`, `Style`) is kept as legacy codes (`client_text.rs`).
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -49,7 +48,7 @@ use crate::runtime::{
     ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
     component_value,
     events::{self, GameEvent, ListenerCallback},
-    expect_ref, identifier_parts, parse_callback_marker, return_desc, stable_hash, uuid_value,
+    expect_ref, identifier_parts, parse_callback_marker, return_desc, uuid_value,
 };
 
 // The player's items and effects (`ItemStack`, `Inventory`, effects). A
@@ -62,6 +61,8 @@ pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 mod text;
 // Config libraries' defaults (`AutoConfig`, YACL), for the interpreter's
 // library dispatch.
+#[path = "client_registrations.rs"]
+mod client_registrations;
 #[path = "client_config.rs"]
 mod config;
 
@@ -105,7 +106,7 @@ const USER: &str = "client/user";
 /// `options.<name>()`: `client/option/<name>`.
 const OPTION: &str = "client/option/";
 /// A `Vec3` the façade handed out: `client/vec3/<x>,<y>,<z>`.
-const VEC3: &str = "client/vec3/";
+use crate::runtime::client_values::VEC3;
 /// A tooltip listener's `List<Component>`: the host collection the game
 /// seeds with the tooltip's lines and reads back after the firing.
 const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
@@ -126,7 +127,7 @@ pub(crate) fn tooltip_arguments() -> Vec<Value> {
 }
 
 /// A `java.awt.Color` constant: `client/awt-color/<aarrggbb>`.
-const AWT_COLOR: &str = "client/awt-color/";
+use crate::runtime::client_values::AWT_COLOR;
 /// `java.awt.Color`'s named constants (both spellings resolve).
 const AWT_COLORS: &[(&str, u32)] = &[
     ("WHITE", 0xffff_ffff),
@@ -144,15 +145,51 @@ const AWT_COLORS: &[(&str, u32)] = &[
     ("BLUE", 0xff00_00ff),
 ];
 
+pub(crate) fn awt_constant(name: &str) -> Option<Value> {
+    let canonical = match name {
+        "lightGray" => "LIGHT_GRAY",
+        "darkGray" => "DARK_GRAY",
+        "white" => "WHITE",
+        "gray" => "GRAY",
+        "black" => "BLACK",
+        "red" => "RED",
+        "pink" => "PINK",
+        "orange" => "ORANGE",
+        "yellow" => "YELLOW",
+        "green" => "GREEN",
+        "magenta" => "MAGENTA",
+        "cyan" => "CYAN",
+        "blue" => "BLUE",
+        other => other,
+    };
+    AWT_COLORS
+        .iter()
+        .find(|(field, _)| *field == canonical)
+        .map(|(_, argb)| marker(format!("{AWT_COLOR}{argb:08x}")))
+}
+
 /// `Runnable`s one firing may queue with `Minecraft.execute`.
 const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
 const VANILLA_KEY: &str = "client/vanilla-key/";
-const CATEGORY: &str = "key-category/";
+use crate::runtime::client_values::CATEGORY;
+/// The categories `KeyMapping.Category` registers itself (`minecraft:<name>`).
+const VANILLA_CATEGORIES: &[&str] = &[
+    "movement",
+    "misc",
+    "multiplayer",
+    "gameplay",
+    "inventory",
+    "creative",
+    "spectator",
+    "debug",
+];
 
 const KEY_MAPPING: &str = "net/minecraft/client/KeyMapping";
 const KEY_CATEGORY: &str = "net/minecraft/client/KeyMapping$Category";
 const INPUT_TYPE: &str = "com/mojang/blaze3d/platform/InputConstants$Type";
+const INPUT_CONSTANTS: &str = "com/mojang/blaze3d/platform/InputConstants";
+const INPUT_KEY_PREFIX: &str = "client/input-key/";
 const MINECRAFT_CLASS: &str = "net/minecraft/client/Minecraft";
 const OPTIONS_CLASS: &str = "net/minecraft/client/Options";
 const FONT_CLASS: &str = "net/minecraft/client/gui/Font";
@@ -517,6 +554,12 @@ struct KeyInit {
     mouse: bool,
     code: i32,
     category: Option<String>,
+    default_key: String,
+    key: String,
+    /// The actual category object passed to the constructor. A jar may pass
+    /// its own `new Category(id)`, which is equal by the record's id but is
+    /// not the registered singleton by reference identity.
+    category_value: Option<Value>,
 }
 
 /// One affine pose without rotation: `[sx, sy, tx, ty]`.
@@ -529,8 +572,11 @@ const IDENTITY: Pose = [1.0, 1.0, 0.0, 0.0];
 pub(crate) struct ClientState {
     /// `KeyMapping` object marker → its constructor's arguments.
     key_inits: BTreeMap<String, KeyInit>,
+    pub(crate) registrations: client_registrations::State,
     /// `KeyMapping.Category` object marker → its identifier.
     categories: BTreeMap<String, String>,
+    /// The ids `KeyMapping.Category.register` made a category of.
+    registered_categories: std::collections::BTreeSet<String>,
     keys: Vec<ClientKeyMapping>,
     /// Registrations that could not become a mapping or layer, with why.
     refused: Vec<String>,
@@ -548,7 +594,15 @@ pub(crate) struct ClientState {
     tasks: Vec<Value>,
 }
 
+/// A client object or value: a game handle (#156 P16d) for a `client/…` or
+/// `key-category/…` marker, the text itself for any other (an enum constant,
+/// a callback, a `String` answer).
 fn marker(text: impl Into<String>) -> Value {
+    crate::runtime::game_object::client_value(text.into())
+}
+
+/// A `String` answer: the text itself, never a client object it might spell.
+fn text(text: impl Into<String>) -> Value {
     Value::Ref(Some(text.into()))
 }
 
@@ -575,20 +629,22 @@ fn cut(text: &str) -> String {
     text.chars().take(MAX_TEXT).collect()
 }
 
-/// A drawn or sent text argument: a `String` or a component marker (a
-/// `FormattedCharSequence` is the component it came from). `None` for null.
-fn text_arg(value: &Value) -> Option<ClientText> {
-    let text = expect_ref(value)?;
-    if let Some(literal) = text.strip_prefix("component/literal/") {
-        return Some(ClientText::Literal(cut(literal)));
+/// A drawn or sent text argument: a `String` or a component as it is when
+/// drawn or sent (its state in `states`; a `FormattedCharSequence` is the
+/// component it came from). `None` for null.
+fn text_arg(value: &Value, states: &crate::runtime::host_component::States) -> Option<ClientText> {
+    let json = crate::runtime::facade_text::json_now(value, Some(states));
+    if let Some(literal) = json.as_ref().and_then(crate::runtime::host_component::bare_literal) {
+        return Some(ClientText::Literal(cut(&literal)));
     }
-    if let Some(key) = text.strip_prefix("component/translatable/") {
-        return Some(ClientText::Translatable(cut(key)));
+    if let Some(key) = json.as_ref().and_then(crate::runtime::host_component::bare_key) {
+        return Some(ClientText::Translatable(cut(&key)));
     }
-    if let Some(json) = text.strip_prefix(crate::runtime::facade_text::JSON_PREFIX) {
+    if let Some(json) = json {
         // Bounded by the component model itself (64 KiB).
-        return Some(ClientText::Json(json.to_owned()));
+        return Some(ClientText::Json(json.to_string()));
     }
+    let text = expect_ref(value)?;
     Some(ClientText::Literal(cut(text)))
 }
 
@@ -597,17 +653,64 @@ fn text_arg(value: &Value) -> Option<ClientText> {
 pub fn input_key_name(mouse: bool, code: i32) -> String {
     if mouse {
         return match code {
-            0 => "key.mouse.left".into(),
-            1 => "key.mouse.right".into(),
+            1 => "key.mouse.left".into(),
             2 => "key.mouse.middle".into(),
-            n if n > 2 => format!("key.mouse.{}", n + 1),
-            _ => "key.keyboard.unknown".into(),
+            3 => "key.mouse.right".into(),
+            n => format!("key.mouse.{n}"),
         };
+    }
+    if code == 0 {
+        return "key.keyboard.unknown".into();
     }
     KEYBOARD_NAMES
         .iter()
         .find(|(scancode, _)| *scancode == code)
-        .map_or_else(|| "key.keyboard.unknown".into(), |(_, name)| (*name).into())
+        .map_or_else(
+            || format!("key.keyboard.{code}"),
+            |(_, name)| (*name).into(),
+        )
+}
+
+fn input_key_marker(mouse: bool, code: i32) -> String {
+    format!(
+        "{INPUT_KEY_PREFIX}{}{code}",
+        if mouse { "MOUSE/" } else { "KEYBOARD/" }
+    )
+}
+
+fn input_key_parts(marker: &str) -> Option<(bool, i32)> {
+    let rest = marker.strip_prefix(INPUT_KEY_PREFIX)?;
+    let (kind, value) = rest.split_once('/')?;
+    Some((kind == "MOUSE", value.parse().ok()?))
+}
+
+fn input_key_from_name(name: &str) -> Result<String, String> {
+    if name == "key.keyboard.unknown" {
+        return Ok(input_key_marker(false, 0));
+    }
+    for (known, code) in [
+        ("key.mouse.left", 1),
+        ("key.mouse.middle", 2),
+        ("key.mouse.right", 3),
+    ] {
+        if name == known {
+            return Ok(input_key_marker(true, code));
+        }
+    }
+    for (code, known) in KEYBOARD_NAMES {
+        if *known == name {
+            return Ok(input_key_marker(false, *code));
+        }
+    }
+    for (prefix, mouse) in [("key.keyboard.", false), ("key.mouse.", true)] {
+        if let Some(number) = name.strip_prefix(prefix) {
+            let code = number
+                .parse::<i32>()
+                .map_err(|_| format!("For input string: \"{number}\""))?;
+            return Ok(input_key_marker(mouse, code));
+        }
+    }
+    Err(format!("Unknown key name: {name}"))
 }
 
 /// `InputConstants` keyboard names by SDL scancode (26.3): the subset a key
@@ -721,7 +824,7 @@ const KEYBOARD_NAMES: &[(i32, &str)] = &[
 
 /// A category marker's identifier: `key-category/<namespace>:<path>`.
 fn category_id(value: &Value, categories: &BTreeMap<String, String>) -> Option<String> {
-    let text = expect_ref(value)?;
+    let text = crate::runtime::game_object::text(value)?;
     if let Some(id) = text.strip_prefix(CATEGORY) {
         return Some(id.to_owned());
     }
@@ -750,11 +853,15 @@ fn key_init(
     } else {
         return None;
     };
+    let key = input_key_marker(mouse, code);
     Some(KeyInit {
         name,
         mouse,
         code,
         category: category_id(category, categories),
+        category_value: Some(category.clone()).filter(|value| !matches!(value, Value::Ref(None))),
+        default_key: key.clone(),
+        key,
     })
 }
 
@@ -872,6 +979,11 @@ impl StdHost {
         self.environment_type != "SERVER"
     }
 
+    /// Registration-only client APIs, in the order the jar called them.
+    pub fn client_registration_summary(&self) -> serde_json::Value {
+        client_registrations::summary(&self.client.registrations)
+    }
+
     /// The key mappings this host's jar registered, in order.
     pub fn client_key_mappings(&self) -> &[ClientKeyMapping] {
         &self.client.keys
@@ -956,6 +1068,28 @@ impl StdHost {
     /// End the firing [`Self::begin_client_frame`] started: what the
     /// callbacks drew and sent, and the mappings' state after them.
     pub fn end_client_frame(&mut self) -> ClientFrameOutput {
+        // A tooltip line that is a component no read resolves (past the
+        // bound, a cycle) is left out of the tooltip and counted.
+        let unread = self
+            .mutable_collections
+            .get(TOOLTIP_LIST)
+            .map_or(0, |lines| {
+                lines
+                    .iter()
+                    .filter(|line| {
+                        crate::runtime::host_component::is_component(line)
+                            && crate::runtime::facade_text::json_now(line, Some(&self.component_states))
+                                .is_none()
+                    })
+                    .count()
+            });
+        for _ in 0..unread {
+            let _ = self.unknown_host_call(&MethodRef {
+                owner: "net/minecraft/network/chat/Component".into(),
+                name: "getString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            });
+        }
         let state = &mut self.client;
         state.frame = None;
         state.poses.clear();
@@ -969,7 +1103,7 @@ impl StdHost {
             tooltip: self.mutable_collections.remove(TOOLTIP_LIST).map(|lines| {
                 lines
                     .iter()
-                    .filter_map(text_arg)
+                    .filter_map(|line| text_arg(line, &self.component_states))
                     .take(MAX_TOOLTIP_LINES)
                     .collect()
             }),
@@ -980,9 +1114,14 @@ impl StdHost {
     /// categories, and the fields of the `Minecraft` and `Options` stand-ins
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
-    pub(crate) fn client_static(&self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
-        if !self.client_environment() {
+    pub(crate) fn client_static(&mut self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
+        // `java.awt.Color` is a JDK singleton family even on a server host;
+        // model both the upper- and lower-case field spellings everywhere.
+        if !self.client_environment() && r.owner != "java/awt/Color" {
             return None;
+        }
+        if let Some(value) = client_registrations::static_field(&mut self.client.registrations, r) {
+            return Some(Ok(value));
         }
         let state = &self.client;
         let frame = state.frame.as_deref();
@@ -993,6 +1132,11 @@ impl StdHost {
         match (r.owner.as_str(), r.name.as_str()) {
             (INPUT_TYPE, name @ ("KEYBOARD" | "MOUSE")) => {
                 Some(Ok(marker(format!("enum/{INPUT_TYPE}/{name}"))))
+            }
+            (INPUT_CONSTANTS, "UNKNOWN")
+                if r.descriptor == "Lcom/mojang/blaze3d/platform/InputConstants$Key;" =>
+            {
+                Some(Ok(marker(input_key_marker(false, 0))))
             }
             (KEY_CATEGORY, name) if r.descriptor == format!("L{KEY_CATEGORY};") => Some(Ok(
                 marker(format!("{CATEGORY}minecraft:{}", name.to_ascii_lowercase())),
@@ -1015,6 +1159,10 @@ impl StdHost {
                     .map_or(Value::Ref(None), |_| marker(GAME_MODE)),
                 "gameRenderer" => marker(GAME_RENDERER),
                 "debugEntries" => marker(DEBUG),
+                // The launcher's configured java.io.File is outside this
+                // bounded host. Count it instead of forging a String-shaped
+                // File marker.
+                "gameDirectory" => return refuse(),
                 _ if frame.is_some() => return refuse(),
                 _ => return None,
             })),
@@ -1034,18 +1182,18 @@ impl StdHost {
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
             // `java.awt.Color`'s constants, which HUD mods turn into ARGB
             // ints with `getRGB()` (durabilityviewer's indicator colours).
-            ("java/awt/Color", name) => AWT_COLORS
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, argb)| Ok(marker(format!("{AWT_COLOR}{argb:08x}")))),
+            ("java/awt/Color", name) => awt_constant(name).map(Ok),
             // Item, block and effect constants answer only in a firing: an
             // entrypoint reading `Items.DIAMOND` keeps the answer it always got.
             ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
                 format!("{}{}", items::ITEM, items::constant_id(name)),
             ))),
-            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => Some(Ok(
-                marker(format!("{}{}", items::BLOCK, items::constant_id(name))),
-            )),
+            // The id 26.3 registers for the constant (`vanilla_blocks.rs`); a
+            // constant 26.3 lacks is no block (#239's review B2).
+            ("net/minecraft/world/level/block/Blocks", name) if frame.is_some() => {
+                crate::runtime::vanilla_blocks::field_id(name)
+                    .map(|id| Ok(marker(format!("{}{id}", items::BLOCK))))
+            }
             ("net/minecraft/world/effect/MobEffects", name) if frame.is_some() => {
                 Some(Ok(marker(format!(
                     "{}{}",
@@ -1067,7 +1215,7 @@ impl StdHost {
                 .collect();
                 Some(Ok(crate::runtime::collection_value("list", &slots)))
             }
-            ("net/minecraft/world/item/ItemStack", "EMPTY") if frame.is_some() => {
+            ("net/minecraft/world/item/ItemStack", "EMPTY") => {
                 Some(Ok(marker(format!("{}empty", items::STACK))))
             }
             (
@@ -1099,9 +1247,48 @@ impl StdHost {
         if let Some(value) = text::text_invoke(r, args) {
             return Some(Ok(value));
         }
+        if let Some(value) = client_registrations::invoke(&mut self.client.registrations, r, args) {
+            return Some(value);
+        }
         let state = &mut self.client;
         match (r.owner.as_str(), r.name.as_str()) {
             (MINECRAFT_CLASS, "getInstance") => Some(Ok(marker(MINECRAFT))),
+            (INPUT_CONSTANTS, "getKey")
+                if r.descriptor
+                    == "(Ljava/lang/String;)Lcom/mojang/blaze3d/platform/InputConstants$Key;" =>
+            {
+                let value = args.first()?;
+                let name = match value {
+                    // 26.3 dereferences the name before looking it up. Preserve
+                    // that exact Java 25 NPE instead of counting a null input.
+                    Value::Ref(None) => {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                r#"Cannot invoke "String.startsWith(String)" because "name" is null"#
+                                    .into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    _ => crate::runtime::game_object::text(value)?,
+                };
+                Some(match input_key_from_name(name) {
+                    Ok(key) => Ok(marker(key)),
+                    Err(message) if message.starts_with("Unknown key name:") => {
+                        Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(message),
+                            frame: None,
+                        })
+                    }
+                    Err(message) => Err(NativeError::UncaughtException {
+                        class: "java/lang/NumberFormatException".into(),
+                        message: Some(message),
+                        frame: None,
+                    }),
+                })
+            }
             (KEY_HELPER, "registerKeyMapping") => {
                 let mapping = args.first().cloned().unwrap_or(Value::Ref(None));
                 state.register_key(&mapping, "KeyMappingHelper.registerKeyMapping");
@@ -1115,9 +1302,16 @@ impl StdHost {
                 state.register_layer(&args[1], &args[2], "HudElementRegistry.attachElement");
                 Some(Ok(Value::Void))
             }
+            // One category per id: vanilla's own and a second registration of
+            // one throw `IllegalArgumentException`, which is not modelled (counted).
             (KEY_CATEGORY, "register") => {
                 let (namespace, path) = identifier_parts(args.first()?);
-                Some(Ok(marker(format!("{CATEGORY}{namespace}:{path}"))))
+                let id = format!("{namespace}:{path}");
+                let vanilla = namespace == "minecraft" && VANILLA_CATEGORIES.contains(&path);
+                if vanilla || !state.registered_categories.insert(id.clone()) {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                }
+                Some(Ok(marker(format!("{CATEGORY}{id}"))))
             }
             _ => None,
         }
@@ -1135,7 +1329,101 @@ impl StdHost {
         if !self.client_environment() {
             return None;
         }
-        let text = expect_ref(receiver)?.clone();
+        if let Some(value) =
+            client_registrations::instance(&mut self.client.registrations, r, receiver, args)
+        {
+            return Some(value);
+        }
+        // A client registration event (`RegisterKeyMappingsEvent`...), as its firing names it.
+        if let Some(event) = crate::runtime::host_game_event::fired_event(receiver) {
+            return self.client_event_call(event.name(), r, args);
+        }
+        // A component's style calls (`client_text.rs`); an unlisted member keeps
+        // the host's own component model.
+        if crate::runtime::host_component::is_component(receiver) {
+            return Some(match text::component_call(r, args)? {
+                // The style as it is now (`withStyle`/`setStyle` change it in place).
+                text::ComponentCall::GetStyle => {
+                    match crate::runtime::facade_text::json_now(receiver, Some(&self.component_states)) {
+                        Some(json) => Ok(text::style_of(&json)),
+                        None => self.unknown_host_call(r),
+                    }
+                }
+                text::ComponentCall::Unknown => self.unknown_host_call(r),
+                // `return this`, the receiver's style changed in place.
+                text::ComponentCall::Restyle { codes, replace } => crate::runtime::host_component::change(
+                    &mut self.component_states,
+                    receiver,
+                    &crate::runtime::facade_text::argument,
+                    |state| text::apply_style(&mut state.base, &codes, replace),
+                )
+                .map(|()| receiver.clone()),
+            });
+        }
+        // Only a runtime-created input-key handle can enter this dispatch.
+        // A jar String that happens to spell the handle marker remains a
+        // String for casts, instanceof, collections and every member call.
+        let input_key = match receiver {
+            Value::Host(handle) if handle.kind() == crate::runtime::HostKind::GameValue => {
+                input_key_parts(handle.key())
+            }
+            _ => None,
+        };
+        if let Some((mouse, code)) = input_key {
+            return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getType", "()Lcom/mojang/blaze3d/platform/InputConstants$Type;") => {
+                    Ok(marker(format!(
+                        "enum/{INPUT_TYPE}/{}",
+                        if mouse { "MOUSE" } else { "KEYBOARD" }
+                    )))
+                }
+                ("getValue", "()I") => Ok(Value::Int(code)),
+                ("getName", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
+                    Ok(Value::Ref(Some(input_key_name(mouse, code))))
+                }
+                ("equals", "(Ljava/lang/Object;)Z") => Ok(flag(
+                    args.first().and_then(|value| match value {
+                        Value::Host(handle) if handle.kind() == crate::runtime::HostKind::GameValue => {
+                            input_key_parts(handle.key())
+                        }
+                        _ => None,
+                    }) == Some((mouse, code)),
+                )),
+                ("hashCode", "()I") => Err(NativeError::UnknownHostCall(r.clone())),
+                _ => return None,
+            });
+        }
+        let text = crate::runtime::game_object::text(receiver)?.clone();
+        if (text == format!("enum/{INPUT_TYPE}/KEYBOARD")
+            || text == format!("enum/{INPUT_TYPE}/MOUSE"))
+            && matches!(r.name.as_str(), "name" | "toString")
+            && r.descriptor == "()Ljava/lang/String;"
+        {
+            return Some(Ok(Value::Ref(Some(
+                if text.ends_with("/MOUSE") {
+                    "MOUSE"
+                } else {
+                    "KEYBOARD"
+                }
+                .into(),
+            ))));
+        }
+        if (text == format!("enum/{INPUT_TYPE}/KEYBOARD")
+            || text == format!("enum/{INPUT_TYPE}/MOUSE"))
+            && r.name == "getOrCreate"
+            && r.descriptor == "(I)Lcom/mojang/blaze3d/platform/InputConstants$Key;"
+        {
+            let code = int_arg(args, 0)?;
+            return Some(Ok(marker(input_key_marker(text.ends_with("/MOUSE"), code))));
+        }
+        // Every `client/…` and `key-category/…` object is a handle now (#156 P16d), so a `String`
+        // spelling one is just that `String`: its own members answer, never the object's (#232's
+        // review: `new KeyMapping("client/minecraft", ..).getName().equals(..)` in a firing).
+        if !matches!(receiver, Value::Host(_))
+            && (text.starts_with("client/") || text.starts_with(CATEGORY))
+        {
+            return None;
+        }
         let refuse = || Err(NativeError::UnknownHostCall(r.clone()));
         // `NonNullList` is a `List`: the inventory's lists answer as one.
         if r.owner == "net/minecraft/core/NonNullList" && text.starts_with("list") {
@@ -1174,12 +1462,15 @@ impl StdHost {
         }
         // `BuiltInRegistries.ITEM.getKey(item)`: the item's identifier.
         if r.name == "getKey"
-            && let Some(id) = args.first().and_then(expect_ref).and_then(|a| {
-                a.strip_prefix(items::ITEM)
-                    .or_else(|| a.strip_prefix(items::BLOCK))
-            })
+            && let Some(id) = args
+                .first()
+                .and_then(crate::runtime::game_object::text)
+                .and_then(|a| {
+                    a.strip_prefix(items::ITEM)
+                        .or_else(|| a.strip_prefix(items::BLOCK))
+                })
         {
-            return Some(Ok(marker(format!("identifier/{id}"))));
+            return Some(Ok(crate::runtime::host_ids::identifier_of_text(id)));
         }
         // A stack the frame built answers as its slot marker does.
         if !text.starts_with("client/")
@@ -1206,54 +1497,42 @@ impl StdHost {
         // Components, styles, text colours and formatting constants
         // (`client_text.rs`); an unlisted component member keeps the host's
         // own component model.
-        if text.starts_with("component/")
-            || text.starts_with("client/style/")
+        if text.starts_with("client/style/")
             || text.starts_with("client/text-color/")
             || text.starts_with("enum/net/minecraft/ChatFormatting/")
         {
-            if let Some(value) = text::text_call(&text, r, args) {
+            if let Some(value) = text::text_call(&text, receiver, r, args) {
                 return Some(Ok(value));
             }
-            if text.starts_with("component/")
-                || text.starts_with("enum/")
-                || self.client.frame.is_none()
-            {
+            if text.starts_with("enum/") || self.client.frame.is_none() {
                 return None;
             }
             return Some(refuse());
         }
-        if let Some(event) = text.strip_prefix("game-event/") {
-            return self.client_event_call(event, r, args);
-        }
-        if self.client.key_inits.contains_key(&text) {
+        if self.client.key_inits.contains_key(&text)
+            && crate::runtime::jar_object::object_class(receiver) == Some(KEY_MAPPING)
+        {
             return self.key_mapping_call(&text, r, args);
         }
+        if self.client.categories.contains_key(&text)
+            && matches!(r.name.as_str(), "equals" | "hashCode")
+        {
+            return Some(self.unknown_host_call(r));
+        }
+        // `equals`, `hashCode` and `toString` of a client handle are its
+        // kind's (`game_object.rs`, `client_values.rs`), answered before here.
         if let Some(id) = text.strip_prefix(CATEGORY) {
-            return Some(match (r.name.as_str(), return_desc(&r.descriptor)) {
-                ("id", _) => {
-                    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
-                    Ok(marker(format!("identifier/{namespace}:{path}")))
-                }
-                ("label", _) => Ok(component_value(
+            return Some(match r.name.as_str() {
+                "id" => Ok(crate::runtime::host_ids::identifier_of_text(id)),
+                "label" => Ok(component_value(
                     "translatable",
                     &format!("key.category.{}", id.replacen(':', ".", 1)),
                 )),
-                ("hashCode", "I") => Ok(Value::Int(stable_hash(&text))),
-                ("equals", "Z") => Ok(flag(args.first() == Some(receiver))),
-                ("toString", _) => Ok(marker(text.clone())),
                 _ => refuse(),
             });
         }
         if !text.starts_with("client/") {
             return None;
-        }
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("hashCode", "()I") => return Some(Ok(Value::Int(stable_hash(&text)))),
-            ("equals", "(Ljava/lang/Object;)Z") => {
-                return Some(Ok(flag(args.first() == Some(receiver))));
-            }
-            ("toString", "()Ljava/lang/String;") => return Some(Ok(marker(text))),
-            _ => {}
         }
         if let Some(hex) = text.strip_prefix(AWT_COLOR) {
             let argb = u32::from_str_radix(hex, 16).ok()?;
@@ -1370,17 +1649,54 @@ impl StdHost {
                 }
                 Value::Void
             }
-            ("getName", "()Ljava/lang/String;") => marker(init.name),
-            ("getCategory", _) => marker(format!(
-                "{CATEGORY}{}",
-                init.category.as_deref().unwrap_or("minecraft:misc")
-            )),
-            ("hashCode", "()I") => Value::Int(stable_hash(object)),
-            ("equals", "(Ljava/lang/Object;)Z") | ("same", _) => flag(
+            // The jar's own `String`, never parsed into an object whatever it spells
+            // (#232's review: `new KeyMapping("client/minecraft", ..)`).
+            ("getName", "()Ljava/lang/String;") => text(init.name),
+            ("getCategory", _)
+                if init
+                    .category_value
+                    .as_ref()
+                    .is_some_and(crate::runtime::jar_object::is_object) =>
+            {
+                return Some(self.unknown_host_call(r));
+            }
+            // Java returns the constructor argument verbatim, including null.
+            ("getCategory", _) => init.category_value.clone().unwrap_or(Value::Ref(None)),
+            ("hashCode", "()I") => return Some(Err(NativeError::UnknownHostCall(r.clone()))),
+            ("equals", "(Ljava/lang/Object;)Z") => flag(
                 args.first()
-                    .and_then(expect_ref)
+                    .filter(|value| crate::runtime::jar_object::object_class(value) == Some(KEY_MAPPING))
+                    .and_then(crate::runtime::jar_object::object_key)
                     .is_some_and(|o| o == object),
             ),
+            ("getDefaultKey", "()Lcom/mojang/blaze3d/platform/InputConstants$Key;") => {
+                marker(init.default_key.clone())
+            }
+            ("getKey", "()Lcom/mojang/blaze3d/platform/InputConstants$Key;") => {
+                marker(init.key.clone())
+            }
+            ("same", "(Lnet/minecraft/client/KeyMapping;)Z") => flag(
+                args.first()
+                    .filter(|value| crate::runtime::jar_object::object_class(value) == Some(KEY_MAPPING))
+                    .and_then(crate::runtime::jar_object::object_key)
+                    .and_then(|other| state.key_inits.get(other))
+                    .is_some_and(|other| other.key == init.key),
+            ),
+            ("setKey", "(Lcom/mojang/blaze3d/platform/InputConstants$Key;)V") => {
+                let Some(Value::Host(handle)) = args.first() else {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                };
+                let Some((_, _)) = input_key_parts(handle.key()) else {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                };
+                if handle.kind() != crate::runtime::HostKind::GameValue {
+                    return Some(Err(NativeError::UnknownHostCall(r.clone())));
+                }
+                if let Some(stored) = state.key_inits.get_mut(object) {
+                    stored.key = handle.key().to_owned();
+                }
+                Value::Void
+            }
             _ if in_frame => return Some(Err(NativeError::UnknownHostCall(r.clone()))),
             _ => return None,
         }))
@@ -1409,14 +1725,13 @@ impl StdHost {
                 ("y", "D") => double(y),
                 ("z", "D") => double(z),
                 ("distanceTo", "D") | ("distanceToSqr", "D") => {
-                    let o = expect_ref(args.first()?)?.strip_prefix(VEC3)?;
+                    let o = crate::runtime::game_object::text(args.first()?)?.strip_prefix(VEC3)?;
                     let o: Vec<f64> = o.split(',').filter_map(|c| c.parse().ok()).collect();
                     let d2 = (x - o.first()?).powi(2)
                         + (y - o.get(1)?).powi(2)
                         + (z - o.get(2)?).powi(2);
                     double(if name == "distanceTo" { d2.sqrt() } else { d2 })
                 }
-                ("toString", _) => Some(marker(format!("({x}, {y}, {z})"))),
                 _ => None,
             };
         }
@@ -1436,7 +1751,7 @@ impl StdHost {
         if let Some(mapping) = object.strip_prefix(VANILLA_KEY) {
             return match (name, returns) {
                 ("isDown", "Z") => Some(flag(frame.vanilla_keys_down.iter().any(|k| k == mapping))),
-                ("getName", _) => Some(marker(mapping)),
+                ("getName", _) => Some(text(mapping)),
                 _ => None,
             };
         }
@@ -1508,7 +1823,7 @@ impl StdHost {
                 // 26.3 reads the open screen through the GUI.
                 ("screen", _) if !frame.screen_open => Some(Value::Ref(None)),
                 ("setOverlayMessage", "V") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     self.client.message(ClientMessage::Overlay(text));
                     Some(Value::Void)
                 }
@@ -1521,7 +1836,7 @@ impl StdHost {
             },
             CHAT => match (name, r.descriptor.as_str()) {
                 ("addMessage", "(Lnet/minecraft/network/chat/Component;)V") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     self.client.message(ClientMessage::Chat(text));
                     Some(Value::Void)
                 }
@@ -1534,7 +1849,7 @@ impl StdHost {
                 }
                 match (name, returns) {
                     ("displayClientMessage", "V") => {
-                        let text = text_arg(args.first()?)?;
+                        let text = text_arg(args.first()?, &self.component_states)?;
                         let overlay = int_arg(args, 1).is_some_and(|v| v != 0);
                         self.client.message(if overlay {
                             ClientMessage::Overlay(text)
@@ -1544,7 +1859,7 @@ impl StdHost {
                         Some(Value::Void)
                     }
                     ("sendSystemMessage", "V") => {
-                        let text = text_arg(args.first()?)?;
+                        let text = text_arg(args.first()?, &self.component_states)?;
                         self.client.message(ClientMessage::Chat(text));
                         Some(Value::Void)
                     }
@@ -1566,9 +1881,9 @@ impl StdHost {
                     ("isAlive", "Z") => Some(flag(p.health > 0.0)),
                     ("getId", "I") => int(p.entity_id),
                     ("getName" | "getDisplayName", _) => Some(component_value("literal", &p.name)),
-                    ("getScoreboardName" | "getPlainTextName", _) => Some(marker(p.name.clone())),
+                    ("getScoreboardName" | "getPlainTextName", _) => Some(text(p.name.clone())),
                     ("getUUID", _) => uuid_value(&uuid_text(p.uuid)).ok(),
-                    ("getStringUUID", _) => Some(marker(uuid_text(p.uuid))),
+                    ("getStringUUID", _) => Some(text(uuid_text(p.uuid))),
                     ("level" | "clientLevel", _) if frame.level.is_some() => Some(marker(LEVEL)),
                     _ => None,
                 }
@@ -1581,10 +1896,10 @@ impl StdHost {
                     ("getDayTime" | "getOverworldClockTime", "J") => {
                         Some(Value::Long(level.day_time))
                     }
-                    ("dimension", _) => Some(marker(format!(
-                        "resource-key/dimension/{}",
-                        level.dimension
-                    ))),
+                    ("dimension", _) => Some(crate::runtime::host_ids::resource_key_named(
+                        "minecraft:dimension",
+                        &level.dimension,
+                    )),
                     ("isClientSide", "Z") => Some(flag(true)),
                     ("getMinY", "I") => int(level.min_y),
                     ("getHeight", "I") => int(level.height),
@@ -1658,7 +1973,7 @@ impl StdHost {
             },
             FONT => match (name, returns) {
                 ("width", "I") => {
-                    let text = text_arg(args.first()?)?;
+                    let text = text_arg(args.first()?, &self.component_states)?;
                     int(frame.metrics.width(&frame.metrics.resolve(&text)))
                 }
                 _ => None,
@@ -1715,7 +2030,7 @@ impl StdHost {
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
                 // A null string draws nothing (`text` returns early).
-                let Some(text) = text_arg(args.get(1)?) else {
+                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
                     return Some(Value::Void);
                 };
                 let v = ints(2, 3)?;
@@ -1761,7 +2076,7 @@ impl StdHost {
                 let slot = self.client_stack_slot(args.get(1)?)?;
                 let v = ints(2, 2)?;
                 let count = args.get(4).map(|text| {
-                    text_arg(text).map(|t| match t {
+                    text_arg(text, &self.component_states).map(|t| match t {
                         ClientText::Literal(s) | ClientText::Translatable(s) => s,
                         ClientText::Json(json) => serde_json::from_str(&json)
                             .map(|json| crate::runtime::facade_text::plain(&json))
@@ -1801,7 +2116,7 @@ impl StdHost {
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
-                let Some(text) = text_arg(args.get(1)?) else {
+                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
                     return Some(Value::Void);
                 };
                 let v = ints(2, 3)?;
@@ -2012,9 +2327,9 @@ mod tests {
         assert_eq!(input_key_name(false, 6), "key.keyboard.c");
         assert_eq!(input_key_name(false, 225), "key.keyboard.left.shift");
         assert_eq!(input_key_name(false, 58), "key.keyboard.f1");
-        assert_eq!(input_key_name(false, -1), "key.keyboard.unknown");
+        assert_eq!(input_key_name(false, 0), "key.keyboard.unknown");
         assert_eq!(input_key_name(true, 2), "key.mouse.middle");
-        assert_eq!(input_key_name(true, 4), "key.mouse.5");
+        assert_eq!(input_key_name(true, 4), "key.mouse.4");
     }
 
     #[test]
@@ -2441,6 +2756,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rgb, Value::Int(0xff00_ff00_u32 as i32));
+        let upper = crate::runtime::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "LIGHT_GRAY", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        let lower = crate::runtime::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "lightGray", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        assert_eq!(upper, lower, "upper={upper:?} lower={lower:?}");
     }
 
     #[test]
@@ -2492,7 +2818,10 @@ mod tests {
     #[test]
     fn a_registered_mapping_answers_clicks_from_its_key_state() {
         let mut host = StdHost::new();
-        let object = marker("net/minecraft/client/KeyMapping#0");
+        let object = Value::Host(crate::runtime::HostRef::new(
+            crate::runtime::HostKind::JarObject,
+            "net/minecraft/client/KeyMapping#0",
+        ));
         let category = host
             .client_static(&method(
                 KEY_CATEGORY,

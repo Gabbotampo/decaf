@@ -25,8 +25,40 @@ sys.path[:] = _before
 
 class JavaModServerLedgerTests(unittest.TestCase):
     @staticmethod
+    def _mod_class(dists=()):
+        # A small valid classfile with a runtime-visible NeoForge @Mod.  The
+        # test uses this instead of a constant-pool marker so Kotlin metadata
+        # cannot be mistaken for loader metadata.
+        import struct
+        utf8 = lambda text: b"\x01" + struct.pack(">H", len(text)) + text.encode()
+        pool = [
+            utf8("example/ExampleMod"), b"\x07\x00\x01",
+            utf8("java/lang/Object"), b"\x07\x00\x03",
+            utf8("Lnet/neoforged/fml/common/Mod;"), utf8("RuntimeVisibleAnnotations"),
+            utf8("value"), utf8("demo"), utf8("dist"),
+            utf8("Lnet/neoforged/api/distmarker/Dist;"), utf8("CLIENT"),
+            utf8("DEDICATED_SERVER"),
+        ]
+        annotation = struct.pack(">H", 5)
+        pairs = [(7, b"s" + struct.pack(">H", 8))]
+        if dists:
+            values = b"[" + struct.pack(">H", len(dists)) + b"".join(
+                b"e" + struct.pack(">HH", 10, 11 if dist == "CLIENT" else 12)
+                for dist in dists
+            )
+            pairs.append((9, values))
+        annotation += struct.pack(">H", len(pairs))
+        annotation += b"".join(struct.pack(">H", name) + value for name, value in pairs)
+        attribute = struct.pack(">HI", 6, len(annotation) + 2) + struct.pack(">H", 1) + annotation
+        return (
+            b"\xca\xfe\xba\xbe" + struct.pack(">HHH", 0, 52, 13) + b"".join(pool)
+            + struct.pack(">HHHHHH", 0x21, 2, 4, 0, 0, 0)
+            + struct.pack(">H", 1) + attribute
+        )
+
+    @staticmethod
     def _jar(directory, name, *, fabric=None, neoforge=None, mod_class=False,
-             fabric_raw=None, corrupt=False):
+             fabric_raw=None, corrupt=False, legacy_mods=False):
         path = Path(directory) / name
         if corrupt:
             path.write_bytes(b"not a zip")
@@ -37,11 +69,11 @@ class JavaModServerLedgerTests(unittest.TestCase):
             elif fabric is not None:
                 jar.writestr("fabric.mod.json", json.dumps(fabric))
             if neoforge is not None:
-                jar.writestr("META-INF/neoforge.mods.toml", neoforge)
+                jar.writestr("META-INF/mods.toml" if legacy_mods else "META-INF/neoforge.mods.toml", neoforge)
             if mod_class:
                 jar.writestr(
                     "example/ExampleMod.class",
-                    b"\xca\xfe\xba\xbeLnet/neoforged/fml/common/Mod;",
+                    mod_class if isinstance(mod_class, bytes) else JavaModServerLedgerTests._mod_class(),
                 )
         return path
 
@@ -243,7 +275,8 @@ class JavaModServerLedgerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             client = self._jar(
                 tmp, "client.jar",
-                neoforge='modLoader = "javafml"\n[[mods]]\nmodId = "client"\nclientSideOnly = true\n',
+                neoforge='clientSideOnly = true\nmodLoader = "javafml"\n[[mods]]\nmodId = "client"\n',
+                legacy_mods=True,
             )
             server = self._jar(
                 tmp, "server.jar",
@@ -452,8 +485,9 @@ class DependencyClosureTests(unittest.TestCase):
                 version="1.0.0"):
         """A Fabric jar; `nested` are (id, provides) pairs carried as jar-in-jar."""
         path = Path(directory) / name
+        dep_map = depends if isinstance(depends, dict) else {dep: "*" for dep in depends}
         meta = {"schemaVersion": 1, "id": ident, "version": version,
-                "depends": {dep: "*" for dep in depends}}
+                "depends": dep_map}
         if provides:
             meta["provides"] = list(provides)
         with zipfile.ZipFile(path, "w") as jar:
@@ -507,6 +541,75 @@ class DependencyClosureTests(unittest.TestCase):
                          nested=(("fabric-api-base", ()),))
             closure = self._closure(tmp, jar)
         self.assertEqual(closure.ids, ("fabric-api",))
+
+    def test_version_ranges_choose_only_a_compatible_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": ["[2,)"]})
+            self._fabric(tmp, "old.jar", "library", version="1.9")
+            good = self._fabric(tmp, "good.jar", "library-new", version="2.4")
+            # The provider id must match; an alias can carry the compatible version.
+            with zipfile.ZipFile(good, "r") as source:
+                content = {name: source.read(name) for name in source.namelist()}
+            with zipfile.ZipFile(good, "w") as target:
+                for name, data in content.items():
+                    if name == "fabric.mod.json":
+                        meta = json.loads(data)
+                        meta["provides"] = ["library"]
+                        data = json.dumps(meta).encode()
+                    target.writestr(name, data)
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("good.jar",))
+        self.assertEqual(closure.missing, ())
+
+    def test_fabric_dependency_arrays_are_or_predicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app",
+                               depends={"library": ["[2,)", "[1.8,1.9]"]})
+            self._fabric(tmp, "old.jar", "library", version="1.8.9")
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("old.jar",))
+
+    def test_newest_satisfying_provider_beats_a_larger_older_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": "*"})
+            self._fabric(tmp, "old.jar", "library", version="1.0")
+            self._fabric(tmp, "new.jar", "library", version="2.0",
+                         nested=(("one", ()), ("two", ()), ("three", ())))
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("new.jar",))
+
+    def test_incompatible_only_provider_is_a_missing_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app", depends={"library": ["[2,)"]})
+            self._fabric(tmp, "old.jar", "library", version="1.9")
+            closure = self._closure(tmp, app)
+        self.assertEqual(closure.missing, (("library", "app"),))
+        self.assertEqual(closure.missing_requirements, (("library", "app", "[2,)"),))
+
+    def test_dependency_cycles_terminate_and_keep_each_provider_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app = self._fabric(tmp, "app.jar", "app", depends=("a",))
+            self._fabric(tmp, "a.jar", "a", depends=("b",))
+            self._fabric(tmp, "b.jar", "b", depends=("a",))
+            closure = self._closure(tmp, app)
+        self.assertEqual(tuple(path.name for path in closure.jars), ("a.jar", "b.jar"))
+        self.assertEqual(closure.missing, ())
+
+    def test_fabric_and_neoforge_range_syntax_is_exactly_bounded(self):
+        accepts = (
+            ("1.5", "[1,)"), ("1.5", "[1,2)"), ("2.0", "[2,)"),
+            ("1.5", "[1,2)"), ("2.0", "[2,)"), ("1.2.3", "1.2.3"),
+        )
+        rejects = (
+            ("0.9", "[1,)"), ("2.0", "[1,2)"), ("1.9", "[2,)"),
+            ("2.0", "[1,2)"), ("1.9", "[2,)"), ("1.2.4", "1.2.3"),
+        )
+        for version, requirement in accepts:
+            self.assertTrue(LEDGER.hybrid_pack.maven_version_satisfies(version, requirement),
+                            (version, requirement))
+        for version, requirement in rejects:
+            self.assertFalse(LEDGER.hybrid_pack.maven_version_satisfies(version, requirement),
+                             (version, requirement))
 
     def test_missing_ids_name_who_needed_them_and_do_not_run(self):
         with tempfile.TemporaryDirectory() as tmp:

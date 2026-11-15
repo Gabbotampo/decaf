@@ -1,0 +1,2 @@
+setup=ok
+check=[kept]|[c, b, a]|[x, y]|{m=1}|1321

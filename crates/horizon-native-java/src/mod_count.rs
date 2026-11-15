@@ -62,9 +62,19 @@ pub(crate) enum ModVerdict {
 }
 
 impl ModStamp {
+    /// The stamp of a collection whose `modCount` the host keeps no count of
+    /// (`Host::mod_stamp`'s default): every check against it is unknown and
+    /// counted, never a silent "unchanged".
+    pub(crate) const UNKEPT: ModStamp = ModStamp {
+        count: u64::MAX,
+        uncertain: u64::MAX,
+    };
+
     /// The check of `expected` against this (live) stamp.
     pub(crate) fn verdict(self, expected: ModStamp) -> ModVerdict {
-        if self == expected {
+        if self == Self::UNKEPT || expected == Self::UNKEPT {
+            ModVerdict::Unknown
+        } else if self == expected {
             ModVerdict::Same
         } else if self.uncertain != expected.uncertain {
             ModVerdict::Unknown
@@ -74,6 +84,9 @@ impl ModStamp {
     }
 
     fn bumped(self, uncertain: bool) -> Self {
+        if self == Self::UNKEPT {
+            return self;
+        }
         ModStamp {
             count: self.count + 1,
             uncertain: self.uncertain + u64::from(uncertain),
@@ -301,9 +314,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     fn element_count(&self, value: &Value) -> usize {
-        self.host
-            .mutable_collection_values(value)
-            .map_or(0, |values| values.len())
+        self.host.collection_len(value).unwrap_or(0)
     }
 
     /// Before a call: whether it may move a tracked collection's `modCount`
@@ -376,7 +387,7 @@ impl<H: Host> Runtime<'_, H> {
         let rule = if sub_list {
             let root = self.mod_count_root(marker);
             let root_class = self
-                .host_collection_class(&Value::Ref(Some(root)))
+                .host_collection_class(&crate::jar_object::stored_value(&root))
                 .unwrap_or_default();
             sub_list_rule(&root_class, name)
         } else if op == 0xb8 && name == "addAll" {
@@ -435,7 +446,7 @@ impl<H: Host> Runtime<'_, H> {
             }
             DequeStep::None => {}
         }
-        let target = Value::Ref(Some(token.marker.clone()));
+        let target = crate::jar_object::stored_value(&token.marker);
         let size = self.element_count(&target);
         match token.rule {
             Some(ModRule::Always) => self.bump_mod_count(&token.marker, false),
@@ -452,7 +463,7 @@ impl<H: Host> Runtime<'_, H> {
             self.write_back_sub_list(&token.marker, structural);
         }
         if let (Some((from, to)), Some(view)) = (token.creates, expect_ref(value))
-            && self.host.mutable_collection_values(value).is_some()
+            && self.host.holds_collection(value)
         {
             self.host.store_sub_list_link(
                 view,
@@ -492,7 +503,7 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<SubCheck, NativeError> {
         let root = self.mod_count_root(marker);
         let array_list = self
-            .host_collection_class(&Value::Ref(Some(root)))
+            .host_collection_class(&crate::jar_object::stored_value(&root))
             .as_deref()
             == Some("java/util/ArrayList");
         let size = self.element_count(target) as i64;
@@ -652,7 +663,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Re-read a view's range from its parent (a parent's `set` shows).
     fn reslice(&mut self, view: &str, link: &SubListLink) -> bool {
-        let parent = Value::Ref(Some(link.parent.clone()));
+        let parent = crate::jar_object::stored_value(&link.parent);
         let Ok(elements) = self.collection_elements(&parent) else {
             return false;
         };
@@ -661,7 +672,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         let range = elements[link.offset..link.offset + link.size].to_vec();
         self.host
-            .replace_mutable_collection(&Value::Ref(Some(view.to_owned())), range);
+            .replace_mutable_collection(&crate::jar_object::stored_value(view), range);
         true
     }
 
@@ -675,8 +686,8 @@ impl<H: Host> Runtime<'_, H> {
             let Some(mut link) = self.host.sub_list_link(&view) else {
                 return;
             };
-            let parent = Value::Ref(Some(link.parent.clone()));
-            let copy = Value::Ref(Some(view.clone()));
+            let parent = crate::jar_object::stored_value(&link.parent);
+            let copy = crate::jar_object::stored_value(&view);
             let (Ok(content), Ok(mut elements)) = (
                 self.collection_elements(&copy),
                 self.collection_elements(&parent),

@@ -275,7 +275,7 @@ impl<H: Host> Runtime<'_, H> {
     /// builds them.
     fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
         Ok(match tree {
-            Tree::Null => Value::Ref(Some(NULL_INSTANCE.to_owned())),
+            Tree::Null => null_instance(),
             Tree::Bool(value) => self.new_primitive(Prim::Bool(value)),
             Tree::Str(text) => self.new_primitive(Prim::Str(text)),
             Tree::Num(text) => {
@@ -312,9 +312,9 @@ impl<H: Host> Runtime<'_, H> {
         match value {
             Value::Ref(None) => Source::Null,
             Value::Ref(Some(text)) if !reader => Source::Text(text.clone()),
-            Value::Ref(Some(marker)) => self
-                .string_readers
-                .get(marker)
+            // A reader the jar `new`ed (`new StringReader(..)`): an object.
+            value if reader => crate::jar_object::object_key(value)
+                .and_then(|marker| self.string_readers.get(marker))
                 .cloned()
                 .map_or(Source::Unknown, Source::Text),
             _ => Source::Unknown,
@@ -342,7 +342,7 @@ impl<H: Host> Runtime<'_, H> {
             return self.count_tree_call(r, receiver, args).map(Some);
         };
         match Parser::parse(&text) {
-            Parsed::Empty => Ok(Some(Value::Ref(Some(NULL_INSTANCE.to_owned())))),
+            Parsed::Empty => Ok(Some(null_instance())),
             Parsed::Value(tree) => self.materialize(tree).map(Some),
             Parsed::Unsupported => self.count_tree_call(r, receiver, args).map(Some),
         }
@@ -367,7 +367,11 @@ impl<H: Host> Runtime<'_, H> {
             | "(Ljava/io/Reader;Ljava/lang/reflect/Type;)Ljava/lang/Object;" => true,
             _ => return Ok(None),
         };
-        let Some(class) = args.get(1).and_then(expect_ref).cloned() else {
+        let Some(class) = args
+            .get(1)
+            .and_then(crate::host_class::class_name)
+            .map(str::to_owned)
+        else {
             return Ok(None);
         };
         if !tree_class(&class) {

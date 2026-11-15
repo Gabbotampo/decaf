@@ -3,18 +3,19 @@
 //! javac (19 and later) lowers every non-`String` concat operand to
 //! `String.valueOf(operand)`; older javac passes the object to the concat
 //! site; `StringBuilder.append(Object)` is `String.valueOf` too. All three
-//! printed the internal marker (`identifier/a:x`, `list/a`). [`owner`] names
+//! printed the internal marker (`uuid/…`, `list/a`). [`owner`] names
 //! the class whose modelled `toString` the host answers for a marker, so
 //! `"" + x` is the text `x.toString()` gives. A plain string, a box, a builder
 //! and a jar object keep their callers' existing paths.
 
 use crate::runtime::{Host, MethodRef, Runtime, Value, expect_ref};
 
-/// The owner whose `toString` answers `marker`, or `None` when no model owns
-/// its text.
-pub(crate) fn owner(marker: &str) -> Option<String> {
+/// The owner whose `toString` answers `value` (a marker, or an object by
+/// its key), or `None` when no model owns its text.
+pub(crate) fn owner(value: &Value) -> Option<String> {
+    let marker = expect_ref(value)?.as_str();
     // A plain string is its own text.
-    if crate::runtime::value_class::is_plain_string(marker) {
+    if matches!(value, Value::Ref(_)) && crate::runtime::value_class::is_plain_string(marker) {
         return None;
     }
     // The optionals are host handles (`host_ref.rs`), printed through
@@ -28,16 +29,7 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     }
     // Prefix families the host models before any class marker.
     let prefix = [
-        ("identifier/", "net/minecraft/resources/Identifier"),
-        ("uuid/", "java/util/UUID"),
-        ("duration/", "java/time/Duration"),
-        ("tag-key/", "net/minecraft/tags/TagKey"),
-        ("regex-pattern/", "java/util/regex/Pattern"),
         ("charset/", "java/nio/charset/Charset"),
-        ("coding-error-action/", "java/nio/charset/CodingErrorAction"),
-        ("locale/", "java/util/Locale"),
-        ("mod-origin/", "net/fabricmc/loader/api/metadata/ModOrigin"),
-        ("unicode-block/", "java/lang/Character$UnicodeBlock"),
         // `key + "=" + value` (`Map.entry`, an entry from `entrySet()`).
         ("map-entry/", "java/util/Map$Entry"),
     ];
@@ -67,8 +59,11 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
     // A class marker (`class#n`): only a class the host models has a body to
     // answer, so a jar object keeps the caller's text. A builder's text lives
     // in the runtime ([`Runtime::invoke_value_of_builder`]), not the host.
-    if let Some((class, _)) = marker.split_once('#')
-        && crate::runtime::host_models_class(class)
+    // Guava's immutable collections the host makes (`RegularImmutableList`...) are no class
+    // `host_models_class` names, but their supertypes are known (`java_immutable.rs`): they
+    // print as `AbstractCollection` does, through the interface's model (#223).
+    if let Some(class) = crate::runtime::jar_object::value_marker_class(value)
+        && (crate::runtime::host_models_class(class) || !crate::runtime::java_immutable::supertypes(class).is_empty())
         && !matches!(class, "java/lang/StringBuilder" | "java/lang/StringBuffer")
     {
         // An unmodifiable collection prints through its interface's model.
@@ -80,8 +75,28 @@ pub(crate) fn owner(marker: &str) -> Option<String> {
 
 /// The text `String.valueOf(value)` gives for a model object.
 pub(crate) fn modelled<H: Host>(host: &mut H, value: &Value) -> Option<String> {
-    // A host object (an `Optional`) prints through its class's model.
-    if let Value::Host(handle) = value {
+    modelled_checked(host, value).ok().flatten()
+}
+
+/// [`modelled`], with a nested walk's `StackOverflowError` thrown rather than read as "no
+/// model" (#250): the host's printing walks (`HostNested`, a collection's elements) call this,
+/// so a cycle ends as Java's does, not in counted text.
+pub(crate) fn modelled_checked<H: Host>(
+    host: &mut H,
+    value: &Value,
+) -> Result<Option<String>, crate::runtime::NativeError> {
+    // A jar's `new UUID(msb, lsb)` prints its halves (`host_jdk_value.rs`); one whose
+    // constructor the host did not see prints nothing modelled (counted by the caller).
+    if crate::runtime::host_jdk_value::is_uuid_object(value) {
+        return Ok(host
+            .constructed_uuid(value)
+            .map(|(msb, lsb)| crate::runtime::host_jdk_value::uuid_text_of(msb, lsb)));
+    }
+    // A host object (an `Optional`) prints through its class's model; an
+    // allocated object through its class's, below.
+    if let Value::Host(handle) = value
+        && !crate::runtime::jar_object::is_object_handle(handle)
+    {
         let to_string = MethodRef {
             // A handle whose class is not known still has `Object.toString`.
             owner: handle.class().unwrap_or("java/lang/Object").to_owned(),
@@ -89,26 +104,38 @@ pub(crate) fn modelled<H: Host>(host: &mut H, value: &Value) -> Option<String> {
             descriptor: "()Ljava/lang/String;".into(),
         };
         return match host.invoke_instance(&to_string, value, &[]) {
-            Ok(Value::Ref(Some(text))) => Some(text),
-            _ => None,
+            Ok(Value::Ref(Some(text))) => Ok(Some(text)),
+            Err(error) if crate::runtime::host_recursion::is_stack_overflow(&error) => Err(error),
+            _ => Ok(None),
         };
     }
-    let marker = expect_ref(value)?;
-    modelled_marker(host, marker)
+    modelled_marker_checked(host, value)
 }
 
-/// [`modelled`] for a marker that is already known to be a reference.
-pub(crate) fn modelled_marker<H: Host>(host: &mut H, marker: &str) -> Option<String> {
-    let owner = owner(marker)?;
-    let value = Value::Ref(Some(marker.to_owned()));
+/// [`modelled`] for a marker or an allocated object.
+pub(crate) fn modelled_marker<H: Host>(host: &mut H, value: &Value) -> Option<String> {
+    modelled_marker_checked(host, value).ok().flatten()
+}
+
+fn modelled_marker_checked<H: Host>(
+    host: &mut H,
+    value: &Value,
+) -> Result<Option<String>, crate::runtime::NativeError> {
+    let Some(owner) = owner(value) else {
+        return Ok(None);
+    };
+    let Some(marker) = expect_ref(value) else {
+        return Ok(None);
+    };
     let to_string = MethodRef {
         owner,
         name: "toString".into(),
         descriptor: "()Ljava/lang/String;".into(),
     };
-    match host.invoke_instance(&to_string, &value, &[]) {
-        Ok(Value::Ref(Some(text))) if text != marker => Some(text),
-        _ => None,
+    match host.invoke_instance(&to_string, value, &[]) {
+        Ok(Value::Ref(Some(text))) if text != *marker => Ok(Some(text)),
+        Err(error) if crate::runtime::host_recursion::is_stack_overflow(&error) => Err(error),
+        _ => Ok(None),
     }
 }
 
@@ -127,7 +154,7 @@ impl<H: Host> Runtime<'_, H> {
         {
             return None;
         }
-        let text = self.string_builders.get(expect_ref(args.first()?)?)?;
+        let text = self.builder_text(args.first()?)?;
         Some(Value::Ref(Some(text.clone())))
     }
 }
