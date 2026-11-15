@@ -222,7 +222,11 @@ fn duplicate_entrypoint_rows_are_invoked_and_failures_continue() {
         text,
         "RuntimeException:Could not execute entrypoint stage 'main' due to errors, provided by 'probe-fixture' at 'demo.Probe'!:IllegalStateException:2"
     );
-    assert!(host.unknown_host_calls().is_empty(), "{:?}", host.unknown_host_calls());
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
 
 /// Another requested type is a new instance (`Object`) or Fabric's
