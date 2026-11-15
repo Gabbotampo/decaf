@@ -1112,9 +1112,7 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
         .map(String::as_str)
         .or_else(|| crate::jar_object::object_key(value))?;
     if host.holds_collection(value) {
-        let class = marker
-            .split_once('#')
-            .map_or(marker, |(class, _)| class);
+        let class = marker.split_once('#').map_or(marker, |(class, _)| class);
         // A map whichever class the host made it (Guava's
         // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
         // (#253 review).
