@@ -177,6 +177,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus", action="append", required=True, metavar="NAME=DIR")
     p.add_argument("--fabric-loader", type=Path)
     p.add_argument("--provider-dir", type=Path, action="append", default=[])
+    p.add_argument("--game-block-classes", type=Path,
+                   help="exact vanilla block closure JSON passed to both census probes")
     p.add_argument("--role", choices=("server", "client", "both"), default="both")
     p.add_argument("--dependency-mode", choices=("both", "alone", "closure"), default="both")
     p.add_argument("--jobs", type=int, default=4)
@@ -206,6 +208,8 @@ def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role:
         command += ["--fabric-loader", str(args.fabric_loader)]
     for provider in args.provider_dir:
         command += ["--provider-dir", str(provider)]
+    if args.game_block_classes:
+        command += ["--game-block-classes", str(args.game_block_classes.expanduser().resolve())]
     subprocess.run(command, cwd=base_checkout, check=True)
     return json.loads(path.read_text())
 
