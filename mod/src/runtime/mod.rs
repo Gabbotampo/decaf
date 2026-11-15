@@ -204,6 +204,7 @@ mod tim_sort;
 mod tree_map;
 mod type_switch;
 mod value_class;
+mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_registries;
 pub mod verdict;
@@ -3911,15 +3912,12 @@ impl StdHost {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
     }
 
-    /// `ItemLike.asItem()` as vanilla answers it, for objects whose game
-    /// superclass the runtime doesn't hold. Only receivers this host knows
-    /// are answered: an item it saw constructed (or a vanilla `Items.X`
-    /// constant) is its own item; a block it saw constructed is the
-    /// `BlockItem` built for it, or `Items.AIR` when there is none, as
-    /// vanilla's `Item.BY_BLOCK` lookup does. Anything else returns `None`
-    /// and stays an unknown host call. The item and block constructors that
-    /// make this answerable are recorded and also return `None`, so the call
-    /// goes on to the rest of the host.
+    /// ItemLike.asItem() as vanilla answers it, for objects whose game
+    /// superclass the runtime does not hold. Only receivers this host knows
+    /// are answered: an item it saw constructed (or a vanilla Items.X
+    /// constant) is its own item; a constructed block is the BlockItem built
+    /// for it. An unregistered jar block stays unknown so the host counts the
+    /// call instead of inventing Items.AIR.
     fn item_like_call(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
         // Only objects the runtime actually allocated can be recorded as a
         // mod's Item/Block.  Game handles (the P16 representation of
@@ -3935,9 +3933,7 @@ impl StdHost {
                             .starts_with("(Lnet/minecraft/world/level/block/Block;")
                         && let Some(block) = args.first().and_then(jar_object::instance_key)
                     {
-                        self.block_items
-                            .entry(block.to_owned())
-                            .or_insert_with(|| receiver.clone());
+                        self.block_items.insert(block.to_owned(), receiver.clone());
                     }
                 }
                 // `Block` or one of its vanilla subclasses (`FenceBlock`),
@@ -3958,13 +3954,10 @@ impl StdHost {
             return Some(receiver.clone());
         }
         if self.constructed_blocks.contains(&marker) {
-            return Some(self.block_items.get(&marker).cloned().unwrap_or_else(|| {
-                if self.environment_type != "SERVER" {
-                    game_object::client_value("client/item/minecraft:air".into())
-                } else {
-                    game_object::server_value("game/item/minecraft:air".into())
-                }
-            }));
+            // A jar-owned block with no observed BlockItem registration has
+            // unknown mapping state. Vanilla would fall back to AIR, but the
+            // bounded host must count rather than invent that answer.
+            return self.block_items.get(&marker).cloned();
         }
         None
     }

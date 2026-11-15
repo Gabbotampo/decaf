@@ -184,6 +184,10 @@ public final class Main {
         CabinetBlock cabinet = new CabinetBlock();
         BlockItem cabinetItem = new BlockItem(cabinet, null);
         Probe.check("block", cabinet.asItem() == cabinetItem);
+        CabinetBlock duplicate = new CabinetBlock();
+        new BlockItem(duplicate, null);
+        BlockItem second = new BlockItem(duplicate, null);
+        Probe.check("duplicate-last", duplicate.asItem() == second);
         CabinetBlock lonely = new CabinetBlock();
         Probe.check("no-item", lonely.asItem() != null);
     }
@@ -215,9 +219,17 @@ public final class Main {
         BTreeMap::from([
             ("block".to_owned(), true),
             ("item".to_owned(), true),
-            ("no-item".to_owned(), true),
+            ("duplicate-last".to_owned(), true),
+            ("no-item".to_owned(), false),
             ("vanilla-block".to_owned(), true),
             ("vanilla-item".to_owned(), true),
         ])
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, count)| *count > 0 && call.contains("#asItem")),
+        "an unregistered jar block must be counted: {:?}",
+        host.unknown_host_calls()
     );
 }
