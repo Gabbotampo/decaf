@@ -293,6 +293,10 @@ pub enum HostKind {
     Thread,
     /// A logger: key `of_values([api, name])`.
     Logger,
+    /// One of Log4j 2's canonical standard levels: key its encoded name/int.
+    Log4jLevel,
+    /// A runtime-materialized `Level[]` returned by `Level.values()`.
+    Log4jLevelArray,
     /// A `StackWalker`: key `""` for `getInstance()`'s, `options` otherwise.
     StackWalker,
     /// A `StackWalker.StackFrame` / `StackTraceElement` of a jar frame: key
@@ -394,6 +398,8 @@ pub enum HostKind {
     /// DataFixerUpper's `Pair.of(..)`: key `[serial, first, second]`
     /// (`host_codec.rs`).
     DfuPair,
+    /// DataFixerUpper Either values keyed by side and payload.
+    DfuEither,
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
@@ -433,6 +439,8 @@ pub enum HostKind {
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
+    /// A `StackWalker.Option` enum constant: key its name.
+    StackWalkerOption,
     /// A `Character.UnicodeBlock` constant: key its name.
     UnicodeBlock,
     /// A `Locale` constant: key `<language>_<country>`.
@@ -1489,6 +1497,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_jdk::LOGGER,
     },
     KindInfo {
+        kind: HostKind::Log4jLevel,
+        tag: "l4lvl",
+        class: ClassRule::Fixed("org/apache/logging/log4j/Level"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_log4j_level::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Log4jLevelArray,
+        tag: "l4arr",
+        class: ClassRule::Fixed("[Lorg/apache/logging/log4j/Level;"),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_array::ARRAY,
+    },
+    KindInfo {
         kind: HostKind::StackWalker,
         tag: "walker",
         class: ClassRule::Fixed("java/lang/StackWalker"),
@@ -1870,6 +1892,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_codec::PAIR_METHODS,
     },
     KindInfo {
+        kind: HostKind::DfuEither,
+        tag: "deither",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_either::either_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_either::EITHER_METHODS,
+    },
+    KindInfo {
         kind: HostKind::OpaqueCodec,
         tag: "ocdc",
         class: ClassRule::Unknown {
@@ -1977,6 +2008,14 @@ const KINDS: &[KindInfo] = &[
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::CODING_ERROR_ACTION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StackWalkerOption,
+        tag: "swopt",
+        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
+        // One object per enum constant.
+        canonical: always_canonical,
+        methods: &crate::runtime::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
     },
     KindInfo {
         kind: HostKind::UnicodeBlock,
