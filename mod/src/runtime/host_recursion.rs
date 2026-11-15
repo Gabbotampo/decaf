@@ -99,6 +99,14 @@ pub(crate) fn stack_overflow() -> NativeError {
     }
 }
 
+/// Record a bounded host walk refusal at an explicit logical depth. Compact
+/// host representations can detect their bound without physically recursing
+/// to it.
+pub(crate) fn refuse_at(depth: usize) -> NativeError {
+    REFUSED.with(|refused| *refused.borrow_mut().entry(depth).or_default() += 1);
+    stack_overflow()
+}
+
 pub(crate) const STACK_OVERFLOW: &str = "java/lang/StackOverflowError";
 
 /// Whether `error` is a `StackOverflowError` a walk threw: a caller that otherwise answers a
