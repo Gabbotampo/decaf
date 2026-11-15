@@ -1,0 +1,2 @@
+mapOf=1:1
+mapOfEntries=1:2
