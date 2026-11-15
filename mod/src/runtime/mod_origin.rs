@@ -40,8 +40,7 @@ pub(crate) fn root_path(id: &str) -> String {
 
 /// Answer one `ModOrigin` or `ModOrigin$Kind` call, or `None` when the receiver
 /// is not an origin.
-pub(super) fn invoke<H: crate::runtime::Host>(
-    host: &mut H,
+pub(super) fn invoke(
     r: &MethodRef,
     receiver: Option<&Value>,
     _args: &[Value],
@@ -87,20 +86,17 @@ pub(super) fn invoke<H: crate::runtime::Host>(
             if kind != "path" {
                 return Err(unsupported(&format!("kind {named} doesn't have paths")));
             }
-            // `ModOriginImpl.getPaths()` returns its `paths` field: the same
-            // list on every call (#156 P14d2).
-            let paths = vec![path_value(&root_path(argument))];
-            match host.owned_collection(
-                receiver,
-                "getPaths",
-                crate::runtime::stand_in_class("list"),
-                false,
-                paths,
-            ) {
-                Some(list) => list,
-                None => return host.unknown_operand_call(r).map(Some),
-            }
-        }
+            host.origin_paths(receiver, &root_path(argument)).unwrap_or_else(|| {
+                host.owned_collection(
+                    receiver,
+                    "getPaths",
+                    "java/util/Collections$SingletonList",
+                    false,
+                    vec![path_value(&root_path(argument))],
+                )
+                .unwrap_or(Value::Ref(None))
+            })
+        },
         ("getParentModId", "()Ljava/lang/String;") => {
             if kind != "nested" {
                 return Err(unsupported(&format!(

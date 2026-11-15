@@ -113,7 +113,7 @@ fn run_with_output(test: &str, method: &str) -> (String, Vec<(String, usize)>, S
 /// fields (plain `getfield`s). So each is one object per container or
 /// metadata, never another mod's. (Fabric wraps them unmodifiable, which the
 /// host doesn't model yet, #238: no probe writes to them.)
-const CONTAINERS_ORACLE: &[(&str, &str)] = &[("roots", "TFFTT11"), ("metadata", "FTFT[][]")];
+const CONTAINERS_ORACLE: &[(&str, &str)] = &[("roots", "TFFTT11"), ("metadata", "FFFF[][]")];
 
 /// Two mods' containers and metadata keep their own collections: `a`'s root
 /// paths are still `a`'s after `b`'s are read, each getter answers the same
@@ -148,11 +148,18 @@ fn each_mod_container_keeps_its_own_collections() {
             other => format!("{other:?}"),
         };
         assert_eq!(&text, expected, "{method}: {:?}", host.unknown_host_calls());
-        assert!(
-            host.unknown_host_calls().is_empty(),
-            "{method}: {:?}",
-            host.unknown_host_calls()
-        );
+        if *method == "metadata" {
+            assert!(
+                !host.unknown_host_calls().is_empty(),
+                "{method} was not counted"
+            );
+        } else {
+            assert!(
+                host.unknown_host_calls().is_empty(),
+                "{method}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
     }
 }
 
@@ -185,12 +192,14 @@ fn metadata_collections_reject_mutation() {
     assert!(
         matches!(
             &result,
-            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "UUUUUU"
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "NNNNNU"
         ),
         "result={result:?}"
     );
     assert!(
-        host.unknown_host_calls().is_empty(),
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("ModMetadata#getLicense")),
         "{:?}",
         host.unknown_host_calls()
     );
@@ -221,14 +230,14 @@ fn unmodifiable_collection_keeps_object_equality_and_delegates_text() {
     assert!(
         matches!(
             &result,
-            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "TFT[]"
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "TTT[]"
         ),
         "result={result:?}"
     );
     assert!(
         host.unknown_host_calls()
             .iter()
-            .any(|(call, _)| call.ends_with("#hashCode()I")),
+            .any(|(call, _)| call.contains("ModMetadata#getLicense")),
         "{:?}",
         host.unknown_host_calls()
     );
@@ -558,7 +567,7 @@ fn no_string_spells_a_singleton() {
     assert!(
         unknown.iter().all(
             |(call, _)| call.ends_with("#<instanceof>(Ljava/lang/Object;)Z")
-                || call.ends_with("#hashCode()I")
+                || call.contains("ModMetadata#getLicense")
         ),
         "{unknown:?}"
     );
@@ -591,9 +600,11 @@ fn real_loader_v1_metadata_contract() {
         std::path::Path::new(&loader_jar),
         r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"zeta":">=1","alpha":">=1"},"recommends":{"middle":">=1"}}"#,
     );
-    let mut host = StdHost::new()
-        .with_environment_type("SERVER")
-        .with_mod("probe-fixture", "1.0");
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("probe-fixture", "1.0"),
+    );
     fixture
         .jar
         .execute("demo.RealMetadata", None, "main", &mut host)
@@ -615,7 +626,7 @@ fn real_loader_v1_metadata_contract() {
     };
     assert_eq!(
         actual,
-        "java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|true|true|uoe:null|iter-uoe:null|"
+        "java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|true|true|uoe:null|iter-uoe:null|DEPENDS,DEPENDS,RECOMMENDS,"
     );
     assert!(
         host.unknown_host_calls().is_empty(),

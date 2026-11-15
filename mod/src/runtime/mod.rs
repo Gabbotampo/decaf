@@ -3844,7 +3844,8 @@ impl StdHost {
         };
         let cache = (identity, member.to_owned());
         if let Some(marker) = self.cached_collections.get(&cache)
-            && self.mutable_collections.contains_key(marker)
+            && (self.mutable_collections.contains_key(marker)
+                || self.unmodifiable_collections.contains_key(marker))
         {
             return jar_object::collection(marker.clone());
         }
@@ -10996,33 +10997,11 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
-            // The metadata keeps each of these: one empty collection per
-            // metadata object and member, the same on every call.
-            (
-                "net/fabricmc/loader/api/metadata/ModMetadata",
-                "getProvides" | "getAuthors" | "getContributors" | "getLicense",
-                "()Ljava/util/Collection;",
-            ) => Ok(self.cached_unmodifiable_collection(
-                receiver,
-                &r.name,
-                "java/util/Collections$UnmodifiableCollection",
-                Vec::new(),
-            )),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
                 "(I)Ljava/util/Optional;",
             ) => Ok(empty_optional()),
-            (
-                "net/fabricmc/loader/api/metadata/ModMetadata",
-                "getDependencies",
-                "()Ljava/util/Collection;",
-            ) => Ok(self.cached_unmodifiable_collection(
-                receiver,
-                "getDependencies",
-                "java/util/Collections$UnmodifiableCollection",
-                Vec::new(),
-            )),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
