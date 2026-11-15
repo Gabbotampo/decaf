@@ -24661,6 +24661,20 @@ impl<H: Host> Runtime<'_, H> {
             })
     }
 
+    fn gson_write_target(&mut self, target: &str, text: &str) -> Result<(), NativeError> {
+        if let Some(key) = self.io_sink_key(target) {
+            self.io_writers.entry(key).or_default().push_str(text);
+            return Ok(());
+        }
+        if let Some(builder) = self.string_builders.get_mut(target) {
+            builder.push_str(text);
+            return Ok(());
+        }
+        Err(NativeError::Metadata(
+            "Gson Appendable is not modeled".into(),
+        ))
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -24694,6 +24708,10 @@ impl<H: Host> Runtime<'_, H> {
                 ("close", "()V") => Ok(Some(Value::Void)),
                 _ => Ok(None),
             };
+        }
+        // JsonWriter state/options are not modeled; count every call.
+        if r.owner == "com/google/gson/stream/JsonWriter" {
+            return self.host.unknown_operand_call(r).map(Some);
         }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
@@ -24745,6 +24763,11 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
+                    ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
+                    }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
                     // all write the same value, so the descriptor only has to
@@ -24768,6 +24791,15 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some),
                         }
+                    }
+                    (name, descriptor)
+                        if name == "toJson"
+                            && descriptor.ends_with(")V")
+                            && descriptor.contains("JsonWriter") =>
+                    {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
                     }
                     (name, descriptor)
                         if name == "toJson"
@@ -24801,17 +24833,15 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if let Some(key) = self.io_sink_key(target) {
-                            self.io_writers.entry(key).or_default().push_str(&text);
-                            return Ok(Some(Value::Void));
+                        if self.io_sink_key(target).is_none()
+                            && !self.string_builders.contains_key(target)
+                        {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
                         }
-                        let builder = self.string_builders.get_mut(target).ok_or_else(|| {
-                            NativeError::Metadata(format!(
-                                "Gson.toJson Appendable {target} is not a modelled StringBuilder, \
-                             StringWriter or file writer"
-                            ))
-                        })?;
-                        builder.push_str(&text);
+                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
