@@ -199,6 +199,10 @@ mod registry_lookup;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
+mod stream_codec;
+#[cfg(test)]
+#[path = "stream_codec_tests.rs"]
+mod stream_codec_tests;
 mod stream_pipeline;
 mod string_code_points;
 mod string_constructors;
@@ -24005,6 +24009,9 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
         // A game codec factory whose result a class only stores.
+        if let Some(value) = stream_codec::static_call(r, args) {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_game_codec_factory(r) {
             return Ok(Some(value));
         }
@@ -32752,6 +32759,7 @@ mod tests {
         // `%a` of an `Integer` throws on the JDK: the call is the host's,
         // counted, not an approximation.
         assert_eq!(format("%a", "[Ljava/lang/Object;#0"), Value::Ref(None));
+        #[allow(clippy::drop_non_drop)]
         drop(format);
         let locale_method = MethodRef {
             owner: "java/lang/String".into(),
