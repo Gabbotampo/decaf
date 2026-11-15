@@ -388,6 +388,10 @@ pub enum HostKind {
     /// An object `new` (or a model) allocated: key `class#n`
     /// (`jar_object.rs`), one key per allocation.
     JarObject,
+    /// A modelled `java.io.Writer` allocation. Its key is `class#n`, but the
+    /// separate kind keeps Gson from accepting an arbitrary jar object as a
+    /// writer sink.
+    Writer,
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
@@ -1886,6 +1890,13 @@ const KINDS: &[KindInfo] = &[
         tag: "obj",
         class: ClassRule::FromKey(crate::runtime::jar_object::class_of_key),
         // `Runtime::new_object` numbers every allocation once.
+        canonical: always_canonical,
+        methods: &crate::runtime::jar_object::JAR_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::Writer,
+        tag: "wrtr",
+        class: ClassRule::FromKey(crate::runtime::jar_object::class_of_key),
         canonical: always_canonical,
         methods: &crate::runtime::jar_object::JAR_OBJECT,
     },

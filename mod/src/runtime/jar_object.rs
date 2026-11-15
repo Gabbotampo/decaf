@@ -49,6 +49,15 @@ pub(crate) fn handle(key: String) -> Value {
     Value::Host(HostRef::new(HostKind::JarObject, key))
 }
 
+/// A canonical handle for one of the runtime's modelled `java.io.Writer`
+/// classes. Keeping this family separate from ordinary jar objects is part of
+/// the sink boundary: Gson may write only to this kind (or an Appendable
+/// family explicitly handled by its overload).
+pub(crate) fn writer_handle(key: String) -> Value {
+    debug_assert!(split_key(&key).is_some(), "{key:?} is no allocation key");
+    Value::Host(HostRef::new(HostKind::Writer, key))
+}
+
 /// The object a table row of the runtime's own names by its key (a model's
 /// field holding a child's key). Never for a jar's text: a key is a handle's
 /// only, and a `String` spelling one is no object. The kind is canonical, so
@@ -56,6 +65,18 @@ pub(crate) fn handle(key: String) -> Value {
 pub(crate) fn stored(key: &str) -> Value {
     if collection_key(key).is_some() {
         return collection(key.to_owned());
+    }
+    if matches!(
+        key_class(key),
+        Some(
+            "java/io/BufferedWriter"
+                | "java/io/FileWriter"
+                | "java/io/OutputStreamWriter"
+                | "java/io/PrintWriter"
+                | "java/io/StringWriter"
+        )
+    ) {
+        return writer_handle(key.to_owned());
     }
     handle(key.to_owned())
 }
@@ -157,7 +178,10 @@ pub(crate) fn spells_key_text(text: &str) -> bool {
 /// Whether `handle` is an allocated object: a jar's (or a model's) `new`, or
 /// a collection the host made.
 pub(crate) fn is_object_handle(handle: &HostRef) -> bool {
-    matches!(handle.kind(), HostKind::JarObject | HostKind::Collection)
+    matches!(
+        handle.kind(),
+        HostKind::JarObject | HostKind::Writer | HostKind::Collection
+    )
 }
 
 /// `ClassRule::FromKey` of a jar object: the class before the allocation

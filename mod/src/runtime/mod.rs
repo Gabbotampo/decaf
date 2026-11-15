@@ -10972,6 +10972,17 @@ impl Host for StdHost {
     }
 }
 
+fn modelled_writer_class(class: &str) -> bool {
+    matches!(
+        class,
+        "java/io/BufferedWriter"
+            | "java/io/FileWriter"
+            | "java/io/OutputStreamWriter"
+            | "java/io/PrintWriter"
+            | "java/io/StringWriter"
+    )
+}
+
 fn expect_int(r: &MethodRef, value: &Value) -> Result<i32, NativeError> {
     match value {
         Value::Int(value) => Ok(*value),
@@ -22569,7 +22580,11 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
-        jar_object::handle(key)
+        if modelled_writer_class(class) {
+            jar_object::writer_handle(key)
+        } else {
+            jar_object::handle(key)
+        }
     }
 
     /// A fresh allocation key `class#n`, for a model whose object is a handle
@@ -25362,17 +25377,47 @@ impl<H: Host> Runtime<'_, H> {
         ))
     }
 
-    fn gson_writer_target_supported(&self, target: &str) -> bool {
-        self.io_sink_key(target).is_some() || self.string_builders.contains_key(target)
+    fn gson_writer_target_marker(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::Writer || !modelled_writer_class(
+            crate::runtime::jar_object::packaged_object_class(value)?,
+        ) {
+            return None;
+        }
+        let marker = handle.key_text();
+        self.io_sink_key(marker).map(|_| marker.to_owned())
     }
 
-    fn gson_host_object_marker(value: &Value) -> Option<String> {
-        match value {
-            Value::Host(handle) if crate::runtime::jar_object::is_object_handle(handle) => {
-                Some(handle.key_text().to_owned())
-            }
-            _ => None,
+    fn gson_appendable_target_marker(&self, value: &Value) -> Option<String> {
+        if let Some(marker) = self.gson_writer_target_marker(value) {
+            return Some(marker);
         }
+        let Value::Host(handle) = value else {
+            return host_service::stream_marker(value).cloned();
+        };
+        let marker = handle.key_text();
+        if handle.kind() == HostKind::JarObject
+            && matches!(
+                crate::runtime::jar_object::packaged_object_class(value),
+                Some("java/lang/StringBuilder" | "java/lang/StringBuffer")
+            )
+            && self.string_builders.contains_key(marker)
+        {
+            return Some(marker.to_owned());
+        }
+        None
+    }
+
+    fn gson_json_writer_marker(value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::JarObject
+            && crate::runtime::jar_object::packaged_object_class(value)
+                == Some("com/google/gson/stream/JsonWriter"))
+        .then(|| handle.key_text().to_owned())
     }
 
     fn gson_writer_fallback(
@@ -25397,7 +25442,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return self.gson_writer_fallback(r, receiver, args);
         };
-        let Some(marker) = Self::gson_host_object_marker(receiver) else {
+        let Some(marker) = Self::gson_json_writer_marker(receiver) else {
             return self.gson_writer_fallback(r, Some(receiver), args);
         };
         if r.name == "<init>" {
@@ -25414,14 +25459,9 @@ impl<H: Host> Runtime<'_, H> {
                     frame: None,
                 });
             }
-            let Some(target) = Self::gson_host_object_marker(argument)
-                .or_else(|| host_service::stream_marker(argument).cloned())
-            else {
+            let Some(target) = self.gson_writer_target_marker(argument) else {
                 return self.gson_writer_fallback(r, Some(receiver), args);
             };
-            if !self.gson_writer_target_supported(&target) {
-                return self.gson_writer_fallback(r, Some(receiver), args);
-            }
             self.gson_writers
                 .insert(marker, gson_writer::State::new(target.to_owned()));
             return Ok(Some(Value::Void));
@@ -25769,20 +25809,13 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
                         let Some(target) = args.first().and_then(|value| {
-                            Self::gson_host_object_marker(value)
-                                .or_else(|| host_service::stream_marker(value).cloned())
+                            self.gson_writer_target_marker(value)
                         }) else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        if !self.gson_writer_target_supported(&target) {
-                            return self
-                                .host
-                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                                .map(Some);
-                        }
                         let writer = self.new_object("com/google/gson/stream/JsonWriter");
                         if let Some(marker) = expect_ref(&writer) {
                             let mut state = gson_writer::State::new(target.to_owned());
@@ -25821,7 +25854,7 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("JsonWriter") =>
                     {
-                        let Some(writer) = args.last().and_then(Self::gson_host_object_marker)
+                        let Some(writer) = args.last().and_then(Self::gson_json_writer_marker)
                         else {
                             return self
                                 .host
@@ -25890,25 +25923,15 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                        let target = args
+                        let Some(target) = args
                             .last()
-                            .and_then(|arg| {
-                                Self::gson_host_object_marker(arg)
-                                    .or_else(|| host_service::stream_marker(arg).cloned())
-                            })
-                            .ok_or_else(|| {
-                                NativeError::Metadata(
-                                    "Gson.toJson needs an Appendable receiver".into(),
-                                )
-                            })?;
-                        if self.io_sink_key(&target).is_none()
-                            && !self.string_builders.contains_key(&target)
-                        {
+                            .and_then(|arg| self.gson_appendable_target_marker(arg))
+                        else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
-                        }
+                        };
                         self.gson_write_target(&target, &text)?;
                         Ok(Some(Value::Void))
                     }

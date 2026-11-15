@@ -157,6 +157,22 @@ public final class Probe {
     StringWriter out = new StringWriter(); JsonWriter w = new JsonWriter(out); w.setIndent("\t"); w.setHtmlSafe(false); w.setSerializeNulls(true); gson.toJson(o, w);
     return q(out.toString()) + "|after=" + w.isHtmlSafe() + "," + w.getSerializeNulls();
   }
+  static final class FakeWriter extends Writer {
+    public void write(char[] value, int off, int len) {}
+    public void flush() {}
+    public void close() {}
+  }
+  static final class FakeJsonWriter extends JsonWriter {
+    FakeJsonWriter() { super(new StringWriter()); }
+  }
+  public static String sinkKinds() throws Exception {
+    Gson gson = new Gson(); JsonObject o = new JsonObject();
+    StringBuilder builder = new StringBuilder(); gson.toJson(o, builder);
+    StringWriter writer = new StringWriter(); gson.toJson(o, writer);
+    gson.toJson(o, new FakeWriter());
+    gson.toJson(o, new FakeJsonWriter());
+    return builder.toString() + "|" + writer.toString();
+  }
   public static String addProperties() {
     Gson gson = new GsonBuilder().setPrettyPrinting().serializeNulls().create(); JsonObject x = new JsonObject();
     x.addProperty("str", "s"); x.addProperty("bool", Boolean.TRUE); x.addProperty("num", Double.valueOf(2.5)); x.addProperty("char", Character.valueOf('x'));
@@ -311,6 +327,24 @@ fn json_object_add_property_overloads_and_nulls_match_real_gson() {
         "{\n  \"str\": \"s\",\n  \"bool\": true,\n  \"num\": 2.5,\n  \"char\": \"x\",\n  \"ns\": null,\n  \"nb\": null,\n  \"nn\": null,\n  \"nc\": null\n}"
     );
     assert_eq!(f.text("nullKey"), "key == null");
+}
+
+#[test]
+fn only_canonical_writer_and_appendable_handles_are_modelled() {
+    let f = Fixture::new();
+    let mut host = StdHost::new();
+    assert_eq!(
+        f.call_with_host("sinkKinds", &mut host).unwrap(),
+        Value::Ref(Some("{}|{}".into()))
+    );
+    let calls = host.unknown_host_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call.starts_with("com/google/gson/Gson#toJson")
+                && call.contains("Appendable"))
+    );
+    assert!(calls.iter().any(|(call, _)| call.contains("JsonWriter")));
 }
 
 #[test]
