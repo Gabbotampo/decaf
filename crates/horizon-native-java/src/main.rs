@@ -949,9 +949,14 @@ fn command_summary(
         return serde_json::Value::Null;
     }
     let mut refused = None;
+    let event = if server {
+        GameEvent::RegisterCommands
+    } else {
+        GameEvent::ClientRegisterCommands
+    };
     for listener in &listeners {
         let mut firing = EventFiring::new(
-            GameEvent::RegisterCommands,
+            event,
             std::sync::Arc::new(EventFacade {
                 dedicated: true,
                 ..EventFacade::default()
@@ -1102,7 +1107,9 @@ fn frame_census(
             l.event.name().starts_with("client_")
                 && !matches!(
                     l.event,
-                    GameEvent::ClientRegisterKeyMappings | GameEvent::ClientRegisterGuiLayers
+                    GameEvent::ClientRegisterKeyMappings
+                        | GameEvent::ClientRegisterGuiLayers
+                        | GameEvent::ClientRegisterCommands
                 )
         })
         .collect();

@@ -6,6 +6,9 @@ import net.fabricmc.fabric.api.client.particle.v1.ParticleProviderRegistry;
 import net.minecraft.client.gui.components.debug.*;
 import net.minecraft.client.gui.screens.MenuScreens;
 import net.fabricmc.fabric.api.client.rendering.v1.ModelLayerRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+import net.fabricmc.fabric.api.client.model.loading.v1.PreparableModelLoadingPlugin;
+import net.minecraft.client.gui.components.debug.DebugScreenEntryStatus;
 
 public class Probe {
   public static String identities() {
@@ -24,6 +27,38 @@ public class Probe {
       ModelLayerRegistry.registerModelLayer(loc, new Object());
       return "none";
     } catch (IllegalArgumentException e) { return e.getClass().getSimpleName(); }
+  }
+  public static String particle_semantics() {
+    SimpleParticleType a = FabricParticleTypes.simple(true);
+    SimpleParticleType b = FabricParticleTypes.simple(false);
+    ParticleType<?> c = FabricParticleTypes.complex(true, null, null);
+    ParticleType<?> d = FabricParticleTypes.complex(false, null, null);
+    return a.getOverrideLimiter() + "|" + b.getOverrideLimiter() + "|" + c.getOverrideLimiter() + "|" + d.getOverrideLimiter()
+        + "|" + (a.getType() == a) + "|" + (a == b) + "|" + (c == d);
+  }
+  public static String hud_ids() {
+    return VanillaHudElements.CHAT.toString() + "|" + VanillaHudElements.INFO_BAR_FOREGROUND.toString();
+  }
+  public static String profiles() {
+    java.util.Map<DebugScreenProfile, java.util.Map<Identifier, DebugScreenEntryStatus>> profiles = DebugScreenEntries.PROFILES;
+    return (profiles.get(DebugScreenProfile.DEFAULT).get(DebugScreenEntries.FPS) == DebugScreenEntryStatus.IN_OVERLAY) + "|"
+        + (profiles.get(DebugScreenProfile.PERFORMANCE).get(DebugScreenEntries.FPS) == DebugScreenEntryStatus.ALWAYS_ON);
+  }
+  public static String model_equal() {
+    try {
+      ModelLayerRegistry.registerModelLayer(new net.minecraft.client.model.geom.ModelLayerLocation(Identifier.withDefaultNamespace("x"), "main"), new Object());
+      ModelLayerRegistry.registerModelLayer(new net.minecraft.client.model.geom.ModelLayerLocation(Identifier.withDefaultNamespace("x"), "main"), new Object());
+      return "none";
+    } catch (IllegalArgumentException e) { return e.getMessage(); }
+  }
+  public static String preparable_nulls() {
+    String a;
+    String b;
+    try { PreparableModelLoadingPlugin.register(null, null); a = "none"; }
+    catch (NullPointerException e) { a = e.getMessage(); }
+    try { PreparableModelLoadingPlugin.register(new PreparableModelLoadingPlugin.DataLoader<Object>() {}, null); b = "none"; }
+    catch (NullPointerException e) { b = e.getMessage(); }
+    return a + "|" + b;
   }
   public static String fields() {
     return (DebugScreenEntries.FPS != null) + "|" + (net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements.CHAT != null);

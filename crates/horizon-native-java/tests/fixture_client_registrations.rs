@@ -13,19 +13,27 @@ const API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/core/particles/ParticleType.java",
-        r#"package net.minecraft.core.particles; public class ParticleType<T> {}"#,
+        r#"package net.minecraft.core.particles; public abstract class ParticleType<T> { public boolean getOverrideLimiter() { throw new AssertionError(); } public Object codec() { throw new AssertionError(); } public Object streamCodec() { throw new AssertionError(); } }"#,
     ),
     (
         "net/minecraft/core/particles/SimpleParticleType.java",
-        r#"package net.minecraft.core.particles; public class SimpleParticleType extends ParticleType<Object> {}"#,
+        r#"package net.minecraft.core.particles; public class SimpleParticleType extends ParticleType<Object> { public SimpleParticleType getType() { throw new AssertionError(); } }"#,
     ),
     (
         "net/minecraft/client/particle/ParticleProvider.java",
         r#"package net.minecraft.client.particle; public interface ParticleProvider<T> {}"#,
     ),
     (
+        "com/mojang/serialization/MapCodec.java",
+        r#"package com.mojang.serialization; public class MapCodec<T> {}"#,
+    ),
+    (
+        "net/minecraft/network/codec/StreamCodec.java",
+        r#"package net.minecraft.network.codec; public class StreamCodec<A, T> {}"#,
+    ),
+    (
         "net/fabricmc/fabric/api/particle/v1/FabricParticleTypes.java",
-        r#"package net.fabricmc.fabric.api.particle.v1; public final class FabricParticleTypes { public static net.minecraft.core.particles.SimpleParticleType simple() { throw new AssertionError(); } public static <T> net.minecraft.core.particles.ParticleType<T> complex(Object a, Object b) { throw new AssertionError(); } }"#,
+        r#"package net.fabricmc.fabric.api.particle.v1; public final class FabricParticleTypes { public static net.minecraft.core.particles.SimpleParticleType simple() { throw new AssertionError(); } public static net.minecraft.core.particles.SimpleParticleType simple(boolean b) { throw new AssertionError(); } public static <T> net.minecraft.core.particles.ParticleType<T> complex(com.mojang.serialization.MapCodec<T> a, net.minecraft.network.codec.StreamCodec<?, T> b) { throw new AssertionError(); } public static <T> net.minecraft.core.particles.ParticleType<T> complex(boolean x, com.mojang.serialization.MapCodec<T> a, net.minecraft.network.codec.StreamCodec<?, T> b) { throw new AssertionError(); } }"#,
     ),
     (
         "net/fabricmc/fabric/api/client/particle/v1/ParticleProviderRegistry.java",
@@ -37,7 +45,11 @@ const API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/client/gui/components/debug/DebugScreenEntries.java",
-        r#"package net.minecraft.client.gui.components.debug; public class DebugScreenEntries { public static net.minecraft.resources.Identifier register(net.minecraft.resources.Identifier i, DebugScreenEntry e) { throw new AssertionError(); } public static final net.minecraft.resources.Identifier FPS = null; }"#,
+        r#"package net.minecraft.client.gui.components.debug; public class DebugScreenEntries { public static net.minecraft.resources.Identifier register(net.minecraft.resources.Identifier i, DebugScreenEntry e) { throw new AssertionError(); } public static final net.minecraft.resources.Identifier FPS = null; public static final java.util.Map<DebugScreenProfile, java.util.Map<net.minecraft.resources.Identifier, DebugScreenEntryStatus>> PROFILES = null; }"#,
+    ),
+    (
+        "net/minecraft/client/gui/components/debug/DebugScreenEntryStatus.java",
+        r#"package net.minecraft.client.gui.components.debug; public enum DebugScreenEntryStatus { IN_OVERLAY, ALWAYS_ON }"#,
     ),
     (
         "net/minecraft/client/gui/components/debug/DebugScreenProfile.java",
@@ -49,11 +61,11 @@ const API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/fabricmc/fabric/api/client/rendering/v1/hud/VanillaHudElements.java",
-        r#"package net.fabricmc.fabric.api.client.rendering.v1.hud; public final class VanillaHudElements { public static final net.minecraft.resources.Identifier CHAT = null; }"#,
+        r#"package net.fabricmc.fabric.api.client.rendering.v1.hud; public final class VanillaHudElements { public static final net.minecraft.resources.Identifier CHAT = null; public static final net.minecraft.resources.Identifier INFO_BAR_FOREGROUND = null; }"#,
     ),
     (
         "net/minecraft/client/model/geom/ModelLayerLocation.java",
-        r#"package net.minecraft.client.model.geom; public class ModelLayerLocation { public ModelLayerLocation(Object id, String part) {} }"#,
+        r#"package net.minecraft.client.model.geom; public record ModelLayerLocation(net.minecraft.resources.Identifier model, String layer) {}"#,
     ),
     (
         "net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry.java",
@@ -62,6 +74,10 @@ const API_STUBS: &[(&str, &str)] = &[
     (
         "net/fabricmc/fabric/api/client/rendering/v1/EntityRendererRegistry.java",
         r#"package net.fabricmc.fabric.api.client.rendering.v1; public final class EntityRendererRegistry { public static void register(Object e, Object p) { throw new AssertionError(); } }"#,
+    ),
+    (
+        "net/fabricmc/fabric/api/client/model/loading/v1/PreparableModelLoadingPlugin.java",
+        r#"package net.fabricmc.fabric.api.client.model.loading.v1; public interface PreparableModelLoadingPlugin<T> { interface DataLoader<T> {} static <T> void register(DataLoader<T> loader, PreparableModelLoadingPlugin<T> plugin) { throw new AssertionError(); } }"#,
     ),
     (
         "net/fabricmc/fabric/api/client/model/loading/v1/ModelLoadingPlugin.java",
@@ -88,6 +104,22 @@ fn client_registration_surfaces_keep_java25_identity_and_order() {
         "IllegalArgumentException"
     );
     assert_eq!(fixture.text_on(&mut host, "fields"), "true|true");
+    assert_eq!(
+        fixture.text_on(&mut host, "particle_semantics"),
+        "true|false|true|false|true|false|false"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "hud_ids"),
+        "minecraft:chat|minecraft:info_bar_foreground"
+    );
+    assert_eq!(fixture.text_on(&mut host, "profiles"), "true|true");
+    assert!(fixture
+        .text_on(&mut host, "model_equal")
+        .starts_with("Cannot replace registration for model layer \"ModelLayerLocation[model=minecraft:x, layer=main]\""));
+    assert_eq!(
+        fixture.text_on(&mut host, "preparable_nulls"),
+        "data loader must not be null|plugin must not be null"
+    );
     assert_eq!(
         host.unknown_host_call_count(),
         0,

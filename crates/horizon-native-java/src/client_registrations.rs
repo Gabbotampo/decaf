@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::host_ref::{HostKind, HostRef};
 use crate::{MethodRef, NativeError, Value};
 
 const PARTICLE_REGISTRY: &str =
@@ -16,8 +17,12 @@ const MENU_SCREENS: &str = "net/minecraft/client/gui/screens/MenuScreens";
 const MODEL_LAYERS: &str = "net/fabricmc/fabric/api/client/rendering/v1/ModelLayerRegistry";
 const ENTITY_RENDERERS: &str = "net/fabricmc/fabric/api/client/rendering/v1/EntityRendererRegistry";
 const MODEL_LOADING: &str = "net/fabricmc/fabric/api/client/model/loading/v1/ModelLoadingPlugin";
+const PREPARABLE_MODEL_LOADING: &str =
+    "net/fabricmc/fabric/api/client/model/loading/v1/PreparableModelLoadingPlugin";
+const MODEL_LOCATION: &str = "net/minecraft/client/model/geom/ModelLayerLocation";
 const VANILLA_HUD: &str = "net/fabricmc/fabric/api/client/rendering/v1/hud/VanillaHudElements";
 const DEBUG_PROFILE: &str = "net/minecraft/client/gui/components/debug/DebugScreenProfile";
+const DEBUG_STATUS: &str = "net/minecraft/client/gui/components/debug/DebugScreenEntryStatus";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Registration {
@@ -52,6 +57,7 @@ pub(crate) struct State {
     next_particle_type: u64,
     model_layers: BTreeSet<String>,
     armor_layers: BTreeSet<String>,
+    model_locations: BTreeMap<String, (String, String)>,
     menu_screens: BTreeSet<String>,
     static_values: BTreeMap<String, Value>,
 }
@@ -68,6 +74,122 @@ fn value_key(value: &Value) -> String {
 
 fn identifier(value: &Value) -> Option<String> {
     crate::host_ids::identifier_key(value).map(str::to_owned)
+}
+
+fn debug_profiles_map(name: &str) -> Value {
+    Value::Host(HostRef::new(HostKind::DebugProfilesMap, name))
+}
+
+fn debug_profile(value: &Value) -> Option<&str> {
+    crate::expect_ref(value)?
+        .strip_prefix("enum/net/minecraft/client/gui/components/debug/DebugScreenProfile/")
+}
+
+fn debug_status(status: &str) -> Value {
+    Value::Ref(Some(format!("enum/{DEBUG_STATUS}/{status}")))
+}
+
+const DEFAULT_PROFILE_IDS: &[&str] = &[
+    "three_dimensional_crosshair",
+    "game_version",
+    "tps",
+    "fps",
+    "memory",
+    "system_specs",
+    "player_position",
+    "player_section_position",
+    "simple_performance_impactors",
+];
+const PERFORMANCE_PROFILE_IDS: &[&str] = &[
+    "tps",
+    "fps",
+    "gpu_utilization",
+    "memory",
+    "simple_performance_impactors",
+];
+
+fn profile_ids(profile: &str) -> Option<&'static [&'static str]> {
+    match profile {
+        "DEFAULT" => Some(DEFAULT_PROFILE_IDS),
+        "PERFORMANCE" => Some(PERFORMANCE_PROFILE_IDS),
+        _ => None,
+    }
+}
+
+fn profile_status(profile: &str, id: &str) -> Option<Value> {
+    profile_ids(profile)?.contains(&id).then(|| {
+        let status = if profile == "PERFORMANCE" && id == "fps" {
+            "ALWAYS_ON"
+        } else {
+            "IN_OVERLAY"
+        };
+        debug_status(status)
+    })
+}
+
+fn profile_map_call(
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let Value::Host(handle) = receiver else {
+        return None;
+    };
+    if handle.kind() != HostKind::DebugProfilesMap || r.owner != "java/util/Map" {
+        return None;
+    }
+    let profile = handle.key().strip_prefix("profile/");
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("get", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+            let key = args.first()?;
+            if let Some(profile) = profile {
+                let id = identifier(key)?;
+                let path = id.strip_prefix("minecraft:").unwrap_or(&id);
+                Some(Ok(profile_status(profile, path).unwrap_or(Value::Ref(None))))
+            } else {
+                Some(Ok(debug_profile(args.first()?)
+                    .map_or(Value::Ref(None), |name| {
+                        debug_profiles_map(&format!("profile/{name}"))
+                    })))
+            }
+        }
+        ("containsKey", "(Ljava/lang/Object;)Z") => {
+            let key = args.first()?;
+            let found = if let Some(profile) = profile {
+                identifier(key)
+                    .and_then(|id| {
+                        profile_status(profile, id.strip_prefix("minecraft:").unwrap_or(&id))
+                    })
+                    .is_some()
+            } else {
+                debug_profile(key).is_some_and(|name| profile_ids(name).is_some())
+            };
+            Some(Ok(Value::Int(i32::from(found))))
+        }
+        ("size", "()I") => {
+            Some(Ok(Value::Int(profile.map_or(2, |name| {
+                profile_ids(name).map_or(0, <[&str]>::len) as i32
+            }))))
+        }
+        ("isEmpty", "()Z") => Some(Ok(Value::Int(0))),
+        ("getOrDefault", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") => {
+            let key = args.first()?;
+            let value = if let Some(profile) = profile {
+                identifier(key)
+                    .and_then(|id| profile_status(profile, &id))
+                    .unwrap_or_else(|| args.get(1).cloned().unwrap_or(Value::Ref(None)))
+            } else {
+                debug_profile(key)
+                    .filter(|name| profile_ids(name).is_some())
+                    .map_or_else(
+                        || args.get(1).cloned().unwrap_or(Value::Ref(None)),
+                        |name| debug_profiles_map(&format!("profile/{name}")),
+                    )
+            };
+            Some(Ok(value))
+        }
+        _ => None,
+    }
 }
 
 fn illegal_state(message: impl Into<String>) -> NativeError {
@@ -147,6 +269,7 @@ const HUD_IDS: &[&str] = &[
     "mount_health",
     "info_bar",
     "experience_level",
+    "info_bar_foreground",
     "held_item_tooltip",
     "spectator_tooltip",
     "mob_effects",
@@ -167,24 +290,25 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Value> {
     if let Some(value) = state.static_values.get(&cache_key) {
         return Some(value.clone());
     }
-    let value = if r.owner == VANILLA_HUD
+    let lower_name = r.name.to_ascii_lowercase();
+    let value = if (r.owner == VANILLA_HUD
         && r.descriptor == "Lnet/minecraft/resources/Identifier;"
-        && HUD_IDS.iter().any(|id| *id == r.name.to_ascii_lowercase())
+        && HUD_IDS.iter().any(|id| *id == lower_name))
+        || (r.owner == DEBUG_ENTRIES
+            && r.descriptor == "Lnet/minecraft/resources/Identifier;"
+            && DEBUG_IDS.iter().any(|id| *id == lower_name))
     {
         Some(crate::host_ids::identifier_of_text(&format!(
-            "minecraft:{}",
-            r.name
+            "minecraft:{lower_name}"
         )))
-    } else if r.owner == DEBUG_ENTRIES
-        && r.descriptor == "Lnet/minecraft/resources/Identifier;"
-        && DEBUG_IDS
-            .iter()
-            .any(|id| *id == r.name.to_ascii_lowercase())
+    } else if r.owner == DEBUG_ENTRIES && r.name == "PROFILES" && r.descriptor == "Ljava/util/Map;"
     {
-        let id = r.name.to_ascii_lowercase();
-        Some(crate::host_ids::identifier_of_text(&format!(
-            "minecraft:{id}"
-        )))
+        Some(debug_profiles_map("profiles"))
+    } else if r.owner == DEBUG_STATUS
+        && r.descriptor == "Lnet/minecraft/client/gui/components/debug/DebugScreenEntryStatus;"
+        && matches!(r.name.as_str(), "IN_OVERLAY" | "ALWAYS_ON")
+    {
+        Some(debug_status(&r.name))
     } else if r.owner == DEBUG_PROFILE
         && r.descriptor == "Lnet/minecraft/client/gui/components/debug/DebugScreenProfile;"
         && matches!(r.name.as_str(), "DEFAULT" | "PERFORMANCE")
@@ -197,6 +321,15 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Value> {
     Some(value)
 }
 
+fn model_layer_identity(state: &State, value: &Value) -> Option<(String, String)> {
+    let object = crate::jar_object::instance_key(value)?;
+    let (id, layer) = state.model_locations.get(object)?;
+    Some((
+        format!("{id}\u{1f}{layer}"),
+        format!("ModelLayerLocation[model={id}, layer={layer}]"),
+    ))
+}
+
 /// Static factories and registration-only static APIs.
 pub(crate) fn invoke(
     state: &mut State,
@@ -204,10 +337,54 @@ pub(crate) fn invoke(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     match (r.owner.as_str(), r.name.as_str()) {
-        (PARTICLE_TYPES, "simple" | "complex") => {
+        (PARTICLE_TYPES, "simple") => {
+            let limiter = match r.descriptor.as_str() {
+                "()Lnet/minecraft/core/particles/SimpleParticleType;" => false,
+                "(Z)Lnet/minecraft/core/particles/SimpleParticleType;" => {
+                    matches!(args.first(), Some(Value::Int(value)) if *value != 0)
+                }
+                _ => return None,
+            };
             let key = state.next_particle_type;
             state.next_particle_type = state.next_particle_type.saturating_add(1);
-            Some(Ok(client_handle(format!("particle-type/{key}"))))
+            Some(Ok(Value::Host(HostRef::new(
+                HostKind::ParticleType,
+                format!("simple/{key}/{}/", i32::from(limiter)),
+            ))))
+        }
+        (PARTICLE_TYPES, "complex") => {
+            let limiter = match (r.descriptor.as_str(), args.len()) {
+                (
+                    "(Lcom/mojang/serialization/MapCodec;Lnet/minecraft/network/codec/StreamCodec;)Lnet/minecraft/core/particles/ParticleType;",
+                    2,
+                )
+                | (
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/core/particles/ParticleType;",
+                    2,
+                ) => false,
+                (
+                    "(ZLcom/mojang/serialization/MapCodec;Lnet/minecraft/network/codec/StreamCodec;)Lnet/minecraft/core/particles/ParticleType;",
+                    3,
+                )
+                | (
+                    "(ZLjava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/core/particles/ParticleType;",
+                    3,
+                ) => {
+                    matches!(args.first(), Some(Value::Int(value)) if *value != 0)
+                }
+                _ => return None,
+            };
+            let key = state.next_particle_type;
+            state.next_particle_type = state.next_particle_type.saturating_add(1);
+            let family = if r.descriptor.contains("java/util/function/Function") {
+                "complex-function"
+            } else {
+                "complex"
+            };
+            Some(Ok(Value::Host(HostRef::new(
+                HostKind::ParticleType,
+                format!("{family}/{key}/{}/", i32::from(limiter)),
+            ))))
         }
         (PARTICLE_REGISTRY, "getInstance") => Some(Ok(client_handle("particle-provider-registry"))),
         (PARTICLE_REGISTRY, "register") => {
@@ -262,10 +439,10 @@ pub(crate) fn invoke(
                     frame: None,
                 }));
             }
-            let key = value_key(&args[0]);
-            if !state.model_layers.insert(key.clone()) {
+            let (key, text) = model_layer_identity(state, &args[0])?;
+            if !state.model_layers.insert(key) {
                 return Some(Err(illegal_argument(format!(
-                    "Cannot replace registration for model layer \"{key}\""
+                    "Cannot replace registration for model layer \"{text}\""
                 ))));
             }
             state.registrations.push(Registration::ModelLayer {
@@ -301,6 +478,26 @@ pub(crate) fn invoke(
             });
             Some(Ok(Value::Void))
         }
+        (PREPARABLE_MODEL_LOADING, "register") if args.len() == 2 => {
+            if args[0] == Value::Ref(None) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("data loader must not be null".into()),
+                    frame: None,
+                }));
+            }
+            if args[1] == Value::Ref(None) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("plugin must not be null".into()),
+                    frame: None,
+                }));
+            }
+            state.registrations.push(Registration::ModelLoadingPlugin {
+                plugin: args[1].clone(),
+            });
+            Some(Ok(Value::Void))
+        }
         (MODEL_LOADING, "register") if args.len() == 1 => {
             if args[0] == Value::Ref(None) {
                 return Some(Err(NativeError::UncaughtException {
@@ -325,6 +522,47 @@ pub(crate) fn instance(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if let Some(answer) = profile_map_call(r, receiver, args) {
+        return Some(answer);
+    }
+    if r.owner == MODEL_LOCATION
+        && r.name == "<init>"
+        && matches!(
+            r.descriptor.as_str(),
+            "(Lnet/minecraft/resources/Identifier;Ljava/lang/String;)V"
+                | "(Ljava/lang/Object;Ljava/lang/String;)V"
+        )
+    {
+        let (Some(object), Some(id), Some(layer)) = (
+            crate::jar_object::instance_key(receiver).map(str::to_owned),
+            args.first().and_then(identifier),
+            args.get(1).and_then(crate::expect_ref).cloned(),
+        ) else {
+            return None;
+        };
+        state.model_locations.insert(object, (id, layer));
+        return Some(Ok(Value::Void));
+    }
+    if let Value::Host(handle) = receiver
+        && handle.kind() == HostKind::ParticleType
+    {
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getOverrideLimiter", "()Z") => {
+                let enabled = handle
+                    .key()
+                    .split('/')
+                    .nth(2)
+                    .is_some_and(|value| value == "1");
+                return Some(Ok(Value::Int(i32::from(enabled))));
+            }
+            ("getType", "()Lnet/minecraft/core/particles/SimpleParticleType;")
+                if handle.key().starts_with("simple/") =>
+            {
+                return Some(Ok(receiver.clone()));
+            }
+            _ => {}
+        }
+    }
     if r.owner != PARTICLE_REGISTRY || r.name != "register" || args.len() != 2 {
         return None;
     }
