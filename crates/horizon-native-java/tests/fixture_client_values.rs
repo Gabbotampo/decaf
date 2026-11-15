@@ -55,9 +55,13 @@ const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/client/KeyMapping.java",
         "package net.minecraft.client; import net.minecraft.resources.Identifier; \
-         public class KeyMapping { public record Category(Identifier id) { \
+         public class KeyMapping { public KeyMapping(String n, int c, Category cat) {} public Category getCategory() { return null; } public record Category(Identifier id) { \
          public static final Category MISC = null; \
          public static Category register(Identifier id) { return null; } } }",
+    ),
+    (
+        "net/minecraft/world/phys/Vec3.java",
+        "package net.minecraft.world.phys; public class Vec3 { public Vec3(double x,double y,double z) {} }",
     ),
 ];
 
@@ -90,6 +94,18 @@ fn identities_the_model_cannot_know_are_counted() {
     let mut host = fixture.jar.seed_host(StdHost::new());
     fixture.text_on(&mut host, "twoBold");
     fixture.text_on(&mut host, "newCategory");
+    let own = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "ownCategoryMapping",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        own.is_err(),
+        "jar-owned Category identity must be counted: {own:?}"
+    );
     let counted: Vec<String> = host
         .unknown_host_calls()
         .into_iter()
@@ -99,6 +115,7 @@ fn identities_the_model_cannot_know_are_counted() {
         counted,
         [
             "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z",
+            "net/minecraft/client/KeyMapping#getCategory()Lnet/minecraft/client/KeyMapping$Category;",
             "net/minecraft/client/KeyMapping$Category#equals(Ljava/lang/Object;)Z",
         ]
     );
