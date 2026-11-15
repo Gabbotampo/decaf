@@ -360,6 +360,10 @@ mod tests {
             "java/util/ArrayList#neutral0",
             "java/util/ImmutableCollections$ListN#immutable3",
             "java/util/ReverseOrderListView$Rand#reversed0",
+            // A collection class with a suffix the host never writes: a
+            // collection is a handle (#253 re-check).
+            "java/util/ArrayList#weird0",
+            "net/minecraft/core/NonNullList#x",
             // Spelled like a class (#156 P13c): a `Class` is a handle.
             "java/lang/String",
             "demo/Probe$Foo",
@@ -371,7 +375,6 @@ mod tests {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
         for marker in [
-            "java/util/ArrayList#weird0",
             "list/4",
             "registry/minecraft:item",
             "string-builder/2",

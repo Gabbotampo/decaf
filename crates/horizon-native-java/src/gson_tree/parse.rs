@@ -460,7 +460,9 @@ mod tests {
             "01",
             "1.",
             "NaN",
-            "\u{feff}{}",
+            // A byte order mark anywhere but first (gson-2.14.0: a
+            // `JsonSyntaxException`).
+            "{}\u{feff}",
             ")]}'\n{}",
             "{} {}",
             "/ {}",
@@ -473,6 +475,12 @@ mod tests {
                 "{text:?} was answered"
             );
         }
+        // `JsonReader`'s first fill skips one leading byte order mark
+        // (gson-2.14.0 reads `\u{feff}{}` as `{}`).
+        assert!(matches!(
+            Parser::parse("\u{feff}{}"),
+            Parsed::Value(Tree::Object(_))
+        ));
         // gson-2.14.0 parses this to `JsonNull`.
         assert!(matches!(
             Parser::parse(" // only\n#also\n/* c */ "),
