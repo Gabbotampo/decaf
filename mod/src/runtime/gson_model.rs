@@ -20,8 +20,8 @@
 //! * `disableHtmlEscaping`: the HTML-unsafe set (`<`, `>`, `&`, `=`, `'`) is
 //!   escaped unless this was called.
 //! * `serializeNulls`: jar-object fields with a null value are written.
-//! * `setFieldNamingPolicy` is a required counted boundary; arbitrary
-//!   reflective naming is never silently approximated.
+//! * `setFieldNamingPolicy`: every `FieldNamingPolicy` constant's transform
+//!   names the JSON keys, both when writing and when reading a jar object.
 //! * `excludeFieldsWithModifiers`: `Excluder.withModifiers` **replaces** its
 //!   default `STATIC|TRANSIENT` mask with the arguments' OR, so
 //!   `excludeFieldsWithModifiers(0)` really does write static and transient
@@ -622,13 +622,13 @@ impl<H: Host> Runtime<'_, H> {
                 "setFieldNamingPolicy",
                 "(Lcom/google/gson/FieldNamingPolicy;)Lcom/google/gson/GsonBuilder;",
             ) => {
-                if args.iter().any(|value| matches!(value, Value::Ref(None))) {
-                    return Err(npe());
-                }
-                // Naming policies are a required counted boundary: this
-                // model does not claim to reproduce arbitrary reflective names.
                 let mut style = self.gson_style(&marker);
-                style.counted = true;
+                style.naming = args
+                    .first()
+                    .and_then(expect_ref)
+                    .and_then(|policy| policy.rsplit_once('/').map(|(_, name)| name))
+                    .and_then(Naming::from_name)
+                    .unwrap_or_default();
                 self.set_gson_style(&marker, style);
                 answer()
             }
