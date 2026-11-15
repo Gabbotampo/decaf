@@ -232,6 +232,17 @@ public final class Probe {
         return take(a + "|" + c + "|" + s.toList() + b.build().toList());
     }
 
+    /// A live stream passed as a String/Object operand must never be treated as
+    /// its internal marker. String equality is exact by Java's rules; the
+    /// builder's Object conversion is identity text and therefore counted.
+    public static String streamTextOperands() {
+        Stream<Integer> s = Stream.of(1, 2).map(x -> x);
+        boolean stringEquals = "x".equals((Object) s);
+        boolean objectEquals = Objects.equals("x", s);
+        String text = new StringBuilder().append((Object) s).toString();
+        return take(stringEquals + "," + objectEquals + "," + text.contains("stream/") + "," + s.toList());
+    }
+
     static final class Jar { }
 
     public static String castMessages() {
@@ -433,6 +444,16 @@ fn a_streams_text_is_counted_and_never_its_marker() {
             }
         }
     }
+}
+
+#[test]
+fn a_stream_as_string_operand_is_counted_or_exact() {
+    let (text, unknown) = run("streamTextOperands");
+    assert_eq!(text.as_deref(), Some(" => false,false,false,[1, 2]"));
+    assert!(
+        unknown.iter().any(|(call, _)| call.contains("toString")),
+        "stream Object conversion was answered without a count: {unknown:?}"
+    );
 }
 
 /// Counted: a failing cast of a stream names its stage class (JDK 25.0.5:
