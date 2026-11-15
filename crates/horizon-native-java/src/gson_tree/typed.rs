@@ -247,12 +247,13 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(value);
         }
         if tree_class(&class) {
-            let fits = match (tree, class.as_str()) {
-                (_, JSON_ELEMENT) => true,
-                (Tree::Object(_), JSON_OBJECT) | (Tree::Array(_), JSON_ARRAY) => true,
-                (Tree::Str(_) | Tree::Num(_) | Tree::Bool(_), JSON_PRIMITIVE) => true,
-                _ => false,
-            };
+            let fits = matches!(
+                (tree, class.as_str()),
+                (_, JSON_ELEMENT)
+                    | (Tree::Object(_), JSON_OBJECT)
+                    | (Tree::Array(_), JSON_ARRAY)
+                    | (Tree::Str(_) | Tree::Num(_) | Tree::Bool(_), JSON_PRIMITIVE)
+            );
             return if fits {
                 self.materialize(tree.clone()).map(Some)
             } else {
