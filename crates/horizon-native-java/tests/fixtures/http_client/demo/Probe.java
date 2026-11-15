@@ -1,6 +1,8 @@
 package demo;
 
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.concurrent.Flow;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -8,6 +10,12 @@ import java.time.Duration;
 
 public final class Probe {
     static String bool(boolean value) { return value ? "T" : "F"; }
+    static HttpRequest.BodyPublisher body() {
+        return new HttpRequest.BodyPublisher() {
+            public long contentLength() { return 0; }
+            public void subscribe(Flow.Subscriber<? super ByteBuffer> subscriber) {}
+        };
+    }
 
     public static void main(String[] args) { System.out.println(run()); }
 
@@ -36,6 +44,20 @@ public final class Probe {
         catch (IllegalArgumentException e) { out.append("|bad-header"); }
         try { HttpRequest.newBuilder().header("X", "bad\nvalue"); out.append("|no-error"); }
         catch (IllegalArgumentException e) { out.append("|bad-value"); }
+        try { builder.connectTimeout(Duration.ZERO); out.append("|no-error"); }
+        catch (IllegalArgumentException e) { out.append("|zero-").append(e.getMessage()); }
+        try { requests.timeout(Duration.ZERO); out.append("|no-error"); }
+        catch (IllegalArgumentException e) { out.append("|request-zero-").append(e.getMessage()); }
+        try { requests.header("Host", "v"); out.append("|no-error"); }
+        catch (IllegalArgumentException e) { out.append("|restricted-").append(e.getMessage()); }
+        try { requests.method("Host", body()); out.append("|method-host"); }
+        catch (IllegalArgumentException e) { out.append("|method-host-error"); }
+        try { requests.method("", body()); out.append("|no-error"); }
+        catch (IllegalArgumentException e) { out.append("|method-empty-").append(e.getMessage()); }
+        try { requests.method("bad name", body()); out.append("|no-error"); }
+        catch (IllegalArgumentException e) { out.append("|method-bad-").append(e.getMessage()); }
+        try { requests.version(null); out.append("|no-error"); }
+        catch (NullPointerException e) { out.append("|version-null"); }
         try { client.send(request, HttpResponse.BodyHandlers.ofString()); out.append("|no-error"); }
         catch (Exception e) { out.append("|send-").append(e.getClass().getName()); }
         return out.toString();

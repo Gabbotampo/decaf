@@ -485,6 +485,10 @@ pub enum HostKind {
     HttpRequest,
     /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
     HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2033,6 +2037,20 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::http_client::ENUM_METHODS,
     },
 ];
 

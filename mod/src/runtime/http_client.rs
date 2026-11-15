@@ -51,9 +51,28 @@ pub(crate) const CLIENT_METHODS: Methods = OBJECT_METHODS;
 pub(crate) const CLIENT_BUILDER_METHODS: Methods = OBJECT_METHODS;
 pub(crate) const REQUEST_METHODS: Methods = OBJECT_METHODS;
 pub(crate) const REQUEST_BUILDER_METHODS: Methods = OBJECT_METHODS;
+pub(crate) const ENUM_METHODS: Methods = Methods {
+    to_string: |handle, _| Ok(Some(handle.key().to_owned())),
+    hash_code: |_, _| Ok(None),
+    equals: identity_equals,
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+fn enum_kind(owner: &str) -> Option<HostKind> {
+    match owner {
+        "java/net/http/HttpClient$Version" => Some(HostKind::HttpClientVersion),
+        "java/net/http/HttpClient$Redirect" => Some(HostKind::HttpClientRedirect),
+        _ => None,
+    }
+}
 
 fn enum_value(owner: &str, name: &str) -> Value {
-    Value::Ref(Some(format!("enum/{owner}/{name}")))
+    Value::Host(HostRef::new(
+        enum_kind(owner).expect("known HTTP enum"),
+        name,
+    ))
 }
 
 pub(crate) fn static_field(owner: &str, name: &str, descriptor: &str) -> Option<Value> {
@@ -87,6 +106,29 @@ fn save_state(runtime: &mut StdHost, kind: &str, key: &str, value: serde_json::V
         .insert(state_key(kind, key), Value::Ref(Some(value.to_string())));
 }
 
+fn field_key(kind: &str, key: &str, field: &str) -> String {
+    format!("{}/{}", state_key(kind, key), field)
+}
+
+fn save_field(runtime: &mut StdHost, kind: &str, key: &str, field: &str, value: Value) {
+    runtime
+        .persistent_static_fields
+        .insert(field_key(kind, key, field), value);
+}
+
+fn field(runtime: &StdHost, kind: &str, key: &str, field_name: &str) -> Option<Value> {
+    runtime
+        .persistent_static_fields
+        .get(&field_key(kind, key, field_name))
+        .cloned()
+}
+
+fn copy_field(runtime: &mut StdHost, from: (&str, &str), to: (&str, &str), field_name: &str) {
+    if let Some(value) = field(runtime, from.0, from.1, field_name) {
+        save_field(runtime, to.0, to.1, field_name, value);
+    }
+}
+
 fn allocation(kind: HostKind, class: &str) -> Value {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -110,12 +152,23 @@ fn illegal_argument(message: &str) -> NativeError {
     }
 }
 
+fn class_cast() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/ClassCastException".into(),
+        message: None,
+        frame: None,
+    }
+}
+
 fn invalid_duration(value: &Value) -> Result<i128, NativeError> {
     let Some(nanos) = crate::runtime::host_jdk_value::duration_nanos(value) else {
         return Err(null_pointer());
     };
-    if nanos < 0 {
-        return Err(illegal_argument("Invalid duration"));
+    if nanos <= 0 {
+        return Err(illegal_argument(&format!(
+            "Invalid duration: {}",
+            crate::runtime::duration_text(nanos)
+        )));
     }
     Ok(nanos)
 }
@@ -128,46 +181,69 @@ fn string_arg(value: Option<&Value>) -> Option<&str> {
 }
 
 fn valid_header_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|byte| {
-            byte.is_ascii()
-                && byte > 0x20
-                && byte < 0x7f
-                && !b"()<>@,;:\\[\\]={}\t\"".contains(&byte)
-        })
+    !name.is_empty() && name.bytes().all(is_token_byte)
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii() && byte > 0x20 && byte < 0x7f && !b"()<>@,;:\"/[]?={}\t".contains(&byte)
 }
 
 fn valid_header_value(value: &str) -> bool {
     !value.bytes().any(|byte| byte == b'\r' || byte == b'\n')
 }
 
-fn method_name(name: &str) -> Result<(), NativeError> {
-    if name.is_empty()
-        || !name.bytes().all(|byte| {
-            byte.is_ascii()
-                && byte > 0x20
-                && byte < 0x7f
-                && !b"()<>@,;:\\[\\]={}\t\"".contains(&byte)
-        })
-    {
-        return Err(illegal_argument("invalid HTTP method name"));
-    }
-    if ["connection", "content-length", "expect", "host", "upgrade"]
+fn restricted_header(name: &str) -> bool {
+    ["connection", "content-length", "expect", "host", "upgrade"]
         .iter()
         .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
-    {
-        return Err(illegal_argument("restricted header name"));
+}
+
+fn validate_header(name: &str, value: &str) -> Result<(), NativeError> {
+    if !valid_header_name(name) {
+        return Err(illegal_argument(&format!(
+            "invalid header name: \"{name}\""
+        )));
+    }
+    if restricted_header(name) {
+        return Err(illegal_argument(&format!(
+            "restricted header name: \"{name}\""
+        )));
+    }
+    if !valid_header_value(value) {
+        return Err(illegal_argument(&format!(
+            "invalid header value: \"{value}\""
+        )));
     }
     Ok(())
 }
 
-fn value_enum(value: &Value, owner: &str, allowed: &[&str]) -> Option<String> {
-    let Value::Ref(Some(text)) = value else {
-        return None;
+fn method_name(name: &str) -> Result<(), NativeError> {
+    if name.is_empty() {
+        return Err(illegal_argument("illegal method <empty string>"));
+    }
+    if !name.bytes().all(is_token_byte) {
+        return Err(illegal_argument(&format!("illegal method \"{name}\"")));
+    }
+    Ok(())
+}
+
+fn value_enum(value: &Value, owner: &str, allowed: &[&str]) -> Result<String, NativeError> {
+    if matches!(value, Value::Ref(None)) {
+        return Err(null_pointer());
+    }
+    let kind = enum_kind(owner).ok_or_else(class_cast)?;
+    let Value::Host(handle) = value else {
+        return Err(class_cast());
     };
-    let prefix = format!("enum/{owner}/");
-    let name = text.strip_prefix(&prefix)?;
-    allowed.contains(&name).then(|| name.to_owned())
+    if handle.kind() != kind {
+        return Err(class_cast());
+    }
+    let name = handle.key();
+    if allowed.contains(&name) {
+        Ok(name.to_owned())
+    } else {
+        Err(class_cast())
+    }
 }
 
 pub(crate) fn static_call(
@@ -274,14 +350,14 @@ fn builder_call(
             Some(Ok(receiver.clone()))
         }
         ("version", "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpClient$Builder;") => {
-            let Some(version) = args.first().and_then(|v| {
-                value_enum(
-                    v,
-                    "java/net/http/HttpClient$Version",
-                    &["HTTP_1_1", "HTTP_2"],
-                )
-            }) else {
-                return Some(Err(null_pointer()));
+            let value = args.first()?;
+            let version = match value_enum(
+                value,
+                "java/net/http/HttpClient$Version",
+                &["HTTP_1_1", "HTTP_2"],
+            ) {
+                Ok(version) => version,
+                Err(error) => return Some(Err(error)),
             };
             current["version"] = serde_json::Value::String(version);
             save_state(runtime, "client-builder", key, current);
@@ -291,14 +367,14 @@ fn builder_call(
             "followRedirects",
             "(Ljava/net/http/HttpClient$Redirect;)Ljava/net/http/HttpClient$Builder;",
         ) => {
-            let Some(redirects) = args.first().and_then(|v| {
-                value_enum(
-                    v,
-                    "java/net/http/HttpClient$Redirect",
-                    &["NEVER", "NORMAL", "ALWAYS"],
-                )
-            }) else {
-                return Some(Err(null_pointer()));
+            let value = args.first()?;
+            let redirects = match value_enum(
+                value,
+                "java/net/http/HttpClient$Redirect",
+                &["NEVER", "NORMAL", "ALWAYS"],
+            ) {
+                Ok(redirects) => redirects,
+                Err(error) => return Some(Err(error)),
             };
             current["redirects"] = serde_json::Value::String(redirects);
             save_state(runtime, "client-builder", key, current);
@@ -308,12 +384,38 @@ fn builder_call(
         | ("proxy", "(Ljava/net/ProxySelector;)Ljava/net/http/HttpClient$Builder;")
         | ("authenticator", "(Ljava/net/Authenticator;)Ljava/net/http/HttpClient$Builder;")
         | ("sslContext", "(Ljavax/net/ssl/SSLContext;)Ljava/net/http/HttpClient$Builder;")
-        | ("sslParameters", "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;")
-        | ("priority", "(I)Ljava/net/http/HttpClient$Builder;") => Some(Ok(receiver.clone())),
+        | ("sslParameters", "(Ljavax/net/ssl/SSLParameters;)Ljava/net/http/HttpClient$Builder;") => {
+            let value = args.first()?;
+            if matches!(value, Value::Ref(None)) {
+                return Some(Err(null_pointer()));
+            }
+            save_field(
+                runtime,
+                "client-builder",
+                key,
+                r.name.as_str(),
+                value.clone(),
+            );
+            Some(Ok(receiver.clone()))
+        }
         ("build", "()Ljava/net/http/HttpClient;") => {
             let client = allocation(HostKind::HttpClient, HTTP_CLIENT);
             if let Value::Host(handle) = &client {
                 save_state(runtime, "client", handle.key(), current);
+                for field_name in [
+                    "executor",
+                    "proxy",
+                    "authenticator",
+                    "sslContext",
+                    "sslParameters",
+                ] {
+                    copy_field(
+                        runtime,
+                        ("client-builder", key),
+                        ("client", handle.key()),
+                        field_name,
+                    );
+                }
             }
             Some(Ok(client))
         }
@@ -349,7 +451,15 @@ fn client_call(
         ("proxy", "()Ljava/util/Optional;")
         | ("authenticator", "()Ljava/util/Optional;")
         | ("executor", "()Ljava/util/Optional;") => {
-            Some(Ok(crate::runtime::host_optional::empty_optional()))
+            Some(Ok(field(runtime, "client", key, r.name.as_str())
+                .map_or_else(
+                    crate::runtime::host_optional::empty_optional,
+                    crate::runtime::host_optional::optional_wrap,
+                )))
+        }
+        ("sslContext", "()Ljavax/net/ssl/SSLContext;")
+        | ("sslParameters", "()Ljavax/net/ssl/SSLParameters;") => {
+            field(runtime, "client", key, r.name.as_str()).map(Ok)
         }
         // `send` and `sendAsync` deliberately fall through to the counted host boundary.
         _ => None,
@@ -410,8 +520,8 @@ fn request_builder_call(
             let Some(value) = string_arg(args.get(1)) else {
                 return Some(Err(null_pointer()));
             };
-            if !valid_header_name(name) || !valid_header_value(value) {
-                return Some(Err(illegal_argument("invalid header")));
+            if let Err(error) = validate_header(name, value) {
+                return Some(Err(error));
             }
             current["headers"]
                 .as_array_mut()?
@@ -429,8 +539,8 @@ fn request_builder_call(
             let Some(value) = string_arg(args.get(1)) else {
                 return Some(Err(null_pointer()));
             };
-            if !valid_header_name(name) || !valid_header_value(value) {
-                return Some(Err(illegal_argument("invalid header")));
+            if let Err(error) = validate_header(name, value) {
+                return Some(Err(error));
             }
             let headers = current["headers"].as_array_mut()?;
             headers.retain(|entry| {
@@ -455,10 +565,25 @@ fn request_builder_call(
             if let Value::Host(handle) = &request {
                 current["uri"] = serde_json::Value::String(uri.into());
                 save_state(runtime, "request", handle.key(), current);
+                copy_field(
+                    runtime,
+                    ("request-builder", key),
+                    ("request", handle.key()),
+                    "version",
+                );
             }
             Some(Ok(request))
         }
         ("version", "(Ljava/net/http/HttpClient$Version;)Ljava/net/http/HttpRequest$Builder;") => {
+            let value = args.first()?;
+            match value_enum(
+                value,
+                "java/net/http/HttpClient$Version",
+                &["HTTP_1_1", "HTTP_2"],
+            ) {
+                Ok(_) => save_field(runtime, "request-builder", key, "version", value.clone()),
+                Err(error) => return Some(Err(error)),
+            }
             Some(Ok(receiver.clone()))
         }
         (
@@ -507,6 +632,12 @@ fn request_call(
         ("expectContinue", "()Z") => Some(Ok(Value::Int(i32::from(
             current["expect"].as_bool().unwrap_or(false),
         )))),
+        ("version", "()Ljava/util/Optional;") => {
+            Some(Ok(field(runtime, "request", key, "version").map_or_else(
+                crate::runtime::host_optional::empty_optional,
+                crate::runtime::host_optional::optional_wrap,
+            )))
+        }
         _ => None,
     }
 }
