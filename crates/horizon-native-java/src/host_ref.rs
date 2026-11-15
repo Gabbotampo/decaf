@@ -437,6 +437,8 @@ pub enum HostKind {
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
+    /// A `StackWalker.Option` enum constant: key its name.
+    StackWalkerOption,
     /// A `Character.UnicodeBlock` constant: key its name.
     UnicodeBlock,
     /// A `Locale` constant: key `<language>_<country>`.
@@ -1995,6 +1997,14 @@ const KINDS: &[KindInfo] = &[
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::CODING_ERROR_ACTION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StackWalkerOption,
+        tag: "swopt",
+        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
+        // One object per enum constant.
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
     },
     KindInfo {
         kind: HostKind::UnicodeBlock,
