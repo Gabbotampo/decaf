@@ -53,12 +53,12 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     };
     let unary = |op: fn(f64) -> f64| argument(0).map(|value| double_value(op(value)));
     Some(match (r.name.as_str(), r.descriptor.as_str()) {
-        ("floor", "(D)D") => unary(f64::floor),
-        ("ceil", "(D)D") => unary(f64::ceil),
-        ("rint", "(D)D") => unary(f64::round_ties_even),
-        ("sqrt", "(D)D") => unary(f64::sqrt),
-        ("abs", "(D)D") => unary(f64::abs),
-        ("abs", "(F)F") => argument(0).map(|value| float_value(value.abs())),
+        ("floor", "(D)D") if math => unary(f64::floor),
+        ("ceil", "(D)D") if math => unary(f64::ceil),
+        ("rint", "(D)D") if math => unary(f64::round_ties_even),
+        ("sqrt", "(D)D") if math => unary(f64::sqrt),
+        ("abs", "(D)D") if math => unary(f64::abs),
+        ("abs", "(F)F") if math => argument(0).map(|value| float_value(value.abs())),
         ("round", "(D)J") if math => argument(0).map(|value| Value::Long(round_double(value))),
         ("round", "(F)I") if math => argument(0).map(|value| Value::Int(round_float(value as f32))),
         ("pow", "(DD)D") if fdlibm_math => {

@@ -509,10 +509,10 @@ pub fn pow(x: f64, y: f64) -> f64 {
         if iy == 0x3ff0_0000 {
             return if hy < 0 { ONE / x } else { x };
         }
-        if iy == 0x4000_0000 {
+        if hy == 0x4000_0000 {
             return x * x;
         }
-        if iy == 0x3fe0_0000 && hx >= 0 {
+        if hy == 0x3fe0_0000 && hx >= 0 {
             return x.sqrt();
         }
     }
