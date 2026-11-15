@@ -1368,8 +1368,6 @@ mod tests {
             "classes",
             "linked_classes",
             "game_block_classes",
-            "block_game_classes",
-            "opaque_game_constants",
             "service_providers",
             "current_time_millis",
             "mods",
