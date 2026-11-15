@@ -416,15 +416,23 @@ impl StdHost {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(1);
         let dependencies = || -> Vec<Value> {
-            field("depends")
-                .and_then(serde_json::Value::as_object)
-                .map(|entries| {
-                    entries
-                        .keys()
-                        .map(|id| loader::dependency(id, "DEPENDS"))
-                        .collect()
-                })
-                .unwrap_or_default()
+            [
+                ("depends", "DEPENDS"),
+                ("recommends", "RECOMMENDS"),
+                ("suggests", "SUGGESTS"),
+                ("conflicts", "CONFLICTS"),
+                ("breaks", "BREAKS"),
+            ]
+            .into_iter()
+            .flat_map(|(field_name, kind)| {
+                field(field_name)
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flat_map(move |entries| {
+                        entries.keys().map(move |id| loader::dependency(id, kind))
+                    })
+            })
+            .collect()
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("getId", "()Ljava/lang/String;") => Ok(text(id)),
