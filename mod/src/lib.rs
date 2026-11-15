@@ -806,9 +806,11 @@ impl Hooks for HorizonJava {
             return;
         };
         let spectator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            event.player.is_spectator(host).unwrap_or(false)
+            event.player.is_spectator(host)
         }))
-        .unwrap_or(false);
+        .ok()
+        .flatten()
+        .unwrap_or(true);
         let player = event.player;
         self.game_hooks(Some(host), "java_base_player_tick_head", |state| {
             Some((
@@ -829,9 +831,11 @@ impl Hooks for HorizonJava {
             return;
         };
         let spectator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            event.player.is_spectator(host).unwrap_or(false)
+            event.player.is_spectator(host)
         }))
-        .unwrap_or(false);
+        .ok()
+        .flatten()
+        .unwrap_or(true);
         let player = event.player;
         self.game_hooks(Some(host), "java_base_player_tick_tail", |state| {
             Some((

@@ -476,8 +476,31 @@ fn note_late_player_tick_post(row: &mut crate::JarRow) {
 mod tests {
     use super::*;
     use mod_api::{
-        EntityRef, Hooks, HostSide, PlayerTickPostEvent, PlayerTickPreEvent, WorldEpoch,
+        Backend, EntityRef, Hooks, Host, HostSide, PlayerRef, PlayerTickPostEvent,
+        PlayerTickPreEvent, ServerHost, WorldEpoch,
     };
+    use std::collections::BTreeMap;
+
+    struct PlayerTickHost {
+        spectator: BTreeMap<u128, Option<bool>>,
+    }
+
+    impl Host for PlayerTickHost {
+        fn backend(&self) -> Option<mod_api::BackendRef<'_>> {
+            Some(mod_api::__private::backend_ref(self))
+        }
+    }
+    mod_api::impl_host_areas!(PlayerTickHost);
+    impl ServerHost for PlayerTickHost {}
+    mod_api::impl_server_host_areas!(PlayerTickHost);
+    impl mod_api::prelude::PlayersBackend for PlayerTickHost {
+        fn player_is_spectator(&self, player: PlayerRef) -> Option<bool> {
+            self.spectator.get(&player.uuid()).copied().flatten()
+        }
+    }
+    impl mod_api::prelude::PlayersClientBackend for PlayerTickHost {}
+    mod_api::impl_backend_areas!(PlayerTickHost, except(players));
+    impl Backend for PlayerTickHost {}
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -848,45 +871,77 @@ mod tests {
     }
 
     #[test]
-    fn spectator_player_tick_firings_run_and_are_counted_until_the_pin_bumps() {
+    fn player_tick_spectator_statuses_are_counted_through_hook_dispatch() {
         let mut state = State::default();
         state.jars.push(load(
             "spectatortick",
             "SpectatorTickMixin",
             "@Mixin(Player.class) public class SpectatorTickMixin { \
                @Inject(method = \"tick\", at = @At(\"HEAD\")) \
-               private void pre(CallbackInfo ci) { System.out.println(\"pre\"); } \
+               private void pre(CallbackInfo ci) { System.out.println(\"pre/\" + ((Player)(Object)this).getUUID()); } \
                @Inject(method = \"tick\", at = @At(\"TAIL\")) \
-               private void post(CallbackInfo ci) { System.out.println(\"post\"); } }",
+               private void post(CallbackInfo ci) { System.out.println(\"post/\" + ((Player)(Object)this).getUUID()); } }",
         ));
         let java = crate::HorizonJava::default();
         java.lock().jars.push(state.jars.remove(0));
-        java.lock().players.push(FacadePlayer {
-            uuid: 0xa1,
-            name: "Spectator".into(),
-            level: None,
-            entity_id: Some(7),
-            session: 1,
-            life: 0,
-        });
-        let mut host = mod_api::testing::FakeHost::new();
-        let player =
-            mod_api::__private::game::player_ref(EntityRef::new(WorldEpoch::new(1), 7), 0xa1);
-        crate::HorizonJava::player_tick_pre(
-            &java,
-            HostSide::Server(&mut host),
-            &mut PlayerTickPreEvent { player },
-        );
-        crate::HorizonJava::player_tick_post(
-            &java,
-            HostSide::Server(&mut host),
-            &mut PlayerTickPostEvent { player },
-        );
+        let players = [
+            (0xa1_u128, 7, "Spectator"),
+            (0xb2, 8, "Survival"),
+            (0xc3, 9, "Unavailable"),
+        ];
+        java.lock().players = players
+            .iter()
+            .map(|&(uuid, entity_id, name)| FacadePlayer {
+                uuid,
+                name: name.into(),
+                level: None,
+                entity_id: Some(entity_id),
+                session: 1,
+                life: 0,
+            })
+            .collect();
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::from([(0xa1, Some(true)), (0xb2, Some(false)), (0xc3, None)]),
+        };
+        for &(uuid, entity_id, _) in &players {
+            let player = mod_api::__private::game::player_ref(
+                EntityRef::new(WorldEpoch::new(1), entity_id),
+                uuid,
+            );
+            crate::HorizonJava::player_tick_pre(
+                &java,
+                HostSide::Server(&mut host),
+                &mut PlayerTickPreEvent { player },
+            );
+            crate::HorizonJava::player_tick_post(
+                &java,
+                HostSide::Server(&mut host),
+                &mut PlayerTickPostEvent { player },
+            );
+        }
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.skipped, 0);
-        assert_eq!(state.jars[0].row.game_hooks.ran, 2);
-        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
-        assert_eq!(stdout(&mut state, 0), ["pre", "post"]);
+        assert_eq!(state.jars[0].row.game_hooks.ran, 6);
+        assert_eq!(state.jars[0].row.game_hooks.failed, 7);
+        assert_eq!(
+            state.jars[0]
+                .row
+                .game_hooks
+                .failures
+                .get("java_base_player_tick_head: fork gap: pinned game may fire PlayerTickEvent for spectator touching an unloaded chunk; ari #4520 narrows this after a pin bump"),
+            Some(&2)
+        );
+        assert_eq!(
+            stdout(&mut state, 0),
+            [
+                "pre/00000000-0000-0000-0000-0000000000a1",
+                "post/00000000-0000-0000-0000-0000000000a1",
+                "pre/00000000-0000-0000-0000-0000000000b2",
+                "post/00000000-0000-0000-0000-0000000000b2",
+                "pre/00000000-0000-0000-0000-0000000000c3",
+                "post/00000000-0000-0000-0000-0000000000c3",
+            ]
+        );
     }
 
     /// `Player.attack` returns once a HEAD callback cancels: a later jar's callback at that
