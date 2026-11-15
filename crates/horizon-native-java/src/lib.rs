@@ -22510,6 +22510,13 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(file) = self.class(&current) {
                 queue.extend(file.interface_names());
+            } else if current.starts_with("java/")
+                && host_ref::ClassHierarchy::is_instance(&host_ref::JdkHierarchy, &current, wanted)
+                    == Some(true)
+            {
+                // A JDK interface the jar names (`implements List`): Java 25's
+                // table knows its superinterfaces (`Collection`, #242).
+                return true;
             }
         }
         false
