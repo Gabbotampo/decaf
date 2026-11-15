@@ -24303,6 +24303,10 @@ impl<H: Host> Runtime<'_, H> {
                 self.io_paths.insert(marker.to_owned(), path.clone());
                 if truncate {
                     self.ensure_io_capacity(&path, 0)?;
+                    // Java creates/truncates the file at open time, so notify
+                    // the watch service before the virtual table records it.
+                    // Otherwise a new writer is misclassified as MODIFY.
+                    self.watch_writer_opened(&path, true);
                     self.io_files.insert(path.clone(), String::new());
                     self.io_file_bytes.insert(path.clone(), Vec::new());
                     self.io_dirs.remove(&path);
