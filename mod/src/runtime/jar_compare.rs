@@ -17,6 +17,17 @@ use super::*;
 const COMPARE_TO: &str = "(Ljava/lang/Object;)I";
 
 impl<H: Host> Runtime<'_, H> {
+    pub(crate) fn is_enum_object(&self, value: &Value) -> bool {
+        let Some(marker) = crate::runtime::jar_object::object_key(value) else {
+            return matches!(value, Value::Ref(Some(text)) if text.starts_with("enum/"));
+        };
+        self.enum_constants.contains_key(marker)
+            || crate::runtime::jar_object::object_class(value)
+                .and_then(|class| self.class(&class))
+                .and_then(|file| Some(file.super_name.as_str()))
+                == Some("java/lang/Enum")
+    }
+
     /// `((Comparable) a).compareTo(b)`.
     pub(crate) fn natural_order(&mut self, a: &Value, b: &Value) -> Result<i32, NativeError> {
         // A host handle's natural order is its kind's row (`host_ref.rs`);
@@ -74,6 +85,45 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.count_compare_to();
         }
+        // Enum.compareTo casts the argument to the receiver's exact enum class,
+        // then subtracts ordinals. The marker is runtime-owned; a jar String
+        // with the same text is classified as String by natural_compare below.
+        let enum_info = |value: &Value| {
+            let marker = crate::runtime::jar_object::object_key(value)
+                .or_else(|| crate::runtime::expect_ref(value).map(|text| text.as_str()))?;
+            let class = match value {
+                Value::Host(_) => crate::runtime::jar_object::object_class(value)?.to_owned(),
+                Value::Ref(_) => marker.strip_prefix("enum/")?.rsplit_once('/')?.0.to_owned(),
+                _ => return None,
+            };
+            let ordinal = self
+                .enum_constants
+                .get(marker)
+                .map(|(_, ordinal)| *ordinal)
+                .or_else(|| {
+                    crate::runtime::game_enum_constants(&class)
+                        .and_then(|constants| {
+                            constants
+                                .iter()
+                                .position(|name| marker.ends_with(&format!("/{name}")))
+                        })
+                        .map(|ordinal| ordinal as i32)
+                })?;
+            Some((class, ordinal))
+        };
+        if let Some((own_class, own_ordinal)) = enum_info(a) {
+            let Some((other_class, other_ordinal)) = enum_info(b) else {
+                return self.count_compare_to();
+            };
+            if own_class != other_class {
+                return Err(crate::runtime::checkcast::class_cast_exception(
+                    &other_class,
+                    &own_class,
+                ));
+            }
+            return Ok(own_ordinal - other_ordinal);
+        }
+
         let Some(class) = self.interpreted_object_class(a) else {
             if self.interpreted_object_class(b).is_some() {
                 // A platform value's `compareTo` of a jar object: a JVM throws

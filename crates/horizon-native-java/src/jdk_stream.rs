@@ -205,29 +205,58 @@ pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> 
             frame: None,
         });
     }
-    if let (Some(a), Some(b)) = (integral(a), integral(b)) {
-        return Ok(a.cmp(&b) as i32);
+    // Each boxed bridge casts its argument to the same final class. Keep the
+    // logical Integer representation (`Value::Int`) paired with Boxed::Integer,
+    // but reject cross-class comparisons with Java's ClassCastException.
+    let class = |value: &Value| {
+        crate::class_of_value(value).or_else(|| match value {
+            Value::Ref(Some(_)) => Some("java/lang/String".into()),
+            _ => None,
+        })
+    };
+    let own_class = class(a);
+    let other_class = class(b);
+    if let (Some(own), Some(other)) = (own_class.as_deref(), other_class.as_deref())
+        && own != other
+    {
+        return Err(crate::checkcast::class_cast_exception(other, own));
+    }
+    if matches!(
+        own_class.as_deref(),
+        Some("java/lang/Integer" | "java/lang/Long" | "java/lang/Byte" | "java/lang/Short")
+    ) {
+        return Ok(integral(a).unwrap().cmp(&integral(b).unwrap()) as i32);
     }
     // `Character.compareTo` is the code-unit difference, not a sign.
-    let character = |value: &Value| match value {
-        Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
-        _ => None,
-    };
-    if let (Some(a), Some(b)) = (character(a), character(b)) {
-        return Ok(a - b);
+    if own_class.as_deref() == Some("java/lang/Character") {
+        let unit = |value: &Value| match value {
+            Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
+            _ => None,
+        };
+        return Ok(unit(a).unwrap() - unit(b).unwrap());
     }
-    if let (Some(a), Some(b)) = (floating(a), floating(b)) {
+    if matches!(
+        own_class.as_deref(),
+        Some("java/lang/Double" | "java/lang/Float")
+    ) {
+        let left = floating(a).unwrap();
+        let right = floating(b).unwrap();
         // `Double.compare`: -0.0 < 0.0 and NaN above everything.
-        return Ok(a.total_cmp(&b) as i32);
+        return Ok(left.total_cmp(&right) as i32);
     }
-    let boolean = |value: &Value| match value {
-        Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
-        _ => None,
-    };
-    if let (Some(a), Some(b)) = (boolean(a), boolean(b)) {
-        return Ok(a.cmp(&b) as i32);
+    if own_class.as_deref() == Some("java/lang/Boolean") {
+        let boolean = |value: &Value| match value {
+            Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
+            _ => None,
+        };
+        return Ok(boolean(a).unwrap().cmp(&boolean(b).unwrap()) as i32);
     }
-    if let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (a, b) {
+    if own_class.as_deref() == Some("java/lang/String") {
+        let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (a, b) else {
+            return Err(NativeError::Metadata(
+                "String.compareTo lost its String operands".into(),
+            ));
+        };
         // `String.compareTo`: the first differing UTF-16 unit, else the
         // length difference.
         let (mut left, mut right) = (a.encode_utf16(), b.encode_utf16());
