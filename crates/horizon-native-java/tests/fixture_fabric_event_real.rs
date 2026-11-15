@@ -1,14 +1,42 @@
 //! Real Fabric API event-order oracle values plus the native exact sorter.
 //!
-//! The JAVA25 lines were recorded by running Fabric API 0.165.2's real
-//! fabric-api-base EventFactory on Java 25. If HORIZON_FABRIC_EVENT_CLASSPATH
-//! is supplied, the test reruns that real source oracle; CI still remains
-//! compile-only and compares against the recorded values.
+//! The JAVA25 lines were recorded from Fabric API Base 2.0.6+fcdff87f5d
+//! (Fabric API 0.165.2+26.3) on Temurin Java 25.0.5. The exact recording
+//! command was: `javac --release 21 -cp fabric-api-base-2.0.6+fcdff87f5d.jar:
+//! guava-33.4.8-jre.jar:slf4j-api-2.0.17.jar -d out Identifier.java
+//! EventOracle.java && java -cp out:fabric-api-base-2.0.6+fcdff87f5d.jar:
+//! guava-33.4.8-jre.jar:slf4j-api-2.0.17.jar EventOracle`. The fixture's
+//! Identifier.java is the minimal Minecraft 26.3 Identifier contract used by
+//! that real Fabric run. If HORIZON_FABRIC_EVENT_CLASSPATH is supplied with
+//! those three real jars, the test reruns the same oracle; CI always compares
+//! the recorded rows below.
 
 use horizon_native_java::events::order::sort_phases;
 use std::{env, fs, path::PathBuf, process::Command};
 
-const JAVA25: &str = "linear=afabric:defaultz\ndiamond=abcdfabric:default\ncycle=fabric:defaultab\nduplicate=afabric:default\nself=java.lang.IllegalArgumentException:Tried to add a phase that depends on itself.\nafter=DL\nunknown=unknown";
+const JAVA25: &str = "linear=afabric:defaultz\ndiamond=abcdfabric:default\ncycle=fabric:defaultab\nduplicate=afabric:default\nself=java.lang.IllegalArgumentException:Tried to add a phase that depends on itself.\nafter=LD\nunknown=unknown";
+const IDENTIFIER_SOURCE: &str = r#"
+package net.minecraft.resources;
+public final class Identifier implements Comparable<Identifier> {
+  private final String namespace;
+  private final String path;
+  private Identifier(String namespace, String path) { this.namespace = namespace; this.path = path; }
+  public static Identifier fromNamespaceAndPath(String namespace, String path) {
+    return new Identifier(namespace, path);
+  }
+  public int compareTo(Identifier other) {
+    int pathOrder = path.compareTo(other.path);
+    return pathOrder != 0 ? pathOrder : namespace.compareTo(other.namespace);
+  }
+  public boolean equals(Object other) {
+    return other instanceof Identifier id
+        && namespace.equals(id.namespace) && path.equals(id.path);
+  }
+  public int hashCode() { return 31 * namespace.hashCode() + path.hashCode(); }
+  public String toString() { return namespace + ":" + path; }
+}
+"#;
+
 const SOURCE: &str = r#"
 import net.fabricmc.fabric.api.event.*;
 import net.minecraft.resources.Identifier;
@@ -55,7 +83,7 @@ public final class EventOracle {
     catch (IllegalArgumentException x) { return x.getClass().getName()+":"+x.getMessage(); }
   }
   static String after() {
-    Event<L> e=event(Event.DEFAULT_PHASE,id("late"));
+    Event<L> e=event(Event.DEFAULT_PHASE);
     StringBuilder out=new StringBuilder();
     e.register(id("late"),()->out.append("L")); e.register(()->out.append("D"));
     e.addPhaseOrdering(id("late"),Event.DEFAULT_PHASE); e.invoker().call(); return out.toString();
@@ -103,10 +131,7 @@ fn native_output() -> String {
     );
     let after = sort_phases(
         ["fabric:default", "demo:late"],
-        &[
-            ("fabric:default", "demo:late"),
-            ("demo:late", "fabric:default"),
-        ],
+        &[("demo:late", "fabric:default")],
     );
     let labels = |order: Vec<String>, names: &[(&str, &str)]| {
         order
@@ -180,7 +205,9 @@ fn fabric_event_order_matches_real_java25_oracle() {
         let root = PathBuf::from(env::var_os("TMPDIR").unwrap_or_else(|| ".".into()))
             .join("fabric-event-real");
         fs::create_dir_all(&root).unwrap();
+        let identifier = root.join("Identifier.java");
         let source = root.join("EventOracle.java");
+        fs::write(&identifier, IDENTIFIER_SOURCE).unwrap();
         fs::write(&source, SOURCE).unwrap();
         let javac = env::var_os("JAVA_HOME")
             .map(|h| PathBuf::from(h).join("bin/javac"))
@@ -192,6 +219,7 @@ fn fabric_event_order_matches_real_java25_oracle() {
             Command::new(javac)
                 .args(["--release", "21", "-cp", &classpath, "-d"])
                 .arg(&root)
+                .arg(&identifier)
                 .arg(&source)
                 .status()
                 .unwrap()
