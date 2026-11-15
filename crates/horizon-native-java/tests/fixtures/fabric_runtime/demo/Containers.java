@@ -102,4 +102,11 @@ public final class Containers {
         return a.getClass().getName() + ":" + a.equals(b) + ":" + (a == b) + ":" + a;
     }
 
+    public static String dependencyKinds() {
+        var m = mod("probe-fixture").getMetadata();
+        StringBuilder out = new StringBuilder();
+        for (var d : m.getDependencies()) out.append(d.getKind()).append(':').append(d.getModId()).append(';');
+        return out.toString();
+    }
+
 }

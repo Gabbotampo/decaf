@@ -297,6 +297,43 @@ fn a_jar_origin_paths_are_the_cached_singleton_list() {
     );
 }
 
+#[test]
+fn real_loader_api_fixture_preserves_all_dependency_kinds() {
+    let jar = [
+        "/Users/sparks/ava/scratch/census-dependency-closures/oracle/fabric-loader-0.19.5.jar",
+        "/Users/sparks/ava/scratch/lib-balm-enum/fabric-loader-0.19.5.jar",
+    ]
+    .iter()
+    .map(std::path::Path::new)
+    .find(|p| p.exists());
+    let Some(jar) = jar else { return };
+    let containers = sources()
+        .into_iter()
+        .find(|(name, _)| name == "demo/Containers.java")
+        .unwrap();
+    let fixture = javac_fixture::Fixture::build_with_real_classpath(
+        "real-loader-api",
+        &[(containers.0.as_str(), containers.1.as_str())],
+        jar,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"depends":{"a":">=1"},"recommends":{"b":">=1"},"suggests":{"c":">=1"},"conflicts":{"d":">=1"},"breaks":{"e":">=1"}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "dependencyKinds",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "DEPENDS:a;RECOMMENDS:b;SUGGESTS:c;CONFLICTS:d;BREAKS:e;"),
+        "{result:?}"
+    );
+}
+
 /// The loader and its mapping resolver are one object each (`==`, `equals`,
 /// `IdentityHashMap`, host lists, `instanceof`); `getEnvironmentType()` is the
 /// `EnvType` constant itself; `EnvType`'s constants are one object each in
