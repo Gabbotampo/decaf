@@ -27,7 +27,8 @@ const JSON_PARSER: &str = "com/google/gson/JsonParser";
 const MAX_TREE_DEPTH: usize = 255;
 
 /// One parsed JSON value, before it becomes runtime objects.
-enum Tree {
+#[derive(Clone)]
+pub(super) enum Tree {
     Object(Vec<(String, Tree)>),
     Array(Vec<Tree>),
     Str(String),
@@ -37,7 +38,7 @@ enum Tree {
 }
 
 /// The outcome of reading a document with `JsonReader` in `LENIENT` mode.
-enum Parsed {
+pub(super) enum Parsed {
     /// Only whitespace and comments: `Streams.parse` answers `JsonNull` and
     /// `Gson.fromJson` answers `null`.
     Empty,
@@ -49,21 +50,31 @@ enum Parsed {
 /// A strict-JSON reader plus the lenient forms whose result is unambiguous:
 /// `//`, `#` and `/* */` comments, unescaped control characters in strings,
 /// and the `\'` escape. Anything else gives up rather than guess.
-struct Parser<'a> {
+pub(super) struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     pos: usize,
+    /// A name repeated in one object: `JsonObject.add` keeps it (first
+    /// position, last value), Gson's map adapter throws "duplicate key".
+    duplicate: bool,
 }
 
 impl<'a> Parser<'a> {
     fn parse(text: &'a str) -> Parsed {
+        Self::parse_noting_duplicates(text).0
+    }
+
+    /// [`Self::parse`], and whether any object repeated a name.
+    pub(super) fn parse_noting_duplicates(text: &'a str) -> (Parsed, bool) {
         if text.len() > MAX_GSON_JSON_BYTES {
-            return Parsed::Unsupported;
+            return (Parsed::Unsupported, false);
         }
         let mut parser = Parser {
             bytes: text.as_bytes(),
             text,
-            pos: 0,
+            // `JsonReader`'s first fill skips one byte order mark.
+            pos: if text.starts_with('\u{feff}') { 3 } else { 0 },
+            duplicate: false,
         };
         let parsed = (|| {
             parser.skip_space()?;
@@ -74,7 +85,7 @@ impl<'a> Parser<'a> {
             parser.skip_space()?;
             (parser.pos == parser.bytes.len()).then_some(Parsed::Value(value))
         })();
-        parsed.unwrap_or(Parsed::Unsupported)
+        (parsed.unwrap_or(Parsed::Unsupported), parser.duplicate)
     }
 
     fn peek(&self) -> Option<u8> {
@@ -148,7 +159,10 @@ impl<'a> Parser<'a> {
                     // `JsonObject.add` keeps a repeated name at its first
                     // position with the last value.
                     match members.iter_mut().find(|(existing, _)| *existing == name) {
-                        Some(member) => member.1 = value,
+                        Some(member) => {
+                            member.1 = value;
+                            self.duplicate = true;
+                        }
                         None => members.push((name, value)),
                     }
                     self.skip_space()?;
@@ -273,7 +287,7 @@ enum Source {
 impl<H: Host> Runtime<'_, H> {
     /// Runtime objects for one parsed value, as `JsonElementTypeAdapter.read`
     /// builds them.
-    fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
+    pub(super) fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
         Ok(match tree {
             Tree::Null => null_instance(),
             Tree::Bool(value) => self.new_primitive(Prim::Bool(value)),
@@ -446,7 +460,9 @@ mod tests {
             "01",
             "1.",
             "NaN",
-            "\u{feff}{}",
+            // A byte order mark anywhere but first (gson-2.14.0: a
+            // `JsonSyntaxException`).
+            "{}\u{feff}",
             ")]}'\n{}",
             "{} {}",
             "/ {}",
@@ -459,6 +475,12 @@ mod tests {
                 "{text:?} was answered"
             );
         }
+        // `JsonReader`'s first fill skips one leading byte order mark
+        // (gson-2.14.0 reads `\u{feff}{}` as `{}`).
+        assert!(matches!(
+            Parser::parse("\u{feff}{}"),
+            Parsed::Value(Tree::Object(_))
+        ));
         // gson-2.14.0 parses this to `JsonNull`.
         assert!(matches!(
             Parser::parse(" // only\n#also\n/* c */ "),

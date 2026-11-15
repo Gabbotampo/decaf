@@ -298,7 +298,43 @@ impl<H: Host> Runtime<'_, H> {
                         unique.push(value);
                     }
                 }
-                Ok(Some(collection_value("set", &unique)))
+                // An `ImmutableEnumSet` (an `EnumSet` inside) iterates in
+                // ordinal order, each constant's own `ordinal()`.
+                if unique.len() > 1 {
+                    let mut ordered = Vec::with_capacity(unique.len());
+                    for value in unique {
+                        // Only a jar enum's `ordinal()` is its own: a JDK
+                        // enum's (`TimeUnit`) is not modelled, so the factory
+                        // is counted (#253 review).
+                        let jar_enum = crate::runtime::jar_object::object_class(&value)
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                expect_ref(&value)
+                                    .and_then(|marker| marker.strip_prefix("enum/"))
+                                    .and_then(|rest| rest.rsplit_once('/'))
+                                    .map(|(class, _)| class.to_owned())
+                            })
+                            .is_some_and(|class| self.class(&class).is_some());
+                        if !jar_enum {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        let ordinal = self.call_virtual(
+                            crate::runtime::jdk_call::Site::Virtual,
+                            "java/lang/Enum",
+                            "ordinal",
+                            "()I",
+                            &value,
+                            &[],
+                        )?;
+                        let Value::Int(ordinal) = ordinal else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        ordered.push((ordinal, value));
+                    }
+                    ordered.sort_by_key(|(ordinal, _)| *ordinal);
+                    unique = ordered.into_iter().map(|(_, value)| value).collect();
+                }
+                Ok(Some(self.factory_or_count(r, "set", unique)?))
             }
             "com/google/common/collect/ImmutableSet"
             | "com/google/common/collect/ImmutableMap"
@@ -370,17 +406,27 @@ impl<H: Host> Runtime<'_, H> {
                             && (r.descriptor == "()Lcom/google/common/collect/ImmutableMap;"
                                 || r.descriptor == "()Ljava/util/Map;") =>
                     {
-                        let Some(map) = self.fields.get(&map_field) else {
-                            return Ok(Some(collection_value("map", &[])));
+                        // `buildOrThrow`: what `ImmutableMap.of` makes for the
+                        // entries put (the shared `RegularImmutableMap.EMPTY`,
+                        // `SingletonImmutableBiMap`, `RegularImmutableMap`),
+                        // counted on a host that makes none (#253: never a
+                        // collection literal, never a JDK `Map.of` class).
+                        let values = match self.fields.get(&map_field) {
+                            Some(map) => runtime_collection_values(&*self.host, map)?,
+                            None => Vec::new(),
                         };
-                        let values = runtime_collection_values(&*self.host, map)?;
-                        Ok(Some(
-                            self.host
-                                .immutable_collection("map", values)
-                                .ok_or_else(|| {
-                                    NativeError::Metadata("immutable map host missing".into())
-                                })?,
-                        ))
+                        let of = MethodRef {
+                            owner: "com/google/common/collect/ImmutableMap".into(),
+                            name: "of".into(),
+                            descriptor: r.descriptor.clone(),
+                        };
+                        match self
+                            .host
+                            .factory_collection(&of.owner, &of.name, "map", values)
+                        {
+                            Some(made) => Ok(Some(made)),
+                            None => self.host.unknown_operand_call(r).map(Some),
+                        }
                     }
                     _ => Ok(None),
                 }
@@ -415,14 +461,17 @@ impl<H: Host> Runtime<'_, H> {
             | "com/google/common/collect/Multimap"
             | "com/google/common/collect/SetMultimap"
             | "com/google/common/collect/ListMultimap" => self.invoke_multimap(r, receiver, args),
-            // `Maps.newConcurrentMap()` is a mutable map. The bounded runtime
-            // is single-threaded, so the host's ordinary map marker is the
-            // same object graph; concurrency has no second thread to serve.
+            // `Maps.newConcurrentMap()` is a new `ConcurrentHashMap`. The
+            // bounded runtime is single-threaded: no second thread to serve.
             "com/google/common/collect/Maps"
                 if r.name == "newConcurrentMap"
                     && r.descriptor == "()Ljava/util/concurrent/ConcurrentMap;" =>
             {
-                Ok(Some(collection_value("map", &[])))
+                Ok(Some(self.new_host_collection(
+                    "java/util/concurrent/ConcurrentHashMap",
+                    Vec::new(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?))
             }
             "com/google/common/collect/Maps"
                 if r.name == "newIdentityHashMap"
@@ -597,7 +646,7 @@ impl<H: Host> Runtime<'_, H> {
                     unique.push(value);
                 }
             }
-            return Ok(Some(collection_value("set", &unique)));
+            return Ok(Some(self.factory_or_count(r, "set", unique)?));
         }
         if !values.len().is_multiple_of(2) {
             return Ok(None);
@@ -627,7 +676,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
-        Ok(Some(collection_value("map", &values)))
+        Ok(Some(self.factory_or_count(r, "map", values)?))
     }
 
     /// `Suppliers.memoize(s)` (and `memoizeWithExpiration`, whose expiry a
@@ -1269,7 +1318,18 @@ impl<H: Host> Runtime<'_, H> {
                         present.push(key);
                     }
                 }
-                collection_value("set", &present)
+                // `AbstractMultimap` caches its key view: one object per
+                // multimap, following it (a set stands in for its class).
+                match self.host.owned_collection(
+                    &map,
+                    "multimap.keySet",
+                    crate::runtime::stand_in_class("set"),
+                    true,
+                    present,
+                ) {
+                    Some(view) => view,
+                    None => self.host.unknown_operand_call(r)?,
+                }
             }
             ("values", "()Ljava/util/Collection;") => {
                 let mut all = Vec::new();
@@ -1277,7 +1337,17 @@ impl<H: Host> Runtime<'_, H> {
                     let collection = self.host.invoke_instance(&get, &map, &[key])?;
                     all.extend(runtime_collection_values(&*self.host, &collection)?);
                 }
-                collection_value("list", &all)
+                // `AbstractMultimap` caches its values view likewise.
+                match self.host.owned_collection(
+                    &map,
+                    "multimap.values",
+                    crate::runtime::stand_in_class("list"),
+                    true,
+                    all,
+                ) {
+                    Some(view) => view,
+                    None => self.host.unknown_operand_call(r)?,
+                }
             }
             ("asMap", "()Ljava/util/Map;") => map,
             ("clear", "()V") => {
@@ -1385,9 +1455,12 @@ impl<H: Host> Runtime<'_, H> {
                 answer()
             }
             ("makeMap", "()Ljava/util/concurrent/ConcurrentMap;") => {
-                // A concurrent map is the single-threaded runtime's map model:
-                // the same object graph, with no second thread to serve.
-                Ok(Some(collection_value("map", &[])))
+                // A new `ConcurrentHashMap` (no second thread to serve).
+                Ok(Some(self.new_host_collection(
+                    "java/util/concurrent/ConcurrentHashMap",
+                    Vec::new(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?))
             }
             ("toString", "()Ljava/lang/String;") => {
                 let mut out = String::from("MapMaker{");

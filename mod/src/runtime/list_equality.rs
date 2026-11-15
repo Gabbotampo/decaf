@@ -84,9 +84,6 @@ const LIST_N: ListRules = ListRules {
 struct HostList {
     rules: ListRules,
     view: bool,
-    /// The host's inline `list/..` value, which keeps no table of its own
-    /// to mutate (the host answers its mutators).
-    inline: bool,
     /// An unmodifiable list that owns its elements (`List.of`,
     /// `Collections.emptyList`, `singletonList`): the host refuses its
     /// mutators.
@@ -109,16 +106,6 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let marker = expect_ref(value)?;
-        // The host's inline lists (`list/a,b`) come from `Arrays.asList` and
-        // the varargs factories: `AbstractList`'s bodies.
-        if marker.starts_with("list/") || marker.starts_with("list#") || marker == "list" {
-            return Some(HostList {
-                rules: ABSTRACT_LIST,
-                view: false,
-                inline: true,
-                unmodifiable: false,
-            });
-        }
         let class = self.host_collection_class(value)?;
         let rules = match class.as_str() {
             "java/util/ArrayList" => ARRAY_LIST,
@@ -152,7 +139,6 @@ impl<H: Host> Runtime<'_, H> {
                 return Some(HostList {
                     rules,
                     view: false,
-                    inline: false,
                     unmodifiable: true,
                 });
             }
@@ -161,7 +147,6 @@ impl<H: Host> Runtime<'_, H> {
                 return Some(HostList {
                     rules: ABSTRACT_LIST,
                     view: true,
-                    inline: false,
                     unmodifiable: false,
                 });
             }
@@ -170,7 +155,6 @@ impl<H: Host> Runtime<'_, H> {
         Some(HostList {
             rules,
             view: false,
-            inline: false,
             unmodifiable: false,
         })
     }
@@ -397,7 +381,7 @@ impl<H: Host> Runtime<'_, H> {
         } else {
             list.rules
         };
-        let immutable = list.view || list.inline || list.unmodifiable;
+        let immutable = list.view || list.unmodifiable;
         match (r.name.as_str(), r.descriptor.as_str(), args) {
             ("hashCode", "()I", []) => {
                 let Some(hash) = self.java_hash(receiver)? else {

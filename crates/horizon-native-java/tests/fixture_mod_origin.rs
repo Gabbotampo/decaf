@@ -20,6 +20,9 @@
 //! `ModContainer.getRootPaths()` answers), not the jar's host path; the
 //! runtime never exposes host paths.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -152,7 +155,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-mod-origin-{test}-{}-{unique}",
             std::process::id()
         ));

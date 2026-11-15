@@ -1291,16 +1291,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(crate::runtime::jar_object::collection_class(handle.key()).to_owned());
         }
+        // No text is a collection (#156 P14d2): only an object `new` made of
+        // a JDK collection class, or of a jar subclass of one, has a row.
         let marker = expect_ref(value)?;
-        let (head, _) = marker
-            .split_once(['#', '/'])
-            .unwrap_or((marker.as_str(), ""));
-        match head {
-            "list" => return Some("java/util/ArrayList".into()),
-            "set" => return Some("java/util/LinkedHashSet".into()),
-            "map" => return Some("java/util/LinkedHashMap".into()),
-            _ => {}
-        }
         let mut class = crate::runtime::jar_object::key_class(marker)
             .or_else(|| marker.split_once('#').map(|(class, _)| class))?
             .to_owned();
