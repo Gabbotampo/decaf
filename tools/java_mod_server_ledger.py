@@ -537,6 +537,7 @@ class Closure:
     jars: tuple[Path, ...] = ()
     ids: tuple[str, ...] = ()
     missing: tuple[tuple[str, str], ...] = ()
+    missing_requirements: tuple[tuple[str, str, str], ...] = ()
 
 
 def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
@@ -560,59 +561,73 @@ def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
 def provider_index(jars: list[hybrid_pack.PackJar]) -> dict[str, list[hybrid_pack.PackJar]]:
     """Each id (own, `provides` alias or nested module) and its providers, best first.
 
-    The hybrid tool's order: a jar whose own id is the dependency first, then one
-    that carries it as a nested module, then the newest version.
+    Providers are ordered by newest compatible version; an own-id provider only
+    breaks a same-version tie with a `provides` alias.
     """
     return hybrid_pack._provider_index(jars)
 
 
 def canonical_provider(providers: list[hybrid_pack.PackJar]) -> hybrid_pack.PackJar:
-    """The provider a dependency should get, from the index's best-first list.
+    """Return the newest compatible provider from the pre-ranked index.
 
-    A mod that bundles a library as jar-in-jar provides every id the library
-    does: Distant Horizons nests Fabric API's root and its 44 modules, so the
-    index's "most nested ids" order would hand `fabric-api-base` to Distant
-    Horizons and run a whole second mod beside the jar under test. The library
-    itself is the provider: a candidate whose own id another candidate nests
-    wins, and the index's order breaks the remaining ties.
+    When equal-version candidates exist, prefer the standalone module over a
+    carrier that nests that module. This is a tie-break after version matching,
+    never a nested-id count or a way to select an older provider.
     """
-    bundled = {ident.lower() for provider in providers
+    newest = providers[0].declaration.version
+    same_version = [provider for provider in providers
+                    if hybrid_pack._compare_maven_versions(provider.declaration.version,
+                                                           newest) == 0]
+    bundled = {ident.lower() for provider in same_version
                for ident in provider.declaration.nested_ids}
-    for provider in providers:
+    for provider in same_version:
         if provider.mod_id.lower() in bundled:
             return provider
-    return providers[0]
+    return same_version[0]
 
 
 def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
-                       declaration: hybrid_pack.Declaration | None = None) -> Closure:
+                       declaration: hybrid_pack.Declaration | None = None,
+                       version_matcher=None) -> Closure:
     """The declared dependency closure of `jar`, resolved against `index`.
 
     Every required id is satisfied by the platform (`minecraft`, `fabricloader`,
     `neoforge`, ...), by an id the closure already holds (the jar's own id, its
     `provides` aliases and jar-in-jar modules, and the same for each provider it
     pulled in), or by the best provider in the index; anything else is missing.
-    Version ranges are not checked: the newest provider stands in for the range,
-    which is what the corpus can offer.
+    Providers are filtered by the declared Fabric or NeoForge version range. A
+    provider with the wrong version is missing from this closure; it is never
+    linked as a host and the census reports the unresolved id.
     """
     root = declaration or hybrid_pack.read_declaration(jar)
+    version_matcher = version_matcher or hybrid_pack.maven_version_satisfies
     target = hybrid_pack.PackJar(jar, None, root)
     held = {target.mod_id.lower()} | {ident.lower() for ident in root.nested_ids}
     chosen: dict[Path, hybrid_pack.PackJar] = {}
     missing: dict[str, str] = {}
+    missing_requirements: dict[str, tuple[str, str]] = {}
     queue = [target]
     while queue:
         current = queue.pop(0)
+        requirements = current.declaration.requirements or tuple(
+            (dependency, "*") for dependency in current.declaration.depends
+        )
+        by_id: dict[str, list[str]] = {}
+        for dependency, requirement in requirements:
+            by_id.setdefault(dependency.lower(), []).append(requirement)
         for dependency in current.declaration.depends:
             key = dependency.lower()
             if key in hybrid_pack.PLATFORM_IDS or key in held:
                 continue
+            predicates = tuple(by_id.get(key, ("*",)))
             providers = [provider for provider in index.get(key, [])
                          if provider.path.resolve() != jar.resolve()
                          and provider.path not in chosen
-                         and provider.mod_id.lower() not in held]
+                         and provider.mod_id.lower() not in held
+                         and version_matcher(provider.declaration.version, predicates)]
             if not providers:
                 missing.setdefault(key, current.mod_id)
+                missing_requirements.setdefault(key, (current.mod_id, ", ".join(predicates)))
                 continue
             provider = canonical_provider(providers)
             chosen[provider.path] = provider
@@ -622,16 +637,25 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
     # An id first missed and then provided by a later provider's nested module
     # is not missing after all.
     missing = {key: by for key, by in missing.items() if key not in held}
+    missing_requirements = {
+        key: value for key, value in missing_requirements.items() if key not in held
+    }
     deps = sorted(chosen.values(), key=lambda item: item.name)
     return Closure(tuple(item.path for item in deps), tuple(item.mod_id for item in deps),
-                   tuple(sorted(missing.items())))
+                   tuple(sorted(missing.items())),
+                   tuple(sorted((key, by, requirement)
+                                for key, (by, requirement) in missing_requirements.items())))
 
 
 def missing_dependency_row(jar: Path, closure: Closure) -> Row:
     """The row of a jar the ledger did not start: its closure cannot be completed."""
     ident, version = metadata(jar)
-    named = ", ".join(key if by.lower() == ident.lower() else f"{key} (needed by {by})"
-                      for key, by in closure.missing)
+    ranges = {key: requirement for key, _, requirement in closure.missing_requirements}
+    named = ", ".join(
+        (key if by.lower() == ident.lower() else f"{key} (needed by {by})")
+        + (f" [{ranges[key]}]" if key in ranges and ranges[key] not in ("", "*") else "")
+        for key, by in closure.missing
+    )
     return Row(jar.name, ident, version, "unresolved", "", "?", reason=bounded(
         f"missing-dependency: {named}", MAX_CAUSE), recommend=MISSING_DEPENDENCY,
         deps=closure.ids)

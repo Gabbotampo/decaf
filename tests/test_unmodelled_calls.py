@@ -220,10 +220,16 @@ class UnmodelledCallsTests(unittest.TestCase):
         probe.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps({'status':'ok','verdict':'ran-clean','unknown_host_call_count':0,'unknown_host_calls':[]}))\n")
         probe.chmod(probe.stat().st_mode | stat.S_IXUSR)
         report_path = directory / "report.json"
-        self.assertEqual(TOOL.main([
-            "--role", "client", "--probe", str(probe), "--jobs", "1",
-            "--json", str(report_path), "--corpus", f"test={directory}",
-        ]), 0)
+        from unittest import mock
+        fake_oracle = type("Oracle", (), {"evaluate": lambda self, pairs: None,
+                                           "matches": lambda self, version, predicates: True})()
+        with mock.patch.object(TOOL, "find_fabric_loader", return_value=directory / "loader.jar"), \
+             mock.patch.object(TOOL, "FabricPredicateOracle", return_value=fake_oracle):
+            self.assertEqual(TOOL.main([
+                "--role", "client", "--dependency-mode", "closure",
+                "--probe", str(probe), "--jobs", "1",
+                "--json", str(report_path), "--corpus", f"test={directory}",
+            ]), 0)
         rows = __import__("json").loads(report_path.read_text())["corpora"]["test"]["rows"]
         row = next(row for row in rows if row["jar"] == "app.jar")
         self.assertEqual((row["role"], row["kind"]), ("client-only", "client"))
