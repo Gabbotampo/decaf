@@ -230,7 +230,9 @@ pub(crate) fn invoke(
         (MENU_SCREENS, "register") if args.len() == 2 => {
             let key = value_key(&args[0]);
             if !state.menu_screens.insert(key.clone()) {
-                return Some(Err(illegal_state(format!("Duplicate registration for {key}"))));
+                return Some(Err(illegal_state(format!(
+                    "Duplicate registration for {key}"
+                ))));
             }
             state.registrations.push(Registration::MenuScreen {
                 menu: args[0].clone(),

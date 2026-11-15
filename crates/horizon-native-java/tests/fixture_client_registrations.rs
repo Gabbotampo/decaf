@@ -79,7 +79,10 @@ fn client_registration_surfaces_keep_java25_identity_and_order() {
     let mut host = fixture
         .jar
         .seed_host(StdHost::new().with_environment_type("CLIENT"));
-    assert_eq!(fixture.text_on(&mut host, "identities"), "false|true|true|true");
+    assert_eq!(
+        fixture.text_on(&mut host, "identities"),
+        "false|true|true|true"
+    );
     assert_eq!(
         fixture.text_on(&mut host, "duplicates"),
         "IllegalArgumentException"
