@@ -30,7 +30,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
@@ -132,7 +134,7 @@ impl<H: Host> Runtime<'_, H> {
         if class == "java/lang/String" || class == "java/lang/CharSequence" {
             let claimed = class_of_value(value).is_some()
                 || marker.contains('#') && !value_class::is_plain_string(marker)
-                || ["@", "enum/", "game/"]
+                || ["enum/", "game/"]
                     .iter()
                     .any(|prefix| marker.starts_with(prefix));
             return !claimed;

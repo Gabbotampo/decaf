@@ -201,7 +201,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(collector));
     }
     if let Some(comparator) = crate::jdk_stream::comparator_static(r, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         // `Modifier`'s predicates over the access flags reflection answers
@@ -407,7 +407,7 @@ pub(crate) fn instance_call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     if let Some(comparator) = crate::jdk_stream::comparator_instance(r, receiver, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
