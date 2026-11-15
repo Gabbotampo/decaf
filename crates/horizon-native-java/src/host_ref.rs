@@ -234,6 +234,8 @@ pub enum HostKind {
     /// A NeoForge `DeferredHolder` or Forge `RegistryObject`: key the loader,
     /// the registration's serial and the entry's key.
     Holder,
+    /// A `Holder.Reference` returned by a jar-owned `Registry.registerForHolder`: key the registry key, id and value.
+    RegistryHolder,
     /// The value a holder's registration registered: key the serial.
     Registered,
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
@@ -1249,6 +1251,13 @@ const KINDS: &[KindInfo] = &[
         // One holder per `register` call: the serial names one allocation.
         canonical: always_canonical,
         methods: &crate::host_registry::HOLDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RegistryHolder,
+        tag: "rhold",
+        class: ClassRule::Fixed("net/minecraft/core/Holder$Reference"),
+        canonical: always_canonical,
+        methods: &crate::host_registry_holder::METHODS,
     },
     KindInfo {
         kind: HostKind::Registered,

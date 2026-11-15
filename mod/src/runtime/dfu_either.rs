@@ -9,6 +9,10 @@ const APP: &str = "com/mojang/datafixers/kinds/App";
 const OBJECT: &str = "java/lang/Object";
 static NEXT_EITHER: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn left(value: &Value) -> Value {
+    either(true, value)
+}
+
 fn either(left: bool, value: &Value) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::DfuEither,

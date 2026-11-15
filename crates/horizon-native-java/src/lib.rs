@@ -111,6 +111,7 @@ mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
 mod host_registry;
+mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
@@ -5957,6 +5958,9 @@ impl Host for StdHost {
         if let Some(value) = self.networking_send(r, args) {
             return Ok(value);
         }
+        if let Some(value) = host_registry_holder::static_call(self, r, args) {
+            return value;
+        }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
         }
@@ -7280,6 +7284,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_either::host_instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = host_registry_holder::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.holder_call(r, receiver) {
@@ -11894,6 +11901,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         ],
         "net/minecraft/world/level/block/Mirror" => &["NONE", "LEFT_RIGHT", "FRONT_BACK"],
         // Mods iterate `PackType.values()` to register a pack for each side.
+        "net/minecraft/core/Holder$Kind" => &["REFERENCE", "DIRECT"],
         "net/minecraft/server/packs/PackType" => &["CLIENT_RESOURCES", "SERVER_DATA"],
         // SLF4J ships with the game; logging shims switch over its levels
         // (javac's `$SwitchMap` sizes its table from `values()`).
