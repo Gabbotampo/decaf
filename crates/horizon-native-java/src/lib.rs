@@ -27658,10 +27658,9 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_bigdecimal_instance(&r, receiver.as_ref(), &args)
                     ) {
                         value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_bigdecimal_static(&r, &args)
-                    ) {
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
