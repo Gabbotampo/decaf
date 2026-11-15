@@ -27,6 +27,31 @@ const TYPE_TOKEN: &str = "com/google/common/reflect/TypeToken";
 /// The captured type a `TypeToken` subclass object keeps, under its marker.
 const RUNTIME_TYPE: &str = "#runtimeTypeLjava/lang/reflect/Type;";
 
+/// The concrete JDK class returned by Guava's no-argument collection
+/// factories, as constructed by Guava 33.6.0.
+pub(crate) fn empty_factory_class(r: &MethodRef) -> Option<&'static str> {
+    if !r.descriptor.starts_with("()") {
+        return None;
+    }
+    match (r.owner.as_str(), r.name.as_str()) {
+        ("com/google/common/collect/Maps", "newHashMap") => Some("java/util/HashMap"),
+        ("com/google/common/collect/Maps", "newLinkedHashMap") => Some("java/util/LinkedHashMap"),
+        ("com/google/common/collect/Maps", "newIdentityHashMap") => {
+            Some("java/util/IdentityHashMap")
+        }
+        ("com/google/common/collect/Maps", "newConcurrentMap") => {
+            Some("java/util/concurrent/ConcurrentHashMap")
+        }
+        ("com/google/common/collect/Lists", "newArrayList") => Some("java/util/ArrayList"),
+        ("com/google/common/collect/Lists", "newLinkedList") => Some("java/util/LinkedList"),
+        ("com/google/common/collect/Sets", "newHashSet") => Some("java/util/HashSet"),
+        ("com/google/common/collect/Sets", "newIdentityHashSet") => {
+            Some("java/util/Collections$SetFromMap")
+        }
+        _ => None,
+    }
+}
+
 fn map_ref(name: &str, descriptor: &str) -> MethodRef {
     MethodRef {
         owner: "java/util/Map".into(),

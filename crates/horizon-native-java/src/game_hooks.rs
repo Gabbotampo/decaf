@@ -685,18 +685,20 @@ fn empty_collection_factory(r: &MethodRef) -> Option<&'static str> {
         return None;
     }
     match (r.owner.as_str(), r.name.as_str()) {
-        (
-            "com/google/common/collect/Maps",
-            "newHashMap" | "newLinkedHashMap" | "newConcurrentMap",
-        ) => Some("map"),
-        (
-            "com/google/common/collect/Lists",
-            "newArrayList" | "newLinkedList" | "newCopyOnWriteArrayList",
-        ) => Some("list"),
-        (
-            "com/google/common/collect/Sets",
-            "newHashSet" | "newLinkedHashSet" | "newConcurrentHashSet",
-        ) => Some("set"),
+        ("com/google/common/collect/Maps", "newHashMap") => Some("java/util/HashMap"),
+        ("com/google/common/collect/Maps", "newLinkedHashMap") => Some("java/util/LinkedHashMap"),
+        ("com/google/common/collect/Maps", "newIdentityHashMap") => {
+            Some("java/util/IdentityHashMap")
+        }
+        ("com/google/common/collect/Maps", "newConcurrentMap") => {
+            Some("java/util/concurrent/ConcurrentHashMap")
+        }
+        ("com/google/common/collect/Lists", "newArrayList") => Some("java/util/ArrayList"),
+        ("com/google/common/collect/Lists", "newLinkedList") => Some("java/util/LinkedList"),
+        ("com/google/common/collect/Sets", "newHashSet") => Some("java/util/HashSet"),
+        ("com/google/common/collect/Sets", "newIdentityHashSet") => {
+            Some("java/util/Collections$SetFromMap")
+        }
         _ => None,
     }
 }
