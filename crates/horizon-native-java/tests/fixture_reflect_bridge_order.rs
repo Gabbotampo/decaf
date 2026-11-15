@@ -10,6 +10,9 @@
 //! (`javac --release 21`, the reordered class file made by the same
 //! transformation, two runs alike).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -105,7 +108,7 @@ fn bridge_first(class: &[u8]) -> Vec<u8> {
 }
 
 fn jar(tag: &str, reorder: bool) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-bridge-order-{tag}-{}",
         std::process::id()
     ));
