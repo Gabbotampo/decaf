@@ -15,7 +15,7 @@ public final class FabricPredicateOracle {
     }
 
     private static String quote(String value) {
-        return "\\\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\\\"";
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
     }
 
     public static void main(String[] args) throws Exception {
