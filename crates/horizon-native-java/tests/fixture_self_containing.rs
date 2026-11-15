@@ -8,6 +8,11 @@
 //! same, and its walks never overflow the native stack (`host_recursion.rs`; a composed
 //! predicate as deep as a jar builds it is that module's own test).
 //!
+//! Stage chains (`limit`, `sorted`, `skip`/`distinct`, `IntStream.limit`) thousands deep answer
+//! as Java does on the test's 2 MiB thread, `(this Collection)` is printed only by the classes
+//! whose `toString` checks for it (by the receiver's identity; a `Collections.unmodifiable*`
+//! view prints its list), and a jar with an unused class annotated 66 levels deep loads.
+//!
 //! `fixtures/self_containing/demo/Probe.java` runs unchanged on both sides; its `main` on Java 25
 //! (with the 26.3 server's gson-2.14.0) printed `java25.txt`. The Gson stubs exist only for
 //! `javac`.
@@ -46,6 +51,11 @@ fn self_containing_collections_answer_as_java_25() {
                 "demo/Probe.java",
                 include_str!("fixtures/self_containing/demo/Probe.java"),
             ),
+            // An unused class annotated 66 levels deep: the jar still loads (#260 review).
+            (
+                "demo/DeepAnnotated.java",
+                include_str!("fixtures/self_containing/demo/DeepAnnotated.java"),
+            ),
         ],
     );
     let mut failures = Vec::new();
@@ -60,6 +70,9 @@ fn self_containing_collections_answer_as_java_25() {
         "gsonCycle",
         "comparatorChain",
         "compareToCycle",
+        "streamChains",
+        "selfPrinting",
+        "viewChain",
     ] {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let text = fixture.text_on(&mut host, method);

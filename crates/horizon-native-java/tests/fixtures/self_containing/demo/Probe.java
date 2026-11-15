@@ -106,6 +106,54 @@ public final class Probe {
         return t(() -> chain.compare(1, 2)) + "|" + r.compare(1, 2);
     }
 
+    /** Stage chains as long as a jar builds them: Java's answer, never a native overflow. */
+    public static String streamChains() {
+        java.util.stream.Stream<Integer> limits = java.util.stream.Stream.of(1, 2);
+        for (int i = 0; i < 5_000; i++) limits = limits.limit(10);
+        java.util.stream.Stream<Integer> sorts = java.util.stream.Stream.of(2, 1);
+        for (int i = 0; i < 3_000; i++) sorts = sorts.sorted();
+        java.util.stream.Stream<Integer> mixed = java.util.stream.Stream.of(1, 2, 2);
+        for (int i = 0; i < 2_500; i++) mixed = mixed.skip(0).distinct();
+        java.util.stream.IntStream ints = java.util.stream.IntStream.of(1, 2, 3);
+        for (int i = 0; i < 5_000; i++) ints = ints.limit(5);
+        java.util.stream.Stream<Integer> a = limits, b = sorts, c = mixed;
+        java.util.stream.IntStream d = ints;
+        return t(() -> a.collect(java.util.stream.Collectors.toList())) + "|" + t(() -> b.collect(java.util.stream.Collectors.toList()))
+            + "|" + t(() -> c.collect(java.util.stream.Collectors.toList())) + "|" + t(() -> d.sum()) + "|" + deepest();
+    }
+
+    /** A 1,000-stage chain collected at the deepest frame a recursion reaches. */
+    static String deepest() {
+        try {
+            return deepest();
+        } catch (StackOverflowError e) {
+            java.util.stream.Stream<Integer> s = java.util.stream.Stream.of(1, 2);
+            for (int i = 0; i < 1_000; i++) s = s.limit(10);
+            return s.collect(java.util.stream.Collectors.toList()).toString();
+        }
+    }
+
+    /** Which collections print `(this Collection)`: per class, by the receiver's identity. */
+    public static String selfPrinting() {
+        java.util.concurrent.CopyOnWriteArrayList<Object> cow = new java.util.concurrent.CopyOnWriteArrayList<>();
+        cow.add(cow);
+        List<Object> l = new ArrayList<>();
+        l.add(l);
+        List<Object> m = new ArrayList<>();
+        m.add(Collections.unmodifiableList(m));
+        return t(() -> cow.toString()) + "|" + Collections.unmodifiableList(l) + "|" + t(() -> m.toString())
+            + "|" + Collections.synchronizedList(l);
+    }
+
+    /** A chain of views as long as a jar nests them reads as its list. */
+    public static String viewChain() {
+        List<Object> base = new ArrayList<>(List.of("x"));
+        List<Object> v = base;
+        for (int i = 0; i < 4_100; i++) v = Collections.unmodifiableList(Collections.synchronizedList(v));
+        return v.size() + "|" + v + "|" + v.get(0) + "|" + v.contains("x") + "|" + v.isEmpty() + "|"
+            + new ArrayList<>(v) + "|" + v.hashCode();
+    }
+
     /** A `compareTo` that recurses through a cycle of jar objects. */
     static final class Node implements Comparable<Node> {
         Node next;
@@ -120,7 +168,7 @@ public final class Probe {
 
     public static void main(String[] args) throws Exception {
         for (String m : new String[] {"listSelf", "setSelf", "mapSelf", "nestedCycle", "hashSelf", "equalsSelf",
-                "arraysSelf", "gsonCycle", "comparatorChain", "compareToCycle"}) {
+                "arraysSelf", "gsonCycle", "comparatorChain", "compareToCycle", "streamChains", "selfPrinting", "viewChain"}) {
             System.out.println(m + "=" + Probe.class.getMethod(m).invoke(null));
         }
     }

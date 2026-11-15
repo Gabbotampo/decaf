@@ -3910,10 +3910,17 @@ impl StdHost {
         }
         // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
         // may be another view, as deep as a jar nests them: followed in a loop, never by
-        // recursion (#250), up to `host_recursion::MAX_HOST_WALK_DEPTH` wrappers.
+        // recursion (#250).
         let mut marker = expect_ref(receiver)?.clone();
         let mut reversed = false;
-        for hops in 0..host_recursion::MAX_HOST_WALK_DEPTH {
+        // Each hop follows one row of the view tables, so their rows bound any chain: a chain
+        // of any length a jar builds is read (#260 review); only a cycle, which no jar can
+        // build, would stop here.
+        let hops_bound = self.unmodifiable_collections.len()
+            + self.synchronized_views.len()
+            + self.reversed_views.len()
+            + 1;
+        for hops in 0..hops_bound {
             let target = self.synchronized_target(&marker).to_owned();
             let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
                 source.clone()
@@ -12651,8 +12658,19 @@ fn collection_text(
     value: &Value,
     owner_is_map: bool,
 ) -> Result<String, NativeError> {
-    let values = host_collection_values(host, value)?;
+    // One level of nested printing (#250).
+    let _level = host_recursion::enter()?;
     let marker = expect_string(value).to_owned();
+    // `Collections.unmodifiable*`'s `toString` is `c.toString()` (Java 25's `javap`): the view
+    // prints the collection it wraps, which is then the receiver `(this Collection)` compares
+    // against, never the view itself.
+    if let Some(source) = Host::unmodifiable_view_source(host, &marker)
+        .map(|source| jar_object::stored_value(&source))
+        .filter(|source| host.mutable_values(source).is_some())
+    {
+        return collection_text(host, &source, false);
+    }
+    let values = host_collection_values(host, value)?;
     let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
@@ -12667,13 +12685,27 @@ fn collection_text(
     // its identity, not its text (#250: a list holding itself recursed until the
     // native stack overflowed). A deeper cycle recurses, as on the JVM, until a
     // `StackOverflowError` (`host_recursion.rs`).
-    let _level = host_recursion::enter()?;
+    // Only a class whose `toString` is `AbstractCollection`'s/`AbstractMap`'s (or checks the
+    // same way: `ConcurrentHashMap`, the reversed views, `Helpers.collectionToString`'s blocking
+    // queues) prints itself as `(this Collection)`. `CopyOnWriteArrayList` (`Arrays.toString` of
+    // its array) and the concurrent linked queues print every element, so a list holding itself
+    // recurses until a `StackOverflowError`, as on the JVM.
+    let checks_itself = !class.is_some_and(|class| {
+        matches!(
+            class,
+            "java/util/concurrent/CopyOnWriteArrayList"
+                | "java/util/concurrent/ConcurrentLinkedQueue"
+                | "java/util/concurrent/ConcurrentLinkedDeque"
+                | "java/util/concurrent/LinkedTransferQueue"
+        )
+    });
     let mut texts = Vec::with_capacity(values.len());
     for element in &values {
-        let itself = match element {
-            Value::Ref(Some(inner)) => *inner == marker,
-            element => object_methods::identical(element, value),
-        };
+        let itself = checks_itself
+            && match element {
+                Value::Ref(Some(inner)) => *inner == marker,
+                element => object_methods::identical(element, value),
+            };
         texts.push(if itself {
             if is_map {
                 "(this Map)"
@@ -13501,10 +13533,11 @@ impl ClassFile {
         let interface_count = r.u2()? as usize;
         r.skip(interface_count * 2)?;
         let fields = read_fields(&mut r, &pool)?;
-        let methods = read_methods(&mut r, &pool)?;
+        let (methods, method_warnings) = read_methods(&mut r, &pool)?;
         let (annotations, bootstrap_methods, warnings) = read_class_attributes(&mut r, &pool)?;
-        let warnings = warnings
+        let warnings = method_warnings
             .into_iter()
+            .chain(warnings)
             .map(|warning| format!("{name}: {warning}"))
             .collect();
         Ok((
@@ -28946,7 +28979,38 @@ fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Field>, NativeErro
     }
     Ok(out)
 }
-fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeError> {
+/// The error a `RuntimeVisibleAnnotations` attribute nested past [`MAX_ANNOTATION_DEPTH`] gives.
+const ANNOTATIONS_TOO_DEEP: &str = "annotation values nested too deeply";
+
+/// A `RuntimeVisibleAnnotations` attribute's annotations. One nested past
+/// [`MAX_ANNOTATION_DEPTH`] is skipped with a warning naming `owner`, never failing the class
+/// (and so the jar) it sits on (#260 review): the class loads without those annotations, as an
+/// unreadable invisible annotation's class does. Any other malformed attribute fails as before.
+fn read_visible_annotations(
+    bytes: &[u8],
+    pool: &[Cp],
+    owner: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Annotation>, NativeError> {
+    match read_annotations(&mut Reader::new(bytes), pool) {
+        Err(NativeError::InvalidClass(why)) if why == ANNOTATIONS_TOO_DEEP => {
+            push_class_annotation_warning(
+                warnings,
+                format!(
+                    "{owner}: annotations nest deeper than {MAX_ANNOTATION_DEPTH} levels; skipped"
+                ),
+            );
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
+fn read_methods(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+) -> Result<(Vec<Method>, Vec<String>), NativeError> {
+    let mut warnings = Vec::new();
     let n = r.u2()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -28969,8 +29033,12 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
                 let len = c.u4()? as usize;
                 code = Some(c.bytes(len)?.to_owned());
             } else if attr == "RuntimeVisibleAnnotations" {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    &format!("method {name}{descriptor}"),
+                    &mut warnings,
+                )?);
             }
             // RuntimeInvisibleAnnotations and parameter annotations are not
             // needed for Mixin discovery; their bytes were already bounded by
@@ -28986,7 +29054,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             annotations,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 fn skip_attributes(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
     let n = r.u2()? as usize;
@@ -29032,8 +29100,12 @@ fn read_class_attributes(
         let bytes = r.bytes(length)?;
         match name.as_str() {
             "RuntimeVisibleAnnotations" => {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    "class",
+                    &mut warnings,
+                )?);
             }
             "RuntimeInvisibleAnnotations" => {
                 read_invisible_mixin_annotations(bytes, pool, &mut annotations, &mut warnings);
@@ -29155,7 +29227,8 @@ fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, 
 /// How deep annotation values may nest (an array or annotation inside another). The JVM sets
 /// no limit, but the reader is Rust recursion over the class file's bytes, which a jar chooses:
 /// three bytes per nested array would otherwise overflow the native stack while the jar loads
-/// (#250). javac writes a handful of levels; a class nested deeper is refused as invalid.
+/// (#250). javac writes a handful of levels; an attribute nested deeper is skipped with a warning
+/// (`read_visible_annotations`), never failing its class or jar.
 const MAX_ANNOTATION_DEPTH: usize = 64;
 
 fn read_annotation(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Annotation, NativeError> {
@@ -41705,6 +41778,43 @@ mandatory = true
     /// Annotation values nested as deep as a class file's bytes allow are refused as an invalid
     /// class, never read by recursion until the native stack overflows (#250); a few levels
     /// read as ever.
+    /// A `RuntimeVisibleAnnotations` attribute nested past the depth bound is skipped with a
+    /// warning naming its owner: its class (and jar) still load (#260 review). One within the
+    /// bound reads as ever.
+    #[test]
+    fn a_too_deep_visible_annotation_is_skipped_with_a_warning() {
+        let pool = vec![
+            Cp::Empty,
+            Cp::Utf8("Ldemo/Deep;".into()),
+            Cp::Utf8("value".into()),
+            Cp::Integer(7),
+        ];
+        let attribute = |levels: usize| {
+            // One annotation `@Deep(value = [[[...7...]]])`.
+            let mut bytes = vec![0, 1, 0, 1, 0, 1, 0, 2];
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 3]);
+            bytes
+        };
+        let mut warnings = Vec::new();
+        let deep =
+            read_visible_annotations(&attribute(100), &pool, "class", &mut warnings).unwrap();
+        assert!(deep.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("class: annotations nest deeper"),
+            "{warnings:?}"
+        );
+        let mut warnings = Vec::new();
+        let shallow =
+            read_visible_annotations(&attribute(3), &pool, "class", &mut warnings).unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].descriptor, "Ldemo/Deep;");
+        assert!(warnings.is_empty());
+    }
+
     #[test]
     fn deeply_nested_annotation_values_are_refused() {
         let pool = vec![Cp::Empty, Cp::Integer(7)];

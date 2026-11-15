@@ -8,3 +8,6 @@ arraysSelf=[[...], x]SOE
 gsonCycle=SOESOE
 comparatorChain=-1|1
 compareToCycle=SOE
+streamChains=[1, 2]|[1, 2]|[1, 2]|6|[1, 2]
+selfPrinting=SOE|[(this Collection)]|SOE|[(this Collection)]
+viewChain=1|[x]|x|true|false|[x]|151
