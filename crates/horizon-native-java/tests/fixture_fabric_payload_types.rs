@@ -194,7 +194,10 @@ fn payload_type_registry_records_direction_type_and_codec() {
         matches!(&sync.codec, Value::Host(handle) if handle.kind() == HostKind::JarObject),
         "{sync:?}"
     );
-    assert!(matches!(sync.handler, Value::Ref(Some(_))), "{sync:?}");
+    assert!(
+        matches!(&sync.handler, Value::Host(handle) if handle.kind() == HostKind::Callback),
+        "{sync:?}"
+    );
     let hello = rows
         .iter()
         .find(|row| row.direction == "configurationToServer")

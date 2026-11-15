@@ -29,6 +29,7 @@
 //! or edits the node stops at the node's first member, which names it.
 //!
 //! **The bound.** Every call runs on a strict host (an unmodelled host call
+
 //! fails instead of answering a neutral value) under its own deterministic instruction budget and distant wall-clock hang guard.
 //! A failure in steps 1–3, 5 or 6 refuses the whole config with the step and
 //! the member it stopped at; a failure in one `shouldApplyMixin` (or its

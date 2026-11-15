@@ -201,6 +201,7 @@ class RealModFixtureTest(unittest.TestCase):
             self.skipTest(f"native probe not built in {self.bin_dir.relative_to(ROOT)}")
         jar = self.output / "fabric-fixture.jar"
 
+
         def run() -> str:
             result = subprocess.run(
                 [str(probe), "--json", "--game-version", "26.3", str(jar), "main"],
@@ -209,6 +210,7 @@ class RealModFixtureTest(unittest.TestCase):
                 check=True,
                 timeout=120,
             )
+
             payload = result.stdout.strip().splitlines()[-1]
             json.loads(payload)
             return payload
