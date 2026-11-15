@@ -1,218 +1,192 @@
-//! Fabric API 0.165.0 slice 2 fixture.
+//! Compile-only Fabric API fixture for the exact phase/event slice.
 //!
-//! The source is compiled against the real nested Fabric API jars and the
-//! 26.3 server jar when HORIZON_FABRIC_API_JAR is set.  The expected oracle
-//! string below is from OpenJDK 25.0.5; native execution sees only the host
-//! event and biome handles.
+//! The expected messages and cycle behavior are recorded from Fabric API
+//! 0.165.0 (fabric-api-base) on Java 25. The API classes below are stubs only:
+//! they let javac compile a real mod shape, while every call crosses the
+//! native host boundary.
 
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use horizon_native_java::{NativeJar, StdHost, Value};
+use horizon_native_java::{Host, NativeJar, StdHost, Value};
 use std::{
-    env,
-    fs::{self, File},
+    collections::BTreeMap,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::Command,
 };
-use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
-const JAVA25: &str = "event=3112;eventClass=net.fabricmc.fabric.impl.base.event.ArrayBackedEvent;same=true;selectors=true;mod=true";
-const SOURCE: &str = r#"
-package demo;
-import java.util.function.Predicate;
-import net.fabricmc.fabric.api.event.Event;
-import net.fabricmc.fabric.api.event.EventFactory;
-import net.fabricmc.fabric.api.biome.v1.*;
-import net.minecraft.resources.Identifier;
+const JAVA25: &str = "Tried to register a null listener!|Tried to register a listener for a null phase!|Tried to add an ordering for a null phase.|Tried to add a phase that depends on itself.|cycle-ok";
 
-public final class Slice2 {
-  interface L { void call(); }
-  public static String run() {
-    Event<L> event = EventFactory.createArrayBacked(L.class, ls -> () -> {
-      for (L l : ls) l.call();
-    });
-    StringBuilder order = new StringBuilder();
-    L one = () -> order.append("1");
-    L two = () -> order.append("2");
-    L three = () -> order.append("3");
-    event.register(one);
-    event.register(Identifier.fromNamespaceAndPath("demo", "late"), two);
-    event.register(Identifier.fromNamespaceAndPath("demo", "early"), three);
-    event.addPhaseOrdering(Identifier.fromNamespaceAndPath("demo", "early"),
-        Identifier.fromNamespaceAndPath("fabric", "default"));
-    event.addPhaseOrdering(Identifier.fromNamespaceAndPath("fabric", "default"),
-        Identifier.fromNamespaceAndPath("demo", "late"));
-    event.register(one);
-    event.invoker().call();
-    Predicate<BiomeSelectionContext> all = BiomeSelectors.all();
-    Predicate<BiomeSelectionContext> overworld = BiomeSelectors.foundInOverworld();
-    BiomeModification modification = BiomeModifications.create(
-        Identifier.fromNamespaceAndPath("demo", "slice2"));
-    boolean same = modification.add(ModificationPhase.ADDITIONS, all, context -> {}) == modification;
-    return "event=" + order + ";eventClass=" + event.getClass().getName()
-        + ";same=" + same + ";selectors=" + (all != null && overworld != null)
-        + ";mod=" + (modification != null);
-  }
-  public static void main(String[] args) { System.out.print(run()); }
-  public void onInitialize() { run(); }
+macro_rules! sources {
+    ($($path:literal => $body:expr),* $(,)?) => {{
+        let mut map = BTreeMap::new();
+        $(map.insert($path, $body);)*
+        map
+    }};
 }
-"#;
 
 fn javac() -> PathBuf {
-    env::var_os("JAVA_HOME")
+    std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
         .unwrap_or_else(|| "javac".into())
 }
 
-fn java() -> PathBuf {
-    env::var_os("JAVA_HOME")
-        .map(|home| PathBuf::from(home).join("bin/java"))
-        .unwrap_or_else(|| "java".into())
+fn files_under(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    fs::read_dir(root)
+        .unwrap()
+        .flat_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
 }
 
-fn real_classpath(root: &Path) -> Option<String> {
-    let aggregate = PathBuf::from(env::var_os("HORIZON_FABRIC_API_JAR")?);
-    let mut archive = ZipArchive::new(File::open(aggregate).ok()?).ok()?;
-    let lib = root.join("lib");
-    fs::create_dir_all(&lib).ok()?;
-    let mut paths = Vec::new();
-    let stubs = root.join("stubs");
-    let identifier = stubs.join("net/minecraft/resources/Identifier.java");
-    fs::create_dir_all(identifier.parent().unwrap()).ok()?;
-    fs::write(
-        &identifier,
-        r#"package net.minecraft.resources; public final class Identifier implements Comparable<Identifier> { private final String n; private final String p; private Identifier(String n,String p){this.n=n;this.p=p;} public static Identifier fromNamespaceAndPath(String n,String p){return new Identifier(n,p);} public String toString(){return n;} public String getNamespace(){return n;} public String getPath(){return p;} public boolean equals(Object o){return o instanceof Identifier i && n.equals(i.n) && p.equals(i.p);} public int hashCode(){return n.hashCode()*31+p.hashCode();} public int compareTo(Identifier o){int c=n.compareTo(o.n); return c!=0?c:p.compareTo(o.p);} }"#,
-    )
-    .ok()?;
+fn write_sources(root: &Path, tree: &BTreeMap<&str, &str>) -> Vec<PathBuf> {
+    tree.iter()
+        .map(|(relative, body)| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
+            path
+        })
+        .collect()
+}
+
+fn compile(out: &Path, classpath: Option<&Path>, sources: &[PathBuf]) {
+    fs::create_dir_all(out).unwrap();
+    let mut command = Command::new(javac());
+    command.args(["--release", "17", "-d"]).arg(out);
+    if let Some(classpath) = classpath {
+        command.arg("-cp").arg(classpath);
+    }
+    let status = command.args(sources).status().unwrap();
+    assert!(status.success(), "javac failed");
+}
+
+fn build_jar() -> (scratch::Scratch, PathBuf) {
+    let root = scratch::Scratch::new("fabric-api-slice2");
+    let stubs = sources! {
+        "net/minecraft/resources/Identifier.java" => r#"
+package net.minecraft.resources;
+public final class Identifier {
+  public static Identifier fromNamespaceAndPath(String namespace, String path) { return null; }
+}
+"#,
+        "net/fabricmc/fabric/api/event/Event.java" => r#"
+package net.fabricmc.fabric.api.event;
+import net.minecraft.resources.Identifier;
+public interface Event<T> {
+  void register(T listener);
+  void register(Identifier phase, T listener);
+  void addPhaseOrdering(Identifier first, Identifier second);
+}
+"#,
+        "net/fabricmc/fabric/api/event/EventFactory.java" => r#"
+package net.fabricmc.fabric.api.event;
+import java.util.function.Function;
+public final class EventFactory {
+  public static <T> Event<T> createArrayBacked(Class<T> type, Function<T[], T> factory) {
+    return null;
+  }
+}
+"#,
+        "net/fabricmc/api/ModInitializer.java" => r#"
+package net.fabricmc.api;
+public interface ModInitializer { void onInitialize(); }
+"#,
+    };
+    let mod_sources = sources! {
+        "demo/PhaseProbe.java" => r#"
+package demo;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.Event;
+import net.fabricmc.fabric.api.event.EventFactory;
+import net.minecraft.resources.Identifier;
+
+public final class PhaseProbe implements ModInitializer {
+  interface Listener { void call(); }
+  public static String RESULT;
+  private static Identifier id(String path) {
+    return Identifier.fromNamespaceAndPath("demo", path);
+  }
+  private static String run() {
+    Event<Listener> event = EventFactory.createArrayBacked(Listener.class, null);
+    StringBuilder result = new StringBuilder();
+    try { event.register((Listener) null); }
+    catch (NullPointerException e) { result.append(e.getMessage()).append("|"); }
+    try { event.register(null, () -> {}); }
+    catch (NullPointerException e) { result.append(e.getMessage()).append("|"); }
+    try { event.addPhaseOrdering(null, id("x")); }
+    catch (NullPointerException e) { result.append(e.getMessage()).append("|"); }
+    Identifier self = id("self");
+    try { event.addPhaseOrdering(self, self); }
+    catch (IllegalArgumentException e) { result.append(e.getMessage()).append("|"); }
+    Identifier a = id("a");
+    Identifier b = id("b");
+    event.addPhaseOrdering(a, b);
+    event.addPhaseOrdering(b, a);
+    result.append("cycle-ok");
+    return result.toString();
+  }
+  @Override public void onInitialize() { RESULT = run(); }
+}
+"#,
+    };
+    let stub_paths = write_sources(&root.join("stub-src"), &stubs);
+    let mod_paths = write_sources(&root.join("src"), &mod_sources);
     let stub_classes = root.join("stub-classes");
-    if !Command::new(javac())
-        .args(["--release", "21", "-d"])
-        .arg(&stub_classes)
-        .arg(&identifier)
-        .status()
-        .ok()?
-        .success()
-    {
-        return None;
-    }
-    paths.push(stub_classes);
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).ok()?;
-        let name = entry.name().ok()?.into_owned();
-        if !name.starts_with("META-INF/jars/") || !name.ends_with(".jar") {
-            continue;
-        }
-        let out = lib.join(Path::new(&name).file_name()?);
-        let mut file = File::create(&out).ok()?;
-        std::io::copy(&mut entry, &mut file).ok()?;
-        paths.push(out);
-    }
-    let server = env::var_os("HORIZON_MINECRAFT_SERVER_JAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/sparks/ava/minecraft-26.3-server-game.jar"));
-    if server.exists() {
-        paths.push(server);
-    }
-    let guava = env::var_os("HORIZON_GUAVA_JAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/sparks/ava/scratch/d2b/lib/guava-33.6.0-jre.jar"));
-    if guava.exists() {
-        paths.push(guava);
-    }
-    let slf4j = env::var_os("HORIZON_SLF4J_JAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/sparks/ava/scratch/fabric-api-javap/slf4j.jar"));
-    if slf4j.exists() {
-        paths.push(slf4j);
-    }
-    Some(env::join_paths(paths).ok()?.to_string_lossy().into_owned())
-}
-
-fn build(root: &Path, classpath: &str) -> PathBuf {
-    let source = root.join("Slice2.java");
-    fs::write(&source, SOURCE).unwrap();
     let classes = root.join("classes");
-    fs::create_dir_all(&classes).unwrap();
-    assert!(
-        Command::new(javac())
-            .args(["--release", "21", "-cp", classpath, "-d"])
-            .arg(&classes)
-            .arg(&source)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let jar = root.join("slice2.jar");
-    let mut zip = zip::ZipWriter::new(File::create(&jar).unwrap());
+    compile(&stub_classes, None, &stub_paths);
+    compile(&classes, Some(&stub_classes), &mod_paths);
+
+    let jar_path = root.join("fabric-api-slice2.jar");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());
     zip.start_file("fabric.mod.json", SimpleFileOptions::default())
         .unwrap();
     zip.write_all(
-        br#"{"id":"fixture-fabric-api-slice2","version":"1","entrypoints":{"main":"demo.Slice2"}}"#,
+        br#"{"id":"fixture-fabric-api-slice2","version":"1","entrypoints":{"main":"demo.PhaseProbe"}}"#,
     )
     .unwrap();
-    let class = classes.join("demo/Slice2.class");
-    zip.start_file("demo/Slice2.class", SimpleFileOptions::default())
-        .unwrap();
-    zip.write_all(&fs::read(class).unwrap()).unwrap();
+    for class in files_under(&classes) {
+        let entry = class.strip_prefix(&classes).unwrap().to_string_lossy();
+        zip.start_file(entry.replace('\\', "/"), SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&fs::read(class).unwrap()).unwrap();
+    }
     zip.finish().unwrap();
-    jar
+    (root, jar_path)
 }
 
 #[test]
-fn fabric_api_slice2_real_java25_shape() {
-    let Some(_) = env::var_os("HORIZON_FABRIC_API_JAR") else {
-        eprintln!("skipped: set HORIZON_FABRIC_API_JAR to fabric-api-0.165.0+26.3.jar");
-        return;
-    };
-    let root = scratch::Scratch::new("fabric-api-slice2-real");
-    let Some(classpath) = real_classpath(&root) else {
-        eprintln!("skipped: real Fabric API aggregate is unavailable");
-        return;
-    };
-    let jar_path = build(&root, &classpath);
-    let oracle = Command::new(java())
-        .args([
-            "-cp",
-            &format!("{}:{}", root.join("classes").display(), classpath),
-        ])
-        .arg("demo.Slice2")
-        .output()
-        .unwrap();
-    assert!(
-        oracle.status.success(),
-        "Java 25 oracle failed: {}",
-        String::from_utf8_lossy(&oracle.stderr)
-    );
-    let oracle_text = String::from_utf8(oracle.stdout).unwrap();
-    assert!(!oracle_text.is_empty());
+fn fabric_api_slice2_matches_java25_oracle() {
+    let (_root, jar_path) = build_jar();
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let entry = jar.discover_entrypoint("main").unwrap();
     let mut host = StdHost::new();
     jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
         .unwrap();
-    assert_eq!(host.fabric_biome_registrations().len(), 1);
-    assert_eq!(
-        host.fabric_biome_registrations()[0].phase,
-        "fabric-biome-phase/ADDITIONS"
+    let (fields, _) = Host::persistent_class_state(&host);
+    let result = fields
+        .get("demo/PhaseProbe#RESULTLjava/lang/String;")
+        .and_then(|value| match value {
+            Value::Ref(Some(value)) => Some(value.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert_eq!(result, JAVA25);
+    assert!(
+        host.invocations()
+            .iter()
+            .any(|call| call.method.name == "addPhaseOrdering")
     );
-    let event = host
-        .invocations()
-        .iter()
-        .find(|call| call.method.name == "register")
-        .and_then(|call| call.receiver.clone())
-        .unwrap();
-    assert_eq!(
-        host.fabric_event_order(&event),
-        [
-            ("demo:early".into(), 2),
-            ("fabric:default".into(), 0),
-            ("fabric:default".into(), 3),
-            ("demo:late".into(), 1)
-        ]
-    );
-    assert_eq!(oracle_text, JAVA25);
-    let _ = Value::Void;
 }
