@@ -29,7 +29,51 @@ impl<H: Host> Runtime<'_, H> {
             let [key, value] = args else {
                 return Ok(None);
             };
-            return Ok(Some(map_entry_value(key, value)));
+            // `new KeyValueHolder(k, v)`: `Objects.requireNonNull` of both.
+            if *key == Value::Ref(None) || *value == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let entry = self.host.mint_map_entry(
+                None,
+                key,
+                value,
+                crate::runtime::host_map_entry::EntryMade::Holder,
+            );
+            return Ok(Some(entry));
+        }
+        // `Map.Entry.copyOf(e)`: a `KeyValueHolder` itself, else `Map.entry(e.getKey(),
+        // e.getValue())`.
+        if r.owner == "java/util/Map$Entry"
+            && r.name == "copyOf"
+            && r.descriptor == "(Ljava/util/Map$Entry;)Ljava/util/Map$Entry;"
+        {
+            let [entry] = args else {
+                return Ok(None);
+            };
+            if crate::runtime::host_map_entry::is_key_value_holder(entry) {
+                return Ok(Some(entry.clone()));
+            }
+            let Some((key, value)) = self.host.map_entry_parts(entry) else {
+                return Ok(None);
+            };
+            if key == Value::Ref(None) || value == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let copy = self.host.mint_map_entry(
+                None,
+                &key,
+                &value,
+                crate::runtime::host_map_entry::EntryMade::Holder,
+            );
+            return Ok(Some(copy));
         }
         // `Map.ofEntries` is `immutable_collections.rs`'s (Java's `MapN` with
         // its probe table, as `Map.of`).
