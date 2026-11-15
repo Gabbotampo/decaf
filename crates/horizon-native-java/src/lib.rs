@@ -24688,7 +24688,7 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         let thrown = |class: &str| NativeError::UncaughtException {
                             class: class.into(),
-                            message: Some(path.clone()),
+                            message: Some(display_path.clone()),
                             frame: None,
                         };
                         match self.delete_path(&path) {

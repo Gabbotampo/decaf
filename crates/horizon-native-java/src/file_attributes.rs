@@ -254,16 +254,16 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         options: Option<&Value>,
     ) -> Result<Option<Value>, NativeError> {
-        let Some(path) = receiver.and_then(host_path::path_key).map(str::to_owned) else {
+        let Some(display_path) = receiver.and_then(host_path::path_key).map(str::to_owned) else {
             return Ok(None);
         };
-        if path.starts_with(library_dispatch::MOD_ROOT_PREFIX) {
+        if display_path.starts_with(library_dispatch::MOD_ROOT_PREFIX) {
             return Ok(None);
         }
         if !self.no_link_options(options) {
             return self.host.unknown_operand_call(r).map(Some);
         }
-        let path = host_path::sandbox_canonical(&path);
+        let path = host_path::sandbox_canonical(&display_path);
         if self.file_kind(&path) != FileKind::Missing {
             return Ok(Some(path_value(&path)));
         }
@@ -275,12 +275,15 @@ impl<H: Host> Runtime<'_, H> {
             if self.file_kind(parent) == FileKind::RegularFile {
                 return Err(thrown(
                     "java/nio/file/FileSystemException",
-                    Some(format!("{path}: Not a directory")),
+                    Some(format!("{display_path}: Not a directory")),
                 ));
             }
             ancestor = parent;
         }
-        Err(thrown("java/nio/file/NoSuchFileException", Some(path)))
+        Err(thrown(
+            "java/nio/file/NoSuchFileException",
+            Some(display_path),
+        ))
     }
 
     /// Whether `options`, a `LinkOption[]`, is empty. A `LinkOption` (the
