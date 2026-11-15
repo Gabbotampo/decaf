@@ -2611,6 +2611,11 @@ pub trait Host {
         Vec::new()
     }
 
+    /// A Fabric origin's stored singleton root list, when this host models it.
+    fn origin_paths(&mut self, _receiver: &Value, _path: &str) -> Option<Value> {
+        None
+    }
+
     /// Text a jar wrote to `System.out`. The bounded host keeps it in memory for the length of
     /// one invocation; a host that shows the jar's output (the game's mod) keeps it across calls
     /// and reads it back through its own accessor. Hosts that do not model a console keep the
@@ -3555,7 +3560,7 @@ impl StdHost {
 
     /// The loader wraps metadata collections in a fresh unmodifiable view,
     /// cached per receiver and getter just like the mutable stand-ins.
-    fn cached_unmodifiable_collection(
+    pub(crate) fn cached_unmodifiable_collection(
         &mut self,
         of: &Value,
         member: &str,
@@ -5226,6 +5231,15 @@ impl Host for StdHost {
         self.merged_service_providers(service)
     }
 
+    fn origin_paths(&mut self, receiver: &Value, path: &str) -> Option<Value> {
+        Some(self.cached_unmodifiable_collection(
+            receiver,
+            "getPaths",
+            "java/util/Collections$SingletonList",
+            vec![path_value(path)],
+        ))
+    }
+
     fn resource_stream_text(&mut self, marker: &str) -> Option<String> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
@@ -6808,7 +6822,7 @@ impl Host for StdHost {
         // A Fabric mod container's origin (`mod_origin.rs`); also reached
         // through `String.valueOf`/`"" + origin`, which asks this host for the
         // object's modelled `toString`.
-        if let Some(value) = mod_origin::invoke(r, Some(receiver), args)? {
+        if let Some(value) = mod_origin::invoke(self, r, Some(receiver), args)? {
             return Ok(value);
         }
         // The command dispatcher, builders, nodes and a running command's
@@ -8407,6 +8421,18 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            if r.name == "remove" && r.descriptor == "()V"
+                && self.iterator_sources.get(marker).is_some_and(|source| {
+                    source.starts_with("java/util/Collections$Unmodifiable")
+                        || source == "java/util/Collections$SingletonList"
+                })
+            {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/UnsupportedOperationException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
                 ("next", "()Ljava/lang/Object;") => {
@@ -26700,7 +26726,7 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) =
-                        invoke_or_catch!(at, mod_origin::invoke(&r, receiver.as_ref(), &args))
+                        invoke_or_catch!(at, mod_origin::invoke(self.host, &r, receiver.as_ref(), &args))
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(

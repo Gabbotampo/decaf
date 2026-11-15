@@ -57,7 +57,7 @@ public final class Containers {
         catch (UnsupportedOperationException e) { out.append('U'); }
         try { ((Collection) a.getMetadata().getProvides()).add("alias"); out.append('N'); }
         catch (UnsupportedOperationException e) { out.append('U'); }
-        try { a.getMetadata().getDependencies().add(new Object()); out.append('N'); }
+        try { a.getMetadata().getDependencies().add((net.fabricmc.loader.api.metadata.ModDependency) null); out.append('N'); }
         catch (UnsupportedOperationException e) { out.append('U'); }
         try { a.getRootPaths().add(Path.of("x")); out.append('N'); }
         catch (UnsupportedOperationException e) { out.append('U'); }
@@ -73,4 +73,33 @@ public final class Containers {
         return b(first.equals(same)) + b(first.equals(other))
             + b(first.hashCode() == same.hashCode()) + first.toString();
     }
+    /** Parsed V1 metadata keeps populated values in the same wrappers. */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static String populated() {
+        ModContainer c = mod("probe-fixture");
+        var m = c.getMetadata();
+        Collection authors = m.getAuthors();
+        Collection contributors = m.getContributors();
+        Collection license = m.getLicense();
+        Collection provides = m.getProvides();
+        Collection deps = m.getDependencies();
+        StringBuilder out = new StringBuilder();
+        out.append(authors.size()).append(':').append(contributors.size()).append(':')
+            .append(license.size()).append(':').append(provides.size()).append(':').append(deps.size());
+        out.append(':').append(((net.fabricmc.loader.api.metadata.Person) authors.iterator().next()).getName());
+        for (Collection values : new Collection[]{authors, contributors, license, provides, deps}) {
+            try { values.add("x"); out.append('N'); } catch (UnsupportedOperationException e) { out.append('U'); }
+            var it = values.iterator();
+            if (it.hasNext()) { it.next(); try { it.remove(); out.append('N'); } catch (UnsupportedOperationException e) { out.append('U'); } }
+        }
+        return out.toString();
+    }
+
+    public static String originPaths() {
+        ModContainer c = mod("probe-fixture");
+        var a = c.getOrigin().getPaths();
+        var b = c.getOrigin().getPaths();
+        return a.getClass().getName() + ":" + a.equals(b) + ":" + (a == b) + ":" + a;
+    }
+
 }

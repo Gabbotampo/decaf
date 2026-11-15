@@ -40,7 +40,8 @@ pub(crate) fn root_path(id: &str) -> String {
 
 /// Answer one `ModOrigin` or `ModOrigin$Kind` call, or `None` when the receiver
 /// is not an origin.
-pub(super) fn invoke(
+pub(super) fn invoke<H: crate::Host>(
+    host: &mut H,
     r: &MethodRef,
     receiver: Option<&Value>,
     _args: &[Value],
@@ -85,7 +86,8 @@ pub(super) fn invoke(
             if kind != "path" {
                 return Err(unsupported(&format!("kind {named} doesn't have paths")));
             }
-            collection_value("list", &[path_value(&root_path(argument))])
+            host.origin_paths(receiver, &root_path(argument))
+                .unwrap_or_else(|| collection_value("list", &[path_value(&root_path(argument))]))
         }
         ("getParentModId", "()Ljava/lang/String;") => {
             if kind != "nested" {
