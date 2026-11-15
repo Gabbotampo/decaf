@@ -5324,6 +5324,11 @@ impl Host for StdHost {
         }
         // The client stand-ins' fields (`Minecraft.player`, `options.keyJump`),
         // key categories and input types.
+        if r.owner == "java/awt/Color"
+            && let Some(value) = client_surface::awt_constant(&r.name)
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.client_static(r) {
             return value;
         }

@@ -143,6 +143,29 @@ const AWT_COLORS: &[(&str, u32)] = &[
     ("BLUE", 0xff00_00ff),
 ];
 
+pub(crate) fn awt_constant(name: &str) -> Option<Value> {
+    let canonical = match name {
+        "lightGray" => "LIGHT_GRAY",
+        "darkGray" => "DARK_GRAY",
+        "white" => "WHITE",
+        "gray" => "GRAY",
+        "black" => "BLACK",
+        "red" => "RED",
+        "pink" => "PINK",
+        "orange" => "ORANGE",
+        "yellow" => "YELLOW",
+        "green" => "GREEN",
+        "magenta" => "MAGENTA",
+        "cyan" => "CYAN",
+        "blue" => "BLUE",
+        other => other,
+    };
+    AWT_COLORS
+        .iter()
+        .find(|(field, _)| *field == canonical)
+        .map(|(_, argb)| marker(format!("{AWT_COLOR}{argb:08x}")))
+}
+
 /// `Runnable`s one firing may queue with `Minecraft.execute`.
 const MAX_TASKS: usize = 64;
 /// A vanilla mapping read through `options.keyJump`...: `client/vanilla-key/key.jump`.
@@ -527,6 +550,10 @@ struct KeyInit {
     mouse: bool,
     code: i32,
     category: Option<String>,
+    /// The actual category object passed to the constructor. A jar may pass
+    /// its own `new Category(id)`, which is equal by the record's id but is
+    /// not the registered singleton by reference identity.
+    category_value: Option<Value>,
 }
 
 /// One affine pose without rotation: `[sx, sy, tx, ty]`.
@@ -777,6 +804,7 @@ fn key_init(
         mouse,
         code,
         category: category_id(category, categories),
+        category_value: Some(category.clone()).filter(|value| !matches!(value, Value::Ref(None))),
     })
 }
 
@@ -1027,7 +1055,9 @@ impl StdHost {
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
     pub(crate) fn client_static(&self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
-        if !self.client_environment() {
+        // `java.awt.Color` is a JDK singleton family even on a server host;
+        // model both the upper- and lower-case field spellings everywhere.
+        if !self.client_environment() && r.owner != "java/awt/Color" {
             return None;
         }
         let state = &self.client;
@@ -1080,10 +1110,30 @@ impl StdHost {
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
             // `java.awt.Color`'s constants, which HUD mods turn into ARGB
             // ints with `getRGB()` (durabilityviewer's indicator colours).
-            ("java/awt/Color", name) => AWT_COLORS
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, argb)| Ok(marker(format!("{AWT_COLOR}{argb:08x}")))),
+            ("java/awt/Color", name) => {
+                // The JDK exposes both `LIGHT_GRAY`/`lightGray` and
+                // `DARK_GRAY`/`darkGray`; spellings are aliases of one object.
+                let canonical = match name {
+                    "lightGray" => Some("LIGHT_GRAY"),
+                    "darkGray" => Some("DARK_GRAY"),
+                    "white" => Some("WHITE"),
+                    "gray" => Some("GRAY"),
+                    "black" => Some("BLACK"),
+                    "red" => Some("RED"),
+                    "pink" => Some("PINK"),
+                    "orange" => Some("ORANGE"),
+                    "yellow" => Some("YELLOW"),
+                    "green" => Some("GREEN"),
+                    "magenta" => Some("MAGENTA"),
+                    "cyan" => Some("CYAN"),
+                    "blue" => Some("BLUE"),
+                    _ => Some(name),
+                }?;
+                AWT_COLORS
+                    .iter()
+                    .find(|(n, _)| *n == canonical)
+                    .map(|(_, argb)| Ok(marker(format!("{AWT_COLOR}{argb:08x}"))))
+            }
             // Item, block and effect constants answer only in a firing: an
             // entrypoint reading `Items.DIAMOND` keeps the answer it always got.
             ("net/minecraft/world/item/Items", name) if frame.is_some() => Some(Ok(marker(
@@ -1447,10 +1497,20 @@ impl StdHost {
             // The jar's own `String`, never parsed into an object whatever it spells
             // (#232's review: `new KeyMapping("client/minecraft", ..)`).
             ("getName", "()Ljava/lang/String;") => text(init.name),
-            ("getCategory", _) => marker(format!(
-                "{CATEGORY}{}",
-                init.category.as_deref().unwrap_or("minecraft:misc")
-            )),
+            ("getCategory", _)
+                if init
+                    .category_value
+                    .as_ref()
+                    .is_some_and(crate::runtime::jar_object::is_object) =>
+            {
+                return Some(self.unknown_host_call(r));
+            }
+            ("getCategory", _) => init.category_value.clone().unwrap_or_else(|| {
+                marker(format!(
+                    "{CATEGORY}{}",
+                    init.category.as_deref().unwrap_or("minecraft:misc")
+                ))
+            }),
             ("hashCode", "()I") => Value::Int(stable_hash(object)),
             ("equals", "(Ljava/lang/Object;)Z") | ("same", _) => flag(
                 args.first()
@@ -2514,6 +2574,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rgb, Value::Int(0xff00_ff00_u32 as i32));
+        let upper = crate::runtime::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "LIGHT_GRAY", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        let lower = crate::runtime::Host::get_static(
+            &mut host,
+            &method("java/awt/Color", "lightGray", "Ljava/awt/Color;"),
+        )
+        .unwrap();
+        assert_eq!(upper, lower, "upper={upper:?} lower={lower:?}");
     }
 
     #[test]
