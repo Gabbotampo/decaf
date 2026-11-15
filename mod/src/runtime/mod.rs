@@ -100,6 +100,7 @@ mod host_jdk;
 mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
+mod host_log4j_level;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;

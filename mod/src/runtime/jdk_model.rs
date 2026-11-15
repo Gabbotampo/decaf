@@ -92,6 +92,9 @@ fn logger_name(r: &MethodRef, args: &[Value]) -> String {
 
 /// A `GETSTATIC` the model answers, or `None` to leave it to the host.
 pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
+    if let Some(value) = crate::runtime::host_log4j_level::static_field(owner, name) {
+        return Some(value);
+    }
     match owner {
         "java/nio/charset/StandardCharsets" => STANDARD_CHARSETS
             .iter()
@@ -141,6 +144,9 @@ fn long_arg(args: &[Value], index: usize) -> Option<i64> {
 
 /// A static call the model answers, or `None` to leave it to the host.
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    if let Some(value) = crate::runtime::host_log4j_level::static_call(r, args) {
+        return Some(value);
+    }
     if let Some(collector) = to_map_collector(r, args) {
         return Some(Ok(collector));
     }
@@ -368,6 +374,9 @@ pub(crate) fn instance_call(
     {
         return logger_call(r, &name);
     }
+    if let Some(value) = crate::runtime::host_log4j_level::instance_call(r, receiver, args) {
+        return Some(value);
+    }
     if crate::runtime::host_fabric_runtime::is_resource_loader(receiver) {
         return match (r.name.as_str(), r.descriptor.as_str()) {
             // Registration is kept nowhere: with no resource reload modelled,
@@ -424,12 +433,14 @@ fn charset_call(
     }))
 }
 
-/// A disabled logger: no level is enabled and no call has an effect.
+/// Logger output methods are safe no-ops. Enablement checks require a real
+/// logging configuration; the standalone host has none, so those calls stay
+/// counted instead of inventing a disabled/enabled answer.
 fn logger_call(r: &MethodRef, name: &str) -> Option<Result<Value, NativeError>> {
     let returns = r.descriptor.rsplit_once(')').map_or("", |(_, ret)| ret);
     Some(Ok(match (r.name.as_str(), returns) {
         ("getName", "Ljava/lang/String;") => Value::Ref(Some(name.to_owned())),
-        (method, "Z") if method.starts_with("is") => Value::Int(0),
+        (method, "Z") if method.starts_with("is") => return None,
         (_, "V") => Value::Void,
         _ => return None,
     }))
@@ -1543,9 +1554,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(
-            instance_call(&enabled, &slf4j, &[]).unwrap().unwrap(),
-            Value::Int(0)
+        assert!(
+            instance_call(&enabled, &slf4j, &[]).is_none(),
+            "enablement requires a host logging configuration"
         );
         let info = method(
             "org/slf4j/Logger",

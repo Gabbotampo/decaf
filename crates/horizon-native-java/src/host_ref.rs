@@ -293,6 +293,8 @@ pub enum HostKind {
     Thread,
     /// A logger: key `of_values([api, name])`.
     Logger,
+    /// One of Log4j 2's canonical standard levels: key its name.
+    Log4jLevel,
     /// A `StackWalker`: key `""` for `getInstance()`'s, `options` otherwise.
     StackWalker,
     /// A `StackWalker.StackFrame` / `StackTraceElement` of a jar frame: key
@@ -1335,6 +1337,13 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: crate::host_jdk::logger_canonical,
         methods: &crate::host_jdk::LOGGER,
+    },
+    KindInfo {
+        kind: HostKind::Log4jLevel,
+        tag: "l4lvl",
+        class: ClassRule::Fixed("org/apache/logging/log4j/Level"),
+        canonical: always_canonical,
+        methods: &crate::host_log4j_level::METHODS,
     },
     KindInfo {
         kind: HostKind::StackWalker,
