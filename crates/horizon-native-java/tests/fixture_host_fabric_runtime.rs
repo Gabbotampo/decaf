@@ -244,7 +244,7 @@ fn populated_real_v1_metadata_uses_wrappers_and_rejects_iterator_remove() {
     let fixture = javac_fixture::Fixture::build_with_mod_json(
         "metadata-populated",
         &sources,
-        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"dep":">=1"}}"#,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"entrypoints":{"main":"demo.RealMetadata"},"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"dep":">=1"}}"#,
     );
     let mut host = fixture
         .jar
@@ -576,4 +576,50 @@ fn a_string_cast_to_a_singleton_type_is_never_the_object() {
             assert!(!text.contains(spelled), "{text} {unknown:?}");
         }
     }
+}
+
+#[test]
+fn real_loader_v1_metadata_contract() {
+    let Ok(loader_jar) = std::env::var("FABRIC_LOADER_JAR") else {
+        eprintln!("FABRIC_LOADER_JAR is unavailable; real-loader fixture is arcweld-only");
+        return;
+    };
+    let source = include_str!("fixtures/fabric_runtime/demo/RealMetadata.java");
+    let fixture = javac_fixture::Fixture::build_with_real_classpath(
+        "real-loader-v1-metadata",
+        &[("demo/RealMetadata.java", source)],
+        std::path::Path::new(&loader_jar),
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"zeta":">=1","alpha":">=1"},"recommends":{"middle":">=1"}}"#,
+    );
+    let mut host = StdHost::new()
+        .with_environment_type("SERVER")
+        .with_mod("probe-fixture", "1.0");
+    fixture
+        .jar
+        .execute("demo.RealMetadata", None, "main", &mut host)
+        .expect("real metadata entrypoint");
+    let actual = match fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/RealMetadata",
+            "inspect",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .expect("real metadata probe")
+    {
+        horizon_native_java::Value::Ref(Some(text)) => text,
+        other => panic!("unexpected real metadata answer: {other:?}"),
+    };
+    assert_eq!(
+        actual,
+        "java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|true|true|uoe:null|iter-uoe:null|"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
