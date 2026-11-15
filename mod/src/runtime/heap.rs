@@ -301,6 +301,9 @@ impl StdHost {
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
+        // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
+        // allocated mod objects. It is traced and pruned with the object
+        // rather than becoming a lifetime root.
         out.extend(self.resource_streams.keys().map(String::as_str));
         // The command tree's callbacks and requirement lambdas (`brigadier.rs`).
         self.brigadier_root_texts(out);
@@ -364,6 +367,7 @@ impl StdHost {
         push(self.hash_tables.get(marker), out);
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
+        push(self.block_items.get(marker), out);
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -390,6 +394,9 @@ impl StdHost {
             .chain(self.hash_tables.keys())
             .chain(self.red_black_trees.keys())
             .chain(self.probe_tables.keys())
+            .chain(self.constructed_items.iter())
+            .chain(self.constructed_blocks.iter())
+            .chain(self.block_items.keys())
             .chain(self.array_view_markers())
             .map(String::as_str)
     }
@@ -413,6 +420,9 @@ impl StdHost {
         self.hash_tables.retain(|key, _| keep(key));
         self.red_black_trees.retain(|key, _| keep(key));
         self.probe_tables.retain(|key, _| keep(key));
+        self.constructed_items.retain(|key| keep(key));
+        self.constructed_blocks.retain(|key| keep(key));
+        self.block_items.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
@@ -471,6 +481,15 @@ fn pin_text(value: &Value) -> Option<&str> {
 /// The receiver of an instance-field key (`receiver|owner#name desc`).
 fn field_receiver(key: &str) -> &str {
     key.rsplit_once('|').map_or(key, |(receiver, _)| receiver)
+}
+
+/// Kotlin lazy cached values share the resident Java field table. The holder
+/// key is the field's ownership edge, so unreachable lazy state is pruned with
+/// the heap collector rather than retained forever (#301).
+const KOTLIN_LAZY_FIELD_PREFIX: &str = "kotlin-lazy|";
+
+fn kotlin_lazy_field_handle(key: &str) -> Option<&str> {
+    key.strip_prefix(KOTLIN_LAZY_FIELD_PREFIX)
 }
 
 fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
@@ -709,6 +728,30 @@ impl Collectable {
     }
 }
 
+fn mark_kotlin_lazy_states(
+    heap: &JavaHeap,
+    text: &str,
+    reached: &mut HashSet<String>,
+    pending: &mut Vec<String>,
+    collectable: &Collectable,
+) {
+    for (field, value) in &heap.fields {
+        let Some(holder) = kotlin_lazy_field_handle(field) else {
+            continue;
+        };
+        if holder != text && !text.contains(holder) {
+            continue;
+        }
+        if !reached.insert(holder.to_owned()) {
+            continue;
+        }
+        if let Some(value) = value_text(value) {
+            collectable.scan(value, pending);
+            mark_kotlin_lazy_states(heap, value, reached, pending, collectable);
+        }
+    }
+}
+
 /// Drop every collectable object of `heap` (and every collectable collection
 /// or iterator of `host`) that nothing reaches from the roots.
 ///
@@ -722,6 +765,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         return;
     }
     let mut pending = Vec::new();
+    let mut reached_kotlin_lazy = HashSet::new();
     // Every allocation number a text the trace reaches names: the objects
     // found live, those without a row of their own included (`FreedObjects`).
     let mut live = Vec::new();
@@ -768,6 +812,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             }
         }
         for text in roots {
+            mark_kotlin_lazy_states(
+                heap,
+                text,
+                &mut reached_kotlin_lazy,
+                &mut pending,
+                &collectable,
+            );
             collectable.scan(text, &mut pending);
             note_numbers(text, &mut live);
         }
@@ -830,6 +881,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .chain(entries)
         {
             if let Some(text) = value_text(value) {
+                mark_kotlin_lazy_states(
+                    heap,
+                    text,
+                    &mut reached_kotlin_lazy,
+                    &mut found,
+                    &collectable,
+                );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
             }
@@ -843,6 +901,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             let mut keyed = Vec::new();
             host.keyed_texts(&marker, &mut keyed);
             for text in &keyed {
+                mark_kotlin_lazy_states(
+                    heap,
+                    text,
+                    &mut reached_kotlin_lazy,
+                    &mut found,
+                    &collectable,
+                );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
             }
@@ -884,7 +949,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         keep(cached)
             && cache_owner(identity).is_none_or(|owner| keep(&owner) && !freed.holds_key(&owner))
     });
-    heap.fields.retain(|key, _| keep(field_receiver(key)));
+    heap.fields.retain(|key, _| {
+        if let Some(holder) = kotlin_lazy_field_handle(key) {
+            reached_kotlin_lazy.contains(holder)
+        } else {
+            keep(field_receiver(key))
+        }
+    });
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
@@ -1327,6 +1398,9 @@ mod tests {
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "constructed_items",
+            "constructed_blocks",
+            "block_items",
             "payload_registrations",
             "payload_bytes",
             "fabric_entrypoint_containers",
@@ -1397,6 +1471,7 @@ mod tests {
             "resource_marks",
             "classes",
             "linked_classes",
+            "game_block_classes",
             "service_providers",
             "current_time_millis",
             "mods",
