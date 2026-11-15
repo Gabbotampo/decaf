@@ -664,6 +664,17 @@ const FABRIC_FIELDS: &[FabricField] = &[
     },
     // Client events (`fabric-lifecycle-events-v1`, `fabric-networking-api-v1`
     // of the same Fabric API), fired by the window only.
+    // Client command callbacks build the same Brigadier tree as the server
+    // command callback; the client census records the tree but never executes
+    // a command or a renderer.
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/command/v2/ClientCommandRegistrationCallback",
+        field: "EVENT",
+        method: "register",
+        descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;)V",
+        event: GameEvent::RegisterCommands,
+        shape: Shape::Commands,
+    },
     fabric(
         client_lifecycle!("ClientTickEvents"),
         "END_CLIENT_TICK",

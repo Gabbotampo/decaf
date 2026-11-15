@@ -599,6 +599,7 @@ fn execution_json(
         "host_calls": calls,
         "unknown_host_call_count": host.unknown_host_call_count(),
         "unknown_host_calls": host.unknown_host_calls(),
+        "client_registrations": host.client_registration_summary(),
         "parked_threads": parked_threads_json(host),
         "payload_directions": host
             .payload_registrations()
