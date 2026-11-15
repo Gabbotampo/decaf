@@ -1043,6 +1043,14 @@ impl<H: Host> GameHookHost<'_, H> {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         if facade_server::owns(text) {
+            // A registry's `keySet()`: a set of its own (#156 P14d2).
+            if let Some(ids) = facade_server::key_set(&self.context.server, text, r) {
+                return Some(ids.and_then(|ids| {
+                    self.inner
+                        .factory_collection("java/util/Collections", "unmodifiableSet", "set", ids)
+                        .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))
+                }));
+            }
             return Some(
                 // A Java exception vanilla throws there stays one.
                 facade_server::answer(&self.context.server, text, r, args).map_err(|error| {
@@ -1690,6 +1698,22 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
+        self.inner.make_collection(class, values)
+    }
+
+    fn owned_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        follow: bool,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner
+            .owned_collection(of, member, class, follow, values)
     }
 
     fn array_view(
