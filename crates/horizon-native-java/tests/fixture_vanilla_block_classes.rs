@@ -6,7 +6,7 @@
 mod scratch;
 
 use horizon_native_java::{NativeJar, StdHost, Value};
-use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command, sync::Arc};
+use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command};
 use zip::write::SimpleFileOptions;
 
 fn javac() -> std::path::PathBuf {
@@ -54,7 +54,7 @@ fn build_jar(
     }
     let status = Command::new(javac())
         .arg("--release")
-        .arg("17")
+        .arg("25")
         .arg("-d")
         .arg(&classes)
         .args(paths)
@@ -112,12 +112,36 @@ fn vanilla_block_constants_answer_instanceof_from_seeded_classes() {
         "package net.minecraft.world.level.block; public interface BucketPickup {}",
     );
     sources.insert(
+        "net/minecraft/world/level/block/LiquidBlockContainer.java",
+        "package net.minecraft.world.level.block; public interface LiquidBlockContainer {}",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/ChangeOverTimeBlock.java",
+        "package net.minecraft.world.level.block; public interface ChangeOverTimeBlock {}",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/SimpleWaterloggedBlock.java",
+        "package net.minecraft.world.level.block; public interface SimpleWaterloggedBlock extends BucketPickup, LiquidBlockContainer {}",
+    );
+    sources.insert(
         "net/minecraft/world/level/block/LiquidBlock.java",
-        "package net.minecraft.world.level.block; public class LiquidBlock extends Block implements BucketPickup {}",
+        "package net.minecraft.world.level.block; public class LiquidBlock extends Block implements BucketPickup, LiquidBlockContainer {}",
+    );
+    sources.insert(
+        "net/minecraft/world/level/block/OakFenceBlock.java",
+        "package net.minecraft.world.level.block; public class OakFenceBlock extends Block implements SimpleWaterloggedBlock {}",
+    );
+    sources.insert(
+        "demo/jar/FireBlock.java",
+        "package demo.jar; public interface FireBlock {}",
+    );
+    sources.insert(
+        "demo/jar/BucketPickup.java",
+        "package demo.jar; public interface BucketPickup {}",
     );
     sources.insert(
         "net/minecraft/world/level/block/Blocks.java",
-        "package net.minecraft.world.level.block; public final class Blocks { public static final Block FIRE = null; public static final Block WATER = null; public static final Block CHEST = null; }",
+        "package net.minecraft.world.level.block; public final class Blocks { public static final Block FIRE = null; public static final Block WATER = null; public static final Block OAK_FENCE = null; public static final Block CHEST = null; }",
     );
     sources.insert(
         "net/minecraft/world/level/block/state/BlockBehaviour.java",
@@ -132,9 +156,12 @@ fn vanilla_block_constants_answer_instanceof_from_seeded_classes() {
         r#"package demo;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.BucketPickup;
+import net.minecraft.world.level.block.ChangeOverTimeBlock;
 import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.FireBlock;
 import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.LiquidBlockContainer;
+import net.minecraft.world.level.block.OakFenceBlock;
 public final class Main {
     public static void main() {
         Probe.check("fire", Blocks.FIRE instanceof FireBlock);
@@ -143,6 +170,13 @@ public final class Main {
         Probe.check("item-like", Blocks.FIRE instanceof net.minecraft.world.level.ItemLike);
         Probe.check("water", Blocks.WATER instanceof LiquidBlock);
         Probe.check("bucket-pickup", Blocks.WATER instanceof BucketPickup);
+        Probe.check("liquid-container", Blocks.WATER instanceof LiquidBlockContainer);
+        Probe.check("fence-bucket", Blocks.OAK_FENCE instanceof BucketPickup);
+        Probe.check("fence-liquid", Blocks.OAK_FENCE instanceof LiquidBlockContainer);
+        Probe.check("fire-no-change", !(Blocks.FIRE instanceof ChangeOverTimeBlock));
+        Probe.check("fence-no-change", !(Blocks.OAK_FENCE instanceof ChangeOverTimeBlock));
+        Probe.check("jar-fire-name", !(Blocks.FIRE instanceof demo.jar.FireBlock));
+        Probe.check("jar-bucket-name", !(Blocks.WATER instanceof demo.jar.BucketPickup));
         Probe.check("same-block", Blocks.FIRE == Blocks.FIRE);
         Probe.check("different-block", Blocks.FIRE != Blocks.CHEST);
     }
@@ -159,37 +193,34 @@ public final class Main {
             "net/minecraft/world/level/block/BaseFireBlock.class",
             "net/minecraft/world/level/block/FireBlock.class",
             "net/minecraft/world/level/block/BucketPickup.class",
+            "net/minecraft/world/level/block/LiquidBlockContainer.class",
+            "net/minecraft/world/level/block/ChangeOverTimeBlock.class",
+            "net/minecraft/world/level/block/SimpleWaterloggedBlock.class",
             "net/minecraft/world/level/block/LiquidBlock.class",
+            "net/minecraft/world/level/block/OakFenceBlock.class",
             "net/minecraft/world/level/block/state/BlockBehaviour.class",
             "net/minecraft/world/level/ItemLike.class",
             "net/minecraft/world/level/block/ChestBlock.class",
             "net/minecraft/world/level/block/Blocks.class",
+            "demo/jar/FireBlock.class",
+            "demo/jar/BucketPickup.class",
         ],
     );
     let jar = NativeJar::from_path(&jar_path).unwrap();
-    let classes = BTreeMap::from([
-        (
-            "minecraft:fire".to_owned(),
-            vec![
-                "net/minecraft/world/level/block/FireBlock".to_owned(),
-                "net/minecraft/world/level/block/BaseFireBlock".to_owned(),
-                "net/minecraft/world/level/block/Block".to_owned(),
-                "net/minecraft/world/level/block/state/BlockBehaviour".to_owned(),
-                "net/minecraft/world/level/ItemLike".to_owned(),
-            ],
-        ),
-        (
-            "minecraft:water".to_owned(),
-            vec![
-                "net/minecraft/world/level/block/LiquidBlock".to_owned(),
-                "net/minecraft/world/level/block/BucketPickup".to_owned(),
-                "net/minecraft/world/level/block/Block".to_owned(),
-                "net/minecraft/world/level/block/state/BlockBehaviour".to_owned(),
-                "net/minecraft/world/level/ItemLike".to_owned(),
-            ],
-        ),
-    ]);
-    let mut host = jar.seed_host(StdHost::new().with_game_block_classes(Arc::new(classes)));
+    let table = jar_path
+        .parent()
+        .unwrap()
+        .join("vanilla-block-classes.json");
+    fs::write(
+        &table,
+        r#"{"blocks":{
+            "minecraft:fire":["net/minecraft/world/level/block/FireBlock","net/minecraft/world/level/block/BaseFireBlock","net/minecraft/world/level/block/Block","net/minecraft/world/level/block/state/BlockBehaviour","net/minecraft/world/level/ItemLike","java/lang/Object"],
+            "minecraft:water":["net/minecraft/world/level/block/LiquidBlock","net/minecraft/world/level/block/BucketPickup","net/minecraft/world/level/block/LiquidBlockContainer","net/minecraft/world/level/block/Block","net/minecraft/world/level/block/state/BlockBehaviour","net/minecraft/world/level/ItemLike","java/lang/Object"],
+            "minecraft:oak_fence":["net/minecraft/world/level/block/OakFenceBlock","net/minecraft/world/level/block/SimpleWaterloggedBlock","net/minecraft/world/level/block/BucketPickup","net/minecraft/world/level/block/LiquidBlockContainer","net/minecraft/world/level/block/Block","net/minecraft/world/level/block/state/BlockBehaviour","net/minecraft/world/level/ItemLike","java/lang/Object"]
+        }}"#,
+    )
+    .unwrap();
+    let mut host = jar.seed_host(StdHost::new().with_game_block_classes_file(&table).unwrap());
     jar.execute("demo.Main", Some("main"), "main", &mut host)
         .unwrap();
     let checks: BTreeMap<String, bool> = host
@@ -211,6 +242,13 @@ public final class Main {
             ("same-block".to_owned(), true),
             ("water".to_owned(), true),
             ("bucket-pickup".to_owned(), true),
+            ("liquid-container".to_owned(), true),
+            ("fence-bucket".to_owned(), true),
+            ("fence-liquid".to_owned(), true),
+            ("fire-no-change".to_owned(), true),
+            ("fence-no-change".to_owned(), true),
+            ("jar-fire-name".to_owned(), true),
+            ("jar-bucket-name".to_owned(), true),
             ("different-block".to_owned(), true),
         ])
     );
