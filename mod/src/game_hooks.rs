@@ -805,7 +805,9 @@ mod tests {
                 life: 0,
             },
         ];
-        let mut host = mod_api::testing::FakeHost::new();
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::from([(alice, Some(false)), (bob, Some(false))]),
+        };
         for (uuid, entity) in [(alice, 7), (bob, 8)] {
             let player = mod_api::__private::game::player_ref(
                 EntityRef::new(WorldEpoch::new(1), entity),
