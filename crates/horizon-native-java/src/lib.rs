@@ -6322,14 +6322,25 @@ impl Host for StdHost {
                     })
             }
             // Java's float extrema: a NaN operand gives NaN, and -0.0 < 0.0.
-            ("java/lang/Math", "max" | "min", "(DD)D" | "(FF)F") => {
+            ("java/lang/Math", "max", "(DD)D") => {
                 let left = expect_float(r, Self::argument(r, args, 0)?)?;
                 let right = expect_float(r, Self::argument(r, args, 1)?)?;
-                Ok(Value::Float(java_float_extremum(
-                    left,
-                    right,
-                    r.name == "max",
-                )))
+                Ok(double_value(java_float_max(left, right)))
+            }
+            ("java/lang/Math", "min", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(java_float_min(left, right)))
+            }
+            ("java/lang/Math", "max", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_max(left, right)))
+            }
+            ("java/lang/Math", "min", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_min(left, right)))
             }
             ("java/lang/Math", "max", "(II)I") => Ok(Value::Int(
                 expect_int(r, Self::argument(r, args, 0)?)?
@@ -10779,30 +10790,6 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ENCHANTMENT", "minecraft:enchantment"),
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
-
-/// `Math.max`/`Math.min` on `double` or `float` as Java defines them.
-fn java_float_extremum(left: f64, right: f64, max: bool) -> f64 {
-    if left.is_nan() || right.is_nan() {
-        return f64::NAN;
-    }
-    if left == 0.0 && right == 0.0 {
-        // Equal zeros: max prefers +0.0, min prefers -0.0.
-        let positive = left.is_sign_positive() && right.is_sign_positive();
-        let negative = left.is_sign_negative() && right.is_sign_negative();
-        return if max {
-            if negative { -0.0 } else { 0.0 }
-        } else if positive {
-            0.0
-        } else {
-            -0.0
-        };
-    }
-    if max {
-        left.max(right)
-    } else {
-        left.min(right)
-    }
-}
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
