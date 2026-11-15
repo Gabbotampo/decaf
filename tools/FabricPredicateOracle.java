@@ -33,18 +33,18 @@ public final class FabricPredicateOracle {
                     else version = unescape(fields.group(2));
                 }
                 if (predicate == null || version == null) {
-                    System.out.println("{\\\"error\\\":\\\"invalid input\\\"}");
+                    System.out.println("{\"error\":\"invalid input\"}");
                     continue;
                 }
                 try {
                     boolean result = VersionPredicate.parse(predicate).test(SemanticVersion.parse(version));
-                    System.out.println("{\\\"predicate\\\":" + quote(predicate)
-                            + ",\\\"version\\\":" + quote(version)
-                            + ",\\\"ok\\\":" + result + "}");
+                    System.out.println("{\"predicate\":" + quote(predicate)
+                            + ",\"version\":" + quote(version)
+                            + ",\"ok\":" + result + "}");
                 } catch (Throwable error) {
-                    System.out.println("{\\\"predicate\\\":" + quote(predicate)
-                            + ",\\\"version\\\":" + quote(version)
-                            + ",\\\"error\\\":" + quote(error.toString()) + "}");
+                    System.out.println("{\"predicate\":" + quote(predicate)
+                            + ",\"version\":" + quote(version)
+                            + ",\"error\":" + quote(error.toString()) + "}");
                 }
             }
         }
