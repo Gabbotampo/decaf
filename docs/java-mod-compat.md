@@ -608,7 +608,7 @@ names start with `java_`, and they are fired only from `java_game_hooks.rs`. One
 | `java_server_stopped` | `MinecraftServer#stopServer` | `TAIL` | listen | an orderly stop, after the final save and the levels' close, before the stopped event |
 | `java_player_tick_head` | `ServerPlayer#tick` | `HEAD` | listen | **unbound:** no pinned hook fires at `ServerPlayer.tick`'s level entity-loop moment; `Player.tick`'s pair is a different moment (a native Mixin escape hatch is a separate option) |
 | `java_base_player_tick_head` | `Player#tick` | `HEAD` | listen | `player_tick_pre`, NeoForge's `PlayerTickEvent.Pre`, with the server player's state acting |
-| `java_base_player_tick_tail` | `Player#tick` | `TAIL` | listen | `player_tick_post`, NeoForge's `PlayerTickEvent.Post`, after body work and with the same player identity |
+| `java_base_player_tick_tail` | `Player#tick` | `TAIL` | listen | `player_tick_post`, with the same player identity; the pinned fork currently fires it after the remainder of `ServerPlayer.doTick`, so every firing is counted with that late-moment departure |
 | `java_destroy_speed` | `Player#getDestroySpeed(BlockState)F` | `RETURN`/`TAIL` | override | the speed `tick_mining` and `destroy_progress` compute; a cancellable callback's `setReturnValue` is the speed the progress divides by hardness |
 | `java_grow_crop` | `BoneMealItem#growCrop` (static) | `HEAD` | cancel with a value | a player's and a dispenser's bone meal (not a farmer villager's, which Horizon decides in its brain); a cancel returns its value without growing or using up the meal, and `false` goes on to `growWaterPlant` as vanilla's caller does |
 | `java_server_tick_head` / `_tail` | `MinecraftServer#tickServer(BooleanSupplier)V` | `HEAD` / `TAIL` | listen | `native_server_tick`'s start and end phases; `haveTime` is null (the host has no supplier) |
@@ -627,10 +627,14 @@ A callback may also take the callback info alone, Mixin's simple form (`(Callbac
 A hook name can stand for several vanilla methods (`living_jump`); a plan registers at the row of its own target.
 
 The pinned `player_tick_pre`/`player_tick_post` hooks are listen-only and run on both logical sides; this
-server-side bridge binds the `Player#tick` rows to their server firing. Horizon currently emits the pair for a
-spectator whose box touches an unloaded chunk even though vanilla skips `super.tick()` there (#4520). The API
-exposes spectator mode but not the complete box/chunk test, so the bridge skips and counts all spectator
-player-tick firings until the pinned game includes that fix. `ServerPlayer#tick` remains unbound; a native
+bridge binds only the server-side Mixin plan because the runtime's game-hook registration is server-side, and
+client-side plans are counted as a deliberate limitation. The fork's `player_tick_post` currently fires after
+the rest of `ServerPlayer.doTick` (pickups, advancements, scores and death handling), so callbacks still run but
+each TAIL firing is counted with that late-moment departure. The fork also filters its pair to guests whose
+terrain is marked loaded; vanilla's `ServerGamePacketListenerImpl.tickPlayer` calls `ServerPlayer.doTick` without
+that client-terrain filter, so a pre-load omission is a fork departure. Before ari #4520 is in a pinned game,
+spectator callbacks fire and are retained; the narrow spectator/unloaded-chunk mismatch is counted by the game
+side and that counting can be removed after the pin bump. `ServerPlayer#tick` remains unbound; a native
 `[[native.mixin]]` is the possible exact-moment route and is outside this binding.
 
 A callback on a value-returning target takes a `CallbackInfoReturnable`. At a `RETURN`/`TAIL` row the game hands
