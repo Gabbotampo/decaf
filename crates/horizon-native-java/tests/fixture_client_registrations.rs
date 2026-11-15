@@ -13,7 +13,7 @@ const API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/core/particles/ParticleType.java",
-        r#"package net.minecraft.core.particles; public abstract class ParticleType<T> { public boolean getOverrideLimiter() { throw new AssertionError(); } public Object codec() { throw new AssertionError(); } public Object streamCodec() { throw new AssertionError(); } }"#,
+        r#"package net.minecraft.core.particles; public abstract class ParticleType<T> { public boolean getOverrideLimiter() { throw new AssertionError(); } public com.mojang.serialization.MapCodec<T> codec() { throw new AssertionError(); } public net.minecraft.network.codec.StreamCodec<Object, T> streamCodec() { throw new AssertionError(); } }"#,
     ),
     (
         "net/minecraft/core/particles/SimpleParticleType.java",
@@ -109,10 +109,17 @@ fn client_registration_surfaces_keep_java25_identity_and_order() {
         "true|false|true|false|true|false|false"
     );
     assert_eq!(
+        fixture.text_on(&mut host, "particle_codecs"),
+        "true|true|true|true"
+    );
+    assert_eq!(
         fixture.text_on(&mut host, "hud_ids"),
         "minecraft:chat|minecraft:info_bar_foreground"
     );
-    assert_eq!(fixture.text_on(&mut host, "profiles"), "true|true");
+    assert_eq!(
+        fixture.text_on(&mut host, "profiles"),
+        "true|true|true|true"
+    );
     assert!(fixture
         .text_on(&mut host, "model_equal")
         .starts_with("Cannot replace registration for model layer \"ModelLayerLocation[model=minecraft:x, layer=main]\""));

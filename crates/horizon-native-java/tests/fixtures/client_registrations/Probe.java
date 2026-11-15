@@ -36,13 +36,25 @@ public class Probe {
     return a.getOverrideLimiter() + "|" + b.getOverrideLimiter() + "|" + c.getOverrideLimiter() + "|" + d.getOverrideLimiter()
         + "|" + (a.getType() == a) + "|" + (a == b) + "|" + (c == d);
   }
+  public static String particle_codecs() {
+    SimpleParticleType a = FabricParticleTypes.simple(true);
+    com.mojang.serialization.MapCodec<?> map = a.codec();
+    net.minecraft.network.codec.StreamCodec<?, ?> stream = a.streamCodec();
+    com.mojang.serialization.MapCodec<Object> suppliedMap = new com.mojang.serialization.MapCodec<>();
+    net.minecraft.network.codec.StreamCodec<Object, Object> suppliedStream = new net.minecraft.network.codec.StreamCodec<>();
+    ParticleType<?> complex = FabricParticleTypes.complex(true, suppliedMap, suppliedStream);
+    return (map == a.codec()) + "|" + (stream == a.streamCodec()) + "|"
+        + (complex.codec() == suppliedMap) + "|" + (complex.streamCodec() == suppliedStream);
+  }
   public static String hud_ids() {
     return VanillaHudElements.CHAT.toString() + "|" + VanillaHudElements.INFO_BAR_FOREGROUND.toString();
   }
   public static String profiles() {
     java.util.Map<DebugScreenProfile, java.util.Map<Identifier, DebugScreenEntryStatus>> profiles = DebugScreenEntries.PROFILES;
     return (profiles.get(DebugScreenProfile.DEFAULT).get(DebugScreenEntries.FPS) == DebugScreenEntryStatus.IN_OVERLAY) + "|"
-        + (profiles.get(DebugScreenProfile.PERFORMANCE).get(DebugScreenEntries.FPS) == DebugScreenEntryStatus.ALWAYS_ON);
+        + (profiles.get(DebugScreenProfile.PERFORMANCE).get(DebugScreenEntries.FPS) == DebugScreenEntryStatus.ALWAYS_ON) + "|"
+        + (profiles.get(DebugScreenProfile.DEFAULT).getOrDefault(DebugScreenEntries.FPS, DebugScreenEntryStatus.ALWAYS_ON) == DebugScreenEntryStatus.IN_OVERLAY) + "|"
+        + (profiles.get(DebugScreenProfile.PERFORMANCE).getOrDefault(DebugScreenEntries.FPS, DebugScreenEntryStatus.IN_OVERLAY) == DebugScreenEntryStatus.ALWAYS_ON);
   }
   public static String model_equal() {
     try {

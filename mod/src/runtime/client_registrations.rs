@@ -23,6 +23,8 @@ const MODEL_LOCATION: &str = "net/minecraft/client/model/geom/ModelLayerLocation
 const VANILLA_HUD: &str = "net/fabricmc/fabric/api/client/rendering/v1/hud/VanillaHudElements";
 const DEBUG_PROFILE: &str = "net/minecraft/client/gui/components/debug/DebugScreenProfile";
 const DEBUG_STATUS: &str = "net/minecraft/client/gui/components/debug/DebugScreenEntryStatus";
+const MAP_CODEC: &str = "com/mojang/serialization/MapCodec";
+const STREAM_CODEC: &str = "net/minecraft/network/codec/StreamCodec";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Registration {
@@ -55,6 +57,7 @@ pub(crate) enum Registration {
 pub(crate) struct State {
     pub(crate) registrations: Vec<Registration>,
     next_particle_type: u64,
+    particle_codecs: BTreeMap<String, (Value, Value)>,
     model_layers: BTreeSet<String>,
     armor_layers: BTreeSet<String>,
     model_locations: BTreeMap<String, (String, String)>,
@@ -176,7 +179,9 @@ fn profile_map_call(
             let key = args.first()?;
             let value = if let Some(profile) = profile {
                 identifier(key)
-                    .and_then(|id| profile_status(profile, &id))
+                    .and_then(|id| {
+                        profile_status(profile, id.strip_prefix("minecraft:").unwrap_or(&id))
+                    })
                     .unwrap_or_else(|| args.get(1).cloned().unwrap_or(Value::Ref(None)))
             } else {
                 debug_profile(key)
@@ -330,6 +335,17 @@ fn model_layer_identity(state: &State, value: &Value) -> Option<(String, String)
     ))
 }
 
+fn particle_unit_codec(particle_key: &str, declared: &str, name: &str) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::OpaqueCodec,
+        &[
+            Value::Ref(Some(declared.to_owned())),
+            Value::Ref(Some(format!("particle/{particle_key}"))),
+            Value::Ref(Some(name.to_owned())),
+        ],
+    ))
+}
+
 /// Static factories and registration-only static APIs.
 pub(crate) fn invoke(
     state: &mut State,
@@ -347,10 +363,22 @@ pub(crate) fn invoke(
             };
             let key = state.next_particle_type;
             state.next_particle_type = state.next_particle_type.saturating_add(1);
-            Some(Ok(Value::Host(HostRef::new(
+            let particle = Value::Host(HostRef::new(
                 HostKind::ParticleType,
                 format!("simple/{key}/{}/", i32::from(limiter)),
-            ))))
+            ));
+            let particle_key = match &particle {
+                Value::Host(handle) => handle.key().to_owned(),
+                _ => unreachable!(),
+            };
+            state.particle_codecs.insert(
+                particle_key.clone(),
+                (
+                    particle_unit_codec(&particle_key, MAP_CODEC, "codec"),
+                    particle_unit_codec(&particle_key, STREAM_CODEC, "streamCodec"),
+                ),
+            );
+            Some(Ok(particle))
         }
         (PARTICLE_TYPES, "complex") => {
             let limiter = match (r.descriptor.as_str(), args.len()) {
@@ -381,10 +409,21 @@ pub(crate) fn invoke(
             } else {
                 "complex"
             };
-            Some(Ok(Value::Host(HostRef::new(
+            let particle = Value::Host(HostRef::new(
                 HostKind::ParticleType,
                 format!("{family}/{key}/{}/", i32::from(limiter)),
-            ))))
+            ));
+            if family == "complex" {
+                let particle_key = match &particle {
+                    Value::Host(handle) => handle.key().to_owned(),
+                    _ => unreachable!(),
+                };
+                state.particle_codecs.insert(
+                    particle_key,
+                    (args[args.len() - 2].clone(), args[args.len() - 1].clone()),
+                );
+            }
+            Some(Ok(particle))
         }
         (PARTICLE_REGISTRY, "getInstance") => Some(Ok(client_handle("particle-provider-registry"))),
         (PARTICLE_REGISTRY, "register") => {
@@ -547,6 +586,18 @@ pub(crate) fn instance(
         && handle.kind() == HostKind::ParticleType
     {
         match (r.name.as_str(), r.descriptor.as_str()) {
+            ("codec", "()Lcom/mojang/serialization/MapCodec;") => {
+                return state
+                    .particle_codecs
+                    .get(handle.key())
+                    .map(|(codec, _)| Ok(codec.clone()));
+            }
+            ("streamCodec", "()Lnet/minecraft/network/codec/StreamCodec;") => {
+                return state
+                    .particle_codecs
+                    .get(handle.key())
+                    .map(|(_, stream_codec)| Ok(stream_codec.clone()));
+            }
             ("getOverrideLimiter", "()Z") => {
                 let enabled = handle
                     .key()
