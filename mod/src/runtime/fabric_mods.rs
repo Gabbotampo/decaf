@@ -444,7 +444,14 @@ impl StdHost {
         if schema != 1
             && matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
-                ("getAuthors" | "getContributors" | "getLicense" | "getProvides" | "getDependencies", "()Ljava/util/Collection;")
+                (
+                    "getAuthors"
+                        | "getContributors"
+                        | "getLicense"
+                        | "getProvides"
+                        | "getDependencies",
+                    "()Ljava/util/Collection;"
+                )
             )
         {
             return self.unknown_host_call(r);
