@@ -157,7 +157,10 @@ pub(crate) fn spells_key_text(text: &str) -> bool {
 /// Whether `handle` is an allocated object: a jar's (or a model's) `new`, or
 /// a collection the host made.
 pub(crate) fn is_object_handle(handle: &HostRef) -> bool {
-    matches!(handle.kind(), HostKind::JarObject | HostKind::Collection)
+    matches!(
+        handle.kind(),
+        HostKind::JarObject | HostKind::Collection | HostKind::GuavaMultimap
+    )
 }
 
 /// `ClassRule::FromKey` of a jar object: the class before the allocation

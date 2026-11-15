@@ -158,14 +158,6 @@ fn map_ref(name: &str, descriptor: &str) -> MethodRef {
     }
 }
 
-fn collection_ref(owner: &str, name: &str, descriptor: &str) -> MethodRef {
-    MethodRef {
-        owner: owner.into(),
-        name: name.into(),
-        descriptor: descriptor.into(),
-    }
-}
-
 fn thrown(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
         class: class.into(),
@@ -204,6 +196,9 @@ impl<H: Host> Runtime<'_, H> {
         }
         if let Some(class) = empty_factory_class(r) {
             return Ok(self.host.empty_mutable_collection(class));
+        }
+        if let Some(value) = crate::guava_multimap::invoke(self, r, receiver, args)? {
+            return Ok(Some(value));
         }
         if let Some((class, values, map)) = self.collection_factory_values(r, args)? {
             let collection = self.host.empty_mutable_collection(class).ok_or_else(|| {
@@ -409,12 +404,6 @@ impl<H: Host> Runtime<'_, H> {
             "com/google/common/cache/LoadingCache" | "com/google/common/cache/Cache" => {
                 self.invoke_cache(r, receiver, args)
             }
-            "com/google/common/collect/HashMultimap"
-            | "com/google/common/collect/LinkedHashMultimap"
-            | "com/google/common/collect/ArrayListMultimap"
-            | "com/google/common/collect/Multimap"
-            | "com/google/common/collect/SetMultimap"
-            | "com/google/common/collect/ListMultimap" => self.invoke_multimap(r, receiver, args),
             // `Maps.newConcurrentMap()` is a mutable map. The bounded runtime
             // is single-threaded, so the host's ordinary map marker is the
             // same object graph; concurrency has no second thread to serve.
@@ -1127,164 +1116,6 @@ impl<H: Host> Runtime<'_, H> {
             }
             "asMap" => cache,
             "cleanUp" | "refresh" => Value::Void,
-            _ => return Ok(None),
-        }))
-    }
-
-    fn invoke_multimap(
-        &mut self,
-        r: &MethodRef,
-        receiver: Option<&Value>,
-        args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
-        if r.name == "create" {
-            let Some(map) = self.host.empty_mutable_collection("map") else {
-                return Ok(None);
-            };
-            let marker = expect_ref(&map).cloned().unwrap_or_default();
-            let values = if r.owner.ends_with("ArrayListMultimap") {
-                "list"
-            } else {
-                "set"
-            };
-            self.fields.insert(
-                format!("{marker}|guava#multimap"),
-                Value::Ref(Some(values.into())),
-            );
-            return Ok(Some(map));
-        }
-        let Some(map) = receiver.cloned() else {
-            return Ok(None);
-        };
-        let Some(marker) = expect_ref(&map).cloned() else {
-            return Ok(None);
-        };
-        let Some(Value::Ref(Some(kind))) = self
-            .fields
-            .get(&format!("{marker}|guava#multimap"))
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        let owner = if kind == "list" {
-            "java/util/List"
-        } else {
-            "java/util/Set"
-        };
-        let get = map_ref("get", "(Ljava/lang/Object;)Ljava/lang/Object;");
-        // The collection a key maps to, made (and stored) on first use.
-        let values_of = |this: &mut Self, key: &Value| -> Result<Value, NativeError> {
-            let existing = this
-                .host
-                .invoke_instance(&get, &map, std::slice::from_ref(key))?;
-            if !matches!(existing, Value::Ref(None)) {
-                return Ok(existing);
-            }
-            let fresh = this.host.empty_mutable_collection(&kind).ok_or_else(|| {
-                NativeError::Metadata("the host models no mutable collection".into())
-            })?;
-            this.host.invoke_instance(
-                &map_ref(
-                    "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                ),
-                &map,
-                &[key.clone(), fresh.clone()],
-            )?;
-            Ok(fresh)
-        };
-        let size_of = |this: &mut Self, collection: &Value| -> Result<i32, NativeError> {
-            let size = this.host.invoke_instance(
-                &collection_ref(owner, "size", "()I"),
-                collection,
-                &[],
-            )?;
-            Ok(boxed_integer(&size).unwrap_or(0))
-        };
-        let keys = |this: &mut Self| -> Result<Vec<Value>, NativeError> {
-            let set =
-                this.host
-                    .invoke_instance(&map_ref("keySet", "()Ljava/util/Set;"), &map, &[])?;
-            runtime_collection_values(&*this.host, &set)
-        };
-        Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-            ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
-                let collection = values_of(self, &args[0])?;
-                self.host.invoke_instance(
-                    &collection_ref(owner, "add", "(Ljava/lang/Object;)Z"),
-                    &collection,
-                    &args[1..2],
-                )?
-            }
-            ("get", _) => values_of(self, &args[0])?,
-            ("containsKey", "(Ljava/lang/Object;)Z") => {
-                let existing = self.host.invoke_instance(&get, &map, &args[..1])?;
-                let present =
-                    !matches!(existing, Value::Ref(None)) && size_of(self, &existing)? > 0;
-                Value::Int(i32::from(present))
-            }
-            ("containsEntry", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
-                let existing = self.host.invoke_instance(&get, &map, &args[..1])?;
-                if matches!(existing, Value::Ref(None)) {
-                    Value::Int(0)
-                } else {
-                    self.host.invoke_instance(
-                        &collection_ref(owner, "contains", "(Ljava/lang/Object;)Z"),
-                        &existing,
-                        &args[1..2],
-                    )?
-                }
-            }
-            ("remove", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
-                let existing = self.host.invoke_instance(&get, &map, &args[..1])?;
-                if matches!(existing, Value::Ref(None)) {
-                    Value::Int(0)
-                } else {
-                    self.host.invoke_instance(
-                        &collection_ref(owner, "remove", "(Ljava/lang/Object;)Z"),
-                        &existing,
-                        &args[1..2],
-                    )?
-                }
-            }
-            ("size", "()I") | ("isEmpty", "()Z") => {
-                let mut total = 0;
-                for key in keys(self)? {
-                    let collection = self.host.invoke_instance(&get, &map, &[key])?;
-                    total += size_of(self, &collection)?;
-                }
-                if r.name == "size" {
-                    Value::Int(total)
-                } else {
-                    Value::Int(i32::from(total == 0))
-                }
-            }
-            ("keySet", "()Ljava/util/Set;") => {
-                let mut present = Vec::new();
-                for key in keys(self)? {
-                    let collection =
-                        self.host
-                            .invoke_instance(&get, &map, std::slice::from_ref(&key))?;
-                    if size_of(self, &collection)? > 0 {
-                        present.push(key);
-                    }
-                }
-                collection_value("set", &present)
-            }
-            ("values", "()Ljava/util/Collection;") => {
-                let mut all = Vec::new();
-                for key in keys(self)? {
-                    let collection = self.host.invoke_instance(&get, &map, &[key])?;
-                    all.extend(runtime_collection_values(&*self.host, &collection)?);
-                }
-                collection_value("list", &all)
-            }
-            ("asMap", "()Ljava/util/Map;") => map,
-            ("clear", "()V") => {
-                self.host
-                    .invoke_instance(&map_ref("clear", "()V"), &map, &[])?;
-                Value::Void
-            }
             _ => return Ok(None),
         }))
     }
