@@ -8442,7 +8442,8 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-            if r.name == "remove" && r.descriptor == "()V"
+            if r.name == "remove"
+                && r.descriptor == "()V"
                 && self.iterator_sources.get(marker).is_some_and(|source| {
                     source.starts_with("java/util/Collections$Unmodifiable")
                         || source == "java/util/Collections$SingletonList"
@@ -26751,9 +26752,10 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_io(&r, receiver.as_ref(), &args, class, method)
                     ) {
                         value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, mod_origin::invoke(self.host, &r, receiver.as_ref(), &args))
-                    {
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        mod_origin::invoke(self.host, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

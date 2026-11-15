@@ -229,34 +229,69 @@ fn unmodifiable_collection_keeps_object_equality_and_delegates_text() {
 #[test]
 fn populated_real_v1_metadata_uses_wrappers_and_rejects_iterator_remove() {
     let sources = sources();
-    let sources = sources.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect::<Vec<_>>();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
     let fixture = javac_fixture::Fixture::build_with_mod_json(
         "metadata-populated",
         &sources,
         r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"dep":">=1"}}"#,
     );
-    let mut host = fixture.jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
     let result = fixture.jar.invoke_method_with_args(
-        "demo/Containers", "populated", "()Ljava/lang/String;", None, &[], &mut host,
+        "demo/Containers",
+        "populated",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
     );
-    assert!(matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "1:1:1:1:1:AliceUUUUUUUUUU"), "{result:?}");
-    assert!(host.unknown_host_calls().is_empty(), "{:?}", host.unknown_host_calls());
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "1:1:1:1:1:AliceUUUUUUUUUU"),
+        "{result:?}"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
 
 #[test]
 fn a_jar_origin_paths_are_the_cached_singleton_list() {
     let sources = sources();
-    let sources = sources.iter().map(|(name, text)| (name.as_str(), text.as_str())).collect::<Vec<_>>();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
     let fixture = javac_fixture::Fixture::build_with_mod_json(
-        "origin-paths", &sources,
+        "origin-paths",
+        &sources,
         r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1}"#,
     );
-    let mut host = fixture.jar.seed_host(StdHost::new().with_environment_type("SERVER"));
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
     let result = fixture.jar.invoke_method_with_args(
-        "demo/Containers", "originPaths", "()Ljava/lang/String;", None, &[], &mut host,
+        "demo/Containers",
+        "originPaths",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
     );
-    assert!(matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "java.util.Collections$SingletonList:true:true:[/horizon/mods/probe-fixture]"), "{result:?}");
-    assert!(host.unknown_host_calls().is_empty(), "{:?}", host.unknown_host_calls());
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "java.util.Collections$SingletonList:true:true:[/horizon/mods/probe-fixture]"),
+        "{result:?}"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
 
 /// The loader and its mapping resolver are one object each (`==`, `equals`,

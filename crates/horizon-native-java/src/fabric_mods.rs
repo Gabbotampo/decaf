@@ -265,10 +265,16 @@ impl StdHost {
             (MOD_DEPENDENCY_KIND, ..) => {
                 let name = expect_ref(receiver)?.rsplit('/').next()?.to_owned();
                 Some(match (r.name.as_str(), r.descriptor.as_str()) {
-                    ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => Ok(text(name)),
+                    ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
+                        Ok(text(name))
+                    }
                     ("ordinal", "()I") => Ok(Value::Int(match name.as_str() {
-                        "DEPENDS" => 0, "RECOMMENDS" => 1, "SUGGESTS" => 2,
-                        "CONFLICTS" => 3, "BREAKS" => 4, _ => 5,
+                        "DEPENDS" => 0,
+                        "RECOMMENDS" => 1,
+                        "SUGGESTS" => 2,
+                        "CONFLICTS" => 3,
+                        "BREAKS" => 4,
+                        _ => 5,
                     })),
                     _ => self.unknown_host_call(r),
                 })
@@ -406,11 +412,18 @@ impl StdHost {
                 _ => Vec::new(),
             }
         };
-        let schema = field("schemaVersion").and_then(serde_json::Value::as_i64).unwrap_or(1);
+        let schema = field("schemaVersion")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(1);
         let dependencies = || -> Vec<Value> {
             field("depends")
                 .and_then(serde_json::Value::as_object)
-                .map(|entries| entries.keys().map(|id| loader::dependency(id, "DEPENDS")).collect())
+                .map(|entries| {
+                    entries
+                        .keys()
+                        .map(|id| loader::dependency(id, "DEPENDS"))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
@@ -451,9 +464,19 @@ impl StdHost {
                     .map(|index| loader::pointed(Pointed::Person, id, &format!("/{key}/{index}")))
                     .collect::<Vec<_>>();
                 if schema == 0 {
-                    Ok(self.cached_unmodifiable_collection(receiver, &r.name, "java/util/Collections$UnmodifiableCollection", people))
+                    Ok(self.cached_unmodifiable_collection(
+                        receiver,
+                        &r.name,
+                        "java/util/Collections$UnmodifiableCollection",
+                        people,
+                    ))
                 } else {
-                    Ok(self.cached_unmodifiable_collection(receiver, &r.name, "java/util/Collections$UnmodifiableCollection", people))
+                    Ok(self.cached_unmodifiable_collection(
+                        receiver,
+                        &r.name,
+                        "java/util/Collections$UnmodifiableCollection",
+                        people,
+                    ))
                 }
             }
             // `V1ModMetadata` holds `ContactInformation.EMPTY` without one.
@@ -469,19 +492,38 @@ impl StdHost {
                 if schema == 0 && !values.is_empty() {
                     Ok(self.unmodifiable_from("java/util/Collections", "singleton", "set", values))
                 } else {
-                    Ok(self.cached_unmodifiable_collection(receiver, "getLicense", "java/util/Collections$UnmodifiableCollection", values))
+                    Ok(self.cached_unmodifiable_collection(
+                        receiver,
+                        "getLicense",
+                        "java/util/Collections$UnmodifiableCollection",
+                        values,
+                    ))
                 }
             }
             ("getProvides", "()Ljava/util/Collection;") => {
                 if schema == 0 && field("provides").is_none() {
-                    Ok(self.unmodifiable_from("java/util/Collections", "emptyList", "list", Vec::new()))
+                    Ok(self.unmodifiable_from(
+                        "java/util/Collections",
+                        "emptyList",
+                        "list",
+                        Vec::new(),
+                    ))
                 } else {
-                    Ok(self.cached_unmodifiable_collection(receiver, "getProvides", "java/util/Collections$UnmodifiableCollection", strings("provides")))
+                    Ok(self.cached_unmodifiable_collection(
+                        receiver,
+                        "getProvides",
+                        "java/util/Collections$UnmodifiableCollection",
+                        strings("provides"),
+                    ))
                 }
             }
-            ("getDependencies", "()Ljava/util/Collection;") => Ok(self.cached_unmodifiable_collection(
-                receiver, "getDependencies", "java/util/Collections$UnmodifiableCollection", dependencies(),
-            )),
+            ("getDependencies", "()Ljava/util/Collection;") => Ok(self
+                .cached_unmodifiable_collection(
+                    receiver,
+                    "getDependencies",
+                    "java/util/Collections$UnmodifiableCollection",
+                    dependencies(),
+                )),
             ("containsCustomValue", "(Ljava/lang/String;)Z") => {
                 let key = expect_string(Self::argument(r, args, 0)?);
                 let present = field("custom").is_some_and(|custom| custom.get(key).is_some());
@@ -536,24 +578,27 @@ impl StdHost {
                 Some(enum_marker(MOD_ENVIRONMENT, "UNIVERSAL"))
             }
             ("getProvides", "()Ljava/util/Collection;") => Some(self.unmodifiable_from(
-                "java/util/Collections", "emptyList", "list", Vec::new(),
+                "java/util/Collections",
+                "emptyList",
+                "list",
+                Vec::new(),
             )),
-            ("getAuthors" | "getContributors" | "getLicense", "()Ljava/util/Collection;") => Some(
-                self.cached_unmodifiable_collection(
+            ("getAuthors" | "getContributors" | "getLicense", "()Ljava/util/Collection;") => {
+                Some(self.cached_unmodifiable_collection(
                     &loader::metadata(id),
                     r.name.as_str(),
                     "java/util/Collections$UnmodifiableCollection",
                     Vec::new(),
-                ),
-            ),
-            ("getDependencies", "()Ljava/util/Collection;") => Some(
-                self.cached_unmodifiable_collection(
+                ))
+            }
+            ("getDependencies", "()Ljava/util/Collection;") => {
+                Some(self.cached_unmodifiable_collection(
                     &loader::metadata(id),
                     "getDependencies",
                     "java/util/Collections$UnmodifiableCollection",
                     Vec::new(),
-                ),
-            ),
+                ))
+            }
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
                 Some(loader::empty_contact())
             }
