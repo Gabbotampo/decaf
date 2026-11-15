@@ -958,7 +958,7 @@ impl<H: Host> Runtime<'_, H> {
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            members.push((style.field_name(&name), value));
+            members.push((style.field_name(&name), primitive_box(&descriptor, value)));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -1090,4 +1090,20 @@ fn gson_collection_kind(marker: &str) -> Option<&str> {
     let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     matches!(kind, "list" | "set" | "map").then_some(kind)
+}
+
+/// A primitive field's value as Gson's adapter for its type writes it: the
+/// interpreter holds a `boolean`, `char`, `byte` and `short` as an `int` and a
+/// `float` as a `double`, so `true` would print `1`, `'a'` `97` and `0.1f`
+/// `0.10000000149011612` (#253 re-check: a config written with booleans then
+/// failed to read back).
+fn primitive_box(descriptor: &str, value: Value) -> Value {
+    match (descriptor, &value) {
+        ("Z", Value::Int(int)) => Value::Boxed(Boxed::Boolean(*int != 0)),
+        ("C", Value::Int(int)) => Value::Boxed(Boxed::Character(*int as u16)),
+        ("B", Value::Int(int)) => Value::Boxed(Boxed::Byte(*int as i8)),
+        ("S", Value::Int(int)) => Value::Boxed(Boxed::Short(*int as i16)),
+        ("F", Value::Float(float)) => Value::Boxed(Boxed::float(*float)),
+        _ => value,
+    }
 }
