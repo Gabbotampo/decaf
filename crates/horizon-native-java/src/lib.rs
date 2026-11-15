@@ -35277,7 +35277,9 @@ mandatory = true
                 )))],
             )
             .unwrap();
-        assert_eq!(mapped, optional_wrap(Value::Ref(Some("demo".into()))));
+        // The host runs no callback: `apply` is counted (#156 P15a), never the
+        // identity.
+        assert_eq!(mapped, optional_wrap(Value::Ref(None)));
         // Mapping an empty optional answers the empty optional, whether the
         // receiver is the empty marker or a host `null` read as empty.
         assert_eq!(
@@ -35318,7 +35320,8 @@ mandatory = true
                 )))],
             )
             .unwrap(),
-            optional_wrap(Value::Ref(Some("demo".into())))
+            // The host runs no predicate: `test` is counted (#156 P15a).
+            empty_optional()
         );
         assert_eq!(
             host.invoke_instance(
@@ -35910,6 +35913,9 @@ mandatory = true
             std::slice::from_ref(&list),
         )
         .unwrap();
+        // The host runs no callback: its `test` is counted (#156 P15a), so
+        // nothing is removed.
+        let before = host.unknown_host_call_count();
         assert_eq!(
             host.invoke_instance(
                 &remove_if,
@@ -35919,11 +35925,12 @@ mandatory = true
                 )))],
             )
             .unwrap(),
-            Value::Int(1)
+            Value::Int(0)
         );
+        assert!(host.unknown_host_call_count() > before);
         assert_eq!(
             host.invoke_instance(&size, &list_copy, &[]).unwrap(),
-            Value::Int(0)
+            host.invoke_instance(&size, &list, &[]).unwrap()
         );
     }
 
@@ -35949,11 +35956,15 @@ mandatory = true
             name: "test".into(),
             descriptor: "(Ljava/lang/Object;)Z".into(),
         };
+        // The host runs neither side: `test` is counted (#156 P15a), never
+        // `true` for any lambda.
+        let before = host.unknown_host_call_count();
         assert_eq!(
             host.invoke_instance(&test, &combined, &[Value::Ref(Some("x".into()))])
                 .unwrap(),
-            Value::Int(1)
+            Value::Int(0)
         );
+        assert!(host.unknown_host_call_count() > before);
         let negate = MethodRef {
             owner: "java/util/function/Predicate".into(),
             name: "negate".into(),
@@ -36107,12 +36118,14 @@ mandatory = true
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            // The host runs no callback: counted, nothing made up and stored
+            // (#156 P15a).
+            Value::Ref(None)
         );
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("computed-key".into()))])
                 .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            Value::Ref(None)
         );
         let compute_present = MethodRef {
             owner: "java/util/Map".into(),
@@ -36130,7 +36143,8 @@ mandatory = true
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            // The key is absent (the counted `computeIfAbsent` stored nothing).
+            Value::Ref(None)
         );
         let merge = MethodRef {
             owner: "java/util/Map".into(),
@@ -36168,12 +36182,14 @@ mandatory = true
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("updated-value".into()))
+            // The remapping function the host cannot run is counted (#156
+            // P15a); its neutral `null` removes the entry, as Java's would.
+            Value::Ref(None)
         );
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("merged-key".into()))],)
                 .unwrap(),
-            Value::Ref(Some("updated-value".into()))
+            Value::Ref(None)
         );
         let put_if_absent = MethodRef {
             owner: "java/util/Map".into(),
@@ -36237,10 +36253,12 @@ mandatory = true
             .unwrap(),
             Value::Void
         );
+        // Each value is the function's, which the host cannot run: `apply` is
+        // counted and its neutral `null` stored (#156 P15a).
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("key".into()))])
                 .unwrap(),
-            Value::Ref(Some("updated".into()))
+            Value::Ref(None)
         );
         assert!(
             host.calls().iter().any(|call| {
@@ -36262,7 +36280,8 @@ mandatory = true
                 ],
             )
             .unwrap(),
-            Value::Int(1)
+            // `replaceAll`'s counted function left `null` there.
+            Value::Int(0)
         );
     }
 
@@ -38221,7 +38240,7 @@ mandatory = true
                 crate::callback_marker::make(
                     "demo/Lambda#make",
                     1,
-                    "",
+                    "java/lang/Object",
                     "demo/Target#callback(Ljava/lang/Object;)V",
                     "rcapture"
                 )
@@ -38800,7 +38819,7 @@ mandatory = true
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(1))
+            Some(Value::Int(0))
         );
         let optional_stream = runtime
             .invoke_stream(
@@ -38879,7 +38898,7 @@ mandatory = true
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(0))
+            Some(Value::Int(1))
         );
         let stream = list_stream(&mut runtime);
         assert_eq!(
@@ -38898,7 +38917,7 @@ mandatory = true
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(1))
+            Some(Value::Int(0))
         );
         let stream = list_stream(&mut runtime);
         assert_eq!(
@@ -40021,7 +40040,8 @@ mandatory = true
                 &[],
             )
             .unwrap(),
-            Value::Ref(Some("handler/items".into()))
+            // `map` runs the function, which the host cannot: counted (#156 P15a).
+            Value::Ref(None)
         );
         host.invoke_instance(
             &MethodRef {
@@ -40035,7 +40055,8 @@ mandatory = true
             )))],
         )
         .unwrap();
-        assert!(host.invocations().iter().any(|invocation| {
+        // `mapped` holds nothing (its function was counted): no consumer runs.
+        assert!(!host.invocations().iter().any(|invocation| {
             invocation.method.owner == "java/util/function/Consumer"
                 && invocation.method.name == "accept"
                 && invocation.args == [Value::Ref(Some("handler/items".into()))]

@@ -180,6 +180,7 @@ class	java/util/Collections$UnmodifiableList	class	java/io/Serializable java/lan
 class	java/util/Collections$UnmodifiableMap	class	java/io/Serializable java/lang/Object java/util/Map	java/lang/Object	java/util/Map java/io/Serializable	equals,hashCode,toString
 class	java/util/Collections$UnmodifiableRandomAccessList	class	java/io/Serializable java/lang/Iterable java/lang/Object java/util/Collection java/util/Collections$UnmodifiableCollection java/util/Collections$UnmodifiableList java/util/List java/util/RandomAccess java/util/SequencedCollection	java/util/Collections$UnmodifiableList	java/util/RandomAccess	equals,hashCode,toString
 class	java/util/Collections$UnmodifiableSet	class	java/io/Serializable java/lang/Iterable java/lang/Object java/util/Collection java/util/Collections$UnmodifiableCollection java/util/Set	java/util/Collections$UnmodifiableCollection	java/util/Set java/io/Serializable	equals,hashCode,toString
+class	java/util/Comparator	interface		-		-
 class	java/util/ConcurrentModificationException	class	java/io/Serializable java/lang/Exception java/lang/Object java/lang/RuntimeException java/lang/Throwable	java/lang/RuntimeException		toString
 class	java/util/Date	class	java/io/Serializable java/lang/Cloneable java/lang/Comparable java/lang/Object	java/lang/Object	java/io/Serializable java/lang/Cloneable java/lang/Comparable	equals,hashCode,toString,compareTo
 class	java/util/Deque	interface	java/lang/Iterable java/util/Collection java/util/Queue java/util/SequencedCollection	-	java/util/Queue java/util/SequencedCollection	-
@@ -271,6 +272,49 @@ class	java/util/concurrent/locks/AbstractQueuedSynchronizer	class	java/io/Serial
 class	java/util/concurrent/locks/ReentrantLock	class	java/io/Serializable java/lang/Object java/util/concurrent/locks/Lock	java/lang/Object	java/util/concurrent/locks/Lock java/io/Serializable	toString
 class	java/util/concurrent/locks/ReentrantReadWriteLock	class	java/io/Serializable java/lang/Object java/util/concurrent/locks/ReadWriteLock	java/lang/Object	java/util/concurrent/locks/ReadWriteLock java/io/Serializable	toString
 class	java/util/concurrent/locks/StampedLock	class	java/io/Serializable java/lang/Object	java/lang/Object	java/io/Serializable	toString
+class	java/util/function/BiConsumer	interface		-		-
+class	java/util/function/BiFunction	interface		-		-
+class	java/util/function/BiPredicate	interface		-		-
+class	java/util/function/BinaryOperator	interface	java/util/function/BiFunction	-	java/util/function/BiFunction	-
+class	java/util/function/BooleanSupplier	interface		-		-
+class	java/util/function/Consumer	interface		-		-
+class	java/util/function/DoubleBinaryOperator	interface		-		-
+class	java/util/function/DoubleConsumer	interface		-		-
+class	java/util/function/DoubleFunction	interface		-		-
+class	java/util/function/DoublePredicate	interface		-		-
+class	java/util/function/DoubleSupplier	interface		-		-
+class	java/util/function/DoubleToIntFunction	interface		-		-
+class	java/util/function/DoubleToLongFunction	interface		-		-
+class	java/util/function/DoubleUnaryOperator	interface		-		-
+class	java/util/function/Function	interface		-		-
+class	java/util/function/IntBinaryOperator	interface		-		-
+class	java/util/function/IntConsumer	interface		-		-
+class	java/util/function/IntFunction	interface		-		-
+class	java/util/function/IntPredicate	interface		-		-
+class	java/util/function/IntSupplier	interface		-		-
+class	java/util/function/IntToDoubleFunction	interface		-		-
+class	java/util/function/IntToLongFunction	interface		-		-
+class	java/util/function/IntUnaryOperator	interface		-		-
+class	java/util/function/LongBinaryOperator	interface		-		-
+class	java/util/function/LongConsumer	interface		-		-
+class	java/util/function/LongFunction	interface		-		-
+class	java/util/function/LongPredicate	interface		-		-
+class	java/util/function/LongSupplier	interface		-		-
+class	java/util/function/LongToDoubleFunction	interface		-		-
+class	java/util/function/LongToIntFunction	interface		-		-
+class	java/util/function/LongUnaryOperator	interface		-		-
+class	java/util/function/ObjDoubleConsumer	interface		-		-
+class	java/util/function/ObjIntConsumer	interface		-		-
+class	java/util/function/ObjLongConsumer	interface		-		-
+class	java/util/function/Predicate	interface		-		-
+class	java/util/function/Supplier	interface		-		-
+class	java/util/function/ToDoubleBiFunction	interface		-		-
+class	java/util/function/ToDoubleFunction	interface		-		-
+class	java/util/function/ToIntBiFunction	interface		-		-
+class	java/util/function/ToIntFunction	interface		-		-
+class	java/util/function/ToLongBiFunction	interface		-		-
+class	java/util/function/ToLongFunction	interface		-		-
+class	java/util/function/UnaryOperator	interface	java/util/function/Function	-	java/util/function/Function	-
 class	java/util/jar/JarFile	class	java/io/Closeable java/lang/AutoCloseable java/lang/Object java/util/zip/ZipConstants java/util/zip/ZipFile	java/util/zip/ZipFile		toString
 class	java/util/jar/JarOutputStream	class	java/io/Closeable java/io/FilterOutputStream java/io/Flushable java/io/OutputStream java/lang/AutoCloseable java/lang/Object java/util/zip/DeflaterOutputStream java/util/zip/ZipConstants java/util/zip/ZipOutputStream	java/util/zip/ZipOutputStream		-
 class	java/util/jar/Manifest	class	java/lang/Cloneable java/lang/Object	java/lang/Object	java/lang/Cloneable	equals,hashCode
