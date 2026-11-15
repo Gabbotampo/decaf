@@ -1391,6 +1391,7 @@ mod tests {
             "strict_unknown_host_calls",
             "next_lazy_optional",
             "next_fabric_event",
+            "fabric_api_slice2",
             "next_iterator",
             "next_neutral_collection",
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.

@@ -45,6 +45,7 @@ mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
 mod executors;
+mod fabric_api_slice2;
 mod fabric_mods;
 mod fabric_registry;
 mod facade_saved_data;
@@ -3268,6 +3269,7 @@ pub struct StdHost {
     strict_unknown_host_calls: bool,
     next_lazy_optional: usize,
     next_fabric_event: usize,
+    fabric_api_slice2: fabric_api_slice2::State,
     next_iterator: usize,
     /// Distinct empty collections handed out for unmodelled calls that
     /// declare a collection return, so a caller that mutates one never shares
@@ -3415,6 +3417,7 @@ impl StdHost {
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
             next_fabric_event: 0,
+            fabric_api_slice2: fabric_api_slice2::State::default(),
             next_iterator: 0,
             next_neutral_collection: 0,
             next_unmodifiable_collection: 0,
@@ -4338,6 +4341,16 @@ impl StdHost {
     /// Inspect the explicitly seeded Fabric entrypoint containers.
     pub fn fabric_entrypoint_containers(&self) -> &[FabricEntrypointContainer] {
         &self.fabric_entrypoint_containers
+    }
+
+    /// Fabric API biome registrations recorded by native entrypoints.
+    pub fn fabric_biome_registrations(&self) -> &[fabric_api_slice2::BiomeRegistration] {
+        &self.fabric_api_slice2.biome_registrations
+    }
+
+    /// Listener phase and registration order for a generic Fabric event.
+    pub fn fabric_event_order(&self, event: &Value) -> Vec<(String, usize)> {
+        fabric_api_slice2::event_order(&self.fabric_api_slice2, event)
     }
 
     /// Seed one capability result for a game-owned block/entity adapter.
@@ -5537,6 +5550,9 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_static(r) {
             return Ok(value);
         }
+        if let Some(value) = fabric_api_slice2::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = self.game_event_static(r) {
             return Ok(value);
         }
@@ -5750,6 +5766,14 @@ impl Host for StdHost {
         }
         // `Minecraft.getInstance`, key-mapping and HUD registration.
         if let Some(value) = self.client_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = fabric_api_slice2::static_call(
+            &mut self.fabric_api_slice2,
+            r,
+            args,
+            &mut self.next_fabric_event,
+        ) {
             return value;
         }
         // Command builders, argument types and a running command's getters.
@@ -7041,6 +7065,11 @@ impl Host for StdHost {
         }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) =
+            fabric_api_slice2::instance_call(&mut self.fabric_api_slice2, r, receiver, args)
+        {
             return value;
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
