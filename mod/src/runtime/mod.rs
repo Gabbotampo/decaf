@@ -6563,6 +6563,27 @@ impl Host for StdHost {
                         method: r.name.clone(),
                     })
             }
+            // Java's float extrema: a NaN operand gives NaN, and -0.0 < 0.0.
+            ("java/lang/Math", "max", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(java_float_max(left, right)))
+            }
+            ("java/lang/Math", "min", "(DD)D") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(double_value(java_float_min(left, right)))
+            }
+            ("java/lang/Math", "max", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_max(left, right)))
+            }
+            ("java/lang/Math", "min", "(FF)F") => {
+                let left = expect_float(r, Self::argument(r, args, 0)?)?;
+                let right = expect_float(r, Self::argument(r, args, 1)?)?;
+                Ok(float_value(java_float_min(left, right)))
+            }
             ("java/lang/Math", "max", "(II)I") => Ok(Value::Int(
                 expect_int(r, Self::argument(r, args, 0)?)?
                     .max(expect_int(r, Self::argument(r, args, 1)?)?),
@@ -28365,8 +28386,12 @@ fn java_double_bits(value: f64) -> u64 {
 /// `Math.max` for a floating-point pair: `NaN` wins, and `+0.0` beats `-0.0`
 /// (Rust's `f64::max` returns the receiver for the signed-zero tie).
 fn java_float_max(left: f64, right: f64) -> f64 {
-    if left.is_nan() || right.is_nan() {
-        f64::NAN
+    // `if (a != a) return a;` then `a >= b ? a : b`: a NaN operand comes back with its
+    // own bits (Java never makes a canonical NaN here), the left one first.
+    if left.is_nan() {
+        left
+    } else if right.is_nan() {
+        right
     } else if left == 0.0 && right == 0.0 {
         if left.is_sign_positive() || right.is_sign_positive() {
             0.0
@@ -28382,8 +28407,10 @@ fn java_float_max(left: f64, right: f64) -> f64 {
 
 /// The `Math.min` twin of [`java_float_max`].
 fn java_float_min(left: f64, right: f64) -> f64 {
-    if left.is_nan() || right.is_nan() {
-        f64::NAN
+    if left.is_nan() {
+        left
+    } else if right.is_nan() {
+        right
     } else if left == 0.0 && right == 0.0 {
         if left.is_sign_negative() || right.is_sign_negative() {
             -0.0
@@ -31810,6 +31837,85 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// Java 25's `Math.max`/`min` (and `Double.max`/`min`) hand back the NaN operand with
+    /// its own bits: `Math.max(longBitsToDouble(0x7ff0000000000001L), 1.0)` is raw
+    /// `0x7ff0000000000001`, and the right operand's NaN comes back when the left is a
+    /// number. (A `float` NaN keeps whatever bits its f64 Value holds; a signalling float
+    /// NaN is quieted earlier, where the float is made: issue #305.)
+    #[test]
+    fn jdk_float_extrema_keep_nan_payloads() {
+        let jdk = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let bits = |host: &mut StdHost, r: &MethodRef, a: f64, b: f64| match host
+            .invoke(r, &[Value::Float(a), Value::Float(b)])
+            .unwrap()
+        {
+            Value::Float(value) => value.to_bits(),
+            other => panic!("{other:?}"),
+        };
+        let signalling = f64::from_bits(0x7ff0_0000_0000_0001);
+        let payload = f64::from_bits(0x7ff8_0000_0000_beef);
+        for owner in ["java/lang/Math", "java/lang/Double"] {
+            let mut host = StdHost::new();
+            let max = jdk(owner, "max", "(DD)D");
+            let min = jdk(owner, "min", "(DD)D");
+            assert_eq!(
+                bits(&mut host, &max, signalling, 1.0),
+                0x7ff0_0000_0000_0001
+            );
+            assert_eq!(bits(&mut host, &min, 1.0, payload), 0x7ff8_0000_0000_beef);
+            assert_eq!(
+                bits(&mut host, &max, payload, signalling),
+                0x7ff8_0000_0000_beef
+            );
+            assert!(host.unknown_host_calls().is_empty(), "{owner}");
+        }
+        let mut host = StdHost::new();
+        let fmin = jdk("java/lang/Math", "min", "(FF)F");
+        let quiet = f64::from(f32::from_bits(0x7fc0_1234));
+        let back = f64::from_bits(bits(&mut host, &fmin, 1.0, quiet)) as f32;
+        assert_eq!(back.to_bits(), 0x7fc0_1234);
+    }
+
+    /// `Math.max`/`min` on doubles and floats follow Java: NaN wins, and the
+    /// signed zeros order as -0.0 < 0.0.
+    #[test]
+    fn jdk_float_extrema_follow_java() {
+        let mut host = StdHost::new();
+        let jdk = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let call = |host: &mut StdHost, r: &MethodRef, a: f64, b: f64| match host
+            .invoke(r, &[Value::Float(a), Value::Float(b)])
+            .unwrap()
+        {
+            Value::Float(value) => value,
+            other => panic!("{other:?}"),
+        };
+        let max = jdk("java/lang/Math", "max", "(DD)D");
+        let min = jdk("java/lang/Math", "min", "(DD)D");
+        assert_eq!(call(&mut host, &max, 2.5, -1.0), 2.5);
+        assert!(call(&mut host, &max, f64::NAN, 1.0).is_nan());
+        assert!(call(&mut host, &min, 1.0, f64::NAN).is_nan());
+        assert!(call(&mut host, &max, -0.0, 0.0).is_sign_positive());
+        assert!(call(&mut host, &min, 0.0, -0.0).is_sign_negative());
+        assert_eq!(
+            call(&mut host, &jdk("java/lang/Math", "min", "(FF)F"), 3.0, 0.5),
+            0.5
+        );
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
 
     /// A class with one static `m()V` that returns, the smallest shape the
     /// weaver accepts. Pool: 1 name, 2 Class 1, 3 `java/lang/Object`, 4 Class 3,
