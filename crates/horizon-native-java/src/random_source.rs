@@ -164,9 +164,7 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         // A direct constructor is reached on a JarObject before any state row
         // exists; random_new allocated the row at the new opcode.
-        let Some((key, mut state)) = self.random_state_mut(receiver) else {
-            return None;
-        };
+        let (key, mut state) = self.random_state_mut(receiver)?;
         if r.name == "<init>" && r.descriptor == "(JJ)V" {
             let (lo, hi) = match args {
                 [lo, hi] => match (as_long(lo), as_long(hi)) {
