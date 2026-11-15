@@ -3084,6 +3084,9 @@ pub struct StdHost {
     /// `None` keeps both questions unanswered instead of inventing a release.
     game_version: Option<String>,
     development_environment: bool,
+    /// Whether this host represents NeoForge's data-generator launch. The
+    /// normal game host seeds `Some(false)`; `None` keeps the API counted.
+    data_gen: Option<bool>,
     calls: Vec<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
@@ -3345,6 +3348,7 @@ impl StdHost {
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
+            data_gen: Some(false),
             calls: Vec::new(),
             invocations: Vec::new(),
             posted_events: Vec::new(),
@@ -3991,6 +3995,26 @@ impl StdHost {
     pub fn with_development_environment(mut self, development_environment: bool) -> Self {
         self.development_environment = development_environment;
         self
+    }
+
+    /// Set NeoForge's launch mode for `DatagenModLoader.isRunningDataGen()`.
+    /// The normal game uses `false`; a data-generator runner uses `true`.
+    pub fn with_data_gen(mut self, running: bool) -> Self {
+        self.data_gen = Some(running);
+        self
+    }
+
+    /// Leave NeoForge's launch mode unknown; data-generator queries then stay
+    /// counted instead of receiving a guessed boolean.
+    pub fn without_data_gen_mode(mut self) -> Self {
+        self.data_gen = None;
+        self
+    }
+
+    /// The launch-mode answer for NeoForge's data-generator flag. `None` is a
+    /// deliberate counted boundary when an embedder has no launch mode.
+    pub(crate) fn data_gen_value(&self) -> Option<Value> {
+        self.data_gen.map(|running| Value::Int(i32::from(running)))
     }
 
     /// The elements a host collection holds, as the `Value`s it stored (a

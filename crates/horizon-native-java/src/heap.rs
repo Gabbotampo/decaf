@@ -1377,6 +1377,7 @@ mod tests {
             "environment_type",
             "game_version",
             "development_environment",
+            "data_gen",
             "console_out",
             "inferred_declarations",
             "declared_registrations",

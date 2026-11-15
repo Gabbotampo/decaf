@@ -10,6 +10,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 use zip::write::SimpleFileOptions;
 
@@ -78,6 +79,16 @@ public final class Probe {
     public static String outside() {
         ModLoadingContext context = ModLoadingContext.get();
         return context.getActiveContainer().getModId() + "|" + context.getActiveNamespace();
+    }
+
+    public static String contextIdentity() {
+        return String.valueOf(ModLoadingContext.get() == ModLoadingContext.get());
+    }
+
+    public static ModLoadingContext context() { return ModLoadingContext.get(); }
+
+    public static String dataGen() {
+        return String.valueOf(DatagenModLoader.isRunningDataGen());
     }
 
     public static String gameDir() { return FMLLoader.getGameDir().toString(); }
@@ -170,7 +181,53 @@ fn neoforge_loader_and_payload_handles_match_java25_oracle() {
         "demo|demo|true|true|true|false|true"
     );
     assert_eq!(text(&jar, &mut host, "outside"), "minecraft|minecraft");
+    assert_eq!(text(&jar, &mut host, "contextIdentity"), "true");
+    assert_eq!(text(&jar, &mut host, "dataGen"), "false");
     assert_eq!(text(&jar, &mut host, "gameDir"), "/horizon/game");
+
+    let mut datagen = jar.seed_host(StdHost::new().with_mod("demo", "1.0").with_data_gen(true));
+    assert_eq!(text(&jar, &mut datagen, "dataGen"), "true");
+    let mut unknown_mode = jar.seed_host(
+        StdHost::new()
+            .with_mod("demo", "1.0")
+            .without_data_gen_mode(),
+    );
+    assert_eq!(text(&jar, &mut unknown_mode, "dataGen"), "false");
+    assert!(
+        unknown_mode
+            .unknown_host_calls()
+            .iter()
+            .any(|(call, count)| call.contains("DatagenModLoader#isRunningDataGen") && *count == 1)
+    );
+
+    // FML's context is a ThreadLocal: equal reads on one native thread share
+    // an object, while a context obtained on another thread is different.
+    let jar = Arc::new(jar);
+    let first = jar
+        .invoke_method(
+            "demo/Probe",
+            "context",
+            "()Lnet/neoforged/fml/ModLoadingContext;",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    let other_jar = Arc::clone(&jar);
+    let other = std::thread::spawn(move || {
+        let mut other_host = other_jar.seed_host(StdHost::new().with_mod("demo", "1.0"));
+        other_jar
+            .invoke_method(
+                "demo/Probe",
+                "context",
+                "()Lnet/neoforged/fml/ModLoadingContext;",
+                None,
+                &mut other_host,
+            )
+            .unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_ne!(first, other);
     assert!(
         host.unknown_host_calls().is_empty(),
         "modelled calls were counted: {:?}",
