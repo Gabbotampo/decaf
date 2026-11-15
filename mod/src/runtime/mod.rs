@@ -24049,6 +24049,62 @@ impl<H: Host> Runtime<'_, H> {
                 self.reflected_constructor(class, descriptor.as_deref()),
             ));
         }
+        // Reflection arrays and repeatable annotations are answered from the
+        // held class file. Unknown JDK/game classes fall through and remain counted.
+        if matches!(
+            r.owner.as_str(),
+            "java/lang/Class"
+                | "java/lang/reflect/Field"
+                | "java/lang/reflect/Method"
+                | "java/lang/reflect/Constructor"
+                | "java/lang/reflect/Executable"
+                | "java/lang/reflect/AccessibleObject"
+                | "java/lang/reflect/AnnotatedElement"
+        ) && matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            (
+                "getAnnotations" | "getDeclaredAnnotations",
+                "()[Ljava/lang/annotation/Annotation;"
+            )
+        ) && let Some(annotations) =
+            receiver.and_then(|receiver| self.reflection_annotations(receiver))
+        {
+            let values = annotations
+                .into_iter()
+                .map(|annotation| self.annotation_proxy(Some(annotation)))
+                .collect();
+            return Ok(Some(
+                self.new_array_value("[Ljava/lang/annotation/Annotation;", values),
+            ));
+        }
+        if matches!(
+            r.owner.as_str(),
+            "java/lang/Class"
+                | "java/lang/reflect/Field"
+                | "java/lang/reflect/Method"
+                | "java/lang/reflect/Constructor"
+                | "java/lang/reflect/Executable"
+                | "java/lang/reflect/AccessibleObject"
+                | "java/lang/reflect/AnnotatedElement"
+        ) && matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            (
+                "getAnnotationsByType" | "getDeclaredAnnotationsByType",
+                "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;"
+            )
+        ) && let Some(annotations) =
+            receiver.and_then(|receiver| self.reflection_annotations(receiver))
+        {
+            let wanted = host_class::class_name(StdHost::argument(r, args, 0)?)
+                .unwrap_or_default()
+                .replace('.', "/");
+            let found = self.annotations_by_type(&annotations, &wanted);
+            let values = found
+                .into_iter()
+                .map(|annotation| self.annotation_proxy(Some(annotation)))
+                .collect();
+            return Ok(Some(self.new_array_value(&format!("[L{wanted};"), values)));
+        }
         // `AnnotatedElement` queries the class-file model answers for classes,
         // fields and methods alike: whether an annotation is present, and a
         // field's (or a class's declared) annotation. Config libraries ask
@@ -24073,7 +24129,7 @@ impl<H: Host> Runtime<'_, H> {
         ) && !(r.owner == "java/lang/Class" && r.name == "getAnnotation")
             && !(r.owner == "java/lang/reflect/Method" && r.name == "getAnnotation")
             && let Some(annotations) =
-                receiver.and_then(|receiver| self.element_annotations(receiver))
+                receiver.and_then(|receiver| self.reflection_annotations(receiver))
         {
             let wanted = host_class::class_name(StdHost::argument(r, args, 0)?)
                 .unwrap_or_default()
@@ -24090,16 +24146,14 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "getAnnotation"
             && r.descriptor == "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;"
         {
-            let class = receiver
-                .and_then(host_class::class_name)
-                .unwrap_or_default();
             let wanted = host_class::class_name(StdHost::argument(r, args, 0)?).unwrap_or_default();
-            let found = self.class(class).and_then(|file| {
-                file.annotations
-                    .iter()
-                    .find(|annotation| annotation_is(annotation, wanted))
-                    .cloned()
-            });
+            let found = receiver
+                .and_then(|receiver| self.reflection_annotations(receiver))
+                .and_then(|annotations| {
+                    annotations
+                        .into_iter()
+                        .find(|annotation| annotation_is(annotation, wanted))
+                });
             return Ok(Some(self.annotation_proxy(found)));
         }
         if r.owner == "java/lang/reflect/Method"
@@ -24108,24 +24162,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             let wanted = host_class::class_name(StdHost::argument(r, args, 0)?).unwrap_or_default();
             let found = receiver
-                .and_then(host_reflect::method_of)
-                .and_then(|method| {
-                    let (class, name, descriptor) = (
-                        method.class.as_str(),
-                        method.name.as_str(),
-                        method.descriptor.as_deref(),
-                    );
-                    let file = self.class(class)?;
-                    let method = file.methods.iter().find(|candidate| {
-                        candidate.name == name
-                            && descriptor
-                                .is_none_or(|descriptor| candidate.descriptor == descriptor)
-                    })?;
-                    method
-                        .annotations
-                        .iter()
+                .and_then(|receiver| self.reflection_annotations(receiver))
+                .and_then(|annotations| {
+                    annotations
+                        .into_iter()
                         .find(|annotation| annotation_is(annotation, wanted))
-                        .cloned()
                 });
             return Ok(Some(self.annotation_proxy(found)));
         }
@@ -24422,6 +24463,54 @@ impl<H: Host> Runtime<'_, H> {
     /// `Field`, `Method` or `Constructor` handle naming a class the runtime
     /// holds. `None` when the element is not one the class-file model knows,
     /// so the call keeps its host answer.
+    fn reflection_annotations(&self, receiver: &Value) -> Option<Vec<Annotation>> {
+        self.element_annotations(receiver).map(|annotations| {
+            annotations
+                .into_iter()
+                .filter(|annotation| annotation.descriptor != MIXIN_ANNOTATION_DESCRIPTOR)
+                .collect()
+        })
+    }
+
+    fn repeatable_container(&self, wanted: &str) -> Option<String> {
+        let descriptor = if wanted.starts_with('L') {
+            wanted.to_owned()
+        } else {
+            format!("L{wanted};")
+        };
+        let file = self.class(&descriptor[1..descriptor.len() - 1])?;
+        let repeatable = file
+            .annotations
+            .iter()
+            .find(|annotation| annotation.descriptor == "Ljava/lang/annotation/Repeatable;")?;
+        match repeatable.values.get("value") {
+            Some(AnnotationValue::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn annotations_by_type(&self, annotations: &[Annotation], wanted: &str) -> Vec<Annotation> {
+        let container = self.repeatable_container(wanted);
+        let mut found = Vec::new();
+        for annotation in annotations {
+            if annotation_is(annotation, wanted) {
+                found.push(annotation.clone());
+            } else if container
+                .as_deref()
+                .is_some_and(|container| annotation_is(annotation, container))
+                && let Some(AnnotationValue::Array(values)) = annotation.values.get("value")
+            {
+                found.extend(values.iter().filter_map(|value| match value {
+                    AnnotationValue::Annotation(nested) if annotation_is(nested, wanted) => {
+                        Some((**nested).clone())
+                    }
+                    _ => None,
+                }));
+            }
+        }
+        found
+    }
+
     fn element_annotations(&self, receiver: &Value) -> Option<Vec<Annotation>> {
         if let Some(field) = host_reflect::field_of(receiver) {
             let (class, name) = (field.class.as_str(), field.name.as_str());
