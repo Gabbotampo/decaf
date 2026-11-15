@@ -270,7 +270,10 @@ fn gson_to_json_tree_matches_real_gson_or_signature_fallback() {
             "nulls",
             r#"{"boxed":2,"nullable":null,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"bee","someValue":"z","one":1.0,"fone":1.0,"base":1,"renamed":"x","exposed":"e"}"#,
         ),
-        ("naming", r#"__counted__"#),
+        (
+            "naming",
+            r#"{"boxed":2,"list":["a","b"],"map":{"k":3},"array":[4,5],"kind":"bee","some_value":"z","one":1.0,"fone":1.0,"base":1,"renamed":"x","exposed":"e"}"#,
+        ),
     ] {
         let mut host = jar.seed_host(StdHost::new());
         let result = jar.invoke_method_with_args(
@@ -281,26 +284,13 @@ fn gson_to_json_tree_matches_real_gson_or_signature_fallback() {
             &[],
             &mut host,
         );
-        if method == "naming" {
-            assert!(matches!(
-                result,
-                Err(horizon_native_java::NativeError::UncaughtException { ref class, .. })
-                    if class == "java/lang/NullPointerException"
-            ));
-            assert!(
-                host.unknown_host_calls()
-                    .iter()
-                    .any(|(call, _)| call.contains("com/google/gson/Gson#toJsonTree"))
-            );
-        } else {
-            assert_eq!(
-                result.unwrap(),
-                Value::Ref(Some(expected.into())),
-                "{method}: {:?}",
-                host.unknown_host_calls()
-            );
-            assert!(host.unknown_host_calls().is_empty());
-        }
+        assert_eq!(
+            result.unwrap(),
+            Value::Ref(Some(expected.into())),
+            "{method}: {:?}",
+            host.unknown_host_calls()
+        );
+        assert!(host.unknown_host_calls().is_empty());
     }
     let mut host = jar.seed_host(StdHost::new());
     let special = jar
