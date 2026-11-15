@@ -48,7 +48,9 @@ def row_key(corpus: str, row: dict, role: str) -> tuple[str, str, str, str]:
 
 def call_counts(row: dict | None) -> dict[str, int]:
     result: dict[str, int] = defaultdict(int)
-    for item in (row or {}).get("calls") or []:
+    row = row or {}
+    calls = row.get("calls") or row.get("counted_before_error") or []
+    for item in calls:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             result[str(item[0])] += int(item[1])
         elif isinstance(item, dict) and "call" in item:

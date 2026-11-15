@@ -23,6 +23,14 @@ class CensusCompareTests(unittest.TestCase):
         self.assertEqual(report["moved"][0]["vanished"], [{"call": "x#f()", "count": 3}])
         self.assertEqual(report["moved"][0]["appeared"], [])
 
+    def test_refused_rows_compare_counted_before_error_calls(self):
+        base = payload([{"jar": "refused.jar", "verdict": "refused",
+                         "counted_before_error": [["Style#EMPTY", 1]]}])
+        merged = payload([{"jar": "refused.jar", "verdict": "refused",
+                           "counted_before_error": []}])
+        report = tool.compare_payloads(base, merged, {"base": [base], "merged": [merged]}, "server")
+        self.assertEqual(report["moved"][0]["vanished"], [{"call": "Style#EMPTY", "count": 1}])
+
     def test_repetition_difference_is_flaky_and_excluded(self):
         stable = {"jar": "stable.jar", "verdict": "ran-clean", "calls": []}
         first = payload([{"jar": "flaky.jar", "verdict": "ran-clean", "calls": []}, stable])
