@@ -11,6 +11,7 @@ public abstract class Either<L, R> {
     public abstract Either<L, R> ifRight(java.util.function.Consumer<? super R> consumer);
     public abstract java.util.Optional<L> left();
     public abstract java.util.Optional<R> right();
+    public Object orThrow() { return null; }
     public Either<R, L> swap() { return null; }
     public <T> Either<T, R> mapLeft(java.util.function.Function<? super L, ? extends T> f) { return null; }
     public <T> Either<L, T> mapRight(java.util.function.Function<? super R, ? extends T> f) { return null; }

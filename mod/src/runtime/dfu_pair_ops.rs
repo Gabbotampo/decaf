@@ -11,7 +11,8 @@ pub(crate) fn runtime_call<H: Host>(
     stack: &mut [Value],
     locals: &mut [Value],
 ) -> Result<Option<Value>, NativeError> {
-    if r.owner != OWNER {
+    let inherited_pair_method = r.owner == OWNER || runtime.class_is_instance(&r.owner, OWNER);
+    if !inherited_pair_method {
         return Ok(None);
     }
     if r.name == "<init>"
@@ -22,18 +23,30 @@ pub(crate) fn runtime_call<H: Host>(
         let [first, second] = args else {
             return Ok(None);
         };
-        let pair = crate::runtime::host_codec::pair(first, second);
-        for slot in stack.iter_mut().chain(locals.iter_mut()) {
-            if slot == receiver {
-                *slot = pair.clone();
+        let class = jar_object::object_class(receiver);
+        if class == Some(OWNER) {
+            let pair = crate::runtime::host_codec::pair(first, second);
+            for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                if slot == receiver {
+                    *slot = pair.clone();
+                }
             }
+            return Ok(Some(Value::Void));
         }
-        return Ok(Some(Value::Void));
+        // A jar subclass remains its own object. Keep only the inherited Pair
+        // state in the runtime field map; the subclass's fields and overrides
+        // continue through the normal jar dispatch path.
+        if class.is_some_and(|class| class != OWNER) {
+            runtime.set_dfu_pair_subclass_state(receiver, first, second);
+            return Ok(Some(Value::Void));
+        }
     }
     let Some(receiver) = receiver else {
         return Ok(None);
     };
-    let Some((first, second)) = crate::runtime::host_codec::pair_parts(receiver) else {
+    let Some((first, second)) = crate::runtime::host_codec::pair_parts(receiver)
+        .or_else(|| runtime.dfu_pair_subclass_state(receiver))
+    else {
         return Ok(None);
     };
     let callback = args.first();
@@ -61,6 +74,11 @@ pub(crate) fn runtime_call<H: Host>(
                 return Ok(None);
             };
             Ok(Some(crate::runtime::host_codec::pair(&first, &mapped)))
+        }
+        "getFirst" if r.descriptor == "()Ljava/lang/Object;" => Ok(Some(first)),
+        "getSecond" if r.descriptor == "()Ljava/lang/Object;" => Ok(Some(second)),
+        "swap" if r.descriptor == "()Lcom/mojang/datafixers/util/Pair;" => {
+            Ok(Some(crate::runtime::host_codec::pair(&second, &first)))
         }
         _ => Ok(None),
     }

@@ -1,9 +1,7 @@
 //! DataFixerUpper Either values as typed host handles.
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::host_ref::{
-    ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out,
-};
+use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out};
 use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value};
 
 const OWNER: &str = "com/mojang/datafixers/util/Either";
@@ -135,7 +133,7 @@ pub(crate) fn runtime_call<H: Host>(
             if r.descriptor
                 == "(Ljava/util/function/Function;)Lcom/mojang/datafixers/util/Either;" =>
         {
-            Ok(Some(receiver.clone()))
+            Ok(Some(either(false, &value)))
         }
         "mapRight"
             if r.descriptor
@@ -154,7 +152,7 @@ pub(crate) fn runtime_call<H: Host>(
             if r.descriptor
                 == "(Ljava/util/function/Function;)Lcom/mojang/datafixers/util/Either;" =>
         {
-            Ok(Some(receiver.clone()))
+            Ok(Some(either(true, &value)))
         }
         "ifLeft"
             if r.descriptor
@@ -189,6 +187,13 @@ pub(crate) fn runtime_call<H: Host>(
                 == "(Ljava/util/function/Consumer;)Lcom/mojang/datafixers/util/Either;" =>
         {
             Ok(Some(receiver.clone()))
+        }
+        "orThrow" if r.descriptor == "()Ljava/lang/Object;" && left => Ok(Some(value)),
+        "orThrow" if r.descriptor == "()Ljava/lang/Object;" => {
+            // The right branch's RuntimeException/cause construction depends
+            // on the payload's toString and Throwable identity. Keep the
+            // boundary counted rather than returning a neutral value.
+            runtime.host.invoke_instance(r, receiver, args).map(Some)
         }
         _ => Ok(None),
     }

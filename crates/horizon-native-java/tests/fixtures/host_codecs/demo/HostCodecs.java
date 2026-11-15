@@ -9,6 +9,11 @@ import java.util.*;
 
 /** DataFixerUpper's Pair and the game's codecs as host objects (#156 P5c). */
 public final class HostCodecs {
+  static final class SubPair extends Pair<Integer, String> {
+    int extra = 7;
+    SubPair() { super(1, "sub"); }
+    String own() { return "own" + extra; }
+  }
   static final String[] OLD = {
     "dfu-pair/i:1,a",
     "nf-codec/0",
@@ -63,6 +68,12 @@ public final class HostCodecs {
     return p + "|" + q + "|" + q.getFirst() + q.getSecond() + "|" + q.equals(Pair.of(3, "B"));
   }
 
+  public static String pairSubclass() {
+    SubPair p = new SubPair();
+    return p.getClass().getName() + "|" + p.getFirst() + "|" + p.getSecond()
+        + "|" + p.extra + "|" + p.own() + "|" + (p instanceof SubPair);
+  }
+
   /** Either's selected branch maps, callbacks and Optional projections. */
   public static String eithers() {
     Either<String, Integer> left = Either.left("a");
@@ -74,6 +85,18 @@ public final class HostCodecs {
         + right.map(String::toUpperCase, Object::toString) + "|" + left.left().get() + "|"
         + right.right().get() + "|" + left.right().isPresent() + "|" + right.left().isPresent()
         + "|" + seen + "|" + left.swap();
+  }
+
+  public static String eitherIdentity() {
+    Either<String, Integer> left = Either.left("a");
+    Either<String, Integer> right = Either.right(2);
+    return ((Object) left.mapRight(Object::toString) == left) + "|"
+        + ((Object) right.mapLeft(String::toUpperCase) == right);
+  }
+
+  public static String eitherOrThrow() {
+    try { return String.valueOf(Either.right(2).orThrow()); }
+    catch (RuntimeException e) { return e.getClass().getName() + "|" + e.getMessage(); }
   }
 
   /** Nested pairs compare and print through their values. */

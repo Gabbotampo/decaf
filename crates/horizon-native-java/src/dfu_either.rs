@@ -133,7 +133,7 @@ pub(crate) fn runtime_call<H: Host>(
             if r.descriptor
                 == "(Ljava/util/function/Function;)Lcom/mojang/datafixers/util/Either;" =>
         {
-            Ok(Some(receiver.clone()))
+            Ok(Some(either(false, &value)))
         }
         "mapRight"
             if r.descriptor
@@ -152,7 +152,7 @@ pub(crate) fn runtime_call<H: Host>(
             if r.descriptor
                 == "(Ljava/util/function/Function;)Lcom/mojang/datafixers/util/Either;" =>
         {
-            Ok(Some(receiver.clone()))
+            Ok(Some(either(true, &value)))
         }
         "ifLeft"
             if r.descriptor
@@ -187,6 +187,13 @@ pub(crate) fn runtime_call<H: Host>(
                 == "(Ljava/util/function/Consumer;)Lcom/mojang/datafixers/util/Either;" =>
         {
             Ok(Some(receiver.clone()))
+        }
+        "orThrow" if r.descriptor == "()Ljava/lang/Object;" && left => Ok(Some(value)),
+        "orThrow" if r.descriptor == "()Ljava/lang/Object;" => {
+            // The right branch's RuntimeException/cause construction depends
+            // on the payload's toString and Throwable identity. Keep the
+            // boundary counted rather than returning a neutral value.
+            runtime.host.invoke_instance(r, receiver, args).map(Some)
         }
         _ => Ok(None),
     }

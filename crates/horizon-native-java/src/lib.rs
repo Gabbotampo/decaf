@@ -22447,7 +22447,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `name` is `wanted` or a subclass (or implementor) of it.
-    fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
+    pub(crate) fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
         let mut current = jar_object::marker_class_or_text(name).to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             if current == wanted {
@@ -22476,6 +22476,26 @@ impl<H: Host> Runtime<'_, H> {
             current = file.super_name.clone();
         }
         false
+    }
+
+    pub(crate) fn dfu_pair_subclass_state(&self, receiver: &Value) -> Option<(Value, Value)> {
+        let key = jar_object::object_key(receiver)?;
+        let state = self.fields.get(&format!("{key}|#dfuPair"))?;
+        crate::host_codec::pair_parts(state)
+    }
+
+    pub(crate) fn set_dfu_pair_subclass_state(
+        &mut self,
+        receiver: &Value,
+        first: &Value,
+        second: &Value,
+    ) -> Option<()> {
+        let key = jar_object::object_key(receiver)?;
+        self.fields.insert(
+            format!("{key}|#dfuPair"),
+            crate::host_codec::pair(first, second),
+        );
+        Some(())
     }
 
     /// `target.isAssignableFrom(source)` (internal names): known, counted
