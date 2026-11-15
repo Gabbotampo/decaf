@@ -4,6 +4,7 @@ import java.util.*;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.level.storage.LevelResource;
 
 /**
@@ -25,6 +26,12 @@ public final class Probe {
     static final class Odd extends BlockPos {
         Odd() { super(1, 2, 3); }
         @Override public int getX() { return 9; }
+    }
+
+    /** A subclass that moves itself through `Vec3i`'s protected setter. */
+    static final class Mover extends BlockPos {
+        Mover() { super(1, 2, 3); }
+        void bump() { setZ(getZ() + 1); }
     }
 
     public void onInitialize() {
@@ -73,7 +80,29 @@ public final class Probe {
         res.put(LevelResource.DATA, "d");
         p("res", r + "," + r.hashCode() + "," + r.equals(LevelResource.DATA) + "," + LevelResource.DATA.equals(r)
             + "," + res.get(r) + "," + r.id() + "," + r.equals(new LevelResource("root")));
+        // Changes the game's own bodies make: each goes through `set(int, int, int)`.
+        BlockPos.MutableBlockPos mv = new BlockPos.MutableBlockPos(1, 2, 3);
+        mv.move(0, 0, 1);
+        p("move", mv.equals(h124) + "," + mv.equals(h123) + "," + mv + "," + mv.hashCode() + "," + h124.equals(mv));
+        BlockPos.MutableBlockPos md = new BlockPos.MutableBlockPos(1, 2, 3);
+        md.move(Direction.SOUTH);
+        String south = md.equals(h124) + "," + md;
+        md.move(Direction.UP, 3);
+        p("move_dir", south + "," + md);
+        BlockPos.MutableBlockPos packed = new BlockPos.MutableBlockPos();
+        packed.set(274877923330L);
+        p("set_long", packed.equals(h124) + "," + packed + "," + new BlockPos.MutableBlockPos().set(-8194L));
+        BlockPos.MutableBlockPos offset = new BlockPos.MutableBlockPos().setWithOffset(h123, 0, 0, 1);
+        p("with_offset", offset.equals(h124) + "," + offset + "," + new HashSet<BlockPos>(List.of(h124)).contains(offset)
+            + "," + new BlockPos.MutableBlockPos().setWithOffset(h123, Direction.SOUTH));
+        // `toString` names the class as `getSimpleName` does: empty for an
+        // anonymous class, the declared name for a local one.
+        BlockPos anon = new BlockPos(1, 2, 3) {};
+        class LocalPos extends BlockPos { LocalPos() { super(1, 2, 3); } }
+        p("names", anon + "," + anon.toString() + "," + new LocalPos() + "," + anon.equals(h123));
         Odd odd = new Odd();
-        counted = odd.equals(h123) + "," + h123.equals(odd);
+        Mover mover = new Mover();
+        mover.bump();
+        counted = odd.equals(h123) + "," + h123.equals(odd) + ";" + mover.equals(h124) + "," + mover.hashCode();
     }
 }

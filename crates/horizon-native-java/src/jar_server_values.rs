@@ -99,6 +99,58 @@ fn simple_name(class: &str) -> &str {
     name.rsplit('$').next().unwrap_or(name)
 }
 
+/// Whether `r` may change its receiver's coordinates: `Vec3i`'s protected
+/// setters, `MutableBlockPos`'s setters and movers, an accessor's setter.
+fn may_mutate(r: &MethodRef) -> bool {
+    ["set", "move", "clamp"]
+        .iter()
+        .any(|prefix| r.name.starts_with(prefix))
+}
+
+/// Whether `r` writes a field of the object it takes first: `Field.set*`,
+/// `Unsafe.put*`/`compareAndSet*`/`getAndSet*`/`getAndAdd*`, `VarHandle`'s
+/// setters.
+fn writes_object_fields(r: &MethodRef) -> bool {
+    match r.owner.as_str() {
+        "java/lang/reflect/Field" => r.name.starts_with("set") && r.name != "setAccessible",
+        "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe" => [
+            "put",
+            "compareAndSet",
+            "compareAndSwap",
+            "compareAndExchange",
+            "getAndSet",
+            "getAndAdd",
+        ]
+        .iter()
+        .any(|prefix| r.name.starts_with(prefix)),
+        "java/lang/invoke/VarHandle" => {
+            r.name.starts_with("set")
+                || r.name.starts_with("compareAndSet")
+                || r.name.starts_with("getAndSet")
+                || r.name.starts_with("getAndAdd")
+        }
+        _ => false,
+    }
+}
+
+/// `Direction.getStepX/Y/Z()` of a direction constant (`enum/<class>/<NAME>`).
+fn direction_step(value: &Value) -> Option<[i32; 3]> {
+    let Value::Ref(Some(text)) = value else {
+        return None;
+    };
+    Some(
+        match text.strip_prefix("enum/net/minecraft/core/Direction/")? {
+            "DOWN" => [0, -1, 0],
+            "UP" => [0, 1, 0],
+            "NORTH" => [0, 0, -1],
+            "SOUTH" => [0, 0, 1],
+            "WEST" => [-1, 0, 0],
+            "EAST" => [1, 0, 0],
+            _ => return None,
+        },
+    )
+}
+
 impl<H: Host> Runtime<'_, H> {
     /// The family of `value` when it is a jar object whose class chain
     /// reaches one, and whether a jar class on the way overrides a member the
@@ -241,6 +293,14 @@ impl<H: Host> Runtime<'_, H> {
             .map(|_| ())
     }
 
+    /// The game class a family object's counted members are filed under.
+    fn family_owner(&self, value: &Value) -> &'static str {
+        match self.server_value_family(value) {
+            Some((Family::LevelResource, _)) => LEVEL_RESOURCE,
+            _ => VEC3I,
+        }
+    }
+
     /// `a.equals(b)` for a jar object `a` of the family; `None` for any other
     /// `a`.
     pub(crate) fn jar_server_value_equals(
@@ -254,8 +314,9 @@ impl<H: Host> Runtime<'_, H> {
         if a == b {
             return Ok(Some(true));
         }
+        let owner = self.family_owner(a);
         let (Some(own), other) = (own, self.other_server_value(b)) else {
-            self.count(VEC3I, "equals", "(Ljava/lang/Object;)Z")?;
+            self.count(owner, "equals", "(Ljava/lang/Object;)Z")?;
             return Ok(Some(false));
         };
         Ok(Some(match other {
@@ -263,7 +324,7 @@ impl<H: Host> Runtime<'_, H> {
             Other::Key(key) => key == own,
             Other::Foreign => false,
             Other::Unknown => {
-                self.count(VEC3I, "equals", "(Ljava/lang/Object;)Z")?;
+                self.count(owner, "equals", "(Ljava/lang/Object;)Z")?;
                 false
             }
         }))
@@ -281,7 +342,8 @@ impl<H: Host> Runtime<'_, H> {
         match own.as_deref().and_then(crate::server_values::hash_code) {
             Some(hash) => Ok(Some(Some(hash))),
             None => {
-                self.count(VEC3I, "hashCode", "()I")?;
+                let owner = self.family_owner(value);
+                self.count(owner, "hashCode", "()I")?;
                 Ok(Some(None))
             }
         }
@@ -316,9 +378,111 @@ impl<H: Host> Runtime<'_, H> {
         let key = self.jar_server_value_key(value)??;
         let class = crate::jar_object::object_class(value)?;
         if let Some([x, y, z]) = crate::server_values::block_pos(&key) {
-            return Some(format!("{}{{x={x}, y={y}, z={z}}}", simple_name(class)));
+            let name = self.class_simple_name(class)?;
+            return Some(format!("{name}{{x={x}, y={y}, z={z}}}"));
         }
         crate::server_values::to_string(&key)
+    }
+
+    /// `Class.getSimpleName()` of a family object's class, which Guava's
+    /// `toStringHelper(this)` prints: the game classes' own, and a jar
+    /// class's from its `InnerClasses` row (empty for an anonymous class, the
+    /// declared name for a local or member class, #259's review). `None` for
+    /// a class the run does not hold (counted by the caller).
+    fn class_simple_name(&self, class: &str) -> Option<String> {
+        if matches!(class, VEC3I | BLOCK_POS | MUTABLE_BLOCK_POS) {
+            return Some(simple_name(class).to_owned());
+        }
+        Some(match self.class(class)?.nested_simple_name() {
+            Some(Some(name)) => name,
+            Some(None) => String::new(),
+            None => class.rsplit('/').next().unwrap_or(class).to_owned(),
+        })
+    }
+
+    /// Forget what the model knows of a family object's fields: a change it
+    /// does not run (a `move` it does not model, a subclass's `setZ`, a
+    /// reflective write) went to the host, which counts it, so every later
+    /// answer that reads the fields is counted too, never read from the old
+    /// place (#259's review).
+    fn forget_server_value(&mut self, value: &Value) {
+        let fields = COORDS
+            .iter()
+            .map(|name| field(VEC3I, name, "I"))
+            .chain([field(LEVEL_RESOURCE, "id", "Ljava/lang/String;")]);
+        for field in fields {
+            if let Some(key) = instance_field_key(value, &field) {
+                self.fields.remove(&key);
+            }
+        }
+    }
+
+    /// The place a `MutableBlockPos` member moves `receiver` to, as 26.3's
+    /// bodies compute it (javap): each goes through `set(int, int, int)`.
+    /// `None` where an argument or the current place is not known.
+    fn mutated_coords(&self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<[i32; 3]> {
+        let int = |index: usize| match args.get(index) {
+            Some(Value::Int(value)) => Some(*value),
+            _ => None,
+        };
+        let double = |index: usize| match args.get(index) {
+            Some(Value::Float(value)) => Some(floor(*value)),
+            _ => None,
+        };
+        let vec = |index: usize| match self.other_server_value(args.get(index)?) {
+            Other::Key(key) => crate::server_values::block_pos(&key),
+            _ => None,
+        };
+        let step = |index: usize| direction_step(args.get(index)?);
+        let now = || self.coords(receiver);
+        let add = |a: [i32; 3], b: [i32; 3]| {
+            [
+                a[0].wrapping_add(b[0]),
+                a[1].wrapping_add(b[1]),
+                a[2].wrapping_add(b[2]),
+            ]
+        };
+        let parameters = &r.descriptor[..r.descriptor.find(')')? + 1];
+        Some(match (r.name.as_str(), parameters) {
+            ("setX", "(I)") => [int(0)?, now()?[1], now()?[2]],
+            ("setY", "(I)") => [now()?[0], int(0)?, now()?[2]],
+            ("setZ", "(I)") => [now()?[0], now()?[1], int(0)?],
+            ("set", "(III)") => [int(0)?, int(1)?, int(2)?],
+            ("set", "(DDD)") => [double(0)?, double(1)?, double(2)?],
+            ("set", "(Lnet/minecraft/core/Vec3i;)") => vec(0)?,
+            // `BlockPos.getX/getY/getZ(long)`: 26 bits of x at 38, 12 of y at
+            // 0, 26 of z at 12, each sign-extended.
+            ("set", "(J)") => {
+                let Some(Value::Long(packed)) = args.first() else {
+                    return None;
+                };
+                [
+                    (packed >> 38) as i32,
+                    ((packed << 52) >> 52) as i32,
+                    ((packed << 26) >> 38) as i32,
+                ]
+            }
+            ("move", "(III)") => add(now()?, [int(0)?, int(1)?, int(2)?]),
+            ("move", "(Lnet/minecraft/core/Vec3i;)") => add(now()?, vec(0)?),
+            ("move", "(Lnet/minecraft/core/Direction;)") => add(now()?, step(0)?),
+            ("move", "(Lnet/minecraft/core/Direction;I)") => {
+                let (n, [x, y, z]) = (int(1)?, step(0)?);
+                add(
+                    now()?,
+                    [x.wrapping_mul(n), y.wrapping_mul(n), z.wrapping_mul(n)],
+                )
+            }
+            ("setWithOffset", "(Lnet/minecraft/core/Vec3i;III)") => {
+                add(vec(0)?, [int(1)?, int(2)?, int(3)?])
+            }
+            ("setWithOffset", "(Lnet/minecraft/core/Vec3i;Lnet/minecraft/core/Direction;)") => {
+                add(vec(0)?, step(1)?)
+            }
+            ("setWithOffset", "(Lnet/minecraft/core/Vec3i;Lnet/minecraft/core/Vec3i;)") => {
+                add(vec(0)?, vec(1)?)
+            }
+            _ => return None,
+        })
     }
 
     /// The game's own members on a jar object of the family (the module
@@ -333,6 +497,16 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
+        // A reflective, `Unsafe` or `VarHandle` write into a family object's
+        // fields: the host answers (counted), and the fields are no longer
+        // known.
+        if writes_object_fields(r)
+            && let Some(target) = args.first()
+            && self.server_value_family(target).is_some()
+        {
+            self.forget_server_value(target);
+            return Ok(None);
+        }
         let Some((family, overridden)) = self.server_value_family(receiver) else {
             return Ok(None);
         };
@@ -380,6 +554,9 @@ impl<H: Host> Runtime<'_, H> {
         // model); one Java's answer reaches through it is the subclass's,
         // which is counted, never answered by identity.
         if overridden {
+            if may_mutate(r) {
+                self.forget_server_value(receiver);
+            }
             let counted = matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
                 ("equals", "(Ljava/lang/Object;)Z")
@@ -413,35 +590,21 @@ impl<H: Host> Runtime<'_, H> {
                     && r.descriptor
                         .ends_with(")Lnet/minecraft/core/BlockPos$MutableBlockPos;")
                 {
-                    let Some(now) = self.coords(receiver) else {
+                    let Some(coords) = self.mutated_coords(r, receiver, args) else {
+                        // A change the model does not run (`clamp`, `set` of
+                        // an `AxisCycle`, an argument it cannot read).
+                        self.forget_server_value(receiver);
                         return Ok(None);
                     };
-                    let mut coords = now.map(Some);
-                    match (
-                        r.name.as_str(),
-                        &r.descriptor[..r.descriptor.find(')').unwrap_or(0) + 1],
-                    ) {
-                        ("setX", "(I)") => coords[0] = int(0),
-                        ("setY", "(I)") => coords[1] = int(0),
-                        ("setZ", "(I)") => coords[2] = int(0),
-                        ("set", "(III)") => coords = [int(0), int(1), int(2)],
-                        ("set", "(DDD)") => coords = [double(0), double(1), double(2)],
-                        ("set", "(Lnet/minecraft/core/Vec3i;)") => {
-                            let Other::Key(key) = self.other_server_value(&args[0]) else {
-                                return Ok(None);
-                            };
-                            let Some(other) = crate::server_values::block_pos(&key) else {
-                                return Ok(None);
-                            };
-                            coords = other.map(Some);
-                        }
-                        _ => return Ok(None),
-                    }
-                    if coords.iter().any(Option::is_none) {
-                        return Ok(None);
-                    }
-                    self.set_coords(receiver, coords);
+                    self.set_coords(receiver, coords.map(Some));
                     return Ok(Some(receiver.clone()));
+                }
+                // Any other change (`Vec3i.setX/setY/setZ` a subclass calls, an
+                // accessor's setter): the host answers it, counted, and the
+                // fields are no longer known.
+                if may_mutate(r) {
+                    self.forget_server_value(receiver);
+                    return Ok(None);
                 }
                 if r.name == "compareTo"
                     && crate::object_methods::is_compare_to(&r.descriptor)

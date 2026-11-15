@@ -222,14 +222,16 @@ impl<H: Host> Runtime<'_, H> {
         if crate::jar_object::packaged_object_class(value).is_none() {
             return Ok(None);
         }
+        // A jar's own `BlockPos`/`LevelResource` (a subclass included):
+        // `Vec3i.toString` or the record's, by its fields
+        // (`jar_server_values.rs`). A subclass with its own `toString` is
+        // not answered here and runs it below.
+        if let Some(text) = self.jar_server_value_text(value) {
+            return Ok(Some(Value::Ref(Some(text))));
+        }
         if let Some(text) = self.jar_to_string(value, class, method)? {
             // `String.valueOf` returns what `toString` returned, even `null`.
             return Ok(Some(text));
-        }
-        // A jar's own `BlockPos`/`LevelResource`: `Vec3i.toString` or the
-        // record's, by its fields (`jar_server_values.rs`).
-        if let Some(text) = self.jar_server_value_text(value) {
-            return Ok(Some(Value::Ref(Some(text))));
         }
         if let Some(text) = self.library_to_string(value, class, method)? {
             return Ok(Some(Value::Ref(Some(text))));

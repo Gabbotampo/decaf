@@ -68,17 +68,29 @@ const STUBS: &[(&str, &str)] = &[
          public Vec3i(int x, int y, int z) {} \
          public int getX() { return 0; } public int getY() { return 0; } public int getZ() { return 0; } \
          public boolean equals(Object o) { return false; } public int hashCode() { return 0; } \
-         public String toString() { return null; } public int compareTo(Vec3i o) { return 0; } }",
+         public String toString() { return null; } public int compareTo(Vec3i o) { return 0; } \
+         protected Vec3i setZ(int z) { return this; } }",
     ),
     (
         "net/minecraft/core/BlockPos.java",
         "package net.minecraft.core; public class BlockPos extends Vec3i { \
          public BlockPos(int x, int y, int z) { super(x, y, z); } \
          public static class MutableBlockPos extends BlockPos { \
+           public MutableBlockPos() { super(0, 0, 0); } \
            public MutableBlockPos(int x, int y, int z) { super(x, y, z); } \
            public MutableBlockPos(double x, double y, double z) { super(0, 0, 0); } \
            public MutableBlockPos set(int x, int y, int z) { return this; } \
-           public MutableBlockPos setY(int y) { return this; } } }",
+           public MutableBlockPos set(long packed) { return this; } \
+           public MutableBlockPos setY(int y) { return this; } \
+           public MutableBlockPos move(int x, int y, int z) { return this; } \
+           public MutableBlockPos move(Direction d) { return this; } \
+           public MutableBlockPos move(Direction d, int n) { return this; } \
+           public MutableBlockPos setWithOffset(Vec3i v, int x, int y, int z) { return this; } \
+           public MutableBlockPos setWithOffset(Vec3i v, Direction d) { return this; } } }",
+    ),
+    (
+        "net/minecraft/core/Direction.java",
+        "package net.minecraft.core; public enum Direction { DOWN, UP, NORTH, SOUTH, WEST, EAST }",
     ),
     (
         "net/minecraft/world/level/storage/LevelResource.java",
@@ -134,7 +146,11 @@ fn a_mods_own_positions_and_resources_meet_the_games_as_in_java() {
     // A subclass overriding `getX`, which `Vec3i.equals` calls, both ways:
     // Java answers `false,false` from the subclass's `getX`; the runtime
     // does not run it there, so both comparisons are counted.
-    assert_eq!(statics(&host, "counted"), "false,false");
+    // Then a subclass that moves itself through `Vec3i`'s protected `setZ`,
+    // which the model does not run: Java's `true,3907` reads the new place;
+    // the runtime forgets the fields, so both answers after it are counted,
+    // never read from the old place (#259's review).
+    assert_eq!(statics(&host, "counted"), "false,false;false,0");
     let counted: Vec<String> = host
         .unknown_host_calls()
         .into_iter()
@@ -145,6 +161,10 @@ fn a_mods_own_positions_and_resources_meet_the_games_as_in_java() {
         [
             "demo/Probe$Odd#equals(Ljava/lang/Object;)Z",
             "net/minecraft/core/BlockPos#equals(Ljava/lang/Object;)Z",
+            "net/minecraft/core/BlockPos#hashCode()I",
+            "net/minecraft/core/BlockPos#setZ(I)Lnet/minecraft/core/Vec3i;",
+            "net/minecraft/core/Vec3i#equals(Ljava/lang/Object;)Z",
+            "net/minecraft/core/Vec3i#hashCode()I",
         ],
         "{counted:?}"
     );

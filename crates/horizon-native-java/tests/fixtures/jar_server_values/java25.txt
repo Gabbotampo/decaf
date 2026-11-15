@@ -9,3 +9,8 @@ tree=BlockPos{x=-1, y=-2, z=-3};BlockPos{x=3, y=1, z=0};BlockPos{x=0, y=1, z=5};
 mutated=null,null,null,1,true,MutableBlockPos{x=5, y=5, z=5}
 mut_set=MutableBlockPos{x=5, y=7, z=5},MutableBlockPos{x=1, y=-1, z=2}
 res=/data,3076010,true,true,d,data,false
+move=true,false,MutableBlockPos{x=1, y=2, z=4},3907,true
+move_dir=true,MutableBlockPos{x=1, y=2, z=4},MutableBlockPos{x=1, y=5, z=4}
+set_long=true,MutableBlockPos{x=1, y=2, z=4},MutableBlockPos{x=-1, y=-2, z=-3}
+with_offset=true,MutableBlockPos{x=1, y=2, z=4},true,MutableBlockPos{x=1, y=2, z=4}
+names={x=1, y=2, z=3},{x=1, y=2, z=3},LocalPos{x=1, y=2, z=3},true
