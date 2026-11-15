@@ -17,7 +17,7 @@ public final class Probe {
         };
     }
 
-    public static void main(String[] args) { System.out.println(run()); }
+    public static void main(String[] args) { System.out.println(args.length > 0 ? uris() : run()); }
 
     public static String run() {
         HttpClient.Builder builder = HttpClient.newBuilder();
@@ -60,6 +60,29 @@ public final class Probe {
         catch (NullPointerException e) { out.append("|version-null"); }
         try { client.send(request, HttpResponse.BodyHandlers.ofString()); out.append("|no-error"); }
         catch (Exception e) { out.append("|send-").append(e.getClass().getName()); }
+        return out.toString();
+    }
+
+    /// `HttpRequest.newBuilder(URI)`/`uri(URI)`/`build()` validation (#283 review):
+    /// exact messages for null, a missing scheme, a non-HTTP scheme, no host, no URI.
+    public static String uris() {
+        StringBuilder out = new StringBuilder();
+        String[] texts = {"http:foo", "HTTPS://Example.com/x", "http:///path", "mailto:a@b",
+            "FTP://x", "relative", "https://user@h:8080/p?q#f"};
+        for (String text : texts) {
+            try {
+                java.net.http.HttpRequest.newBuilder(URI.create(text));
+                out.append(text).append(" ok|");
+            } catch (RuntimeException e) {
+                out.append(text).append(' ').append(e.getClass().getName()).append(':').append(e.getMessage()).append('|');
+            }
+        }
+        try { java.net.http.HttpRequest.newBuilder((URI) null); }
+        catch (RuntimeException e) { out.append("new(null) ").append(e.getMessage()).append('|'); }
+        try { java.net.http.HttpRequest.newBuilder().uri(null); }
+        catch (RuntimeException e) { out.append("uri(null) ").append(e.getMessage()).append('|'); }
+        try { java.net.http.HttpRequest.newBuilder().build(); }
+        catch (RuntimeException e) { out.append("build ").append(e.getClass().getName()).append(':').append(e.getMessage()); }
         return out.toString();
     }
 }

@@ -144,6 +144,54 @@ fn null_pointer() -> NativeError {
     }
 }
 
+fn exception(class: &str, message: String) -> NativeError {
+    NativeError::UncaughtException {
+        class: class.into(),
+        message: Some(message),
+        frame: None,
+    }
+}
+
+/// `HttpRequestBuilderImpl.uri(URI)` (also reached from `newBuilder(URI)`): JDK 25's
+/// `requireNonNull(uri, "uri must be non-null")`, then `checkURI`: a scheme, `http` or
+/// `https` in any case (the message names it lower-cased), and a host. `Ok(None)` for a
+/// value that is no URI handle or a URI text this model doesn't parse exactly: the call
+/// is then counted, never answered with a made-up exception.
+fn checked_request_uri(value: &Value) -> Result<Option<String>, NativeError> {
+    if matches!(value, Value::Ref(None)) {
+        return Err(exception(
+            "java/lang/NullPointerException",
+            "uri must be non-null".into(),
+        ));
+    }
+    let Some(text) = crate::runtime::host_jdk_value::uri_text(value) else {
+        return Ok(None);
+    };
+    let Some(parts) = crate::runtime::host_jdk_value::uri_parts(text) else {
+        return Ok(None);
+    };
+    let Some(scheme) = parts.scheme else {
+        return Err(exception(
+            "java/lang/IllegalArgumentException",
+            "URI with undefined scheme".into(),
+        ));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(exception(
+            "java/lang/IllegalArgumentException",
+            format!("invalid URI scheme {scheme}"),
+        ));
+    }
+    if parts.host.is_none() {
+        return Err(exception(
+            "java/lang/IllegalArgumentException",
+            format!("unsupported URI {text}"),
+        ));
+    }
+    Ok(Some(text.to_owned()))
+}
+
 fn illegal_argument(message: &str) -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/IllegalArgumentException".into(),
@@ -271,17 +319,11 @@ pub(crate) fn static_call(
             "java/net/http/HttpRequest",
             "newBuilder",
             "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
-        ) => {
-            let uri = match args.first() {
-                Some(Value::Ref(None)) => return Some(Err(null_pointer())),
-                Some(value) => crate::runtime::host_jdk_value::uri_text(value).map(str::to_owned),
-                None => None,
-            };
-            Some(match uri {
-                Some(uri) => Ok(new_request_builder(runtime, Some(uri))),
-                None => Err(null_pointer()),
-            })
-        }
+        ) => match checked_request_uri(args.first()?) {
+            Ok(Some(uri)) => Some(Ok(new_request_builder(runtime, Some(uri)))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        },
         _ => None,
     }
 }
@@ -478,11 +520,12 @@ fn request_builder_call(
     });
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("uri", "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;") => {
-            let value = args.first()?;
-            let Some(uri) = crate::runtime::host_jdk_value::uri_text(value) else {
-                return Some(Err(null_pointer()));
+            let uri = match checked_request_uri(args.first()?) {
+                Ok(Some(uri)) => uri,
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
             };
-            current["uri"] = serde_json::Value::String(uri.to_owned());
+            current["uri"] = serde_json::Value::String(uri);
             save_state(runtime, "request-builder", key, current);
             Some(Ok(receiver.clone()))
         }
@@ -557,7 +600,7 @@ fn request_builder_call(
             let Some(uri) = current["uri"].as_str() else {
                 return Some(Err(NativeError::UncaughtException {
                     class: "java/lang/IllegalStateException".into(),
-                    message: Some("uri is required".into()),
+                    message: Some("uri is null".into()),
                     frame: None,
                 }));
             };
