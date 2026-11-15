@@ -102,6 +102,7 @@ mod host_jdk;
 mod host_jdk_constant;
 mod host_jdk_value;
 mod host_list_iterator;
+mod host_log4j_level;
 mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
@@ -3279,6 +3280,8 @@ pub struct StdHost {
     /// fields, arrays, builders and enum identity of what its statics and
     /// registered callbacks still reach.
     heap: heap::JavaHeap,
+    /// Log4j custom levels registered by `Level.forName`, keyed by normalized name.
+    log4j_levels: crate::runtime::host_log4j_level::CustomLevels,
     /// Values the embedder holds between invocations (`StdHost::retain`),
     /// with their hold counts: roots of the heap's collections.
     retained: BTreeMap<String, usize>,
@@ -3433,6 +3436,7 @@ impl StdHost {
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
+            log4j_levels: crate::runtime::host_log4j_level::CustomLevels::new(),
             retained: BTreeMap::new(),
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
@@ -5798,6 +5802,9 @@ impl Host for StdHost {
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
         }
+        if let Some(value) = crate::runtime::host_log4j_level::static_call(r, args, &mut self.log4j_levels) {
+            return value;
+        }
         if let Some(value) = client_reload::static_call(self, r, args) {
             return value;
         }
@@ -7797,6 +7804,37 @@ impl Host for StdHost {
             }) && (java_immutable::is_mutator(&r.name) || r.name == "subList")
             {
                 return self.unknown_host_call(r);
+            }
+            // Gson's `LinkedTreeMap` (a `fromJson` read's map) orders its keys
+            // by `Comparable.compareTo`: `put` of a `null` key throws its own
+            // NPE ("key == null"), and a key that is no `String` (a
+            // comparison with the document's names) is counted (#253
+            // re-check B5). Every other write is the host's map model.
+            if jar_object::collection_key(marker)
+                .is_some_and(|_| jar_object::collection_class(marker) == gson_tree::TREE_MAP)
+                && matches!(
+                    r.name.as_str(),
+                    "put"
+                        | "putIfAbsent"
+                        | "compute"
+                        | "computeIfAbsent"
+                        | "computeIfPresent"
+                        | "merge"
+                        | "putAll"
+                )
+            {
+                match args.first() {
+                    Some(Value::Ref(None)) if matches!(r.name.as_str(), "put" | "putIfAbsent") => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("key == null".into()),
+                            frame: None,
+                        });
+                    }
+                    Some(Value::Ref(Some(key)))
+                        if r.name != "putAll" && value_class::is_plain_string(key) => {}
+                    _ => return self.unknown_host_call(r),
+                }
             }
             // `Arrays.asList`'s fixed size, before the sequenced members
             // (its `removeFirst` checks emptiness, then refuses).
@@ -21971,6 +22009,12 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn materialize_host_value(&mut self, value: Value) -> Value {
+        crate::runtime::host_log4j_level::array_values(&value).map_or(value, |values| {
+            self.new_array_value("[Lorg/apache/logging/log4j/Level;", values)
+        })
+    }
+
     /// The key of a new array of `class` (`[I`, `[Ljava/lang/String;`); its
     /// elements go in `arrays` under it, and its handle is
     /// [`host_array::handle`] of it, made once (`host_array.rs`).
@@ -22395,6 +22439,14 @@ impl<H: Host> Runtime<'_, H> {
                 .map(|name| (*name).to_owned())
                 .collect(),
             (None, None) if crate::runtime::jdk_closure::in_jdk_package(&name) => return None,
+            // A Guava class the host makes, or Gson's `LinkedTreeMap`: the
+            // interfaces its class file declares.
+            (None, None) if crate::runtime::java_immutable::guava_superclass(&name).is_some() => {
+                crate::runtime::java_immutable::guava_interfaces(&name)
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            }
             (None, None) => Vec::new(),
         };
         let values = interfaces
@@ -27467,6 +27519,7 @@ impl<H: Host> Runtime<'_, H> {
                             r.owner, r.name, r.descriptor
                         )));
                     };
+                    let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {

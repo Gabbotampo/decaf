@@ -462,18 +462,21 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// `ReflectiveTypeAdapterFactory` for a jar class: the object with each
-    /// field the document names read as the field's declared type. A JSON
-    /// string for a jar class is its enum constant's name.
+    /// field the document names read as the field's declared type. A jar enum
+    /// is `TypeAdapters.EnumTypeAdapter`'s instead ([`Self::gson_read_jar_enum`]);
+    /// a JSON string for any other jar class is Gson's `JsonSyntaxException`
+    /// (counted, #253 re-check B6).
     fn gson_read_jar_object(
         &mut self,
         tree: &Tree,
         class: &str,
         style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
-        let members = match tree {
-            Tree::Object(members) => members,
-            Tree::Str(name) => return Ok(Some(Value::Ref(Some(format!("enum/{class}/{name}"))))),
-            _ => return Ok(None),
+        if let Some(read) = self.gson_read_jar_enum(tree, class)? {
+            return Ok(read);
+        }
+        let Tree::Object(members) = tree else {
+            return Ok(None);
         };
         let fields = self.gson_fields(class);
         if fields.is_empty() {
@@ -509,6 +512,122 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         Ok(Some(object))
+    }
+
+    /// `TypeAdapters.EnumTypeAdapter` (gson-2.14.0) when `class` is a jar enum
+    /// (`Some(read)`, `read` `None` where counted); `None` for any other class.
+    ///
+    /// The adapter maps each constant field (`isEnumConstant`, declaration
+    /// order, a later `put` replacing an earlier one) by its `@SerializedName`
+    /// `alternate`s, then its `value` or else `name()`; a second map holds
+    /// `toString()`. A read is `nextString` (a string or a number's text; any
+    /// other token throws, counted), then the first map, then the second, else
+    /// `null`. The constant answered is the jar's own object the class
+    /// initializer built, never a marker of a name. A constant whose
+    /// `toString` the jar overrides is counted when the first map misses: its
+    /// text is not computed here.
+    fn gson_read_jar_enum(
+        &mut self,
+        tree: &Tree,
+        class: &str,
+    ) -> Result<Option<Option<Value>>, NativeError> {
+        const ACC_ENUM: u16 = 0x4000;
+        const SERIALIZED_NAME: &str = "Lcom/google/gson/annotations/SerializedName;";
+        let Some(file) = self.class(class) else {
+            return Ok(None);
+        };
+        if file.super_name != "java/lang/Enum"
+            || crate::runtime::jdk_model::class_access_flags(file).is_none_or(|flags| flags & ACC_ENUM == 0)
+        {
+            return Ok(None);
+        }
+        let constant_fields = file
+            .fields
+            .iter()
+            .filter(|field| field.is_static() && field.access & ACC_ENUM != 0)
+            .map(|field| {
+                let serialized = file
+                    .field_annotations(&field.name, &field.descriptor)
+                    .into_iter()
+                    .find(|annotation| annotation.descriptor == SERIALIZED_NAME);
+                (field.name.clone(), field.descriptor.clone(), serialized)
+            })
+            .collect::<Vec<_>>();
+        let key = match tree {
+            Tree::Str(text) | Tree::Num(text) => text.clone(),
+            _ => return Ok(Some(None)),
+        };
+        self.ensure_initialized(class)?;
+        // (map key, constant), in `put` order: a later entry wins.
+        let mut by_name: Vec<(String, Value)> = Vec::new();
+        let mut by_text: Vec<(String, Value)> = Vec::new();
+        let mut text_overridden = false;
+        for (name, descriptor, serialized) in constant_fields {
+            let field = MethodRef {
+                owner: class.to_owned(),
+                name,
+                descriptor,
+            };
+            let Some(constant) = self
+                .static_fields
+                .get(&Self::static_field_key(&field))
+                .cloned()
+            else {
+                return Ok(Some(None));
+            };
+            let Some((constant_name, _)) = expect_ref(&constant)
+                .and_then(|marker| self.enum_constants.get(marker))
+                .cloned()
+            else {
+                return Ok(Some(None));
+            };
+            // `toString()`: `Enum.name()` unless the enum or the constant's
+            // body class declares its own.
+            let body = crate::runtime::jar_object::object_class(&constant)
+                .unwrap_or(class)
+                .to_owned();
+            text_overridden |= [class, body.as_str()].iter().any(|owner| {
+                self.class(owner).is_some_and(|file| {
+                    file.methods.iter().any(|method| {
+                        method.name == "toString" && method.descriptor == "()Ljava/lang/String;"
+                    })
+                })
+            });
+            let mut json_name = constant_name.clone();
+            if let Some(annotation) = serialized {
+                match annotation.values.get("value") {
+                    Some(crate::runtime::AnnotationValue::String(value)) => json_name = value.clone(),
+                    _ => return Ok(Some(None)),
+                }
+                if let Some(alternates) = annotation.values.get("alternate") {
+                    let crate::runtime::AnnotationValue::Array(alternates) = alternates else {
+                        return Ok(Some(None));
+                    };
+                    for alternate in alternates {
+                        let crate::runtime::AnnotationValue::String(alternate) = alternate else {
+                            return Ok(Some(None));
+                        };
+                        by_name.push((alternate.clone(), constant.clone()));
+                    }
+                }
+            }
+            by_name.push((json_name, constant.clone()));
+            by_text.push((constant_name, constant));
+        }
+        let last = |entries: &[(String, Value)]| {
+            entries
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == key)
+                .map(|(_, constant)| constant.clone())
+        };
+        if let Some(constant) = last(&by_name) {
+            return Ok(Some(Some(constant)));
+        }
+        if text_overridden {
+            return Ok(Some(None));
+        }
+        Ok(Some(Some(last(&by_text).unwrap_or(Value::Ref(None)))))
     }
 
     /// A field's declared type: its generic `Signature` when it has one, else
