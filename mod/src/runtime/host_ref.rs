@@ -555,6 +555,14 @@ pub(crate) trait Nested {
         let _ = value;
         None
     }
+    /// The handle key a jar's own `BlockPos`/`LevelResource` has
+    /// (`jar_server_values.rs`): `None` for any other value or where this
+    /// context cannot read jar objects' fields, `Some(None)` where its
+    /// fields are not known (the caller counts).
+    fn server_value_key(&mut self, value: &Value) -> Option<Option<String>> {
+        let _ = value;
+        None
+    }
     /// The `(msb, lsb)` of a jar's `new UUID(msb, lsb)` object
     /// (`host_jdk_value.rs`); `None` where this context cannot read the
     /// host's table or the object is no constructed UUID (the caller counts).
