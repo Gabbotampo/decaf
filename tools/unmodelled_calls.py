@@ -104,11 +104,11 @@ def entrypoint_kind(path: Path, corpus: str, role: str = "server") -> str | None
     if role == "client":
         if corpus == "neoforge":
             return "neoforge-client" if entrypoints.neoforge else None
+        if entrypoints.fabric_environment == "server":
+            return None
         stages = [kind for kind in CLIENT_STAGES if kind in entrypoints.kinds]
         return ",".join(stages) if stages else None
-    if entrypoints.neoforge_client_only or (
-        entrypoints.client_side_only and corpus != "neoforge"
-    ):
+    if entrypoints.neoforge_client_only or entrypoints.client_side_only:
         return None
     stages = [kind for kind in SERVER_STAGES if kind in entrypoints.kinds]
     if stages:
@@ -126,10 +126,14 @@ def classify_client(path: Path, corpus: str) -> tuple[str, str | None, str]:
     if corpus == "neoforge":
         if not entrypoints.neoforge:
             return "library", None, "no @Mod class"
-        if entrypoints.neoforge_client_only:
+        if entrypoints.neoforge_client_only or entrypoints.client_side_only:
             return "client-only", "neoforge-client", "client-only @Mod"
+        if entrypoints.neoforge_server_only:
+            return "server-only", None, "server-only @Mod"
         return "neo-client", "neoforge-client", ""
     kinds = set(entrypoints.kinds)
+    if entrypoints.fabric_environment == "server":
+        return "server-only", None, "environment: server"
     stages = [kind for kind in CLIENT_STAGES if kind in kinds]
     if entrypoints.client_side_only:
         if stages:
@@ -147,7 +151,7 @@ def classify_server_skip(path: Path, corpus: str) -> str:
     entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
     if entrypoints is None:
         return "metadata unreadable"
-    if ((entrypoints.client_side_only and corpus != "neoforge")
+    if (entrypoints.client_side_only
             or entrypoints.neoforge_client_only
             or entrypoints.kinds and "client" in entrypoints.kinds):
         return "client-only"

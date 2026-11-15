@@ -1059,7 +1059,7 @@ fn frame_census(
     use horizon_native_java::client_surface::{
         ClientLevel, ClientPlayer, ClientSnapshot, TextMetrics,
     };
-    use horizon_native_java::events::{EventContext, EventFacade, EventFiring};
+    use horizon_native_java::events::{EventContext, EventFacade, EventFiring, GameEvent};
     use std::sync::Arc;
     let snapshot = Arc::new(ClientSnapshot {
         player: Some(ClientPlayer {
@@ -1090,7 +1090,13 @@ fn frame_census(
         .game_listeners(jar, false)
         .listeners
         .into_iter()
-        .filter(|l| l.event.name().starts_with("client_"))
+        .filter(|l| {
+            l.event.name().starts_with("client_")
+                && !matches!(
+                    l.event,
+                    GameEvent::ClientRegisterKeyMappings | GameEvent::ClientRegisterGuiLayers
+                )
+        })
         .collect();
     for listener in &listeners {
         host.begin_client_frame(snapshot.clone(), &keys);

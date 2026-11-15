@@ -176,8 +176,8 @@ def _skip_annotation(data: bytes, offset: int) -> int:
     return offset
 
 
-def neoforge_mod_dist(data: bytes) -> bool | None:
-    """Return whether the class has @Mod and is Dist.CLIENT-only.
+def neoforge_mod_dist(data: bytes) -> frozenset[str] | None:
+    """Return the complete @Mod `dist` set, or None when there is no @Mod.
 
     This reads only class-level runtime annotations.  Looking for `CLIENT` in
     a constant pool is not enough: common Forge classes call `Dist.CLIENT`
@@ -246,7 +246,7 @@ def neoforge_mod_dist(data: bytes) -> bool | None:
                 pairs, cursor = _u2(data, cursor)
                 is_mod = descriptor in ("Lnet/neoforged/fml/common/Mod;",
                                         "Lnet/minecraftforge/fml/common/Mod;")
-                client = False
+                dists: set[str] = set()
                 for _ in range(pairs):
                     element_name, cursor = _u2(data, cursor)
                     tag = chr(data[cursor])
@@ -255,16 +255,17 @@ def neoforge_mod_dist(data: bytes) -> bool | None:
                         values, value_start = _u2(data, value_start)
                         for _ in range(values):
                             if data[value_start:value_start + 1] == b"e":
-                                enum_type, value_start = _u2(data, value_start + 1)
+                                _, value_start = _u2(data, value_start + 1)
                                 enum_name, value_start = _u2(data, value_start)
-                                client |= cp[enum_name] == "CLIENT"
+                                if cp[enum_name] in ("CLIENT", "DEDICATED_SERVER"):
+                                    dists.add(cp[enum_name])
                             else:
                                 value_start = _skip_element(data, value_start)
                         cursor = value_start
                     else:
                         cursor = _skip_element(data, cursor)
                 if is_mod:
-                    return client
+                    return frozenset(dists)
             offset = end
     except (IndexError, UnicodeError, ValueError):
         return None
@@ -283,6 +284,8 @@ class JarEntrypoints:
     # annotation on each @Mod class to decide which physical side constructs
     # it.
     neoforge_client_only: bool = False
+    neoforge_server_only: bool = False
+    fabric_environment: str = "*"
 
     @property
     def server(self) -> bool:
@@ -432,8 +435,10 @@ def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> 
                 kinds = fabric_entrypoint_kinds(obj)
                 # `"environment": "client"` keeps a Fabric mod off a server
                 # (a multi-loader jar's NeoForge `@Mod` class included).
-                fabric_client_only = obj.get("environment") == "client"
+                fabric_environment = str(obj.get("environment", "*"))
+                fabric_client_only = fabric_environment == "client"
             else:
+                fabric_environment = "*"
                 fabric_client_only = False
             client_side_only = fabric_client_only
             for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
@@ -448,15 +453,15 @@ def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> 
             ):
                 # The server has something to execute (or the jar says it is
                 # client-only); no class scan can change that verdict.
-                return JarEntrypoints(kinds, False, client_side_only)
+                return JarEntrypoints(kinds, False, client_side_only, fabric_environment=fabric_environment)
             if "fabric.mod.json" in names and not force_neoforge:
                 # A jar with Fabric metadata runs only its Fabric entrypoints,
                 # as on Fabric Loader, which never reads `@Mod`; a universal
                 # jar's NeoForge class is not a server entrypoint
                 # (`entrypoint_role.rs`).
-                return JarEntrypoints(kinds, False, client_side_only)
+                return JarEntrypoints(kinds, False, client_side_only, fabric_environment=fabric_environment)
             neoforge = False
-            mod_dists: list[bool] = []
+            mod_dists: list[frozenset[str]] = []
             for name in names:
                 if (
                     not name.endswith(".class")
@@ -467,11 +472,6 @@ def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> 
                     continue
                 data = jar.read(name)
                 mod_dist = neoforge_mod_dist(data)
-                if mod_dist is None and any(marker in data for marker in NEOFORGE_MOD_ANNOTATIONS):
-                    # Minimal synthetic class files used by the ledger tests
-                    # carry the annotation descriptor without an attributes
-                    # table.  Keep the conservative both-sided answer.
-                    mod_dist = False
                 if mod_dist is not None:
                     neoforge = True
                     mod_dists.append(mod_dist)
@@ -479,7 +479,9 @@ def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> 
                 kinds,
                 neoforge,
                 client_side_only,
-                neoforge and bool(mod_dists) and all(mod_dists),
+                neoforge and bool(mod_dists) and all(dists == frozenset({"CLIENT"}) for dists in mod_dists),
+                neoforge and bool(mod_dists) and all(dists == frozenset({"DEDICATED_SERVER"}) for dists in mod_dists),
+                fabric_environment,
             )
     except (OSError, ValueError, KeyError, EOFError, RuntimeError, zipfile.BadZipFile):
         return None
