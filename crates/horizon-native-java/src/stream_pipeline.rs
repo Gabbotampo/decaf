@@ -379,7 +379,6 @@ pub(crate) struct Pipelines {
 /// `String` it is (`is_live_stream`). A random `HashMap` seed here used to feed
 /// the jar's Java `HashMap` bucket order, making the same probe take different
 /// paths.
-
 pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
     // This is a stable keyed hash rather than `RandomState`: marker text must
     // be reproducible across probe processes, or it changes Java hash-table
