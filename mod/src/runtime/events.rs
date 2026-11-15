@@ -175,7 +175,7 @@ pub enum GameEvent {
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 42] = [
+    pub const ALL: [GameEvent; 43] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
