@@ -19,6 +19,19 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(receiver) = receiver
+            && let Some(value) = crate::runtime::kotlin_stdlib::instance(self, r, receiver, args)
+        {
+            return value.map(Some);
+        }
+        if receiver.is_none()
+            && let Some(value) = crate::runtime::kotlin_stdlib::invoke(self, r, args)
+        {
+            return value.map(Some);
+        }
+        if let Some(value) = string_constructors::value_of(self, r, args)? {
+            return Ok(Some(value));
+        }
         // Loggers named after a class (`jdk_model.rs`).
         if let Some(value) = self.invoke_logger_factory(r, args)? {
             return Ok(Some(value));
@@ -166,7 +179,7 @@ impl<H: Host> Runtime<'_, H> {
     /// value live in the object's own `key`/`value` fields; `getKey`,
     /// `getValue`, `setValue` (the immutable one throws) and `toString`
     /// answer from them. A call typed as `Map.Entry` on one reaches here too,
-    /// before the host's `map-entry/` marker model refuses the object.
+    /// before the host's entry model (`host_map_entry.rs`) counts the object.
     fn invoke_simple_entry(
         &mut self,
         r: &MethodRef,
@@ -1149,7 +1162,23 @@ impl<H: Host> Runtime<'_, H> {
         let Ok(items) = runtime_collection_values(&*self.host, receiver) else {
             return Ok(None);
         };
-        let values = items;
+        // `toArray(IntFunction)` on an entry set of `Collections.unmodifiableMap` is JDK 25's
+        // `UnmodifiableCollection.toArray(f)`, `c.toArray(f)`: the source map's own entries.
+        // `UnmodifiableEntrySet` wraps each entry only in `toArray()` and `toArray(T[])`, so the
+        // other two forms keep the wrappers (#221 review 7, B11). Only a view's entry set holds
+        // wrappers (a list copied from it keeps them, as Java's copy does).
+        let unwrap = r.descriptor == "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"
+            && expect_ref(receiver).is_some_and(|marker| {
+                self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
+            });
+        let values = if unwrap {
+            items
+                .into_iter()
+                .map(|entry| self.host.unwrapped_view_entry(&entry).unwrap_or(entry))
+                .collect()
+        } else {
+            items
+        };
         // `toArray(IntFunction)` is `toArray(generator.apply(0))`
         // (`Collection`'s default): the generated array names the class.
         let target = match r.descriptor.as_str() {
