@@ -1376,6 +1376,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
             .note_entrypoint_constructed(kind, class, instance);
     }
 
+    fn fabric_entrypoints(&self, kind: &str) -> Vec<(String, String)> {
+        self.inner.fabric_entrypoints(kind)
+    }
+
+    fn fabric_entrypoint_object(&self, kind: &str, class: &str, requested: &str) -> Option<Value> {
+        self.inner.fabric_entrypoint_object(kind, class, requested)
+    }
+
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         // An instance-field read the callbacks never wrote reaches the host
         // too. A Mixin `@Shadow` field is the game object's own field, which

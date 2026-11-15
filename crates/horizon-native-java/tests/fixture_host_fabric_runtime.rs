@@ -36,6 +36,9 @@ envClass=CCE|truenet.fabricmc.api.EnvTypejava.lang.Enumfalse
 payloads=truefalsefalsetruetruepnulltrue
 resources=truefalsetruetruednull
 entrypoints=1trueprobe-fixturetrue0true
+invokeAll=demo.Probe;
+invokeWrong=EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'
+invokeFailure=EntrypointException:Exception while invoking entrypoint 'main' provided by 'probe-fixture'
 otherTypes=false|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|EntrypointException:Exception while loading entries for entrypoint 'main' provided by 'probe-fixture'|falsefalsefalse
 spelled=Stringtrue-1040676293falsefalsefalsefalsefalsefalsefalsefalsefabric-loader!,Stringtrue-1221724595falsefalsefalsefalsefalsefalsefalsefalsefabric-mapping-resolver!,Stringtrue1990584267falsefalsefalsefalsefalsefalsefalsefalseCLIENT!,Stringtrue-1852497085falsefalsefalsefalsefalsefalsefalsefalseSERVER!,Stringtrue3145783falsefalsefalsefalsefalsefalsefalsefalsefli:!,Stringtrue-952377214falsefalsefalsefalsefalsefalsefalsefalsefenv:rSERVER!,Stringtrue1041408092falsefalsefalsefalsefalsefalsefalsefalsefpt:rplayToClient!,Stringtrue-116919410falsefalsefalsefalsefalsefalsefalsefalsefrl:rSERVER_DATA!,falsefalsefalsefabric-entrypoint/main/demo/Probe/probe-fixture!,falsefalsefalsefabric-payload-types/playToClient!,falsefalsefalsefabric-resource-loader/SERVER_DATA!,falsefalsefalsefabric-entrypoint-instance/demo/Probe!,12sfalse
 forged=CCECCE
@@ -174,6 +177,9 @@ fn the_singletons_and_the_entrypoint_answer_as_java_25() {
         "payloads",
         "resources",
         "entrypoints",
+        "invokeAll",
+        "invokeWrong",
+        "invokeFailure",
     ] {
         let (text, unknown) = run(method, method);
         assert_eq!(text, expected(method), "{method}: {unknown:?}");

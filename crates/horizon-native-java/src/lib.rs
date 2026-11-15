@@ -2652,6 +2652,27 @@ pub trait Host {
     /// has two.
     fn note_entrypoint_constructed(&mut self, _kind: &str, _class: &str, _instance: &Value) {}
 
+    /// The Fabric entrypoint rows the loader host declared for `kind`, in the
+    /// loader's invocation order.  A host that does not own loader state
+    /// exposes no rows; the runtime then keeps the call on its counted host
+    /// path instead of inventing providers.
+    fn fabric_entrypoints(&self, _kind: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// The already constructed instance for one Fabric entrypoint and the
+    /// requested interface.  Fabric caches one instance per entrypoint key;
+    /// a missing value means loading that entry failed or the host has not
+    /// constructed this provider in the current run.
+    fn fabric_entrypoint_object(
+        &self,
+        _kind: &str,
+        _class: &str,
+        _requested: &str,
+    ) -> Option<Value> {
+        None
+    }
+
     /// Sibling-jar classes this host lets the executing jar link against.
     ///
     /// `None` keeps single-jar behavior exactly as before: a symbol the
@@ -4850,6 +4871,23 @@ impl Host for StdHost {
     fn note_entrypoint_constructed(&mut self, kind: &str, class: &str, instance: &Value) {
         self.constructed_entrypoints
             .insert((kind.to_owned(), class.to_owned()), instance.clone());
+    }
+
+    fn fabric_entrypoints(&self, kind: &str) -> Vec<(String, String)> {
+        let mut rows = self
+            .fabric_entrypoint_containers
+            .iter()
+            .filter(|entry| entry.kind == kind)
+            .map(|entry| (entry.class.clone(), entry.provider.clone()))
+            .collect::<Vec<_>>();
+        // Fabric's resolver presents selected mod candidates by id while
+        // retaining each metadata document's declared entrypoint order.
+        rows.sort_by(|(_, left), (_, right)| left.cmp(right));
+        rows
+    }
+
+    fn fabric_entrypoint_object(&self, kind: &str, class: &str, requested: &str) -> Option<Value> {
+        self.fabric_entrypoint_object(kind, class, Some(requested))
     }
 
     fn note_content_builder(&mut self, event: ContentBuilderEvent) {
@@ -11428,6 +11466,16 @@ fn exception_is_subtype(
     thrown: &str,
     catch: &str,
 ) -> bool {
+    // Loader exceptions such as `EntrypointException` live in the host's
+    // class path rather than the mod jar. Their names still carry the Java
+    // throwable contract, so a jar's ordinary `catch (Throwable/Exception)`
+    // must receive the wrapped failure instead of letting it escape.
+    if is_throwable_owner(thrown)
+        && (catch == "java/lang/Throwable"
+            || catch == "java/lang/Exception" && thrown.ends_with("Exception"))
+    {
+        return true;
+    }
     if catch == "java/lang/Object" {
         return true;
     }
@@ -12675,6 +12723,82 @@ fn object_text(host: &mut StdHost, value: &Value) -> String {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// `FabricLoaderImpl.invokeEntrypoints` walks the entrypoint rows in the
+    /// same order as `getEntrypointContainers`, obtains each cached instance,
+    /// and passes it to the supplied `Consumer`. Loader failures are wrapped
+    /// in Fabric's `EntrypointException`; they must not turn into a neutral
+    /// `null`/`void` answer because callers commonly catch this exact type.
+    fn invoke_fabric_entrypoints(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "net/fabricmc/loader/api/FabricLoader"
+            || r.name != "invokeEntrypoints"
+            || r.descriptor != "(Ljava/lang/String;Ljava/lang/Class;Ljava/util/function/Consumer;)V"
+        {
+            return Ok(None);
+        }
+        let Some(Value::Host(loader)) = receiver else {
+            return Ok(None);
+        };
+        if loader.kind() != HostKind::FabricLoaderInstance {
+            return Ok(None);
+        }
+        let kind = expect_string(args.first().unwrap_or(&Value::Ref(None))).to_owned();
+        let requested = args
+            .get(1)
+            .and_then(host_class::class_name)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Class".into()))?;
+        let consumer = args
+            .get(2)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Consumer".into()))?
+            .clone();
+        for (class, provider) in self.host.fabric_entrypoints(&kind) {
+            let object = self.host.fabric_entrypoint_object(&kind, &class, requested);
+            let Some(object) = object else {
+                return Err(NativeError::UncaughtException {
+                    class: "net/fabricmc/loader/api/EntrypointException".into(),
+                    message: Some(format!(
+                        "Exception while loading entries for entrypoint '{kind}' provided by '{provider}'"
+                    )),
+                    frame: None,
+                });
+            };
+            let accepted = match self.run_functional(
+                (
+                    "java/util/function/Consumer",
+                    "accept",
+                    "(Ljava/lang/Object;)V",
+                ),
+                &consumer,
+                &[object],
+            ) {
+                Ok(accepted) => accepted,
+                Err(_) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "net/fabricmc/loader/api/EntrypointException".into(),
+                        message: Some(format!(
+                            "Exception while invoking entrypoint '{kind}' provided by '{provider}'"
+                        )),
+                        frame: None,
+                    });
+                }
+            };
+            if !accepted {
+                return Err(NativeError::UncaughtException {
+                    class: "net/fabricmc/loader/api/EntrypointException".into(),
+                    message: Some(format!(
+                        "Exception while invoking entrypoint '{kind}' provided by '{provider}'"
+                    )),
+                    frame: None,
+                });
+            }
+        }
+        Ok(Some(Value::Void))
+    }
+
     /// Refuse a field access on an object the resident heap collected: its
     /// fields are gone, so the access is a missed root, never its fields'
     /// defaults (#226 review). Checked where no field row exists, which is
@@ -26831,6 +26955,15 @@ impl<H: Host> Runtime<'_, H> {
                                 .transpose())
                             .flatten();
                             if let Some(value) = optional {
+                                value
+                            } else if let Some(value) = invoke_or_catch!(
+                                at,
+                                self.invoke_fabric_entrypoints(
+                                    &resolved,
+                                    receiver.as_ref(),
+                                    &args,
+                                )
+                            ) {
                                 value
                             } else if matches!(
                                 resolved.owner.as_str(),

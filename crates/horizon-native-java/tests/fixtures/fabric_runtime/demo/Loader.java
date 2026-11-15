@@ -89,6 +89,33 @@ public final class Loader {
             + (((Object) l.getEntrypoints("absent", Object.class)) == l.getEntrypoints("absent", Runnable.class));
     }
 
+    /** Fabric invokes each declared entrypoint in storage order and passes it to the consumer. */
+    public static String invokeAll(FabricLoader l) {
+        StringBuilder out = new StringBuilder();
+        l.invokeEntrypoints("main", ModInitializer.class,
+            value -> out.append(value.getClass().getName()).append(';'));
+        return out.toString();
+    }
+
+    public static String invokeWrong(FabricLoader l) {
+        try {
+            l.invokeEntrypoints("main", Runnable.class, value -> { });
+            return "none";
+        } catch (Throwable e) {
+            return e.getClass().getSimpleName() + ":" + e.getMessage();
+        }
+    }
+
+    public static String invokeFailure(FabricLoader l) {
+        try {
+            l.invokeEntrypoints("main", ModInitializer.class,
+                value -> { throw new IllegalStateException("boom"); });
+            return "none";
+        } catch (Throwable e) {
+            return e.getClass().getSimpleName() + ":" + e.getMessage();
+        }
+    }
+
     /**
      * Inside the entrypoint's own `onInitialize`: `getEntrypoints("main", ModInitializer.class)` and its container's
      * `getEntrypoint()` are this very object (the loader made it for that type and runs it); each call is a new

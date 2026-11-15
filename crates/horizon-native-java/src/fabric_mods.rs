@@ -137,10 +137,27 @@ impl StdHost {
         else {
             return;
         };
-        if let Some(id) = document.get("id").and_then(serde_json::Value::as_str) {
-            self.fabric_metadata
-                .entry(id.to_owned())
-                .or_insert(document);
+        if let Some(id) = document
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        {
+            self.fabric_metadata.entry(id.clone()).or_insert(document);
+            // Linked and nested Fabric jars contribute their declared
+            // entrypoints to the same loader storage. Keep declaration order
+            // within a provider; the host sorts providers by mod id below.
+            for (kind, entries) in &jar.fabric_entrypoints {
+                for entry in entries {
+                    let row = FabricEntrypointContainer {
+                        kind: kind.clone(),
+                        class: entry.class.clone(),
+                        provider: id.clone(),
+                    };
+                    if !self.fabric_entrypoint_containers.contains(&row) {
+                        self.fabric_entrypoint_containers.push(row);
+                    }
+                }
+            }
         }
     }
 
@@ -248,7 +265,15 @@ impl StdHost {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/Collection;") => {
                 let containers = self.fabric_containers();
-                Some(Ok(collection_value("list", &containers)))
+                // `FabricLoaderImpl.setup` stores the one
+                // `Collections.unmodifiableList(mods)` wrapper and returns
+                // that same object on every query. The backing list is fixed
+                // after setup, so a shared immutable host row is exact here.
+                Some(Ok(self.shared_unmodifiable(
+                    "fabric-loader-all-mods",
+                    "java/util/Collections$UnmodifiableRandomAccessList",
+                    containers,
+                )))
             }
             (MOD_METADATA, ..) => {
                 let id = loader::metadata_id(receiver)?;
