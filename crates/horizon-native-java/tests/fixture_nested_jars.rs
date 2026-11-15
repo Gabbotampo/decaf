@@ -6,6 +6,9 @@
 //! `libjf-base` dependency and the runtime answered "class not on the class
 //! path" (`docs/in-game-survey.md`, "Top causes" §5).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, dependencies};
 use std::{
     fs,
@@ -120,7 +123,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-nested-{test}-{}-{unique}",
             std::process::id()
         ));

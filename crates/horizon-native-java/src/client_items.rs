@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{MethodRef, StdHost, Value, collection_value, component_value};
+use crate::{MethodRef, StdHost, Value, component_value};
 
 use super::{ClientSnapshot, flag, int_arg, marker};
 
@@ -34,6 +34,9 @@ pub(super) const STACK: &str = "client/stack/";
 pub(super) const ITEM: &str = "client/item/";
 pub(super) const BLOCK: &str = "client/block/";
 pub(super) const INVENTORY: &str = "client/inventory";
+
+/// The game's `NonNullList` (`extends AbstractList`).
+pub(crate) const NON_NULL_LIST: &str = "net/minecraft/core/NonNullList";
 pub(super) const EFFECT: &str = "client/effect/";
 pub(super) const EFFECT_HOLDER: &str = "client/effect-holder/";
 pub(super) const MOB_EFFECT: &str = "client/mob-effect/";
@@ -365,7 +368,9 @@ impl StdHost {
                 let effects: Vec<Value> = (0..p.effects.len())
                     .map(|i| marker(format!("{EFFECT}{i}")))
                     .collect();
-                collection_value("list", &effects)
+                // `activeEffects.values()`: the game's map view, which a new
+                // list stands in for (#156 P14d2).
+                self.new_collection(crate::stand_in_class("list"), effects)
             }
             ("hasEffect", "Z") => {
                 let id = crate::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
@@ -544,7 +549,10 @@ impl StdHost {
             ("getNonEquipmentItems", _) => {
                 let stacks: Vec<Value> =
                     (0..36).map(|i| StackSlot::Inventory(i).marker()).collect();
-                collection_value("list", &stacks)
+                // `Inventory.items`, the inventory's one `NonNullList`: its
+                // reads answer as a `List`'s, its mutators (`NonNullList`'s
+                // own rules) are counted (#255 review).
+                self.cached_collection(&marker(INVENTORY), "items", NON_NULL_LIST, true, stacks)
             }
             ("getFreeSlot", "I") => Value::Int(
                 p.inventory

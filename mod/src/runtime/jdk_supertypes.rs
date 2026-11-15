@@ -567,24 +567,6 @@ const TABLE: &[(&str, &[&str])] = &[
     ("java/util/Optional", &["java/lang/Object"]),
 ];
 
-/// The interfaces every list, set or map marker the runtime builds itself
-/// (`list/...`, `set/...`, `map/...`) implements, whatever concrete class
-/// `List.of`, `new ArrayList` or a stream collector would have made.
-const LIST_TYPES: &[&str] = &[
-    "java/util/List",
-    "java/util/SequencedCollection",
-    "java/util/Collection",
-    "java/lang/Iterable",
-    "java/lang/Object",
-];
-const SET_TYPES: &[&str] = &[
-    "java/util/Set",
-    "java/util/Collection",
-    "java/lang/Iterable",
-    "java/lang/Object",
-];
-const MAP_TYPES: &[&str] = &["java/util/Map", "java/lang/Object"];
-
 /// Whether an object of the JDK class `class` is an instance of `target`;
 /// `None` when `class` is not one `TABLE` lists.
 pub(super) fn jdk_instance_of(class: &str, target: &str) -> Option<bool> {
@@ -598,8 +580,8 @@ pub(super) fn is_listed(class: &str) -> bool {
 }
 
 /// `true` when a runtime collection `marker` is certainly an instance of
-/// `target` (`List` for a list marker...); `false` when that is not known.
-/// An unmodifiable collection (`java_immutable`, `<class>#immutable<n>`)
+/// `target`; `false` when that is not known (no text is a collection,
+/// #156 P14d2). An unmodifiable collection (`java_immutable`, `<class>#immutable<n>`)
 /// implements its interfaces whichever JDK class (`List12`, `ListN`) the
 /// real factory would have picked.
 pub(super) fn collection_marker_is(marker: &str, target: &str) -> bool {
@@ -608,12 +590,5 @@ pub(super) fn collection_marker_is(marker: &str, target: &str) -> bool {
         return !supertypes.is_empty()
             && (target == "java/lang/Object" || supertypes.contains(&target));
     }
-    let kind = marker.split('/').next().unwrap_or(marker);
-    let types = match kind {
-        "list" => LIST_TYPES,
-        "set" => SET_TYPES,
-        "map" => MAP_TYPES,
-        _ => return false,
-    };
-    types.contains(&target)
+    false
 }

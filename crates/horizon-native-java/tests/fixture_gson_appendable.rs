@@ -208,13 +208,18 @@ impl Drop for Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        // The counter keeps two parallel tests in this process apart: the
+        // clock alone repeats on a coarse timer (macOS), and then one test's
+        // `Drop` deleted the jar the other was reading (#255 round 4, S3).
+        static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "horizon-gson-writer-{}-{}",
+            "horizon-gson-writer-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let classes = root.join("classes");
         let srcs = [

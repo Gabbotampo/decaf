@@ -7,6 +7,9 @@
 //! back. Malformed and over-deep documents are refused with a bounded reason
 //! instead of answering an empty value.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -184,7 +187,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-gson-{test}-{}-{unique}",
             std::process::id()
         ));
@@ -277,21 +280,34 @@ fn gson_round_trips_primitives_strings_lists_and_maps() {
     );
 }
 
+/// `Gson.fromJson` that Gson would refuse: a malformed document (Gson's
+/// `JsonSyntaxException`, whose message carries the reader's position) and
+/// one nested past `JsonReader`'s 255 levels. Neither is reproduced: the
+/// call is counted.
 #[test]
-fn malformed_json_is_refused_with_a_bounded_reason() {
+fn malformed_and_too_deep_json_are_counted() {
     let fixture = Fixture::build("malformed");
-    let error = fixture
-        .call(
+    for json in [
+        "[".to_owned(),
+        format!("{}{}", "[".repeat(256), "]".repeat(256)),
+    ] {
+        let mut host = StdHost::new();
+        let _ = fixture.jar.invoke_method_with_args(
+            "demo/Probe",
             "parse",
             "(Ljava/lang/String;)Ljava/lang/String;",
-            &[Value::Ref(Some("[".into()))],
-        )
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("Gson.fromJson rejected the document"),
-        "unexpected error: {message}"
-    );
+            None,
+            &[Value::Ref(Some(json))],
+            &mut host,
+        );
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson")),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
 }
 
 #[test]
@@ -301,34 +317,28 @@ fn lenient_json_accepts_comments_and_a_byte_order_mark() {
     assert_eq!(fixture.text_with("lenient", document), "2");
 }
 
+/// 40 nested arrays are well within `JsonReader`'s 255 levels: a raw `List`
+/// holding one list, as Gson 2.14.0 reads it.
 #[test]
-fn deeply_nested_json_is_refused_by_the_depth_bound() {
+fn nested_json_within_gsons_limit_is_read() {
     let fixture = Fixture::build("depth");
     let json = format!("{}{}", "[".repeat(40), "]".repeat(40));
-    let error = fixture
-        .call(
-            "parse",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            &[Value::Ref(Some(json))],
-        )
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("nests") && message.contains("at most 32"),
-        "unexpected error: {message}"
-    );
+    assert_eq!(fixture.text_with("parse", &json), "1");
 }
 
+/// A raw `Map`'s numbers are `ObjectTypeAdapter`'s `Double`s, so the value
+/// read back prints `7.0` (Gson 2.14.0 writes `{"a":7.0}` and reads it back
+/// as `7.0`).
 #[test]
 fn file_writer_and_file_reader_round_trip_through_the_virtual_file() {
     let fixture = Fixture::build("file-round-trip");
-    assert_eq!(fixture.text("fileRoundTrip"), "false|true|7");
+    assert_eq!(fixture.text("fileRoundTrip"), "false|true|7.0");
 }
 
 #[test]
 fn output_stream_writer_and_files_reader_share_the_same_file() {
     let fixture = Fixture::build("stream-round-trip");
-    assert_eq!(fixture.text("streamRoundTrip"), "2");
+    assert_eq!(fixture.text("streamRoundTrip"), "2.0");
 }
 
 #[test]

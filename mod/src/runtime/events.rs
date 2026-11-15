@@ -1494,6 +1494,21 @@ impl StdHost {
         // resource) answer from the firing's server facts. Outside a firing
         // there are none, so only what a marker holds by itself answers (a rule's id and default, a resource's id).
         if facade_server::owns(text) {
+            // A registry's `keySet()`: a set of its own (#156 P14d2).
+            let ids = match self.game_event.as_deref() {
+                Some(firing) => facade_server::key_set(&firing.facade.server, text, r),
+                None => facade_server::key_set(&ServerFacts::default(), text, r),
+            };
+            if let Some(ids) = ids {
+                return Some(ids.map(|ids| {
+                    self.factory_unmodifiable(
+                        "java/util/Collections",
+                        "unmodifiableSet",
+                        "set",
+                        ids,
+                    )
+                }));
+            }
             return Some(match self.game_event.as_deref() {
                 Some(firing) => facade_server::answer(&firing.facade.server, text, r, args),
                 None => facade_server::answer(&ServerFacts::default(), text, r, args),
