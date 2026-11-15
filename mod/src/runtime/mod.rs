@@ -4335,6 +4335,13 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<Value>> {
+        // A typed SetFromMap handle reads its backing map's keys.
+        if let Value::Host(handle) = receiver
+            && handle.kind() == HostKind::Collection
+            && let Some(values) = self.set_from_map_values(handle.key())
+        {
+            return Some(values);
+        }
         // A `String` is no collection, whatever it spells (`jar_object.rs`).
         if jar_object::spells_key(receiver) {
             return None;
@@ -5430,10 +5437,16 @@ impl Host for StdHost {
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {
+        eprintln!(
+            "SETMAP? {value:?} keys={:?}",
+            self.set_from_map_views.keys().collect::<Vec<_>>()
+        );
         let Value::Host(handle) = value else {
             return false;
         };
-        handle.kind() == HostKind::Collection && self.set_from_map_views.contains_key(handle.key())
+        let answer = handle.kind() == HostKind::Collection
+            && self.set_from_map_views.contains_key(handle.key());
+        answer
     }
 
     fn set_from_map_source(&self, value: &Value) -> Option<Value> {
@@ -5480,6 +5493,18 @@ impl Host for StdHost {
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        if let Value::Host(handle) = value
+            && handle.kind() == HostKind::Collection
+            && let Some(map) = self.set_from_map_views.get(handle.key()).cloned()
+        {
+            let mut entries = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                entries.push(value);
+                entries.push(Value::Boxed(Boxed::Boolean(true)));
+            }
+            self.mutable_collections.insert(map, entries);
+            return;
+        }
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
             self.mutable_collections.insert(marker, values);
@@ -22542,6 +22567,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
+        eprintln!(
+            "CALLBACK target={:?} captures={:?} args={:?}",
+            callback.target, callback.captures, args
+        );
         // The callback target may live in a linked library jar, so resolve it
         // the same way a frame resolves its own class: the host's modelled
         // surface wins over a lookalike class in the pack.

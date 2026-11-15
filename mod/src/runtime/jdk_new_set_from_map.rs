@@ -124,7 +124,13 @@ impl StdHost {
         let marker = crate::runtime::jar_object::object_key(receiver)?.to_owned();
         let map = self.set_from_map_views.get(&marker)?.clone();
         let source = args.first()?;
-        let retained = crate::runtime::runtime_collection_values(self, source).ok()?;
+        let retained = match crate::runtime::runtime_collection_values(self, source) {
+            Ok(values) => values,
+            Err(error) => {
+                eprintln!("RETAIN error={error:?}");
+                return Some(Err(error));
+            }
+        };
         let values = self.mutable_collections.get_mut(&map)?;
         let mut changed = false;
         let mut kept = Vec::with_capacity(values.len());

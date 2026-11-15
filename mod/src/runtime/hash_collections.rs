@@ -602,16 +602,6 @@ impl<H: Host> Runtime<'_, H> {
         for arg in args.iter() {
             self.refresh_set_from_map(arg)?;
         }
-        if let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb7 | 0xb9))
-            && self.host.is_set_from_map(receiver)
-            && matches!(r.name.as_str(), "removeIf" | "retainAll")
-        {
-            // Set's default removeIf/retainAll walks an iterator. The host
-            // can answer these two live-view operations directly, preserving
-            // write-through to the backing map instead of mutating a detached
-            // iterator row.
-            return self.host.invoke_instance(r, receiver, args).map(Some);
-        }
         if let Some(answer) = self.map_view_copy(r, opcode, receiver, args)? {
             return Ok(answer);
         }
