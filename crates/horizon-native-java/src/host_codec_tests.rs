@@ -127,7 +127,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         // collections exact, the constants' reads counted (#199 F2).
         (
             "codecConstants",
-            CountedAs("truefalsetruefalsetruefalse2true1truefalse1true"),
+            Exact("truefalsetruefalsetruefalse2true1truefalse1true"),
         ),
         // `Set.of` refuses one constant twice and prints it (DFU's `toString`).
         (
