@@ -43,6 +43,14 @@ use crate::Value;
 use crate::host_ref::{HostKind, HostRef, Methods};
 
 pub(crate) const IDENTIFIER: &str = "net/minecraft/resources/Identifier";
+pub(crate) fn identifier_types(_: &str) -> &'static [&'static str] {
+    &[
+        IDENTIFIER,
+        "net/minecraft/resources/ResourceLocation",
+        "java/lang/Comparable",
+    ]
+}
+
 /// `Identifier`'s name before the 1.21 rename; an older jar's
 /// `ResourceLocation` is the same handle.
 const RESOURCE_LOCATION: &str = "net/minecraft/resources/ResourceLocation";

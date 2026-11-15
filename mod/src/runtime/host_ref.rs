@@ -1680,7 +1680,9 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::FabricStaticIdentifier,
         tag: "fsi",
-        class: ClassRule::Fixed("net/minecraft/resources/Identifier"),
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_ids::identifier_types,
+        },
         canonical: always_canonical,
         methods: &crate::runtime::host_ids::IDENTIFIER_METHODS,
     },
