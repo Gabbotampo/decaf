@@ -134,16 +134,21 @@ impl<H: Host> Runtime<'_, H> {
             attributes,
             text.is_empty(),
         );
+        let bytes = self.io_file_bytes.get(&source).cloned();
         if moving {
             self.io_dirs.remove(&source);
             self.io_files.remove(&source);
+            self.io_file_bytes.remove(&source);
         }
         if directory {
             self.io_dirs.insert(target.clone());
         } else {
             self.io_dirs.remove(&target);
         }
-        self.io_files.insert(target, text);
+        self.io_store_file(target.clone(), text);
+        if let Some(bytes) = bytes {
+            self.io_file_bytes.insert(target, bytes);
+        }
         Ok(Some(answer))
     }
 }

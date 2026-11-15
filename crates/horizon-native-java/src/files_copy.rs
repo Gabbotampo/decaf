@@ -105,6 +105,7 @@ impl<H: Host> Runtime<'_, H> {
             // `deleteIfExists(target)` first (`watch_service.rs`).
             self.watch_deleted(&target);
             self.io_files.remove(&target);
+            self.io_file_bytes.remove(&target);
         }
         if self.io_files.contains_key(&target) {
             return Err(thrown(
@@ -121,8 +122,7 @@ impl<H: Host> Runtime<'_, H> {
         if count > 0 {
             self.watch_change(&target, watch_service::Change::Modify);
         }
-        self.io_files
-            .insert(target, String::from_utf8_lossy(&bytes).into_owned());
+        self.io_store_bytes(target, bytes);
         Ok(Some(Value::Long(count)))
     }
 }

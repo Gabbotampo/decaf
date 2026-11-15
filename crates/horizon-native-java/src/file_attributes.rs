@@ -11,7 +11,7 @@
 //! `File.isDirectory` false and `File.isFile` true for a directory the run
 //! made: silent wrong answers for paths the model holds.
 //!
-//! **What the model knows.** It keeps the files a run wrote (`io_files`) and,
+//! **What the model knows.** It keeps the files a jar host wrote (`io_files`) and,
 //! since this module, the directories it made (`io_dirs`: `createDirectory`,
 //! `createDirectories`, `File.mkdir`, `File.mkdirs`). A path is
 //!
@@ -48,7 +48,10 @@
 //! On that object, `isDirectory`, `isRegularFile`, `isSymbolicLink` (false:
 //! the model has no links) and `isOther` (false) are exact. `size`,
 //! `lastModifiedTime`, `lastAccessTime`, `creationTime` and `fileKey` are
-//! counted. The model keeps a file's text, not its bytes or charset (a
+//! counted. The model keeps decoded text and each writer's encoded bytes. File.length
+//! uses the latter, so UTF-8 and the six standard JDK charsets have their
+//! Java byte lengths. Times and the inode belong to the machine.
+//!
 //! UTF-16 writer makes `"ab"` six bytes long). A directory's size is the
 //! filesystem's (8192 on the oracle's). Times and the inode belong to the
 //! machine.
@@ -121,7 +124,8 @@ fn is_parent_of(ancestor: &str, path: &str) -> bool {
 impl<H: Host> Runtime<'_, H> {
     /// What `path` is in the file model (see the module docs).
     pub(crate) fn file_kind(&mut self, path: &str) -> FileKind {
-        let path = path.trim_end_matches('/');
+        let absolute = host_path::sandbox_absolute(path);
+        let path = absolute.trim_end_matches('/');
         // The working directory (`Path.of("")`, `Path.of(".")`) always exists.
         if path.is_empty()
             || path == "."
@@ -147,7 +151,8 @@ impl<H: Host> Runtime<'_, H> {
     /// A loader folder's contents are the game's, so deleting one is
     /// [`Deletion::Unknown`].
     pub(crate) fn delete_path(&mut self, path: &str) -> Deletion {
-        let path = path.trim_end_matches('/');
+        let absolute = host_path::sandbox_absolute(path);
+        let path = absolute.trim_end_matches('/');
         match self.file_kind(path) {
             FileKind::Missing => return Deletion::Missing,
             FileKind::Directory => {
@@ -170,6 +175,7 @@ impl<H: Host> Runtime<'_, H> {
         self.watch_deleted(path);
         self.io_dirs.remove(path);
         self.io_files.remove(path);
+        self.io_file_bytes.remove(path);
         Deletion::Deleted
     }
 
