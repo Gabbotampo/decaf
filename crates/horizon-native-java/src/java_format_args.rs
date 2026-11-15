@@ -56,6 +56,16 @@ impl<H: Host> Runtime<'_, H> {
     /// One element of the `Object[]`, classed as `Object.getClass` would
     /// class it (`class_of_value`).
     fn format_arg(&mut self, value: &Value) -> Arg {
+        // Java dispatches %s on Formattable through the jar object's
+        // formatTo(Formatter, flags, width, precision), not toString(). The
+        // bounded runtime does not yet execute that callback, so refuse the
+        // whole format rather than silently printing the wrong text.
+        if let Value::Host(handle) = value
+            && let Some(class) = handle.class()
+            && self.class_known_instance_of(class, "java/util/Formattable") == Some(true)
+        {
+            return Arg::Opaque;
+        }
         let marker = match value {
             Value::Ref(None) => return Arg::Null,
             Value::Int(value) => return Arg::Int(*value),

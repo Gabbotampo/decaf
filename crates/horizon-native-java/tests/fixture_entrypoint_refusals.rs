@@ -358,6 +358,11 @@ fn stack_walker_sees_the_jar_frames_innermost_first() {
         "demo/Logs.java",
         r#"package demo;
 public final class Logs {
+    static String walkStream() {
+        return StackWalker.getInstance().walk(frames -> frames.limit(4)
+            .map(frame -> frame.getClassName() + "." + frame.getMethodName())
+            .collect(java.util.stream.Collectors.joining(",")));
+    }
     static String callerCaller() {
         return StackWalker.getInstance()
             .walk(frames -> frames.skip(2).findFirst())
@@ -378,13 +383,14 @@ public final class Main {
     public static void main() {
         Probe.check("caller", "demo.Main".equals(Logs.named()));
         Probe.check("method", "method".equals(Logs.method()));
+        Probe.check("stream", "demo.Logs.walkStream,demo.Main.main".equals(Logs.walkStream()));
     }
 }
 "#,
     );
     assert_eq!(
         run("stack-walker", sources, &[]),
-        all_true(&["caller", "method"])
+        all_true(&["caller", "method", "stream"])
     );
 }
 

@@ -88,7 +88,14 @@ impl<H: Host> Runtime<'_, H> {
                     .ok_or_else(|| NativeError::Metadata("invalid StackWalker receiver".into()))?;
                 // `walk`'s own frame is the JDK's, not the caller's; the first
                 // frame the function sees is the method that called `walk`.
-                let frames = snapshot()
+                // A top-level native entrypoint has no interpreter caller frame
+                // to stand in for Java's launcher/main frame. Refuse the walk
+                // instead of returning a silently truncated stream.
+                let snapshot = snapshot();
+                if snapshot.len() < 2 {
+                    return Ok(None);
+                }
+                let frames = snapshot
                     .iter()
                     .map(|(class, method)| {
                         crate::runtime::host_jdk::frame_value_with_retain(
