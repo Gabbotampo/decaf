@@ -2198,7 +2198,8 @@ impl NativeJar {
                 .values()
                 .chain(&results)
                 .chain(returned_value.as_ref())
-                .filter_map(|value| crate::heap::value_text(value).map(str::to_owned))
+                .flat_map(crate::heap::value_texts)
+                .map(str::to_owned)
                 .collect();
             let persistence = runtime.persist_class_state();
             let io_persistence = runtime.persist_io_state();
