@@ -124,7 +124,8 @@ pub(crate) fn static_call(
     // register RETURN and calls Holder.Reference.bindValue(entry). This state
     // is exact only when that module is present in the explicitly linked run
     // metadata; vanilla, Fabric without it, and NeoForge stay unbound here.
-    let fabric_registry_sync = host.fabric_mod_present("fabric-registry-sync-v0");
+    let fabric_registry_sync = host.run_loader == crate::runtime::class_precedence::RunLoader::Fabric
+        && host.fabric_mod_present("fabric-registry-sync-v0");
     let answer = match r.descriptor.as_str() {
         "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" => {
             make_for_identifier(registry, id_or_key, value, fabric_registry_sync)

@@ -2,10 +2,10 @@
 //! The host probe exercises the pre-freeze state. The committed oracle records
 //! both states from a real writable 26.3 MappedRegistry run.
 
-use horizon_native_java::{StdHost, Value};
-
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
+
+use horizon_native_java::{RunLoader, StdHost, Value};
 
 const REAL_ORACLE: &str = include_str!("fixtures/holder_reference/java25.txt");
 const EXPECTED: &str = "demo:item|Optional[demo:item]|Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]' from registry Registry[ResourceKey[minecraft:root / minecraft:item] (Stable)]|truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|falsefalse|Reference{ResourceKey[minecraft:item / demo:item]=null}|truefalse|false";
@@ -120,7 +120,9 @@ fn self_registered_holders_match_java_25() {
     );
     assert_eq!(fixture.text("holder"), EXPECTED);
 
-    let mut fabric_without_sync = fixture.jar.seed_host(StdHost::new());
+    let mut fabric_without_sync = fixture
+        .jar
+        .seed_host(StdHost::new().with_run_loader(RunLoader::Fabric));
     let without_sync = fixture
         .jar
         .invoke_method_with_args(
@@ -134,9 +136,11 @@ fn self_registered_holders_match_java_25() {
         .unwrap();
     assert_eq!(without_sync, Value::Ref(Some(EXPECTED.into())));
 
-    let mut fabric_with_sync = fixture
-        .jar
-        .seed_host(StdHost::new().with_mod("fabric-registry-sync-v0", "8.0.4"));
+    let mut fabric_with_sync = fixture.jar.seed_host(
+        StdHost::new()
+            .with_run_loader(RunLoader::Fabric)
+            .with_mod("fabric-registry-sync-v0", "8.0.4"),
+    );
     let bound = fixture
         .jar
         .invoke_method_with_args(
