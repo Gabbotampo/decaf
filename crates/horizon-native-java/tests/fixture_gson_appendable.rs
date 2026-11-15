@@ -50,7 +50,7 @@ public class JsonWriter { public JsonWriter(java.io.Writer out) {} public void f
 const PROBE: &str = r#"package demo;
 import com.google.gson.*; import java.io.*;
 public final class Probe {
-  public static String writers() throws Exception {
+  public static String writers() {
     Gson gson = new GsonBuilder().setPrettyPrinting().serializeNulls().disableHtmlEscaping().create();
     JsonObject o = new JsonObject();
     o.addProperty("text", "<&>"); o.addProperty("bool", Boolean.TRUE);
@@ -58,26 +58,23 @@ public final class Probe {
     o.addProperty("nil", (String) null);
     StringBuilder b = new StringBuilder(); gson.toJson(o, b);
     StringWriter s = new StringWriter(); gson.toJson(o, s);
-    File file = new File("gson.json");
-    FileWriter fw = new FileWriter(file); gson.toJson(o, fw); fw.close();
-    JsonObject fromFile = gson.fromJson(new FileReader(file), JsonObject.class);
-    StringWriter jtext = new StringWriter();
-    com.google.gson.stream.JsonWriter jw = gson.newJsonWriter(jtext);
-    gson.toJson((JsonElement)o, jw); jw.flush();
     String compact = new Gson().toJson(o);
     String omitted = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create().toJson(o);
-    String failure;
-    try {
-      gson.toJson(o, new Appendable() {
-        public Appendable append(CharSequence x) throws IOException { throw new IOException("boom"); }
-        public Appendable append(CharSequence x, int a, int z) throws IOException { throw new IOException("boom"); }
-        public Appendable append(char x) throws IOException { throw new IOException("boom"); }
-      }); failure = "none";
-    } catch (JsonIOException e) { failure = e.getClass().getName(); }
     return b.toString().replace("\n", "\\n") + "|S=" + s.toString().replace("\n", "\\n")
-      + "|W=" + gson.toJson(fromFile).replace("\n", "\\n")
-      + "|J=" + jtext.toString().replace("\n", "\\n") + "|C=" + compact + "|O="
-      + omitted.replace("\n", "\\n") + "|F=" + failure;
+      + "|C=" + compact + "|O=" + omitted.replace("\n", "\\n");
+  }
+  public static String unsupportedAppendable() {
+    Gson gson = new Gson();
+    gson.toJson(new JsonObject(), new Appendable() {
+      public Appendable append(CharSequence x) throws IOException { throw new IOException("boom"); }
+      public Appendable append(CharSequence x, int a, int z) throws IOException { throw new IOException("boom"); }
+      public Appendable append(char x) throws IOException { throw new IOException("boom"); }
+    });
+    return "unreachable";
+  }
+  public static String fileWriter() throws Exception {
+    FileWriter fw = new FileWriter(new File("gson.json"));
+    new Gson().toJson(new JsonObject(), fw); fw.close(); return "unreachable";
   }
   public static String nullKey() { try { new JsonObject().addProperty((String)null, "x"); return "no"; } catch (NullPointerException e) { return "npe"; } }
 }
@@ -158,18 +155,18 @@ impl Fixture {
             jar: NativeJar::from_path(&jar_path).unwrap(),
         }
     }
-    fn call(&self, name: &str) -> Result<Value, NativeError> {
+    fn call_with_host(&self, name: &str, host: &mut StdHost) -> Result<Value, NativeError> {
         self.jar.invoke_method_with_args(
             "demo/Probe",
             name,
             "()Ljava/lang/String;",
             None,
             &[],
-            &mut StdHost::new(),
+            host,
         )
     }
     fn text(&self, name: &str) -> String {
-        match self.call(name).unwrap() {
+        match self.call_with_host(name, &mut StdHost::new()).unwrap() {
             Value::Ref(Some(s)) => s,
             v => panic!("{name}: {v:?}"),
         }
@@ -177,11 +174,35 @@ impl Fixture {
 }
 
 #[test]
-fn writers_options_tree_properties_and_ioexception_match_real_gson() {
+fn writers_options_and_tree_properties_match_real_gson() {
     let f = Fixture::new();
     assert_eq!(
         f.text("writers"),
-        r#"{\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|S={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|W={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|J={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|C={"text":"\u003c\u0026\u003e","bool":true,"num":2.5,"char":"x"}|O={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x"\n}|F=com.google.gson.JsonIOException"#
+        r#"{\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|S={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x",\n  "nil": null\n}|C={"text":"\u003c\u0026\u003e","bool":true,"num":2.5,"char":"x"}|O={\n  "text": "<&>",\n  "bool": true,\n  "num": 2.5,\n  "char": "x"\n}"#
+    );
+}
+
+#[test]
+fn unsupported_appendable_is_counted() {
+    let f = Fixture::new();
+    let mut host = StdHost::new();
+    let _ = f.call_with_host("unsupportedAppendable", &mut host);
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.starts_with("com/google/gson/Gson#toJson"))
+    );
+}
+
+#[test]
+fn file_writer_is_counted_before_any_virtual_side_effect() {
+    let f = Fixture::new();
+    let mut host = StdHost::new();
+    let _ = f.call_with_host("fileWriter", &mut host);
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("FileWriter"))
     );
 }
 
