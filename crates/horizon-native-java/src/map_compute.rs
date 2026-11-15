@@ -56,7 +56,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         // Only a callback marker is the interpreter's to run; the host keeps
         // its own answer for anything else.
-        if !expect_ref(function).is_some_and(|marker| marker.starts_with("@indy:")) {
+        if !expect_ref(function).is_some_and(|marker| crate::callback_marker::is_callback(marker)) {
             return Ok(None);
         }
         let get = MethodRef {

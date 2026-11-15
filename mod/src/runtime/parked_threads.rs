@@ -83,14 +83,8 @@ fn runnable_name(value: &Value) -> String {
     let Some(marker) = expect_ref(value) else {
         return "null".into();
     };
-    if marker.starts_with("@indy:") {
-        // `@indy:<source>:<index>:<owner#name(descriptor)>:<captures>`.
-        if let Some(target) = marker.split(':').nth(3) {
-            return target
-                .split_once('(')
-                .map_or(target, |(name, _)| name)
-                .to_owned();
-        }
+    if let Ok(callback) = crate::runtime::callback_marker::parse(marker) {
+        return format!("{}#{}", callback.target.owner, callback.target.name);
     }
     // A host model's own object (`java/lang/Thread#neutral2`) names its class.
     marker

@@ -1911,7 +1911,7 @@ fn context_subject(facade: &EventFacade, context: &EventContext) -> Option<Value
 /// The last `@indy:` argument of a registration call: its listener.
 pub(crate) fn indy_argument(args: &[Value]) -> Option<&str> {
     args.iter().rev().find_map(|value| match value {
-        Value::Ref(Some(text)) if text.starts_with("@indy:") => Some(text.as_str()),
+        Value::Ref(Some(text)) if crate::runtime::callback_marker::is_callback(text) => Some(text.as_str()),
         _ => None,
     })
 }

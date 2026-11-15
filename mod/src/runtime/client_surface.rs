@@ -914,13 +914,15 @@ impl StdHost {
         let mut refused = Vec::new();
         for (id, element, source) in &self.client.layers {
             let callback = match expect_ref(element) {
-                Some(text) if text.starts_with("@indy:") => match parse_callback_marker(text) {
-                    Ok(marker) => Some(ListenerCallback::Indy {
-                        target: marker.target,
-                        captures: marker.captures,
-                    }),
-                    Err(_) => None,
-                },
+                Some(text) if crate::runtime::callback_marker::is_callback(text) => {
+                    match parse_callback_marker(text) {
+                        Ok(marker) => Some(ListenerCallback::Indy {
+                            target: marker.target,
+                            captures: marker.captures,
+                        }),
+                        Err(_) => None,
+                    }
+                }
                 _ => events::jar_object(jar, element).and_then(|(class, value)| {
                     ["extractRenderState", "render"]
                         .iter()
@@ -2026,14 +2028,12 @@ impl NativeJar {
         budget: &ExecutionBudget,
     ) -> Result<(), NativeError> {
         let callback = match expect_ref(task) {
-            Some(text) if text.starts_with("@indy:") => {
-                parse_callback_marker(text)
-                    .ok()
-                    .map(|marker| ListenerCallback::Indy {
-                        target: marker.target,
-                        captures: marker.captures,
-                    })
-            }
+            Some(text) if crate::runtime::callback_marker::is_callback(text) => parse_callback_marker(text)
+                .ok()
+                .map(|marker| ListenerCallback::Indy {
+                    target: marker.target,
+                    captures: marker.captures,
+                }),
             _ => events::jar_object(self, task).and_then(|(class, value)| {
                 events::resolve_method(self, class, "run", "()V").map(|method| {
                     ListenerCallback::Object {

@@ -211,6 +211,15 @@ impl<H: Host> Runtime<'_, H> {
                 crate::runtime::stream_pipeline::STREAM_TEXT.into(),
             ))));
         }
+        // A callback's `toString` is its hidden class and identity hash, which
+        // no run reproduces: counted, and its marker (which carries the run's
+        // tag) never printed (`callback_marker.rs`).
+        if crate::runtime::callback_marker::holds_callback(marker) {
+            self.host.unknown_operand_call(&object_to_string())?;
+            return Ok(Some(Value::Ref(Some(
+                crate::runtime::callback_marker::CALLBACK_TEXT.into(),
+            ))));
+        }
         // A host map entry prints `key=value` (`host_entry.rs`).
         if let Some(text) = self.host_entry_text(value, class, method)? {
             return Ok(Some(text));

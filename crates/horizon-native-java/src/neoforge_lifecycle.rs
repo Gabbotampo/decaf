@@ -365,7 +365,7 @@ impl NativeJar {
     /// a jar object's method.
     fn work_callback(&self, task: &DeferredTask) -> Option<ListenerCallback> {
         if let Some(text) = expect_ref(&task.work)
-            && text.starts_with("@indy:")
+            && crate::callback_marker::is_callback(text)
         {
             let marker = crate::parse_callback_marker(text).ok()?;
             return Some(ListenerCallback::Indy {

@@ -1225,9 +1225,9 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             Handle::LambdaFactory {
-                descriptor: _,
+                descriptor,
                 implementation,
-            } => Ok(self.spin_lambda(implementation, args)?),
+            } => Ok(self.spin_lambda(descriptor, implementation, args)?),
         }
     }
 
@@ -1238,6 +1238,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `MethodHandle.invokeExact` on the handle itself, captured first.
     fn spin_lambda(
         &mut self,
+        factory: &str,
         implementation: &Handle,
         captured: &[Value],
     ) -> Result<Value, NativeError> {
@@ -1257,9 +1258,17 @@ impl<H: Host> Runtime<'_, H> {
                 )
             }
         };
-        Ok(Value::Ref(Some(format!(
-            "@indy:{METAFACTORY_SITE}:0:{target}:{}",
-            bounded_captured_markers(&captures)
+        // The factory type's result is the functional interface made.
+        let sam = crate::return_desc(factory)
+            .strip_prefix('L')
+            .and_then(|class| class.strip_suffix(';'))
+            .unwrap_or("");
+        Ok(Value::Ref(Some(crate::callback_marker::make(
+            METAFACTORY_SITE,
+            0,
+            sam,
+            &target,
+            &bounded_captured_markers(&captures),
         ))))
     }
 

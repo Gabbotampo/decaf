@@ -22,6 +22,7 @@ mod attachment_codec;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
+mod callback_marker;
 mod charset_decoder;
 mod checkcast;
 mod class_init;
@@ -170,6 +171,10 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+/// A live callback token for tests that hand a host a listener without a jar
+/// (`callback_marker.rs`).
+#[doc(hidden)]
+pub use callback_marker::test_token as callback_test_token;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
 mod reference_identity;
@@ -4270,7 +4275,7 @@ impl StdHost {
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
                 && invocation.args.iter().any(|value| {
-                    matches!(value, Value::Ref(Some(marker)) if marker.starts_with("@indy:"))
+                    matches!(value, Value::Ref(Some(marker)) if crate::callback_marker::is_callback(marker))
                 })
         })
     }
@@ -7195,7 +7200,7 @@ impl Host for StdHost {
         if let Some(marker) = callback_text(receiver)
             && let Some(value) = functional_composition_marker(r, &marker, args)
         {
-            return Ok(value);
+            return value;
         }
         // A `Field`/`Method` handle's own facts (`host_reflect.rs`); its
         // `toString` is the kind's row. A field the runtime did not read (a
@@ -7807,10 +7812,16 @@ impl Host for StdHost {
                     {
                         return Ok(values[index * 2 + 1].clone());
                     }
+                    // A callback the host cannot run: counted, never a value
+                    // made up for it (the runtime runs it first, `map_compute.rs`).
+                    if crate::callback_marker::callback_text(function).is_some() {
+                        return self.unknown_host_call(r);
+                    }
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
                     let computed = match function {
-                        Value::Ref(Some(callback)) if callback.starts_with("@indy:") => {
-                            Value::Ref(Some(format!("computed/{}", value_marker(&key))))
-                        }
                         Value::Ref(None) => Value::Ref(None),
                         other => Value::Ref(Some(format!(
                             "computed/{}/{}",
@@ -9455,15 +9466,22 @@ impl Host for StdHost {
                 "filter",
                 "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
             ) => {
-                let Some(_value) = optional_present(receiver) else {
+                let Some(value) = optional_present(receiver) else {
                     return Ok(empty_optional());
                 };
-                let predicate = Self::argument(r, args, 0)?;
-                let accepted = matches!(
-                    predicate,
-                    Value::Ref(Some(marker)) if marker.starts_with("@indy:")
-                );
-                Ok(if accepted {
+                // `predicate.test(value)`: the host runs no callback, so the
+                // test is counted (above), never answered for the lambda.
+                let predicate = Self::argument(r, args, 0)?.clone();
+                let tested = self.invoke_instance(
+                    &MethodRef {
+                        owner: "java/util/function/Predicate".into(),
+                        name: "test".into(),
+                        descriptor: "(Ljava/lang/Object;)Z".into(),
+                    },
+                    &predicate,
+                    &[value.clone()],
+                )?;
+                Ok(if matches!(tested, Value::Int(flag) if flag != 0) {
                     receiver.clone()
                 } else {
                     empty_optional()
@@ -9602,38 +9620,40 @@ impl Host for StdHost {
                     Err(thrown_from_supplied(supplied))
                 }
             }
-            (
-                "java/util/function/UnaryOperator",
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-            )
-            | ("java/util/function/Function", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-                Ok(Self::argument(r, args, 0)?.clone())
-            }
-            (
-                "java/util/function/BiFunction",
-                "apply",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ) => Ok(Self::argument(r, args, 1)?.clone()),
-            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => {
+            // A functional interface's method on a value the host holds: the
+            // host runs no jar code (the runtime runs callbacks before a call
+            // gets here), so it counts the call, never answers for the
+            // callback (#156 P15a: `apply` used to answer its argument,
+            // `test` true for any lambda, `get` null, uncounted).
+            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
                 if let Some(marker) = receiver_marker.as_deref()
                     && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
-                    && let Some((left, right)) = rest.split_once('|')
-                {
-                    self.invoke_instance(r, &composed_callback(left), args)?;
-                    self.invoke_instance(r, &composed_callback(right), args)?;
-                }
+                    && let Some((left, right)) = rest.split_once('|') =>
+            {
+                self.invoke_instance(r, &composed_callback(left), args)?;
+                self.invoke_instance(r, &composed_callback(right), args)?;
                 Ok(Value::Void)
             }
             (
+                "java/util/function/UnaryOperator" | "java/util/function/Function",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            | (
+                "java/util/function/BiFunction",
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            | ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
+            | (
                 "java/util/function/BiConsumer",
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            ) => Ok(Value::Void),
-            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
-            )),
-            ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
+            )
+            | ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z")
+            | ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => {
+                self.unknown_host_call(r)
+            }
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
             // their registry wrappers by `registry.key().identifier()`.
@@ -10749,6 +10769,11 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Ref(Some(value)) if stream_pipeline::is_stream_marker(value) => {
             stream_pipeline::STREAM_TEXT.into()
         }
+        // Nor does a callback, or a composition holding one: its text carries
+        // the run's tag (`callback_marker.rs`).
+        Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
+            callback_marker::CALLBACK_TEXT.into()
+        }
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
@@ -11687,6 +11712,10 @@ fn value_text(value: &Value) -> String {
             if stream_pipeline::is_stream_marker(value) {
                 return stream_pipeline::STREAM_TEXT.into();
             }
+            // Nor does a callback (`callback_marker.rs`).
+            if callback_marker::holds_callback(value) {
+                return callback_marker::CALLBACK_TEXT.into();
+            }
             value.clone()
         }
         Value::Ref(None) => "null".into(),
@@ -12619,6 +12648,12 @@ fn object_text(host: &mut StdHost, value: &Value) -> String {
             if stream_pipeline::is_stream_marker(marker) {
                 let _ = host.unknown_host_call(&jar_text::object_to_string());
                 return stream_pipeline::STREAM_TEXT.into();
+            }
+            // A callback's text is the hidden class and an identity hash:
+            // counted, its marker never printed (`callback_marker.rs`).
+            if callback_marker::holds_callback(marker) {
+                let _ = host.unknown_host_call(&jar_text::object_to_string());
+                return callback_marker::CALLBACK_TEXT.into();
             }
             if crate::jar_object::packaged_object_class(value).is_some() {
                 let _ = host.unknown_host_call(&jar_text::object_to_string());
@@ -19448,7 +19483,9 @@ impl NativeJar {
             .iter()
             .rev()
             .find_map(|value| match value {
-                Value::Ref(Some(value)) if value.starts_with("@indy:") => Some(value.as_str()),
+                Value::Ref(Some(value)) if crate::callback_marker::is_callback(value) => {
+                    Some(value.as_str())
+                }
                 _ => None,
             })
             .ok_or_else(|| {
@@ -19502,71 +19539,13 @@ impl NativeJar {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct CallbackMarker {
-    target: MethodRef,
-    captures: Vec<Value>,
-}
+/// A callback marker read back (`callback_marker.rs`).
+type CallbackMarker = callback_marker::Callback;
 
+/// Read a live callback's text back (`callback_marker::parse`): a `String`
+/// spelled like one is no callback.
 fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
-    let mut parts = marker.splitn(5, ':');
-    if parts.next() != Some("@indy") {
-        return Err(NativeError::Metadata(
-            "invalid callback marker prefix".into(),
-        ));
-    }
-    let _source = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no source".into()))?;
-    let _index = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no call-site index".into()))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no target".into()))?;
-    let captures = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no captures".into()))?;
-    let (owner, method_and_descriptor) = target
-        .split_once('#')
-        .ok_or_else(|| NativeError::Metadata("callback target has no owner separator".into()))?;
-    let descriptor_at = method_and_descriptor
-        .find('(')
-        .ok_or_else(|| NativeError::Metadata("callback target has no descriptor".into()))?;
-    let target = MethodRef {
-        owner: owner.to_owned(),
-        name: method_and_descriptor[..descriptor_at].to_owned(),
-        descriptor: method_and_descriptor[descriptor_at..].to_owned(),
-    };
-    let captures = if captures.is_empty() {
-        Vec::new()
-    } else {
-        split_capture_markers(captures)?
-            .into_iter()
-            .map(|capture| parse_value_marker(&capture))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    Ok(CallbackMarker { target, captures })
-}
-
-/// Evaluate the bounded truth surface of a predicate marker.  Java's default
-/// `Predicate` combinators are represented as markers, so they remain usable
-/// even though the interpreter does not materialize interface instances.
-fn predicate_marker_value(marker: &str) -> bool {
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
-        return !predicate_marker_value(rest);
-    }
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
-        && let Some((left, right)) = rest.split_once('|')
-    {
-        return predicate_marker_value(left) && predicate_marker_value(right);
-    }
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
-        && let Some((left, right)) = rest.split_once('|')
-    {
-        return predicate_marker_value(left) || predicate_marker_value(right);
-    }
-    marker.starts_with("@indy:")
+    callback_marker::parse(marker)
 }
 
 /// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
@@ -19602,10 +19581,10 @@ fn functional_composition_marker(
     r: &MethodRef,
     receiver_marker: &str,
     args: &[Value],
-) -> Option<Value> {
+) -> Option<Result<Value, NativeError>> {
     let other_text = args.first().and_then(callback_text);
     let other = || other_text.as_deref();
-    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+    let composed = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (
             "java/util/function/Predicate",
             "and",
@@ -19670,7 +19649,18 @@ fn functional_composition_marker(
             other().unwrap_or("@fn:function.empty")
         )))),
         _ => None,
+    }?;
+    // `Objects.requireNonNull(other)`: every combinator taking another
+    // callback refuses `null` before it builds anything (Java 25: a
+    // `NullPointerException` with no message).
+    if matches!(args.first(), Some(Value::Ref(None))) {
+        return Some(Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        }));
     }
+    Some(Ok(composed))
 }
 
 fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
@@ -26046,6 +26036,15 @@ impl<H: Host> Runtime<'_, H> {
                     let index = read_u16(code, &mut pc)?;
                     let wanted = class_name(&file.pool, index)?;
                     let value = pop(&mut stack, class, method, at)?;
+                    // A lambda is an instance of its functional interface's
+                    // supertypes only (`callback_marker.rs`); one the run
+                    // cannot decide falls through and is counted below.
+                    if let Some(answer) = callback_marker::callback_text(&value)
+                        .and_then(|text| self.callback_instance_of(text, &wanted))
+                    {
+                        stack.push(Value::Int(i32::from(answer)));
+                        continue;
+                    }
                     // The `java.lang.reflect.Type` nodes the generic
                     // reflection surface builds answer their own runtime type,
                     // and a class marker answers `Class`. Every other marker
@@ -26793,7 +26792,7 @@ impl<H: Host> Runtime<'_, H> {
                                         callback_text(receiver).as_deref().unwrap_or(""),
                                         &args,
                                     ) {
-                                        value
+                                        invoke_or_catch!(at, value)
                                     } else if let Some(value) =
                                         invoke_or_catch!(at, self.invoke_callback(receiver, &args))
                                     {
@@ -27041,10 +27040,18 @@ impl<H: Host> Runtime<'_, H> {
                     let target = file.invoke_dynamic_target(index)?.map(|target| {
                         format!("{}#{}{}", target.owner, target.name, target.descriptor)
                     });
-                    let marker = format!(
-                        "@indy:{class}#{method}:{index}:{}:{}",
+                    // The call site's own type is the functional interface the
+                    // lambda's class implements (`callback_marker.rs`).
+                    let sam = return_desc(&descriptor)
+                        .strip_prefix('L')
+                        .and_then(|class| class.strip_suffix(';'))
+                        .unwrap_or("");
+                    let marker = callback_marker::make(
+                        &format!("{class}#{method}"),
+                        index,
+                        sam,
                         target.as_deref().unwrap_or("?"),
-                        bounded_captured_markers(&captured)
+                        &bounded_captured_markers(&captured),
                     );
                     if return_desc(&descriptor) != "V" {
                         stack.push(Value::Ref(Some(marker)));
@@ -30616,50 +30623,8 @@ pub fn dispatch_payload_frame_with(
 /// Parse an `@indy:` handler marker into its implementation method and bound
 /// captures. Runtime arguments (the payload and context) are not included.
 fn parse_dynamic_handler(marker: &str) -> Option<(MethodRef, Vec<Value>)> {
-    // `@indy:<class>#<method>:<index>:<target>:<captures>`. The first three
-    // hold no `:` (a descriptor has none); the captures may (a handle's
-    // `h<tag>:<key>`, the entrypoint object `this::handle` captures).
-    let rest = marker.strip_prefix("@indy:")?;
-    let mut parts = rest.splitn(4, ':');
-    let (_class_method, _index, target, captures) =
-        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    let (owner, name_desc) = target.split_once('#')?;
-    let (name, descriptor) = name_desc.split_once('(')?;
-    let target = MethodRef {
-        owner: owner.to_owned(),
-        name: name.to_owned(),
-        descriptor: format!("({descriptor}"),
-    };
-    let mut values = Vec::new();
-    for capture in split_dynamic_captures(captures) {
-        values.push(parse_value_marker(&capture).ok()?);
-    }
-    Some((target, values))
-}
-
-/// Split a marker's captures on unescaped commas.
-fn split_dynamic_captures(captures: &str) -> Vec<String> {
-    if captures.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    for ch in captures.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            current.push(ch);
-            escaped = true;
-        } else if ch == ',' {
-            out.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-    }
-    out.push(current);
-    out
+    let callback = callback_marker::parse(marker).ok()?;
+    Some((callback.target, callback.captures))
 }
 
 #[cfg(test)]
@@ -31396,7 +31361,9 @@ mod tests {
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
             let captured = bounded_captured_markers(std::slice::from_ref(&value));
-            value = Value::Ref(Some(format!("@indy:demo/C#m:0:?:{captured}")));
+            value = Value::Ref(Some(crate::callback_marker::make(
+                "demo/C#m", 0, "", "?", &captured,
+            )));
         }
         let Value::Ref(Some(marker)) = &value else {
             panic!("expected a marker");
@@ -35249,7 +35216,9 @@ mandatory = true
             .invoke_instance(
                 &map,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:identity".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "identity",
+                )))],
             )
             .unwrap();
         assert_eq!(mapped, optional_wrap(Value::Ref(Some("demo".into()))));
@@ -35288,7 +35257,9 @@ mandatory = true
             host.invoke_instance(
                 &filter,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:predicate".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "predicate"
+                )))],
             )
             .unwrap(),
             optional_wrap(Value::Ref(Some("demo".into())))
@@ -35311,7 +35282,9 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:unused-supplier".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "unused-supplier"
+                )))],
             )
             .unwrap(),
             optional_wrap(Value::Ref(Some("demo".into())))
@@ -35320,7 +35293,9 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &Value::Ref(None),
-                &[Value::Ref(Some("@indy:empty-supplier".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "empty-supplier"
+                )))],
             )
             .unwrap(),
             empty_optional()
@@ -35334,7 +35309,9 @@ mandatory = true
             host.invoke_instance(
                 &if_present,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:consumer".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "consumer"
+                )))],
             )
             .unwrap(),
             Value::Void
@@ -35374,7 +35351,9 @@ mandatory = true
             .invoke_instance(
                 &or_else_throw_supplier,
                 &Value::Ref(None),
-                &[Value::Ref(Some("@indy:optional-error".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "optional-error",
+                )))],
             )
             .unwrap_err();
         assert!(
@@ -35589,7 +35568,9 @@ mandatory = true
             host.invoke_instance(
                 &collection_for_each,
                 &list,
-                &[Value::Ref(Some("@indy:list-consumer".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "list-consumer"
+                )))],
             )
             .unwrap(),
             Value::Void
@@ -35767,7 +35748,9 @@ mandatory = true
             host.invoke_instance(
                 &for_each_remaining,
                 &remaining_iterator,
-                &[Value::Ref(Some("@indy:remaining-consumer".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "remaining-consumer"
+                )))],
             )
             .unwrap(),
             Value::Void
@@ -35854,7 +35837,7 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list,
-                &[Value::Ref(Some("@indy:list-predicate".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token("list-predicate")))],
             ),
             Err(NativeError::UncaughtException { class, .. })
                 if class == "java/lang/UnsupportedOperationException"
@@ -35875,7 +35858,9 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list_copy,
-                &[Value::Ref(Some("@indy:list-predicate".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "list-predicate"
+                )))],
             )
             .unwrap(),
             Value::Int(1)
@@ -35897,8 +35882,10 @@ mandatory = true
         let combined = host
             .invoke_instance(
                 &predicate,
-                &Value::Ref(Some("@indy:left".into())),
-                &[Value::Ref(Some("@indy:right".into()))],
+                &Value::Ref(Some(crate::callback_marker::test_token("left"))),
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "right",
+                )))],
             )
             .unwrap();
         let test = MethodRef {
@@ -35931,8 +35918,10 @@ mandatory = true
         let chained = host
             .invoke_instance(
                 &consumer,
-                &Value::Ref(Some("@indy:first".into())),
-                &[Value::Ref(Some("@indy:second".into()))],
+                &Value::Ref(Some(crate::callback_marker::test_token("first"))),
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "second",
+                )))],
             )
             .unwrap();
         let accept = MethodRef {
@@ -36052,9 +36041,13 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some(
-                        "@indy:demo#0:0:demo/Factory#make()Ljava/lang/Object;:".into()
-                    )),
+                    Value::Ref(Some(crate::callback_marker::make(
+                        "demo#0",
+                        0,
+                        "",
+                        "demo/Factory#make()Ljava/lang/Object;",
+                        ""
+                    ))),
                 ],
             )
             .unwrap(),
@@ -36077,7 +36070,7 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some("@indy:compute-present".into())),
+                    Value::Ref(Some(crate::callback_marker::test_token("compute-present"))),
                 ],
             )
             .unwrap(),
@@ -36097,7 +36090,7 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("merged-value".into())),
-                    Value::Ref(Some("@indy:merge".into())),
+                    Value::Ref(Some(crate::callback_marker::test_token("merge"))),
                 ],
             )
             .unwrap(),
@@ -36115,7 +36108,7 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("updated-value".into())),
-                    Value::Ref(Some("@indy:merge-existing".into())),
+                    Value::Ref(Some(crate::callback_marker::test_token("merge-existing"))),
                 ],
             )
             .unwrap(),
@@ -36181,7 +36174,9 @@ mandatory = true
             host.invoke_instance(
                 &replace_all,
                 &map,
-                &[Value::Ref(Some("@indy:map-replace".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "map-replace"
+                )))],
             )
             .unwrap(),
             Value::Void
@@ -36251,7 +36246,9 @@ mandatory = true
             host.invoke_instance(
                 &for_each,
                 &map,
-                &[Value::Ref(Some("@indy:map-consumer".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "map-consumer"
+                )))],
             )
             .unwrap(),
             Value::Void
@@ -37637,7 +37634,9 @@ mandatory = true
             .invoke_instance(
                 &with_path,
                 &id,
-                &[Value::Ref(Some("@indy:path-transform".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "path-transform",
+                )))],
             )
             .unwrap();
         // The operator is a jar lambda the host boundary cannot run; the call
@@ -37738,7 +37737,9 @@ mandatory = true
             host.invoke_instance(
                 &add_listener,
                 &bus,
-                &[Value::Ref(Some("@indy:listener".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token(
+                    "listener"
+                )))],
             )
             .unwrap(),
             bus
@@ -37769,7 +37770,7 @@ mandatory = true
                 &register,
                 &[
                     Value::Ref(Some("entry".into())),
-                    Value::Ref(Some("@indy:supplier".into())),
+                    Value::Ref(Some(crate::callback_marker::test_token("supplier"))),
                 ],
             )
             .unwrap();
@@ -37918,13 +37919,15 @@ mandatory = true
         assert_eq!(host.invocations().len(), 18);
         assert_eq!(
             host.invocations()[2].args[0],
-            Value::Ref(Some("@indy:listener".into()))
+            Value::Ref(Some(crate::callback_marker::test_token("listener")))
         );
         let dispatches = host.dispatch_event(Value::Ref(Some("RegisterEvent".into())));
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some("@indy:listener".into())))
+            Some(&Value::Ref(Some(crate::callback_marker::test_token(
+                "listener"
+            ))))
         );
         assert_eq!(
             dispatches[0].event,
@@ -38000,7 +38003,7 @@ mandatory = true
                     descriptor: "(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/minecraftforge/registries/RegistryObject;".into(),
                 },
                 &register,
-                &[Value::Ref(Some("entry".into())), Value::Ref(Some("@indy:supplier".into()))],
+                &[Value::Ref(Some("entry".into())), Value::Ref(Some(crate::callback_marker::test_token("supplier")))],
             )
             .unwrap();
         // A Forge `RegistryObject` handle (`host_registry.rs`).
@@ -38081,7 +38084,9 @@ mandatory = true
             &[
                 host_ids::resource_key_named("minecraft:root", "minecraft:item"),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some("@indy:ruby-wand-supplier".into())),
+                Value::Ref(Some(crate::callback_marker::test_token(
+                    "ruby-wand-supplier",
+                ))),
             ],
         )
         .unwrap();
@@ -38090,7 +38095,9 @@ mandatory = true
         assert_eq!(entry.key(), "minecraft:item/ruby:wand");
         assert_eq!(
             entry.value,
-            Value::Ref(Some("@indy:ruby-wand-supplier".into()))
+            Value::Ref(Some(crate::callback_marker::test_token(
+                "ruby-wand-supplier"
+            )))
         );
     }
 
@@ -38155,8 +38162,14 @@ mandatory = true
         assert_eq!(
             value,
             Value::Ref(Some(
-                "@indy:demo/Lambda#make:1:demo/Target#callback(Ljava/lang/Object;)V:rcapture"
-                    .into(),
+                crate::callback_marker::make(
+                    "demo/Lambda#make",
+                    1,
+                    "",
+                    "demo/Target#callback(Ljava/lang/Object;)V",
+                    "rcapture"
+                )
+                .into(),
             ))
         );
     }
@@ -38724,7 +38737,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[Value::Ref(Some(crate::callback_marker::test_token(
+                        "stream-predicate"
+                    )))],
                     "demo/Stream",
                     "probe",
                 )
@@ -38801,7 +38816,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[Value::Ref(Some(crate::callback_marker::test_token(
+                        "stream-predicate"
+                    )))],
                     "demo/Stream",
                     "probe",
                 )
@@ -38818,7 +38835,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[Value::Ref(Some(crate::callback_marker::test_token(
+                        "stream-predicate"
+                    )))],
                     "demo/Stream",
                     "probe",
                 )
@@ -39461,8 +39480,14 @@ mandatory = true
         };
         let jar = NativeJar::from_classes([caller, target]);
         let marker = Value::Ref(Some(
-            "@indy:demo/Caller#make:0:demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;:"
-                .into(),
+            crate::callback_marker::make(
+                "demo/Caller#make",
+                0,
+                "",
+                "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+                "",
+            )
+            .into(),
         ));
         assert_eq!(
             jar.invoke_method_with_args(
@@ -39485,8 +39510,14 @@ mandatory = true
                 &[
                     optional_wrap(Value::Ref(Some("input".into()))),
                     Value::Ref(Some(
-                        "@indy:demo/Caller#make:0:demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;:"
-                            .into(),
+                        crate::callback_marker::make(
+                            "demo/Caller#make",
+                            0,
+                            "",
+                            "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+                            ""
+                        )
+                        .into(),
                     )),
                 ],
                 &mut NullHost,
@@ -39498,9 +39529,12 @@ mandatory = true
 
     #[test]
     fn callback_marker_round_trips_delimited_capture_values() {
-        let marker = format!(
-            "@indy:demo/Mod#make:1:demo/Target#callback(Ljava/lang/Object;)V:{}",
-            value_marker(&Value::Ref(Some("a,b\\c".into())))
+        let marker = crate::callback_marker::make(
+            "demo/Mod#make",
+            1,
+            "java/util/function/Consumer",
+            "demo/Target#callback(Ljava/lang/Object;)V",
+            &value_marker(&Value::Ref(Some("a,b\\c".into()))),
         );
         let parsed = parse_callback_marker(&marker).unwrap();
         assert_eq!(parsed.captures, vec![Value::Ref(Some("a,b\\c".into()))]);
@@ -39539,8 +39573,14 @@ mandatory = true
                 },
                 receiver: Some(Value::Ref(Some("event-bus".into()))),
                 args: vec![Value::Ref(Some(
-                    "@indy:demo/Mod#wire:1:demo/Target#callback(Ljava/lang/Object;)V:rTarget"
-                        .into(),
+                    crate::callback_marker::make(
+                        "demo/Mod#wire",
+                        1,
+                        "",
+                        "demo/Target#callback(Ljava/lang/Object;)V",
+                        "rTarget",
+                    )
+                    .into(),
                 ))],
             },
             event: Value::Ref(Some("register-event".into())),
@@ -39911,7 +39951,7 @@ mandatory = true
                     descriptor: "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;".into(),
                 },
                 &optional,
-                &[Value::Ref(Some("@indy:identity-map".into()))],
+                &[Value::Ref(Some(crate::callback_marker::test_token("identity-map")))],
             )
             .unwrap();
         assert_eq!(
@@ -39934,7 +39974,9 @@ mandatory = true
                 descriptor: "(Ljava/util/function/Consumer;)V".into(),
             },
             &mapped,
-            &[Value::Ref(Some("@indy:capability-consumer".into()))],
+            &[Value::Ref(Some(crate::callback_marker::test_token(
+                "capability-consumer",
+            )))],
         )
         .unwrap();
         assert!(host.invocations().iter().any(|invocation| {
@@ -40016,9 +40058,13 @@ mandatory = true
                 &create,
                 &[
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some(
-                        "@indy:demo/Mod#event:0:demo/Mod#combine()Ljava/lang/Object;:".into(),
-                    )),
+                    Value::Ref(Some(crate::callback_marker::make(
+                        "demo/Mod#event",
+                        0,
+                        "",
+                        "demo/Mod#combine()Ljava/lang/Object;",
+                        "",
+                    ))),
                 ],
             )
             .unwrap();
@@ -40028,9 +40074,13 @@ mandatory = true
             name: "register".into(),
             descriptor: "(Ljava/lang/Object;)V".into(),
         };
-        let listener = Value::Ref(Some(
-            "@indy:demo/Mod#wire:1:demo/Mod#onEvent(Ljava/lang/Object;)V:".into(),
-        ));
+        let listener = Value::Ref(Some(crate::callback_marker::make(
+            "demo/Mod#wire",
+            1,
+            "",
+            "demo/Mod#onEvent(Ljava/lang/Object;)V",
+            "",
+        )));
         assert!(matches!(
             host.invoke_instance(&register, &event, &[listener]),
             Ok(Value::Void)
@@ -40095,7 +40145,9 @@ mandatory = true
         host.invoke_instance(
             &register,
             &bus,
-            &[Value::Ref(Some("@indy:forge-static-handler".into()))],
+            &[Value::Ref(Some(crate::callback_marker::test_token(
+                "forge-static-handler",
+            )))],
         )
         .unwrap();
         let dispatches = host.dispatch_event(Value::Ref(Some("forge-event".into())));
@@ -40118,14 +40170,18 @@ mandatory = true
         host.invoke_instance(
             &add_listener,
             &bus,
-            &[Value::Ref(Some("@indy:default-listener".into()))],
+            &[Value::Ref(Some(crate::callback_marker::test_token(
+                "default-listener",
+            )))],
         )
         .unwrap();
         host.invoke_instance(
             &add_listener,
             &bus,
             &[
-                Value::Ref(Some("@indy:cancelled-listener".into())),
+                Value::Ref(Some(crate::callback_marker::test_token(
+                    "cancelled-listener",
+                ))),
                 Value::Int(1),
             ],
         )
@@ -40134,7 +40190,9 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args[0],
-            Value::Ref(Some("@indy:cancelled-listener".into()))
+            Value::Ref(Some(crate::callback_marker::test_token(
+                "cancelled-listener"
+            )))
         );
     }
 
@@ -40155,7 +40213,7 @@ mandatory = true
                     Value::Ref(Some("NORMAL".into())),
                     Value::Int(1),
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some("@indy:typed-listener".into())),
+                    Value::Ref(Some(crate::callback_marker::test_token("typed-listener"))),
                 ],
             )
             .unwrap();
@@ -40164,7 +40222,9 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some("@indy:typed-listener".into())))
+            Some(&Value::Ref(Some(crate::callback_marker::test_token(
+                "typed-listener"
+            ))))
         );
     }
 
@@ -40177,7 +40237,7 @@ mandatory = true
             name: "addListener".into(),
             descriptor: "(Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some("@indy:remove-me".into()));
+        let listener = Value::Ref(Some(crate::callback_marker::test_token("remove-me")));
         host.invoke_instance(&add_listener, &bus, std::slice::from_ref(&listener))
             .unwrap();
         let unregister = MethodRef {
@@ -40255,7 +40315,7 @@ mandatory = true
             descriptor:
                 "(Ljava/util/function/Consumer;)Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some("@indy:forge-listener".into()));
+        let listener = Value::Ref(Some(crate::callback_marker::test_token("forge-listener")));
         assert_eq!(
             host.invoke_instance(&add, &bus, std::slice::from_ref(&listener))
                 .unwrap(),
@@ -44109,7 +44169,7 @@ mandatory = true
             },
         )
         .unwrap();
-        let value = Value::Ref(Some("@indy:ruby-wand".into()));
+        let value = Value::Ref(Some(crate::callback_marker::test_token("ruby-wand")));
         assert_eq!(
             Host::invoke(
                 &mut host,
@@ -44134,7 +44194,7 @@ mandatory = true
             &[
                 Value::Ref(None),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some("@indy:ruby-wand".into())),
+                Value::Ref(Some(crate::callback_marker::test_token("ruby-wand"))),
             ],
         )
         .unwrap();

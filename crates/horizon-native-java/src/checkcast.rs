@@ -25,10 +25,9 @@
 //! - the exception message names a jar's or the game's class as in the
 //!   unnamed module of loader `app` (a plain `java -cp` run): in the game its
 //!   loader is Knot's, whose name carries an identity hash no run can know;
-//! - a lambda (an `@indy:` marker) cast to a jar *interface* passes uncounted:
-//!   the marker does not record which functional interface the lambda
-//!   implements, and javac only emits such a cast after an erased generic read.
-//!   A lambda cast to a jar *class* still throws.
+//! - a lambda cast to a type its class does not implement throws a counted
+//!   `ClassCastException`: Java's message names the lambda's hidden class
+//!   (`Demo$$Lambda/0x…`), which no run reproduces (`callback_marker.rs`).
 
 use super::*;
 
@@ -259,6 +258,20 @@ impl<H: Host> Runtime<'_, H> {
             self.count_cast(value, target)?;
             return Err(cast_failed_counted(target));
         }
+        // A lambda's class implements its call site's functional interface
+        // and that interface's supertypes only (`callback_marker.rs`): any
+        // other cast fails, naming a hidden class the runtime does not model
+        // (counted); one it cannot decide is counted and passes.
+        if let Some(text) = crate::callback_marker::callback_text(value) {
+            return match self.callback_instance_of(text, target) {
+                Some(true) => Ok(()),
+                Some(false) => {
+                    self.count_cast(value, target)?;
+                    Err(cast_failed_counted(target))
+                }
+                None => self.count_cast(value, target),
+            };
+        }
         // A plain `String`, or a `stream/...` text that is no live stream (a
         // jar `String` spelled like one), is never a stream: Java's CCE.
         if crate::stream_pipeline::is_stream_interface(target)
@@ -475,6 +488,9 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
         }
+        if let Some(text) = crate::callback_marker::callback_text(value) {
+            return self.callback_instance_of(text, target);
+        }
         let target_is_interface = self
             .class(target)
             .and_then(class_access)
@@ -622,13 +638,6 @@ impl<H: Host> Runtime<'_, H> {
                 Verdict::No
             };
             return (verdict, Some("java/lang/String".into()));
-        }
-        if marker.starts_with("@indy:") {
-            // A lambda is an instance of its functional interface only.
-            return match target_is_interface {
-                Some(false) => (Verdict::No, Some("java/lang/Object".into())),
-                _ => (Verdict::Yes, None),
-            };
         }
         // An annotation object reflection handed out implements exactly its
         // annotation interface.

@@ -179,7 +179,7 @@ impl<H: Host> Runtime<'_, H> {
                 _ => crate::jdk_model::class_instance_of(class, component).then_some(true),
             };
         }
-        if text.starts_with("@indy:") {
+        if crate::callback_marker::is_callback(text) {
             // A lambda's hidden class is no `String`, box or `Class`.
             if FINAL_COMPONENTS.contains(&component) {
                 return Some(false);

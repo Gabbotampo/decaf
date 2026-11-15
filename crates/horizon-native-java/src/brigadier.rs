@@ -2052,7 +2052,8 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
             return false;
         }
-        let Some(text) = expect_ref(receiver).filter(|t| t.starts_with("@indy:")) else {
+        let Some(text) = expect_ref(receiver).filter(|t| crate::callback_marker::is_callback(t))
+        else {
             return false;
         };
         let Ok(callback) = parse_callback_marker(text) else {
@@ -2120,7 +2121,7 @@ impl NativeJar {
             )));
         }
         if let Some(text) = expect_ref(callback)
-            && text.starts_with("@indy:")
+            && crate::callback_marker::is_callback(text)
         {
             let parsed = parse_callback_marker(text)?;
             let (target, mut captures) =
@@ -2541,7 +2542,7 @@ mod tests {
             "executes",
             EXECUTES,
             &child,
-            &[marker("@indy:late".into())],
+            &[marker(crate::callback_marker::test_token("late"))],
         );
         register(&mut h, &root);
         let tree = h.command_tree();
@@ -2556,7 +2557,10 @@ mod tests {
         // `/home a` then `/home b` with a new command on `home`: one root
         // with both children, and the newer command.
         let mut h = host();
-        for (child, command) in [("a", "@indy:first"), ("b", "@indy:second")] {
+        for (child, command) in [
+            ("a", crate::callback_marker::test_token("first")),
+            ("b", crate::callback_marker::test_token("second")),
+        ] {
             let root = literal(&mut h, "home");
             let leaf = literal(&mut h, child);
             call(&mut h, BUILDER, "then", THEN, &root, &[leaf]);
@@ -2574,7 +2578,10 @@ mod tests {
         let roots: Vec<_> = tree.roots().collect();
         assert_eq!(roots.len(), 1);
         let home = roots[0].1;
-        assert_eq!(home.command, Some(marker("@indy:second".into())));
+        assert_eq!(
+            home.command,
+            Some(marker(crate::callback_marker::test_token("second")))
+        );
         let names: Vec<_> = home
             .children
             .iter()

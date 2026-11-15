@@ -427,7 +427,7 @@ impl<H: Host> Runtime<'_, H> {
     /// follow it; `None` where it cannot (counted, departure B3).
     fn consumer_event_class(&self, consumer: &Value) -> Option<String> {
         if let Some(text) = expect_ref(consumer)
-            && text.starts_with("@indy:")
+            && crate::callback_marker::is_callback(text)
         {
             let marker = parse_callback_marker(text).ok()?;
             let parameters = crate::descriptor_arguments(&marker.target.descriptor);
@@ -480,7 +480,7 @@ impl<H: Host> Runtime<'_, H> {
     /// cast of a game event is not needed).
     fn consumer_callback(&self, consumer: &Value, class: &str) -> Option<ListenerCallback> {
         if let Some(text) = expect_ref(consumer)
-            && text.starts_with("@indy:")
+            && crate::callback_marker::is_callback(text)
         {
             let marker = parse_callback_marker(text).ok()?;
             return Some(ListenerCallback::Indy {

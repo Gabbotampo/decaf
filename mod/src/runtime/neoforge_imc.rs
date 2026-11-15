@@ -198,7 +198,7 @@ fn crosses_jars(value: &Value) -> bool {
 /// a jar object's own `get`.
 fn supplier_callback(jar: &NativeJar, supplier: &Value) -> Option<ListenerCallback> {
     if let Some(text) = expect_ref(supplier)
-        && text.starts_with("@indy:")
+        && crate::runtime::callback_marker::is_callback(text)
     {
         let marker = crate::runtime::parse_callback_marker(text).ok()?;
         return Some(ListenerCallback::Indy {
