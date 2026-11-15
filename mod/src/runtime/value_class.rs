@@ -37,6 +37,8 @@ const RETIRED_PREFIXES: &[&str] = &[
     "mixin/callback-info/",
     "mixin-plugin/",
     "mixin-side/",
+    // Map entries are handles (`host_entry.rs`, #261 re-review).
+    "map-entry/",
     // Iterators, enumerations and list iterators are handles, and `Collectors`' results
     // `Collector` handles (#156 P14f, `host_iterator.rs`, `host_collector.rs`).
     "iterator/",
@@ -69,6 +71,11 @@ const RETIRED_PREFIXES: &[&str] = &[
     // StackWalker.Option moved to a typed host handle; old marker-shaped
     // text remains an ordinary String.
     "enum/java/lang/StackWalker$Option/",
+    // Reflective handles moved to typed host values in P10; their old
+    // marker-shaped text remains an ordinary String.
+    "reflect-field/",
+    "reflect-method/",
+    "reflect-constructor/",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
@@ -89,7 +96,6 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 ///   separator-free class. An object's key, `<class>#<n>` or a host-made
 ///   collection's `<class>#neutral<n>`/`#immutable<n>`/`#reversed<n>`, is a handle,
 ///   never text (#156 P12b, P14c), so a text spelled like one is a `String`;
-/// - a callback or comparator: a leading `@`;
 /// - a marker kind: a `/` whose first segment has no `:`, `.` or space
 ///   (`list/3`, `registry/minecraft:item`), which a resource id like
 ///   `minecraft:block/stone` does not match.
@@ -119,8 +125,12 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
     // The last separator-free markers (`guava-cache-builder`,
     // `mixin-environment`) became handles in #179 and #180, so a text with no
     // `/`, `#`, `@` or `:` is never a runtime marker any more.
+    // Callbacks and comparators are handles (`callback_marker.rs`), so no
+    // runtime marker starts with `@` any more: text spelled like a lambda's
+    // key (`@indy:…`), a combinator's (`@fn:…`) or an old comparator's
+    // (`@cmp:…`) is a `String`.
     if marker.starts_with('@') {
-        return false;
+        return true;
     }
     // An array class's descriptor (`[I`, `[Ljava/lang/String;`) names a
     // `Class`, which is a handle (#156 P13c): as text it is a `String`.
@@ -162,8 +172,8 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
 /// The first segment of the runtime's own `word/rest` markers that a class
 /// name's could be: lowercase words a package might be named, which the
 /// runtime writes ahead of a capitalized segment (`component/Hello`,
-/// `enum/…`, `game/…`). A hyphenated kind (`map-entry/`) is no package name,
-/// so it needs no entry. Until #156 P17 retires these markers, a text with one
+/// `enum/…`, `game/…`). A hyphenated kind is no package name, so it needs no
+/// entry. Until #156 P17 retires these markers, a text with one
 /// of these heads keeps reading as the marker.
 const MARKER_HEADS: &[&str] = &[
     "annotation",
@@ -396,14 +406,24 @@ mod tests {
             "[Ljava/lang/String;",
             "[I",
             "int",
+            // A `String` spelled like a callback's key: callbacks are handles.
+            "@indy:demo/Main#main:0:java/lang/Runnable:demo/Main#lambda$0()V:",
+            "@fn:identity/function",
+            "@cmp:natural",
+            "@cmp:reverse:r@cmp:natural",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
+        assert!(is_plain_string(&crate::runtime::callback_marker::make(
+            "demo/Main#main",
+            0,
+            "java/lang/Runnable",
+            "demo/Main#lambda$0()V",
+            "",
+        )));
         for marker in [
             "registry/minecraft:item",
             "string-builder/2",
-            "@indy:demo/Main:0:demo/Main#lambda$0()V:",
-            "@cmp:natural",
             // A marker kind ahead of a capitalized segment is no class name.
             "component/Hello",
             "enum/net/minecraft/core/Direction/NORTH",

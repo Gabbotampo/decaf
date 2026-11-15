@@ -21,7 +21,7 @@ const PROBE: &str = include_str!("fixtures/client_values/demo/Probe.java");
 const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/ChatFormatting.java",
-        "package net.minecraft; public enum ChatFormatting { DARK_BLUE, GOLD, RED, BOLD, RESET }",
+        "package net.minecraft; public enum ChatFormatting { DARK_BLUE, GOLD, RED, BOLD, ITALIC, RESET }",
     ),
     (
         "net/minecraft/resources/Identifier.java",
@@ -34,7 +34,13 @@ const STUBS: &[(&str, &str)] = &[
         "package net.minecraft.network.chat; public final class TextColor { \
          public static TextColor fromRgb(int rgb) { return null; } \
          public static TextColor fromLegacyFormat(net.minecraft.ChatFormatting f) { return null; } \
+         public static com.mojang.serialization.DataResult<TextColor> parseColor(String s) { return null; } \
          public int getValue() { return 0; } }",
+    ),
+    (
+        "com/mojang/serialization/DataResult.java",
+        "package com.mojang.serialization; import java.util.Optional; \
+         public class DataResult<T> { public Optional<T> result() { return null; } public boolean isError() { return false; } }",
     ),
     (
         "net/minecraft/network/chat/Style.java",
@@ -48,8 +54,19 @@ const STUBS: &[(&str, &str)] = &[
          public Style withUnderlined(Boolean b) { return null; } \
          public Style withStrikethrough(Boolean b) { return null; } \
          public Style withObfuscated(Boolean b) { return null; } \
+         public Style withClickEvent(Object e) { return null; } \
+         public Style withHoverEvent(Object e) { return null; } \
+         public Style withInsertion(String e) { return null; } \
+         public Style withFont(Object e) { return null; } \
          public Style applyFormat(ChatFormatting f) { return null; } \
          public Style applyLegacyFormat(ChatFormatting f) { return null; } \
+         public Style applyFormats(ChatFormatting... f) { return null; } \
+         public Style applyTo(Style f) { return null; } \
+         public TextColor getColor() { return null; } public boolean isBold() { return false; } \
+         public boolean isItalic() { return false; } public boolean isUnderlined() { return false; } \
+         public boolean isStrikethrough() { return false; } public boolean isObfuscated() { return false; } \
+         public Object getClickEvent() { return null; } public Object getHoverEvent() { return null; } \
+         public String getInsertion() { return null; } public Object getFont() { return null; } \
          public boolean isEmpty() { return false; } }",
     ),
     (
@@ -81,6 +98,15 @@ fn client_values_answer_as_java() {
         assert_eq!(line, expected);
     }
     assert_eq!(printed.lines().count(), ORACLE.lines().count());
+    assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
+    assert_eq!(
+        fixture.text_on(&mut host, "parseColors"),
+        "false,10,gold,true,true"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "randomChains"),
+        "-22923262620280,-7553391633733,7373"
+    );
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
 

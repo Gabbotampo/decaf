@@ -6,6 +6,9 @@
 //! `removeIf`'s kept order and answer, and the four exception messages appear
 //! verbatim in the JDK's `Objects.checkIndex` and `ArrayList.rangeCheckForAdd`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -169,7 +172,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-collections-{test}-{}-{unique}",
             std::process::id()
         ));

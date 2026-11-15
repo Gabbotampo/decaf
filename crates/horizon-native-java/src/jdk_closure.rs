@@ -126,6 +126,16 @@ pub(crate) fn object_members(name: &str) -> Option<&'static str> {
     table().objects.get(name).copied()
 }
 
+/// Whether Java 25 identifies a public JDK class as an enum. Explicit
+/// hierarchy rows carry their direct superclass; exported-package rows carry
+/// the generated uppercase E marker for enum classes.
+pub(crate) fn class_is_enum(name: &str) -> Option<bool> {
+    if let Some(row) = class(name) {
+        return Some(row.superclass == Some("java/lang/Enum"));
+    }
+    object_members(name).map(|members| members.contains('E'))
+}
+
 /// The generated row of JDK class `name`.
 pub(crate) fn class(name: &str) -> Option<&'static JdkClass> {
     table().classes.get(name)

@@ -48,7 +48,7 @@ use crate::{
     ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
     component_value,
     events::{self, GameEvent, ListenerCallback},
-    expect_ref, identifier_parts, parse_callback_marker, return_desc, uuid_value,
+    expect_ref, identifier_parts, return_desc, uuid_value,
 };
 
 // The player's items and effects (`ItemStack`, `Inventory`, effects). A
@@ -59,7 +59,7 @@ pub(crate) use items::NON_NULL_LIST;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]
-mod text;
+pub(super) mod text;
 // Config libraries' defaults (`AutoConfig`, YACL), for the interpreter's
 // library dispatch.
 #[path = "client_registrations.rs"]
@@ -1013,15 +1013,12 @@ impl StdHost {
         let mut layers = Vec::new();
         let mut refused = Vec::new();
         for (id, element, source) in &self.client.layers {
-            let callback = match expect_ref(element) {
-                Some(text) if text.starts_with("@indy:") => match parse_callback_marker(text) {
-                    Ok(marker) => Some(ListenerCallback::Indy {
-                        target: marker.target,
-                        captures: marker.captures,
-                    }),
-                    Err(_) => None,
-                },
-                _ => events::jar_object(jar, element).and_then(|(class, value)| {
+            let callback = match crate::callback_marker::lambda_of(element) {
+                Some(marker) => Some(ListenerCallback::Indy {
+                    target: marker.target,
+                    captures: marker.captures,
+                }),
+                None => events::jar_object(jar, element).and_then(|(class, value)| {
                     ["extractRenderState", "render"]
                         .iter()
                         .find_map(|name| events::resolve_method(jar, class, name, LAYER_DESCRIPTOR))
@@ -1125,6 +1122,11 @@ impl StdHost {
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
     pub(crate) fn client_static(&mut self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
+        // Chat style/color values are shared by server-side callbacks too;
+        // their handles do not depend on a client frame.
+        if let Some(value) = text::text_static(r) {
+            return Some(Ok(value));
+        }
         // `java.awt.Color` is a JDK singleton family even on a server host;
         // model both the upper- and lower-case field spellings everywhere.
         if !self.client_environment() && r.owner != "java/awt/Color" {
@@ -1142,9 +1144,6 @@ impl StdHost {
                 None if frame.is_some() => refuse(),
                 None => None,
             };
-        }
-        if let Some(value) = text::text_static(r) {
-            return Some(Ok(value));
         }
         match (r.owner.as_str(), r.name.as_str()) {
             (INPUT_TYPE, name @ ("KEYBOARD" | "MOUSE")) => {
@@ -1267,11 +1266,12 @@ impl StdHost {
         r: &MethodRef,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        if !self.client_environment() {
-            return None;
-        }
+        // TextColor factories are valid in server callbacks as well.
         if let Some(value) = text::text_invoke(r, args) {
             return Some(Ok(value));
+        }
+        if !self.client_environment() {
+            return None;
         }
         if let Some(value) = client_registrations::invoke(&mut self.client.registrations, r, args) {
             return Some(value);
@@ -1352,6 +1352,23 @@ impl StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        // Style and TextColor are value handles used by server-side mods too;
+        // ChatFormatting constants are text markers produced by this surface.
+        if let Some(text) = crate::game_object::text(receiver)
+            && (text.starts_with("client/style/")
+                || text.starts_with("client/text-color/")
+                || text.starts_with("enum/net/minecraft/ChatFormatting/"))
+            && (matches!(receiver, Value::Host(_))
+                || text.starts_with("enum/net/minecraft/ChatFormatting/"))
+        {
+            if let Some(value) = text::text_call(text, receiver, r, args) {
+                return Some(Ok(value));
+            }
+            if text.starts_with("enum/") || self.client.frame.is_none() {
+                return None;
+            }
+            return Some(Err(NativeError::UnknownHostCall(r.clone())));
+        }
         if !self.client_environment() {
             return None;
         }
@@ -1529,21 +1546,6 @@ impl StdHost {
                 _ => return None,
             };
             return Some(Ok(flag(answer)));
-        }
-        // Components, styles, text colours and formatting constants
-        // (`client_text.rs`); an unlisted component member keeps the host's
-        // own component model.
-        if text.starts_with("client/style/")
-            || text.starts_with("client/text-color/")
-            || text.starts_with("enum/net/minecraft/ChatFormatting/")
-        {
-            if let Some(value) = text::text_call(&text, receiver, r, args) {
-                return Some(Ok(value));
-            }
-            if text.starts_with("enum/") || self.client.frame.is_none() {
-                return None;
-            }
-            return Some(refuse());
         }
         if self.client.key_inits.contains_key(&text)
             && crate::jar_object::object_class(receiver) == Some(KEY_MAPPING)
@@ -2345,16 +2347,12 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<(), NativeError> {
-        let callback = match expect_ref(task) {
-            Some(text) if text.starts_with("@indy:") => {
-                parse_callback_marker(text)
-                    .ok()
-                    .map(|marker| ListenerCallback::Indy {
-                        target: marker.target,
-                        captures: marker.captures,
-                    })
-            }
-            _ => events::jar_object(self, task).and_then(|(class, value)| {
+        let callback = match crate::callback_marker::lambda_of(task) {
+            Some(marker) => Some(ListenerCallback::Indy {
+                target: marker.target,
+                captures: marker.captures,
+            }),
+            None => events::jar_object(self, task).and_then(|(class, value)| {
                 events::resolve_method(self, class, "run", "()V").map(|method| {
                     ListenerCallback::Object {
                         receiver: value.clone(),

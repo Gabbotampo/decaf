@@ -10,6 +10,9 @@
 //! a `Thread` object a jar constructs never runs and gets its own stable id,
 //! because two distinct objects must not compare equal.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -100,7 +103,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-locale-{test}-{}-{unique}",
             std::process::id()
         ));
