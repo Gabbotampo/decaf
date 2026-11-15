@@ -89,6 +89,10 @@ public final class Probe {
         Config c = new Gson().fromJson("{\"unknown\":1}", Config.class);
         return String.valueOf(c.name)+"|"+c.size+"|"+c.enabled+"|"+c.ctorDefault;
     }
+    public static String booleanFieldBoxing() {
+        Config c = new Gson().fromJson("{\"enabled\":true}", Config.class);
+        return Boolean.valueOf(c.enabled).toString();
+    }
     public static String unsafe() {
         UnsafeConfig c = new Gson().fromJson("{\"value\":\"json\"}", UnsafeConfig.class);
         return c.value;
@@ -229,6 +233,13 @@ fn missing_fields_keep_constructor_defaults_and_unknown_are_ignored() {
     assert_eq!(
         Fixture::build("defaults").text("defaults"),
         "null|0|false|constructor"
+    );
+}
+#[test]
+fn primitive_boolean_fields_stay_ints_when_boxed() {
+    assert_eq!(
+        Fixture::build("boolean-field").text("booleanFieldBoxing"),
+        "true"
     );
 }
 #[test]

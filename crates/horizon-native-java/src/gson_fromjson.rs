@@ -447,7 +447,17 @@ impl<H: Host> Runtime<'_, H> {
                     .or_else(|| bool_text(tree).map(|value| Value::Ref(Some(value.to_string())))));
             }
             "boolean" | "java/lang/Boolean" => {
-                return Ok(bool_text(tree).map(boolean_value));
+                // JVM boolean fields and method arguments use the int 0/1
+                // representation. Only the reference wrapper is a boxed
+                // Boolean; handing that box to Boolean.valueOf(Z) makes the
+                // interpreter reject the operand just as #313 did in Noisium.
+                return Ok(bool_text(tree).map(|value| {
+                    if class == "boolean" {
+                        Value::Int(i32::from(value))
+                    } else {
+                        boolean_value(value)
+                    }
+                }));
             }
             "byte" | "java/lang/Byte" => {
                 return Ok(numeric_text(tree)
