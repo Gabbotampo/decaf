@@ -2,9 +2,10 @@
 //! `Registry.registerForHolder` calls.
 //!
 //! A registration carries the registry key, entry id, registered value and
-//! binding state. MappedRegistry.register creates an unbound reference; this
-//! host has no game freeze hook yet, so these handles remain unbound and
-//! value() throws Java's catchable IllegalStateException. A jar can only
+//! binding state. MappedRegistry.register creates an unbound reference. Fabric
+//! API's fabric-registry-sync-v0 mixin binds it immediately at register return;
+//! NeoForge and vanilla leave it unbound until their real registry lifecycle.
+//! A jar can only
 //! obtain one of these handles from the host call; spelling the
 //! old marker text in a `String` never aliases it. Vanilla holders whose
 //! registry contents or tags belong to the game stay outside this model.
@@ -87,23 +88,23 @@ fn same_registry(registry: &Value, registry_key: &Value) -> bool {
     host_ids::registry_name(registry_key).as_deref() == Some(registry_id)
 }
 
-fn make_for_identifier(registry: &Value, id: &Value, value: &Value) -> Option<Value> {
+fn make_for_identifier(registry: &Value, id: &Value, value: &Value, bound: bool) -> Option<Value> {
     let registry_key = registry_key_for_registry(registry)?;
     let id_text = host_ids::identifier_key(id)?.to_owned();
     Some(holder(
         registry_key,
         host_ids::identifier_of_text(&id_text),
         value.clone(),
-        false,
+        bound,
     ))
 }
 
-fn make_for_key(registry: &Value, key: &Value, value: &Value) -> Option<Value> {
+fn make_for_key(registry: &Value, key: &Value, value: &Value, bound: bool) -> Option<Value> {
     let (registry_key, id, _id_text) = key_parts(key)?;
     if !same_registry(registry, &registry_key) {
         return None;
     }
-    Some(holder(registry_key, id, value.clone(), false))
+    Some(holder(registry_key, id, value.clone(), bound))
 }
 
 /// `Registry.registerForHolder`'s two 26.3 overloads. An unmodelled registry,
@@ -119,12 +120,17 @@ pub(crate) fn static_call(
     let [registry, id_or_key, value] = args else {
         return Some(host.unknown_host_call(r));
     };
+    // Fabric API's fabric-registry-sync-v0 MappedRegistryMixin injects at
+    // register RETURN and calls Holder.Reference.bindValue(entry). This state
+    // is exact only when that module is present in the explicitly linked run
+    // metadata; vanilla, Fabric without it, and NeoForge stay unbound here.
+    let fabric_registry_sync = host.fabric_mod_present("fabric-registry-sync-v0");
     let answer = match r.descriptor.as_str() {
         "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" => {
-            make_for_identifier(registry, id_or_key, value)
+            make_for_identifier(registry, id_or_key, value, fabric_registry_sync)
         }
         "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" => {
-            make_for_key(registry, id_or_key, value)
+            make_for_key(registry, id_or_key, value, fabric_registry_sync)
         }
         _ => None,
     };
@@ -343,6 +349,83 @@ mod tests {
             .unwrap(),
             Value::Int(1)
         ));
+    }
+
+    #[test]
+    fn fabric_registry_sync_binds_at_register_return() {
+        let mut host = StdHost::new()
+            .with_run_loader(crate::class_precedence::RunLoader::Fabric)
+            .with_mod("fabric-registry-sync-v0", "8.0.4");
+        let holder = host
+            .invoke(
+                &method(
+                    "registerForHolder",
+                    "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;",
+                ),
+                &[
+                    crate::host_registry::registry("minecraft:item"),
+                    crate::host_ids::identifier("demo", "item"),
+                    Value::Ref(Some("value".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "value".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &holder,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("value".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "isBound".into(),
+                    descriptor: "()Z".into(),
+                },
+                &holder,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn fabric_without_registry_sync_stays_unbound() {
+        let mut host = StdHost::new().with_run_loader(crate::class_precedence::RunLoader::Fabric);
+        let holder = host
+            .invoke(
+                &method(
+                    "registerForHolder",
+                    "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;",
+                ),
+                &[
+                    crate::host_registry::registry("minecraft:item"),
+                    crate::host_ids::identifier("demo", "item"),
+                    Value::Ref(Some("value".into())),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "isBound".into(),
+                    descriptor: "()Z".into(),
+                },
+                &holder,
+                &[],
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
     }
 
     #[test]

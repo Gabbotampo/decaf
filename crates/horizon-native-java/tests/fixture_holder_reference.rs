@@ -117,7 +117,44 @@ fn self_registered_holders_match_java_25() {
         ],
     );
     assert_eq!(fixture.text("holder"), EXPECTED);
+
+    let mut fabric_without_sync = fixture.jar.seed_host(
+        StdHost::new(),
+    );
+    let without_sync = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "holder",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut fabric_without_sync,
+        )
+        .unwrap();
+    assert_eq!(without_sync, Value::Ref(Some(EXPECTED.into())));
+
+    let mut fabric_with_sync = fixture.jar.seed_host(
+        StdHost::new().with_mod("fabric-registry-sync-v0", "8.0.4"),
+    );
+    let bound = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "holder",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut fabric_with_sync,
+        )
+        .unwrap();
+    let expected_bound = EXPECTED
+        .replace("Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]' from registry Registry[ResourceKey[minecraft:root / minecraft:item] (Stable)]", "value")
+        .replace("truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|falsefalse|Reference{ResourceKey[minecraft:item / demo:item]=null}", "truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|truefalse|Reference{ResourceKey[minecraft:item / demo:item]=value}");
+    assert_eq!(bound, Value::Ref(Some(expected_bound.into())));
+
     assert!(REAL_ORACLE.contains("before|"));
     assert!(REAL_ORACLE.contains("after|"));
-    assert_eq!(REAL_ORACLE.lines().count(), 2);
+    assert!(REAL_ORACLE.contains("fabric-sync|"));
+    assert_eq!(REAL_ORACLE.lines().count(), 3);
 }
