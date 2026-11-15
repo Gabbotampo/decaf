@@ -1,4 +1,4 @@
-//! Expected values were recorded from Java 25.0.5 with commons-lang3 3.17.0.
+//! Expected values were recorded from Java 25.0.5 with commons-lang3 3.20.0.
 //! The compile-only stubs keep CI independent of the third-party jar.
 
 #[path = "support/javac_fixture.rs"]
@@ -69,11 +69,11 @@ fn commons_lang_slice_two_matches_java25() {
     );
     assert_eq!(
         fixture.text_on(&mut host, "pad"),
-        "<null>|   |ab   |😀   |abxyx|xyxab|ééé"
+        "<null>|   |ab   |😀   |abxyx|xyxab|ééé|ab   |ab   |   ab|   ab|ab\u{f600}\u{f600}\u{f600}|\u{f600}\u{f600}\u{f600}ab"
     );
     assert_eq!(
         fixture.text_on(&mut host, "unicode"),
-        "false|true|fallback|fallback|\u{a0}"
+        "false|true|true|true|fallback|fallback|\u{a0}"
     );
     assert_eq!(
         fixture.text_on(&mut host, "nullRules"),
@@ -81,12 +81,13 @@ fn commons_lang_slice_two_matches_java25() {
     );
     assert_eq!(
         fixture.text_on(&mut host, "validate"),
-        "java.lang.IllegalArgumentException:The validated expression is false|java.lang.IllegalArgumentException:bad é 7|ok"
+        "java.lang.IllegalArgumentException:The validated expression is false|java.lang.IllegalArgumentException:bad é 7|java.lang.IllegalArgumentException:The validated expression is false|ok"
     );
+    assert_eq!(fixture.text_on(&mut host, "surrogate"), "<null>");
     assert_eq!(fixture.text_on(&mut host, "nopIdentity"), "true");
     assert_eq!(
         host.unknown_host_call_count(),
-        0,
+        1,
         "{:?}",
         host.unknown_host_calls()
     );

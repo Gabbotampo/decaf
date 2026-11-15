@@ -21,12 +21,20 @@ public final class Probe {
         return q(StringUtils.rightPad(null, 4)) + "|" + StringUtils.rightPad("", 3) + "|"
             + StringUtils.rightPad("ab", 5) + "|" + StringUtils.rightPad("😀", 5) + "|"
             + StringUtils.rightPad("ab", 5, "xy") + "|"
-            + StringUtils.leftPad("ab", 5, "xy") + "|" + StringUtils.repeat("é", 3);
+            + StringUtils.leftPad("ab", 5, "xy") + "|" + StringUtils.repeat("é", 3)
+            + "|" + q(StringUtils.rightPad("ab", 5, (String) null))
+            + "|" + q(StringUtils.rightPad("ab", 5, ""))
+            + "|" + q(StringUtils.leftPad("ab", 5, (String) null))
+            + "|" + q(StringUtils.leftPad("ab", 5, ""))
+            + "|" + q(StringUtils.rightPad("ab", 5, (char) 0x1f600))
+            + "|" + q(StringUtils.leftPad("ab", 5, (char) 0x1f600));
     }
 
     public static String unicode() {
         return StringUtils.containsIgnoreCase("Straße", "STRASSE") + "|"
             + StringUtils.containsIgnoreCase("Éclair", "ÉC") + "|"
+            + StringUtils.containsIgnoreCase("e\u0301clair", "İ") + "|"
+            + StringUtils.containsIgnoreCase("İ", "i") + "|"
             + q(StringUtils.defaultIfBlank(null, "fallback")) + "|"
             + StringUtils.defaultIfBlank("\u2003", "fallback") + "|"
             + StringUtils.defaultIfBlank("\u00a0", "fallback");
@@ -63,7 +71,18 @@ public final class Probe {
         } catch (Exception error) {
             trueCase = "bad";
         }
-        return bare + "|" + formatted + "|" + trueCase;
+        String nullMessage;
+        try {
+            Validate.isTrue(false, null);
+            nullMessage = "no";
+        } catch (Exception error) {
+            nullMessage = error.getClass().getName() + ":" + error.getMessage();
+        }
+        return bare + "|" + formatted + "|" + nullMessage + "|" + trueCase;
+    }
+
+    public static String surrogate() {
+        return q(StringUtils.rightPad("a", 2, (char) 0xd800));
     }
 
     public static String nopIdentity() {

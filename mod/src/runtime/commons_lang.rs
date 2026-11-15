@@ -52,16 +52,18 @@ pub(crate) fn static_call(
             let Some(pad) = char_arg(pad) else {
                 return Some(host.unknown_host_call(r));
             };
-            string_result(right_pad(value, width, &pad.to_string()))
+            match right_pad_char(value, width, pad) {
+                None => Ok(Value::Ref(None)),
+                Some(Some(result)) => Ok(Value::Ref(Some(result))),
+                Some(None) => host.unknown_host_call(r),
+            }
         }
         (
             "rightPad",
             "(Ljava/lang/String;ILjava/lang/String;)Ljava/lang/String;",
             [value, width, pad],
         ) => {
-            let Some(pad) = expect_ref(pad) else {
-                return Some(host.unknown_host_call(r));
-            };
+            let pad = string_pad(pad);
             string_result(right_pad(value, width, pad))
         }
         ("leftPad", "(Ljava/lang/String;I)Ljava/lang/String;", [value, width]) => {
@@ -71,16 +73,18 @@ pub(crate) fn static_call(
             let Some(pad) = char_arg(pad) else {
                 return Some(host.unknown_host_call(r));
             };
-            string_result(left_pad(value, width, &pad.to_string()))
+            match left_pad_char(value, width, pad) {
+                None => Ok(Value::Ref(None)),
+                Some(Some(result)) => Ok(Value::Ref(Some(result))),
+                Some(None) => host.unknown_host_call(r),
+            }
         }
         (
             "leftPad",
             "(Ljava/lang/String;ILjava/lang/String;)Ljava/lang/String;",
             [value, width, pad],
         ) => {
-            let Some(pad) = expect_ref(pad) else {
-                return Some(host.unknown_host_call(r));
-            };
+            let pad = string_pad(pad);
             string_result(left_pad(value, width, pad))
         }
         ("repeat", "(Ljava/lang/String;I)Ljava/lang/String;", [value, count]) => {
@@ -155,17 +159,13 @@ pub(crate) fn runtime_call<H: Host>(
         if *condition != 0 {
             return Ok(Some(Value::Void));
         }
-        let Some(Value::Ref(Some(_))) = args.get(1) else {
-            return Err(NativeError::UncaughtException {
-                class: "java/lang/NullPointerException".into(),
-                message: None,
-                frame: None,
-            });
-        };
-        let Some(values) = args.get(2) else {
+        let Some(format) = args.get(1) else {
             return Ok(None);
         };
-        let Some(format) = args.get(1) else {
+        if matches!(format, Value::Ref(None)) {
+            return Err(invalid("The validated expression is false".into()));
+        }
+        let Some(values) = args.get(2) else {
             return Ok(None);
         };
         let Some(message) = runtime.java_format(None, format, values) else {
@@ -212,9 +212,15 @@ fn int_arg(value: &Value) -> Option<i32> {
     }
 }
 
-fn char_arg(value: &Value) -> Option<char> {
-    let unit = int_arg(value)?;
-    char::from_u32(unit as u32)
+fn char_arg(value: &Value) -> Option<u16> {
+    u16::try_from(int_arg(value)?).ok()
+}
+
+fn string_pad(value: &Value) -> &str {
+    match expect_ref(value) {
+        Some(text) if !text.is_empty() => text,
+        _ => " ",
+    }
 }
 
 fn utf16_len(text: &str) -> usize {
@@ -252,6 +258,28 @@ fn title_case(value: char) -> Option<char> {
     }
 }
 
+fn right_pad_char(value: &Value, width: &Value, pad: u16) -> Option<Option<String>> {
+    let text = expect_ref(value)?;
+    let width = int_arg(width)?;
+    let length = utf16_len(text);
+    if width <= length as i32 {
+        return Some(Some(text.clone()));
+    }
+    let needed = width as usize - length;
+    Some(repeat_utf16_units(&[pad], needed).map(|suffix| format!("{text}{suffix}")))
+}
+
+fn left_pad_char(value: &Value, width: &Value, pad: u16) -> Option<Option<String>> {
+    let text = expect_ref(value)?;
+    let width = int_arg(width)?;
+    let length = utf16_len(text);
+    if width <= length as i32 {
+        return Some(Some(text.clone()));
+    }
+    let needed = width as usize - length;
+    Some(repeat_utf16_units(&[pad], needed).map(|prefix| format!("{prefix}{text}")))
+}
+
 fn right_pad(value: &Value, width: &Value, pad: &str) -> Option<String> {
     let text = expect_ref(value)?;
     let width = int_arg(width)?;
@@ -275,16 +303,56 @@ fn left_pad(value: &Value, width: &Value, pad: &str) -> Option<String> {
 }
 
 fn repeat_utf16(pattern: &str, needed: usize) -> Option<String> {
-    if pattern.is_empty() {
+    repeat_utf16_units(&pattern.encode_utf16().collect::<Vec<_>>(), needed)
+}
+
+fn repeat_utf16_units(units: &[u16], needed: usize) -> Option<String> {
+    if units.is_empty() {
         return Some(String::new());
     }
-    let units = pattern.encode_utf16().collect::<Vec<_>>();
     let mut out = Vec::new();
     while out.len() < needed {
         let take = (needed - out.len()).min(units.len());
         out.extend_from_slice(&units[..take]);
     }
     String::from_utf16(&out).ok()
+}
+
+fn simple_upper(unit: u16) -> u16 {
+    let Some(ch) = char::from_u32(unit as u32) else {
+        return unit;
+    };
+    let mut mapped = ch.to_uppercase();
+    let Some(first) = mapped.next() else {
+        return unit;
+    };
+    if mapped.next().is_some() {
+        unit
+    } else {
+        u16::try_from(first as u32).unwrap_or(unit)
+    }
+}
+
+fn simple_lower(unit: u16) -> u16 {
+    let Some(ch) = char::from_u32(unit as u32) else {
+        return unit;
+    };
+    let Some(first) = ch.to_lowercase().next() else {
+        return unit;
+    };
+    u16::try_from(first as u32).unwrap_or(unit)
+}
+
+fn region_matches_ignore_case(haystack: &[u16], needle: &[u16]) -> bool {
+    haystack.iter().zip(needle).all(|(left, right)| {
+        if left == right {
+            return true;
+        }
+        let left_upper = simple_upper(*left);
+        let right_upper = simple_upper(*right);
+        left_upper == right_upper
+            || simple_lower(left_upper) == simple_lower(right_upper)
+    })
 }
 
 fn contains_ignore_case(haystack: &Value, needle: &Value) -> bool {
@@ -294,18 +362,14 @@ fn contains_ignore_case(haystack: &Value, needle: &Value) -> bool {
     let Some(needle) = expect_ref(needle) else {
         return false;
     };
+    let haystack = haystack.encode_utf16().collect::<Vec<_>>();
+    let needle = needle.encode_utf16().collect::<Vec<_>>();
     if needle.is_empty() {
         return true;
     }
-    let needle_lower = needle.to_lowercase();
-    haystack.char_indices().any(|(start, _)| {
-        haystack[start..]
-            .chars()
-            .take(needle.chars().count())
-            .collect::<String>()
-            .to_lowercase()
-            == needle_lower
-    })
+    haystack
+        .windows(needle.len())
+        .any(|window| region_matches_ignore_case(window, &needle))
 }
 
 fn is_blank(value: &Value) -> bool {
