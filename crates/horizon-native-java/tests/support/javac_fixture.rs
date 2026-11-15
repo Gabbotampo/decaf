@@ -63,6 +63,49 @@ impl Fixture {
         Self::build_jars(test, sources, &[], false)
     }
 
+    pub fn build_with_real_classpath(
+        test: &str,
+        sources: &[(&str, &str)],
+        classpath: &Path,
+        mod_json: &str,
+    ) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            false,
+            "demo",
+            Some(mod_json),
+            Some(classpath),
+        )
+    }
+
+    /// Compile a probe against a string classpath for lightweight fixtures.
+    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            false,
+            "demo",
+            None,
+            Some(Path::new(classpath)),
+        )
+    }
+
+    /// Compile a probe against a string classpath for lightweight fixtures.
+    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            false,
+            "demo",
+            None,
+            Some(Path::new(classpath)),
+        )
+    }
+
     /// [`Self::build`], with the `lib/` classes packed as a second jar
     /// (`lib`, a library the probe jar bundles or depends on) and `extra`
     /// `(entry, bytes)` files written into the probe jar.
@@ -80,12 +123,6 @@ impl Fixture {
     /// entrypoints).
     pub fn build_with_mod_json(test: &str, sources: &[(&str, &str)], mod_json: &str) -> Self {
         Self::build_packed(test, sources, &[], false, "demo", Some(mod_json), None)
-    }
-
-    /// Compile a probe against a real external library jar. The external classes are
-    /// intentionally not packed into the probe jar, so the native model answers them.
-    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &Path) -> Self {
-        Self::build_packed(test, sources, &[], false, "demo", None, Some(classpath))
     }
 
     fn build_jars(
@@ -122,10 +159,11 @@ impl Fixture {
             .map(|home| PathBuf::from(home).join("bin/javac"))
             .unwrap_or_else(|| "javac".into());
         let mut javac = Command::new(javac);
-        javac.args(["--release", "21", "-d"]).arg(&classes);
+        javac.args(["--release", "21"]);
         if let Some(classpath) = classpath {
-            javac.arg("--class-path").arg(classpath);
+            javac.arg("-cp").arg(classpath);
         }
+        javac.args(["-d"]).arg(&classes);
         for (path, source) in sources {
             let file = root.join("src").join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
