@@ -169,6 +169,8 @@ pub enum GameEvent {
     /// An item's tooltip is being built (Fabric `ItemTooltipCallback.EVENT`,
     /// NeoForge `ItemTooltipEvent`): the listener edits its lines.
     ClientItemTooltip,
+    /// NeoForge's client mod-bus reload-listener registration event.
+    ClientReloadListeners,
 }
 
 impl GameEvent {
@@ -216,6 +218,7 @@ impl GameEvent {
         GameEvent::ClientRegisterKeyMappings,
         GameEvent::ClientRegisterGuiLayers,
         GameEvent::ClientItemTooltip,
+        GameEvent::ClientReloadListeners,
     ];
 
     /// The stable name logs and reports use.
@@ -263,6 +266,7 @@ impl GameEvent {
             GameEvent::ClientRegisterKeyMappings => "client_register_key_mappings",
             GameEvent::ClientRegisterGuiLayers => "client_register_gui_layers",
             GameEvent::ClientItemTooltip => "client_item_tooltip",
+            GameEvent::ClientReloadListeners => "client_reload_listeners",
         }
     }
 
@@ -306,6 +310,7 @@ impl GameEvent {
                 | GameEvent::ClientRegisterKeyMappings
                 | GameEvent::ClientRegisterGuiLayers
                 | GameEvent::ClientItemTooltip
+                | GameEvent::ClientReloadListeners
         )
     }
 }
@@ -872,6 +877,10 @@ const CLIENT_BUS_EVENTS: &[(&str, GameEvent)] = &[
         GameEvent::ClientRegisterKeyMappings,
     ),
     ("RegisterGuiLayersEvent", GameEvent::ClientRegisterGuiLayers),
+    (
+        "AddClientReloadListenersEvent",
+        GameEvent::ClientReloadListeners,
+    ),
 ];
 const NEOFORGE_CLIENT_EVENT_ROOT: &str = "net/neoforged/neoforge/client/event/";
 const FORGE_CLIENT_EVENT_ROOT: &str = "net/minecraftforge/client/event/";
@@ -1353,7 +1362,7 @@ impl StdHost {
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
         if r.owner == FABRIC_EVENT && r.name == "DEFAULT_PHASE" {
-            return Some(crate::runtime::host_ids::identifier_of_text(order::DEFAULT_PHASE));
+            return Some(crate::runtime::host_ids::static_identifier(order::DEFAULT_PHASE));
         }
         if order::PRIORITY_CLASSES.contains(&r.owner.as_str())
             && order::PRIORITIES.contains(&r.name.as_str())
