@@ -240,6 +240,10 @@ pub(crate) fn guava_superclass(class: &str) -> Option<&'static str> {
             "com/google/common/collect/ImmutableCollection"
         }
         "com/google/common/collect/ImmutableCollection" => "java/util/AbstractCollection",
+        // The game's `NonNullList<E> extends AbstractList<E>` with no
+        // interfaces of its own (26.3 `javap`), the inventory list's class
+        // (#253 re-check).
+        crate::client_surface::NON_NULL_LIST => "java/util/AbstractList",
         _ => return None,
     })
 }
@@ -473,12 +477,25 @@ impl StdHost {
     /// or `map`): a new view reading `source` live. `None` when `source` is no
     /// object.
     pub(crate) fn unmodifiable_view(&mut self, kind: &str, source_value: &Value) -> Option<Value> {
+        let class = view_class(kind, crate::jar_object::object_class(source_value));
+        self.unmodifiable_view_as(class, source_value)
+    }
+
+    /// A new unmodifiable view of the JDK class `class` reading `source_value`
+    /// live, whatever the source's own class: `Collections.unmodifiable*`
+    /// picks `class` from the source ([`Self::unmodifiable_view`]), while
+    /// `UnmodifiableList.subList` keeps its own class (#251). `None` when
+    /// `source_value` is no object.
+    pub(crate) fn unmodifiable_view_as(
+        &mut self,
+        class: &str,
+        source_value: &Value,
+    ) -> Option<Value> {
         let source = expect_ref(source_value)?.clone();
-        let source_class = crate::jar_object::object_class(source_value);
         // A counter that never moves back: the collector shrinks the table, so its size
         // would hand a new view a live one's key (#249).
         let marker = crate::jar_object::collection_key_for(
-            view_class(kind, source_class),
+            class,
             crate::jar_object::CollectionFamily::Immutable,
             self.next_unmodifiable_collection,
         );

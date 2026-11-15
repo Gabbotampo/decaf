@@ -101,6 +101,7 @@ mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
 mod host_path;
+mod host_recursion;
 mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
@@ -121,6 +122,7 @@ mod java_format;
 mod java_format_args;
 mod java_identifier;
 mod java_immutable;
+mod java_math;
 mod java_nbt;
 mod java_numbers;
 mod java_regex;
@@ -173,6 +175,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
 mod reference_identity;
@@ -2366,6 +2369,13 @@ pub trait Host {
         None
     }
 
+    /// [`Self::modelled_to_string`], with a nested walk's `StackOverflowError` thrown rather
+    /// than read as "no model" (#250): the runtime's `String.valueOf`, `Objects.toString` and
+    /// string-concatenation paths call this, so a cycle ends as Java's does.
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(self.modelled_to_string(value))
+    }
+
     /// The `(msb, lsb)` of a `new UUID(msb, lsb)` object this host saw
     /// constructed (`host_jdk_value.rs`), `None` for any other value.
     fn constructed_uuid(&self, _value: &Value) -> Option<(i64, i64)> {
@@ -2409,6 +2419,14 @@ pub trait Host {
     /// The collection an unmodifiable view (`Collections.unmodifiableList`)
     /// reads, by the view's marker.
     fn unmodifiable_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
+    /// A new `Collections$UnmodifiableList` or `$UnmodifiableRandomAccessList`
+    /// (`class`) reading `source` live: what `UnmodifiableList.subList` makes
+    /// with `new` (#251), whatever `source`'s own class. `None` when the host
+    /// keeps no views, so the call is counted.
+    fn unmodifiable_list_view_as(&mut self, _class: &str, _source: &Value) -> Option<Value> {
         None
     }
 
@@ -2652,6 +2670,28 @@ pub trait Host {
     /// has two.
     fn note_entrypoint_constructed(&mut self, _kind: &str, _class: &str, _instance: &Value) {}
 
+    /// The Fabric entrypoint rows the loader host declared for `kind`, in the
+    /// loader's invocation order.  A host that does not own loader state
+    /// exposes no rows; the runtime then keeps the call on its counted host
+    /// path instead of inventing providers.
+    fn fabric_entrypoints(&self, _kind: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// The already constructed instance for one Fabric entrypoint and the
+    /// requested interface.  Fabric caches one instance per entrypoint key;
+    /// a missing value means loading that entry failed or the host has not
+    /// constructed this provider in the current run.
+    fn fabric_entrypoint_object(
+        &self,
+        _kind: &str,
+        _class: &str,
+        _requested: &str,
+        _ordinal: usize,
+    ) -> Option<Value> {
+        None
+    }
+
     /// Sibling-jar classes this host lets the executing jar link against.
     ///
     /// `None` keeps single-jar behavior exactly as before: a symbol the
@@ -2703,6 +2743,41 @@ pub trait Host {
     /// interpreter allocates one and registers the message here. `getMessage`
     /// and `toString` then answer through the host's existing Throwable model.
     fn record_throwable(&mut self, _marker: &str, _message: Option<String>) {}
+
+    /// Throwable objects the host has retained with `addSuppressed`.
+    fn throwable_suppressed(&self, _marker: &str) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn record_throwable_suppressed(&mut self, _marker: &str, _value: Value) {}
+
+    /// Record the cause of a host-created wrapper throwable. The default host
+    /// has no throwable table, so it keeps the older message-only behavior.
+    fn record_throwable_cause(&mut self, _marker: &str, _cause: Value) {}
+
+    /// A wrapper throwable whose cause is known before its marker is created.
+    fn record_wrapped_cause(&mut self, _class: &str, _message: Option<&str>, _cause: Value) {}
+
+    /// Take a cause staged for the next throwable with this class/message.
+    fn take_wrapped_cause(&mut self, _class: &str, _message: &Option<String>) -> Option<Value> {
+        None
+    }
+
+    /// Stage wrappers are materialized only when Java catches the final
+    /// exception. Keep later stage failures until that marker exists.
+    fn record_wrapped_suppressed(&mut self, _class: &str, _message: Option<&str>, _value: Value) {}
+
+    fn take_wrapped_suppressed(&mut self, _class: &str, _message: &Option<String>) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// A constructor failure discovered while running an entrypoint. The
+    /// loader's next `getEntrypoint()` call must see the original chain.
+    fn record_fabric_entrypoint_failure(&mut self, _kind: &str, _class: &str, _cause: Value) {}
+
+    fn take_fabric_entrypoint_failure(&mut self, _kind: &str, _class: &str) -> Option<Value> {
+        None
+    }
 
     /// Return jar-owned class state retained across native callback invocations.
     /// Hosts that do not keep a resident jar instance use an empty snapshot.
@@ -3184,6 +3259,7 @@ pub struct StdHost {
     /// enough for bootstrap diagnostics without modelling Java stack traces.
     throwable_messages: BTreeMap<String, Option<String>>,
     throwable_causes: BTreeMap<String, Option<Value>>,
+    throwable_suppressed: BTreeMap<String, Vec<Value>>,
     /// Jar-owned static fields retained across entrypoint/event invocations.
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
@@ -3342,6 +3418,7 @@ impl StdHost {
             capability_requests: Vec::new(),
             throwable_messages: BTreeMap::new(),
             throwable_causes: BTreeMap::new(),
+            throwable_suppressed: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
@@ -3481,6 +3558,7 @@ impl StdHost {
         kind: &str,
         class: &str,
         requested: Option<&str>,
+        ordinal: usize,
     ) -> Option<Value> {
         if class.contains("::") || requested.is_none() {
             return None;
@@ -3492,13 +3570,37 @@ impl StdHost {
         // One object per entrypoint key (Fabric Loader 0.19.5's
         // `EntrypointStorage.add`: a new `NewEntry`, with its own instance
         // map, per key).
-        self.constructed_entrypoints
-            .get(&(kind.to_owned(), internal))
-            .cloned()
+        let object = self
+            .constructed_entrypoints
+            .get(&(kind.to_owned(), internal.clone()))
+            .cloned()?;
+        if ordinal == 0 {
+            Some(object)
+        } else {
+            // Fabric's storage creates a distinct Entry (and therefore a
+            // distinct cached instance) for every duplicate declaration. The
+            // native entrypoint runner has one constructed object for the
+            // class, so give later duplicate rows distinct handles while
+            // retaining the normal object for the first row.
+            Some(jar_object::handle(format!(
+                "{internal}#{}",
+                1_000_000 + ordinal
+            )))
+        }
     }
 
     fn empty_collection(&mut self, kind: &str) -> Value {
-        self.new_collection(stand_in_class(kind), Vec::new())
+        self.empty_collection_class(match kind {
+            "map" => "java/util/LinkedHashMap",
+            "set" => "java/util/LinkedHashSet",
+            _ => "java/util/ArrayList",
+        })
+    }
+
+    /// Allocate a fresh mutable collection with the concrete JDK class a
+    /// library factory constructs.
+    fn empty_collection_class(&mut self, class: &str) -> Value {
+        self.new_collection(class, Vec::new())
     }
 
     /// A new mutable collection of class `class` holding `values`: an object
@@ -3921,14 +4023,42 @@ impl StdHost {
         if jar_object::spells_key(receiver) {
             return None;
         }
-        let marker = self.synchronized_target(expect_ref(receiver)?);
-        if let Some(values) = self.view_values(marker) {
-            return Some(values);
+        // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
+        // may be another view, as deep as a jar nests them: followed in a loop, never by
+        // recursion (#250).
+        let mut marker = expect_ref(receiver)?.clone();
+        let mut reversed = false;
+        // Each hop follows one row of the view tables, so their rows bound any chain: a chain
+        // of any length a jar builds is read (#260 review); only a cycle, which no jar can
+        // build, would stop here.
+        let hops_bound = self.unmodifiable_collections.len()
+            + self.synchronized_views.len()
+            + self.reversed_views.len()
+            + 1;
+        for hops in 0..hops_bound {
+            let target = self.synchronized_target(&marker).to_owned();
+            let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
+                source.clone()
+            } else if let Some((base, _)) = self.reversed_views.get(&target) {
+                reversed = !reversed;
+                base.clone()
+            } else {
+                let mut values = match self.mutable_collections.get(&target) {
+                    Some(values) => values.clone(),
+                    // A view over a collection the host keeps no row for (a literal).
+                    None if hops > 0 => {
+                        collection_values(&jar_object::stored_value(&target)).ok()?
+                    }
+                    None => return None,
+                };
+                if reversed {
+                    values.reverse();
+                }
+                return Some(values);
+            };
+            marker = next;
         }
-        if let Some(values) = self.reversed_view_values(marker) {
-            return Some(values);
-        }
-        self.mutable_collections.get(marker).cloned()
+        None
     }
 
     /// Answer `java.util.Properties` members from the map a collection keeps.
@@ -4204,8 +4334,7 @@ impl StdHost {
     }
 
     /// Add one bounded Fabric entrypoint container to the loader view.
-    /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
-    /// deterministic when a launcher seeds the same jar more than once.
+    /// Fabric stores every declaration, including duplicate rows.
     pub fn with_fabric_entrypoint(
         mut self,
         kind: impl Into<String>,
@@ -4217,9 +4346,7 @@ impl StdHost {
             class: class.into(),
             provider: provider.into(),
         };
-        if !self.fabric_entrypoint_containers.contains(&entry) {
-            self.fabric_entrypoint_containers.push(entry);
-        }
+        self.fabric_entrypoint_containers.push(entry);
         self
     }
 
@@ -4875,6 +5002,29 @@ impl Host for StdHost {
             .insert((kind.to_owned(), class.to_owned()), instance.clone());
     }
 
+    fn fabric_entrypoints(&self, kind: &str) -> Vec<(String, String)> {
+        let mut rows = self
+            .fabric_entrypoint_containers
+            .iter()
+            .filter(|entry| entry.kind == kind)
+            .map(|entry| (entry.class.clone(), entry.provider.clone()))
+            .collect::<Vec<_>>();
+        // Fabric's resolver presents selected mod candidates by id while
+        // retaining each metadata document's declared entrypoint order.
+        rows.sort_by(|(_, left), (_, right)| left.cmp(right));
+        rows
+    }
+
+    fn fabric_entrypoint_object(
+        &self,
+        kind: &str,
+        class: &str,
+        requested: &str,
+        ordinal: usize,
+    ) -> Option<Value> {
+        self.fabric_entrypoint_object(kind, class, Some(requested), ordinal)
+    }
+
     fn note_content_builder(&mut self, event: ContentBuilderEvent) {
         if let Some(entry) = self.content_builders.note(event) {
             // An attachment registers itself; a metadata row for the same key
@@ -4935,6 +5085,10 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {
+        self.unmodifiable_view_as(class, source)
     }
 
     fn is_jdk_list_of(&self, marker: &str) -> bool {
@@ -5169,7 +5323,13 @@ impl Host for StdHost {
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
-        Some(self.empty_collection(kind))
+        let class = match kind {
+            "map" => "java/util/LinkedHashMap",
+            "set" => "java/util/LinkedHashSet",
+            "list" => "java/util/ArrayList",
+            class => class,
+        };
+        Some(self.empty_collection_class(class))
     }
 
     fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
@@ -5277,6 +5437,10 @@ impl Host for StdHost {
         crate::java_tostring::modelled(self, value)
     }
 
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        crate::java_tostring::modelled_checked(self, value)
+    }
+
     fn constructed_uuid(&self, value: &Value) -> Option<(i64, i64)> {
         self.constructed_uuids
             .get(jar_object::object_key(value)?)
@@ -5301,6 +5465,64 @@ impl Host for StdHost {
             self.throwable_causes.insert(marker.to_owned(), None);
         }
         self.throwable_messages.insert(marker.to_owned(), message);
+    }
+
+    fn throwable_suppressed(&self, marker: &str) -> Option<Vec<Value>> {
+        (self.throwable_messages.contains_key(marker) || self.throwable_causes.contains_key(marker))
+            .then(|| {
+                self.throwable_suppressed
+                    .get(marker)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+    }
+
+    fn record_throwable_suppressed(&mut self, marker: &str, value: Value) {
+        self.throwable_suppressed
+            .entry(marker.to_owned())
+            .or_default()
+            .push(value);
+    }
+
+    fn record_throwable_cause(&mut self, marker: &str, cause: Value) {
+        self.throwable_causes.insert(marker.to_owned(), Some(cause));
+    }
+
+    fn record_wrapped_cause(&mut self, class: &str, message: Option<&str>, cause: Value) {
+        self.throwable_causes.insert(
+            wrapped_cause_key(class, &message.map(str::to_owned)),
+            Some(cause),
+        );
+    }
+
+    fn take_wrapped_cause(&mut self, class: &str, message: &Option<String>) -> Option<Value> {
+        self.throwable_causes
+            .remove(&wrapped_cause_key(class, message))
+            .flatten()
+    }
+
+    fn record_wrapped_suppressed(&mut self, class: &str, message: Option<&str>, value: Value) {
+        self.throwable_suppressed
+            .entry(wrapped_suppressed_key(class, &message.map(str::to_owned)))
+            .or_default()
+            .push(value);
+    }
+
+    fn take_wrapped_suppressed(&mut self, class: &str, message: &Option<String>) -> Vec<Value> {
+        self.throwable_suppressed
+            .remove(&wrapped_suppressed_key(class, message))
+            .unwrap_or_default()
+    }
+
+    fn record_fabric_entrypoint_failure(&mut self, kind: &str, class: &str, cause: Value) {
+        self.throwable_causes
+            .insert(fabric_failure_key(kind, class), Some(cause));
+    }
+
+    fn take_fabric_entrypoint_failure(&mut self, kind: &str, class: &str) -> Option<Value> {
+        self.throwable_causes
+            .remove(&fabric_failure_key(kind, class))
+            .flatten()
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
@@ -5340,6 +5562,11 @@ impl Host for StdHost {
         }
         // The client stand-ins' fields (`Minecraft.player`, `options.keyJump`),
         // key categories and input types.
+        if r.owner == "java/awt/Color"
+            && let Some(value) = client_surface::awt_constant(&r.name)
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.client_static(r) {
             return value;
         }
@@ -5530,6 +5757,12 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_invoke(r, args) {
             return value;
         }
+        if let Some(result) = guava_model::sized_factory_class(r, args) {
+            return result.map(|class| self.empty_collection_class(class));
+        }
+        if let Some(class) = guava_model::empty_factory_class(r) {
+            return Ok(self.empty_collection_class(class));
+        }
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
         }
@@ -5537,6 +5770,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = java_math::static_call(r, args) {
             return value;
         }
         if let Some(value) = java_identifier::invoke_static(self, r, args) {
@@ -6251,7 +6487,7 @@ impl Host for StdHost {
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             ("java/lang/Math", "abs", "(I)I") => {
@@ -6377,7 +6613,7 @@ impl Host for StdHost {
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             // Chat components are a common loader/bootstrap value (mod
@@ -7500,10 +7736,12 @@ impl Host for StdHost {
         {
             // The game's `NonNullList` (an inventory's list): its own rules
             // (no `null`, a fixed size for `withSize`) are not modelled, so a
-            // mutator is counted (#255 review).
+            // mutator is counted (#255 review), and so is `subList`, whose
+            // `AbstractList$SubList` window would carry the same rules
+            // (#253 re-check), whatever the owner the call names.
             if jar_object::collection_key(marker).is_some_and(|_| {
                 jar_object::collection_class(marker) == client_surface::NON_NULL_LIST
-            }) && java_immutable::is_mutator(&r.name)
+            }) && (java_immutable::is_mutator(&r.name) || r.name == "subList")
             {
                 return self.unknown_host_call(r);
             }
@@ -8473,8 +8711,8 @@ impl Host for StdHost {
                 // counted as in any collection's text).
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
-                    object_text(self, &key),
-                    object_text(self, &value)
+                    object_text(self, &key)?,
+                    object_text(self, &value)?
                 )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
@@ -9698,6 +9936,9 @@ impl Host for StdHost {
                     && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
                     && let Some((left, right)) = rest.split_once('|')
                 {
+                    // One level of a composed consumer (#250): a chain as long as a jar
+                    // builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+                    let _level = host_recursion::enter()?;
                     self.invoke_instance(r, &composed_callback(left), args)?;
                     self.invoke_instance(r, &composed_callback(right), args)?;
                 }
@@ -9708,9 +9949,13 @@ impl Host for StdHost {
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
             ) => Ok(Value::Void),
-            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
-            )),
+            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
+                let truth = match expect_ref(receiver) {
+                    Some(marker) => predicate_marker_value(marker)?,
+                    None => false,
+                };
+                Ok(Value::Int(i32::from(truth)))
+            }
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
@@ -9905,12 +10150,16 @@ impl Host for StdHost {
                     .get(1)
                     .and_then(host_class::class_name)
                     .map(str::to_owned);
-                let entries = self
+                let mut entries = self
                     .fabric_entrypoint_containers
                     .iter()
                     .filter(|entry| entry.kind == kind)
                     .cloned()
                     .collect::<Vec<_>>();
+                // Resolver selection presents providers by mod id while
+                // retaining each provider's declaration order. `invoke` uses
+                // the same stable ordering below through `fabric_entrypoints`.
+                entries.sort_by(|left, right| left.provider.cmp(&right.provider));
                 if entries.is_empty() {
                     // `EntrypointStorage.getEntrypoints` of a key no mod
                     // declares: `Collections.emptyList()`, one shared object.
@@ -9922,7 +10171,7 @@ impl Host for StdHost {
                     ));
                 }
                 let mut values = Vec::new();
-                for entry in entries {
+                for (ordinal, entry) in entries.into_iter().enumerate() {
                     if r.name == "getEntrypointContainers" {
                         values.push(host_fabric_runtime::entrypoint_container(
                             &host_fabric_runtime::ContainerParts {
@@ -9930,6 +10179,7 @@ impl Host for StdHost {
                                 class: entry.class,
                                 provider: entry.provider,
                                 requested: requested.clone(),
+                                ordinal,
                             },
                         ));
                     } else {
@@ -9937,6 +10187,7 @@ impl Host for StdHost {
                             &kind,
                             &entry.class,
                             requested.as_deref(),
+                            ordinal,
                         ) {
                             Some(object) => values.push(object),
                             None => return self.unknown_host_call(r),
@@ -10016,6 +10267,7 @@ impl Host for StdHost {
                             &parts.kind,
                             &parts.class,
                             parts.requested.as_deref(),
+                            parts.ordinal,
                         )
                     });
                 match object {
@@ -11383,6 +11635,21 @@ fn is_throwable_marker(marker: &str) -> bool {
     jar_object::marker_class(marker).is_some_and(is_throwable_owner)
 }
 
+fn wrapped_cause_key(class: &str, message: &Option<String>) -> String {
+    format!("@wrapped-cause/{class}/{message:?}")
+}
+
+fn wrapped_suppressed_key(class: &str, message: &Option<String>) -> String {
+    format!("@wrapped-suppressed/{class}/{message:?}")
+}
+
+fn fabric_failure_key(kind: &str, class: &str) -> String {
+    format!(
+        "@fabric-entrypoint-failure/{kind}/{}",
+        class.replace('.', "/")
+    )
+}
+
 /// The superclass of the JDK throwable types a mod catch block can name.
 ///
 /// A jar's own classes carry their `super_class`, but `java/lang/*` classes
@@ -11422,6 +11689,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/StringIndexOutOfBoundsException"
         | "java/util/InputMismatchException" => "java/lang/IndexOutOfBoundsException",
         "java/lang/RuntimeException" => "java/lang/Exception",
+        "java/util/concurrent/CompletionException" => "java/lang/RuntimeException",
         "java/lang/ClassNotFoundException"
         | "java/lang/NoSuchMethodException"
         | "java/lang/NoSuchFieldException"
@@ -11435,6 +11703,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
+        "java/util/concurrent/ExecutionException" => "java/lang/Exception",
         "java/lang/ReflectiveOperationException"
         | "java/io/IOException"
         | "java/lang/InterruptedException"
@@ -11469,6 +11738,16 @@ fn exception_is_subtype(
     thrown: &str,
     catch: &str,
 ) -> bool {
+    // Loader exceptions such as `EntrypointException` live in the host's
+    // class path rather than the mod jar. Their names still carry the Java
+    // throwable contract, so a jar's ordinary `catch (Throwable/Exception)`
+    // must receive the wrapped failure instead of letting it escape.
+    if is_throwable_owner(thrown)
+        && (catch == "java/lang/Throwable"
+            || catch == "java/lang/Exception" && thrown.ends_with("Exception"))
+    {
+        return true;
+    }
     if catch == "java/lang/Object" {
         return true;
     }
@@ -11597,6 +11876,7 @@ impl host_ref::Nested for MarkerText {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(Some(match value {
             // An object prints its key, as its marker did.
             Value::Host(handle) if jar_object::is_object_handle(handle) => handle.key().to_owned(),
@@ -11620,6 +11900,7 @@ struct HostNested<'a>(Option<&'a mut StdHost>);
 
 impl host_ref::Nested for HostNested<'_> {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match value {
             // An object's own `hashCode` is jar code (or an identity hash).
             Value::Host(handle) if jar_object::is_object_handle(handle) => None,
@@ -11632,6 +11913,7 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match a {
             // `a == b` answers for any object; its own `equals` is jar code.
             Value::Host(handle) if jar_object::is_object_handle(handle) => (a == b).then_some(true),
@@ -11646,10 +11928,11 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match (value, self.0.as_deref_mut()) {
             // An object prints what its class's model prints, if one does.
             (Value::Host(handle), Some(host)) if jar_object::is_object_handle(handle) => {
-                host.modelled_to_string(value)
+                java_tostring::modelled_checked(host, value)?
             }
             (Value::Host(handle), None) if jar_object::is_object_handle(handle) => None,
             // A `Class` the host can name the kind of: a primitive, an array,
@@ -11659,7 +11942,7 @@ impl host_ref::Nested for HostNested<'_> {
             }
             (Value::Host(handle), _) => return handle.to_string(self),
             (Value::Ref(Some(text)), _) if value_class::is_plain_string(text) => Some(text.clone()),
-            (Value::Ref(Some(_)), Some(host)) => host.modelled_to_string(value),
+            (Value::Ref(Some(_)), Some(host)) => java_tostring::modelled_checked(host, value)?,
             (Value::Ref(Some(_)), None) => None,
             (other, _) => Some(value_text(other)),
         })
@@ -12242,7 +12525,7 @@ pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeErr
     ))
 }
 
-fn is_collection_owner(owner: &str) -> bool {
+pub(crate) fn is_collection_owner(owner: &str) -> bool {
     is_list_owner(owner)
         || is_set_owner(owner)
         || is_map_owner(owner)
@@ -12343,6 +12626,7 @@ fn is_set_owner(owner: &str) -> bool {
                 | "java/util/concurrent/CopyOnWriteArraySet"
                 | "java/util/concurrent/ConcurrentSkipListSet"
                 | "java/util/concurrent/ConcurrentHashMap$KeySetView"
+                | "java/util/Collections$SetFromMap"
                 | "java/util/EnumSet"
                 | "com/google/common/collect/ImmutableSet"
         )
@@ -12612,26 +12896,60 @@ fn collection_text(
     value: &Value,
     owner_is_map: bool,
 ) -> Result<String, NativeError> {
-    let values = host_collection_values(host, value)?;
+    // One level of nested printing (#250).
+    let _level = host_recursion::enter()?;
     let marker = expect_string(value).to_owned();
+    // `Collections.unmodifiable*`'s `toString` is `c.toString()` (Java 25's `javap`): the view
+    // prints the collection it wraps, which is then the receiver `(this Collection)` compares
+    // against, never the view itself.
+    if let Some(source) = Host::unmodifiable_view_source(host, &marker)
+        .map(|source| jar_object::stored_value(&source))
+        .filter(|source| host.mutable_values(source).is_some())
+    {
+        return collection_text(host, &source, false);
+    }
+    let values = host_collection_values(host, value)?;
     let class = marker.split_once('#').map(|(class, _)| class);
     let is_map = owner_is_map
         || class.is_some_and(|class| {
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
     // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
-    // `String.valueOf(element)`, and the collection itself inside it prints
-    // `(this Collection)`/`(this Map)`.
+    // `String.valueOf(element)`, and the collection itself inside it (`e == this`)
+    // prints `(this Collection)`/`(this Map)`. A collection is a handle, so `==` is
+    // its identity, not its text (#250: a list holding itself recursed until the
+    // native stack overflowed). A deeper cycle recurses, as on the JVM, until a
+    // `StackOverflowError` (`host_recursion.rs`).
+    // Only a class whose `toString` is `AbstractCollection`'s/`AbstractMap`'s (or checks the
+    // same way: `ConcurrentHashMap`, the reversed views, `Helpers.collectionToString`'s blocking
+    // queues) prints itself as `(this Collection)`. `CopyOnWriteArrayList` (`Arrays.toString` of
+    // its array) and the concurrent linked queues print every element, so a list holding itself
+    // recurses until a `StackOverflowError`, as on the JVM.
+    let checks_itself = !class.is_some_and(|class| {
+        matches!(
+            class,
+            "java/util/concurrent/CopyOnWriteArrayList"
+                | "java/util/concurrent/ConcurrentLinkedQueue"
+                | "java/util/concurrent/ConcurrentLinkedDeque"
+                | "java/util/concurrent/LinkedTransferQueue"
+        )
+    });
     let mut texts = Vec::with_capacity(values.len());
     for element in &values {
-        texts.push(match element {
-            Value::Ref(Some(inner)) if *inner == marker => if is_map {
+        let itself = checks_itself
+            && match element {
+                Value::Ref(Some(inner)) => *inner == marker,
+                element => object_methods::identical(element, value),
+            };
+        texts.push(if itself {
+            if is_map {
                 "(this Map)"
             } else {
                 "(this Collection)"
             }
-            .to_owned(),
-            element => object_text(host, element),
+            .to_owned()
+        } else {
+            object_text(host, element)?
         });
     }
     Ok(if is_map {
@@ -12649,36 +12967,257 @@ fn collection_text(
 /// `String.valueOf(Object)` of one value a model holds (a collection's
 /// element, an optional's payload): a box prints its value and a model
 /// object its `toString`.
-fn object_text(host: &mut StdHost, value: &Value) -> String {
-    match value {
+fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
+    Ok(match value {
         Value::Boxed(boxed) => boxed.text(),
         // A handle prints its kind's `toString`; one holding an object the
-        // host cannot print is counted, and keeps the old text.
+        // host cannot print is counted, and keeps the old text. A cycle's
+        // `StackOverflowError` is thrown, as Java's is.
         Value::Host(handle) => match handle.to_string(&mut HostNested(Some(host))) {
             Ok(Some(text)) => text,
+            Err(error) if host_recursion::is_stack_overflow(&error) => return Err(error),
             _ => {
                 let _ = host.unknown_host_call(&jar_text::object_to_string());
                 host_text(value)
             }
         },
-        Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
-            // An object no model prints (a jar object, an identity hash)
-            // is counted; the element keeps its marker in the text. A
-            // stream is counted too, and never prints its marker.
-            if stream_pipeline::is_stream_marker(marker) {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-                return stream_pipeline::STREAM_TEXT.into();
-            }
-            if crate::jar_object::packaged_object_class(value).is_some() {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-            }
-            marker.clone()
-        }),
+        Value::Ref(Some(marker)) => {
+            java_tostring::modelled_checked(host, value)?.unwrap_or_else(|| {
+                // An object no model prints (a jar object, an identity hash)
+                // is counted; the element keeps its marker in the text. A
+                // stream is counted too, and never prints its marker.
+                if stream_pipeline::is_stream_marker(marker) {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                    return stream_pipeline::STREAM_TEXT.into();
+                }
+                if crate::jar_object::packaged_object_class(value).is_some() {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                }
+                marker.clone()
+            })
+        }
         other => value_text(other),
-    }
+    })
 }
 
 impl<H: Host> Runtime<'_, H> {
+    fn retain_entrypoint_failure(
+        &mut self,
+        first: &mut Option<(String, Value)>,
+        suppressed: &mut Vec<Value>,
+        message: String,
+        cause: Value,
+    ) {
+        if first.is_none() {
+            *first = Some((message, cause));
+            return;
+        }
+        let wrapper =
+            self.caught_throwable("java/lang/RuntimeException", Some(message.clone()), None);
+        if let Some(marker) = jar_object::instance_key(&wrapper) {
+            self.host.record_throwable_cause(marker, cause);
+        }
+        suppressed.push(wrapper);
+    }
+
+    /// The bounded Throwable state that the JDK exposes for Fabric's
+    /// aggregated entrypoint failures. Arrays are allocated by the runtime so
+    /// normal `getSuppressed()[i]` bytecode sees the real handles.
+    fn invoke_throwable_metadata(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !is_throwable_owner(&r.owner) {
+            return Ok(None);
+        }
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(marker) = jar_object::instance_key(receiver).map(str::to_owned) else {
+            return Ok(None);
+        };
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getSuppressed", "()[Ljava/lang/Throwable;") => {
+                let Some(values) = self.host.throwable_suppressed(&marker) else {
+                    return Ok(None);
+                };
+                Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+            }
+            ("addSuppressed", "(Ljava/lang/Throwable;)V") => {
+                let Some(value) = args.first().filter(|value| **value != Value::Ref(None)) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                };
+                if receiver == value {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Self-suppression not permitted".into()),
+                        frame: None,
+                    });
+                }
+                self.host
+                    .record_throwable_suppressed(&marker, value.clone());
+                Ok(Some(Value::Void))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `FabricLoaderImpl.invokeEntrypoints` walks the entrypoint rows in the
+    /// same order as `getEntrypointContainers`, obtains each cached instance,
+    /// and passes it to the supplied `Consumer`. Fabric catches `Throwable`
+    /// for every row, wraps it with the stage/provider/definition message,
+    /// gathers later failures, and continues before throwing the first
+    /// wrapper. An entrypoint loading/type error is itself an
+    /// `EntrypointException` with its original cause.
+    fn invoke_fabric_entrypoints(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "net/fabricmc/loader/api/FabricLoader"
+            || r.name != "invokeEntrypoints"
+            || r.descriptor != "(Ljava/lang/String;Ljava/lang/Class;Ljava/util/function/Consumer;)V"
+        {
+            return Ok(None);
+        }
+        let Some(Value::Host(loader)) = receiver else {
+            return Ok(None);
+        };
+        if loader.kind() != HostKind::FabricLoaderInstance {
+            return Ok(None);
+        }
+        let kind = expect_string(args.first().unwrap_or(&Value::Ref(None))).to_owned();
+        let requested = args
+            .get(1)
+            .and_then(host_class::class_name)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Class".into()))?;
+        let consumer = args
+            .get(2)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Consumer".into()))?
+            .clone();
+        let entries = self.host.fabric_entrypoints(&kind);
+        if entries.is_empty() {
+            // The standalone host does not know the run's loader rows. Keep
+            // this counted, as the old host path did, rather than silently
+            // answering an empty invocation.
+            self.host.unknown_operand_call(r)?;
+            return Ok(Some(Value::Void));
+        }
+        let mut first_failure: Option<(String, Value)> = None;
+        let mut suppressed_failures = Vec::new();
+        for (ordinal, (entry_class, provider)) in entries.into_iter().enumerate() {
+            let object =
+                self.host
+                    .fabric_entrypoint_object(&kind, &entry_class, requested, ordinal);
+            let Some(object) = object else {
+                let loading_message = format!(
+                    "Exception while loading entries for entrypoint '{kind}' provided by '{provider}'"
+                );
+                let cast_cause = match self
+                    .host
+                    .take_fabric_entrypoint_failure(&kind, &entry_class)
+                {
+                    Some(cause) => cause,
+                    None => self.caught_throwable(
+                        "java/lang/ClassCastException",
+                        Some(format!(
+                            "entrypoint {entry_class} is not assignable to {requested}"
+                        )),
+                        None,
+                    ),
+                };
+                let loading = self.caught_throwable(
+                    "net/fabricmc/loader/api/EntrypointException",
+                    Some(loading_message),
+                    None,
+                );
+                if let Some(marker) = jar_object::instance_key(&loading) {
+                    self.host.record_throwable_cause(marker, cast_cause);
+                }
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                self.retain_entrypoint_failure(
+                    &mut first_failure,
+                    &mut suppressed_failures,
+                    stage_message,
+                    loading,
+                );
+                continue;
+            };
+            let accepted = match self.run_functional(
+                (
+                    "java/util/function/Consumer",
+                    "accept",
+                    "(Ljava/lang/Object;)V",
+                ),
+                &consumer,
+                &[object],
+            ) {
+                Ok(accepted) => accepted,
+                Err(NativeError::UncaughtException {
+                    class: thrown_class,
+                    message,
+                    frame,
+                }) => {
+                    let cause = self.caught_throwable(&thrown_class, message, frame.as_deref());
+                    let stage_message = format!(
+                        "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                    );
+                    self.retain_entrypoint_failure(
+                        &mut first_failure,
+                        &mut suppressed_failures,
+                        stage_message,
+                        cause,
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !accepted {
+                self.host.unknown_operand_call(r)?;
+                let cause = self.caught_throwable(
+                    "java/lang/RuntimeException",
+                    Some("entrypoint consumer was not executable".into()),
+                    None,
+                );
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                self.retain_entrypoint_failure(
+                    &mut first_failure,
+                    &mut suppressed_failures,
+                    stage_message,
+                    cause,
+                );
+            }
+        }
+        if let Some((message, cause)) = first_failure {
+            self.host
+                .record_wrapped_cause("java/lang/RuntimeException", Some(&message), cause);
+            for suppressed in suppressed_failures {
+                self.host.record_wrapped_suppressed(
+                    "java/lang/RuntimeException",
+                    Some(&message),
+                    suppressed,
+                );
+            }
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/RuntimeException".into(),
+                message: Some(message),
+                frame: None,
+            });
+        }
+        Ok(Some(Value::Void))
+    }
+
     /// Refuse a field access on an object the resident heap collected: its
     /// fields are gone, so the access is a missed root, never its fields'
     /// defaults (#226 review). Checked where no field row exists, which is
@@ -13286,9 +13825,27 @@ fn array_operand_error(
     }
 }
 
+/// Maximum number of [`Value`] slots one jar-controlled array materialization
+/// may create. `Value` is 32 bytes on the 64-bit arcweld/Linux build, so the
+/// bound is about 512 MiB before the array table's HashMap overhead. It keeps
+/// a hostile jar from touching unbounded overcommitted memory; exceeding it is
+/// a refusal because the runtime cannot answer whether HotSpot would have had
+/// enough heap for the allocation.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
+
+/// The interpreter cannot answer an allocation whose host representation is
+/// over the fixed safety bound. Include both values so the refusal identifies
+/// the requested materialization and the limit that stopped it.
+fn array_bound_error(elements: u128) -> NativeError {
+    NativeError::Metadata(format!(
+        "array of {elements} elements exceeds the runtime's bound of {MAX_ARRAY_ELEMENTS}"
+    ))
+}
+
 /// An array creation's length. A negative one is the JVM's
 /// `NegativeArraySizeException` (its message is the length), which a jar's
-/// handler may catch; one over the runtime's bound is refused.
+/// handler may catch. Positive lengths are preserved and checked before their
+/// elements are materialized.
 fn array_length(value: i32) -> Result<usize, NativeError> {
     if value < 0 {
         return Err(NativeError::UncaughtException {
@@ -13297,10 +13854,52 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
             frame: None,
         });
     }
-    usize::try_from(value)
-        .ok()
-        .filter(|length| *length <= 1 << 20)
-        .ok_or_else(|| NativeError::Metadata("array length is invalid".into()))
+    usize::try_from(value).map_err(|_| array_bound_error(u128::from(u32::MAX) + 1))
+}
+
+/// Most array objects one `multianewarray` may create. Each sub-array is its
+/// own entry in the runtime's array table, with a cost well above its element
+/// slots, so `new int[1 << 23][1]` must not pass on its 2^24 slots alone.
+pub(crate) const MAX_MULTIANEWARRAY_ARRAYS: u128 = 1 << 20;
+
+/// Check what a `multianewarray` will materialise before any of it exists:
+/// every level's element slots (the outer array's too, not only the leaves)
+/// against [`MAX_ARRAY_ELEMENTS`], and the number of array objects against
+/// [`MAX_MULTIANEWARRAY_ARRAYS`]. Only the supplied dimensions count: a partial
+/// array leaves its remaining dimensions null and creates nothing for them.
+fn array_total_elements(counts: &[usize]) -> Result<(), NativeError> {
+    // Level k holds prod(counts[..k]) arrays of counts[k] slots each.
+    let (mut arrays_at_level, mut arrays, mut slots) = (1_u128, 0_u128, 0_u128);
+    for &count in counts {
+        arrays = arrays.saturating_add(arrays_at_level);
+        arrays_at_level = arrays_at_level.saturating_mul(count as u128);
+        slots = slots.saturating_add(arrays_at_level);
+    }
+    if slots > MAX_ARRAY_ELEMENTS as u128 {
+        return Err(array_bound_error(slots));
+    }
+    if arrays > MAX_MULTIANEWARRAY_ARRAYS {
+        return Err(NativeError::Metadata(format!(
+            "multianewarray of {arrays} arrays exceeds the runtime's bound of \
+             {MAX_MULTIANEWARRAY_ARRAYS} arrays"
+        )));
+    }
+    Ok(())
+}
+
+/// Allocate repeated array elements without allowing Rust's allocator failure
+/// to abort the whole probe process. Allocation failure is a refusal, never a
+/// guessed catchable Java `OutOfMemoryError`.
+fn repeated_array_values(value: Value, length: usize) -> Result<Vec<Value>, NativeError> {
+    if length > MAX_ARRAY_ELEMENTS {
+        return Err(array_bound_error(length as u128));
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| array_bound_error(length as u128))?;
+    values.resize(length, value);
+    Ok(values)
 }
 
 /// The null checks a method reference's adapter makes before its target runs
@@ -13446,10 +14045,11 @@ impl ClassFile {
         let interface_count = r.u2()? as usize;
         r.skip(interface_count * 2)?;
         let fields = read_fields(&mut r, &pool)?;
-        let methods = read_methods(&mut r, &pool)?;
+        let (methods, method_warnings) = read_methods(&mut r, &pool)?;
         let (annotations, bootstrap_methods, warnings) = read_class_attributes(&mut r, &pool)?;
-        let warnings = warnings
+        let warnings = method_warnings
             .into_iter()
+            .chain(warnings)
             .map(|warning| format!("{name}: {warning}"))
             .collect();
         Ok((
@@ -14838,6 +15438,10 @@ impl NativeJar {
                                     slice: None,
                                     shift: None,
                                 };
+                                if injection_metadata_requires_refusal(inject) {
+                                    unresolved.push(plan);
+                                    continue;
+                                }
                                 let (slice, shift) =
                                     match resolve_injection_modifiers(anchor, &inject_slices) {
                                         Ok(modifiers) => modifiers,
@@ -17127,14 +17731,19 @@ impl NativeJar {
         for declaration in &self.native_declarations {
             host.declared_registrations.insert(declaration.key());
         }
-        let provider = self
-            .fabric_id
-            .as_deref()
-            .or(self.neoforge_id.as_deref())
-            .unwrap_or("unknown");
-        for (kind, entries) in &self.fabric_entrypoints {
-            for entry in entries {
-                host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+        // `record_fabric_metadata` already copied declarations from a real
+        // fabric.mod.json. Synthetic class-only jars have no metadata bytes,
+        // so retain the explicit builder path for their unit fixtures.
+        if !self.resource_bytes.contains_key("fabric.mod.json") {
+            let provider = self
+                .fabric_id
+                .as_deref()
+                .or(self.neoforge_id.as_deref())
+                .unwrap_or("unknown");
+            for (kind, entries) in &self.fabric_entrypoints {
+                for entry in entries {
+                    host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+                }
             }
         }
         host
@@ -17210,6 +17819,7 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,
             arrays: BTreeMap::new(),
@@ -17291,7 +17901,47 @@ impl NativeJar {
                 if active.is_some() {
                     neoforge_imc::set_active(runtime.host, previous.as_deref());
                 }
-                constructed?;
+                if let Err(error) = constructed {
+                    if let NativeError::UncaughtException {
+                        class: thrown_class,
+                        message,
+                        frame,
+                    } = &error
+                    {
+                        // The default Fabric adapter reflects through
+                        // Constructor.newInstance: its LanguageAdapterException
+                        // retains an InvocationTargetException, which in turn
+                        // retains the constructor's original Throwable.
+                        let original = runtime.caught_throwable(
+                            thrown_class,
+                            message.clone(),
+                            frame.as_deref(),
+                        );
+                        let invocation = runtime.caught_throwable(
+                            "java/lang/reflect/InvocationTargetException",
+                            None,
+                            None,
+                        );
+                        if let Some(marker) = jar_object::instance_key(&invocation) {
+                            runtime.host.record_throwable_cause(marker, original);
+                        }
+                        let adapter = runtime.caught_throwable(
+                            "net/fabricmc/loader/api/LanguageAdapterException",
+                            Some(format!(
+                                "Could not instantiate class {}!",
+                                class_name.replace('/', ".")
+                            )),
+                            None,
+                        );
+                        if let Some(marker) = jar_object::instance_key(&adapter) {
+                            runtime.host.record_throwable_cause(marker, invocation);
+                        }
+                        runtime
+                            .host
+                            .record_fabric_entrypoint_failure(kind, &class_name, adapter);
+                    }
+                    return Err(error);
+                }
                 runtime
                     .host
                     .note_entrypoint_constructed(kind, &class_name, &instance);
@@ -17376,6 +18026,7 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields,
             initialized_classes,
             arrays: BTreeMap::new(),
@@ -17538,6 +18189,7 @@ impl NativeJar {
             host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields,
             initialized_classes,
             arrays: BTreeMap::new(),
@@ -19601,21 +20253,25 @@ fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
 /// Evaluate the bounded truth surface of a predicate marker.  Java's default
 /// `Predicate` combinators are represented as markers, so they remain usable
 /// even though the interpreter does not materialize interface instances.
-fn predicate_marker_value(marker: &str) -> bool {
+///
+/// One level per combinator (#250): a chain as deep as a jar builds it ends in a
+/// `StackOverflowError`, as Java's default-method chain does.
+fn predicate_marker_value(marker: &str) -> Result<bool, NativeError> {
+    let _level = host_recursion::enter()?;
     if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
-        return !predicate_marker_value(rest);
+        return Ok(!predicate_marker_value(rest)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) && predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? && predicate_marker_value(right)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) || predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? || predicate_marker_value(right)?);
     }
-    marker.starts_with("@indy:")
+    Ok(marker.starts_with("@indy:"))
 }
 
 /// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
@@ -19788,455 +20444,6 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// Largest JSON document the bounded Gson surface accepts. Config files in
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
-/// Deepest JSON nesting `Gson.fromJson` materializes.
-const MAX_GSON_DEPTH: usize = 32;
-
-/// Parse one JSON document and materialize it for `Gson.fromJson`.
-///
-/// The target class decides between a primitive, a modelled `String`, and the
-/// collection/map markers the interpreter already understands. A document
-/// that nests past [`MAX_GSON_DEPTH`] or measures over
-/// [`MAX_GSON_JSON_BYTES`] is refused with a bounded reason, never replaced by
-/// an empty value.
-fn gson_document(text: &str) -> Result<Option<serde_json::Value>, NativeError> {
-    // Gson answers `null` for an empty document; a config file that does not
-    // exist yet is read through `Files.newBufferedReader` as an empty stream,
-    // and the caller's null check is the next step.
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    if text.len() > MAX_GSON_JSON_BYTES {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document is {} bytes; the bounded parser reads at most {MAX_GSON_JSON_BYTES}",
-            text.len()
-        )));
-    }
-    // Gson's lenient parser accepts the `//` and `/* */` comments a
-    // hand-maintained lang or config file carries; strip them outside string
-    // literals before the bounded JSON reader sees the bytes.
-    let json: serde_json::Value =
-        serde_json::from_str(&strip_json_comments(text)).map_err(|error| {
-            NativeError::Metadata(format!("Gson.fromJson rejected the document: {error}"))
-        })?;
-    let depth = gson_json_depth(&json, 0);
-    if depth > MAX_GSON_DEPTH {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document nests {depth} levels; the bounded parser reads at most {MAX_GSON_DEPTH}"
-        )));
-    }
-    Ok(Some(json))
-}
-
-/// Remove the `//` and `/* */` comments a lenient Gson read accepts.
-///
-/// The scan tracks string literals and escapes, so a `//` inside a value stays
-/// part of the value. A leading byte-order mark is dropped too: a file written
-/// by an editor that adds one is still valid to Gson.
-fn strip_json_comments(text: &str) -> String {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = characters.next() {
-        if in_string {
-            out.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            out.push(character);
-            continue;
-        }
-        if character == '/' {
-            match characters.peek() {
-                Some('/') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if next == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    characters.next();
-                    let mut previous = '\0';
-                    for next in characters.by_ref() {
-                        if previous == '*' && next == '/' {
-                            break;
-                        }
-                        previous = next;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        out.push(character);
-    }
-    out
-}
-
-fn gson_json_depth(json: &serde_json::Value, depth: usize) -> usize {
-    if depth > MAX_GSON_DEPTH {
-        return depth;
-    }
-    match json {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        serde_json::Value::Object(values) => values
-            .values()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        _ => depth,
-    }
-}
-
-fn gson_list_target(class: &str) -> bool {
-    is_collection_owner(class) && !is_map_owner(class)
-}
-
-fn gson_set_target(class: &str) -> bool {
-    is_set_owner(class)
-}
-
-fn gson_map_target(class: &str) -> bool {
-    is_map_owner(class)
-}
-
-fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
-    match class {
-        "int"
-        | "java/lang/Integer"
-        | "short"
-        | "java/lang/Short"
-        | "byte"
-        | "java/lang/Byte"
-        | "char"
-        | "java/lang/Character" => number.as_i64().map_or_else(
-            || Value::Float(number.as_f64().unwrap_or(0.0)),
-            |value| Value::Int(value as i32),
-        ),
-        "long" | "java/lang/Long" => number
-            .as_i64()
-            .map_or_else(|| Value::Float(number.as_f64().unwrap_or(0.0)), Value::Long),
-        "float" | "java/lang/Float" | "double" | "java/lang/Double" => {
-            Value::Float(number.as_f64().unwrap_or(0.0))
-        }
-        _ => {
-            if let Some(value) = number.as_i64() {
-                if let Ok(value) = i32::try_from(value) {
-                    Value::Int(value)
-                } else {
-                    Value::Long(value)
-                }
-            } else if let Some(value) = number.as_u64() {
-                match i32::try_from(value) {
-                    Ok(value) => Value::Int(value),
-                    Err(_) => Value::Float(number.as_f64().unwrap_or(0.0)),
-                }
-            } else {
-                Value::Float(number.as_f64().unwrap_or(0.0))
-            }
-        }
-    }
-}
-
-/// The JDK class Gson 2.x builds for a collection or map target: the
-/// target's own class when it is a concrete JDK collection, else its default
-/// (`ArrayList`, `LinkedHashSet`; for a map `LinkedTreeMap`, which no model
-/// holds, so `LinkedHashMap` stands in: the same insertion order).
-fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
-    const CONCRETE: &[&str] = &[
-        "java/util/ArrayList",
-        "java/util/LinkedList",
-        "java/util/HashSet",
-        "java/util/LinkedHashSet",
-        "java/util/TreeSet",
-        "java/util/HashMap",
-        "java/util/LinkedHashMap",
-        "java/util/TreeMap",
-        "java/util/concurrent/ConcurrentHashMap",
-    ];
-    if CONCRETE.contains(&class) {
-        return class;
-    }
-    // `ConstructorConstructor`'s sorted defaults (#253 review).
-    match class {
-        "java/util/SortedSet" | "java/util/NavigableSet" => return "java/util/TreeSet",
-        "java/util/SortedMap" | "java/util/NavigableMap" => return "java/util/TreeMap",
-        _ => {}
-    }
-    match kind {
-        "set" => "java/util/LinkedHashSet",
-        "map" => "java/util/LinkedHashMap",
-        _ => "java/util/ArrayList",
-    }
-}
-
-/// The call a Gson collection is made for, counted on a host that makes none.
-const GSON_FROM_JSON: (&str, &str, &str) = (
-    "com/google/gson/Gson",
-    "fromJson",
-    "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-);
-
-impl<H: Host> Runtime<'_, H> {
-    /// Gson's value for `json` read as `class`: a collection, map or array
-    /// is an object of its own (#156 P14d2), never text.
-    fn gson_json_value(
-        &mut self,
-        json: &serde_json::Value,
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        if matches!(json, serde_json::Value::Null) {
-            return Ok(Value::Ref(None));
-        }
-        if class.starts_with('[') {
-            return match json {
-                serde_json::Value::Array(values) => self.gson_json_array(values, class),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON array for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        if gson_list_target(class) {
-            return match json {
-                serde_json::Value::Array(values) => self.gson_json_collection(
-                    values,
-                    class,
-                    if gson_set_target(class) {
-                        "set"
-                    } else {
-                        "list"
-                    },
-                ),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON array for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        if gson_map_target(class) {
-            return match json {
-                serde_json::Value::Object(values) => self.gson_json_map(values, class),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON object for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        match json {
-            serde_json::Value::Bool(value) => Ok(match class {
-                "java/lang/String" => Value::Ref(Some(value.to_string())),
-                _ => Value::Int(i32::from(*value)),
-            }),
-            serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
-            serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
-            serde_json::Value::Array(values) => self.gson_json_collection(values, class, "list"),
-            serde_json::Value::Object(values) => self.gson_json_map(values, class),
-            serde_json::Value::Null => Ok(Value::Ref(None)),
-        }
-    }
-
-    /// A JSON array read as the array class `class`: an array of that class
-    /// whose elements are each read as its component type, as Gson's
-    /// adapters read them. An element no adapter here reads (a jar class's
-    /// object, which needs the reflective adapter) is counted, never stored
-    /// with the wrong type (#253 review).
-    fn gson_json_array(
-        &mut self,
-        values: &[serde_json::Value],
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        let component = &class[1..];
-        let mut materialized = Vec::with_capacity(values.len());
-        for value in values {
-            match self.gson_array_element(value, component)? {
-                Some(element) => materialized.push(element),
-                None => {
-                    let r = crate::stream_pipeline::wanted(
-                        GSON_FROM_JSON.0,
-                        GSON_FROM_JSON.1,
-                        GSON_FROM_JSON.2,
-                    );
-                    return self.host.unknown_operand_call(&r);
-                }
-            }
-        }
-        Ok(self.new_array_value(class, materialized))
-    }
-
-    /// One element of a JSON array read as the component `descriptor`, or
-    /// `None` where Gson's adapter would read something this does not model
-    /// (or throw).
-    fn gson_array_element(
-        &mut self,
-        json: &serde_json::Value,
-        descriptor: &str,
-    ) -> Result<Option<Value>, NativeError> {
-        use serde_json::Value as Json;
-        let integer = |json: &Json| json.as_i64();
-        Ok(match (descriptor, json) {
-            (_, Json::Null) if descriptor.len() == 1 => None,
-            (_, Json::Null) => Some(Value::Ref(None)),
-            // `ObjectTypeAdapter` (#253 review).
-            ("Ljava/lang/Object;", _) => self.gson_object_adapter(json)?,
-            // `TypeAdapters.STRING`: a string, an integer's text, a boolean's.
-            ("Ljava/lang/String;", Json::String(text)) => Some(Value::Ref(Some(text.clone()))),
-            ("Ljava/lang/String;", Json::Number(number)) if number.is_i64() || number.is_u64() => {
-                Some(Value::Ref(Some(number.to_string())))
-            }
-            ("Ljava/lang/String;", Json::Bool(flag)) => Some(Value::Ref(Some(flag.to_string()))),
-            // `TypeAdapters.INTEGER`/`LONG`: `nextInt`/`nextLong`.
-            ("I" | "Ljava/lang/Integer;", _) => integer(json)
-                .and_then(|n| i32::try_from(n).ok())
-                .map(Value::Int),
-            ("J" | "Ljava/lang/Long;", _) => integer(json).map(Value::Long),
-            // `TypeAdapters.SHORT`/`BYTE`: `nextInt`, a `JsonSyntaxException`
-            // past 65535 or 255 (or below the type's minimum), then the
-            // narrowing cast. Their boxes are classes no value here carries:
-            // counted.
-            ("S", _) => integer(json)
-                .filter(|n| (i64::from(i16::MIN)..=65535).contains(n))
-                .map(|n| Value::Int(i32::from(n as i16))),
-            ("B", _) => integer(json)
-                .filter(|n| (i64::from(i8::MIN)..=255).contains(n))
-                .map(|n| Value::Int(i32::from(n as i8))),
-            // `nextDouble`, and for a `float` its narrowing.
-            ("D" | "Ljava/lang/Double;", Json::Number(number)) => number.as_f64().map(Value::Float),
-            ("F", Json::Number(number)) => {
-                number.as_f64().map(|n| Value::Float(f64::from(n as f32)))
-            }
-            ("Z", Json::Bool(flag)) => Some(Value::Int(i32::from(*flag))),
-            ("Ljava/lang/Boolean;", Json::Bool(flag)) => Some(boolean_value(*flag)),
-            // A nested array, or a collection or map the converters read.
-            (nested, _) if nested.starts_with('[') => Some(self.gson_json_value(json, nested)?),
-            (object, _) if object.starts_with('L') && object.ends_with(';') => {
-                let class = &object[1..object.len() - 1];
-                if gson_list_target(class) || gson_map_target(class) {
-                    Some(self.gson_json_value(json, class)?)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-    }
-
-    /// Gson's `ObjectTypeAdapter` (`ToNumberPolicy.DOUBLE`): a string, a
-    /// `Double`, a `Boolean`, `null`, an `ArrayList` of the same; `None` for
-    /// an object, which it reads as a `LinkedTreeMap` no model holds.
-    fn gson_object_adapter(
-        &mut self,
-        json: &serde_json::Value,
-    ) -> Result<Option<Value>, NativeError> {
-        use serde_json::Value as Json;
-        Ok(match json {
-            Json::Null => Some(Value::Ref(None)),
-            Json::String(text) => Some(Value::Ref(Some(text.clone()))),
-            Json::Bool(flag) => Some(boolean_value(*flag)),
-            Json::Number(number) => number.as_f64().map(Value::Float),
-            Json::Array(values) => {
-                let mut elements = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(element) = self.gson_object_adapter(value)? else {
-                        return Ok(None);
-                    };
-                    elements.push(element);
-                }
-                Some(self.new_host_collection("java/util/ArrayList", elements, GSON_FROM_JSON)?)
-            }
-            Json::Object(_) => None,
-        })
-    }
-
-    /// A JSON array read as the collection `class` (`kind`: `list`/`set`).
-    /// The element type is not resolved (that needs the declared type
-    /// arguments): elements read as `Object`.
-    fn gson_json_collection(
-        &mut self,
-        values: &[serde_json::Value],
-        class: &str,
-        kind: &str,
-    ) -> Result<Value, NativeError> {
-        let mut materialized = Vec::with_capacity(values.len());
-        for value in values {
-            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
-        }
-        let class = gson_collection_class(class, kind);
-        if kind == "list" {
-            return self.new_host_collection(class, materialized, GSON_FROM_JSON);
-        }
-        // A set takes each element through its own `add`, as Gson's
-        // `CollectionTypeAdapterFactory` does: a `TreeSet` sorts, every set
-        // drops a repeat (#253 review).
-        let set = self.new_host_collection(class, Vec::new(), GSON_FROM_JSON)?;
-        for element in materialized {
-            self.call_virtual(
-                crate::jdk_call::Site::Interface,
-                "java/util/Set",
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &set,
-                &[element],
-            )?;
-        }
-        Ok(set)
-    }
-
-    /// A JSON object read as the map `class`: each member through the map's
-    /// own `put`, as Gson's `MapTypeAdapterFactory` does (a `TreeMap` sorts
-    /// its keys).
-    fn gson_json_map(
-        &mut self,
-        values: &serde_json::Map<String, serde_json::Value>,
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        let map = self.new_host_collection(
-            gson_collection_class(class, "map"),
-            Vec::new(),
-            GSON_FROM_JSON,
-        )?;
-        for (key, value) in values {
-            let value = self.gson_json_value(value, "java/lang/Object")?;
-            self.call_virtual(
-                crate::jdk_call::Site::Interface,
-                "java/util/Map",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                &map,
-                &[Value::Ref(Some(key.clone())), value],
-            )?;
-        }
-        Ok(map)
-    }
-}
-
-fn gson_json_kind(json: &serde_json::Value) -> &'static str {
-    match json {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
 
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
@@ -20254,6 +20461,8 @@ struct Runtime<'a, H> {
     host: &'a mut H,
     calls: usize,
     fields: BTreeMap<String, Value>,
+    /// Suppressed callback exceptions attached to a runtime throwable.
+    suppressed: BTreeMap<String, Vec<Value>>,
     static_fields: BTreeMap<String, Value>,
     initialized_classes: std::collections::BTreeSet<String>,
     arrays: BTreeMap<String, Vec<Value>>,
@@ -21264,6 +21473,9 @@ impl<H: Host> Runtime<'_, H> {
         marker: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // One level of a composed callback (`andThen`, `compose`, #250): a chain as deep as a
+        // jar builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+        let _level = host_recursion::enter()?;
         // A `Stream.Builder` handle, or a push's sink handed to a
         // spliterator, is a `Consumer` (`stream_pipeline.rs`).
         if let Some(value) = self.stream_callback(marker, args)? {
@@ -21702,17 +21914,26 @@ impl<H: Host> Runtime<'_, H> {
     /// reference that would fail a `TypeMismatch`.
     /// `descriptor` is the array class of this level (`[[I`); each nested
     /// level is an array of its component (`[I`).
-    fn new_multidim_array(&mut self, descriptor: &str, counts: &[usize]) -> Value {
+    fn new_multidim_array(
+        &mut self,
+        descriptor: &str,
+        counts: &[usize],
+    ) -> Result<Value, NativeError> {
         let length = counts.first().copied().unwrap_or(0);
         let component = &descriptor[1..];
         let values = if counts.len() <= 1 {
-            vec![Value::default_for(component); length]
+            repeated_array_values(Value::default_for(component), length)?
         } else {
-            (0..length)
-                .map(|_| self.new_multidim_array(component, &counts[1..]))
-                .collect()
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(length)
+                .map_err(|_| array_bound_error(length as u128))?;
+            for _ in 0..length {
+                values.push(self.new_multidim_array(component, &counts[1..])?);
+            }
+            values
         };
-        self.new_array_value(descriptor, values)
+        Ok(self.new_array_value(descriptor, values))
     }
 
     /// Materialize a `java.lang.reflect.Type[]` for the generic reflection
@@ -22035,6 +22256,13 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(file) = self.class(&current) {
                 queue.extend(file.interface_names());
+            } else if current.starts_with("java/")
+                && host_ref::ClassHierarchy::is_instance(&host_ref::JdkHierarchy, &current, wanted)
+                    == Some(true)
+            {
+                // A JDK interface the jar names (`implements List`): Java 25's
+                // table knows its superinterfaces (`Collection`, #242).
+                return true;
             }
         }
         false
@@ -22134,7 +22362,14 @@ impl<H: Host> Runtime<'_, H> {
                 let element = return_desc(&r.descriptor)
                     .trim_start_matches('[')
                     .to_owned();
-                let mut values = Vec::with_capacity(end.saturating_sub(start));
+                let copy_len = end.saturating_sub(start);
+                if copy_len > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(copy_len as u128));
+                }
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(copy_len)
+                    .map_err(|_| array_bound_error(copy_len as u128))?;
                 for index in start..end {
                     values.push(
                         source
@@ -22202,7 +22437,10 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let class = value_class::array_class_marker(&component.replace('.', "/"));
                 // Each slot holds the component's zero (`0` for `int.class`).
-                self.new_array_value(&class, vec![Value::default_for(&class[1..]); length])
+                self.new_array_value(
+                    &class,
+                    repeated_array_values(Value::default_for(&class[1..]), length)?,
+                )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
                 Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
@@ -24262,205 +24500,39 @@ impl<H: Host> Runtime<'_, H> {
             .unwrap_or_default()
     }
 
-    /// `Gson.fromJson` for a document whose target is the jar's own class.
-    ///
-    /// Gson's reflective adapter allocates the object without running a
-    /// constructor and sets the declared instance fields, and a config class
-    /// then reads them back through ordinary field accesses. The interpreter
-    /// does the same: the field table is keyed by the declaring class, so the
-    /// accessors the mod generates find what the document declared. A document
-    /// that names no field this class declares, or a class the runtime does not
-    /// hold, keeps the previous JSON-shaped answer.
+    /// `Gson.fromJson(text, target)` (`r`) for a target that is not one of
+    /// Gson's tree classes: Gson's answer as its adapter for the declared type
+    /// reads it (`gson_tree/typed.rs`), or the call counted where that is not
+    /// reproduced, never a JSON-shaped stand-in (#253 re-check). `target` is
+    /// `None` when the declared type itself is not known (a `TypeToken` or
+    /// `Type` the runtime cannot read).
     fn gson_from_json(
         &mut self,
+        r: &MethodRef,
         text: &str,
-        class: &str,
+        target: Option<GenericType>,
         style: &gson_model::GsonStyle,
     ) -> Result<Value, NativeError> {
-        let Some(json) = gson_document(text)? else {
-            return Ok(Value::Ref(None));
-        };
-        let class = class.replace('.', "/");
-        if let Some(value) = self.gson_materialize(&json, &class, style)? {
+        if let Some(target) = target
+            && let Some(value) = self.gson_read_text(text, &target, style)?
+        {
             return Ok(value);
         }
-        self.gson_json_value(&json, &class)
+        self.host.unknown_operand_call(r)
     }
 
-    /// The erased runtime type a `TypeToken` names.
-    ///
-    /// A token subclass declares its type argument in its `Signature`; when
-    /// that resolves, the token behaves like the same class literal would.
-    /// A token the model cannot read answers `Object`, which the JSON shape
-    /// still materializes into a map or a list.
-    fn type_token_class(&self, _token: &Value) -> String {
-        "java/lang/Object".into()
-    }
-
-    /// Allocate one instance of `class` and inject the document's fields.
-    fn gson_materialize(
-        &mut self,
-        json: &serde_json::Value,
-        class: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        let serde_json::Value::Object(document) = json else {
-            return Ok(None);
-        };
-        if class.starts_with("java/") || !self.has_class(class) {
-            return Ok(None);
+    /// The declared type a `TypeToken` or `Type` argument holds: Gson's
+    /// canonical type, a JDK `java.lang.reflect` type, or a `Class`.
+    fn gson_target(&self, value: &Value) -> Option<GenericType> {
+        if *value == Value::Ref(None) {
+            return None;
         }
-        let fields = self.gson_fields(class);
-        if fields.is_empty() {
-            return Ok(None);
-        }
-        self.ensure_initialized(class)?;
-        let value = self.new_object(class);
-        for (declaring, name, descriptor, access) in fields {
-            if !style.includes_field(access) {
-                continue;
-            }
-            // The naming policy names the JSON key on the way in too.
-            let Some(raw) = document.get(&style.field_name(&name)) else {
-                continue;
-            };
-            let Some(field_value) = self.gson_field_value(raw, &descriptor, style)? else {
-                return Ok(None);
-            };
-            let field = MethodRef {
-                owner: declaring,
-                name,
-                descriptor,
-            };
-            if access & 0x0008 != 0 {
-                // Gson sets a static field through reflection; the
-                // invocation's static table is the same field here.
-                self.static_fields
-                    .insert(Self::static_field_key(&field), field_value);
-            } else if let Some(key) = instance_field_key(&value, &field) {
-                self.fields.insert(key, field_value);
-            }
-        }
-        Ok(Some(value))
-    }
-
-    /// Convert one JSON value to the field descriptor it must land in.
-    ///
-    /// A shape the runtime cannot represent answers `None`, and the caller
-    /// keeps the JSON-shaped value rather than an object with masked fields.
-    fn gson_field_value(
-        &mut self,
-        json: &serde_json::Value,
-        descriptor: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        if json.is_null() {
-            return Ok(Some(Value::Ref(None)));
-        }
-        Ok(Some(match descriptor {
-            "Ljava/lang/String;" => match json {
-                serde_json::Value::String(text) => Value::Ref(Some(text.clone())),
-                serde_json::Value::Bool(flag) => Value::Ref(Some(flag.to_string())),
-                serde_json::Value::Number(number) => Value::Ref(Some(number.to_string())),
-                _ => return Ok(None),
-            },
-            "Z" => match json {
-                serde_json::Value::Bool(flag) => Value::Int(i32::from(*flag)),
-                _ => return Ok(None),
-            },
-            "B" | "S" | "I" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "J" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "F" | "D" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Boolean;" => match json {
-                serde_json::Value::Bool(flag) => boolean_value(*flag),
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Byte;" | "Ljava/lang/Short;" | "Ljava/lang/Integer;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Long;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Float;" | "Ljava/lang/Double;" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            // A collection or map field: Gson's own class for it (#156 P14d2).
-            descriptor @ ("Ljava/util/List;"
-            | "Ljava/util/Collection;"
-            | "Ljava/util/ArrayList;"
-            | "Ljava/util/LinkedList;") => match json {
-                serde_json::Value::Array(values) => {
-                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "list")?
-                }
-                _ => return Ok(None),
-            },
-            descriptor @ ("Ljava/util/Set;"
-            | "Ljava/util/HashSet;"
-            | "Ljava/util/LinkedHashSet;") => match json {
-                serde_json::Value::Array(values) => {
-                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "set")?
-                }
-                _ => return Ok(None),
-            },
-            descriptor @ ("Ljava/util/Map;"
-            | "Ljava/util/HashMap;"
-            | "Ljava/util/LinkedHashMap;") => match json {
-                serde_json::Value::Object(values) => {
-                    self.gson_json_map(values, &descriptor[1..descriptor.len() - 1])?
-                }
-                _ => return Ok(None),
-            },
-            descriptor if descriptor.starts_with("L") && descriptor.ends_with(';') => {
-                let class = &descriptor[1..descriptor.len() - 1];
-                if !self.has_class(class) {
-                    return Ok(None);
-                }
-                match json {
-                    serde_json::Value::Object(_) => {
-                        match self.gson_materialize(json, class, style)? {
-                            Some(value) => value,
-                            None => return Ok(None),
-                        }
-                    }
-                    // A JSON string for a jar class is its enum constant name.
-                    serde_json::Value::String(name) => {
-                        Value::Ref(Some(format!("enum/{class}/{name}")))
-                    }
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        }))
+        let value = self.gson_token_type(value).unwrap_or_else(|| value.clone());
+        crate::host_gson_type::any_node(&value)
+            .or_else(|| generic_type_marker(&value))
+            .or_else(|| {
+                host_class::class_name(&value).map(|name| GenericType::Class(name.to_owned()))
+            })
     }
 
     /// Answer the bounded `com.google.gson` surface config code reaches.
@@ -24468,7 +24540,7 @@ impl<H: Host> Runtime<'_, H> {
     /// The adapter models the two calls that make a config bootstrap work:
     /// `Gson.fromJson` for primitives, `String` and JSON-shaped collections and
     /// maps, and `Gson.toJson` back to text. The parsed document is bounded by
-    /// [`MAX_GSON_JSON_BYTES`] and [`MAX_GSON_DEPTH`]; a malformed document is
+    /// [`MAX_GSON_JSON_BYTES`] and the tree parser's 255 levels; a malformed document is
     /// rejected with a named reason instead of answering `null` or an empty
     /// string. Objects of a jar's own class are not instantiated (that needs
     /// field injection the native path does not model), so their JSON shape is
@@ -24627,8 +24699,8 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, text, Some(target), &style)?))
                     }
                     ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
                         let reader = args.first().and_then(expect_ref).ok_or_else(|| {
@@ -24647,13 +24719,11 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(&text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, &text, Some(target), &style)?))
                     }
-                    // `Gson.fromJson(Reader, TypeToken)` takes the token's erased
-                    // type: a document that is an object becomes a map and an
-                    // array a list, which is what every JSON-shaped token resolves
-                    // to in the bounded adapter.
+                    // `Gson.fromJson(.., TypeToken)` reads the token's whole type
+                    // (`List<Integer>`'s elements as `Integer`, #253 re-check).
                     (
                         "fromJson",
                         "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
@@ -24678,7 +24748,7 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         } else {
                             let text = args
                                 .first()
@@ -24691,9 +24761,9 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         };
-                        Ok(Some(self.gson_from_json(&text, &class, &style)?))
+                        Ok(Some(self.gson_from_json(r, &text, class, &style)?))
                     }
                     (
                         "fromJson",
@@ -24702,16 +24772,9 @@ impl<H: Host> Runtime<'_, H> {
                         let text = args.first().map(expect_string).ok_or_else(|| {
                             NativeError::Metadata("Gson.fromJson needs a JSON string".into())
                         })?;
-                        let raw = args
-                            .get(1)
-                            .and_then(generic_type_marker)
-                            .and_then(|value| match value {
-                                GenericType::Class(name) => Some(name),
-                                GenericType::Parameterized { raw, .. } => Some(raw),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "java/lang/Object".into());
-                        Ok(Some(self.gson_from_json(text, &raw, &style)?))
+                        let text = text.to_owned();
+                        let target = args.get(1).and_then(|ty| self.gson_target(ty));
+                        Ok(Some(self.gson_from_json(r, &text, target, &style)?))
                     }
                     _ => Ok(None),
                 }
@@ -25007,6 +25070,86 @@ impl<H: Host> Runtime<'_, H> {
         Ok(None)
     }
 
+    /// Where a throw that a call at `at` raised goes: this frame's handler that catches it
+    /// (its program counter and the throwable it receives), or the error leaving the frame.
+    ///
+    /// A Java throw is delivered by its class. A jar recursion past the thread's stack
+    /// ([`NativeError::CallDepthExceeded`], `frame_bound.rs`) is Java's `StackOverflowError`
+    /// (#250): a handler for it (or `Error`/`Throwable`) catches it, as on the JVM; with none it
+    /// leaves as the bound's own diagnostic. Any other error leaves with this frame's context.
+    /// Kept out of line so `invoke_frame`, which delivers at every call site, keeps a small
+    /// frame (the jar-frame bound is measured in those frames).
+    #[inline(never)]
+    fn deliver_throw(
+        &mut self,
+        error: NativeError,
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(usize, Value), NativeError> {
+        // A host walk's refusal (`host_recursion.rs`) reaches the jar here: counted before any
+        // handler sees its throw.
+        self.count_bound_refusals()?;
+        match error {
+            NativeError::UncaughtException {
+                class: thrown,
+                message,
+                frame,
+            } => {
+                if let Some(handler) = self.exception_handler(file, method, desc, at, &thrown)? {
+                    let value = self.caught_throwable(&thrown, message, frame.as_deref());
+                    return Ok((handler, value));
+                }
+                Err(NativeError::UncaughtException {
+                    class: thrown,
+                    message,
+                    frame: frame.or_else(|| Some(format!("{class}#{method} +{at}"))),
+                })
+            }
+            error @ NativeError::CallDepthExceeded { limit, .. } => {
+                // A table that cannot be read catches nothing: the bound's error stands.
+                if let Ok(Some(handler)) =
+                    self.exception_handler(file, method, desc, at, host_recursion::STACK_OVERFLOW)
+                {
+                    // The bound is the host's native stack (`frame_bound.rs`), far shallower than
+                    // the JVM's: a finite recursion Java finishes (`sum(2000)`) is refused here,
+                    // and even an endless one does not overflow where Java's would. The jar gets
+                    // Java's catchable throw; the conversion is counted, naming the bound and the
+                    // depth, so the run is never silent (#260 review). A strict host refuses.
+                    self.count_bound("frame-bound", limit)?;
+                    let value = self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
+                    return Ok((handler, value));
+                }
+                Err(error)
+            }
+            error => Err(frame_context(error, class, method, at)),
+        }
+    }
+
+    /// Count one `StackOverflowError` the runtime raised from its own `bound` at `depth`
+    /// (`java/lang/StackOverflowError#<BOUND:DEPTH>()V`): the bound decided it, not Java.
+    fn count_bound(&mut self, bound: &str, depth: usize) -> Result<(), NativeError> {
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: host_recursion::STACK_OVERFLOW.into(),
+                name: format!("<{bound}:{depth}>"),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Count the host walks' refusals since the last count (`host_recursion.rs`).
+    fn count_bound_refusals(&mut self) -> Result<(), NativeError> {
+        for (depth, times) in host_recursion::take_refusals() {
+            for _ in 0..times {
+                self.count_bound("host-walk-bound", depth)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
     fn caught_throwable(
@@ -25020,9 +25163,17 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.caught_object(class, &message, frame) {
             return value;
         }
+        let pending_cause = self.host.take_wrapped_cause(class, &message);
+        let pending_suppressed = self.host.take_wrapped_suppressed(class, &message);
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
+            if let Some(cause) = pending_cause {
+                self.host.record_throwable_cause(marker, cause);
+            }
+            for suppressed in pending_suppressed {
+                self.host.record_throwable_suppressed(marker, suppressed);
+            }
         }
         value
     }
@@ -25294,6 +25445,11 @@ impl<H: Host> Runtime<'_, H> {
         let result = self.invoke_frame(class, method, desc, receiver, args);
         stack_walk::leave();
         self.depth -= 1;
+        // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
+        // host call, or one that left uncaught) is counted too.
+        if self.depth == 0 {
+            self.count_bound_refusals()?;
+        }
         result
     }
 
@@ -25307,6 +25463,24 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// One jar frame, executed instruction by instruction.
+    fn invoke_throwable_suppressed(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "getSuppressed"
+            || r.descriptor != "()[Ljava/lang/Throwable;"
+            || !is_throwable_owner(&r.owner)
+        {
+            return Ok(None);
+        }
+        let Some(marker) = receiver.and_then(jar_object::instance_key) else {
+            return Ok(None);
+        };
+        let values = self.suppressed.get(marker).cloned().unwrap_or_default();
+        Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -25457,27 +25631,16 @@ impl<H: Host> Runtime<'_, H> {
             ($at:expr, $call:expr) => {
                 match $call {
                     Ok(value) => value,
-                    Err(NativeError::UncaughtException {
-                        class: thrown,
-                        message,
-                        frame,
-                    }) => {
-                        if let Some(handler) =
-                            self.exception_handler(file, method, desc, $at, &thrown)?
-                        {
-                            let value = self.caught_throwable(&thrown, message, frame.as_deref());
-                            stack.clear();
-                            stack.push(value);
-                            pc = handler;
-                            continue;
-                        }
-                        return Err(NativeError::UncaughtException {
-                            class: thrown,
-                            message,
-                            frame: frame.or_else(|| Some(format!("{class}#{method} +{}", $at))),
-                        });
+                    // One call per site: the delivery's code lives in `deliver_throw`, so a
+                    // frame of this function stays as small as the bound measured it.
+                    Err(error) => {
+                        let (handler, value) =
+                            self.deliver_throw(error, file, class, method, desc, $at)?;
+                        stack.clear();
+                        stack.push(value);
+                        pc = handler;
+                        continue;
                     }
-                    Err(error) => return Err(frame_context(error, class, method, $at)),
                 }
             };
         }
@@ -26168,7 +26331,10 @@ impl<H: Host> Runtime<'_, H> {
                     let component = value_class::primitive_array_component(atype)
                         .ok_or(NativeError::InvalidClass("invalid newarray type"))?;
                     let class = value_class::array_class_marker(component);
-                    stack.push(self.new_array_value(&class, vec![empty; length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(empty, length)),
+                    ));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
@@ -26176,7 +26342,10 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, array_length(pop_int(&mut stack, class, method, at)?));
                     let component = class_name(&file.pool, i)?;
                     let class = value_class::array_class_marker(&component);
-                    stack.push(self.new_array_value(&class, vec![Value::Ref(None); length]));
+                    stack.push(self.new_array_value(
+                        &class,
+                        invoke_or_catch!(at, repeated_array_values(Value::Ref(None), length)),
+                    ));
                 }
                 0xbe => {
                     self.pull_array_views();
@@ -26277,7 +26446,11 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|count| array_length(*count))
                             .collect::<Result<Vec<_>, _>>()
                     );
-                    stack.push(self.new_multidim_array(&descriptor, &counts));
+                    invoke_or_catch!(at, array_total_elements(&counts));
+                    stack.push(invoke_or_catch!(
+                        at,
+                        self.new_multidim_array(&descriptor, &counts)
+                    ));
                 }
                 0xc0 => {
                     // The reference stays on the stack; a cast to a class the
@@ -26590,6 +26763,11 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
                     {
@@ -26618,11 +26796,21 @@ impl<H: Host> Runtime<'_, H> {
                         // A jar's own `BlockPos`/`LevelResource`: the game's
                         // members on its fields (`jar_server_values.rs`).
                         value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_throwable_suppressed(&r, receiver.as_ref())
+                    ) {
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
                     {
                         // A jar exception's inherited `Throwable` text members
                         // (`jar_throwables.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_throwable_metadata(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -27024,6 +27212,15 @@ impl<H: Host> Runtime<'_, H> {
                             .flatten();
                             if let Some(value) = optional {
                                 value
+                            } else if let Some(value) = invoke_or_catch!(
+                                at,
+                                self.invoke_fabric_entrypoints(
+                                    &resolved,
+                                    receiver.as_ref(),
+                                    &args,
+                                )
+                            ) {
+                                value
                             } else if matches!(
                                 resolved.owner.as_str(),
                                 "java/util/function/Function"
@@ -27210,7 +27407,7 @@ impl<H: Host> Runtime<'_, H> {
                         // `String` operand is already its text.
                         for (value, argument) in captured.iter_mut().zip(&arguments) {
                             if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string(value)
+                                && let Some(text) = self.host.modelled_to_string_checked(value)?
                             {
                                 *value = Value::Ref(Some(text));
                             }
@@ -29041,7 +29238,38 @@ fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Field>, NativeErro
     }
     Ok(out)
 }
-fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeError> {
+/// The error a `RuntimeVisibleAnnotations` attribute nested past [`MAX_ANNOTATION_DEPTH`] gives.
+const ANNOTATIONS_TOO_DEEP: &str = "annotation values nested too deeply";
+
+/// A `RuntimeVisibleAnnotations` attribute's annotations. One nested past
+/// [`MAX_ANNOTATION_DEPTH`] is skipped with a warning naming `owner`, never failing the class
+/// (and so the jar) it sits on (#260 review): the class loads without those annotations, as an
+/// unreadable invisible annotation's class does. Any other malformed attribute fails as before.
+fn read_visible_annotations(
+    bytes: &[u8],
+    pool: &[Cp],
+    owner: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Annotation>, NativeError> {
+    match read_annotations(&mut Reader::new(bytes), pool) {
+        Err(NativeError::InvalidClass(why)) if why == ANNOTATIONS_TOO_DEEP => {
+            push_class_annotation_warning(
+                warnings,
+                format!(
+                    "{owner}: annotations nest deeper than {MAX_ANNOTATION_DEPTH} levels; skipped"
+                ),
+            );
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
+fn read_methods(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+) -> Result<(Vec<Method>, Vec<String>), NativeError> {
+    let mut warnings = Vec::new();
     let n = r.u2()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -29064,8 +29292,12 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
                 let len = c.u4()? as usize;
                 code = Some(c.bytes(len)?.to_owned());
             } else if attr == "RuntimeVisibleAnnotations" {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    &format!("method {name}{descriptor}"),
+                    &mut warnings,
+                )?);
             }
             // RuntimeInvisibleAnnotations and parameter annotations are not
             // needed for Mixin discovery; their bytes were already bounded by
@@ -29081,7 +29313,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             annotations,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 fn skip_attributes(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
     let n = r.u2()? as usize;
@@ -29127,8 +29359,12 @@ fn read_class_attributes(
         let bytes = r.bytes(length)?;
         match name.as_str() {
             "RuntimeVisibleAnnotations" => {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    "class",
+                    &mut warnings,
+                )?);
             }
             "RuntimeInvisibleAnnotations" => {
                 read_invisible_mixin_annotations(bytes, pool, &mut annotations, &mut warnings);
@@ -29247,18 +29483,46 @@ fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, 
     })
 }
 
+/// How deep annotation values may nest (an array or annotation inside another). The JVM sets
+/// no limit, but the reader is Rust recursion over the class file's bytes, which a jar chooses:
+/// three bytes per nested array would otherwise overflow the native stack while the jar loads
+/// (#250). javac writes a handful of levels; an attribute nested deeper is skipped with a warning
+/// (`read_visible_annotations`), never failing its class or jar.
+const MAX_ANNOTATION_DEPTH: usize = 64;
+
 fn read_annotation(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Annotation, NativeError> {
+    read_annotation_at(r, pool, 0)
+}
+
+fn read_annotation_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<Annotation, NativeError> {
     let descriptor = utf8(pool, r.u2()?)?;
     let pair_count = r.u2()? as usize;
     let mut values = BTreeMap::new();
     for _ in 0..pair_count {
         let name = utf8(pool, r.u2()?)?;
-        values.insert(name, read_annotation_value(r, pool)?);
+        values.insert(name, read_annotation_value_at(r, pool, depth + 1)?);
     }
     Ok(Annotation { descriptor, values })
 }
 
 fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationValue, NativeError> {
+    read_annotation_value_at(r, pool, 0)
+}
+
+fn read_annotation_value_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<AnnotationValue, NativeError> {
+    if depth > MAX_ANNOTATION_DEPTH {
+        return Err(NativeError::InvalidClass(
+            "annotation values nested too deeply",
+        ));
+    }
     match r.u1()? {
         b's' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
         b'Z' => match int_constant(pool, r.u2()?)? {
@@ -29281,14 +29545,16 @@ fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationVa
         // A class constant in an annotation is a field descriptor such as
         // `Lnet/minecraft/world/level/Level;`.
         b'c' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
-        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation(
-            r, pool,
+        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation_at(
+            r,
+            pool,
+            depth + 1,
         )?))),
         b'[' => {
             let count = r.u2()? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_annotation_value(r, pool)?);
+                items.push(read_annotation_value_at(r, pool, depth + 1)?);
             }
             Ok(AnnotationValue::Array(items))
         }
@@ -29708,6 +29974,26 @@ fn mixin_target_owners(mixin: &Annotation) -> Vec<String> {
 }
 
 /// A boolean annotation element; absent or non-boolean is false.
+/// The bounded injector does not implement Mixin's injection-count or local-capture metadata.
+/// Refuse non-default values so a game-hook plan is counted instead of silently claiming the
+/// loader would have accepted or warned about it.
+fn injection_metadata_requires_refusal(annotation: &Annotation) -> bool {
+    let nonzero = |key: &str| {
+        matches!(
+            annotation.values.get(key),
+            Some(AnnotationValue::Int(value)) if *value != 0
+        )
+    };
+    if nonzero("require") || nonzero("expect") {
+        return true;
+    }
+    match annotation.values.get("locals") {
+        None => false,
+        Some(AnnotationValue::String(value)) => value.rsplit('.').next() != Some("NO_CAPTURE"),
+        Some(_) => true,
+    }
+}
+
 fn annotation_bool(annotation: &Annotation, key: &str) -> bool {
     matches!(
         annotation.values.get(key),
@@ -30992,6 +31278,102 @@ mod tests {
     }
 
     #[test]
+    fn guava_empty_factories_keep_their_java_classes_and_identity_maps() {
+        let factories = [
+            (
+                "com/google/common/collect/Maps",
+                "newHashMap",
+                "()Ljava/util/HashMap;",
+                "java/util/HashMap",
+            ),
+            (
+                "com/google/common/collect/Lists",
+                "newArrayList",
+                "()Ljava/util/ArrayList;",
+                "java/util/ArrayList",
+            ),
+            (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "()Ljava/util/HashSet;",
+                "java/util/HashSet",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newLinkedHashMap",
+                "()Ljava/util/LinkedHashMap;",
+                "java/util/LinkedHashMap",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newIdentityHashMap",
+                "()Ljava/util/IdentityHashMap;",
+                "java/util/IdentityHashMap",
+            ),
+            (
+                "com/google/common/collect/Sets",
+                "newIdentityHashSet",
+                "()Ljava/util/Set;",
+                "java/util/Collections$SetFromMap",
+            ),
+            (
+                "com/google/common/collect/Maps",
+                "newConcurrentMap",
+                "()Ljava/util/concurrent/ConcurrentMap;",
+                "java/util/concurrent/ConcurrentHashMap",
+            ),
+            (
+                "com/google/common/collect/Lists",
+                "newLinkedList",
+                "()Ljava/util/LinkedList;",
+                "java/util/LinkedList",
+            ),
+        ];
+        let mut host = StdHost::new();
+        for (owner, name, descriptor, class) in factories {
+            let r = MethodRef {
+                owner: owner.into(),
+                name: name.into(),
+                descriptor: descriptor.into(),
+            };
+            let first = host.invoke(&r, &[]).unwrap();
+            let second = host.invoke(&r, &[]).unwrap();
+            assert_eq!(class_of_value(&first).as_deref(), Some(class));
+            assert_ne!(first, second, "each Guava factory call allocates");
+        }
+        let make = MethodRef {
+            owner: "com/google/common/collect/Maps".into(),
+            name: "newIdentityHashMap".into(),
+            descriptor: "()Ljava/util/IdentityHashMap;".into(),
+        };
+        let map = host.invoke(&make, &[]).unwrap();
+        let put = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "put".into(),
+            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let get = MethodRef {
+            owner: "java/util/Map".into(),
+            name: "get".into(),
+            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;".into(),
+        };
+        let key_a = Value::Ref(Some("demo/Object#1".into()));
+        let key_b = Value::Ref(Some("demo/Object#2".into()));
+        host.invoke_instance(&put, &map, &[key_a.clone(), Value::Int(1)])
+            .unwrap();
+        host.invoke_instance(&put, &map, &[key_b.clone(), Value::Int(2)])
+            .unwrap();
+        assert_eq!(
+            host.invoke_instance(&get, &map, &[key_a]).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&get, &map, &[key_b]).unwrap(),
+            Value::Int(2)
+        );
+    }
+
+    #[test]
     fn with_woven_classes_keeps_metadata_and_installs_the_new_classes() {
         let root = std::env::temp_dir().join(format!(
             "horizon-native-java-woven-metadata-{}",
@@ -31391,6 +31773,7 @@ mod tests {
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([(
@@ -31449,6 +31832,7 @@ mod tests {
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
@@ -38534,6 +38918,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -38694,6 +39079,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -38877,6 +39263,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -39228,6 +39615,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
@@ -39539,6 +39927,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -41766,6 +42155,73 @@ mandatory = true
             host_collection_values(&host, &entries).unwrap(),
             Vec::<Value>::new()
         );
+    }
+
+    /// Annotation values nested as deep as a class file's bytes allow are refused as an invalid
+    /// class, never read by recursion until the native stack overflows (#250); a few levels
+    /// read as ever.
+    /// A `RuntimeVisibleAnnotations` attribute nested past the depth bound is skipped with a
+    /// warning naming its owner: its class (and jar) still load (#260 review). One within the
+    /// bound reads as ever.
+    #[test]
+    fn a_too_deep_visible_annotation_is_skipped_with_a_warning() {
+        let pool = vec![
+            Cp::Empty,
+            Cp::Utf8("Ldemo/Deep;".into()),
+            Cp::Utf8("value".into()),
+            Cp::Integer(7),
+        ];
+        let attribute = |levels: usize| {
+            // One annotation `@Deep(value = [[[...7...]]])`.
+            let mut bytes = vec![0, 1, 0, 1, 0, 1, 0, 2];
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 3]);
+            bytes
+        };
+        let mut warnings = Vec::new();
+        let deep =
+            read_visible_annotations(&attribute(100), &pool, "class", &mut warnings).unwrap();
+        assert!(deep.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("class: annotations nest deeper"),
+            "{warnings:?}"
+        );
+        let mut warnings = Vec::new();
+        let shallow =
+            read_visible_annotations(&attribute(3), &pool, "class", &mut warnings).unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].descriptor, "Ldemo/Deep;");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_annotation_values_are_refused() {
+        let pool = vec![Cp::Empty, Cp::Integer(7)];
+        let nested = |levels: usize| {
+            let mut bytes = Vec::with_capacity(levels * 3 + 3);
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 1]);
+            bytes
+        };
+        let deep = nested(100_000);
+        assert!(matches!(
+            read_annotation_value(&mut Reader::new(&deep), &pool),
+            Err(NativeError::InvalidClass(_))
+        ));
+        let shallow = nested(3);
+        let mut value = read_annotation_value(&mut Reader::new(&shallow), &pool).unwrap();
+        for _ in 0..3 {
+            let AnnotationValue::Array(mut items) = value else {
+                panic!("{value:?}")
+            };
+            value = items.remove(0);
+        }
+        assert_eq!(value, AnnotationValue::Int(7));
     }
 
     #[test]
@@ -44703,6 +45159,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),
@@ -44731,7 +45188,7 @@ mandatory = true
             depth: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
-        let grid = runtime.new_multidim_array("[[I", &[2, 3]);
+        let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
         assert_eq!(host_array::exact_class(&grid), Some("[[I"));
         let outer = runtime.array(&grid).unwrap().clone();
         assert_eq!(outer.len(), 2);
@@ -44756,6 +45213,7 @@ mandatory = true
             host: &mut host,
             calls: 0,
             fields: BTreeMap::new(),
+            suppressed: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::new(),

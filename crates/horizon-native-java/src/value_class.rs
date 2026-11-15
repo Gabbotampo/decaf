@@ -98,6 +98,12 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 /// handles, never text (`host_array.rs`, `host_brigadier.rs`): a text spelled
 /// like their old markers ([`RETIRED_PREFIXES`]) or their keys (`[I#0`,
 /// `color-collection#0`) is a `String`.
+/// A class whose objects are collection handles: a collection or map type,
+/// or a class the collection model gives supertypes.
+fn collection_class(class: &str) -> bool {
+    crate::is_collection_owner(class) || !crate::java_immutable::supertypes(class).is_empty()
+}
+
 pub(crate) fn is_plain_string(marker: &str) -> bool {
     if RETIRED_PREFIXES
         .iter()
@@ -125,7 +131,10 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
         && !class.is_empty()
         && !class.contains([':', ' '])
     {
-        return host_array::handle_only_class(class);
+        // A collection is a handle (#156 P14d2), and the keys the host writes
+        // read as plain above: `java/util/ArrayList#x` or
+        // `net/minecraft/core/NonNullList#x` is text (#253 re-check).
+        return host_array::handle_only_class(class) || collection_class(class);
     }
     if !marker.contains('#') && class_of_text(marker).is_some() {
         return false;
