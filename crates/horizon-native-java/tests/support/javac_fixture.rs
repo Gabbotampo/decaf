@@ -60,14 +60,14 @@ impl Fixture {
     /// `javac --release 21` and pack the `demo/` classes as a Fabric jar with
     /// `demo.Probe` as its `main` entrypoint.
     pub fn build(test: &str, sources: &[(&str, &str)]) -> Self {
-        Self::build_jars(test, sources, &[], false)
+        Self::build_jars(test, sources, &[], false, None)
     }
 
     /// [`Self::build`], with the `lib/` classes packed as a second jar
     /// (`lib`, a library the probe jar bundles or depends on) and `extra`
     /// `(entry, bytes)` files written into the probe jar.
     pub fn build_with_lib(test: &str, sources: &[(&str, &str)], extra: &[(&str, &[u8])]) -> Self {
-        Self::build_jars(test, sources, extra, true)
+        Self::build_jars(test, sources, extra, true, None)
     }
 
     /// [`Self::build`], packing every compiled class into the probe jar, not
@@ -82,18 +82,20 @@ impl Fixture {
         Self::build_packed(test, sources, &[], false, "demo", Some(mod_json), None)
     }
 
-    /// Compile a probe against a real library jar while shipping only demo classes.
-    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
-        Self::build_packed(test, sources, &[], false, "demo", None, Some(classpath))
-    }
-
     fn build_jars(
         test: &str,
         sources: &[(&str, &str)],
         extra: &[(&str, &[u8])],
         with_lib: bool,
+        classpath: Option<&str>,
     ) -> Self {
-        Self::build_packed(test, sources, extra, with_lib, "demo", None, None)
+        Self::build_packed(test, sources, extra, with_lib, "demo", None, classpath)
+    }
+
+    /// Compile a probe against a real library jar while still shipping only
+    /// the demo classes in the probe jar.
+    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+        Self::build_packed(test, sources, &[], false, "demo", None, Some(classpath))
     }
 
     /// Compile `sources` and pack the classes under `packed` (every class
