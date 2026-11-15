@@ -184,6 +184,8 @@ def summarise(report: dict | None, log_lines: list[str]) -> list[dict]:
             "callbacks": jar.get("callbacks"),
             "commands": jar.get("commands"),
             "content": jar.get("content"),
+            # Game-class Mixin callbacks: bound, unbound, run, failed, skipped (#156 P16e2).
+            "game_hooks": jar.get("game_hooks"),
             "usages": {"translated": usages[0], "refused": usages[1]},
             "registration": {"ran": callbacks[0], "failed": callbacks[1]},
             "log_reasons": reasons[:8],

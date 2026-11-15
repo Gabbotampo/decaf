@@ -1342,3 +1342,154 @@ fn game_object_fields_keep_every_kind_of_handle_across_collections() {
         ]
     );
 }
+
+/// A game class's own field on a game object, read and written without
+/// `@Shadow`, and a field a Mixin inherits from the game class it extends.
+const FIELD_MIXINS: &[(&str, &str)] = &[
+    (
+        "ReadMixin",
+        r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class ReadMixin {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDie(DamageSource source, CallbackInfo ci) {
+        Object connection = ((ServerPlayer) (Object) this).connection;
+        HookSink.mark("read/" + (connection == null));
+    }
+}
+"#,
+    ),
+    (
+        "WriteMixin",
+        r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class WriteMixin {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDie(DamageSource source, CallbackInfo ci) {
+        ((ServerPlayer) (Object) this).hurtMarked = true;
+        HookSink.mark("wrote");
+    }
+}
+"#,
+    ),
+    (
+        "HeirMixin",
+        r#"package demo;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.player.Player;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+@Mixin(ServerPlayer.class)
+public abstract class HeirMixin extends Player {
+    @Inject(method = "die", at = @At("HEAD"))
+    private void onDie(DamageSource source, CallbackInfo ci) {
+        HookSink.mark("level/" + experienceLevel);
+    }
+}
+"#,
+    ),
+];
+
+/// The game object's own fields are the game's, which the model does not
+/// hold: a plain `getfield` or `putfield` of a game class's field on a game
+/// object, and one a Mixin inherits from the game class it extends, fail the
+/// firing as a `@Shadow` one does, never `null` read or a write kept as the
+/// Mixin's own (#248's reviews: cpm's `ServerPlayer.connection`).
+#[test]
+fn game_fields_on_a_game_object_refuse_reads_and_writes() {
+    for (mixin, source, expected) in [
+        (
+            FIELD_MIXINS[0].0,
+            FIELD_MIXINS[0].1,
+            "reads the game's field net/minecraft/server/level/ServerPlayer#connection",
+        ),
+        (
+            FIELD_MIXINS[1].0,
+            FIELD_MIXINS[1].1,
+            "writes the game's field game/player/",
+        ),
+        (
+            FIELD_MIXINS[2].0,
+            FIELD_MIXINS[2].1,
+            "reads the game's field demo/HeirMixin#experienceLevel",
+        ),
+    ] {
+        let mut sources: BTreeMap<&str, String> = CASES_GAME
+            .iter()
+            .map(|(path, body)| (*path, (*body).to_owned()))
+            .collect();
+        sources.insert(
+            "net/minecraft/world/entity/player/Player.java",
+            "package net.minecraft.world.entity.player;\npublic class Player extends net.minecraft.world.entity.LivingEntity { public int experienceLevel; public boolean hurtMarked; }\n".into(),
+        );
+        sources.insert(
+            "net/minecraft/server/level/ServerPlayer.java",
+            "package net.minecraft.server.level;\npublic class ServerPlayer extends net.minecraft.world.entity.player.Player { public Object connection; public void tick() {} public void die(net.minecraft.world.damagesource.DamageSource source) {} }\n".into(),
+        );
+        let path = format!("demo/{mixin}.java");
+        sources.insert(path.as_str(), source.into());
+        let game_classes: Vec<String> = CASES_GAME
+            .iter()
+            .map(|(path, _)| path.replace(".java", ".class"))
+            .collect();
+        let compile_only: Vec<&str> = COMPILE_ONLY
+            .iter()
+            .copied()
+            .chain(game_classes.iter().map(String::as_str))
+            .collect();
+        let fixture = Fixture::build_with(&mixin.to_lowercase(), sources, &[mixin], &compile_only);
+        let jar = fixture.load();
+        let weave = jar.plan_load_time_weave_with_game_hooks(MixinSide::Server);
+        let registrations = jar.register_game_hooks(&weave).unwrap();
+        let mut host = StdHost::new();
+        let mut context = GameHookContext::new();
+        let receiver = context.insert(
+            GameObject::player(0xa1, "Alice")
+                .with_incarnation(1, 0)
+                .with_entity_id(7),
+        );
+        let source = context.insert(GameObject::opaque(
+            "net/minecraft/world/damagesource/DamageSource",
+            "lava#1",
+        ));
+        let error = jar
+            .run_game_hook_in(
+                &registrations,
+                &mut GameHookState::default(),
+                &mut context,
+                "player_died",
+                Some(receiver),
+                &[source],
+                &mut host,
+                &ExecutionBudget::within(std::time::Duration::from_secs(5)),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(expected) && error.contains("not "),
+            "{mixin}: {error}"
+        );
+        // A read refuses before the callback goes on; a write is refused
+        // once the callback returns, so nothing it did is kept.
+        let marks = marks(&host);
+        assert!(marks.is_empty() || marks == ["wrote"], "{mixin}: {marks:?}");
+    }
+}
