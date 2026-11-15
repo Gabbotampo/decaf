@@ -10910,7 +10910,8 @@ fn duration_seconds_nanos(nanos: i128) -> (i128, i128) {
 /// `Duration.toString()` (Java 25): `PT` and the hours, minutes and seconds of the duration's
 /// seconds (one less for a negative duration with nanos), the nanos as a fraction with trailing
 /// zeros dropped, so `ofSeconds(-1, 500_000_000)` is `PT-0.5S`.
-pub(crate) fn duration_text(total: i128) -> String {    let seconds = total.div_euclid(1_000_000_000) as i64;
+pub(crate) fn duration_text(total: i128) -> String {
+    let seconds = total.div_euclid(1_000_000_000) as i64;
     let nanos = total.rem_euclid(1_000_000_000) as i64;
     if seconds == 0 && nanos == 0 {
         return "PT0S".into();
