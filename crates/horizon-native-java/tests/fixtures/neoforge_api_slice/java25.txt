@@ -1,0 +1,4 @@
+# Java 25 / NeoForge 26.3.0.101 real-run values
+active=demo|demo|true|true|true|false|true
+outside=minecraft|minecraft
+gameDir=/horizon/game

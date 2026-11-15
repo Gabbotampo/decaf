@@ -163,6 +163,7 @@ mod mod_count;
 mod mod_origin;
 mod modified_utf8;
 mod native_library;
+mod neoforge_api;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
@@ -170,6 +171,7 @@ pub mod neoforge_imc;
 mod neoforge_inject;
 pub mod neoforge_lifecycle;
 mod neoforge_loader;
+mod neoforge_payload;
 mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
@@ -5741,6 +5743,9 @@ impl Host for StdHost {
         if let Some(value) = commons_lang::static_call(self, r, args) {
             return value;
         }
+        if let Some(value) = neoforge_api::static_call(self, r) {
+            return Ok(value);
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -7048,6 +7053,12 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
+            return Ok(value);
+        }
+        if let Some(value) = neoforge_api::instance_call(self, r, receiver) {
+            return Ok(value);
+        }
+        if let Some(value) = neoforge_payload::instance_call(r, receiver, args) {
             return Ok(value);
         }
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
@@ -10597,9 +10608,9 @@ impl Host for StdHost {
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent",
                 "registrar",
                 "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
-            ) => Ok(Value::Ref(Some(
-                "net/neoforged/neoforge/network/registration/PayloadRegistrar".into(),
-            ))),
+            ) => Ok(neoforge_payload::registrar(
+                args.first().unwrap_or(&Value::Ref(None)),
+            )),
             ("net/neoforged/neoforge/network/registration/PayloadRegistrar", _, descriptor)
                 if descriptor.ends_with(
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",

@@ -328,6 +328,9 @@ pub enum HostKind {
     NeoForgeModInfo,
     /// A `ModFileInfo`: key its file's first mod id.
     NeoForgeModFileInfo,
+    /// A NeoForge `PayloadRegistrar` builder. Its key contains a serial and
+    /// the version/refinement values, so a jar cannot forge one with text.
+    NeoForgePayloadRegistrar,
     /// A `ModConfig.Type` constant: key its name.
     NeoForgeConfigType,
     /// A detected `WorldVersion`: key its name.
@@ -1476,6 +1479,14 @@ const KINDS: &[KindInfo] = &[
         // `fileById.get(id)`: one per file, keyed by the file.
         canonical: always_canonical,
         methods: &crate::host_neoforge_loader::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::NeoForgePayloadRegistrar,
+        tag: "nfpr",
+        class: ClassRule::Fixed("net/neoforged/neoforge/network/registration/PayloadRegistrar"),
+        // Each refinement is a fresh registrar object.
+        canonical: never_canonical,
+        methods: &crate::host_service::METHODS,
     },
     KindInfo {
         kind: HostKind::NeoForgeConfigType,

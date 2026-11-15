@@ -37,6 +37,7 @@ pub(crate) fn stream_marker(value: &Value) -> Option<&String> {
 
 /// The loader classes a [`HostKind::LoaderSingleton`] is keyed by.
 const LOADER_CLASSES: &[&str] = &[
+    "net/neoforged/fml/ModLoadingContext",
     "net/neoforged/fml/ModList",
     "net/minecraftforge/fml/ModList",
     "net/neoforged/fml/loading/FMLLoader",

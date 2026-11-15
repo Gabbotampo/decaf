@@ -164,6 +164,13 @@ pub(crate) fn set_active<H: Host + ?Sized>(host: &mut H, id: Option<&str>) -> Op
     std::mem::replace(&mut imc.active, id.map(str::to_owned))
 }
 
+/// The mod id whose constructor or lifecycle callback is currently running.
+/// `None` is the loader's outside-of-a-mod state, which NeoForge exposes as
+/// the `minecraft` container.
+pub(crate) fn active_id(handle: &ImcHandle) -> Option<&str> {
+    handle.active.as_deref()
+}
+
 fn count(unknown: &mut BTreeMap<String, usize>, call: &str, why: &str) {
     *unknown.entry(format!("{call} ({why})")).or_default() += 1;
 }
