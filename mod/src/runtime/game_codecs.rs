@@ -8,7 +8,7 @@
 //! answers the object, not its encode/decode behaviour: those calls stay
 //! unmodelled and are still reported.
 
-use crate::runtime::{Host, MethodRef, Runtime, Value, host_codec};
+use crate::runtime::{Host, MethodRef, Runtime, Value, game_codec_fields, host_codec};
 
 impl<H: Host> Runtime<'_, H> {
     /// The game codec factories this module answers; `None` for any other.
@@ -32,6 +32,14 @@ impl<H: Host> Runtime<'_, H> {
 /// itself is pure and must not be counted.
 pub(super) fn static_field(r: &MethodRef) -> Option<Value> {
     let declared = r.descriptor.strip_prefix("L")?.strip_suffix(";")?;
-    (r.owner.starts_with("net/minecraft/") && declared == "net/minecraft/network/codec/StreamCodec")
-        .then(|| host_codec::static_codec(declared, &r.owner, &r.name))
+    if declared != "net/minecraft/network/codec/StreamCodec" {
+        return None;
+    }
+    let (declaring_owner, declaring_name) =
+        game_codec_fields::stream_codec_field(&r.owner, &r.name)?;
+    Some(host_codec::static_codec(
+        declared,
+        declaring_owner,
+        declaring_name,
+    ))
 }

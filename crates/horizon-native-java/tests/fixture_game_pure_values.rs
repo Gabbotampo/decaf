@@ -29,6 +29,14 @@ public interface StreamCodec<B, T> {
   T decode(B buffer);
 }
 "#;
+const BLOCK_POS: &str = r#"
+package net.minecraft.core;
+import net.minecraft.network.codec.StreamCodec;
+public class BlockPos {
+  public static StreamCodec<Object, BlockPos> STREAM_CODEC = null;
+  public static class MutableBlockPos extends BlockPos { }
+}
+"#;
 const BYTE_BUF_CODECS: &str = r#"
 package net.minecraft.network.codec;
 public interface ByteBufCodecs {
@@ -44,6 +52,8 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
+import java.nio.file.Path;
+import net.minecraft.core.BlockPos;
 public final class Probe {
   public static String sound() {
     Identifier id = Identifier.parse("demo:bell");
@@ -56,6 +66,17 @@ public final class Probe {
         + fixed.equals(fixedSame) + "|" + (variable == same) + "|" + (variable == variable)
         + "|" + variable + "|" + fixed;
   }
+  public static String reviewEdges() {
+    SoundEvent variable = SoundEvent.createVariableRangeEvent(Identifier.parse("demo:bell"));
+    SoundEvent fixed = SoundEvent.createFixedRangeEvent(Identifier.parse("demo:bell"), 0.1f);
+    Object boxed = fixed.fixedRange().get();
+    Path forged = Path.of("sound-event/demo:bell/variable#123456");
+    return variable.hashCode() + "," + SoundEvent.createFixedRangeEvent(Identifier.parse("demo:bell"), Float.NaN).hashCode()
+        + "," + (boxed instanceof Float) + "," + (boxed instanceof Double) + "," + boxed.getClass().getName()
+        + "," + boxed + "," + variable.equals(forged) + "," + forged.equals(variable)
+        + "," + (BlockPos.MutableBlockPos.STREAM_CODEC == BlockPos.STREAM_CODEC);
+  }
+
   public static String codecs() {
     StreamCodec<Object, String> strings = ByteBufCodecs.STRING_UTF8;
     StreamCodec<Object, Integer> ints = ByteBufCodecs.INT;
@@ -81,6 +102,7 @@ fn fixture() -> javac_fixture::Fixture {
                 "net/minecraft/network/codec/ByteBufCodecs.java",
                 BYTE_BUF_CODECS,
             ),
+            ("net/minecraft/core/BlockPos.java", BLOCK_POS),
             ("demo/Probe.java", PROBE),
         ],
     )
@@ -132,5 +154,21 @@ fn codec_constants_are_canonical_but_network_io_stays_counted() {
             .iter()
             .any(|(call, _)| call.contains("ByteBufCodecs#INT")),
         "{unknown:?}"
+    );
+}
+
+#[test]
+fn reviewer_edge_cases_are_exact() {
+    let fixture = fixture();
+    let mut host = StdHost::new();
+    let answer = fixture.text_on(&mut host, "reviewEdges");
+    assert_eq!(
+        answer,
+        "-1241801600,901487744,true,false,java.lang.Float,0.1,false,false,true"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{answer}: {:?}",
+        host.unknown_host_calls()
     );
 }

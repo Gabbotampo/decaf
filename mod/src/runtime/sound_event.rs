@@ -67,6 +67,14 @@ pub(crate) fn to_string(key: &str) -> Option<String> {
 
 pub(crate) fn hash_code(key: &str) -> Option<i32> {
     let (location, fixed) = parse(key)?;
+    let location_hash = location.split_once(':').map_or_else(
+        || crate::runtime::stable_hash(location),
+        |(namespace, path)| {
+            crate::runtime::stable_hash(namespace)
+                .wrapping_mul(31)
+                .wrapping_add(crate::runtime::stable_hash(path))
+        },
+    );
     let fixed_hash = fixed.map_or(0, |value| {
         let bits = if value.is_nan() {
             f32::NAN.to_bits()
@@ -75,11 +83,7 @@ pub(crate) fn hash_code(key: &str) -> Option<i32> {
         };
         bits as i32
     });
-    Some(
-        crate::runtime::stable_hash(location)
-            .wrapping_mul(31)
-            .wrapping_add(fixed_hash),
-    )
+    Some(location_hash.wrapping_mul(31).wrapping_add(fixed_hash))
 }
 
 fn game_value(key: String) -> Value {
@@ -150,7 +154,9 @@ pub(crate) fn instance_call(
             ))))
         }
         ("fixedRange", "()Ljava/util/Optional;") => Ok(crate::runtime::optional_wrap(
-            fixed.map_or(Value::Ref(None), |value| Value::Float(f64::from(value))),
+            fixed.map_or(Value::Ref(None), |value| {
+                Value::Boxed(crate::runtime::Boxed::float(f64::from(value)))
+            }),
         )),
         _ => host.unknown_host_call(r),
     })

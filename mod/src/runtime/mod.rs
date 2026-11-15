@@ -61,6 +61,7 @@ mod files_copy;
 mod files_move;
 mod frame_bound;
 mod game_codecs;
+mod game_codec_fields;
 mod game_hooks;
 mod game_object;
 mod game_rules;

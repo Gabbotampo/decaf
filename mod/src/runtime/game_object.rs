@@ -537,6 +537,7 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
     },
     equals: |handle, other, nested| {
         if let Value::Host(other) = other
+            && other.kind() == HostKind::GameValue
             && let Some(result) = crate::runtime::sound_event::equals_keys(handle.key(), other.key())
         {
             return Ok(Some(result));
