@@ -16,4 +16,5 @@ public final class Probe {
   public static String array(){return run(ArrayListMultimap.create());}
   public static String hash(){return run(HashMultimap.create());}
   public static String linked(){return run(LinkedHashMultimap.create());}
+  public static String sync(){ ListMultimap<String,Integer> base=ArrayListMultimap.create(); return Boolean.toString(Multimaps.synchronizedListMultimap(base) != base); }
 }

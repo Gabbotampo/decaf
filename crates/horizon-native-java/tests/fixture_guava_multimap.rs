@@ -38,6 +38,7 @@ fn real_guava_multimaps_match_java25() {
     ] {
         assert_eq!(fixture.text_on(&mut host, method), expected, "{method}");
     }
+    assert_eq!(fixture.text_on(&mut host, "sync"), "true");
     assert_eq!(
         host.unknown_host_call_count(),
         0,
