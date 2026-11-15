@@ -127,7 +127,7 @@ impl<H: Host> Runtime<'_, H> {
         if count > 0 {
             self.watch_change(&target, watch_service::Change::Modify);
         }
-        self.io_store_bytes(target, bytes);
+        self.io_store_bytes(target, bytes)?;
         Ok(Some(Value::Long(count)))
     }
 }

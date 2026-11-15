@@ -155,7 +155,7 @@ impl<H: Host> Runtime<'_, H> {
         } else {
             self.io_dirs.remove(&target);
         }
-        self.io_store_file(target.clone(), text);
+        self.io_store_file(target.clone(), text)?;
         if let Some(bytes) = bytes {
             self.io_file_bytes.insert(target, bytes);
         }

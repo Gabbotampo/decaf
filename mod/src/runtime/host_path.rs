@@ -54,7 +54,7 @@ pub(crate) const SANDBOX_CWD: &str = "/horizon/game";
 /// The model has no links, so callers use the same value for canonical paths.
 pub(crate) fn sandbox_absolute(path: &str) -> String {
     let path = unix_normal(path);
-    if path.is_empty() || path == "." {
+    if path.is_empty() {
         return SANDBOX_CWD.into();
     }
     if path.starts_with('/') {
@@ -62,6 +62,26 @@ pub(crate) fn sandbox_absolute(path: &str) -> String {
     } else {
         format!("{SANDBOX_CWD}/{path}")
     }
+}
+
+/// Lexically resolve dot segments for the sandbox's canonical path. No
+/// symlinks exist in this backend, so Java's realpath result is this lexical
+/// form for paths that exist.
+pub(crate) fn sandbox_canonical(path: &str) -> String {
+    let absolute = sandbox_absolute(path);
+    let mut parts: Vec<&str> = Vec::new();
+    for part in absolute.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if !parts.is_empty() {
+                    parts.pop();
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// Recover the caller-facing spelling for an absolute sandbox path in an

@@ -124,7 +124,7 @@ fn is_parent_of(ancestor: &str, path: &str) -> bool {
 impl<H: Host> Runtime<'_, H> {
     /// What `path` is in the file model (see the module docs).
     pub(crate) fn file_kind(&mut self, path: &str) -> FileKind {
-        let absolute = host_path::sandbox_absolute(path);
+        let absolute = host_path::sandbox_canonical(path);
         let path = absolute.trim_end_matches('/');
         // The working directory (`Path.of("")`, `Path.of(".")`) always exists.
         if path.is_empty()
@@ -151,7 +151,7 @@ impl<H: Host> Runtime<'_, H> {
     /// A loader folder's contents are the game's, so deleting one is
     /// [`Deletion::Unknown`].
     pub(crate) fn delete_path(&mut self, path: &str) -> Deletion {
-        let absolute = host_path::sandbox_absolute(path);
+        let absolute = host_path::sandbox_canonical(path);
         let path = absolute.trim_end_matches('/');
         match self.file_kind(path) {
             FileKind::Missing => return Deletion::Missing,
@@ -260,14 +260,10 @@ impl<H: Host> Runtime<'_, H> {
         if path.starts_with(library_dispatch::MOD_ROOT_PREFIX) {
             return Ok(None);
         }
-        let normal = path.starts_with('/')
-            && (path == "/"
-                || path[1..]
-                    .split('/')
-                    .all(|segment| !matches!(segment, "" | "." | "..")));
-        if !normal || !self.no_link_options(options) {
+        if !self.no_link_options(options) {
             return self.host.unknown_operand_call(r).map(Some);
         }
+        let path = host_path::sandbox_canonical(&path);
         if self.file_kind(&path) != FileKind::Missing {
             return Ok(Some(path_value(&path)));
         }
