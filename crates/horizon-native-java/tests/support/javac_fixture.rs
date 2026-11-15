@@ -80,6 +80,11 @@ impl Fixture {
         )
     }
 
+    /// Compile a probe against a string classpath for lightweight fixtures.
+    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+        Self::build_packed(test, sources, &[], false, "demo", None, Some(Path::new(classpath)))
+    }
+
     /// [`Self::build`], with the `lib/` classes packed as a second jar
     /// (`lib`, a library the probe jar bundles or depends on) and `extra`
     /// `(entry, bytes)` files written into the probe jar.
