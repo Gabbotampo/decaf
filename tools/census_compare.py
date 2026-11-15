@@ -278,14 +278,14 @@ def main(argv: list[str] | None = None) -> int:
     roles = ["server", "client"] if args.role == "both" else [args.role]
     reports: dict[str, dict] = {}
     output = ""
-    # The table-aware driver is needed only for the merged probe. Keeping the
-    # base checkout's driver for the base probe avoids auto-discovering a table
-    # on main, whose binary predates the flag.
+    # The merged probe runs under the merged checkout driver, so flags added
+    # by main or the head are available. The base probe keeps its own driver
+    # and option set; the prepared table is passed only to the merged run.
     for role in roles:
         repetitions: dict[str, list[dict]] = {"base": [], "merged": []}
         for label, probe in (("base", base_probe), ("merged", merged_probe)):
             for number in range(args.repeat):
-                # Both probes run under the BASE checkout's driver, so the flags mean the same thing.
+                # Each probe uses its matching checkout driver; the merged run can use new flags.
                 path = root / f"{role}-{label}-{number}.json"
                 driver = merged_checkout if label == "merged" else base_checkout
                 payload = run_census(driver, probe, args, role, path,
