@@ -70,7 +70,14 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
                 Ok(value) => value,
                 Err(error) => return Some(Err(error)),
             };
-            Ok(double_value(fdlibm::pow(base, exponent)))
+            let result = fdlibm::pow(base, exponent);
+            // HotSpot's x86 StrictMath.pow has tier-dependent NaN payloads:
+            // Xint disagrees with C1/C2 on 30 measured inputs. A NaN payload
+            // therefore has no single exact answer on this host.
+            if strict && !cfg!(target_arch = "aarch64") && result.is_nan() {
+                return None;
+            }
+            Ok(double_value(result))
         }
         ("tan", "(D)D") if fdlibm_math => unary(fdlibm::tan),
         ("exp", "(D)D") if fdlibm_math => unary(fdlibm::exp),
@@ -185,9 +192,17 @@ mod tests {
             name: "pow".into(),
             descriptor: "(DD)D".into(),
         };
-        assert_eq!(
-            static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_some(),
-            cfg!(target_arch = "aarch64")
-        );
+        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_math_pow_is_answered() {
+        let r = MethodRef {
+            owner: "java/lang/Math".into(),
+            name: "pow".into(),
+            descriptor: "(DD)D".into(),
+        };
+        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_some());
     }
 }

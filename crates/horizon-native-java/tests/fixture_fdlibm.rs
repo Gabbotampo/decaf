@@ -216,6 +216,26 @@ fn math_fdlibm_is_enabled_on_aarch64() {
 
 #[cfg(not(target_arch = "aarch64"))]
 #[test]
+fn strictmath_pow_nan_is_counted_on_x86_due_tier_payloads() {
+    let mut host = StdHost::new();
+    let method = MethodRef {
+        owner: "java/lang/StrictMath".into(),
+        name: "pow".into(),
+        descriptor: "(DD)D".into(),
+    };
+    let result = host.invoke(
+        &method,
+        &[
+            Value::Float(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::Float(2.0),
+        ],
+    );
+    assert!(result.is_ok());
+    assert_eq!(host.unknown_host_call_count(), 1);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[test]
 fn math_fdlibm_stays_counted_off_aarch64() {
     let mut host = StdHost::new();
     let method = MethodRef {
