@@ -23387,34 +23387,6 @@ impl<H: Host> Runtime<'_, H> {
             })
             .cloned();
         match r.owner.as_str() {
-            "java/io/FileWriter"
-                if r.name == "<init>" || r.name == "write" || r.name == "append" =>
-            {
-                self.host.unknown_operand_call(r).map(Some)
-            }
-            "java/io/FileReader" if r.name == "<init>" || r.name == "read" => {
-                self.host.unknown_operand_call(r).map(Some)
-            }
-            "java/io/FileOutputStream" if r.name == "<init>" || r.name == "write" => {
-                self.host.unknown_operand_call(r).map(Some)
-            }
-            "java/io/FileInputStream" if r.name == "<init>" || r.name == "read" => {
-                self.host.unknown_operand_call(r).map(Some)
-            }
-            "java/nio/file/Files"
-                if matches!(
-                    r.name.as_str(),
-                    "newOutputStream"
-                        | "newBufferedWriter"
-                        | "newBufferedReader"
-                        | "readString"
-                        | "writeString"
-                        | "write"
-                        | "createFile"
-                ) =>
-            {
-                self.host.unknown_operand_call(r).map(Some)
-            }
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
@@ -24449,6 +24421,9 @@ impl<H: Host> Runtime<'_, H> {
             };
         }
         // JsonWriter state/options are not modeled; count every call.
+        if r.owner == "com/google/gson/stream/JsonWriter" {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
                 self.invoke_gson_builder(r, receiver, args)
@@ -24527,6 +24502,15 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some),
                         }
+                    }
+                    (name, descriptor)
+                        if name == "toJson"
+                            && descriptor.ends_with(")V")
+                            && descriptor.contains("JsonWriter") =>
+                    {
+                        self.host
+                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                            .map(Some)
                     }
                     (name, descriptor)
                         if name == "toJson"

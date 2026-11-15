@@ -233,19 +233,15 @@ impl Fixture {
         fixture
     }
 
-    fn call_with_host(
-        &self,
-        method: &str,
-        descriptor: &str,
-        args: &[Value],
-        host: &mut StdHost,
-    ) -> Result<Value, NativeError> {
-        self.jar
-            .invoke_method_with_args("demo/Probe", method, descriptor, None, args, host)
-    }
-
     fn call(&self, method: &str, descriptor: &str, args: &[Value]) -> Result<Value, NativeError> {
-        self.call_with_host(method, descriptor, args, &mut StdHost::new())
+        self.jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            descriptor,
+            None,
+            args,
+            &mut StdHost::new(),
+        )
     }
 
     fn text_with(&self, method: &str, argument: &str) -> String {
@@ -324,23 +320,15 @@ fn deeply_nested_json_is_refused_by_the_depth_bound() {
 }
 
 #[test]
-fn file_writer_and_file_reader_are_counted_without_virtual_readback() {
+fn file_writer_and_file_reader_round_trip_through_the_virtual_file() {
     let fixture = Fixture::build("file-round-trip");
-    let mut host = StdHost::new();
-    let _ = fixture.call_with_host("fileRoundTrip", "()Ljava/lang/String;", &[], &mut host);
-    assert!(
-        host.unknown_host_calls()
-            .iter()
-            .any(|(call, _)| call.contains("FileWriter"))
-    );
+    assert_eq!(fixture.text("fileRoundTrip"), "false|true|7");
 }
 
 #[test]
-fn output_stream_file_writes_are_counted_without_virtual_readback() {
+fn output_stream_writer_and_files_reader_share_the_same_file() {
     let fixture = Fixture::build("stream-round-trip");
-    let mut host = StdHost::new();
-    let _ = fixture.call_with_host("streamRoundTrip", "()Ljava/lang/String;", &[], &mut host);
-    assert!(!host.unknown_host_calls().is_empty());
+    assert_eq!(fixture.text("streamRoundTrip"), "2");
 }
 
 #[test]
@@ -350,13 +338,7 @@ fn string_writer_is_an_appendable_gson_can_write_to() {
 }
 
 #[test]
-fn a_missing_file_reader_is_counted_without_a_fake_exception() {
+fn a_missing_file_raises_an_ioexception_a_java_catch_sees() {
     let fixture = Fixture::build("missing-file");
-    let mut host = StdHost::new();
-    let _ = fixture.call_with_host("missingFile", "()Ljava/lang/String;", &[], &mut host);
-    assert!(
-        host.unknown_host_calls()
-            .iter()
-            .any(|(call, _)| call.contains("FileReader"))
-    );
+    assert_eq!(fixture.text("missingFile"), "caught");
 }

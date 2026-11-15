@@ -45,10 +45,23 @@ const IOEX: &str = r#"package com.google.gson;
 public class JsonIOException extends RuntimeException { public JsonIOException(String s) { super(s); } }
 "#;
 const WRITER: &str = r#"package com.google.gson.stream;
-public class JsonWriter { public JsonWriter(java.io.Writer out) {} public void flush() {} }
+public class JsonWriter {
+  public JsonWriter(java.io.Writer out) {}
+  public JsonWriter beginObject() { return this; }
+  public JsonWriter name(String name) { return this; }
+  public JsonWriter value(String value) { return this; }
+  public JsonWriter endObject() { return this; }
+  public JsonWriter setIndent(String indent) { return this; }
+  public JsonWriter setLenient(boolean lenient) { return this; }
+  public JsonWriter setStrictness(Object strictness) { return this; }
+  public JsonWriter setSerializeNulls(boolean serializeNulls) { return this; }
+  public JsonWriter setHtmlSafe(boolean htmlSafe) { return this; }
+  public void flush() {}
+  public void close() {}
+}
 "#;
 const PROBE: &str = r#"package demo;
-import com.google.gson.*; import java.io.*;
+import com.google.gson.*; import com.google.gson.stream.JsonWriter; import java.io.*;
 public final class Probe {
   public static String writers() {
     Gson gson = new GsonBuilder().setPrettyPrinting().serializeNulls().disableHtmlEscaping().create();
@@ -72,9 +85,17 @@ public final class Probe {
     });
     return "unreachable";
   }
-  public static String fileWriter() throws Exception {
-    FileWriter fw = new FileWriter(new File("gson.json"));
-    new Gson().toJson(new JsonObject(), fw); fw.close(); return "unreachable";
+  public static String jsonWriterCalls() {
+    Gson gson = new Gson();
+    StringWriter out = new StringWriter();
+    JsonWriter writer = new JsonWriter(out);
+    writer.beginObject(); writer.name("x"); writer.value("y"); writer.endObject();
+    writer.setIndent("  "); writer.setLenient(true); writer.setStrictness(null);
+    writer.setSerializeNulls(true); writer.setHtmlSafe(true); writer.flush(); writer.close(); writer.endObject();
+    JsonWriter incomplete = new JsonWriter(out); incomplete.beginObject(); incomplete.close();
+    gson.toJson(new JsonObject(), writer);
+    gson.newJsonWriter(out);
+    return "done";
   }
   public static String nullKey() { try { new JsonObject().addProperty((String)null, "x"); return "no"; } catch (NullPointerException e) { return "npe"; } }
 }
@@ -195,14 +216,29 @@ fn unsupported_appendable_is_counted() {
 }
 
 #[test]
-fn file_writer_is_counted_before_any_virtual_side_effect() {
+fn json_writer_state_options_and_gson_overload_are_counted() {
     let f = Fixture::new();
     let mut host = StdHost::new();
-    let _ = f.call_with_host("fileWriter", &mut host);
+    match f.call_with_host("jsonWriterCalls", &mut host).unwrap() {
+        Value::Ref(Some(text)) => assert_eq!(text, "done"),
+        value => panic!("jsonWriterCalls: {value:?}"),
+    }
+    let calls = host.unknown_host_calls();
     assert!(
-        host.unknown_host_calls()
+        calls
             .iter()
-            .any(|(call, _)| call.contains("FileWriter"))
+            .any(|(call, _)| call.contains("JsonWriter#beginObject"))
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call.contains("JsonWriter#setIndent"))
+    );
+    assert!(calls.iter().any(|(call, _)| call.contains("Gson#toJson")));
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call.contains("Gson#newJsonWriter"))
     );
 }
 
