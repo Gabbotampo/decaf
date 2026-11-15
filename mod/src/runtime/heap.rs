@@ -561,25 +561,37 @@ fn value_bytes(value: &Value) -> usize {
     value_text(value).map_or(8, str::len)
 }
 
-/// Every text a value names other objects through: [`value_text`], and for
-/// a callback the texts of the values its row holds, which its key names
-/// only in bounded text (#156 P15b). Every root and heap walker uses this.
+/// Every text a value names other objects through: [`value_text`], and the
+/// texts of every value a handle holds exactly (a callback's row, the values
+/// an optional or a map entry was made of), which its key names only in
+/// bounded text (#156 P15b). Every root and heap walker uses this.
+///
+/// The walk has no depth bound (#261 round-3 S2): a capture held 70 links
+/// down a chain a jar built in a loop is as reachable as one held at the
+/// top. It is a loop over a worklist, so a chain 200,000 deep takes no native
+/// stack, and it visits each shared row or held list once, so a chain that
+/// holds one operand twice per link (`p = p.or(p)`) is not walked 2^n times.
 pub(crate) fn value_texts(value: &Value) -> Vec<&str> {
-    fn push<'a>(value: &'a Value, out: &mut Vec<&'a str>, depth: usize) {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
         if let Some(text) = value_text(value) {
             out.push(text);
         }
-        if depth < 64
-            && let Value::Host(handle) = value
-            && let Some(row) = handle.row()
+        let Value::Host(handle) = value else {
+            continue;
+        };
+        if let Some(row) = handle.row()
+            && seen.insert(std::ptr::from_ref(row).cast::<u8>())
         {
-            for held in row.values() {
-                push(held, out, depth + 1);
-            }
+            pending.extend(row.values());
+        }
+        let held = handle.held();
+        if !held.is_empty() && seen.insert(held.as_ptr().cast::<u8>()) {
+            pending.extend(held);
         }
     }
-    let mut out = Vec::new();
-    push(value, &mut out, 0);
     out
 }
 

@@ -363,8 +363,7 @@ mod tests {
             "[Ljava/lang/String;",
             "[I",
             "int",
-            // A `String` spelled like a callback's key, with or without this
-            // run's tag: callbacks are handles.
+            // A `String` spelled like a callback's key: callbacks are handles.
             "@indy:demo/Main#main:0:java/lang/Runnable:demo/Main#lambda$0()V:",
             "@fn:identity/function",
             "@cmp:natural",

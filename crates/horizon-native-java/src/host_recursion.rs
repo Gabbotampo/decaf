@@ -142,8 +142,9 @@ mod tests {
         for _ in 0..200_000 {
             chain = crate::callback_marker::composite("predicate.not", &[&chain]);
         }
-        // The collector's walk of what it holds stops at its own bound.
-        assert!(crate::heap::value_texts(&chain).len() <= 65);
+        // The collector's walk reaches every link (#261 round-3 S2): the
+        // chain's 200,000 rows and the token at its end.
+        assert_eq!(crate::heap::value_texts(&chain).len(), 200_001);
         drop(chain);
     }
 }

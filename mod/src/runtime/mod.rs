@@ -11126,8 +11126,8 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Ref(Some(value)) if stream_pipeline::is_stream_marker(value) => {
             stream_pipeline::STREAM_TEXT.into()
         }
-        // Nor does a callback, or a composition holding one: its text carries
-        // the run's tag (`callback_marker.rs`).
+        // Nor does a callback, or a composition holding one: its text names
+        // a live callback (`callback_marker.rs`).
         Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
             callback_marker::CALLBACK_TEXT.into()
         }
@@ -11402,7 +11402,14 @@ fn bounded_markers(values: &[Value], max_chars: usize) -> String {
             // The cut value is no value any more: an element no capture
             // parser accepts follows it, so running the callback is counted
             // rather than handing it the cut text (#261 review).
-            text.extend(marker.chars().take(room));
+            let mut cut: String = marker.chars().take(room).collect();
+            // A cut right after an escaping `\` would escape the sentinel's
+            // `,` and read back as one longer, wrong value (#261 round-3
+            // S1): drop that `\`.
+            if cut.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1 {
+                cut.pop();
+            }
+            text.push_str(&cut);
             text.push_str(",\u{2026}");
             break;
         }
@@ -20484,19 +20491,9 @@ fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
     Ok(captures)
 }
 
-/// A value marker from text a jar may have spelled or read (a `Ref`
-/// marker): no callback comes out of it (`HostRef::decode`).
+/// A value marker read back from text: no callback comes out of it, nor out
+/// of a handle it yields, at any depth (`HostRef::decode`).
 fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
-    parse_marker(marker, false)
-}
-
-/// [`parse_value_marker`] for text only the runtime wrote and no jar reads:
-/// a handle's own key, which may hold a callback (`HostRef::decode_trusted`).
-pub(crate) fn parse_value_marker_trusted(marker: &str) -> Result<Value, NativeError> {
-    parse_marker(marker, true)
-}
-
-fn parse_marker(marker: &str, trusted: bool) -> Result<Value, NativeError> {
     if marker == "null" {
         return Ok(Value::Ref(None));
     }
@@ -20506,12 +20503,7 @@ fn parse_marker(marker: &str, trusted: bool) -> Result<Value, NativeError> {
     if let Some(boxed) = Boxed::parse_marker(marker) {
         return Ok(Value::Boxed(boxed));
     }
-    let host = if trusted {
-        HostRef::decode_trusted(marker)
-    } else {
-        HostRef::decode(marker)
-    };
-    if let Some(host) = host {
+    if let Some(host) = HostRef::decode(marker) {
         return Ok(Value::Host(host));
     }
     if let Some(value) = marker.strip_prefix('i') {

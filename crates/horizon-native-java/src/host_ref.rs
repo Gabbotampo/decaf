@@ -100,9 +100,43 @@ pub struct HostRef {
     origin: u64,
     /// A callback's row (`callback_marker::Row`): its target and the values
     /// it holds, exactly. Not part of the value either: the key names the
-    /// object, and a handle decoded from text (a host collection's marker)
-    /// has no row, so its readers fall back to the key's bounded text.
+    /// object. Only the runtime makes rows; a handle decoded from text has
+    /// none.
     row: Option<Arc<crate::callback_marker::Row>>,
+    /// The values [`Self::of_values`] was given, exactly: a callback among
+    /// them keeps its row (#261 round-3 S1). Not part of the value: the key
+    /// names them. A handle decoded from text has none, and its key is read
+    /// back as untrusted text, so no callback comes out of it at any depth
+    /// (#261 round-3 B1).
+    held: Option<Arc<Vec<Value>>>,
+}
+
+/// A chain a jar builds in a loop (`p = p.negate()` 200,000 times,
+/// `Optional.of(Optional.of(…))`) nests one handle per link: dropping it
+/// recursively would overflow the native stack. Each handle hands the rows
+/// and held values only it holds to one loop instead.
+impl Drop for HostRef {
+    fn drop(&mut self) {
+        fn take(handle: &mut HostRef, pending: &mut Vec<Value>) {
+            if let Some(row) = handle.row.take()
+                && let Ok(mut row) = Arc::try_unwrap(row)
+            {
+                pending.extend(row.take_values());
+            }
+            if let Some(held) = handle.held.take()
+                && let Ok(held) = Arc::try_unwrap(held)
+            {
+                pending.extend(held);
+            }
+        }
+        let mut pending = Vec::new();
+        take(self, &mut pending);
+        while let Some(value) = pending.pop() {
+            if let Value::Host(mut handle) = value {
+                take(&mut handle, &mut pending);
+            }
+        }
+    }
 }
 
 /// The next [`HostRef::origin`]: only ever compared for equality, never shown.
@@ -2327,51 +2361,60 @@ impl HostRef {
             key: Arc::new(key.into()),
             origin: NEXT_ORIGIN.fetch_add(1, AtomicOrdering::Relaxed),
             row: None,
+            held: None,
         }
     }
 
     /// A callback handle keyed `key` that carries `row` (`callback_marker.rs`).
     pub(crate) fn with_row(kind: HostKind, key: String, row: crate::callback_marker::Row) -> Self {
-        Self {
-            row: Some(Arc::new(row)),
-            ..Self::new(kind, key)
-        }
+        let mut handle = Self::new(kind, key);
+        handle.row = Some(Arc::new(row));
+        handle
     }
 
-    /// The row this handle alone holds, taken out of it (for
-    /// `callback_marker::Row`'s drop, which unwinds a deep chain in a loop).
-    pub(crate) fn into_unique_row(self) -> Option<crate::callback_marker::Row> {
-        Arc::try_unwrap(self.row?).ok()
-    }
-
-    /// The row a callback handle carries, when it was made rather than
-    /// decoded from text.
+    /// The row a callback handle carries: every callback the runtime made
+    /// has one; a handle decoded from text never does.
     pub(crate) fn row(&self) -> Option<&crate::callback_marker::Row> {
         self.row.as_deref()
     }
 
     /// A handle whose key holds `values`: each value's marker, separators
-    /// escaped, joined with `,`. No values is the empty key.
+    /// escaped, joined with `,`. No values is the empty key. The handle keeps
+    /// the values themselves too ([`Self::values`]).
     pub(crate) fn of_values(kind: HostKind, values: &[Value]) -> Self {
         let key = values
             .iter()
             .map(crate::value_marker)
             .collect::<Vec<_>>()
             .join(",");
-        Self::new(kind, key)
+        let mut handle = Self::new(kind, key);
+        handle.held = Some(Arc::new(values.to_vec()));
+        handle
     }
 
-    /// The values [`Self::of_values`] put in the key, `None` when one does
-    /// not parse.
+    /// The values a handle holds: exactly what [`Self::of_values`] was
+    /// given, or, for a handle rebuilt from a key, the key read back as
+    /// untrusted text (`parse_value_marker`), so no callback comes out of
+    /// text at any depth however its escapes nest (#261 round-3 B1). `None`
+    /// when a marker does not parse.
     pub(crate) fn values(&self) -> Option<Vec<Value>> {
+        if let Some(held) = &self.held {
+            return Some(held.as_ref().clone());
+        }
         if self.key.is_empty() {
             return Some(Vec::new());
         }
         crate::split_capture_markers(&self.key)
             .ok()?
             .iter()
-            .map(|marker| crate::parse_value_marker_trusted(marker).ok())
+            .map(|marker| crate::parse_value_marker(marker).ok())
             .collect()
+    }
+
+    /// The values the runtime gave this handle ([`Self::of_values`]),
+    /// without reading text: what the collector traces.
+    pub(crate) fn held(&self) -> &[Value] {
+        self.held.as_deref().map_or(&[], Vec::as_slice)
     }
 
     pub fn kind(&self) -> HostKind {
@@ -2470,23 +2513,21 @@ impl HostRef {
         format!("h{}:{}", self.kind.info().tag, self.key)
     }
 
-    /// Read [`Self::encode`] back from text a jar may have spelled or read
-    /// (a `Ref` marker): never a callback, nor a handle whose key holds one
-    /// at any depth. A callback reaches a jar only as its handle, so no text
-    /// becomes one (#261 re-review).
+    /// Read [`Self::encode`] back from text: never a callback, nor a handle
+    /// that yields one at any depth. A decoded handle has no row and holds
+    /// no values but its key's text, which [`Self::values`] reads back as
+    /// untrusted text again, so however a jar nests and escapes `hcb:`, no
+    /// text becomes a callback (#261 round-3 B1). A callback reaches a jar
+    /// only as the handle the runtime made.
     pub(crate) fn decode(text: &str) -> Option<Self> {
+        // A text naming a callback anywhere is refused outright, as before;
+        // the structural rule above is what holds once escapes nest.
         if text.contains("hcb:") {
             return None;
         }
-        Self::decode_trusted(text)
-    }
-
-    /// [`Self::decode`] for text only the runtime wrote and no jar reads: a
-    /// handle's own key ([`Self::values`], a callback key's captures).
-    pub(crate) fn decode_trusted(text: &str) -> Option<Self> {
         let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
         let kind = HostKind::from_tag(tag)?;
-        Some(Self::new(kind, key))
+        (kind != HostKind::Callback).then(|| Self::new(kind, key))
     }
 }
 
@@ -2511,12 +2552,7 @@ mod tests {
                 info.kind
             );
             let handle = HostRef::new(info.kind, "a,b\\c:d");
-            assert_eq!(
-                HostRef::decode_trusted(&handle.encode()),
-                Some(handle.clone())
-            );
-            // From text a jar may hold, a callback (or a handle holding one)
-            // is nothing.
+            // From text, a callback (or a handle holding one) is nothing.
             if info.kind == HostKind::Callback {
                 assert_eq!(HostRef::decode(&handle.encode()), None);
             } else {

@@ -22,11 +22,12 @@
 //! * a combinator's result: `@fn:<op>[~<n>]:<operands>` (`predicate.and`,
 //!   `cmp.then`, the operand-free `identity/function`, `cmp.natural`...).
 //!
-//! A key holds no secret: no text becomes a callback. `HostRef::decode`
-//! refuses one, and any handle whose key holds one, from text a jar may
-//! have spelled or read (a `Ref` marker); only a handle's own key, which no
-//! jar reads, is read back with `decode_trusted` (an optional of a lambda).
-//! So a structure that holds a callback for a jar is a handle too
+//! A key holds no secret, and no text becomes a callback: `HostRef::decode`
+//! never yields one, and a handle it yields reads its key back as untrusted
+//! text again, at every depth. A handle that holds a callback (an optional,
+//! a map entry) keeps the value itself (`HostRef::of_values`), row and all.
+//! Every callback the runtime makes has a row; the key's text is only its
+//! name. So a structure that holds a callback for a jar is a handle too
 //! (comparators here, `HostKind::MapEntry`). `<site>` is the call site's
 //! instruction offset in `<class#method>`: HotSpot links each
 //! `invokedynamic` instruction once, and javac duplicates a `finally` body's
@@ -81,26 +82,12 @@ impl Row {
         }
     }
 
-    fn take_values(&mut self) -> Vec<Value> {
+    /// The values, taken out (for `HostRef`'s drop, which unwinds a deep
+    /// chain in a loop).
+    pub(crate) fn take_values(&mut self) -> Vec<Value> {
         match self {
             Row::Lambda { callback, .. } => std::mem::take(&mut callback.captures),
             Row::Composite { operands, .. } => std::mem::take(operands),
-        }
-    }
-}
-
-/// A chain a jar builds in a loop (`p = p.negate()` 200,000 times) nests one
-/// row per link: dropping it recursively would overflow the native stack.
-/// Each row hands the rows only it holds to one loop instead.
-impl Drop for Row {
-    fn drop(&mut self) {
-        let mut pending = self.take_values();
-        while let Some(value) = pending.pop() {
-            if let Value::Host(handle) = value
-                && let Some(mut row) = handle.into_unique_row()
-            {
-                pending.extend(row.take_values());
-            }
         }
     }
 }
@@ -123,8 +110,8 @@ fn composite_prefix() -> &'static str {
 }
 
 /// What a callback prints where its text is counted (`toString`, string
-/// concatenation, a collection's text): never its marker, which would hand
-/// the tag to the jar.
+/// concatenation, a collection's text): never its marker, which names the
+/// object and could be fed back.
 pub(crate) const CALLBACK_TEXT: &str = "null";
 
 #[cfg(test)]
@@ -222,7 +209,7 @@ pub(crate) fn lambda_from_text(
         crate::split_capture_markers(captures)
             .unwrap()
             .iter()
-            .map(|marker| crate::parse_value_marker_trusted(marker).unwrap())
+            .map(|marker| crate::parse_value_marker(marker).unwrap())
             .collect()
     };
     lambda(
@@ -336,7 +323,7 @@ pub(crate) fn parse(text: &str) -> Result<Callback, NativeError> {
     } else {
         crate::split_capture_markers(captures)?
             .into_iter()
-            .map(|capture| crate::parse_value_marker_trusted(&capture))
+            .map(|capture| crate::parse_value_marker(&capture))
             .collect::<Result<Vec<_>, _>>()?
     };
     Ok(Callback {
@@ -383,57 +370,24 @@ pub(crate) fn composite(op: &str, operands: &[&Value]) -> Value {
     Value::Host(HostRef::with_row(HostKind::Callback, key, row))
 }
 
-/// The operation and operands of `value` when it is a combinator result:
-/// its row, or (read back from another handle's key) its key's text.
+/// The operation and operands of `value` when it is a combinator result,
+/// from its row: every combinator result the runtime makes has one, and no
+/// text becomes one.
 pub(crate) fn composite_of(value: &Value) -> Option<(String, Vec<Value>)> {
-    let Value::Host(handle) = value else {
-        return None;
-    };
-    if handle.kind() != HostKind::Callback {
-        return None;
-    }
-    if let Some(row) = handle.row() {
-        return match row {
+    match value {
+        Value::Host(handle) if handle.kind() == HostKind::Callback => match handle.row()? {
             Row::Composite { op, operands } => Some((op.clone(), operands.clone())),
             Row::Lambda { .. } => None,
-        };
+        },
+        _ => None,
     }
-    let (op, _) = handle
-        .key()
-        .strip_prefix(composite_prefix())?
-        .split_once(':')?;
-    let op = op.split('~').next().unwrap_or_default().to_owned();
-    let operands = composite_operands(value, &op)?;
-    Some((op, operands))
 }
 
 /// The operands of `value` when it is a combinator result of `op`.
 pub(crate) fn composite_operands(value: &Value, op: &str) -> Option<Vec<Value>> {
-    if let Value::Host(handle) = value
-        && handle.kind() == HostKind::Callback
-        && let Some(row) = handle.row()
-    {
-        return match row {
-            Row::Composite { op: own, operands } if own == op => Some(operands.clone()),
-            _ => None,
-        };
-    }
-    let rest = callback_text(value)?
-        .strip_prefix(composite_prefix())?
-        .strip_prefix(op)?;
-    // A result's own number (`~<n>`), which only names the object.
-    let rest = match rest.strip_prefix('~') {
-        Some(numbered) => numbered.split_once(':')?.1,
-        None => rest.strip_prefix(':')?,
-    };
-    if rest.is_empty() {
-        return Some(Vec::new());
-    }
-    crate::split_capture_markers(rest)
-        .ok()?
-        .iter()
-        .map(|marker| crate::parse_value_marker_trusted(marker).ok())
-        .collect()
+    composite_of(value)
+        .filter(|(own, _)| own == op)
+        .map(|(_, operands)| operands)
 }
 
 /// Whether two callbacks with key `key` are one object: always. A key
@@ -549,11 +503,51 @@ mod tests {
         assert!(lambda_of(&spelled).is_none() && callback_text(&spelled).is_none());
         let encoded = HostRef::new(HostKind::Callback, key).encode();
         assert!(crate::parse_value_marker(&encoded).is_err());
-        // A handle's own key (an optional of a lambda) still reads it back.
-        assert!(matches!(
-            crate::parse_value_marker_trusted(&encoded),
-            Ok(Value::Host(handle)) if handle.kind() == HostKind::Callback
-        ));
+        // Nor does a handle decoded from text whose key holds one, at any
+        // escape depth (#261 round-3 B1): its key reads back as untrusted
+        // text again.
+        let mut nested = encoded;
+        for depth in 0..4 {
+            let escaped = nested.replace('\\', "\\\\").replace(',', "\\,");
+            for spelled in [format!("hopt:{escaped}"), format!("hment:rk,{escaped}")] {
+                let Ok(Value::Host(outer)) = crate::parse_value_marker(&spelled) else {
+                    continue;
+                };
+                let held = outer.values().unwrap_or_default();
+                assert!(
+                    held.iter().all(|value| lambda_of(value).is_none()
+                        && composite_of(value).is_none()
+                        && callback_text(value).is_none()),
+                    "depth {depth}: {spelled} gave {held:?}"
+                );
+            }
+            nested = format!("hopt:{escaped}");
+        }
+    }
+
+    /// A key's bounded text never ends a cut value on an escaping `\`: the
+    /// cut value and the sentinel stay two elements, whatever the cut lands
+    /// on (#261 round-3 S1, `"A"×4094 + ",tail"` cut right after its `\`).
+    #[test]
+    fn a_cut_never_escapes_its_sentinel() {
+        for length in 4090..4100 {
+            let text = format!("{},tail", "A".repeat(length));
+            let bounded = crate::bounded_markers(&[Value::Ref(Some(text.clone()))], 4096);
+            let parts = crate::split_capture_markers(&bounded).unwrap();
+            if bounded.ends_with(",\u{2026}") {
+                assert_eq!(
+                    parts.last().map(String::as_str),
+                    Some("\u{2026}"),
+                    "{length}"
+                );
+                assert!(
+                    parts.len() == 2 && text.starts_with(&parts[0][1..]),
+                    "{length}"
+                );
+            } else {
+                assert_eq!(parts, [format!("r{text}")], "{length}");
+            }
+        }
     }
 
     #[test]

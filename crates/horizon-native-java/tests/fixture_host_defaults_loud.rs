@@ -148,8 +148,8 @@ fn a_reader_over_a_stream_no_host_holds_is_not_empty() {
 #[test]
 fn a_record_never_prints_a_marker_no_model_prints() {
     let fixture = fixture();
-    // A live callback: no model prints it, and its text (which carries the
-    // run's tag) is never shown.
+    // A live callback: no model prints it, and its key's text is never
+    // shown.
     let marker = horizon_native_java::callback_test_token("demo/Probe#0");
     assert_eq!(
         refusal(
