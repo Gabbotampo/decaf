@@ -427,6 +427,8 @@ pub enum HostKind {
     Collection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
+    /// A RoundingMode constant keyed by name.
+    RoundingMode,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
     /// A `Character.UnicodeBlock` constant: key its name.
@@ -1801,6 +1803,13 @@ const KINDS: &[KindInfo] = &[
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::TIME_UNIT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RoundingMode,
+        tag: "rmode",
+        class: ClassRule::Fixed("java/math/RoundingMode"),
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::ROUNDING_MODE_METHODS,
     },
     KindInfo {
         kind: HostKind::CodingErrorAction,
