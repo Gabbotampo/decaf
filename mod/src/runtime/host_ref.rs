@@ -494,6 +494,18 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
     /// Vanilla's `FileToIdConverter` record.
@@ -2210,6 +2222,56 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::runtime::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
