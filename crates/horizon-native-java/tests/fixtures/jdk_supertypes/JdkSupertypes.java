@@ -232,6 +232,7 @@ public final class JdkSupertypes {
             if (c == null || c.isInterface() || !Modifier.isPublic(c.getModifiers())) continue;
             String own = overrides(c);
             StringBuilder flags = new StringBuilder();
+            if (c.isEnum()) flags.append("E");
             for (String member : own.split(",")) if (!member.equals("-")) flags.append(member.charAt(0));
             entries.add(simple + "=" + (flags.length() == 0 ? "-" : flags));
           }

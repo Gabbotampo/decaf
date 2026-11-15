@@ -11,6 +11,9 @@
 //! the fixture also requires zero unknown host calls, which is the regression
 //! the test exists for.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -151,7 +154,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-neoforge-bootstrap-{test}-{}-{unique}",
             std::process::id()
         ));

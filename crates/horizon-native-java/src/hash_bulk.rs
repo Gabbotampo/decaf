@@ -121,10 +121,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
-        let copy_like = self.host.is_view_copy(&marker)
-            || marker.starts_with("set/")
-            || marker.starts_with("set#")
-            || marker.contains("#immutable");
+        let copy_like = self.host.is_view_copy(&marker) || marker.contains("#immutable");
         let sorted_source = self
             .host
             .unmodifiable_view_source(&marker)
@@ -245,7 +242,7 @@ impl<H: Host> Runtime<'_, H> {
                 let found = self.get_node(&table, key)?;
                 return Ok((None, found));
             }
-            table.begin_compute();
+            table.begin_compute()?;
             let hash = self.java_hash(key)?;
             let found = self.table_lookup(&table, key, hash)?;
             Ok((hash, found))
@@ -480,7 +477,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 None if *value != Value::Ref(None) && name != "computeIfPresent" => {
                     let capacity = table.capacity();
-                    table.insert_at_head(key, hash);
+                    table.insert_at_head(key, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -525,7 +522,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(receiver)?;
                 entries.extend([key.clone(), value.clone()]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert_at_head(key, hash);
+                table.insert_at_head(key, hash)?;
             }
             None => {}
         }
@@ -817,7 +814,7 @@ impl<H: Host> Runtime<'_, H> {
             match self.table_lookup(&table, value, hash)? {
                 Lookup::Found(_) => {}
                 Lookup::Absent => {
-                    table.insert(value, hash);
+                    table.insert(value, hash)?;
                     kept.push(value.clone());
                 }
                 Lookup::Unknown => {
@@ -906,7 +903,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(());
         };
         // `HashMap.merge(key, value, merge)`.
-        table.begin_compute();
+        table.begin_compute()?;
         let hash = self.java_hash(&key)?;
         match self.table_lookup(table, &key, hash)? {
             Lookup::Unknown => {
@@ -917,7 +914,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(map)?;
                 entries.extend([key.clone(), value]);
                 self.host.replace_mutable_collection(map, entries);
-                table.insert_at_head(&key, hash);
+                table.insert_at_head(&key, hash)?;
             }
             Lookup::Found(stored) => {
                 let entries = self.collection_elements(map)?;

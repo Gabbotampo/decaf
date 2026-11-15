@@ -3,6 +3,9 @@
 //! `Block` answers the `BlockItem` built for it (vanilla's `Item.BY_BLOCK`), or
 //! `Items.AIR` when there is none, never null.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::client_surface::ClientSnapshot;
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{collections::BTreeMap, fs, io::Write, path::Path, process::Command, sync::Arc};
@@ -34,7 +37,7 @@ fn build_jar(
     resources: &[(&str, &str)],
     excluded: &[&str],
 ) -> std::path::PathBuf {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-item-like-{name}-{}",
         std::process::id()
     ));

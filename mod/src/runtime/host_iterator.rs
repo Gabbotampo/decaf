@@ -316,7 +316,7 @@ impl<H: Host> Runtime<'_, H> {
                 break;
             }
         }
-        let parts = self.new_array_list(parts);
+        let parts = self.new_array_list(parts)?;
         let join = MethodRef {
             owner: JOINER.into(),
             name: "join".into(),

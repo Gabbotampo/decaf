@@ -549,22 +549,72 @@ fn is_stream_owner(owner: &str) -> bool {
     )
 }
 
+/// The call a model makes a collection for, counted on a host that makes
+/// none.
+pub(crate) fn wanted(owner: &str, name: &str, descriptor: &str) -> crate::MethodRef {
+    crate::MethodRef {
+        owner: owner.into(),
+        name: name.into(),
+        descriptor: descriptor.into(),
+    }
+}
+
 impl<H: crate::Host> crate::Runtime<'_, H> {
     /// An unmodifiable `ListN` holding `values` (`Stream.toList()`,
-    /// `Collectors.toUnmodifiableList()`).
-    pub(crate) fn unmodifiable_list(&mut self, values: Vec<Value>) -> Value {
-        let fallback = crate::collection_value("list", &values);
-        self.host.unmodifiable_list(values).unwrap_or(fallback)
+    /// `Collectors.toUnmodifiableList()`); counted on a host that models none.
+    pub(crate) fn unmodifiable_list(&mut self, values: Vec<Value>) -> Result<Value, NativeError> {
+        match self.host.unmodifiable_list(values) {
+            Some(list) => Ok(list),
+            None => self.host.unknown_operand_call(&wanted(
+                "java/util/stream/Stream",
+                "toList",
+                "()Ljava/util/List;",
+            )),
+        }
     }
 
     /// A new `ArrayList` of its own holding `values` (`Collectors.toList()`).
-    pub(crate) fn new_array_list(&mut self, values: Vec<Value>) -> Value {
-        match self.host.empty_mutable_collection("list") {
-            Some(list) if self.host.holds_collection(&list) => {
-                self.host.replace_mutable_collection(&list, values);
-                list
-            }
-            _ => crate::collection_value("list", &values),
+    pub(crate) fn new_array_list(&mut self, values: Vec<Value>) -> Result<Value, NativeError> {
+        self.new_host_collection(
+            "java/util/ArrayList",
+            values,
+            ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
+        )
+    }
+
+    /// What the factory `r` answers for `values`
+    /// ([`crate::Host::factory_collection`]: Java's or Guava's unmodifiable
+    /// class, its shared empty one), counted on a host that models none.
+    pub(crate) fn factory_or_count(
+        &mut self,
+        r: &crate::MethodRef,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Result<Value, NativeError> {
+        match self
+            .host
+            .factory_collection(&r.owner, &r.name, kind, values)
+        {
+            Some(made) => Ok(made),
+            None => self.host.unknown_operand_call(r),
+        }
+    }
+
+    /// A new collection of the JDK class `class` holding `values`
+    /// ([`crate::Host::make_collection`], #156 P14d2). A host that makes none
+    /// counts `wanted`, the call that asked for one: no collection is ever
+    /// text.
+    pub(crate) fn new_host_collection(
+        &mut self,
+        class: &str,
+        values: Vec<Value>,
+        wanted: (&str, &str, &str),
+    ) -> Result<Value, NativeError> {
+        match self.host.make_collection(class, values) {
+            Some(made) => Ok(made),
+            None => self
+                .host
+                .unknown_operand_call(&self::wanted(wanted.0, wanted.1, wanted.2)),
         }
     }
 
@@ -1250,7 +1300,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 None => crate::empty_optional(),
             },
             Terminal::Fold(_, _, value) | Terminal::Container(_, value) => value,
-            Terminal::ToMap(state) => state.finish(),
+            Terminal::ToMap(state) => self.finish_to_map(*state)?,
             Terminal::Collect(_)
             | Terminal::Forward(..)
             | Terminal::Supply(..)

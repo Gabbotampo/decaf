@@ -18,6 +18,9 @@
 //! not know for a file it did not write, so the open is counted and answers
 //! the neutral `null`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -161,7 +164,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-open-options-{test}-{}-{unique}",
             std::process::id()
         ));

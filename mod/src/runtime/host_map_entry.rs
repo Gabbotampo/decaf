@@ -166,8 +166,8 @@ enum OpaqueReading {
     /// (`unmodifiableMap`'s are [`Life::Wrapped`]).
     New,
     /// The map's stored entry, one object while the map has no structural change:
-    /// `Collections.singletonMap`'s cached `SimpleImmutableEntry`, a host literal (Guava's
-    /// `ImmutableMap.of`, whose `ImmutableMapEntry` array `entrySet()` walks), Gson's
+    /// `Collections.singletonMap`'s cached `SimpleImmutableEntry`, Guava's `ImmutableMap.of`
+    /// (whose cached `entrySet()` walks its own entries), a host literal, Gson's
     /// `LinkedTreeMap` node.
     Stored,
     /// Not known: one key per mapping, a fresh origin per reading (`==` counted).
@@ -180,6 +180,15 @@ fn opaque_reading(map: &str) -> OpaqueReading {
         OpaqueReading::New
     } else if class == "java/util/Collections$SingletonMap"
         || class == crate::runtime::gson_tree::TREE_MAP
+        // Guava's immutable maps the host makes (#253): `ImmutableMap` caches its
+        // `entrySet()`, whose entries are the map's own (`RegularImmutableMap`'s entry array,
+        // `SingletonImmutableBiMap`'s one entry), so two readings are one object.
+        || matches!(
+            class,
+            "com/google/common/collect/RegularImmutableMap"
+                | "com/google/common/collect/SingletonImmutableBiMap"
+                | "com/google/common/collect/RegularImmutableBiMap"
+        )
         // A host literal (`map/k,v...`): an immutable map the host keeps no row for.
         || (!map.is_empty() && !map.contains('#'))
     {

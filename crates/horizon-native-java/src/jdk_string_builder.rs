@@ -269,6 +269,13 @@ fn too_long(length: i64) -> Result<(), Outcome> {
     Ok(())
 }
 
+/// `AbstractStringBuilder.ensureCapacityInternal`: when the requested
+/// minimum exceeds the current backing array, Java grows to `(old << 1) + 2`
+/// or the minimum, whichever is larger.
+fn grown_capacity(old: usize, minimum: usize) -> usize {
+    minimum.max(old.saturating_mul(2).saturating_add(2))
+}
+
 fn run(name: &str, descriptor: &str, text: &str, args: &[Arg]) -> Result<Outcome, Outcome> {
     let params = parameters(descriptor);
     let units = units_of(text);
@@ -681,6 +688,7 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        crate::check_jdk_capacity(r, args)?;
         // A `String` spelling a builder's key is no builder (`jar_object.rs`).
         if receiver.is_some_and(crate::jar_object::spells_key) {
             return Ok(None);
@@ -724,6 +732,22 @@ impl<H: Host> Runtime<'_, H> {
             self.forget_builder_after(r, &marker);
             return Ok(None);
         };
+        let current_capacity = self
+            .string_builder_capacities
+            .get(&marker)
+            .copied()
+            .unwrap_or_else(|| units_of(&text).len().max(16));
+        if r.name == "ensureCapacity" && r.descriptor == "(I)V" {
+            let minimum = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?.max(0) as usize;
+            if minimum > current_capacity {
+                let capacity = grown_capacity(current_capacity, minimum);
+                if capacity > crate::MAX_ARRAY_ELEMENTS {
+                    return Err(crate::array_bound_error(capacity as u128));
+                }
+                self.string_builder_capacities
+                    .insert(marker.clone(), capacity);
+            }
+        }
         match call(&r.name, &r.descriptor, &text, &resolved) {
             Outcome::Unmodelled => {
                 self.forget_builder_after(r, &marker);
@@ -735,7 +759,31 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             }),
             Outcome::Done { text, answer } => {
-                if let Some(text) = text {
+                if constructing {
+                    let capacity = if r.descriptor == "(I)V" {
+                        expect_int(r, args.first().unwrap_or(&Value::Int(0)))?.max(0) as usize
+                    } else {
+                        16
+                    };
+                    self.string_builder_capacities
+                        .insert(marker.clone(), capacity);
+                    if let Some(text) = text {
+                        self.string_builders.insert(marker.clone(), text);
+                    }
+                } else if let Some(text) = text {
+                    let units = units_of(&text).len();
+                    let capacity = if r.name == "trimToSize" {
+                        units
+                    } else if units > current_capacity {
+                        grown_capacity(current_capacity, units)
+                    } else {
+                        current_capacity
+                    };
+                    if capacity > crate::MAX_ARRAY_ELEMENTS {
+                        return Err(crate::array_bound_error(capacity as u128));
+                    }
+                    self.string_builder_capacities
+                        .insert(marker.clone(), capacity);
                     self.string_builders.insert(marker.clone(), text);
                 }
                 Ok(Some(match answer {
