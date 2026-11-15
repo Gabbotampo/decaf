@@ -7067,6 +7067,15 @@ impl Host for StdHost {
         if let Some(value) = registry_lookup::instance_call(self, r, receiver, args) {
             return value;
         }
+        // ItemStack.EMPTY is a canonical host value even before a client frame
+        // exists, so its bootstrap isEmpty() answer must stay exact.
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "isEmpty"
+            && r.descriptor == "()Z"
+            && crate::game_object::handle_key(receiver) == Some("client/stack/empty")
+        {
+            return Ok(Value::Int(1));
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -24170,7 +24179,7 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     return Ok(Some(Value::Void));
                 }
-                let Some(path) = self.io_paths.get(&marker).cloned() else {
+                let Some(path) = self.io_path_of(&Value::Ref(Some(marker.clone()))) else {
                     return Ok(None);
                 };
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
