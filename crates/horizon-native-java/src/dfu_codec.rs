@@ -198,14 +198,18 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
         {
             let inner = receiver.filter(|value| codec_receiver(value))?.clone();
             let name = field_name(args)?;
-            node(
-                "dfu-map-optional",
-                vec![
-                    inner,
-                    Value::Ref(Some(name)),
-                    args.get(1).cloned().unwrap_or(Value::Ref(None)),
-                ],
-            )
+            let mut values = vec![inner, Value::Ref(Some(name))];
+            if args.len() > 1 {
+                let default = if descriptor
+                    .starts_with("(Ljava/lang/String;Lcom/mojang/serialization/Lifecycle;")
+                {
+                    args.get(2)
+                } else {
+                    args.get(1)
+                }?;
+                values.push(default.clone());
+            }
+            node("dfu-map-optional", values)
         }
         (
             MAP_CODEC,
