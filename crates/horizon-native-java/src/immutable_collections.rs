@@ -401,7 +401,9 @@ impl<H: Host> Runtime<'_, H> {
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_MAP) {
             return self.identity_map_member(r, receiver, args);
         }
-        if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET) {
+        if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET)
+            && !self.host.is_set_from_map(receiver)
+        {
             return self.identity_set_member(r, receiver, args);
         }
         if let Some(answer) = self.identity_view_member(r, receiver, args)? {
