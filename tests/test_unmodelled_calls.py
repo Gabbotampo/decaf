@@ -1,6 +1,12 @@
 import importlib.util
+import contextlib
+import io
+import json
+import os
+import tempfile
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -15,6 +21,34 @@ sys.path[:] = _before
 
 
 class UnmodelledCallsTests(unittest.TestCase):
+    FABRIC_REVIEW_PAIRS = {
+        (">=0.14.3 <1.0.0", "0.15.2+26.3"): True,
+        (">=0.6.3 <1.0.0", "0.6.10"): True,
+        (">=0.6.3 <1.0.0", "0.6.8"): True,
+        (">=0.9.3- <=0.9.3", "0.9.3-alpha.1+mc26.3"): True,
+        (">=0.9.3- <=0.9.3", "0.9.3-beta.1+mc26.3"): True,
+        (">=1.0.0+26.x", "1.0.0+26.x"): True,
+        (">=1.1.17 <1.2.0", "1.1.25"): True,
+        (">=1.9.3", "unspecified"): None,
+        (">=2.3.1+26.3.x", "2.3.1+26.3.x"): True,
+        (">=6.9.0 <6.10", "6.9.0"): True,
+    }
+
+    def test_real_loader_review_pairs_are_recorded(self):
+        """Answers came from Fabric Loader 0.19.5's Java harness in rc265-review."""
+        loader = os.environ.get("FABRIC_LOADER_0195")
+        if not loader:
+            self.skipTest("set FABRIC_LOADER_0195 for the real Java oracle")
+        oracle = TOOL.FabricPredicateOracle(Path(loader))
+        valid = {pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items() if answer is not None}
+        oracle.evaluate(valid)
+        self.assertEqual({pair: oracle.cache[pair] for pair in valid},
+                         {pair: answer for pair, answer in self.FABRIC_REVIEW_PAIRS.items()
+                          if answer is not None})
+        invalid = {pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items() if answer is None}
+        oracle.evaluate(invalid)
+        self.assertFalse(oracle.cache[next(iter(invalid))])
+        self.assertTrue(oracle.parse_errors)
     def test_aggregate_counts_jars_calls_and_sole_rows(self):
         corpora = {
             "wide": [
@@ -125,6 +159,60 @@ class UnmodelledCallsTests(unittest.TestCase):
                                            "unknown_host_call_count": 0}), "ran-partial")
         self.assertEqual(TOOL.row_verdict({"unknown_host_call_count": 0}), "ran-clean")
         self.assertEqual(TOOL.row_verdict({"unknown_host_call_count": 3}), "ran-hollow")
+
+    @staticmethod
+    def _jar(directory, name, ident, depends=None):
+        path = Path(directory) / name
+        metadata = {"schemaVersion": 1, "id": ident, "version": "1",
+                    "entrypoints": {"main": ["demo.Entry"]}}
+        if depends is not None:
+            metadata["depends"] = depends
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("fabric.mod.json", json.dumps(metadata))
+        return path
+
+    def test_both_modes_are_reported_and_missing_closure_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._jar(root, "app.jar", "app", {"absent": ">=2"})
+            probe = root / "probe"
+            probe.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in *--link*) n=2 ;; *) n=1 ;; esac\n"
+                "printf '{\"status\":\"ok\",\"unknown_host_call_count\":%s,\"unknown_host_calls\":[]}\\n' \"$n\"\n",
+                encoding="utf-8")
+            probe.chmod(0o755)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(TOOL.main([
+                    "--corpus", f"wide={root}", "--probe", str(probe),
+                    "--dependency-mode", "both", "--jobs", "1",
+                ]), 0)
+            report = json.loads(output.getvalue())
+        rows = report["corpora"]["wide"]["rows"]
+        by_mode = {row["mode"]: row for row in rows}
+        self.assertEqual(by_mode["alone"]["verdict"], "ran-hollow")
+        self.assertEqual(by_mode["alone"]["unknown"], 1)
+        self.assertEqual(by_mode["closure"]["verdict"], "refused")
+        self.assertIn("Fabric dependency predicate oracle unavailable",
+                      by_mode["closure"]["error"])
+        self.assertEqual(report["totals"]["alone"]["wide"]["ran-hollow"], 1)
+        self.assertNotIn("refused", report["totals"]["closure"]["wide"])
+        self.assertEqual(len(report["corpora"]["wide"]["closure_regressions"]), 1)
+
+    def test_dependency_failure_is_a_regression_outside_closure_totals(self):
+        rows = [
+            {"jar": "app.jar", "mode": "alone", "verdict": "ran-hollow",
+             "unknown": 1, "calls": [["a", 1]]},
+            {"jar": "app.jar", "mode": "closure", "verdict": "refused",
+             "stage": "execute", "error": "at dep/Config#<clinit> +7",
+             "deps": ["dep.jar"], "unknown": 0, "calls": []},
+        ]
+        regressions = TOOL.mark_closure_regressions(rows)
+        self.assertEqual(len(regressions), 1)
+        self.assertEqual(rows[1]["classification"], "closure-regression")
+        totals, _ = TOOL.aggregate({"wide": [rows[0]]})
+        self.assertEqual(totals["wide"]["ran-hollow"], 1)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,8 @@ awt_hash=-65536
 awt_same=true
 awt_pink_text=java.awt.Color[r=255,g=175,b=175]
 awt_pink_hash=-20561
+awt_lightgray=true
+awt_darkgray=true
 forged_style_equals=false,false
 forged_cat_equals=false,false
 forged_cat_set=2
@@ -55,4 +57,5 @@ forged_map=1,null
 forged_style_instanceof=false,true
 forged_class=java.lang.String
 forged_cast=CCE
+forged_vec3_cast=CCE
 idmap_sizes=1,1,2
