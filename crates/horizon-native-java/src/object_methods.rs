@@ -337,6 +337,11 @@ impl<H: Host> Runtime<'_, H> {
     /// The hash of a host-modelled value: a list, set or map by the JDK's
     /// formula over its elements, a handle by its kind's row.
     fn host_value_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // A jar's own `BlockPos`/`LevelResource`: `Vec3i.hashCode` or the
+        // record's, by its fields (`jar_server_values.rs`).
+        if let Some(hash) = self.jar_server_value_hash(value)? {
+            return Ok(hash);
+        }
         // A jar's `new UUID(msb, lsb)`: `UUID.hashCode` of its fields.
         if crate::host_jdk_value::is_uuid_object(value) {
             return Ok(self
@@ -474,6 +479,11 @@ impl<H: Host> Runtime<'_, H> {
                             Ok(false)
                         }
                     };
+                }
+                // A jar's own `BlockPos`/`LevelResource`: `Vec3i.equals` or
+                // the record's, by its fields (`jar_server_values.rs`).
+                if let Some(equal) = self.jar_server_value_equals(a, b)? {
+                    return Ok(equal);
                 }
                 // A jar's `new UUID(msb, lsb)`: `UUID.equals` of its fields.
                 if crate::host_jdk_value::is_uuid_object(a) {
@@ -1177,6 +1187,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
+    }
+
+    fn server_value_key(&mut self, value: &Value) -> Option<Option<String>> {
+        self.runtime.jar_server_value_key(value)
     }
 }
 
