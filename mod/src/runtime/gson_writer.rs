@@ -78,7 +78,12 @@ impl State {
         self.serialize_nulls = style.serialize_nulls;
     }
 
-    pub(crate) fn set_indent(&mut self, indent: &str) {
+    pub(crate) fn set_indent(&mut self, indent: &str) -> Result<(), NativeError> {
+        if indent.chars().any(|c| c != ' ' && c != '\t') {
+            return Err(illegal_argument(
+                "Only combinations of spaces and tabs are allowed in indent.",
+            ));
+        }
         let style = if indent.is_empty() {
             host_gson::Style {
                 newline: String::new(),
@@ -99,6 +104,7 @@ impl State {
         };
         self.formatting = style;
         self.formatting_value = value;
+        Ok(())
     }
     pub(crate) fn set_formatting_style(&mut self, value: &Value) -> Result<(), NativeError> {
         let Some(style) = host_gson::style_of(value) else {
@@ -303,6 +309,15 @@ impl State {
         }
     }
     pub(crate) fn number_value(&mut self, v: &Value) -> Result<Option<String>, NativeError> {
+        // Gson's primitive and Number overloads call writeDeferredName before
+        // validating the value. A rejected number therefore consumes the name
+        // and leaves the object in its dangling-name state.
+        let mut out = self.write_deferred_name()?;
+        if matches!(v, Value::Ref(None)) {
+            out.push_str(&self.before_value()?);
+            out.push_str("null");
+            return Ok(Some(out));
+        }
         let Some(text) = number_text(v) else {
             return Ok(None);
         };
@@ -317,7 +332,9 @@ impl State {
                 number_class(v)
             )));
         }
-        Ok(Some(self.raw(&text)?))
+        out.push_str(&self.before_value()?);
+        out.push_str(&text);
+        Ok(Some(out))
     }
     pub(crate) fn raw_tree(&mut self, text: String) -> Result<String, NativeError> {
         self.raw(&text)
