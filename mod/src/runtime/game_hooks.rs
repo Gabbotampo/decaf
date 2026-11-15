@@ -1136,6 +1136,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.unmodifiable_view_source(marker)
     }
 
+    fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {
+        self.inner.unmodifiable_list_view_as(class, source)
+    }
+
     fn has_mutable_collection(&self, marker: &str) -> bool {
         self.inner.has_mutable_collection(marker)
     }
