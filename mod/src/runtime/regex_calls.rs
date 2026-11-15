@@ -39,7 +39,7 @@ impl<H: Host> Runtime<'_, H> {
     /// the marker.
     fn char_sequence(&self, value: &Value) -> Option<String> {
         let marker = expect_ref(value)?;
-        if let Some(text) = self.string_builders.get(marker) {
+        if let Some(text) = self.builder_text(value) {
             return Some(text.clone());
         }
         crate::runtime::value_class::is_plain_string(marker).then(|| marker.clone())
@@ -52,14 +52,10 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
-        class: &str,
-        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         let text = |index: usize| args.get(index).and_then(expect_ref).cloned();
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-            ("java/lang/String", "split", _) => {
-                self.invoke_string_split(r, receiver, args, class, method)
-            }
+            ("java/lang/String", "split", _) => self.invoke_string_split(r, receiver, args),
             ("java/lang/String", "matches", "(Ljava/lang/String;)Z") => {
                 let (Some(input), Some(pattern)) = (receiver.and_then(expect_ref), text(0)) else {
                     return Ok(None);
@@ -122,8 +118,6 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
-        class: &str,
-        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/String" || r.name != "split" {
             return Ok(None);
@@ -156,14 +150,10 @@ impl<H: Host> Runtime<'_, H> {
         let Ok(parts) = split_java_string(receiver.as_str(), pattern, limit) else {
             return Ok(None);
         };
-        let marker = self.new_array(class, method);
-        self.arrays.insert(
-            marker.clone(),
-            parts
-                .into_iter()
-                .map(|part| Value::Ref(Some(part)))
-                .collect(),
-        );
-        Ok(Some(Value::Ref(Some(marker))))
+        let parts = parts
+            .into_iter()
+            .map(|part| Value::Ref(Some(part)))
+            .collect();
+        Ok(Some(self.new_array_value("[Ljava/lang/String;", parts)))
     }
 }

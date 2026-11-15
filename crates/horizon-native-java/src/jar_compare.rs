@@ -21,11 +21,58 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn natural_order(&mut self, a: &Value, b: &Value) -> Result<i32, NativeError> {
         // A host handle's natural order is its kind's row (`host_ref.rs`);
         // a kind with none, or a pair it cannot compare, is counted.
-        if let Value::Host(handle) = a {
+        // An object compares by its class's own `compareTo`, below.
+        if let Value::Host(handle) = a
+            && !crate::jar_object::is_object_handle(handle)
+        {
+            // A kind known not to be `Comparable` (an array) fails the
+            // `(Comparable)` cast, as `ComparableTimSort` does.
+            if handle.instance_of("java/lang/Comparable", self) == Some(false)
+                && let Some(class) = handle.class()
+            {
+                return Err(crate::checkcast::class_cast_exception(
+                    class,
+                    "java/lang/Comparable",
+                ));
+            }
             return match self.host_ref_compare(handle, b)? {
                 Some(order) => Ok(order),
                 None => self.count_compare_to(),
             };
+        }
+        // A jar's own `BlockPos`: `Vec3i.compareTo` of its fields
+        // (`jar_server_values.rs`), counted where they are not known.
+        if let Some(order) = self.jar_server_value_compare(a, b) {
+            return order;
+        }
+        // A jar's `new UUID(msb, lsb)`: `UUID.compareTo` of the halves the host kept
+        // (`host_jdk_value.rs`), counted where it kept none.
+        if crate::host_jdk_value::is_uuid_object(a) {
+            let theirs =
+                crate::host_jdk_value::uuid_bits_of(b).or_else(|| self.host.constructed_uuid(b));
+            return match (self.host.constructed_uuid(a), theirs) {
+                (Some(own), Some(theirs)) => Ok(crate::host_jdk_value::uuid_order(own, theirs)),
+                _ => self.count_compare_to(),
+            };
+        }
+        // A JDK object a jar built: Java 25's table says whether its class is `Comparable`
+        // (`jdk_object_methods.rs`). One that is not fails `ComparableTimSort`'s cast; one
+        // that is runs a body the host does not have: counted.
+        if self.interpreted_object_class(a).is_none()
+            && let Some(base) = self.jdk_base_class(a)
+        {
+            if crate::jdk_object_methods::overrides(
+                &base,
+                crate::jdk_object_methods::Member::CompareTo,
+            ) == Some(false)
+                && let Some(class) = crate::jar_object::object_class(a)
+            {
+                return Err(crate::checkcast::class_cast_exception(
+                    class,
+                    "java/lang/Comparable",
+                ));
+            }
+            return self.count_compare_to();
         }
         let Some(class) = self.interpreted_object_class(a) else {
             if self.interpreted_object_class(b).is_some() {
@@ -68,7 +115,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Count `Comparable.compareTo` as unknown and answer "equal".
-    fn count_compare_to(&mut self) -> Result<i32, NativeError> {
+    pub(crate) fn count_compare_to(&mut self) -> Result<i32, NativeError> {
         self.host.unknown_operand_call(&MethodRef {
             owner: "java/lang/Comparable".into(),
             name: "compareTo".into(),

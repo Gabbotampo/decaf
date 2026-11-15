@@ -162,6 +162,12 @@ fn table_facts(class: &str) -> Option<EventFacts> {
     })
 }
 
+/// Whether NeoForge's table says `class` is an `ICancellableEvent` and an `IModBusEvent`
+/// (`isAssignableFrom`, so inherited ones too).
+pub(crate) fn table_interfaces(class: &str) -> Option<(bool, bool)> {
+    table_facts(class).map(|facts| (facts.cancellable, facts.mod_bus))
+}
+
 /// The superclass NeoForge's table names for one of its event classes.
 pub(crate) fn table_superclass(class: &str) -> Option<String> {
     table_facts(class).map(|facts| facts.superclass)
@@ -301,8 +307,8 @@ impl<H: Host> Runtime<'_, H> {
             return counted("no consumer");
         };
         let class = match shape.class {
-            Some(at) => match args.get(at).and_then(expect_ref) {
-                Some(class) => class.clone(),
+            Some(at) => match args.get(at).and_then(crate::runtime::host_class::class_name) {
+                Some(class) => class.to_owned(),
                 None => return counted("event class is not a class literal"),
             },
             None => match self.consumer_event_class(&consumer) {
@@ -420,8 +426,9 @@ impl<H: Host> Runtime<'_, H> {
     /// typetools' `resolveRawArgument(Consumer.class, consumer.getClass())`, where the runtime can
     /// follow it; `None` where it cannot (counted, departure B3).
     fn consumer_event_class(&self, consumer: &Value) -> Option<String> {
-        let text = expect_ref(consumer)?;
-        if text.starts_with("@indy:") {
+        if let Some(text) = expect_ref(consumer)
+            && text.starts_with("@indy:")
+        {
             let marker = parse_callback_marker(text).ok()?;
             let parameters = crate::runtime::descriptor_arguments(&marker.target.descriptor);
             // `populateLambdaArgs`: an implementation method with one parameter fewer than
@@ -439,7 +446,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         // An object of a jar class: the `Consumer<X>` its own or a jar superclass's signature
         // implements.
-        let (class, _) = text.split_once('#')?;
+        let class = crate::runtime::jar_object::object_class(consumer)?;
         let mut at = class.to_owned();
         for _ in 0..32 {
             let file = self.class(&at)?;
@@ -472,15 +479,16 @@ impl<H: Host> Runtime<'_, H> {
     /// `accept` of a jar object (its typed `accept(Event)` when it declares one, so the bridge's
     /// cast of a game event is not needed).
     fn consumer_callback(&self, consumer: &Value, class: &str) -> Option<ListenerCallback> {
-        let text = expect_ref(consumer)?;
-        if text.starts_with("@indy:") {
+        if let Some(text) = expect_ref(consumer)
+            && text.starts_with("@indy:")
+        {
             let marker = parse_callback_marker(text).ok()?;
             return Some(ListenerCallback::Indy {
                 target: marker.target,
                 captures: marker.captures,
             });
         }
-        let (owner, _) = text.split_once('#')?;
+        let owner = crate::runtime::jar_object::object_class(consumer)?;
         let typed = format!("(L{class};)V");
         for descriptor in [typed.as_str(), "(Ljava/lang/Object;)V"] {
             let mut at = owner.to_owned();

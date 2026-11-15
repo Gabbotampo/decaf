@@ -320,8 +320,13 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(answer) = self.host_entry_equals(r, opcode, this, args)? {
             return Ok(Some(answer));
         }
-        if let Some(class) =
-            expect_ref(this).and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+        // A host-made collection of the same class (`Arrays.asList`'s
+        // `subList`, `array_views.rs`) keeps its state in the host's row,
+        // not in fields: the host answers it.
+        let host_made = matches!(this, Value::Host(handle)
+            if handle.kind() == crate::host_ref::HostKind::Collection);
+        if !host_made
+            && let Some(class) = crate::jar_object::object_class(this)
             && INTERNAL.iter().any(|(internal, _, _)| *internal == class)
         {
             let class = class.to_owned();
@@ -329,8 +334,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         // A jar object on a skeleton, or a `SimpleEntry`/`SimpleImmutableEntry`
         // itself (its state is the same two fields either way).
-        let direct_entry = expect_ref(this)
-            .and_then(|marker| jvm_dispatch::constructed_object_class(marker))
+        let direct_entry = crate::jar_object::object_class(this)
             .filter(|class| [map::SIMPLE_ENTRY, map::IMMUTABLE_ENTRY].contains(class))
             .map(str::to_owned);
         let Some(base) = self.stateless_jar_object(this).or(direct_entry) else {
@@ -431,7 +435,7 @@ impl<H: Host> Runtime<'_, H> {
                 skeleton_owner(&owner).or_else(|| interface_default(&[data_interface(&owner)?]))
             }
             0xb6 | 0xb9 if !r.name.starts_with('<') => {
-                let class = jvm_dispatch::constructed_object_class(expect_ref(this)?)?;
+                let class = crate::jar_object::object_class(this)?;
                 // A jar declaration (abstract, or a jar interface's default
                 // the JVM dispatch already declined) is not a JDK body.
                 if self
@@ -464,9 +468,6 @@ impl<H: Host> Runtime<'_, H> {
         let Some(body) = body_for(owner, &r.name, &r.descriptor) else {
             return Ok(None);
         };
-        if body == Body::Default && !self.default_runs_here(owner, &r.name, this) {
-            return Ok(None);
-        }
         self.run_body(body, owner, r, this, args)
     }
 
@@ -531,9 +532,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         let other = args.first().cloned().unwrap_or(Value::Ref(None));
-        let Some(class) =
-            expect_ref(&other).and_then(|marker| jvm_dispatch::constructed_object_class(marker))
-        else {
+        let Some(class) = crate::jar_object::object_class(&other) else {
             return Ok(None);
         };
         if self.class(class).is_none() && !jar_operands::is_skeleton(class) {
@@ -664,23 +663,13 @@ impl<H: Host> Runtime<'_, H> {
 
     /// A new array of `component` holding `values`.
     fn new_reference_array(&mut self, component: &str, values: Vec<Value>) -> Value {
-        let marker = self.new_array("java/util/AbstractCollection", "toArray");
-        self.arrays.insert(marker.clone(), values);
-        self.record_array_component(&marker, component);
-        Value::Ref(Some(marker))
+        self.new_array_value(&value_class::array_class_marker(component), values)
     }
 
-    /// The component class an array was created with (`Object` when the
-    /// runtime did not record one).
+    /// The component class of an array (`Object` for a value that is no
+    /// array).
     fn skeleton_array_component(&self, array: &Value) -> String {
-        expect_ref(array)
-            .and_then(|marker| {
-                self.fields
-                    .get(&format!("{marker}{}", value_class::ARRAY_COMPONENT_FIELD))
-            })
-            .and_then(expect_ref)
-            .cloned()
-            .unwrap_or_else(|| "java/lang/Object".into())
+        value_class::array_component(array).unwrap_or_else(|| "java/lang/Object".into())
     }
 
     /// `array[index] = value` on an array this run owns.
@@ -690,7 +679,7 @@ impl<H: Host> Runtime<'_, H> {
         index: usize,
         value: Value,
     ) -> Result<(), NativeError> {
-        let marker = expect_array_marker(array)?;
+        let marker = expect_array_key(array)?;
         let values = self
             .arrays
             .get_mut(marker)

@@ -31,18 +31,6 @@ use super::*;
 /// `toString()`'s descriptor.
 const TO_STRING: &str = "()Ljava/lang/String;";
 
-/// The class of a `class#n` marker: an object `new` (or a model) built in this
-/// run. Strings, boxes and the host's other marker families do not match.
-pub(crate) fn object_marker_class(marker: &str) -> Option<&str> {
-    let (class, serial) = marker.split_once('#')?;
-    (!class.is_empty()
-        && class.contains('/')
-        && !class.contains([':', ' ', '.'])
-        && !serial.is_empty()
-        && serial.bytes().all(|byte| byte.is_ascii_digit()))
-    .then_some(class)
-}
-
 /// The `Object.toString()` reference the unknown answer is counted under.
 pub(crate) fn object_to_string() -> MethodRef {
     MethodRef {
@@ -82,7 +70,7 @@ fn string_overload(r: &MethodRef) -> Option<&'static str> {
 impl<H: Host> Runtime<'_, H> {
     /// The jar class of an object this run built from a jar's own class.
     fn jar_object_class(&self, value: &Value) -> Option<String> {
-        let class = object_marker_class(expect_ref(value)?)?;
+        let class = crate::jar_object::packaged_object_class(value)?;
         (!self.host.models_class(class) && self.class(class).is_some()).then(|| class.to_owned())
     }
 
@@ -194,7 +182,9 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         // A host handle prints its kind's `toString` (`host_ref.rs`); one
         // whose held value has no text here is counted.
-        if let Value::Host(handle) = value {
+        if let Value::Host(handle) = value
+            && !crate::jar_object::is_object_handle(handle)
+        {
             return match self.host_ref_text(handle, class, method)? {
                 Some(text) => Ok(Some(Value::Ref(Some(text)))),
                 None => self
@@ -203,11 +193,23 @@ impl<H: Host> Runtime<'_, H> {
                     .map(Some),
             };
         }
+        // A `String` spelling an object's key is that text.
+        if crate::jar_object::spells_key(value) {
+            return Ok(None);
+        }
         let Some(marker) = expect_ref(value) else {
             return Ok(None);
         };
         if let Some(text) = self.string_builders.get(marker) {
             return Ok(Some(Value::Ref(Some(text.clone()))));
+        }
+        // A stream's `toString` is its stage class and identity hash: counted,
+        // and its marker never printed (`stream_pipeline::STREAM_TEXT`).
+        if self.is_live_stream(marker) {
+            self.host.unknown_operand_call(&object_to_string())?;
+            return Ok(Some(Value::Ref(Some(
+                crate::stream_pipeline::STREAM_TEXT.into(),
+            ))));
         }
         // A host map entry prints `key=value` (`host_entry.rs`).
         if let Some(text) = self.host_entry_text(value, class, method)? {
@@ -217,8 +219,15 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(path) = self.file_path(value) {
             return Ok(Some(Value::Ref(Some(path.to_owned()))));
         }
-        if object_marker_class(marker).is_none() {
+        if crate::jar_object::packaged_object_class(value).is_none() {
             return Ok(None);
+        }
+        // A jar's own `BlockPos`/`LevelResource` (a subclass included):
+        // `Vec3i.toString` or the record's, by its fields
+        // (`jar_server_values.rs`). A subclass with its own `toString` is
+        // not answered here and runs it below.
+        if let Some(text) = self.jar_server_value_text(value) {
+            return Ok(Some(Value::Ref(Some(text))));
         }
         if let Some(text) = self.jar_to_string(value, class, method)? {
             // `String.valueOf` returns what `toString` returned, even `null`.
@@ -243,13 +252,15 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
-        if let Value::Host(handle) = value {
+        if let Value::Host(handle) = value
+            && !crate::jar_object::is_object_handle(handle)
+        {
             if let Some(text) = self.host_ref_text(handle, class, method)? {
                 return Ok(text);
             }
             self.host.unknown_operand_call(&object_to_string())?;
         }
-        if matches!(value, Value::Ref(Some(_))) {
+        if matches!(value, Value::Ref(Some(_))) || crate::jar_object::is_object(value) {
             match self.runtime_value_of(value, class, method)? {
                 Some(Value::Ref(Some(text))) => return Ok(text),
                 Some(_) => return Ok("null".into()),
@@ -257,6 +268,13 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(text) = self.host.modelled_to_string(value) {
                 return Ok(text);
+            }
+            // No model prints it: a `String` is its own text, anything else
+            // (a host marker, a stream, an object) is counted, never shown
+            // as its key without a count.
+            if !matches!(value, Value::Ref(Some(text)) if crate::value_class::is_plain_string(text))
+            {
+                self.host.unknown_operand_call(&object_to_string())?;
             }
         }
         Ok(java_value_text(value, desc))
@@ -286,6 +304,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             if let Some(text) = self.host_entry_text(receiver, class, method)? {
                 return Ok(Some(text));
+            }
+            if expect_ref(receiver).is_some_and(|marker| self.is_live_stream(marker)) {
+                return self.runtime_value_of(receiver, class, method);
             }
             return self.jar_to_string(receiver, class, method);
         }
@@ -334,7 +355,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         // A builder argument keeps the builder model's own path.
-        if expect_ref(value).is_some_and(|marker| self.string_builders.contains_key(marker)) {
+        if self.builder_text(value).is_some() {
             return Ok(None);
         }
         let Some(text) = self.runtime_value_of(value, class, method)? else {

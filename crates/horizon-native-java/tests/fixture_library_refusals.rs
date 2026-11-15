@@ -784,8 +784,11 @@ impl Host for Tracing {
         );
         out
     }
-    fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
+    fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         Host::mutable_collection_values(&self.inner, value)
+    }
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        Host::unknown_operand_call(&mut self.inner, r)
     }
     fn service_providers(&self, service: &str) -> Vec<String> {
         let out = Host::service_providers(&self.inner, service);
@@ -812,7 +815,7 @@ impl Host for Tracing {
     fn platform_class_present(&self, name: &str) -> bool {
         Host::platform_class_present(&self.inner, name)
     }
-    fn throwable_message(&self, marker: &str) -> Option<String> {
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         Host::throwable_message(&self.inner, marker)
     }
     fn record_throwable(&mut self, marker: &str, message: Option<String>) {
