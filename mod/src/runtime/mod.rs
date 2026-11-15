@@ -22468,9 +22468,6 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(answer) = self.host.game_instance_of(marker, wanted) {
             return answer;
         }
-        if generic_type_instance_of(marker, wanted) {
-            return true;
-        }
         // Collections and optionals keep their kind in the marker prefix.
         let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
         let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
