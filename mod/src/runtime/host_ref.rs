@@ -917,6 +917,10 @@ pub(crate) const PARTICLE_TYPE_CLASS_SIDE: ClassSide = ClassSide {
     },
 };
 
+fn debug_profiles_map_class(_key: &str) -> &'static str {
+    "java/util/ImmutableCollections$MapN"
+}
+
 fn debug_profiles_equals(
     _handle: &HostRef,
     _other: &Value,
@@ -2090,7 +2094,7 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::DebugProfilesMap,
         tag: "dpm",
-        class: ClassRule::Fixed("java/util/ImmutableCollections$MapN"),
+        class: ClassRule::FromKey(debug_profiles_map_class),
         canonical: always_canonical,
         methods: &DEBUG_PROFILES_MAP_METHODS,
     },
