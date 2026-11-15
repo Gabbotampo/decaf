@@ -330,11 +330,23 @@ impl<H: Host> Runtime<'_, H> {
         // A sub-list read as an argument (copied, compared, printed) checks
         // its list first, as its `toArray`/`iterator`/`toString` would.
         self.sync_sub_list_arguments(r, op, receiver, args)?;
-        if op == 0xb7 && r.name == "<init>" && r.owner == "java/util/ArrayDeque" {
+        if op == 0xb7
+            && r.owner == "java/util/ArrayDeque"
+            && r.name == "<init>"
+            && matches!(
+                r.descriptor.as_str(),
+                "()V" | "(I)V" | "(Ljava/util/Collection;)V"
+            )
+        {
             let Some(marker) = receiver.and_then(expect_ref).cloned() else {
                 return Ok(None);
             };
             let layout = self.deque_constructed(args);
+            if let Some(layout) = layout
+                && layout.capacity_of() > crate::MAX_ARRAY_ELEMENTS
+            {
+                return Err(crate::array_bound_error(layout.capacity_of() as u128));
+            }
             return Ok(Some(ModToken {
                 marker,
                 name: r.name.clone(),

@@ -8,3 +8,5 @@ lazyAcrossCallbacks=Lazy value not initialized yet.|false
 lazyAfterCollection=kept|1|true
 lazyRetriesAfterThrow=java.lang.IllegalStateException|boom|retry|2|true
 readResolveIdentity=true
+lazyLambdaHold=5000held1|true
+lazyLambdaUse=5000held1|true

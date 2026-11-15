@@ -733,9 +733,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(adapter) = args.get(1).filter(|adapter| **adapter != Value::Ref(None)) else {
             return Err(npe());
         };
-        if expect_ref(adapter)
-            .is_some_and(|text| text.starts_with("@indy:") || text.starts_with("@fn:"))
-        {
+        if crate::callback_marker::callback_text(adapter).is_some() {
             return Ok(());
         }
         let Some(class) = crate::jar_object::object_class(adapter) else {

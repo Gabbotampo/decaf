@@ -1,0 +1,53 @@
+cmpKeyCastCharSeq=ClassCastException
+cmpReversedCastString=ClassCastException
+cmpThenCastCharSeq=ClassCastException
+cmpInstanceOfString=false,false,false,true,true
+cmpConcatLeak=false,false,false,false,false,false
+cmpEqualsText=false,false,false,true
+cmpStringIsString=true,java.lang.String,false,1377924533
+cmpStringCastSort=ClassCastException
+cmpStringCompare=ClassCastException
+cmpForgeJarObject=ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ran=false,log=
+listForgeJarObject=ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ClassCastException,ran=false,log=
+listOfLambdaCast=ClassCastException
+entryOfLambdaCast=ClassCastException
+cmpHashCodeText=false,false,false
+ncSameSite=true,true,true,true
+finallySites=false,true
+twoSitesSameBody=false,false
+capSameSite=false,false
+capHashSet=2
+capHashSetDiff=3
+ncHashSet=1,false
+lambdaMapKey=a,b,2,true
+capIdentityMap=2
+compositeIdentity=false,false,true,true,2
+negateSetOf=2
+fnIdentity=true,true,false,false
+capThisTwice=false,false
+heldVsFresh=true,true
+andShort=MyEx:pm,p
+andOrder=false,false,true,false,true,true,pqfpfqpqpq
+orThrowsSecond=IllegalStateException:qm,fq
+negateThrows=MyEx:neg
+consumerThrow=MyEx:c1,MyEx:c4,1x3y4y
+fnOrder=xgf,xfg,MyEx:h,MyEx:h,xffgf,gffghhffgf
+biOrder=pqg,MyEx:bt,MyEx:c2,bgt1uv2
+checkedThroughAnd=java.io.IOException:io
+identityApply=true,z,a!,b?
+cmpLambdaStable=a0,h1,o2,v3,c4,j5,q6,x7,e8,l9,s10,z11,g12,n13,u14,b15,i16,p17,w18,d19,k20,r21,y22,f23,m24,t25,a26,h27,o28,v29,c30,j31,q32,x33,e34,l35,s36,z37,g38,n39,u40,b41,i42,p43,w44
+cmpLambdaLog=[1, 2, 3, 5, 7, 8, 9]|35 83 85 15 13 95 98 25 23 21 75 79 78 
+cmpLambdaLogBig=332,5013683427069668964,0,69
+cmpThrowsMidArrayList=MyEx:cmp4,[3, 5, 8, 1, 9, 2, 7]
+cmpThrowsMidLinked=MyEx:cmp4,[5, 3, 8, 1, 9, 2, 7]
+cmpContract=50=ok:1:19:k197;100=ok:51:94:k466;500=IllegalArgumentException:Comparison method violates its general contract!:k847;1000=IllegalArgumentException:Comparison method violates its general contract!:k847;2000=IllegalArgumentException:Comparison method violates its general contract!:k847;
+cmpArraysSort=[1, 1, 2, 3, 4]|14 31 34 31 13 11 23 21 
+cmpStreamSorted=[a, e, bb, dd, ccc]|accc bba bbccc bba ddbb ddccc edd ebb ea 
+cmpTreeMap={c=3, b=1, a=2}|bb ab cb 
+cmpMax=ccc,ccc,a|abb cccbb ddccc 
+cmpPriorityQueue=96543211
+cmpLambdaCombined=[ccc, dd, bb, aa, c, a],[ccc, aa, bb, dd, a, c]
+cmpReturnsNonInteger=[a, b, c]
+cmpModifiesList=ConcurrentModificationException:null,5
+gcHold=held
+gcUse=sup,true,false,[zz, a, b],list,>map,nested,true

@@ -5,12 +5,11 @@
 //! `round`'s tie and saturation rules are spelled out below. The functions
 //! answered here were compared with JDK 25 on x86-64 and agree bit for bit.
 //!
-//! `pow` is left unmodelled on purpose. Java only requires it within one ulp,
-//! and the platform `pow` is not HotSpot's algorithm: it differs from the JDK
-//! in the last bit on some inputs, and between platform libms. An answer off
-//! by one ulp would turn a counted unknown into a false `ran-clean`, so `pow`
-//! stays counted until it is a port of HotSpot's own `dpow`.
+//! The fdlibm functions below are answered for `StrictMath` on every host.
+//! `Math` uses the same model only on AArch64, where HotSpot routes these
+//! methods through fdlibm; other `Math` architectures stay counted.
 
+use crate::fdlibm;
 use crate::{MethodRef, NativeError, Value, double_value, expect_float, float_value};
 
 /// `Math.round(double)`: the closest `long`, ties toward positive infinity.
@@ -40,9 +39,12 @@ fn round_float(value: f32) -> i32 {
 
 /// Answer a `Math` call on `double`/`float`, or `None` for any other call.
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
-    if r.owner != "java/lang/Math" {
+    let strict = r.owner == "java/lang/StrictMath";
+    let math = r.owner == "java/lang/Math";
+    if !strict && !math {
         return None;
     }
+    let fdlibm_math = strict || cfg!(target_arch = "aarch64");
     let argument = |index: usize| -> Result<f64, NativeError> {
         let value = args.get(index).ok_or_else(|| {
             NativeError::Metadata(format!("{}#{} missing argument {index}", r.owner, r.name))
@@ -51,14 +53,50 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     };
     let unary = |op: fn(f64) -> f64| argument(0).map(|value| double_value(op(value)));
     Some(match (r.name.as_str(), r.descriptor.as_str()) {
-        ("floor", "(D)D") => unary(f64::floor),
-        ("ceil", "(D)D") => unary(f64::ceil),
-        ("rint", "(D)D") => unary(f64::round_ties_even),
-        ("sqrt", "(D)D") => unary(f64::sqrt),
-        ("abs", "(D)D") => unary(f64::abs),
-        ("abs", "(F)F") => argument(0).map(|value| float_value(value.abs())),
-        ("round", "(D)J") => argument(0).map(|value| Value::Long(round_double(value))),
-        ("round", "(F)I") => argument(0).map(|value| Value::Int(round_float(value as f32))),
+        ("floor", "(D)D") if math => unary(f64::floor),
+        ("ceil", "(D)D") if math => unary(f64::ceil),
+        ("rint", "(D)D") if math => unary(f64::round_ties_even),
+        ("sqrt", "(D)D") if math => unary(f64::sqrt),
+        ("abs", "(D)D") if math => unary(f64::abs),
+        ("abs", "(F)F") if math => argument(0).map(|value| float_value(value.abs())),
+        ("round", "(D)J") if math => argument(0).map(|value| Value::Long(round_double(value))),
+        ("round", "(F)I") if math => argument(0).map(|value| Value::Int(round_float(value as f32))),
+        ("pow", "(DD)D") if fdlibm_math => {
+            let base = match argument(0) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            let exponent = match argument(1) {
+                Ok(value) => value,
+                Err(error) => return Some(Err(error)),
+            };
+            let result = fdlibm::pow(base, exponent);
+            // HotSpot's x86 StrictMath.pow has tier-dependent NaN payloads:
+            // Xint disagrees with C1/C2 on 30 measured inputs. A NaN payload
+            // therefore has no single exact answer on this host.
+            if strict && !cfg!(target_arch = "aarch64") && result.is_nan() {
+                return None;
+            }
+            Ok(double_value(result))
+        }
+        ("tan", "(D)D") if fdlibm_math => unary(fdlibm::tan),
+        ("exp", "(D)D") if fdlibm_math => unary(fdlibm::exp),
+        ("log", "(D)D") if fdlibm_math => argument(0).map(|value| {
+            double_value(if math && value.is_nan() && value.is_sign_negative() {
+                f64::from_bits(0x7ff8_0000_0000_0000)
+            } else {
+                fdlibm::log(value)
+            })
+        }),
+        ("log10", "(D)D") if fdlibm_math => argument(0).map(|value| {
+            double_value(if math && value.is_nan() && value.is_sign_negative() {
+                f64::from_bits(0x7ff8_0000_0000_0000)
+            } else {
+                fdlibm::log10(value)
+            })
+        }),
+        ("cbrt", "(D)D") if fdlibm_math => unary(fdlibm::cbrt),
+        ("tanh", "(D)D") if fdlibm_math => unary(fdlibm::tanh),
         _ => return None,
     })
 }
@@ -149,11 +187,24 @@ mod tests {
             descriptor: "(D)D".into(),
         };
         assert!(static_call(&r, &[Value::Float(0.0)]).is_none());
+        if !cfg!(target_arch = "aarch64") {
+            let r = MethodRef {
+                owner: "java/lang/Math".into(),
+                name: "pow".into(),
+                descriptor: "(DD)D".into(),
+            };
+            assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_math_pow_is_answered() {
         let r = MethodRef {
             owner: "java/lang/Math".into(),
             name: "pow".into(),
             descriptor: "(DD)D".into(),
         };
-        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_none());
+        assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_some());
     }
 }
