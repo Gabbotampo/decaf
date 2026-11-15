@@ -28,6 +28,9 @@
 //! The fixture now names the opcode javac actually emits, so the matrix covers
 //! the whole family set and no row is an expected failure.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     LoadTimeMixinWeave, MixinSide, MixinSkipReason, NativeJar, StdHost, Value,
 };
@@ -609,7 +612,7 @@ struct Fixture {
 
 impl Fixture {
     fn build() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-mixin-family-matrix-{}",
             std::process::id()
         ));

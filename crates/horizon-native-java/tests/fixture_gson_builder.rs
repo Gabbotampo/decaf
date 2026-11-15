@@ -32,6 +32,9 @@
 //! runtime answers `null` for `toJson` and counts the call, so a jar never
 //! receives text that ignored its strategy.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -373,7 +376,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-gson-builder-{test}-{}-{unique}",
             std::process::id()
         ));

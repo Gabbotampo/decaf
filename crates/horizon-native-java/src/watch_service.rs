@@ -711,13 +711,12 @@ impl<H: Host> Runtime<'_, H> {
                 if unsettled {
                     self.host.unknown_operand_call(r)?;
                 }
-                match self.host.empty_mutable_collection("list") {
-                    Some(list) => {
-                        self.host.replace_mutable_collection(&list, values);
-                        list
-                    }
-                    None => collection_value("list", &values),
-                }
+                // `pollEvents()`: a new list of the events.
+                self.new_host_collection(
+                    "java/util/ArrayList",
+                    values,
+                    (&r.owner, &r.name, &r.descriptor),
+                )?
             }
             ("reset", "()Z") => {
                 let Some(key) = self.watch.keys.get_mut(marker) else {

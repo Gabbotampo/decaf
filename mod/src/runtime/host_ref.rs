@@ -398,9 +398,13 @@ pub enum HostKind {
     /// DataFixerUpper's `Pair.of(..)`: key `[serial, first, second]`
     /// (`host_codec.rs`).
     DfuPair,
+    /// DataFixerUpper Either values keyed by side and payload.
+    DfuEither,
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
+    /// A pure network StreamCodec factory result.
+    StreamCodec,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -433,8 +437,16 @@ pub enum HostKind {
     /// jar's `new ArrayList()` (a [`HostKind::JarObject`]), whose row it
     /// shares.
     Collection,
+    /// Kotlin's declaration-order enum entries view.
+    KotlinEnumEntries,
+    /// A Kotlin lazy holder.
+    KotlinLazy,
+    /// Kotlin's canonical empty list, set, or map singleton.
+    KotlinEmptyCollection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
+    /// A RoundingMode constant keyed by name.
+    RoundingMode,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
     /// A `StackWalker.Option` enum constant: key its name.
@@ -486,15 +498,36 @@ pub enum HostKind {
     Enumeration,
     /// A list's `listIterator()`: key `list-iterator/<n>`.
     ListIterator,
+    /// A `Map.Entry` whose class the host knows (`HashMap$Node`, `TreeMap$Entry`,
+    /// `KeyValueHolder`...): key `<class>#entry<n>` (one object per key) or
+    /// `<class>#node<n>` (a map's node, identity by origin) (`host_map_entry.rs`).
+    MapEntry,
+    /// A `Map.Entry` of a map whose entry class the host does not model: key
+    /// `java/util/Map$Entry#node<n>` (`host_map_entry.rs`).
+    OpaqueMapEntry,
     /// `System.out`/`System.err`: key `system-out`/`system-err`
     /// (`host_service.rs`).
     StdStream,
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
-    /// Vanilla's `FileToIdConverter` record.
+    /// Commons Lang's class-loader-local Consumers.nop singleton.
+    CommonsNop,
+    /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
 }
 
@@ -551,12 +584,24 @@ pub(crate) trait Nested {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError>;
     /// `Objects.equals(a, b)`.
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError>;
+    /// The held values of a Java collection, when the host keeps its entries.
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        let _ = value;
+        None
+    }
     /// `String.valueOf(value)`.
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError>;
     /// The vanilla JSON a chat component holds now (its host's state,
     /// `host_component.rs`); `None` where this context cannot read the
     /// host's table (the caller counts).
     fn component_json(&mut self, value: &Value) -> Option<serde_json::Value> {
+        let _ = value;
+        None
+    }
+    /// The key and value a host `Map.Entry` holds now (`host_map_entry.rs`);
+    /// `None` where this context cannot read the host's table or the entry's
+    /// contents are unknown (the caller counts).
+    fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
         let _ = value;
         None
     }
@@ -745,6 +790,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
     (
         HostKind::TypeToken,
         &crate::runtime::host_type_token::TOKEN_CLASS_SIDE,
+    ),
+    (
+        HostKind::StreamCodec,
+        &crate::runtime::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
 ];
 
@@ -1890,6 +1939,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_codec::PAIR_METHODS,
     },
     KindInfo {
+        kind: HostKind::DfuEither,
+        tag: "deither",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_either::either_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_either::EITHER_METHODS,
+    },
+    KindInfo {
         kind: HostKind::OpaqueCodec,
         tag: "ocdc",
         class: ClassRule::Unknown {
@@ -1899,6 +1957,14 @@ const KINDS: &[KindInfo] = &[
         // declared type alone, and two such handles prove nothing.
         canonical: crate::runtime::host_codec::opaque_canonical,
         methods: &crate::runtime::host_codec::OPAQUE_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StreamCodec,
+        tag: "scdc",
+        class: ClassRule::FromKey(crate::runtime::stream_codec::class_of_key),
+        // Every factory call allocates a new implementation object.
+        canonical: always_canonical,
+        methods: &crate::runtime::stream_codec::STREAM_CODEC_METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,
@@ -1983,12 +2049,40 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::KotlinEnumEntries,
+        tag: "kentries",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::enum_entries_class),
+        canonical: never_canonical,
+        methods: &crate::runtime::kotlin_stdlib::ENUM_ENTRIES_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinLazy,
+        tag: "klazy",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::lazy_class),
+        canonical: never_canonical,
+        methods: &crate::runtime::kotlin_stdlib::LAZY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::KotlinEmptyCollection,
+        tag: "kempty",
+        class: ClassRule::FromKey(crate::runtime::kotlin_stdlib::empty_class),
+        canonical: always_canonical,
+        methods: &crate::runtime::kotlin_stdlib::EMPTY_COLLECTION_METHODS,
+    },
+    KindInfo {
         kind: HostKind::TimeUnit,
         tag: "tunit",
         class: ClassRule::Fixed("java/util/concurrent/TimeUnit"),
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::TIME_UNIT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RoundingMode,
+        tag: "rmode",
+        class: ClassRule::Fixed("java/math/RoundingMode"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_jdk_constant::ROUNDING_MODE_METHODS,
     },
     KindInfo {
         kind: HostKind::CodingErrorAction,
@@ -2180,6 +2274,25 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_iterator::ITERATOR_METHODS,
     },
     KindInfo {
+        kind: HostKind::MapEntry,
+        tag: "ment",
+        class: ClassRule::FromKey(crate::runtime::host_map_entry::entry_class),
+        // A new `KeyValueHolder`/snapshot per key; a node's key is reused
+        // for every reading of that node, its identity told by origin.
+        canonical: crate::runtime::host_map_entry::entry_canonical,
+        methods: &crate::runtime::host_map_entry::ENTRY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::OpaqueMapEntry,
+        tag: "omen",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_map_entry::opaque_types,
+        },
+        // Fresh or reused per reading, by a map this model does not know.
+        canonical: never_canonical,
+        methods: &crate::runtime::host_map_entry::ENTRY_METHODS,
+    },
+    KindInfo {
         kind: HostKind::StdStream,
         tag: "stds",
         // A `PrintStream`; in the game vanilla's `LoggedPrintStream`
@@ -2201,6 +2314,56 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_service::METHODS,
     },
     KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
         tag: "rmh",
         class: ClassRule::Unknown {
@@ -2208,6 +2371,15 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::runtime::client_reload::HELPER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CommonsNop,
+        tag: "cnop",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::commons_lang::consumer_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::FileToIdConverter,
@@ -2369,6 +2541,12 @@ impl HostRef {
     /// sides), are one object. `None` for two equal handles of a kind that
     /// is not canonical from different constructions: maybe two objects,
     /// maybe one Java object a model wrapped twice. The caller counts it.
+    /// Which construction this handle came from: two handles with one key and different
+    /// origins may be two objects (`host_map_entry.rs` keeps each one's own state by it).
+    pub(crate) fn origin(&self) -> u64 {
+        self.origin
+    }
+
     pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
         if self != other {
             return Some(false);

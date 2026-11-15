@@ -25,8 +25,9 @@
 //! tables' contents, never on hashing order or time.
 //!
 //! Markers are text, and composite values embed other markers in their own
-//! text (a lambda's `@indy:...` marker carries its captures, a `map-entry/k,v`
-//! both halves, a map view its map). Rather than parse every composite format,
+//! text (a lambda's `@indy:...` marker carries its captures, a map view its
+//! map). A host map entry is a handle whose key and value (and, for a node, its
+//! map) the host keeps by its key (`host_map_entry.rs`); they are its edges. Rather than parse every composite format,
 //! the collector looks for any collectable marker that ends where a run of
 //! digits ends inside a value's text: every collectable marker ends in its
 //! allocation number, so this finds an embedded one wherever it sits. A string
@@ -184,6 +185,12 @@ impl StdHost {
         self.cached_collections.len()
     }
 
+    /// How many `Map.Entry` objects the host keeps (`host_map_entry.rs`): each as long as
+    /// something reaches it, so this follows the live entries, not how many a jar walked.
+    pub fn map_entry_count(&self) -> usize {
+        self.map_entries.len()
+    }
+
     pub(crate) fn take_resident_heap(&mut self) -> JavaHeap {
         let live = self.heap.live;
         let heap = std::mem::take(&mut self.heap);
@@ -294,6 +301,9 @@ impl StdHost {
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
+        // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
+        // allocated mod objects. It is traced and pruned with the object
+        // rather than becoming a lifetime root.
         out.extend(self.resource_streams.keys().map(String::as_str));
         // The command tree's callbacks and requirement lambdas (`brigadier.rs`).
         self.brigadier_root_texts(out);
@@ -358,6 +368,7 @@ impl StdHost {
         push(self.hash_tables.get(marker), out);
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
+        push(self.block_items.get(marker), out);
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -385,6 +396,9 @@ impl StdHost {
             .chain(self.hash_tables.keys())
             .chain(self.red_black_trees.keys())
             .chain(self.probe_tables.keys())
+            .chain(self.constructed_items.iter())
+            .chain(self.constructed_blocks.iter())
+            .chain(self.block_items.keys())
             .chain(self.array_view_markers())
             .map(String::as_str)
     }
@@ -409,6 +423,9 @@ impl StdHost {
         self.hash_tables.retain(|key, _| keep(key));
         self.red_black_trees.retain(|key, _| keep(key));
         self.probe_tables.retain(|key, _| keep(key));
+        self.constructed_items.retain(|key| keep(key));
+        self.constructed_blocks.retain(|key| keep(key));
+        self.block_items.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
@@ -440,6 +457,14 @@ fn collectable(marker: &str) -> bool {
     {
         return rest.ends_with(|c: char| c.is_ascii_digit());
     }
+    // A host map entry (`host_map_entry.rs`): `<class>#entry<n>`/`<class>#node<n>`.
+    if let Some((_, serial)) = marker.rsplit_once('#')
+        && let Some(number) = serial
+            .strip_prefix("entry")
+            .or_else(|| serial.strip_prefix("node"))
+    {
+        return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    }
     // A collection the host made (`<class>#neutral<n>`, `#immutable<n>`,
     // `#reversed<n>`, `jar_object::collection_key`): an object like any other.
     crate::runtime::jar_object::collection_key(marker).is_some()
@@ -459,6 +484,15 @@ fn pin_text(value: &Value) -> Option<&str> {
 /// The receiver of an instance-field key (`receiver|owner#name desc`).
 fn field_receiver(key: &str) -> &str {
     key.rsplit_once('|').map_or(key, |(receiver, _)| receiver)
+}
+
+/// Kotlin lazy cached values share the resident Java field table. The holder
+/// key is the field's ownership edge, so unreachable lazy state is pruned with
+/// the heap collector rather than retained forever (#301).
+const KOTLIN_LAZY_FIELD_PREFIX: &str = "kotlin-lazy|";
+
+fn kotlin_lazy_field_handle(key: &str) -> Option<&str> {
+    key.strip_prefix(KOTLIN_LAZY_FIELD_PREFIX)
 }
 
 fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
@@ -663,6 +697,7 @@ impl Collectable {
             .chain(host.iterators.keys().map(String::as_str))
             .chain(host.enumerations.keys().map(String::as_str))
             .chain(host.component_states.keys().map(String::as_str))
+            .chain(host.map_entries.keys().map(String::as_str))
             .chain(host.keyed_table_keys())
             .filter(|marker| collectable(marker))
             .map(str::to_owned)
@@ -696,6 +731,30 @@ impl Collectable {
     }
 }
 
+fn mark_kotlin_lazy_states(
+    heap: &JavaHeap,
+    text: &str,
+    reached: &mut HashSet<String>,
+    pending: &mut Vec<String>,
+    collectable: &Collectable,
+) {
+    for (field, value) in &heap.fields {
+        let Some(holder) = kotlin_lazy_field_handle(field) else {
+            continue;
+        };
+        if holder != text && !text.contains(holder) {
+            continue;
+        }
+        if !reached.insert(holder.to_owned()) {
+            continue;
+        }
+        if let Some(value) = value_text(value) {
+            collectable.scan(value, pending);
+            mark_kotlin_lazy_states(heap, value, reached, pending, collectable);
+        }
+    }
+}
+
 /// Drop every collectable object of `heap` (and every collectable collection
 /// or iterator of `host`) that nothing reaches from the roots.
 ///
@@ -709,6 +768,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         return;
     }
     let mut pending = Vec::new();
+    let mut reached_kotlin_lazy = HashSet::new();
     // Every allocation number a text the trace reaches names: the objects
     // found live, those without a row of their own included (`FreedObjects`).
     let mut live = Vec::new();
@@ -755,6 +815,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             }
         }
         for text in roots {
+            mark_kotlin_lazy_states(
+                heap,
+                text,
+                &mut reached_kotlin_lazy,
+                &mut pending,
+                &collectable,
+            );
             collectable.scan(text, &mut pending);
             note_numbers(text, &mut live);
         }
@@ -803,14 +870,27 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .get(&marker)
             .into_iter()
             .flat_map(|state| state.siblings.iter().chain(state.args.iter().flatten()));
+        // A map entry's key and value, and a node's map (`host_map_entry.rs`).
+        let entries = host.map_entries.held(&marker);
+        if let Some(map) = host.map_entries.map_of(&marker) {
+            collectable.scan(map, &mut found);
+        }
         for value in fields
             .chain(arrays)
             .chain(collections)
             .chain(iterators)
             .chain(enumerations)
             .chain(components)
+            .chain(entries)
         {
             if let Some(text) = value_text(value) {
+                mark_kotlin_lazy_states(
+                    heap,
+                    text,
+                    &mut reached_kotlin_lazy,
+                    &mut found,
+                    &collectable,
+                );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
             }
@@ -824,6 +904,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             let mut keyed = Vec::new();
             host.keyed_texts(&marker, &mut keyed);
             for text in &keyed {
+                mark_kotlin_lazy_states(
+                    heap,
+                    text,
+                    &mut reached_kotlin_lazy,
+                    &mut found,
+                    &collectable,
+                );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
             }
@@ -865,14 +952,21 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         keep(cached)
             && cache_owner(identity).is_none_or(|owner| keep(&owner) && !freed.holds_key(&owner))
     });
-    heap.fields.retain(|key, _| keep(field_receiver(key)));
+    heap.fields.retain(|key, _| {
+        if let Some(holder) = kotlin_lazy_field_handle(key) {
+            reached_kotlin_lazy.contains(holder)
+        } else {
+            keep(field_receiver(key))
+        }
+    });
     heap.arrays.retain(|key, _| keep(key));
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
-    host.mutable_collections.retain(|key, _| keep(key));
+    host.mutable_collections.retain_markers(|key| keep(key));
     host.iterators.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
+    host.map_entries.retain(keep);
     host.prune_keyed_tables(keep);
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
@@ -1010,10 +1104,14 @@ mod tests {
             "demo/Mod#MAPLjava/util/List;".into(),
             text("java/util/ArrayList#7"),
         );
-        host.mutable_collections.insert(
-            "java/util/ArrayList#7".into(),
-            vec![text("map-entry/rkey,rdemo/Node#1")],
+        let entry = host.mint_map_entry(
+            None,
+            &text("key"),
+            &text("demo/Node#1"),
+            crate::runtime::host_map_entry::EntryMade::Holder,
         );
+        host.mutable_collections
+            .insert("java/util/ArrayList#7".into(), vec![entry]);
         host.mutable_collections
             .insert("java/util/ArrayList#8".into(), vec![text("demo/Node#3")]);
         collect(&mut heap, &mut host, &[]);
@@ -1303,6 +1401,9 @@ mod tests {
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "constructed_items",
+            "constructed_blocks",
+            "block_items",
             "payload_registrations",
             "payload_bytes",
             "fabric_entrypoint_containers",
@@ -1315,6 +1416,9 @@ mod tests {
             "neoforge_bus",
             "holders",
             "holder_rows",
+            // Map entries: their keys join the collectable set, their key, value and map are
+            // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
+            "map_entries",
             "mutable_collections",
             "component_states",
             "unmodifiable_collections",
@@ -1371,6 +1475,7 @@ mod tests {
             "resource_marks",
             "classes",
             "linked_classes",
+            "game_block_classes",
             "service_providers",
             "current_time_millis",
             "mods",
