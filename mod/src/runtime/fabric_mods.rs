@@ -257,7 +257,7 @@ impl StdHost {
                 Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("getModId", "()Ljava/lang/String;") => Ok(text(mod_id)),
                     ("getKind", "()Lnet/fabricmc/loader/api/metadata/ModDependency$Kind;") => {
-                        Ok(enum_marker(MOD_DEPENDENCY_KIND, &kind))
+                        Ok(Value::Ref(Some(format!("enum/{MOD_DEPENDENCY_KIND}/{kind}"))))
                     }
                     _ => self.unknown_host_call(r),
                 })
