@@ -1,4 +1,15 @@
 //! Guava 33.6.0 ImmutableMap/HashBiMap parity fixture, compiled with Java 25.
+//!
+//! Oracle command: javac --release 25 -cp guava-33.6.0-jre.jar GuavaOracle.java
+//! followed by java -cp .:guava-33.6.0-jre.jar GuavaOracle.
+//!
+//! Oracle rows:
+//! copy=RegularImmutableMap|{a=1, b=2}|1|true|true
+//! copy-one=SingletonImmutableBiMap
+//! builder=java.lang.IllegalArgumentException:Multiple entries with same key: a=2 and a=1
+//! replace={a=3, b=2}|{3=a, 2=b}
+//! bimap={a=1, b=2}|[1, 2]|1|true|java.lang.IllegalArgumentException:value already present: 2|{a=1, c=2}|{1=a, 2=c}|true|{d=2}|[2]|{2=d}
+//! nulls=K=java.lang.NullPointerException:null key in entry: null=1|V=java.lang.NullPointerException:null value in entry: a=null
 
 use horizon_native_java::{NativeJar, Value};
 use std::{
@@ -44,6 +55,10 @@ public final class Probe {
     Map<String,Integer> m = new LinkedHashMap<>(); m.put("a",1); m.put("b",2);
     Map<String,Integer> x = ImmutableMap.copyOf(m);
     return x.getClass().getName()+"|"+x+"|"+x.get("a")+"|"+x.containsKey("b")+"|"+(ImmutableMap.copyOf(x)==x);
+  }
+  public static String copyOne() {
+    Map<String,Integer> m = new LinkedHashMap<>(); m.put("a",1);
+    return ImmutableMap.copyOf(m).getClass().getName();
   }
   public static String builderDuplicate() {
     try { ImmutableMap.builder().put("a",1).put("a",2).build(); return "ok"; }
@@ -167,6 +182,14 @@ fn immutable_copy_order_same_instance() {
         "com.google.common.collect.RegularImmutableMap|{a=1, b=2}|1|true|true"
     );
 }
+#[test]
+fn immutable_copy_one_entry_uses_the_real_guava_class() {
+    assert_eq!(
+        Fixture::new().text("copyOne"),
+        "com.google.common.collect.SingletonImmutableBiMap"
+    );
+}
+
 #[test]
 fn immutable_duplicate_and_null_messages() {
     let f = Fixture::new();

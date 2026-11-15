@@ -3003,6 +3003,18 @@ pub trait Host {
         None
     }
 
+    /// A fresh immutable collection made by a library factory whose owner
+    /// selects a concrete class (Guava immutable map copy, for example).
+    fn immutable_collection_from(
+        &mut self,
+        _owner: &str,
+        _name: &str,
+        _kind: &str,
+        _values: Vec<Value>,
+    ) -> Option<Value> {
+        None
+    }
+
     /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
     /// from `offset`) holding `values`: a fixed-size view that the runtime
     /// keeps in step with the array (`array_views.rs`), for a host that
@@ -5705,6 +5717,16 @@ impl Host for StdHost {
             _ => return None,
         };
         Some(self.unmodifiable_from(owner, "of", kind, values))
+    }
+
+    fn immutable_collection_from(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        Some(self.unmodifiable_from(owner, name, kind, values))
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -13542,6 +13564,12 @@ fn is_map_owner(owner: &str) -> bool {
                 | "java/util/concurrent/ConcurrentSkipListMap"
                 | "com/google/common/collect/ImmutableMap"
                 | "com/google/common/collect/ImmutableBiMap"
+                | "com/google/common/collect/RegularImmutableMap"
+                | "com/google/common/collect/SingletonImmutableMap"
+                | "com/google/common/collect/RegularImmutableBiMap"
+                | "com/google/common/collect/SingletonImmutableBiMap"
+                | "com/google/common/collect/HashBiMap"
+                | "com/google/common/collect/HashBiMap$Inverse"
                 | gson_tree::TREE_MAP
         )
 }

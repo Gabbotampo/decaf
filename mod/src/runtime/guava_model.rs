@@ -190,6 +190,25 @@ fn boxed_class(primitive: &str) -> Option<&'static str> {
     })
 }
 
+const BIMAP_INVERSE_FIELD: &str = "|guava#inverse";
+
+fn bimap_marker(value: &Value) -> Option<String> {
+    let marker = crate::runtime::expect_ref(value)?;
+    matches!(
+        crate::runtime::jar_object::collection_class(marker),
+        "com/google/common/collect/HashBiMap" | "com/google/common/collect/HashBiMap$Inverse"
+    )
+    .then(|| marker.clone())
+}
+
+fn bimap_method(name: &str, descriptor: &str) -> MethodRef {
+    MethodRef {
+        owner: "java/util/Map".into(),
+        name: name.into(),
+        descriptor: descriptor.into(),
+    }
+}
+
 impl<H: Host> Runtime<'_, H> {
     /// The Guava calls this module answers, or `None`.
     pub(super) fn invoke_guava(
@@ -198,6 +217,16 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if (r.owner == "com/google/common/collect/ImmutableMap"
+            || r.owner == "com/google/common/collect/ImmutableBiMap")
+            && r.name == "copyOf"
+            && r.descriptor.starts_with("(Ljava/util/Map;")
+        {
+            return self.guava_immutable_map_copy(r, args);
+        }
+        if receiver.and_then(bimap_marker).is_some() {
+            return self.invoke_bimap(r, receiver, args);
+        }
         if let Some(result) = sized_factory_class(r, args) {
             let class = result?;
             return Ok(self.host.empty_mutable_collection(class));
@@ -455,6 +484,36 @@ impl<H: Host> Runtime<'_, H> {
             "com/google/common/cache/LoadingCache" | "com/google/common/cache/Cache" => {
                 self.invoke_cache(r, receiver, args)
             }
+            "com/google/common/collect/HashBiMap"
+                if r.name == "create"
+                    && r.descriptor == "()Lcom/google/common/collect/HashBiMap;" =>
+            {
+                let map = self
+                    .host
+                    .empty_mutable_collection("com/google/common/collect/HashBiMap")
+                    .ok_or_else(|| NativeError::Metadata("HashBiMap host missing".into()))?;
+                let inverse = self
+                    .host
+                    .empty_mutable_collection("com/google/common/collect/HashBiMap$Inverse")
+                    .ok_or_else(|| {
+                        NativeError::Metadata("HashBiMap inverse host missing".into())
+                    })?;
+                let map_marker = crate::runtime::expect_ref(&map)
+                    .cloned()
+                    .ok_or_else(|| NativeError::Metadata("HashBiMap marker missing".into()))?;
+                let inverse_marker = crate::runtime::expect_ref(&inverse).cloned().ok_or_else(|| {
+                    NativeError::Metadata("HashBiMap inverse marker missing".into())
+                })?;
+                self.fields.insert(
+                    format!("{map_marker}{BIMAP_INVERSE_FIELD}"),
+                    inverse.clone(),
+                );
+                self.fields.insert(
+                    format!("{inverse_marker}{BIMAP_INVERSE_FIELD}"),
+                    map.clone(),
+                );
+                Ok(Some(map))
+            }
             "com/google/common/collect/HashMultimap"
             | "com/google/common/collect/LinkedHashMultimap"
             | "com/google/common/collect/ArrayListMultimap"
@@ -562,6 +621,364 @@ impl<H: Host> Runtime<'_, H> {
                     .empty_mutable_collection("java/util/Collections$SetFromMap"))
             }
             "com/google/common/collect/MapMaker" => self.invoke_map_maker(r, receiver, args),
+            _ => Ok(None),
+        }
+    }
+
+    fn guava_immutable_map_copy(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(source) = args.first() else {
+            return Ok(None);
+        };
+        if matches!(source, Value::Ref(None)) {
+            return Err(thrown("java/lang/NullPointerException", None));
+        }
+        if let Some(marker) = crate::runtime::expect_ref(source) {
+            let class = crate::runtime::jar_object::collection_class(marker);
+            let immutable_map = matches!(
+                class,
+                "com/google/common/collect/RegularImmutableMap"
+                    | "com/google/common/collect/SingletonImmutableMap"
+            );
+            let immutable_bimap = matches!(
+                class,
+                "com/google/common/collect/RegularImmutableBiMap"
+                    | "com/google/common/collect/SingletonImmutableBiMap"
+            );
+            if (r.owner.ends_with("ImmutableMap") && (immutable_map || immutable_bimap))
+                || (r.owner.ends_with("ImmutableBiMap") && immutable_bimap)
+            {
+                return Ok(Some(source.clone()));
+            }
+        }
+        let values = runtime_collection_values(&*self.host, source)?;
+        if !values.len().is_multiple_of(2) {
+            return Ok(None);
+        }
+        let mut prior = Vec::new();
+        for pair in values.chunks(2) {
+            if matches!(pair[0], Value::Ref(None)) {
+                return Err(thrown(
+                    "java/lang/NullPointerException",
+                    Some(format!(
+                        "null key in entry: null={}",
+                        crate::runtime::value_text(&pair[1])
+                    )),
+                ));
+            }
+            if matches!(pair[1], Value::Ref(None)) {
+                return Err(thrown(
+                    "java/lang/NullPointerException",
+                    Some(format!(
+                        "null value in entry: {}=null",
+                        crate::runtime::value_text(&pair[0])
+                    )),
+                ));
+            }
+            for old in prior.chunks(2) {
+                if self.java_equals(&pair[0], &old[0])? {
+                    return Err(thrown(
+                        "java/lang/IllegalArgumentException",
+                        Some(format!(
+                            "Multiple entries with same key: {}={} and {}={}",
+                            crate::runtime::value_text(&pair[0]),
+                            crate::runtime::value_text(&pair[1]),
+                            crate::runtime::value_text(&old[0]),
+                            crate::runtime::value_text(&old[1])
+                        )),
+                    ));
+                }
+            }
+            if r.owner.ends_with("ImmutableBiMap")
+                && prior
+                    .chunks(2)
+                    .any(|old| self.java_equals(&pair[1], &old[1]).unwrap_or(false))
+            {
+                return Err(thrown(
+                    "java/lang/IllegalArgumentException",
+                    Some(format!(
+                        "value already present: {}",
+                        crate::runtime::value_text(&pair[1])
+                    )),
+                ));
+            }
+            prior.extend_from_slice(pair);
+        }
+        let made = self
+            .host
+            .immutable_collection_from(r.owner.as_str(), "copyOf", "map", values)
+            .ok_or_else(|| NativeError::Metadata("Guava immutable map host missing".into()))?;
+        Ok(Some(made))
+    }
+
+    fn bimap_inverse(&self, marker: &str) -> Option<Value> {
+        self.fields
+            .get(&format!("{marker}{BIMAP_INVERSE_FIELD}"))
+            .cloned()
+    }
+
+    fn bimap_pairs(&self, map: &Value) -> Result<Vec<Value>, NativeError> {
+        runtime_collection_values(&*self.host, map)
+    }
+
+    fn bimap_find(
+        &mut self,
+        pairs: &[Value],
+        offset: usize,
+        wanted: &Value,
+    ) -> Result<Option<usize>, NativeError> {
+        for (index, pair) in pairs.chunks(2).enumerate() {
+            if let Some(candidate) = pair.get(offset)
+                && self.java_equals(candidate, wanted)?
+            {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn bimap_host_put(
+        &mut self,
+        map: &Value,
+        key: Value,
+        value: Value,
+    ) -> Result<Value, NativeError> {
+        let mut pairs = self.bimap_pairs(map)?;
+        let found = pairs
+            .chunks(2)
+            .position(|pair| self.java_equals(&pair[0], &key).unwrap_or(false));
+        let old = found.map(|index| pairs[index * 2 + 1].clone());
+        if let Some(index) = found {
+            pairs[index * 2 + 1] = value;
+        } else {
+            pairs.extend([key, value]);
+        }
+        self.host.replace_mutable_collection(map, pairs);
+        Ok(old.unwrap_or(Value::Ref(None)))
+    }
+
+    fn bimap_host_replace_key(
+        &mut self,
+        map: &Value,
+        old_key: &Value,
+        new_key: Value,
+    ) -> Result<(), NativeError> {
+        let mut pairs = self.bimap_pairs(map)?;
+        if let Some(index) = self.bimap_find(&pairs, 0, old_key)? {
+            pairs[index * 2] = new_key;
+            self.host.replace_mutable_collection(map, pairs);
+        }
+        Ok(())
+    }
+
+    fn bimap_host_remove(&mut self, map: &Value, key: &Value) -> Result<Value, NativeError> {
+        let mut pairs = self.bimap_pairs(map)?;
+        let Some(index) = pairs
+            .chunks(2)
+            .position(|pair| self.java_equals(&pair[0], key).unwrap_or(false))
+        else {
+            return Ok(Value::Ref(None));
+        };
+        let old = pairs[index * 2 + 1].clone();
+        pairs.drain(index * 2..index * 2 + 2);
+        self.host.replace_mutable_collection(map, pairs);
+        Ok(old)
+    }
+
+    fn bimap_host_clear(&mut self, map: &Value) -> Result<(), NativeError> {
+        self.host.replace_mutable_collection(map, Vec::new());
+        Ok(())
+    }
+
+    fn invoke_bimap(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(marker) = bimap_marker(receiver) else {
+            return Ok(None);
+        };
+        let inverse = crate::runtime::jar_object::collection_class(&marker)
+            == "com/google/common/collect/HashBiMap$Inverse";
+        let Some(other) = self.bimap_inverse(&marker) else {
+            return Ok(None);
+        };
+        if r.name == "inverse" && r.descriptor.ends_with("Lcom/google/common/collect/BiMap;") {
+            return Ok(Some(other));
+        }
+        let root = if inverse {
+            other.clone()
+        } else {
+            receiver.clone()
+        };
+        let partner = if inverse {
+            receiver.clone()
+        } else {
+            other.clone()
+        };
+        if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
+            return Ok(Some(self.host.invoke_instance(
+                &bimap_method("toString", "()Ljava/lang/String;"),
+                receiver,
+                &[],
+            )?));
+        }
+        let reverse = |key: &Value, value: &Value| {
+            if inverse {
+                (value.clone(), key.clone())
+            } else {
+                (key.clone(), value.clone())
+            }
+        };
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;")
+            | ("forcePut", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;") => {
+                let key = args.first().cloned().unwrap_or(Value::Ref(None));
+                let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                if matches!(key, Value::Ref(None)) || matches!(value, Value::Ref(None)) {
+                    return Err(thrown("java/lang/NullPointerException", None));
+                }
+                let pairs = self.bimap_pairs(&root)?;
+                if !pairs.len().is_multiple_of(2) {
+                    return Err(NativeError::Metadata("HashBiMap has odd entries".into()));
+                }
+                let key_index = self.bimap_find(&pairs, usize::from(inverse), &key)?;
+                let value_index = self.bimap_find(&pairs, usize::from(!inverse), &value)?;
+                let (root_key, root_value) = reverse(&key, &value);
+                if let Some(value_index) = value_index
+                    && Some(value_index) != key_index
+                    && r.name == "put"
+                {
+                    return Err(thrown(
+                        "java/lang/IllegalArgumentException",
+                        Some(format!(
+                            "value already present: {}",
+                            crate::runtime::value_text(&value)
+                        )),
+                    ));
+                }
+                let old = key_index.map(|index| {
+                    if inverse {
+                        pairs[index * 2].clone()
+                    } else {
+                        pairs[index * 2 + 1].clone()
+                    }
+                });
+                if inverse && let Some(index) = key_index {
+                    let existing_key = pairs[index * 2].clone();
+                    self.bimap_host_replace_key(&root, &existing_key, root_key.clone())?;
+                } else if let Some(index) = key_index {
+                    let existing_value = pairs[index * 2 + 1].clone();
+                    self.bimap_host_replace_key(&partner, &existing_value, value.clone())?;
+                }
+                if r.name == "forcePut"
+                    && let Some(index) = value_index
+                    && Some(index) != key_index
+                {
+                    let old_key = pairs[index * 2].clone();
+                    let old_value = pairs[index * 2 + 1].clone();
+                    self.bimap_host_remove(&root, &old_key)?;
+                    self.bimap_host_remove(&partner, &old_value)?;
+                }
+                self.bimap_host_put(&root, root_key, root_value)?;
+                let (partner_key, partner_value) =
+                    if inverse { (key, value) } else { (value, key) };
+                self.bimap_host_put(&partner, partner_key, partner_value)?;
+                Ok(Some(old.unwrap_or(Value::Ref(None))))
+            }
+            ("get", "(Ljava/lang/Object;)Ljava/lang/Object;")
+            | ("containsKey", "(Ljava/lang/Object;)Z")
+            | ("containsValue", "(Ljava/lang/Object;)Z") => {
+                let wanted = args.first().cloned().unwrap_or(Value::Ref(None));
+                let pairs = self.bimap_pairs(&root)?;
+                let offset = if r.name == "containsValue" {
+                    usize::from(!inverse)
+                } else {
+                    usize::from(inverse)
+                };
+                let found = self.bimap_find(&pairs, offset, &wanted)?;
+                if r.name == "get" {
+                    Ok(Some(found.map_or(Value::Ref(None), |index| {
+                        if inverse {
+                            pairs[index * 2].clone()
+                        } else {
+                            pairs[index * 2 + 1].clone()
+                        }
+                    })))
+                } else {
+                    Ok(Some(Value::Int(i32::from(found.is_some()))))
+                }
+            }
+            ("remove", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+                let wanted = args.first().cloned().unwrap_or(Value::Ref(None));
+                let pairs = self.bimap_pairs(&root)?;
+                let index = self.bimap_find(&pairs, usize::from(inverse), &wanted)?;
+                let Some(index) = index else {
+                    return Ok(Some(Value::Ref(None)));
+                };
+                let old_key = pairs[index * 2].clone();
+                let old_value = pairs[index * 2 + 1].clone();
+                self.bimap_host_remove(&root, &old_key)?;
+                let partner_key = old_value.clone();
+                self.bimap_host_remove(&partner, &partner_key)?;
+                Ok(Some(if inverse { old_key } else { old_value }))
+            }
+            ("clear", "()V") => {
+                self.bimap_host_clear(&root)?;
+                self.bimap_host_clear(&partner)?;
+                Ok(Some(Value::Void))
+            }
+            ("size", "()I") => Ok(Some(Value::Int(
+                (self.bimap_pairs(&root)?.len() / 2) as i32,
+            ))),
+            ("isEmpty", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.bimap_pairs(&root)?.is_empty(),
+            )))),
+            ("values", "()Ljava/util/Collection;") => {
+                let pairs = self.bimap_pairs(&root)?;
+                let values = pairs
+                    .chunks(2)
+                    .map(|pair| {
+                        if inverse {
+                            pair[0].clone()
+                        } else {
+                            pair[1].clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let _ = values;
+                Ok(Some(self.host.invoke_instance(
+                    &bimap_method("values", "()Ljava/util/Collection;"),
+                    receiver,
+                    &[],
+                )?))
+            }
+            ("keySet", "()Ljava/util/Set;") => {
+                let pairs = self.bimap_pairs(&root)?;
+                let keys = pairs
+                    .chunks(2)
+                    .map(|pair| {
+                        if inverse {
+                            pair[1].clone()
+                        } else {
+                            pair[0].clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let _ = keys;
+                Ok(Some(self.host.invoke_instance(
+                    &bimap_method("keySet", "()Ljava/util/Set;"),
+                    receiver,
+                    &[],
+                )?))
+            }
             _ => Ok(None),
         }
     }
