@@ -447,6 +447,7 @@ pub enum HostKind {
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
+    /// A bounded DataFixerUpper construction node retaining nested codecs and callbacks.
     DfuCodec,
     /// A `java.lang.reflect.Type` that is no class (`ParameterizedType`,
     /// `TypeVariable`, `WildcardType`, `GenericArrayType`): key the node
