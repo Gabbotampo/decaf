@@ -309,17 +309,9 @@ impl StdHost {
                 let id = loader::metadata_id(receiver)?;
                 if let Some(document) = self.fabric_document(&id).map(std::borrow::Cow::into_owned)
                 {
-                    let v1 = document
-                        .get("schemaVersion")
-                        .and_then(serde_json::Value::as_i64)
-                        == Some(1);
-                    Some(if v1 {
-                        self.jar_metadata(r, receiver, &id, &document, args)
-                    } else {
-                        self.unknown_host_call(r)
-                    })
+                    Some(self.jar_metadata(r, receiver, &id, &document, args))
                 } else if Self::builtin_fabric_mod(&id) {
-                    Some(self.unknown_host_call(r))
+                    Some(self.builtin_metadata(r, &id))
                 } else {
                     None
                 }
@@ -446,7 +438,17 @@ impl StdHost {
                 _ => Vec::new(),
             }
         };
-        // The caller admits only LoaderModMetadata V1 (schemaVersion == 1).
+        let schema = field("schemaVersion")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if schema != 1
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("getAuthors" | "getContributors" | "getLicense" | "getProvides" | "getDependencies", "()Ljava/util/Collection;")
+            )
+        {
+            return self.unknown_host_call(r);
+        }
         let dependencies = || -> Vec<Value> {
             [
                 ("depends", "DEPENDS"),
@@ -529,16 +531,12 @@ impl StdHost {
                     ))
                 }
             }
-            ("getProvides", "()Ljava/util/Collection;") => {
-                {
-                    Ok(self.cached_unmodifiable_collection(
-                        receiver,
-                        "getProvides",
-                        "java/util/Collections$UnmodifiableCollection",
-                        strings("provides"),
-                    ))
-                }
-            }
+            ("getProvides", "()Ljava/util/Collection;") => Ok(self.cached_unmodifiable_collection(
+                receiver,
+                "getProvides",
+                "java/util/Collections$UnmodifiableCollection",
+                strings("provides"),
+            )),
             ("getDependencies", "()Ljava/util/Collection;") => Ok(self
                 .cached_unmodifiable_collection(
                     receiver,
@@ -578,6 +576,65 @@ impl StdHost {
     /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
     /// `Minecraft` and its version the game version a caller seeded (counted
     /// without one).
+    fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
+        if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
+            return Ok(text(id));
+        }
+        if !matches!(id, "java" | "minecraft") {
+            return self.unknown_host_call(r);
+        }
+        let answer = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getType", "()Ljava/lang/String;") => Some(text("builtin")),
+            ("getVersion", "()Lnet/fabricmc/loader/api/Version;") => {
+                if id == "java" {
+                    Some(text(JAVA_SPECIFICATION_VERSION))
+                } else {
+                    self.game_version.clone().map(text)
+                }
+            }
+            ("getName", "()Ljava/lang/String;") if id == "minecraft" => Some(text("Minecraft")),
+            ("getDescription", "()Ljava/lang/String;") => Some(text("")),
+            ("getEnvironment", "()Lnet/fabricmc/loader/api/metadata/ModEnvironment;") => {
+                Some(enum_marker(MOD_ENVIRONMENT, "UNIVERSAL"))
+            }
+            ("getProvides", "()Ljava/util/Collection;") => Some(self.unmodifiable_from(
+                "java/util/Collections",
+                "emptyList",
+                "list",
+                Vec::new(),
+            )),
+            ("getAuthors" | "getContributors" | "getLicense", "()Ljava/util/Collection;") => {
+                Some(self.cached_unmodifiable_collection(
+                    &loader::metadata(id),
+                    r.name.as_str(),
+                    "java/util/Collections$UnmodifiableCollection",
+                    Vec::new(),
+                ))
+            }
+            ("getDependencies", "()Ljava/util/Collection;") => {
+                Some(self.cached_unmodifiable_collection(
+                    &loader::metadata(id),
+                    "getDependencies",
+                    "java/util/Collections$UnmodifiableCollection",
+                    Vec::new(),
+                ))
+            }
+            ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
+                Some(loader::empty_contact())
+            }
+            ("containsCustomValue", "(Ljava/lang/String;)Z") => Some(Value::Int(0)),
+            (
+                "getCustomValue",
+                "(Ljava/lang/String;)Lnet/fabricmc/loader/api/metadata/CustomValue;",
+            ) => Some(Value::Ref(None)),
+            _ => None,
+        };
+        match answer {
+            Some(value) => Ok(value),
+            None => self.unknown_host_call(r),
+        }
+    }
+
     fn custom_value_call(
         &mut self,
         r: &MethodRef,
