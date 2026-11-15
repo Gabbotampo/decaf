@@ -14,7 +14,7 @@ pub(crate) fn static_call(_host: &mut StdHost, r: &MethodRef) -> Option<Value> {
         (MOD_LOADING_CONTEXT, "get", "()Lnet/neoforged/fml/ModLoadingContext;") => {
             Some(host_service::loader_singleton(MOD_LOADING_CONTEXT))
         }
-        ("net/neoforged/fml/loading/DatagenModLoader", "isRunningDataGen", "()Z") => {
+        ("net/neoforged/neoforge/data/loading/DatagenModLoader", "isRunningDataGen", "()Z") => {
             Some(Value::Int(0))
         }
         (FML_LOADER, "isProduction", "()Z") => Some(Value::Int(1)),

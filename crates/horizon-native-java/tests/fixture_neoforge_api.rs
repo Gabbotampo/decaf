@@ -34,8 +34,8 @@ const STUBS: &[(&str, &str)] = &[
         "package net.neoforged.fml.loading; public class FMLLoader { public static boolean isProduction(){return false;} public static java.nio.file.Path getGameDir(){return null;} }",
     ),
     (
-        "net/neoforged/fml/loading/DatagenModLoader.java",
-        "package net.neoforged.fml.loading; public class DatagenModLoader { public static boolean isRunningDataGen(){return true;} }",
+        "net/neoforged/neoforge/data/loading/DatagenModLoader.java",
+        "package net.neoforged.neoforge.data.loading; public class DatagenModLoader { public static boolean isRunningDataGen(){return true;} }",
     ),
     (
         "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent.java",
@@ -52,7 +52,7 @@ const PROBE: &str = r#"package demo;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.ModLoadingContext;
 import net.neoforged.fml.common.Mod;
-import net.neoforged.fml.loading.DatagenModLoader;
+import net.neoforged.neoforge.data.loading.DatagenModLoader;
 import net.neoforged.fml.loading.FMLLoader;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
