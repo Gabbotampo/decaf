@@ -4,6 +4,7 @@
     unmodelled_calls.py [--corpus name=DIR]... [--probe PATH] [--json OUT]
                         [--game-version 26.3] [--limit N] [--jobs N]
                         [--dependency-mode both|alone|closure]
+                        [--game-block-classes PATH]
 
 Runs the probe once per jar alone and once with the jar's declared dependency
 closure (unless `--dependency-mode` selects one), resolved against the other
@@ -280,8 +281,10 @@ def row_verdict(result: dict) -> str:
 
 
 def probe_one(probe: Path, jar: Path, kind: str, deps: list[Path],
-              game_version: str) -> dict:
+              game_version: str, game_block_classes: Path | None) -> dict:
     command = [str(probe), "--json", "--game-version", game_version]
+    if game_block_classes is not None:
+        command += ["--game-block-classes", str(game_block_classes)]
     for dep in deps:
         command += ["--link", str(dep)]
     command += [str(jar), kind]
@@ -406,6 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
                         default="both", help="run alone, closure, or both (default: both)")
     parser.add_argument("--provider-dir", type=Path, action="append", default=[],
                         help="providers-only directory for closure dependencies; rows are never scanned")
+    parser.add_argument("--game-block-classes", type=Path,
+                        help="exact vanilla block closure JSON generated from the player's 26.3 install")
     parser.add_argument("--allow-missing-fabric-oracle", action="store_true",
                         help="run closure mode even without the Fabric Loader oracle; every Fabric "
                              "closure row is then refused (only for tests and partial machines)")
@@ -518,7 +523,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"status": "refused", "stage": "dependency",
                           "error": missing_reason(missing, requirements)}
             else:
-                result = probe_one(probe, jar, kind, deps, args.game_version)
+                result = probe_one(
+                    probe, jar, kind, deps, args.game_version,
+                    args.game_block_classes.resolve() if args.game_block_classes else None,
+                )
             return result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:

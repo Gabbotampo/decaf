@@ -59,6 +59,7 @@ mod file_attributes;
 mod files_copy;
 mod files_move;
 mod frame_bound;
+mod game_block_classes;
 mod game_codecs;
 mod game_hooks;
 mod game_object;
@@ -3932,6 +3933,19 @@ impl StdHost {
     pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
         self.game_block_classes = classes;
         self
+    }
+
+    /// Seed the closure generated from the player's prepared 26.3 resources.
+    /// The file is external data from that installation and is validated to
+    /// contain internal names before any `instanceof` answer can use it.
+    pub fn with_game_block_classes_file(self, path: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(self.with_game_block_classes(game_block_classes::from_file(path.as_ref())?))
+    }
+
+    /// Seed from a prepared 26.3 resource root.  The game host and the census
+    /// runner use the same prepared-data contract.
+    pub fn with_prepared_game_block_classes(self, root: impl AsRef<Path>) -> Result<Self, String> {
+        Ok(self.with_game_block_classes(game_block_classes::from_prepared(root.as_ref())?))
     }
 
     /// ItemLike.asItem() as vanilla answers it, for objects whose game
@@ -18080,6 +18094,18 @@ impl NativeJar {
             }
         }
         host
+    }
+
+    /// Seed a game host from the same prepared 26.3 resource root used by the
+    /// Horizon game. This keeps the game and census paths on one exact table;
+    /// callers that do not have prepared resources retain the counted default.
+    pub fn seed_host_from_prepared(
+        &self,
+        host: StdHost,
+        root: impl AsRef<Path>,
+    ) -> Result<StdHost, String> {
+        let host = host.with_prepared_game_block_classes(root)?;
+        Ok(self.seed_host(host))
     }
 
     /// Return the resource paths discovered in the jar in deterministic order.
