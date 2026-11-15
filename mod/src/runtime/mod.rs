@@ -2873,6 +2873,37 @@ pub trait Host {
         Ok(())
     }
 
+    /// The per-jar virtual file namespace. A resident host owns these tables
+    /// so one callback can read and stat a file written by an earlier callback.
+    /// The default host has no persistent namespace.
+    fn persistent_io_state(
+        &self,
+    ) -> (
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeSet<String>,
+    ) {
+        (
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        )
+    }
+
+    /// Store the virtual namespace after a callback. The host rejects no
+    /// ordinary path state; callers can count a future bounded-host refusal.
+    fn store_persistent_io_state(
+        &mut self,
+        _paths: BTreeMap<String, String>,
+        _files: BTreeMap<String, String>,
+        _file_bytes: BTreeMap<String, Vec<u8>>,
+        _dirs: BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        Ok(())
+    }
+
     /// Take the objects earlier invocations of this jar left (`heap.rs`), so a
     /// callback reaches the instance state its entrypoint built. `None`: the
     /// host keeps no resident jar instance and every invocation starts empty.
@@ -3122,6 +3153,10 @@ const MAX_SEEDED_SERVICE_PROVIDERS: usize = 256;
 /// in place of the call's result (`Runtime::persist_class_state`).
 const MAX_PERSISTENT_CLASS_FIELDS: usize = 1 << 20;
 const MAX_PERSISTENT_INITIALIZED_CLASSES: usize = 1 << 20;
+/// Persistent virtual files are bounded per jar so a mod cannot retain an
+/// unbounded directory or byte payload across callbacks.
+const MAX_PERSISTENT_IO_ENTRIES: usize = 4096;
+const MAX_PERSISTENT_IO_BYTES: usize = 16 * 1024 * 1024;
 
 /// Deterministic, game-independent mappings for the small standard-library
 /// surface commonly reached during mod bootstrap.
@@ -3192,6 +3227,12 @@ pub struct StdHost {
     /// Text the jar wrote to `System.out`, kept for callers that show it (the game's mod). The
     /// interpreter's own `io_writers` sink lives for one invocation; this one outlives them.
     console_out: String,
+    /// Per-jar virtual file state. These tables belong to the host rather than
+    /// a single Runtime, so callbacks in one jar run share their namespace.
+    io_paths: BTreeMap<String, String>,
+    io_files: BTreeMap<String, String>,
+    io_file_bytes: BTreeMap<String, Vec<u8>>,
+    io_dirs: BTreeSet<String>,
     registrations: Vec<RegistryEntry>,
     /// Registry keys (`registry/id`) whose declaration was inferred from the
     /// builder calls a registration's value carries. An explicit adapter may
@@ -3459,6 +3500,10 @@ impl StdHost {
             invocations: Vec::new(),
             posted_events: Vec::new(),
             console_out: String::new(),
+            io_paths: BTreeMap::new(),
+            io_files: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
+            io_dirs: BTreeSet::new(),
             registrations: Vec::new(),
             inferred_declarations: BTreeSet::new(),
             content_builders: Default::default(),
@@ -4405,7 +4450,6 @@ impl StdHost {
             ("stringPropertyNames", "()Ljava/util/Set;")
             | ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
-            | ("entrySet", "()Ljava/util/Set;")
             | ("keySet", "()Ljava/util/Set;")
             | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
             // JDK 25's `store` writes a `#` line with `new Date().toString()`
@@ -9269,8 +9313,10 @@ impl Host for StdHost {
             ("java/nio/file/Path", "isAbsolute", "()Z") => {
                 Ok(Value::Int(i32::from(path_text(receiver).starts_with('/'))))
             }
-            ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;")
-            | ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
+            ("java/nio/file/Path", "toAbsolutePath", "()Ljava/nio/file/Path;") => Ok(path_value(
+                &host_path::sandbox_absolute(path_text(receiver)),
+            )),
+            ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
                 Ok(path_value(path_text(receiver)))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
@@ -11272,6 +11318,46 @@ impl Host for StdHost {
         }
         self.persistent_static_fields = fields;
         self.persistent_initialized_classes = initialized;
+        Ok(())
+    }
+
+    fn persistent_io_state(
+        &self,
+    ) -> (
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeSet<String>,
+    ) {
+        (
+            self.io_paths.clone(),
+            self.io_files.clone(),
+            self.io_file_bytes.clone(),
+            self.io_dirs.clone(),
+        )
+    }
+
+    fn store_persistent_io_state(
+        &mut self,
+        paths: BTreeMap<String, String>,
+        files: BTreeMap<String, String>,
+        file_bytes: BTreeMap<String, Vec<u8>>,
+        dirs: BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        let entries = files.len()
+            + dirs
+                .iter()
+                .filter(|path| !files.contains_key(*path))
+                .count();
+        let bytes = files.values().map(String::len).sum::<usize>()
+            + file_bytes.values().map(Vec::len).sum::<usize>();
+        if entries > MAX_PERSISTENT_IO_ENTRIES || bytes > MAX_PERSISTENT_IO_BYTES {
+            return Err(Runtime::<Self>::io_capacity_error(entries, bytes));
+        }
+        self.io_paths = paths;
+        self.io_files = files;
+        self.io_file_bytes = file_bytes;
+        self.io_dirs = dirs;
         Ok(())
     }
 
@@ -18439,6 +18525,7 @@ impl NativeJar {
         self.prepare_config_plugins_for_entrypoint(kind, host);
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
             mixin_index: std::cell::OnceCell::new(),
@@ -18459,9 +18546,11 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
-            io_paths: BTreeMap::new(),
-            io_files: BTreeMap::new(),
-            io_dirs: BTreeSet::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
             watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
@@ -18582,6 +18671,7 @@ impl NativeJar {
             Ok(())
         })();
         let persistence = runtime.persist_class_state();
+        let io_persistence = runtime.persist_io_state();
         let heap = if resident {
             runtime.persist_resident_heap()
         } else {
@@ -18589,6 +18679,7 @@ impl NativeJar {
         };
         result?;
         persistence?;
+        io_persistence?;
         heap?;
         Ok(ExecutionReport {
             class: class.to_owned(),
@@ -18645,6 +18736,7 @@ impl NativeJar {
         budget: &ExecutionBudget,
     ) -> Result<Value, NativeError> {
         let (static_fields, initialized_classes) = host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
         let mut runtime = Runtime {
             classes: &self.classes,
@@ -18666,9 +18758,11 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
-            io_paths: BTreeMap::new(),
-            io_files: BTreeMap::new(),
-            io_dirs: BTreeSet::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
             watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
@@ -18698,11 +18792,13 @@ impl NativeJar {
         );
         // A failed run keeps what it wrote before failing, as a JVM would.
         let persistence = runtime.persist_class_state();
+        let io_persistence = runtime.persist_io_state();
         if resident {
             crossing.extend(result.as_ref().ok().cloned());
             runtime.persist_resident_heap_crossing(&crossing)?;
         }
         persistence?;
+        io_persistence?;
         result
     }
 
@@ -18809,6 +18905,7 @@ impl NativeJar {
         // listener do (`invoke_persistent`), so what one callback writes the
         // next sees, and `<clinit>` runs once.
         let (static_fields, initialized_classes) = host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut runtime = Runtime {
             classes: &self.classes,
             mixin_index: std::cell::OnceCell::new(),
@@ -18829,9 +18926,11 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
-            io_paths: BTreeMap::new(),
-            io_files: BTreeMap::new(),
-            io_dirs: BTreeSet::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
             watch: watch_service::WatchState::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
@@ -18857,6 +18956,7 @@ impl NativeJar {
         let result = runtime.invoke(&class_name, method, descriptor, receiver, args);
         // A failed run keeps what it wrote before failing, as a JVM would.
         let persistence = runtime.persist_class_state();
+        let io_persistence = runtime.persist_io_state();
         if resident {
             runtime.callback_infos.hold(result.as_ref().ok());
             // Each table's whole `Debug` text, scanned for markers like the
@@ -18884,6 +18984,7 @@ impl NativeJar {
             runtime.persist_resident_heap_with(roots)?;
         }
         persistence?;
+        io_persistence?;
         result
     }
 
@@ -21120,6 +21221,12 @@ struct Runtime<'a, H> {
     /// `OutputStreamWriter`) opens the same sink as the writer it wraps, so the
     /// text is committed once and a later close cannot truncate it.
     io_writers: BTreeMap<String, String>,
+    /// Charset selected by each writer sink; UTF-8 is Java 25's default.
+    io_writer_charsets: BTreeMap<String, String>,
+    /// Charset-independent bytes committed for each virtual file. Text is
+    /// retained separately for the reader model; File.length() uses these
+    /// bytes, as the JDK does.
+    io_file_bytes: BTreeMap<String, Vec<u8>>,
     /// The virtual file each `java.io.File`, stream, reader or writer marker
     /// names, keyed by the marker.
     io_paths: BTreeMap<String, String>,
@@ -21304,6 +21411,18 @@ impl<H: Host> Runtime<'_, H> {
             })?;
         }
         Ok(())
+    }
+
+    /// Commit the callback's virtual file namespace to its host. The host
+    /// carries it across callbacks for this jar, while a fresh host starts
+    /// empty just like a fresh filesystem sandbox.
+    fn persist_io_state(&mut self) -> Result<(), NativeError> {
+        self.host.store_persistent_io_state(
+            self.io_paths.clone(),
+            self.io_files.clone(),
+            self.io_file_bytes.clone(),
+            self.io_dirs.clone(),
+        )
     }
 
     /// Open one `CallbackInfo` object for a host hook callback.
@@ -24233,15 +24352,95 @@ impl<H: Host> Runtime<'_, H> {
     /// A `File`/`FileInputStream`/`FileWriter` marker resolves through
     /// [`Runtime::io_paths`]; a `Path` is its handle's text; anything else is
     /// a plain string path.
+    pub(crate) fn io_store_file(&mut self, path: String, text: String) -> Result<(), NativeError> {
+        self.io_store_encoded_file(path, text, "UTF-8")
+    }
+
+    pub(crate) fn io_store_encoded_file(
+        &mut self,
+        path: String,
+        text: String,
+        charset: &str,
+    ) -> Result<(), NativeError> {
+        let bytes = Self::encode_io_text(&text, charset).unwrap_or_else(|| {
+            let _ = self.host.unknown_operand_call(&MethodRef {
+                owner: "java/nio/file/Files".into(),
+                name: "writeString".into(),
+                descriptor: "(Ljava/nio/file/Path;Ljava/lang/CharSequence;)Ljava/nio/file/Path;"
+                    .into(),
+            });
+            text.as_bytes().to_vec()
+        });
+        self.ensure_io_capacity(&path, text.len() + bytes.len())?;
+        self.io_file_bytes.insert(path.clone(), bytes);
+        self.io_files.insert(path, text);
+        Ok(())
+    }
+
+    pub(crate) fn io_store_file_with_charset_args(
+        &mut self,
+        path: String,
+        text: String,
+        args: &[Value],
+    ) -> Result<(), NativeError> {
+        let charset = args
+            .iter()
+            .rev()
+            .find_map(|value| expect_ref(value).and_then(|text| text.strip_prefix("charset/")));
+        self.io_store_encoded_file(path, text, charset.unwrap_or("UTF-8"))
+    }
+
+    pub(crate) fn io_store_bytes(
+        &mut self,
+        path: String,
+        bytes: Vec<u8>,
+    ) -> Result<(), NativeError> {
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        self.ensure_io_capacity(&path, text.len() + bytes.len())?;
+        self.io_file_bytes.insert(path.clone(), bytes);
+        self.io_files.insert(path, text);
+        Ok(())
+    }
+
+    fn io_entries(&self) -> usize {
+        self.io_files.len()
+            + self
+                .io_dirs
+                .iter()
+                .filter(|path| !self.io_files.contains_key(*path))
+                .count()
+    }
+
+    fn io_bytes(&self) -> usize {
+        self.io_files.values().map(String::len).sum::<usize>()
+            + self.io_file_bytes.values().map(Vec::len).sum::<usize>()
+            + self.io_writers.values().map(String::len).sum::<usize>()
+    }
+
+    fn io_capacity_error(entries: usize, bytes: usize) -> NativeError {
+        NativeError::Metadata(format!(
+            "persistent virtual file state exceeds bounds: entries={entries} (max {MAX_PERSISTENT_IO_ENTRIES}), bytes={bytes} (max {MAX_PERSISTENT_IO_BYTES})"
+        ))
+    }
+
+    fn ensure_io_capacity(&self, path: &str, added_bytes: usize) -> Result<(), NativeError> {
+        let entries = self.io_entries() + usize::from(!self.io_files.contains_key(path));
+        let bytes = self.io_bytes().saturating_add(added_bytes);
+        if entries > MAX_PERSISTENT_IO_ENTRIES || bytes > MAX_PERSISTENT_IO_BYTES {
+            return Err(Self::io_capacity_error(entries, bytes));
+        }
+        Ok(())
+    }
+
     fn io_path_of(&self, value: &Value) -> Option<String> {
         if let Some(path) = host_path::path_key(value) {
-            return Some(path.to_owned());
+            return Some(host_path::sandbox_canonical(path));
         }
         let text = expect_ref(value)?;
         if let Some(path) = self.io_paths.get(text) {
-            return Some(path.clone());
+            return Some(host_path::sandbox_canonical(path));
         }
-        Some(text.to_owned())
+        Some(host_path::sandbox_canonical(text))
     }
 
     /// The path of a `java.io.File` object, as `UnixFileSystem.normalize`
@@ -24272,33 +24471,89 @@ impl<H: Host> Runtime<'_, H> {
     /// stream that names no file. `truncate` is what Java does when the
     /// constructor opens the file itself; a wrapper keeps the bytes written so
     /// far.
-    fn io_open_writer(&mut self, marker: &str, path: Option<String>, truncate: bool) {
+    fn io_set_writer_charset(&mut self, marker: &str, args: &[Value]) {
+        let Some(charset) = args.iter().rev().find_map(|value| {
+            expect_ref(value)
+                .and_then(|text| text.strip_prefix("charset/"))
+                .map(str::to_owned)
+        }) else {
+            return;
+        };
+        if let Some(key) = self.io_sink_key(marker) {
+            self.io_writer_charsets.insert(key, charset);
+        }
+    }
+
+    fn encode_io_text(text: &str, charset: &str) -> Option<Vec<u8>> {
+        match charset {
+            "UTF-8" => Some(text.as_bytes().to_vec()),
+            "US-ASCII" => text.is_ascii().then(|| text.as_bytes().to_vec()),
+            "ISO-8859-1" => text.chars().map(|c| u8::try_from(c as u32).ok()).collect(),
+            "UTF-16BE" => Some(text.encode_utf16().flat_map(u16::to_be_bytes).collect()),
+            "UTF-16LE" => Some(text.encode_utf16().flat_map(u16::to_le_bytes).collect()),
+            "UTF-16" => {
+                let mut bytes = vec![0xfe, 0xff];
+                bytes.extend(text.encode_utf16().flat_map(u16::to_be_bytes));
+                Some(bytes)
+            }
+            _ => None,
+        }
+    }
+
+    fn io_open_writer(
+        &mut self,
+        marker: &str,
+        path: Option<String>,
+        truncate: bool,
+    ) -> Result<(), NativeError> {
         let key = match path {
             Some(path) => {
                 self.io_paths.insert(marker.to_owned(), path.clone());
+                if truncate {
+                    self.ensure_io_capacity(&path, 0)?;
+                    // Java creates/truncates the file at open time, so notify
+                    // the watch service before the virtual table records it.
+                    // Otherwise a new writer is misclassified as MODIFY.
+                    self.watch_writer_opened(&path, true);
+                    self.io_files.insert(path.clone(), String::new());
+                    self.io_file_bytes.insert(path.clone(), Vec::new());
+                    self.io_dirs.remove(&path);
+                }
                 format!("file:{path}")
             }
             None => format!("mem:{marker}"),
         };
         if truncate {
             self.io_writers.insert(key.clone(), String::new());
+        } else if let Some(path) = key.strip_prefix("file:") {
+            let initial = self.io_files.get(path).cloned().unwrap_or_default();
+            self.io_writers.entry(key.clone()).or_insert(initial);
         } else {
             self.io_writers.entry(key.clone()).or_default();
         }
-        if let Some(path) = key.strip_prefix("file:") {
-            self.watch_writer_opened(path, truncate);
+        self.io_writer_charsets
+            .entry(key.clone())
+            .or_insert_with(|| "UTF-8".into());
+        if !truncate && let Some(path) = key.strip_prefix("file:") {
+            self.watch_writer_opened(path, false);
         }
+        Ok(())
     }
 
     /// Append text to a modelled writer's sink.
-    fn io_write(&mut self, marker: &str, text: &str) {
+    fn io_write(&mut self, marker: &str, text: &str) -> Result<(), NativeError> {
         let Some(key) = self.io_sink_key(marker) else {
-            return;
+            return Ok(());
         };
+        if key.starts_with("file:") {
+            let path = key.strip_prefix("file:").unwrap_or_default();
+            self.ensure_io_capacity(path, text.len())?;
+        }
         if key == "mem:system-out" {
             self.host.write_console(text);
         }
         self.io_writers.entry(key).or_default().push_str(text);
+        Ok(())
     }
 
     /// Copy a writer's sink into the virtual file it names. A close or flush
@@ -24308,7 +24563,22 @@ impl<H: Host> Runtime<'_, H> {
             return;
         };
         if let Some(text) = self.io_writers.get(&format!("file:{path}")).cloned() {
-            self.watch_writer_committed(&path, text.len());
+            let key = format!("file:{path}");
+            let charset = self
+                .io_writer_charsets
+                .get(&key)
+                .map(String::as_str)
+                .unwrap_or("UTF-8");
+            let bytes = Self::encode_io_text(&text, charset).unwrap_or_else(|| {
+                let _ = self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/io/Writer".into(),
+                    name: "write".into(),
+                    descriptor: "(Ljava/lang/String;)V".into(),
+                });
+                text.as_bytes().to_vec()
+            });
+            self.watch_writer_committed(&path, bytes.len());
+            self.io_file_bytes.insert(path.clone(), bytes);
             self.io_files.insert(path, text);
         }
     }
@@ -24336,7 +24606,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 return Err(NativeError::UncaughtException {
                     class: "java/nio/file/NoSuchFileException".into(),
-                    message: Some(path.to_string()),
+                    message: Some(host_path::sandbox_display(path)),
                     frame: None,
                 });
             }
@@ -24347,7 +24617,7 @@ impl<H: Host> Runtime<'_, H> {
             };
             return Err(NativeError::UncaughtException {
                 class: class.into(),
-                message: Some(path.to_string()),
+                message: Some(host_path::sandbox_display(path)),
                 frame: None,
             });
         };
@@ -24359,9 +24629,9 @@ impl<H: Host> Runtime<'_, H> {
     /// reaches.
     ///
     /// The native path never touches the host filesystem: files a jar writes
-    /// live in [`Runtime::io_files`] for the length of one invocation, so a
+    /// live in [`Runtime::io_files`] for the lifetime of that jar host, so a
     /// bootstrap that saves defaults and reads them back sees its own bytes and
-    /// nothing else. A read of a path the invocation never wrote reports the
+    /// nothing else. A read of a path no callback has written reports the
     /// exception Java would raise. Readers keep their text in
     /// [`Runtime::string_readers`], which is also what `Gson.fromJson(Reader,
     /// Class)` reads; writers append into [`Runtime::io_writers`], which is
@@ -24423,9 +24693,10 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     return Ok(Some(Value::Void));
                 }
-                let Some(path) = self.io_path_of(&Value::Ref(Some(marker.clone()))) else {
+                let Some(display_path) = self.io_paths.get(&marker).cloned() else {
                     return Ok(None);
                 };
+                let path = host_path::sandbox_canonical(&display_path);
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("exists", "()Z") => Value::Int(i32::from(self.io_files.contains_key(&path))),
                     // `file_attributes.rs`: what the model knows the path to be.
@@ -24435,19 +24706,25 @@ impl<H: Host> Runtime<'_, H> {
                     ("isDirectory", "()Z") => Value::Int(i32::from(
                         self.file_kind(&path) == file_attributes::FileKind::Directory,
                     )),
-                    ("length", "()J") => {
-                        Value::Long(self.io_files.get(&path).map_or(0, |text| text.len() as i64))
-                    }
-                    ("getName", "()Ljava/lang/String;") => {
-                        Value::Ref(Some(path.rsplit('/').next().unwrap_or(&path).to_owned()))
-                    }
+                    ("length", "()J") => Value::Long(self.io_file_bytes.get(&path).map_or_else(
+                        || self.io_files.get(&path).map_or(0, String::len) as i64,
+                        |bytes| bytes.len() as i64,
+                    )),
+                    ("getName", "()Ljava/lang/String;") => Value::Ref(Some(
+                        display_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&display_path)
+                            .to_owned(),
+                    )),
                     ("getParent", "()Ljava/lang/String;") => Value::Ref(
-                        path.rsplit_once('/')
+                        display_path
+                            .rsplit_once('/')
                             .map(|(parent, _)| parent.to_owned())
                             .filter(|parent| !parent.is_empty()),
                     ),
                     ("getParentFile", "()Ljava/io/File;") => {
-                        match path.rsplit_once('/').map(|(parent, _)| parent) {
+                        match display_path.rsplit_once('/').map(|(parent, _)| parent) {
                             Some(parent) if !parent.is_empty() => {
                                 let value = self.new_object("java/io/File");
                                 if let Some(marker) = expect_ref(&value) {
@@ -24459,10 +24736,10 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     }
                     ("toPath", "()Ljava/nio/file/Path;") => {
-                        if !host_path::encodable(&path) {
+                        if !host_path::encodable(&display_path) {
                             self.host.unknown_operand_call(r)?;
                         }
-                        path_value(&path)
+                        path_value(&display_path)
                     }
                     ("mkdir", "()Z") | ("mkdirs", "()Z") | ("createNewFile", "()Z") => {
                         if r.name == "mkdirs" {
@@ -24473,7 +24750,8 @@ impl<H: Host> Runtime<'_, H> {
                         if r.name != "createNewFile" {
                             self.io_dirs.insert(path.clone());
                         }
-                        self.io_files.entry(path).or_default();
+                        self.io_files.entry(path.clone()).or_default();
+                        self.io_file_bytes.entry(path).or_default();
                         Value::Int(1)
                     }
                     // `false` for a missing path or a directory that still
@@ -24486,14 +24764,20 @@ impl<H: Host> Runtime<'_, H> {
                             return self.host.unknown_operand_call(r).map(Some);
                         }
                     },
-                    (
-                        "getPath" | "getAbsolutePath" | "getCanonicalPath" | "toString",
-                        "()Ljava/lang/String;",
-                    ) => Value::Ref(Some(path)),
+                    ("getPath" | "toString", "()Ljava/lang/String;") => {
+                        Value::Ref(Some(display_path))
+                    }
+                    ("getAbsolutePath", "()Ljava/lang/String;") => {
+                        Value::Ref(Some(host_path::sandbox_absolute(&display_path)))
+                    }
+                    ("getCanonicalPath", "()Ljava/lang/String;") => {
+                        Value::Ref(Some(host_path::sandbox_canonical(&display_path)))
+                    }
                     // `UnixFileSystem.hashCode`/`compare`: the path's text.
-                    ("hashCode", "()I") => Value::Int(file_hash(&path)),
+                    ("hashCode", "()I") => Value::Int(file_hash(&display_path)),
                     ("equals", "(Ljava/lang/Object;)Z") => Value::Int(i32::from(
-                        args.first().and_then(|other| self.file_path(other)) == Some(&path),
+                        args.first().and_then(|other| self.file_path(other))
+                            == Some(display_path.as_str()),
                     )),
                     _ => return Ok(None),
                 }))
@@ -24509,10 +24793,11 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(Some(value))
             }
             "java/nio/file/Files" => {
-                let Some(path) = args.first().map(path_text).map(str::to_owned) else {
+                let Some(display_path) = args.first().map(path_text).map(str::to_owned) else {
                     return Ok(None);
                 };
-                if let Some(value) = self.jar_root_files(r, &path, class, method)? {
+                let path = host_path::sandbox_canonical(&display_path);
+                if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
@@ -24548,7 +24833,7 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
                         self.watch_whole_write(&path, text.is_empty());
-                        self.io_files.insert(path, text);
+                        self.io_store_file_with_charset_args(path, text, args)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("write", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
@@ -24575,14 +24860,15 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_change(&path, watch_service::Change::Unmodelled);
                         }
-                        self.io_files.insert(path, text);
+                        self.io_store_file(path, text)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         self.watch_created(&path);
-                        self.io_files.entry(path).or_default();
+                        self.io_files.entry(path.clone()).or_default();
+                        self.io_file_bytes.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     // Directories share the file table (as `File.mkdirs`
@@ -24596,7 +24882,8 @@ impl<H: Host> Runtime<'_, H> {
                             self.watch_created(&path);
                         }
                         self.io_dirs.insert(path.clone());
-                        self.io_files.entry(path).or_default();
+                        self.io_files.entry(path.clone()).or_default();
+                        self.io_file_bytes.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("walk" | "list", descriptor)
@@ -24613,7 +24900,7 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         let thrown = |class: &str| NativeError::UncaughtException {
                             class: class.into(),
-                            message: Some(path.clone()),
+                            message: Some(display_path.clone()),
                             frame: None,
                         };
                         match self.delete_path(&path) {
@@ -24646,7 +24933,8 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         let value = self.new_object("java/io/BufferedWriter");
                         if let Some(writer) = expect_ref(&value) {
-                            self.io_open_writer(writer, Some(path), true);
+                            self.io_open_writer(writer, Some(path), true)?;
+                            self.io_set_writer_charset(writer, args);
                         }
                         value
                     }
@@ -24664,7 +24952,7 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         let value = self.new_object("java/io/FileOutputStream");
                         if let Some(stream) = expect_ref(&value) {
-                            self.io_open_writer(stream, Some(path), true);
+                            self.io_open_writer(stream, Some(path), true)?;
                         }
                         value
                     }
@@ -24686,11 +24974,12 @@ impl<H: Host> Runtime<'_, H> {
                     expect_ref(value).is_some_and(|marker| self.io_paths.contains_key(marker))
                 }) {
                     let path = self.io_path_of(wrapped);
-                    self.io_open_writer(&marker, path, false);
+                    self.io_open_writer(&marker, path, false)?;
                 } else {
                     let path = args.first().and_then(|value| self.io_path_of(value));
-                    self.io_open_writer(&marker, path, !appending);
+                    self.io_open_writer(&marker, path, !appending)?;
                 }
+                self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
             "java/io/OutputStreamWriter" if r.name == "<init>" => {
@@ -24698,7 +24987,8 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false);
+                self.io_open_writer(&marker, path, false)?;
+                self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
             "java/io/BufferedWriter" if r.name == "<init>" => {
@@ -24706,14 +24996,15 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false);
+                self.io_open_writer(&marker, path, false)?;
+                self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
             "java/io/StringWriter" if r.name == "<init>" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                self.io_open_writer(&marker, None, true);
+                self.io_open_writer(&marker, None, true)?;
                 Ok(Some(Value::Void))
             }
             "java/io/FileOutputStream" | "java/io/FileInputStream" if r.name == "<init>" => {
@@ -24730,7 +25021,7 @@ impl<H: Host> Runtime<'_, H> {
                         && args
                             .get(1)
                             .is_some_and(|value| expect_int(r, value).unwrap_or(0) != 0);
-                    self.io_open_writer(&marker, Some(path), !appending);
+                    self.io_open_writer(&marker, Some(path), !appending)?;
                 }
                 Ok(Some(Value::Void))
             }
@@ -24800,7 +25091,7 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("write", "(Ljava/lang/String;)V") => {
                         let text = args.first().map(expect_string).unwrap_or_default();
-                        self.io_write(&marker, text);
+                        self.io_write(&marker, text)?;
                         Value::Void
                     }
                     ("write", "(Ljava/lang/String;II)V") => {
@@ -24816,7 +25107,7 @@ impl<H: Host> Runtime<'_, H> {
                             .transpose()?
                             .unwrap_or(0);
                         let slice = slice_utf16(text, start, length);
-                        self.io_write(&marker, &slice);
+                        self.io_write(&marker, &slice)?;
                         Value::Void
                     }
                     // `write(char[])` and `write(char[], off, len)`: the units in
@@ -24854,7 +25145,7 @@ impl<H: Host> Runtime<'_, H> {
                             .flatten();
                         match text {
                             Some(text) => {
-                                self.io_write(&marker, &text);
+                                self.io_write(&marker, &text)?;
                                 Value::Void
                             }
                             None => self.host.unknown_operand_call(r)?,
@@ -24867,7 +25158,7 @@ impl<H: Host> Runtime<'_, H> {
                             .transpose()?
                             .unwrap_or(0);
                         let text = char::from_u32(code as u32).unwrap_or('\u{fffd}');
-                        self.io_write(&marker, &text.to_string());
+                        self.io_write(&marker, &text.to_string())?;
                         Value::Void
                     }
                     ("write", "(CC)V") => {
@@ -24885,7 +25176,7 @@ impl<H: Host> Runtime<'_, H> {
                             .into_iter()
                             .chain(char::from_u32(low as u32))
                             .collect::<String>();
-                        self.io_write(&marker, &text);
+                        self.io_write(&marker, &text)?;
                         Value::Void
                     }
                     ("append", descriptor)
@@ -24900,12 +25191,12 @@ impl<H: Host> Runtime<'_, H> {
                             .first()
                             .map(|value| java_value_text(value, descriptor))
                             .unwrap_or_default();
-                        self.io_write(&marker, &text);
+                        self.io_write(&marker, &text)?;
                         // `return this`: the writer itself.
                         jar_object::stored_value(&marker)
                     }
                     ("newLine", "()V") => {
-                        self.io_write(&marker, "\n");
+                        self.io_write(&marker, "\n")?;
                         Value::Void
                     }
                     ("print", _) | ("println", _) => {
@@ -24922,7 +25213,7 @@ impl<H: Host> Runtime<'_, H> {
                         if r.name == "println" {
                             text.push('\n');
                         }
-                        self.io_write(&marker, &text);
+                        self.io_write(&marker, &text)?;
                         Value::Void
                     }
                     ("printf", _) | ("format", _) => {
@@ -24940,7 +25231,7 @@ impl<H: Host> Runtime<'_, H> {
                         let Some(text) = text else {
                             return Ok(None);
                         };
-                        self.io_write(&marker, &text);
+                        self.io_write(&marker, &text)?;
                         receiver.cloned().unwrap_or(Value::Void)
                     }
                     ("flush", "()V") | ("close", "()V") => {
@@ -25363,9 +25654,11 @@ impl<H: Host> Runtime<'_, H> {
                                     "Gson.toJson needs an Appendable receiver".into(),
                                 )
                             })?;
-                        if self.io_sink_key(target).is_none()
-                            && !self.string_builders.contains_key(target)
-                        {
+                        if self.io_sink_key(target).is_some() {
+                            self.io_write(target, &text)?;
+                            return Ok(Some(Value::Void));
+                        }
+                        if !self.string_builders.contains_key(target) {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
@@ -32833,6 +33126,8 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -32899,6 +33194,8 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -39999,6 +40296,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -40160,6 +40459,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -40344,6 +40645,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -40704,6 +41007,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -41008,6 +41313,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -46240,6 +46547,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
@@ -46294,6 +46603,8 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
             io_dirs: BTreeSet::new(),
