@@ -43,7 +43,9 @@ mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
+mod dfu_either;
 mod dfu_pair;
+mod dfu_pair_ops;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
@@ -117,6 +119,7 @@ mod host_service;
 mod host_services;
 mod host_type_token;
 mod host_watch;
+mod http_client;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -151,6 +154,7 @@ mod jdk_supertypes;
 #[cfg(test)]
 mod jdk_text_oracle;
 mod jvm_dispatch;
+mod kotlin_stdlib;
 mod lambda_boxing;
 mod library_dispatch;
 mod linked_resources;
@@ -206,6 +210,7 @@ mod tim_sort;
 mod tree_map;
 mod type_switch;
 mod value_class;
+mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_registries;
 pub mod verdict;
@@ -2653,6 +2658,12 @@ pub trait Host {
         None
     }
 
+    /// Whether a game object marker is an instance of `wanted`, when the host
+    /// knows that object's class chain; `None` leaves the interpreter's answer.
+    fn game_instance_of(&self, _marker: &str, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// Up to `limit` bytes (all that are left when `None`) of a bounded
     /// input-stream marker the host holds, consumed from the stream.
     ///
@@ -3058,6 +3069,18 @@ pub struct StdHost {
     /// `Arc` so a pack can build one table and every mod's host uses it
     /// without copying the class bytes again.
     linked_classes: Arc<LinkedClassTable>,
+    /// Each vanilla block's full internal-name transitive class/interface closure
+    /// (`minecraft:fire` → `net/minecraft/world/level/block/FireBlock`, ...),
+    /// which a game host seeds from its prepared `block-behaviours.json`.
+    game_block_classes: Arc<BTreeMap<String, Vec<String>>>,
+    /// Objects a game `Item` constructor built (a mod's item subclasses
+    /// included), and the `BlockItem` built for each block: vanilla's
+    /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
+    constructed_items: BTreeSet<String>,
+    /// Objects a vanilla block constructor built (a mod's block subclasses
+    /// included), so `asItem()` answers only blocks it knows.
+    constructed_blocks: BTreeSet<String>,
+    block_items: BTreeMap<String, Value>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -3337,6 +3360,10 @@ impl StdHost {
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
             linked_classes: Arc::default(),
+            game_block_classes: Arc::default(),
+            constructed_items: BTreeSet::new(),
+            constructed_blocks: BTreeSet::new(),
+            block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             mods: BTreeMap::new(),
@@ -3903,6 +3930,63 @@ impl StdHost {
         classes: impl IntoIterator<Item = ClassFile>,
     ) -> Result<usize, NativeError> {
         Arc::make_mut(&mut self.linked_classes).link_classes(id, classes)
+    }
+
+    /// Seed each vanilla block's full binary-name transitive class/interface closure, so
+    /// `Blocks.FIRE instanceof FireBlock` answers as in the game.
+    pub fn with_game_block_classes(mut self, classes: Arc<BTreeMap<String, Vec<String>>>) -> Self {
+        self.game_block_classes = classes;
+        self
+    }
+
+    /// ItemLike.asItem() as vanilla answers it, for objects whose game
+    /// superclass the runtime does not hold. Only receivers this host knows
+    /// are answered: an item it saw constructed (or a vanilla Items.X
+    /// constant) is its own item; a constructed block is the BlockItem built
+    /// for it. An unregistered jar block stays unknown so the host counts the
+    /// call instead of inventing Items.AIR.
+    fn item_like_call(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
+        // Only objects the runtime actually allocated can be recorded as a
+        // mod's Item/Block.  Game handles (the P16 representation of
+        // vanilla Items/Blocks) are left for the game-object/client surface;
+        // a String that merely spells an object key is never an object.
+        let marker = jar_object::object_key(receiver)?.to_owned();
+        if r.name == "<init>" {
+            match r.owner.as_str() {
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem" => {
+                    self.constructed_items.insert(marker.clone());
+                    if r.owner == "net/minecraft/world/item/BlockItem"
+                        && r.descriptor
+                            .starts_with("(Lnet/minecraft/world/level/block/Block;")
+                        && let Some(block) = args.first().and_then(jar_object::instance_key)
+                    {
+                        self.block_items.insert(block.to_owned(), receiver.clone());
+                    }
+                }
+                // `Block` or one of its vanilla subclasses (`FenceBlock`),
+                // which a mod's own block reaches through `super(...)`.
+                owner if is_vanilla_block_class(owner) => {
+                    self.constructed_blocks.insert(marker);
+                }
+                _ => {}
+            }
+            return None;
+        }
+        if r.name != "asItem" || r.descriptor != "()Lnet/minecraft/world/item/Item;" {
+            return None;
+        }
+        if self.constructed_items.contains(&marker)
+            || marker.starts_with("net/minecraft/world/item/Item#net/minecraft/world/item/Items.")
+        {
+            return Some(receiver.clone());
+        }
+        if self.constructed_blocks.contains(&marker) {
+            // A jar-owned block with no observed BlockItem registration has
+            // unknown mapping state. Vanilla would fall back to AIR, but the
+            // bounded host must count rather than invent that answer.
+            return self.block_items.get(&marker).cloned();
+        }
+        None
     }
 
     /// Share one linked table across many hosts (`Self::link_jar` clones it
@@ -4910,6 +4994,16 @@ impl StdHost {
                 }
                 Ok(None)
             }
+            // Vanilla subclass constructors carry class-specific arguments
+            // (BlockSetType, TreeGrower, base state, ...). Until each argument
+            // family is decoded exactly, keep the constructor counted.
+            owner
+                if r.name == "<init>"
+                    && owner != BLOCK_CLASS
+                    && owner.starts_with("net/minecraft/world/level/block/") =>
+            {
+                self.unknown_host_call(r).map(Some)
+            }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
                     return Ok(None);
@@ -5415,6 +5509,16 @@ impl Host for StdHost {
         Some(text)
     }
 
+    fn game_instance_of(&self, marker: &str, wanted: &str) -> Option<bool> {
+        let block_id = marker.strip_prefix("game/block/")?;
+        let classes = self.game_block_classes.get(block_id)?;
+        // The game seed must contain the full binary-name transitive closure
+        // (`BlockBehaviour`, inherited interfaces such as `BucketPickup`, ...).
+        // Anything absent is unknown and therefore counted.
+        (wanted == "java/lang/Object" || classes.iter().any(|class| class == wanted))
+            .then_some(true)
+    }
+
     fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let start = (*index).min(bytes.len());
@@ -5579,6 +5683,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = http_client::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
+        }
         if let Some(value) = client_reload::static_field(&r.owner, &r.name, &r.descriptor) {
             return Ok(value);
         }
@@ -5591,6 +5698,17 @@ impl Host for StdHost {
             .or_else(|| gson_writer::static_field(r))
         {
             return Ok(value);
+        }
+        // `Blocks.<FIELD>` is already a game registry handle in the current
+        // P16 API. The 26.3 field table is the authority: an absent field is
+        // a real `NoSuchFieldError` path and remains counted.
+        if r.owner == "net/minecraft/world/level/block/Blocks"
+            && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
+        {
+            return match crate::runtime::vanilla_blocks::field_id(&r.name) {
+                Some(id) => Ok(crate::runtime::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
         }
         // Registry statics are handles instead of a null constant so
         // registration calls downstream can name their target registry. The
@@ -5788,6 +5906,9 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_invoke(r, args) {
             return value;
         }
+        if let Some(value) = http_client::static_call(self, r, args) {
+            return value;
+        }
         if let Some(result) = guava_model::sized_factory_class(r, args) {
             return result.map(|class| self.empty_collection_class(class));
         }
@@ -5826,6 +5947,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_pair::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = dfu_either::static_call(r, args) {
             return value;
         }
         if let Some(value) = fabric_registry::static_call(r, args) {
@@ -7099,6 +7223,9 @@ impl Host for StdHost {
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
+        if let Some(value) = self.item_like_call(r, receiver, args) {
+            return Ok(value);
+        }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
             return Ok(value);
@@ -7135,6 +7262,9 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_call(r, receiver, args) {
             return value;
         }
+        if let Some(value) = http_client::instance_call(self, r, receiver, args) {
+            return value;
+        }
         if let Some(value) = client_reload::host_instance_call(self, r, receiver, args) {
             return value;
         }
@@ -7154,6 +7284,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_pair::instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = dfu_either::host_instance_call(r, receiver, args) {
             return value;
         }
         if let Some(value) = self.holder_call(r, receiver) {
@@ -11161,6 +11294,15 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
+/// `Block` itself or a vanilla block class directly in its package
+/// (`FenceBlock`, `FireBlock`), whose constructor a mod's block reaches
+/// through `super(...)`.
+fn is_vanilla_block_class(owner: &str) -> bool {
+    owner
+        .strip_prefix("net/minecraft/world/level/block/")
+        .is_some_and(|name| !name.contains('/') && name.ends_with("Block"))
+}
+
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
 fn registry_static_id(owner: &str, field: &str) -> Option<&'static str> {
     if !matches!(
@@ -11288,7 +11430,7 @@ fn duration_seconds_nanos(nanos: i128) -> (i128, i128) {
 /// `Duration.toString()` (Java 25): `PT` and the hours, minutes and seconds of the duration's
 /// seconds (one less for a negative duration with nanos), the nanos as a fraction with trailing
 /// zeros dropped, so `ofSeconds(-1, 500_000_000)` is `PT-0.5S`.
-fn duration_text(total: i128) -> String {
+pub(crate) fn duration_text(total: i128) -> String {
     let seconds = total.div_euclid(1_000_000_000) as i64;
     let nanos = total.rem_euclid(1_000_000_000) as i64;
     if seconds == 0 && nanos == 0 {
@@ -12026,6 +12168,10 @@ impl host_ref::Nested for MarkerText {
         Ok(None)
     }
 
+    fn collection_entries(&mut self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
+
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         let _level = host_recursion::enter()?;
         Ok(Some(match value {
@@ -12076,6 +12222,10 @@ impl host_ref::Nested for HostNested<'_> {
             }
             _ => Some(boxed::canonical(a) == boxed::canonical(b)),
         })
+    }
+
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        self.0.as_deref_mut()?.mutable_collection_entries(value)
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
@@ -22576,7 +22726,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `name` is `wanted` or a subclass (or implementor) of it.
-    fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
+    pub(crate) fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
         let mut current = jar_object::marker_class_or_text(name).to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             if current == wanted {
@@ -22605,6 +22755,26 @@ impl<H: Host> Runtime<'_, H> {
             current = file.super_name.clone();
         }
         false
+    }
+
+    pub(crate) fn dfu_pair_subclass_state(&self, receiver: &Value) -> Option<(Value, Value)> {
+        let key = jar_object::object_key(receiver)?;
+        let state = self.fields.get(&format!("{key}|#dfuPair"))?;
+        crate::runtime::host_codec::pair_parts(state)
+    }
+
+    pub(crate) fn set_dfu_pair_subclass_state(
+        &mut self,
+        receiver: &Value,
+        first: &Value,
+        second: &Value,
+    ) -> Option<()> {
+        let key = jar_object::object_key(receiver)?;
+        self.fields.insert(
+            format!("{key}|#dfuPair"),
+            crate::runtime::host_codec::pair(first, second),
+        );
+        Some(())
     }
 
     /// `target.isAssignableFrom(source)` (internal names): known, counted
@@ -26540,6 +26710,24 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<Value>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        // Kotlin stdlib facades and holder methods are registration/runtime
+        // surfaces: the native interpreter records their exact bounded result
+        // without executing the bundled implementation.
+        let kotlin_call = MethodRef {
+            owner: class.to_owned(),
+            name: method.to_owned(),
+            descriptor: desc.to_owned(),
+        };
+        if let Some(receiver) = receiver.as_ref()
+            && let Some(value) = kotlin_stdlib::instance(self, &kotlin_call, receiver, args)
+        {
+            return value;
+        }
+        if receiver.is_none()
+            && let Some(value) = kotlin_stdlib::invoke(self, &kotlin_call, args)
+        {
+            return value;
+        }
         // Snapshot the table so the frame's class reference outlives the
         // `&mut self` calls the instruction loop makes.
         let linked = Arc::clone(&self.linked);
@@ -27883,6 +28071,23 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A jar's copy of a loader class its run's loader
                         // lacks (`class_precedence.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_pair_ops::runtime_call(
+                            self,
+                            &r,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_either::runtime_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -32322,6 +32527,143 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// A vanilla subclass constructor is not modelled without an exact argument
+    /// decoder; the call stays counted instead of selecting a wrong template.
+    #[test]
+    fn subclass_constructors_stay_counted() {
+        let mut host = StdHost::new();
+        host.set_strict_unknown_host_calls(true);
+        let call = MethodRef {
+            owner: "net/minecraft/world/level/block/DoorBlock".into(),
+            name: "<init>".into(),
+            descriptor: "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+                .into(),
+        };
+        let _ = host.invoke_instance(
+            &call,
+            &Value::Ref(Some("door#1".into())),
+            &[Value::Ref(Some("properties#1".into()))],
+        );
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    /// With the game's block classes seeded, a vanilla block constant answers
+    /// `instanceof` for its real class chain and interfaces, and only those.
+    #[test]
+    fn seeded_block_classes_answer_instanceof() {
+        let classes = BTreeMap::from([(
+            "minecraft:fire".to_owned(),
+            vec![
+                "net/minecraft/world/level/block/FireBlock".into(),
+                "net/minecraft/world/level/block/BaseFireBlock".into(),
+                "net/minecraft/world/level/block/Block".into(),
+                "net/minecraft/world/level/block/state/BlockBehaviour".into(),
+                "net/minecraft/world/level/ItemLike".into(),
+            ],
+        )]);
+        let mut host = StdHost::new().with_game_block_classes(Arc::new(classes));
+        let fire = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/Blocks".into(),
+                name: "FIRE".into(),
+                descriptor: "Lnet/minecraft/world/level/block/Block;".into(),
+            })
+            .unwrap();
+        let marker = match &fire {
+            Value::Host(handle) => handle.key().to_owned(),
+            other => panic!("expected a game handle, got {other:?}"),
+        };
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/FireBlock"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/ItemLike"),
+            Some(true)
+        );
+        assert_eq!(
+            host.game_instance_of(&marker, "net/minecraft/world/level/block/ChestBlock"),
+            None
+        );
+        assert_eq!(
+            host.game_instance_of(
+                &marker,
+                "net/minecraft/world/level/block/state/BlockBehaviour"
+            ),
+            Some(true)
+        );
+        // Simple names and unrelated interfaces remain counted.
+        assert_eq!(host.game_instance_of(&marker, "FireBlock"), None);
+        assert_eq!(host.game_instance_of(&marker, "java/lang/Cloneable"), None);
+        // An unseeded block keeps the interpreter's own answer.
+        assert_eq!(
+            host.game_instance_of(
+                "net/minecraft/world/level/block/Block#net/minecraft/world/level/block/Blocks.STONE",
+                "net/minecraft/world/level/block/FireBlock"
+            ),
+            None
+        );
+    }
+
+    /// Non-block game constants remain counted until an exact family model exists.
+    #[test]
+    fn non_block_game_constants_stay_counted() {
+        let mut host = StdHost::new();
+        let _ = host.get_static(&MethodRef {
+            owner: "net/minecraft/world/level/block/SoundType".into(),
+            name: "WOOD".into(),
+            descriptor: "Lnet/minecraft/world/level/block/SoundType;".into(),
+        });
+        assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    /// `asItem()` is answered only for receivers the host knows: a vanilla
+    /// `Items.X` constant is itself, and an object it never saw built keeps the
+    /// neutral unmodelled answer rather than a confident `Items.AIR`.
+    #[test]
+    fn as_item_answers_only_known_receivers() {
+        let as_item = MethodRef {
+            owner: "net/minecraft/world/level/ItemLike".into(),
+            name: "asItem".into(),
+            descriptor: "()Lnet/minecraft/world/item/Item;".into(),
+        };
+        let mut host = StdHost::new();
+        let item = jar_object::handle("net/minecraft/world/item/Item#0".into());
+        host.invoke_instance(
+            &MethodRef {
+                owner: "net/minecraft/world/item/Item".into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/item/Item$Properties;)V".into(),
+            },
+            &item,
+            &[Value::Ref(None)],
+        )
+        .unwrap();
+        assert_eq!(host.invoke_instance(&as_item, &item, &[]).unwrap(), item);
+        host.begin_client_frame(
+            std::sync::Arc::new(crate::runtime::client_surface::ClientSnapshot::default()),
+            &[],
+        );
+        let diamond = game_object::client_value("client/item/minecraft:diamond".into());
+        assert_eq!(
+            host.invoke_instance(&as_item, &diamond, &[]).unwrap(),
+            diamond
+        );
+        let stone = game_object::client_value("client/block/minecraft:stone".into());
+        assert_eq!(
+            host.invoke_instance(&as_item, &stone, &[]).unwrap(),
+            game_object::client_value("client/item/minecraft:stone".into())
+        );
+        host.end_client_frame();
+        let stranger = Value::Ref(Some("net/minecraft/world/level/block/Block#stone".into()));
+        // An object it never saw built keeps the host's neutral answer for an
+        // unmodelled call (null), as before, not a confident `Items.AIR`.
+        assert_eq!(
+            host.invoke_instance(&as_item, &stranger, &[]).unwrap(),
+            Value::Ref(None)
+        );
+    }
+
     /// Java 25's `Math.max`/`min` (and `Double.max`/`min`) hand back the NaN operand with
     /// its own bits: `Math.max(longBitsToDouble(0x7ff0000000000001L), 1.0)` is raw
     /// `0x7ff0000000000001`, and the right operand's NaN comes back when the left is a
@@ -33096,6 +33438,7 @@ mod tests {
         // `%a` of an `Integer` throws on the JDK: the call is the host's,
         // counted, not an approximation.
         assert_eq!(format("%a", "[Ljava/lang/Object;#0"), Value::Ref(None));
+        #[allow(clippy::drop_non_drop)]
         drop(format);
         let locale_method = MethodRef {
             owner: "java/lang/String".into(),
