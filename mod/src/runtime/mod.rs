@@ -14122,14 +14122,11 @@ fn array_operand_error(
 /// enough heap for the allocation.
 pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
 
-/// The same bound in bytes, for an array whose elements are not `Value`s (a `byte[]`, #274):
-/// what [`MAX_ARRAY_ELEMENTS`] `Value` slots take, 512 MiB.
-pub(crate) const MAX_ARRAY_BYTES: usize = MAX_ARRAY_ELEMENTS * std::mem::size_of::<Value>();
-
-/// A new `byte[length]` of zeros: bounded in bytes, and refused (never an abort) where the
-/// allocator cannot give it.
+/// A new `byte[length]` of zeros: within [`MAX_ARRAY_ELEMENTS`] like every array (#273; the bound
+/// moves to bytes with every kind compact, hj-notes/compact-arrays-plan.md), and refused (never
+/// an abort) where the allocator cannot give it.
 fn zeroed_byte_array(length: usize) -> Result<ArrayData, NativeError> {
-    if length > MAX_ARRAY_BYTES {
+    if length > MAX_ARRAY_ELEMENTS {
         return Err(array_bound_error(length as u128));
     }
     ArrayData::zeroed_bytes(length).ok_or_else(|| array_bound_error(length as u128))
