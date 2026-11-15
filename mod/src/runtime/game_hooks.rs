@@ -1400,6 +1400,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.mint_map_entries(map, pairs, made)
     }
 
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        self.inner.unwrapped_view_entry(entry)
+    }
+
     fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
         self.inner.entries_before_call(marker, name, args);
     }

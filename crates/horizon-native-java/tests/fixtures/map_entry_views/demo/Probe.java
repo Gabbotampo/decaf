@@ -183,6 +183,145 @@ public final class Probe {
         return e.getValue() + "|" + e + "|" + thrown + "|" + m;
     }
 
+    // Review 7, B11: JDK 25's `UnmodifiableCollection.toArray(IntFunction)` is `c.toArray(f)`, so a
+    // view's entry set hands out its source's own entries there (`UnmodifiableEntrySet` wraps only
+    // in `toArray()` and `toArray(T[])`): `setValue` writes through, and `==` the direct entry.
+    static <M extends Map<String, Integer>> M fill(M m) {
+        m.put("a", 1);
+        m.put("b", 2);
+        return m;
+    }
+
+    @SuppressWarnings("unchecked")
+    static <K, V> Map.Entry<K, V>[] arr(Set<Map.Entry<K, V>> s) {
+        return s.toArray(Map.Entry[]::new);
+    }
+
+    public static String d06ToArrayFn() {
+        var m = fill(new HashMap<String, Integer>());
+        Map.Entry<String, Integer>[] a = arr(Collections.unmodifiableMap(m).entrySet());
+        try {
+            a[0].setValue(9);
+            return "set|" + m;
+        } catch (UnsupportedOperationException x) {
+            return "UOE|" + m;
+        }
+    }
+
+    public static String t01HashFnSetValue() {
+        var m = fill(new HashMap<String, Integer>());
+        var a = arr(Collections.unmodifiableMap(m).entrySet());
+        a[0].setValue(9);
+        return m + "";
+    }
+
+    public static String t04ChmFnSetValue() {
+        var m = fill(new ConcurrentHashMap<String, Integer>());
+        var a = arr(Collections.unmodifiableMap(m).entrySet());
+        a[0].setValue(9);
+        return m + "|" + a[0];
+    }
+
+    public static String t05GsonFnSetValue() {
+        JsonObject o = obj();
+        Map.Entry<String, JsonElement>[] a = arr(Collections.unmodifiableMap(o.asMap()).entrySet());
+        a[0].setValue(new JsonPrimitive(9));
+        return o + "";
+    }
+
+    public static String t06TreeFnSetValue() {
+        var m = fill(new TreeMap<String, Integer>());
+        var a = arr(Collections.unmodifiableMap(m).entrySet());
+        a[0].setValue(9);
+        return m + "";
+    }
+
+    public static String t07NestedFnSetValue() {
+        var m = fill(new HashMap<String, Integer>());
+        var a = arr(Collections.unmodifiableMap(Collections.unmodifiableMap(m)).entrySet());
+        a[0].setValue(9);
+        return m + "";
+    }
+
+    public static String t08FnSameAsDirect() {
+        var m = fill(new HashMap<String, Integer>());
+        var a = arr(Collections.unmodifiableMap(m).entrySet());
+        var d = ent(m, "a");
+        return (a[0] == d) + "";
+    }
+
+    // Review 7, B12: `Map.Entry.comparingByKey` over entries read before a Gson write, directly
+    // or through a view.
+    public static String e11ComparingGsonReadd() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(Collections.unmodifiableMap(o.asMap()).entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        l.sort(Map.Entry.comparingByKey());
+        return l + "";
+    }
+
+    public static String s01DirectGsonSort() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(o.entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        l.sort(Map.Entry.comparingByKey());
+        return l + "";
+    }
+
+    public static String s02DirectGsonInPlace() {
+        JsonObject o = obj();
+        var g = new ArrayList<>(o.entrySet());
+        o.addProperty("a", 7);
+        try {
+            g.sort(Map.Entry.comparingByKey());
+            return g + "";
+        } catch (RuntimeException x) {
+            return x.getClass().getSimpleName();
+        }
+    }
+
+    public static String s03ViewGsonStream() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(Collections.unmodifiableMap(o.asMap()).entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        return l.stream().sorted(Map.Entry.comparingByKey()).map(Object::toString)
+            .collect(java.util.stream.Collectors.joining(","));
+    }
+
+    public static String s05ViewGsonTreeSet() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(Collections.unmodifiableMap(o.asMap()).entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        var t = new TreeSet<Map.Entry<String, JsonElement>>(Map.Entry.comparingByKey());
+        t.addAll(l);
+        return t.size() + "";
+    }
+
+    public static String s06ViewGsonCompare() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(Collections.unmodifiableMap(o.asMap()).entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        return Map.Entry.<String, JsonElement>comparingByKey().compare(l.get(0), l.get(1)) + "";
+    }
+
+    public static String s07ViewGsonCatch() {
+        JsonObject o = obj();
+        var l = new ArrayList<>(Collections.unmodifiableMap(o.asMap()).entrySet());
+        o.remove("a");
+        o.addProperty("a", 0);
+        try {
+            l.sort(Map.Entry.comparingByKey());
+            return "ok|" + l;
+        } catch (Throwable x) {
+            return "caught " + x.getClass().getSimpleName();
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         for (var m : Probe.class.getDeclaredMethods()) {
             if (m.getParameterCount() == 0 && m.getReturnType() == String.class

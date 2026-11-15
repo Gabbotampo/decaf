@@ -836,6 +836,19 @@ impl StdHost {
             .map(|(_, state)| state)
     }
 
+    /// The entry an unmodifiable view's entry wraps (`Life::Wrapped`'s `inner`): the source map's
+    /// own entry, which `UnmodifiableCollection.toArray(IntFunction)` hands out (#221 review 7,
+    /// B11). `None` for any other value.
+    pub(crate) fn view_entry_inner(&self, entry: &Value) -> Option<Value> {
+        let Value::Host(handle) = entry else {
+            return None;
+        };
+        match &self.entry_state(handle)?.life {
+            Life::Wrapped { inner } => Some(inner.clone()),
+            _ => None,
+        }
+    }
+
     /// The key and value `entry` holds now; `None` for any other value, or when unknown.
     pub(crate) fn map_entry_now(&self, entry: &Value) -> Option<(Value, Value)> {
         let Value::Host(handle) = entry else {

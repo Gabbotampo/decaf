@@ -16,7 +16,7 @@
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
-use horizon_native_java::StdHost;
+use horizon_native_java::{NativeError, StdHost, Value};
 
 const ORACLE: &str = include_str!("fixtures/map_entry_views/java25.txt");
 
@@ -32,7 +32,8 @@ public void add(String p, JsonElement v) { throw new AssertionError(); }\n\
 public void addProperty(String p, Number v) { throw new AssertionError(); }\n\
 public JsonElement remove(String p) { throw new AssertionError(); }\n\
 public JsonObject getAsJsonObject(String p) { throw new AssertionError(); }\n\
-public java.util.Map<String, JsonElement> asMap() { throw new AssertionError(); }\n}\n";
+public java.util.Map<String, JsonElement> asMap() { throw new AssertionError(); }\n\
+public java.util.Set<java.util.Map.Entry<String, JsonElement>> entrySet() { throw new AssertionError(); }\n}\n";
 const JSON_ARRAY_STUB: &str = "package com.google.gson;\n\
 public final class JsonArray extends JsonElement {\n\
 public void add(JsonElement v) { throw new AssertionError(); }\n\
@@ -148,6 +149,81 @@ fn views_of_gson_objects_count_a_reading_after_a_write() {
         assert!(
             unknown.iter().any(|counted| counted == call),
             "v13ViewEqualsHashSet: {call} in {unknown:?}"
+        );
+    }
+}
+
+/// Review 7, B11: `toArray(IntFunction)` on a view's entry set is JDK 25's
+/// `UnmodifiableCollection.toArray(f)`, `c.toArray(f)`: the source's own entries, unwrapped.
+/// `setValue` writes through and `==` the direct entry, through a view of a view too, over
+/// `HashMap`, `TreeMap` and `ConcurrentHashMap` (whose `MapEntry` puts and keeps the value). A
+/// Gson entry's `setValue` is counted, as a direct Gson entry's is.
+#[test]
+fn a_view_entry_sets_to_array_with_a_generator_hands_out_the_source_entries() {
+    let fixture = fixture();
+    for method in [
+        "d06ToArrayFn",
+        "t01HashFnSetValue",
+        "t04ChmFnSetValue",
+        "t06TreeFnSetValue",
+        "t07NestedFnSetValue",
+        "t08FnSameAsDirect",
+    ] {
+        let (text, unknown) = run(&fixture, method);
+        assert_eq!(text, expected(method), "{method}: {unknown:?}");
+        assert!(unknown.is_empty(), "{method}: {unknown:?}");
+    }
+    let (text, unknown) = run(&fixture, "t05GsonFnSetValue");
+    assert!(
+        unknown.iter().any(
+            |call| call == "java/util/Map$Entry#setValue(Ljava/lang/Object;)Ljava/lang/Object;"
+        ),
+        "t05GsonFnSetValue: {text}, {unknown:?}"
+    );
+}
+
+/// Review 7, B12: `Map.Entry.comparingByKey` over Gson entries read before a write (directly, an
+/// in-place replace, through a view; a sort, a sorted stream, a `TreeSet`, one `compare`, a sort
+/// inside `catch (Throwable)`). Each unreadable entry's key is `getKey`'s counted call, as a direct
+/// read is: Java's answer, or that count with at most a Java exception after it (the counted
+/// `null` key's `compareTo`), never an internal error.
+#[test]
+fn entry_comparators_count_an_entry_they_cannot_read() {
+    let fixture = fixture();
+    for method in [
+        "e11ComparingGsonReadd",
+        "s01DirectGsonSort",
+        "s02DirectGsonInPlace",
+        "s03ViewGsonStream",
+        "s05ViewGsonTreeSet",
+        "s06ViewGsonCompare",
+        "s07ViewGsonCatch",
+    ] {
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        let result = fixture.jar.invoke_method(
+            "demo.Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        );
+        let unknown: Vec<String> = host
+            .unknown_host_calls()
+            .into_iter()
+            .map(|(call, _)| call)
+            .collect();
+        assert!(
+            matches!(&result, Ok(_) | Err(NativeError::UncaughtException { .. })),
+            "{method}: an internal error {result:?}"
+        );
+        let exact = matches!(&result, Ok(Value::Ref(Some(text))) if text == expected(method));
+        assert!(
+            exact
+                || unknown
+                    .iter()
+                    .any(|call| call == "java/util/Map$Entry#getKey()Ljava/lang/Object;"),
+            "{method}: {result:?}, {unknown:?} (Java {})",
+            expected(method)
         );
     }
 }

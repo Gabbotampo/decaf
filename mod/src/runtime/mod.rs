@@ -2408,6 +2408,14 @@ pub trait Host {
         host_map_entry::unknown_entry()
     }
 
+    /// The entry an unmodifiable view's entry wraps (`host_map_entry.rs`, `Life::Wrapped`): what
+    /// `UnmodifiableCollection.toArray(IntFunction)` hands out, the source's own entry. `None` for
+    /// any other value.
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        let _ = entry;
+        None
+    }
+
     /// [`Self::mint_map_entry`] over the pairs `[k, v, k, v...]` of `map`.
     fn mint_map_entries(
         &mut self,
@@ -5506,6 +5514,10 @@ impl Host for StdHost {
         made: host_map_entry::EntryMade,
     ) -> Vec<Value> {
         StdHost::mint_map_entries(self, map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        StdHost::view_entry_inner(self, entry)
     }
 
     fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
