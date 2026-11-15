@@ -1,0 +1,621 @@
+//! Bounded Gson 2.14.0 reflective deserialization.
+//
+// The tree reader remains in gson_tree; this module supplies the ordinary
+// reflective adapter used by config classes. Every shape it cannot resolve is
+// handed back to the host and counted, rather than being replaced with an
+// erased map or an empty object.
+
+use super::*;
+use crate::gson_tree::parse::{Parsed, Parser, Tree};
+
+const GSON: &str = "com/google/gson/Gson";
+const SERIALIZED_NAME: &str = "Lcom/google/gson/annotations/SerializedName;";
+
+fn tree_target(class: &str) -> bool {
+    matches!(
+        class,
+        crate::gson_tree::JSON_ELEMENT
+            | crate::gson_tree::JSON_OBJECT
+            | crate::gson_tree::JSON_ARRAY
+            | crate::gson_tree::JSON_PRIMITIVE
+            | crate::gson_tree::JSON_NULL
+    )
+}
+
+fn class_from_descriptor(descriptor: &str) -> Option<String> {
+    match descriptor {
+        "Z" => Some("boolean".into()),
+        "B" => Some("byte".into()),
+        "C" => Some("char".into()),
+        "S" => Some("short".into()),
+        "I" => Some("int".into()),
+        "J" => Some("long".into()),
+        "F" => Some("float".into()),
+        "D" => Some("double".into()),
+        "V" => Some("void".into()),
+        other if other.starts_with('L') && other.ends_with(';') => {
+            Some(other[1..other.len() - 1].into())
+        }
+        other if other.starts_with('[') => Some(other.into()),
+        _ => None,
+    }
+}
+
+fn descriptor_type(descriptor: &str) -> Option<GenericType> {
+    class_from_descriptor(descriptor).map(GenericType::Class)
+}
+
+fn raw_type(type_: &GenericType) -> Option<String> {
+    match type_ {
+        GenericType::Class(class) => Some(class.clone()),
+        GenericType::Parameterized { raw, .. } => Some(raw.clone()),
+        GenericType::Array(component) => Some(format!("[{}", generic_descriptor(component)?)),
+        GenericType::Wildcard { upper, .. } => upper.first().and_then(raw_type),
+        GenericType::Variable { .. } => None,
+    }
+}
+
+fn generic_descriptor(type_: &GenericType) -> Option<String> {
+    match type_ {
+        GenericType::Class(class) => match class.as_str() {
+            "boolean" => Some("Z".into()),
+            "byte" => Some("B".into()),
+            "char" => Some("C".into()),
+            "short" => Some("S".into()),
+            "int" => Some("I".into()),
+            "long" => Some("J".into()),
+            "float" => Some("F".into()),
+            "double" => Some("D".into()),
+            "void" => Some("V".into()),
+            class if class.starts_with('[') => Some(class.into()),
+            class => Some(format!("L{class};")),
+        },
+        GenericType::Parameterized { raw, .. } => Some(format!("L{raw};")),
+        GenericType::Array(component) => Some(format!("[{}", generic_descriptor(component)?)),
+        GenericType::Wildcard { .. } | GenericType::Variable { .. } => None,
+    }
+}
+
+fn type_args(type_: &GenericType) -> &[GenericType] {
+    match type_ {
+        GenericType::Parameterized { args, .. } => args,
+        _ => &[],
+    }
+}
+
+fn contains_variable(type_: &GenericType) -> bool {
+    match type_ {
+        GenericType::Variable { .. } => true,
+        GenericType::Parameterized { owner, args, .. } => {
+            owner.as_deref().is_some_and(contains_variable) || args.iter().any(contains_variable)
+        }
+        GenericType::Wildcard { upper, lower } => {
+            upper.iter().any(contains_variable) || lower.iter().any(contains_variable)
+        }
+        GenericType::Array(component) => contains_variable(component),
+        GenericType::Class(_) => false,
+    }
+}
+
+fn numeric_text(tree: &Tree) -> Option<&str> {
+    match tree {
+        Tree::Num(text) | Tree::Str(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn bool_text(tree: &Tree) -> Option<bool> {
+    match tree {
+        Tree::Bool(value) => Some(*value),
+        Tree::Str(text) => match text.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn json_object(tree: &Tree) -> Option<&[(String, Tree)]> {
+    match tree {
+        Tree::Object(fields) => Some(fields),
+        _ => None,
+    }
+}
+
+fn json_array(tree: &Tree) -> Option<&[Tree]> {
+    match tree {
+        Tree::Array(values) => Some(values),
+        _ => None,
+    }
+}
+
+fn tree_depth(tree: &Tree, depth: usize) -> usize {
+    match tree {
+        Tree::Array(values) => values
+            .iter()
+            .map(|value| tree_depth(value, depth + 1))
+            .max()
+            .unwrap_or(depth),
+        Tree::Object(values) => values
+            .iter()
+            .map(|(_, value)| tree_depth(value, depth + 1))
+            .max()
+            .unwrap_or(depth),
+        _ => depth,
+    }
+}
+
+impl<H: Host> Runtime<'_, H> {
+    fn count_gson_fromjson(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        self.host
+            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+            .map(Some)
+    }
+
+    fn gson_source(&self, value: Option<&Value>, reader: bool) -> Option<String> {
+        let value = value?;
+        match value {
+            Value::Ref(None) => None,
+            Value::Ref(Some(text)) if !reader => Some(text.clone()),
+            value if reader => crate::jar_object::object_key(value)
+                .and_then(|marker| self.string_readers.get(marker))
+                .cloned(),
+            _ => None,
+        }
+    }
+
+    fn gson_type_for_field(
+        &self,
+        declaring: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<GenericType> {
+        let file = self.class(declaring)?;
+        let parsed = file
+            .field_signature(name, descriptor)
+            .and_then(|signature| {
+                parse_generic_signature(
+                    &signature,
+                    crate::reflect_generic::class_scope(declaring, Some(file)),
+                )
+            });
+        parsed.or_else(|| descriptor_type(descriptor))
+    }
+
+    fn gson_serialized_names(
+        &self,
+        declaring: &str,
+        name: &str,
+        descriptor: &str,
+        style: &gson_model::GsonStyle,
+    ) -> Vec<String> {
+        let mut names = vec![style.field_name(name)];
+        let Some(file) = self.class(declaring) else {
+            return names;
+        };
+        for annotation in file.field_annotations(name, descriptor) {
+            if annotation.descriptor != SERIALIZED_NAME {
+                continue;
+            }
+            if let Some(AnnotationValue::String(primary)) = annotation.values.get("value") {
+                names[0] = primary.clone();
+            }
+            if let Some(AnnotationValue::Array(alternates)) = annotation.values.get("alternate") {
+                names.extend(alternates.iter().filter_map(|value| match value {
+                    AnnotationValue::String(value) => Some(value.clone()),
+                    _ => None,
+                }));
+            }
+        }
+        names
+    }
+
+    fn gson_enum_value(&mut self, class: &str, tree: &Tree) -> Option<Value> {
+        let Tree::Str(name) = tree else {
+            return None;
+        };
+        let file = self.class(class)?;
+        for field in &file.fields {
+            if field.access & 0x0008 == 0 {
+                continue;
+            }
+            let mut names = vec![field.name.clone()];
+            for annotation in file.field_annotations(&field.name, &field.descriptor) {
+                if annotation.descriptor == SERIALIZED_NAME {
+                    if let Some(AnnotationValue::String(primary)) = annotation.values.get("value") {
+                        names.push(primary.clone());
+                    }
+                    if let Some(AnnotationValue::Array(alternates)) =
+                        annotation.values.get("alternate")
+                    {
+                        names.extend(alternates.iter().filter_map(|value| match value {
+                            AnnotationValue::String(value) => Some(value.clone()),
+                            _ => None,
+                        }));
+                    }
+                }
+            }
+            if names.iter().any(|candidate| candidate == name) {
+                return Some(Value::Ref(Some(format!("enum/{class}/{}", field.name))));
+            }
+        }
+        None
+    }
+
+    fn gson_object(
+        &mut self,
+        fields: &[(String, Tree)],
+        class: &str,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Option<Value>, NativeError> {
+        if class.starts_with("java/")
+            || !self.has_class(class)
+            || self.class(class).is_some_and(|file| {
+                crate::jdk_model::class_access_flags(file).is_some_and(|flags| flags & 0x1000 != 0)
+            })
+        {
+            return Ok(None);
+        }
+        let declared = self.gson_fields(class);
+        if declared.is_empty() {
+            return Ok(None);
+        }
+        if declared.iter().any(|(owner, name, descriptor, _)| {
+            self.gson_type_for_field(owner, name, descriptor)
+                .is_some_and(|type_| contains_variable(&type_))
+        }) {
+            return Ok(None);
+        }
+        self.ensure_initialized(class)?;
+        let value = self.new_object(class);
+        let has_noarg = self.class(class).is_some_and(|file| {
+            file.methods
+                .iter()
+                .any(|method| method.name == "<init>" && method.descriptor == "()V")
+        });
+        if has_noarg {
+            self.invoke(class, "<init>", "()V", Some(value.clone()), &[])?;
+        }
+        for (declaring, name, descriptor, access) in declared {
+            if !style.includes_field(access) {
+                continue;
+            }
+            let matching: Vec<String> = self
+                .gson_serialized_names(&declaring, &name, &descriptor, style)
+                .into_iter()
+                .filter(|key| fields.iter().any(|(candidate, _)| candidate == key))
+                .collect();
+            if matching.len() > 1 {
+                return Ok(None);
+            }
+            let key = matching.into_iter().next();
+            let Some(key) = key else {
+                continue;
+            };
+            let Some(raw) = fields
+                .iter()
+                .find(|(candidate, _)| candidate == &key)
+                .map(|(_, value)| value)
+            else {
+                continue;
+            };
+            let Some(type_) = self.gson_type_for_field(&declaring, &name, &descriptor) else {
+                return Ok(None);
+            };
+            let Some(field_value) = self.gson_materialize_type(raw, &type_, style)? else {
+                return Ok(None);
+            };
+            let field = MethodRef {
+                owner: declaring,
+                name,
+                descriptor,
+            };
+            if access & 0x0008 != 0 {
+                self.static_fields
+                    .insert(Self::static_field_key(&field), field_value);
+            } else if let Some(key) = instance_field_key(&value, &field) {
+                self.fields.insert(key, field_value);
+            }
+        }
+        Ok(Some(value))
+    }
+
+    fn gson_materialize_type(
+        &mut self,
+        tree: &Tree,
+        type_: &GenericType,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Option<Value>, NativeError> {
+        if contains_variable(type_) {
+            return Ok(None);
+        }
+        let Some(class) = raw_type(type_) else {
+            return Ok(None);
+        };
+        let args = type_args(type_);
+        if tree_matches_null(tree) {
+            return Ok(Some(Value::Ref(None)));
+        }
+        match class.as_str() {
+            "java/lang/Object" => return self.gson_object_value(tree),
+            "java/lang/String" => {
+                return Ok(numeric_text(tree)
+                    .map(|text| Value::Ref(Some(text.to_owned())))
+                    .or_else(|| bool_text(tree).map(|value| Value::Ref(Some(value.to_string())))));
+            }
+            "boolean" | "java/lang/Boolean" => {
+                return Ok(bool_text(tree).map(boolean_value));
+            }
+            "byte" | "java/lang/Byte" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<i8>().ok())
+                    .map(|value| Value::Int(i32::from(value))));
+            }
+            "short" | "java/lang/Short" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<i16>().ok())
+                    .map(|value| Value::Int(i32::from(value))));
+            }
+            "int" | "java/lang/Integer" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<i32>().ok())
+                    .map(Value::Int));
+            }
+            "long" | "java/lang/Long" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .map(Value::Long));
+            }
+            "float" | "java/lang/Float" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .map(Value::Float));
+            }
+            "double" | "java/lang/Double" => {
+                return Ok(numeric_text(tree)
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .map(Value::Float));
+            }
+            "char" | "java/lang/Character" => {
+                return Ok(numeric_text(tree).and_then(|text| {
+                    let mut chars = text.chars();
+                    let value = chars.next()?;
+                    chars.next().is_none().then_some(Value::Int(value as i32))
+                }));
+            }
+            _ => {}
+        }
+        if let Some(component_desc) = class.strip_prefix('[') {
+            let Some(values) = json_array(tree) else {
+                return Ok(None);
+            };
+            let Some(component) = descriptor_type(component_desc) else {
+                return Ok(None);
+            };
+            let mut materialized = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = self.gson_materialize_type(value, &component, style)? else {
+                    return Ok(None);
+                };
+                materialized.push(value);
+            }
+            return Ok(Some(self.new_array_value(&class, materialized)));
+        }
+        if is_collection_owner(&class) && !is_map_owner(&class) {
+            let Some(values) = json_array(tree) else {
+                return Ok(None);
+            };
+            let element = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| GenericType::Class("java/lang/Object".into()));
+            let mut materialized = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = self.gson_materialize_type(value, &element, style)? else {
+                    return Ok(None);
+                };
+                materialized.push(value);
+            }
+            return Ok(Some(collection_value(
+                if is_set_owner(&class) { "set" } else { "list" },
+                &materialized,
+            )));
+        }
+        if is_map_owner(&class) {
+            let Some(values) = json_object(tree) else {
+                return Ok(None);
+            };
+            let element = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| GenericType::Class("java/lang/Object".into()));
+            let mut materialized = Vec::with_capacity(values.len() * 2);
+            for (key, value) in values {
+                materialized.push(Value::Ref(Some(key.clone())));
+                let Some(value) = self.gson_materialize_type(value, &element, style)? else {
+                    return Ok(None);
+                };
+                materialized.push(value);
+            }
+            return Ok(Some(collection_value("map", &materialized)));
+        }
+        if self.has_class(&class) {
+            if let Some(value) = self.gson_enum_value(&class, tree) {
+                return Ok(Some(value));
+            }
+            let Some(values) = json_object(tree) else {
+                return Ok(None);
+            };
+            return self.gson_object(values, &class, style);
+        }
+        Ok(gson_scalar_value(tree))
+    }
+
+    fn gson_object_value(&mut self, tree: &Tree) -> Result<Option<Value>, NativeError> {
+        Ok(match tree {
+            Tree::Null => Some(Value::Ref(None)),
+            Tree::Bool(value) => Some(boolean_value(*value)),
+            Tree::Num(text) => {
+                if let Ok(value) = text.parse::<i32>() {
+                    Some(Value::Int(value))
+                } else if let Ok(value) = text.parse::<i64>() {
+                    Some(Value::Long(value))
+                } else {
+                    text.parse::<f64>().ok().map(Value::Float)
+                }
+            }
+            Tree::Str(text) => Some(Value::Ref(Some(text.clone()))),
+            Tree::Array(values) => {
+                let mut materialized = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value) = self.gson_object_value(value)? else {
+                        return Ok(None);
+                    };
+                    materialized.push(value);
+                }
+                Some(collection_value("list", &materialized))
+            }
+            Tree::Object(values) => {
+                let mut materialized = Vec::with_capacity(values.len() * 2);
+                for (key, value) in values {
+                    materialized.push(Value::Ref(Some(key.clone())));
+                    let Some(value) = self.gson_object_value(value)? else {
+                        return Ok(None);
+                    };
+                    materialized.push(value);
+                }
+                Some(collection_value("map", &materialized))
+            }
+        })
+    }
+
+    fn gson_fromjson_type(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != GSON || r.name != "fromJson" {
+            return Ok(None);
+        }
+        let (reader, type_arg) = match r.descriptor.as_str() {
+            "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;"
+            | "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;"
+            | "(Lcom/google/gson/JsonElement;Ljava/lang/Class;)Ljava/lang/Object;" => {
+                (r.descriptor.starts_with("(Ljava/io/Reader;"), args.get(1))
+            }
+            "(Ljava/lang/String;Ljava/lang/reflect/Type;)Ljava/lang/Object;"
+            | "(Ljava/io/Reader;Ljava/lang/reflect/Type;)Ljava/lang/Object;" => {
+                (r.descriptor.starts_with("(Ljava/io/Reader;"), args.get(1))
+            }
+            "(Ljava/lang/String;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;"
+            | "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;"
+            | "(Lcom/google/gson/JsonElement;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;" => {
+                (r.descriptor.starts_with("(Ljava/io/Reader;"), args.get(1))
+            }
+            "(Lcom/google/gson/JsonElement;Ljava/lang/reflect/Type;)Ljava/lang/Object;" => {
+                (false, args.get(1))
+            }
+            _ => return Ok(None),
+        };
+        let Some(type_arg) = type_arg else {
+            return self.count_gson_fromjson(r, receiver, args);
+        };
+        let target = if r.descriptor.contains("Ljava/lang/Class;") {
+            let Some(class) = crate::host_class::class_name(type_arg) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            GenericType::Class(class.to_owned())
+        } else if r.descriptor.contains("TypeToken") {
+            let Some(type_value) = self.gson_token_type(type_arg) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            let Some(type_) = crate::host_gson_type::any_node(&type_value) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            type_
+        } else {
+            let Some(type_) = crate::host_gson_type::any_node(type_arg) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            type_
+        };
+        let Some(class) = raw_type(&target) else {
+            return self.count_gson_fromjson(r, receiver, args);
+        };
+        let element_input = r.descriptor.starts_with("(Lcom/google/gson/JsonElement;");
+        if tree_target(&class) && !element_input {
+            return Ok(None);
+        }
+        let style = self.gson_style_of(receiver);
+        if style.is_counted() {
+            return self.count_gson_fromjson(r, receiver, args);
+        }
+        let parsed = if element_input {
+            let Some(element) = args.first() else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            if *element == Value::Ref(None) {
+                return Ok(Some(Value::Ref(None)));
+            }
+            let Some(tree) = self.gson_tree_to_parse(element) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            tree
+        } else {
+            if reader && matches!(args.first(), Some(Value::Ref(None))) {
+                return self.count_gson_fromjson(r, receiver, args);
+            }
+            let Some(text) = self.gson_source(args.first(), reader) else {
+                return self.count_gson_fromjson(r, receiver, args);
+            };
+            match Parser::parse(&text) {
+                Parsed::Empty => return Ok(Some(Value::Ref(None))),
+                Parsed::Value(tree) => tree,
+                // Keep the established bounded parser's diagnostic for malformed,
+                // BOM-prefixed and otherwise unsupported input.
+                Parsed::Unsupported => return Ok(None),
+            }
+        };
+        if tree_depth(&parsed, 0) > MAX_GSON_DEPTH {
+            return Ok(None);
+        }
+        match self.gson_materialize_type(&parsed, &target, &style)? {
+            Some(value) => Ok(Some(value)),
+            None => self.count_gson_fromjson(r, receiver, args),
+        }
+    }
+
+    pub(super) fn invoke_gson_fromjson(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        self.gson_fromjson_type(r, receiver, args)
+    }
+}
+
+fn tree_matches_null(tree: &Tree) -> bool {
+    matches!(tree, Tree::Null)
+}
+
+fn gson_scalar_value(tree: &Tree) -> Option<Value> {
+    match tree {
+        Tree::Bool(value) => Some(boolean_value(*value)),
+        Tree::Num(text) => text
+            .parse::<i32>()
+            .map(Value::Int)
+            .or_else(|_| text.parse::<i64>().map(Value::Long))
+            .or_else(|_| text.parse::<f64>().map(Value::Float))
+            .ok(),
+        Tree::Str(text) => Some(Value::Ref(Some(text.clone()))),
+        _ => None,
+    }
+}

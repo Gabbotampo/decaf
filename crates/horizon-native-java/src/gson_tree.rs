@@ -65,7 +65,7 @@
 
 use super::*;
 
-mod parse;
+pub(crate) mod parse;
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";
@@ -701,6 +701,36 @@ fn check_number(number: &Num, lenient: bool) -> NumberCheck {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// Convert a runtime-owned JsonElement into the parser's bounded tree.
+    /// This is the source form for Gson.fromJson(JsonElement, ...).
+    pub(crate) fn gson_tree_to_parse(&self, value: &Value) -> Option<parse::Tree> {
+        let kind = value_kind(value)?;
+        Some(match kind {
+            Kind::Null => parse::Tree::Null,
+            Kind::Object => parse::Tree::Object(
+                self.member_pairs(&self.members_of(crate::jar_object::object_key(value)?)?)
+                    .ok()?
+                    .into_iter()
+                    .map(|(name, value)| Some((name, self.gson_tree_to_parse(&value)?)))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Kind::Array => parse::Tree::Array(
+                self.element_values(&self.elements_of(crate::jar_object::object_key(value)?)?)
+                    .ok()?
+                    .into_iter()
+                    .map(|value| self.gson_tree_to_parse(&value))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            Kind::Primitive => match self.primitive_of(crate::jar_object::object_key(value)?)? {
+                Prim::Str(text) => parse::Tree::Str(text),
+                Prim::Bool(value) => parse::Tree::Bool(value),
+                Prim::Num(value) => parse::Tree::Num(self.number_of(&value)?.text()?),
+            },
+            Kind::Lazy => parse::Tree::Num(self.lazy_text(crate::jar_object::object_key(value)?)?),
+            Kind::Map => return None,
+        })
+    }
+
     /// The Gson tree surface: `JsonElement`'s four kinds,
     /// `LazilyParsedNumber` and `JsonObject.asMap()`'s map. `Ok(None)` leaves
     /// the call to the rest of the dispatch chain.

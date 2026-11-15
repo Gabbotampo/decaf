@@ -27,7 +27,8 @@ const JSON_PARSER: &str = "com/google/gson/JsonParser";
 const MAX_TREE_DEPTH: usize = 255;
 
 /// One parsed JSON value, before it becomes runtime objects.
-enum Tree {
+#[derive(Debug)]
+pub(crate) enum Tree {
     Object(Vec<(String, Tree)>),
     Array(Vec<Tree>),
     Str(String),
@@ -37,7 +38,7 @@ enum Tree {
 }
 
 /// The outcome of reading a document with `JsonReader` in `LENIENT` mode.
-enum Parsed {
+pub(crate) enum Parsed {
     /// Only whitespace and comments: `Streams.parse` answers `JsonNull` and
     /// `Gson.fromJson` answers `null`.
     Empty,
@@ -49,14 +50,14 @@ enum Parsed {
 /// A strict-JSON reader plus the lenient forms whose result is unambiguous:
 /// `//`, `#` and `/* */` comments, unescaped control characters in strings,
 /// and the `\'` escape. Anything else gives up rather than guess.
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     pos: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn parse(text: &'a str) -> Parsed {
+    pub(crate) fn parse(text: &'a str) -> Parsed {
         if text.len() > MAX_GSON_JSON_BYTES {
             return Parsed::Unsupported;
         }
@@ -273,7 +274,7 @@ enum Source {
 impl<H: Host> Runtime<'_, H> {
     /// Runtime objects for one parsed value, as `JsonElementTypeAdapter.read`
     /// builds them.
-    fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
+    pub(crate) fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
         Ok(match tree {
             Tree::Null => null_instance(),
             Tree::Bool(value) => self.new_primitive(Prim::Bool(value)),

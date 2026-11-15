@@ -671,15 +671,20 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
-            // Inert for this runtime: the parser is lenient by its documented
-            // departure (writing does not depend on strictness), nothing here
-            // instantiates through `Unsafe`, and `fromJson` already builds an
-            // object without running a constructor.
+            // `setLenient` remains the documented bounded parser departure;
+            // the reflective fromJson module owns allocation. Strictness is
+            // recorded as counted below because it changes reader errors.
             ("setLenient" | "disableJdkUnsafe", _) => answer(),
             ("setStrictness", _) => {
                 if args.iter().any(|value| matches!(value, Value::Ref(None))) {
                     return Err(npe());
                 }
+                // Strictness changes the JsonReader's accepted language and
+                // its JsonSyntaxException paths; fromJson delegates/counts it
+                // until the reader state is modelled exactly.
+                let mut style = self.gson_style(&marker);
+                style.counted = true;
+                self.set_gson_style(&marker, style);
                 answer()
             }
             _ => Ok(None),
