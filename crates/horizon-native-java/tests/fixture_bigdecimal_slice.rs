@@ -33,6 +33,23 @@ public final class Probe {
             + zero.toPlainString() + "|" + zero.toString() + "|" + zero.scale() + "|"
             + zero.hashCode() + "|" + zeroExp.toString() + "|" + zeroExp.toPlainString();
     }
+
+    public static String reviewEdges() {
+        StringBuilder out = new StringBuilder();
+        for (double value : new double[] { Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY }) {
+            try { BigDecimal.valueOf(value); out.append("no"); }
+            catch (RuntimeException e) { out.append(e.getClass().getSimpleName()).append(':').append(e.getMessage()).append('|'); }
+        }
+        out.append(BigDecimal.valueOf(0) == BigDecimal.valueOf(0)).append('|')
+            .append(BigDecimal.valueOf(1) == BigDecimal.valueOf(1)).append('|')
+            .append(BigDecimal.valueOf(10) == BigDecimal.valueOf(10)).append('|')
+            .append(BigDecimal.valueOf(0, 0) == BigDecimal.ZERO).append('|')
+            .append(BigDecimal.ZERO.stripTrailingZeros() == BigDecimal.ZERO).append('|');
+        try { new BigDecimal("1.2").setScale(0, null); out.append("no"); }
+        catch (RuntimeException e) { out.append(e.getClass().getSimpleName()).append(':').append(e.getMessage()).append('|'); }
+        out.append(BigDecimal.valueOf(Long.MIN_VALUE).hashCode());
+        return out.toString();
+    }
 }
 "#;
 
@@ -135,6 +152,35 @@ fn java25_bigdecimal_slice_matches_the_jdk() {
     assert_eq!(
         text,
         "12.3400|12.3400|1.5|4|6|12.34|12.34|1.24|10.0|true|false|0|3825404|38256|0.00|0.00|2|2|0E+3|0"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn java25_review_edges_match_the_jdk() {
+    let fixture = Fixture::build();
+    let mut host = StdHost::new();
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "reviewEdges",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    let Value::Ref(Some(text)) = answer else {
+        panic!("not text: {answer:?}")
+    };
+    assert_eq!(
+        text,
+        "NumberFormatException:Infinite or NaN|NumberFormatException:Infinite or NaN|NumberFormatException:Infinite or NaN|true|true|true|true|true|NullPointerException:Cannot read field \"oldMode\" because \"roundingMode\" is null|-2147483648"
     );
     assert!(
         host.unknown_host_calls().is_empty(),

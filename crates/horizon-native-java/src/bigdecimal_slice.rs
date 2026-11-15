@@ -9,6 +9,9 @@ use crate::{Host, MethodRef, NativeError, Runtime, Value};
 
 const OWNER: &str = "java/math/BigDecimal";
 const STATE: &str = "|#bigDecimal";
+const CACHE_ZERO: &str = "java/math/BigDecimal#18446744073709551610";
+const CACHE_ONE: &str = "java/math/BigDecimal#18446744073709551611";
+const CACHE_TEN: &str = "java/math/BigDecimal#18446744073709551612";
 
 #[derive(Clone, Debug)]
 struct Decimal {
@@ -260,7 +263,20 @@ fn read<H: Host>(runtime: &Runtime<'_, H>, receiver: &Value) -> Option<Decimal> 
                 digits: parts.next()?.into(),
             })
         }
-        _ => None,
+        _ => match marker {
+            CACHE_ZERO => Some(Decimal::zero()),
+            CACHE_ONE => Some(Decimal {
+                sign: 1,
+                digits: "1".into(),
+                scale: 0,
+            }),
+            CACHE_TEN => Some(Decimal {
+                sign: 1,
+                digits: "10".into(),
+                scale: 0,
+            }),
+            _ => None,
+        },
     }
 }
 fn write<H: Host>(runtime: &mut Runtime<'_, H>, receiver: &Value, value: &Decimal) -> Option<()> {
@@ -275,14 +291,37 @@ fn write<H: Host>(runtime: &mut Runtime<'_, H>, receiver: &Value, value: &Decima
     Some(())
 }
 fn new_value<H: Host>(runtime: &mut Runtime<'_, H>, value: Decimal) -> Value {
+    if let Some(cached) = cached_value(&value) {
+        return cached;
+    }
     let object = runtime.new_object(OWNER);
     let _ = write(runtime, &object, &value);
     object
+}
+
+fn cached_value(value: &Decimal) -> Option<Value> {
+    if value.scale != 0 || value.sign < 0 {
+        return None;
+    }
+    match (value.sign, value.digits.as_str()) {
+        (0, "0") => Some(crate::jar_object::stored(CACHE_ZERO)),
+        (1, "1") => Some(crate::jar_object::stored(CACHE_ONE)),
+        (1, "10") => Some(crate::jar_object::stored(CACHE_TEN)),
+        _ => None,
+    }
 }
 fn rounding_mode(value: Option<&Value>) -> Option<&str> {
     value.and_then(crate::host_jdk_constant::rounding_mode_name)
 }
 pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
+    if r.owner == OWNER && r.descriptor == "Ljava/math/BigDecimal;" {
+        return match r.name.as_str() {
+            "ZERO" => Some(crate::jar_object::stored(CACHE_ZERO)),
+            "ONE" => Some(crate::jar_object::stored(CACHE_ONE)),
+            "TEN" => Some(crate::jar_object::stored(CACHE_TEN)),
+            _ => None,
+        };
+    }
     if r.owner == "java/math/RoundingMode"
         && r.descriptor == "Ljava/math/RoundingMode;"
         && matches!(
@@ -304,7 +343,7 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
 fn bad_number() -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/NumberFormatException".into(),
-        message: None,
+        message: Some("Infinite or NaN".into()),
         frame: None,
     }
 }
@@ -415,6 +454,15 @@ pub(crate) fn instance_call<H: Host>(
                 Some(Value::Int(v)) => i64::from(*v),
                 _ => return Some(Err(bad_number())),
             };
+            if matches!(args.get(1), Some(Value::Ref(None))) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot read field \"oldMode\" because \"roundingMode\" is null".into(),
+                    ),
+                    frame: None,
+                }));
+            }
             let mode = rounding_mode(args.get(1)).unwrap_or("UNNECESSARY");
             value.set_scale(scale, mode).map(|v| new_value(runtime, v))
         }
@@ -460,7 +508,7 @@ fn big_integer_hash(digits: &str, sign: i8) -> i32 {
     for word in words.iter().rev() {
         hash = hash.wrapping_mul(31).wrapping_add(*word as i32);
     }
-    if sign < 0 { -hash } else { hash }
+    if sign < 0 { hash.wrapping_neg() } else { hash }
 }
 fn big_decimal_hash(value: &Decimal) -> i32 {
     big_integer_hash(&value.digits, value.sign)
