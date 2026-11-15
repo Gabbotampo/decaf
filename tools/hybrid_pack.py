@@ -238,48 +238,7 @@ class Declaration:
     error: str = ""
 
 
-_VERSION_TOKEN = re.compile(r"\d+|[A-Za-z]+")
 _MAVEN_SET = re.compile(r"([\[(])\s*([^,\]]*)\s*,\s*([^\])]*)\s*([\])])")
-
-
-def _fabric_version(value: str) -> tuple[tuple[int, ...], str | None]:
-    """Fabric's SemanticVersion components, with build metadata discarded."""
-    core = value.strip().split("+", 1)[0]
-    base, _, prerelease = core.partition("-")
-    try:
-        return tuple(int(component) for component in base.split(".")), prerelease or None
-    except ValueError:
-        raise ValueError(f"invalid semantic version {value!r}")
-
-
-def _compare_prerelease(left: str | None, right: str | None) -> int:
-    if left == right:
-        return 0
-    if left is None:
-        return 1
-    if right is None:
-        return -1
-    for a, b in zip(left.split("."), right.split(".")):
-        if a == b:
-            continue
-        if a.isdigit() and b.isdigit():
-            return 1 if int(a) > int(b) else -1
-        if a.isdigit() != b.isdigit():
-            return -1 if a.isdigit() else 1
-        return 1 if a < b else -1
-    return (len(left.split(".")) > len(right.split("."))) - (
-        len(left.split(".")) < len(right.split(".")))
-
-
-def _compare_fabric_versions(left: str, right: str) -> int:
-    left_components, left_pre = _fabric_version(left)
-    right_components, right_pre = _fabric_version(right)
-    for index in range(max(len(left_components), len(right_components))):
-        a = left_components[index] if index < len(left_components) else 0
-        b = right_components[index] if index < len(right_components) else 0
-        if a != b:
-            return 1 if a > b else -1
-    return _compare_prerelease(left_pre, right_pre)
 
 
 def _maven_tokens(version: str) -> tuple[object, ...]:
@@ -312,53 +271,6 @@ def _compare_maven_versions(left: str, right: str) -> int:
     return 0
 
 
-def _fabric_predicate(version: str, expression: str) -> bool:
-    expression = expression.strip()
-    if expression in ("", "*"):
-        return True
-    operator = "="
-    for candidate in (">=", "<=", ">", "<", "=", "~", "^"):
-        if expression.startswith(candidate):
-            operator, expression = candidate, expression[len(candidate):].strip()
-            break
-    wildcard = any(part.lower() in ("x", "*") for part in expression.split("."))
-    if wildcard:
-        if operator != "=":
-            return False
-        try:
-            candidate, _ = _fabric_version(version)
-        except ValueError:
-            return False
-        parts = expression.split(".")
-        return all(part.lower() in ("x", "*") or int(part) == candidate[index]
-                   for index, part in enumerate(parts))
-    try:
-        reference, _ = _fabric_version(expression)
-    except ValueError:
-        return False
-    try:
-        comparison = _compare_fabric_versions(version, expression)
-    except ValueError:
-        return False
-    if operator == "=":
-        return comparison == 0
-    if operator == ">=":
-        return comparison >= 0
-    if operator == "<=":
-        return comparison <= 0
-    if operator == ">":
-        return comparison > 0
-    if operator == "<":
-        return comparison < 0
-    if operator == "^":
-        upper = f"{reference[0] + 1}.0"
-        return comparison >= 0 and _compare_fabric_versions(version, upper) < 0
-    # Fabric's tilde always advances the minor component; a one-component
-    # reference therefore has an implicit `.0` before the upper bound.
-    upper = f"{reference[0]}.{(reference[1] if len(reference) > 1 else 0) + 1}"
-    return comparison >= 0 and _compare_fabric_versions(version, upper) < 0
-
-
 def _maven_interval(version: str, expression: str) -> bool:
     match = _MAVEN_SET.fullmatch(expression.strip())
     if not match:
@@ -376,20 +288,17 @@ def _maven_interval(version: str, expression: str) -> bool:
     return True
 
 
-def version_satisfies(version: str, requirement: str | tuple[str, ...]) -> bool:
-    """Match Fabric Loader 0.19.5 or NeoForge Maven version predicates."""
+def maven_version_satisfies(version: str, requirement: str | tuple[str, ...]) -> bool:
+    """Match NeoForge's Maven VersionRange syntax. Fabric is oracle-backed."""
     if isinstance(requirement, (tuple, list)):
-        return any(version_satisfies(version, item) for item in requirement)
+        return any(maven_version_satisfies(version, item) for item in requirement)
     expression = (requirement or "*").strip()
     if expression in ("", "*"):
         return True
-    # NeoForge's VersionRange permits a comma-separated list of complete sets;
-    # Fabric's comma-separated predicate terms are also OR alternatives.
     if expression.startswith(("[", "(")):
-        intervals = [item for item in re.findall(r"[\[(][^\])]+[\])]", expression)]
+        intervals = re.findall(r"[\[(][^\])]+[\])]", expression)
         return any(_maven_interval(version, item) for item in intervals) if intervals else False
-    return any(_fabric_predicate(version, item) for item in expression.split(","))
-
+    return _maven_interval(version, expression)
 
 def _lenient_json(text: str) -> str:
     """Escape raw control characters inside JSON strings, as the native reader does."""
@@ -691,7 +600,7 @@ def _dependency_targets(jar: PackJar, pack_by_id: dict[str, list[PackJar]]) -> l
         if key in PLATFORM_IDS:
             continue
         targets.extend(target for target in pack_by_id.get(key, [])
-                       if version_satisfies(target.declaration.version, requirement))
+                       if maven_version_satisfies(target.declaration.version, requirement))
     return targets
 
 
@@ -1735,7 +1644,7 @@ def _closure(batch: list[PackJar], index: dict[str, list[PackJar]]) -> list[Pack
                          and provider.mod_id.lower() not in ids]
             predicates = tuple(by_id.get(key, ("*",)))
             providers = [provider for provider in providers
-                         if version_satisfies(provider.declaration.version, predicates)]
+                         if maven_version_satisfies(provider.declaration.version, predicates)]
             if not providers:
                 continue
             provider = providers[0]

@@ -432,7 +432,8 @@ def canonical_provider(providers: list[hybrid_pack.PackJar]) -> hybrid_pack.Pack
 
 
 def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
-                       declaration: hybrid_pack.Declaration | None = None) -> Closure:
+                       declaration: hybrid_pack.Declaration | None = None,
+                       version_matcher=None) -> Closure:
     """The declared dependency closure of `jar`, resolved against `index`.
 
     Every required id is satisfied by the platform (`minecraft`, `fabricloader`,
@@ -444,6 +445,7 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
     linked as a host and the census reports the unresolved id.
     """
     root = declaration or hybrid_pack.read_declaration(jar)
+    version_matcher = version_matcher or hybrid_pack.maven_version_satisfies
     target = hybrid_pack.PackJar(jar, None, root)
     held = {target.mod_id.lower()} | {ident.lower() for ident in root.nested_ids}
     chosen: dict[Path, hybrid_pack.PackJar] = {}
@@ -467,7 +469,7 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
                          if provider.path.resolve() != jar.resolve()
                          and provider.path not in chosen
                          and provider.mod_id.lower() not in held
-                         and hybrid_pack.version_satisfies(provider.declaration.version, predicates)]
+                         and version_matcher(provider.declaration.version, predicates)]
             if not providers:
                 missing.setdefault(key, current.mod_id)
                 missing_requirements.setdefault(key, (current.mod_id, ", ".join(predicates)))

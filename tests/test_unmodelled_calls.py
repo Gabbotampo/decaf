@@ -2,6 +2,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 import tempfile
 import sys
 import unittest
@@ -20,6 +21,33 @@ sys.path[:] = _before
 
 
 class UnmodelledCallsTests(unittest.TestCase):
+    FABRIC_REVIEW_PAIRS = {
+        (">=0.14.3 <1.0.0", "0.15.2+26.3"): True,
+        (">=0.6.3 <1.0.0", "0.6.10"): True,
+        (">=0.6.3 <1.0.0", "0.6.8"): True,
+        (">=0.9.3- <=0.9.3", "0.9.3-alpha.1+mc26.3"): True,
+        (">=0.9.3- <=0.9.3", "0.9.3-beta.1+mc26.3"): True,
+        (">=1.0.0+26.x", "1.0.0+26.x"): True,
+        (">=1.1.17 <1.2.0", "1.1.25"): True,
+        (">=1.9.3", "unspecified"): None,
+        (">=2.3.1+26.3.x", "2.3.1+26.3.x"): True,
+        (">=6.9.0 <6.10", "6.9.0"): True,
+    }
+
+    def test_real_loader_review_pairs_are_recorded(self):
+        """Answers came from Fabric Loader 0.19.5's Java harness in rc265-review."""
+        loader = os.environ.get("FABRIC_LOADER_0195")
+        if not loader:
+            self.skipTest("set FABRIC_LOADER_0195 for the real Java oracle")
+        oracle = TOOL.FabricPredicateOracle(Path(loader))
+        valid = {pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items() if answer is not None}
+        oracle.evaluate(valid)
+        self.assertEqual({pair: oracle.cache[pair] for pair in valid},
+                         {pair: answer for pair, answer in self.FABRIC_REVIEW_PAIRS.items()
+                          if answer is not None})
+        with self.assertRaises(TOOL.FabricOracleUnavailable):
+            oracle.evaluate({pair for pair, answer in self.FABRIC_REVIEW_PAIRS.items()
+                             if answer is None})
     def test_aggregate_counts_jars_calls_and_sole_rows(self):
         corpora = {
             "wide": [
@@ -165,7 +193,8 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(by_mode["alone"]["verdict"], "ran-hollow")
         self.assertEqual(by_mode["alone"]["unknown"], 1)
         self.assertEqual(by_mode["closure"]["verdict"], "refused")
-        self.assertIn("missing dependency absent", by_mode["closure"]["error"])
+        self.assertIn("Fabric dependency predicate oracle unavailable",
+                      by_mode["closure"]["error"])
         self.assertEqual(report["totals"]["alone"]["wide"]["ran-hollow"], 1)
         self.assertNotIn("refused", report["totals"]["closure"]["wide"])
         self.assertEqual(len(report["corpora"]["wide"]["closure_regressions"]), 1)

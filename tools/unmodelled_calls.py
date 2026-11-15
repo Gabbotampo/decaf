@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -59,6 +60,95 @@ DEFAULT_CORPORA = (
 )
 PROBE_TIMEOUT = 180.0
 MAX_REPORTED = 400
+FABRIC_LOADER_NAME = "fabric-loader-0.19.5.jar"
+
+
+class FabricOracleUnavailable(RuntimeError):
+    pass
+
+
+class FabricPredicateOracle:
+    """Batch the exact Fabric Loader 0.19.5 predicate oracle once per run."""
+
+    def __init__(self, loader: Path):
+        self.loader = loader
+        self.cache: dict[tuple[str, str], bool] = {}
+        self.java = shutil.which("java")
+        self.javac = shutil.which("javac")
+        if not self.java or not self.javac:
+            raise FabricOracleUnavailable("Java 25 (java and javac) is unavailable")
+        source = ROOT / "tools" / "FabricPredicateOracle.java"
+        cache = Path.home() / ".cache" / "horizon-java" / "fabric-predicate-oracle"
+        cache.mkdir(parents=True, exist_ok=True)
+        class_file = cache / "FabricPredicateOracle.class"
+        if not class_file.is_file() or class_file.stat().st_mtime < source.stat().st_mtime:
+            result = subprocess.run(
+                [self.javac, "--release", "21", "-cp", str(loader), "-d", str(cache), str(source)],
+                capture_output=True, text=True, check=False,
+            )
+            if result.returncode:
+                raise FabricOracleUnavailable(
+                    f"could not compile Fabric predicate oracle: {(result.stderr or result.stdout).strip()[-300:]}"
+                )
+        self.class_path = cache
+
+    def evaluate(self, pairs: set[tuple[str, str]]) -> None:
+        pending = sorted(pair for pair in pairs if pair not in self.cache)
+        if not pending:
+            return
+        lines = "".join(json.dumps({"predicate": predicate, "version": version}) + "\n"
+                        for predicate, version in pending)
+        result = subprocess.run(
+            [self.java, "-cp", os.pathsep.join((str(self.loader), str(self.class_path))),
+             "FabricPredicateOracle", str(self.loader)],
+            input=lines, capture_output=True, text=True, check=False,
+        )
+        if result.returncode:
+            raise FabricOracleUnavailable(
+                f"Fabric predicate oracle failed: {(result.stderr or result.stdout).strip()[-300:]}"
+            )
+        answers = []
+        for raw in result.stdout.splitlines():
+            try:
+                answers.append(json.loads(raw))
+            except ValueError as error:
+                raise FabricOracleUnavailable(f"invalid Fabric oracle output: {raw[:200]}") from error
+        if len(answers) != len(pending):
+            raise FabricOracleUnavailable("Fabric predicate oracle returned the wrong number of answers")
+        for pair, answer in zip(pending, answers):
+            if "error" in answer:
+                raise FabricOracleUnavailable(
+                    f"Fabric predicate parse error for {pair[0]!r}: {answer['error']}"
+                )
+            self.cache[pair] = bool(answer.get("ok"))
+
+    def matches(self, version: str, predicates: tuple[str, ...]) -> bool:
+        pairs = {(predicate, version) for predicate in predicates}
+        self.evaluate(pairs)
+        return any(self.cache[pair] for pair in pairs)
+
+
+def find_fabric_loader(corpora: list[tuple[str, Path]], explicit: Path | None) -> Path | None:
+    candidates = [explicit] if explicit else []
+    for _, directory in corpora:
+        candidates.append(directory / FABRIC_LOADER_NAME)
+        candidates.extend(directory.glob(f"**/{FABRIC_LOADER_NAME}"))
+    candidates.extend(path / FABRIC_LOADER_NAME for path in ledger.DEFAULT_DEP_DIRS)
+    for candidate in candidates:
+        if candidate and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def fabric_pairs(index: dict[str, list]) -> set[tuple[str, str]]:
+    pairs = set()
+    for providers in index.values():
+        for provider in providers:
+            requirements = provider.declaration.requirements
+            for dependency, predicate in requirements:
+                for candidate in index.get(dependency.lower(), []):
+                    pairs.add((predicate, candidate.declaration.version))
+    return pairs
 
 
 def parse_corpus(value: str) -> tuple[str, Path]:
@@ -237,6 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=0,
                         help="probe at most N jars per corpus (0 = all)")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--fabric-loader", type=Path,
+                        help="path to the real Fabric Loader 0.19.5 jar")
     parser.add_argument("--dependency-mode", choices=("both", "alone", "closure"),
                         default="both", help="run alone, closure, or both (default: both)")
     return parser
@@ -267,6 +359,23 @@ def main(argv: list[str] | None = None) -> int:
                               if str(path) not in {str(d) for d in provider_dirs}]
         indexes[name] = ledger.provider_index(ledger.corpus_jars(provider_dirs))
 
+    fabric_oracle: FabricPredicateOracle | None = None
+    fabric_oracle_error = ""
+    if any(name != "neoforge" for name, _ in corpora):
+        loader = find_fabric_loader(corpora, args.fabric_loader)
+        if loader is None:
+            fabric_oracle_error = f"missing {FABRIC_LOADER_NAME}"
+        else:
+            try:
+                fabric_oracle = FabricPredicateOracle(loader)
+                pairs = set()
+                for name, _ in corpora:
+                    if name != "neoforge":
+                        pairs.update(fabric_pairs(indexes[name]))
+                fabric_oracle.evaluate(pairs)
+            except FabricOracleUnavailable as error:
+                fabric_oracle_error = str(error)
+
     report: dict[str, dict] = {}
     for name, directory in corpora:
         index = indexes[name]
@@ -284,19 +393,28 @@ def main(argv: list[str] | None = None) -> int:
                     rows.append({"jar": jar.name, "mode": mode, "verdict": "skipped",
                                  "reason": "no server entrypoint"})
                 continue
-            closure = ledger.dependency_closure(jar, index)
+            closure_error = ""
+            if name != "neoforge" and fabric_oracle_error:
+                closure = ledger.Closure()
+                closure_error = f"Fabric dependency predicate oracle unavailable: {fabric_oracle_error}"
+            else:
+                matcher = (fabric_oracle.matches if name != "neoforge"
+                           else hybrid_pack.maven_version_satisfies)
+                closure = ledger.dependency_closure(jar, index, version_matcher=matcher)
             missing = list(closure.missing)
             requirements = closure.missing_requirements
             modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
             for mode in modes:
                 if mode == "alone":
-                    todo.append((jar, kind, [], [], (), mode))
+                    todo.append((jar, kind, [], [], (), mode, ""))
                 else:
-                    todo.append((jar, kind, list(closure.jars), missing, requirements, mode))
+                    todo.append((jar, kind, list(closure.jars), missing, requirements, mode, closure_error))
 
         def run(item):
-            jar, kind, deps, missing, requirements, mode = item
-            if missing:
+            jar, kind, deps, missing, requirements, mode, closure_error = item
+            if closure_error:
+                result = {"status": "refused", "stage": "dependency", "error": closure_error}
+            elif missing:
                 result = {"status": "refused", "stage": "dependency",
                           "error": missing_reason(missing, requirements)}
             else:
