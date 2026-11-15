@@ -158,6 +158,14 @@ fn map_ref(name: &str, descriptor: &str) -> MethodRef {
     }
 }
 
+fn collection_ref(owner: &str, name: &str, descriptor: &str) -> MethodRef {
+    MethodRef {
+        owner: owner.into(),
+        name: name.into(),
+        descriptor: descriptor.into(),
+    }
+}
+
 fn thrown(class: &str, message: Option<String>) -> NativeError {
     NativeError::UncaughtException {
         class: class.into(),

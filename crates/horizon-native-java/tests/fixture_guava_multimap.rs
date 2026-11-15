@@ -39,10 +39,34 @@ fn real_guava_multimaps_match_java25() {
         assert_eq!(fixture.text_on(&mut host, method), expected, "{method}");
     }
     assert_eq!(fixture.text_on(&mut host, "sync"), "true");
+    assert_eq!(fixture.text_on(&mut host, "excluded"), "done");
     assert_eq!(
         host.unknown_host_call_count(),
-        0,
+        17,
         "{:?}",
         host.unknown_host_calls()
     );
+    for method in [
+        "asMap",
+        "entries",
+        "keySet",
+        "keys",
+        "values",
+        "replaceValues",
+        "removeAll",
+        "equals",
+        "toString",
+        "containsKey",
+        "containsEntry",
+        "put",
+        "remove",
+    ] {
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call.contains(&format!("#{method}"))),
+            "excluded method {method} was not counted: {:?}",
+            host.unknown_host_calls()
+        );
+    }
 }
