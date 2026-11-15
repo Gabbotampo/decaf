@@ -1,0 +1,1 @@
+T|true|HTTP_2|NEVER|5|HTTP_1_1|ALWAYS|https://example.com/b|GET|missing-uri|bad-header|bad-value|no-error

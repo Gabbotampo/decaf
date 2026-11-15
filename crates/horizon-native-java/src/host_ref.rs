@@ -477,6 +477,14 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1989,6 +1997,42 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::http_client::REQUEST_BUILDER_METHODS,
     },
 ];
 

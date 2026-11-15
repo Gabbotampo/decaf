@@ -109,6 +109,7 @@ mod host_service;
 mod host_services;
 mod host_type_token;
 mod host_watch;
+mod http_client;
 mod immutable_collections;
 mod iteration_guard;
 mod jar_compare;
@@ -5323,6 +5324,9 @@ impl Host for StdHost {
         if let Some(value) = self.client_static(r) {
             return value;
         }
+        if let Some(value) = http_client::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
+        }
         if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
             return Ok(value);
         }
@@ -5508,6 +5512,9 @@ impl Host for StdHost {
         }
         // Command builders, argument types and a running command's getters.
         if let Some(value) = self.brigadier_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = http_client::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = jdk_model::static_call(r, args) {
@@ -6807,6 +6814,9 @@ impl Host for StdHost {
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = http_client::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
