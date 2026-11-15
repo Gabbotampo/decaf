@@ -285,4 +285,3 @@ fn a_string_cast_to_a_singleton_type_is_never_the_object() {
         }
     }
 }
-
