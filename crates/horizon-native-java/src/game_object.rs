@@ -199,6 +199,7 @@ pub(crate) fn handle_only_class(class: &str) -> bool {
         "net/minecraft/network/chat/Style"
             | "net/minecraft/network/chat/TextColor"
             | "net/minecraft/client/KeyMapping$Category"
+            | "net/minecraft/world/phys/Vec3"
             | "net/minecraft/client/Minecraft"
             | "net/minecraft/client/Options"
             | "net/minecraft/client/gui/Gui"
