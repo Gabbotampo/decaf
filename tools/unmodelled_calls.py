@@ -17,12 +17,12 @@ aggregates the probe's `unknown_host_calls`:
 
 A Fabric jar runs every server stage it declares, in the loader's order
 (`Hooks.startServer`: `main`, then `server`), passed to the probe as
-`main,server`; a NeoForge jar runs its `@Mod` classes. The verdict is the one
-the game's mod gives (`verdict.rs`): `ran-clean` when every stage ran with no
-unknown host call, `ran-hollow` with at least one, `ran-partial` when a stage
-failed and another ran, `refused` when nothing ran. A jar with no server-side
-entrypoint is `skipped` (client-only or a library, out of scope for a server
-run).
+`main,server`; a NeoForge jar runs its `@Mod` classes. With `--role client`,
+Fabric runs `main,client` and NeoForge runs client-side `@Mod` classes. The
+verdict is the one the game's mod gives (`verdict.rs`): `ran-clean` when every
+stage ran with no unknown host call, `ran-hollow` with at least one,
+`ran-partial` when a stage failed and another ran, `refused` when nothing ran.
+A jar with no entrypoint for the selected role is `skipped` with its reason.
 
 Default corpora: the Fabric `~/horizon-corpus/{corpus-xl,mega}` and the NeoForge
 jars pinned by `tools/real_mod_fixtures/neoforge_corpus.lock.json`. Nothing is
@@ -87,9 +87,10 @@ def corpus_jars(name: str, directory: Path) -> list[Path]:
 
 
 SERVER_STAGES = ("main", "server")
+CLIENT_STAGES = ("main", "client")
 
 
-def entrypoint_kind(path: Path, corpus: str) -> str | None:
+def entrypoint_kind(path: Path, corpus: str, role: str = "server") -> str | None:
     """The stages a dedicated server runs for this jar, comma-joined in loader order.
 
     Fabric Loader's `Hooks.startServer` invokes every `main` entrypoint, then
@@ -97,10 +98,17 @@ def entrypoint_kind(path: Path, corpus: str) -> str | None:
     same since #31). A jar without Fabric server stages runs its NeoForge
     `@Mod` classes.
     """
-    if corpus == "neoforge":
-        return "neoforge"
-    entrypoints = ledger.read_jar_entrypoints(path)
+    entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
     if entrypoints is None:
+        return None
+    if role == "client":
+        if corpus == "neoforge":
+            return "neoforge-client" if entrypoints.neoforge else None
+        stages = [kind for kind in CLIENT_STAGES if kind in entrypoints.kinds]
+        return ",".join(stages) if stages else None
+    if entrypoints.neoforge_client_only or (
+        entrypoints.client_side_only and corpus != "neoforge"
+    ):
         return None
     stages = [kind for kind in SERVER_STAGES if kind in entrypoints.kinds]
     if stages:
@@ -108,6 +116,46 @@ def entrypoint_kind(path: Path, corpus: str) -> str | None:
     if entrypoints.neoforge:
         return "neoforge"
     return None
+
+
+def classify_client(path: Path, corpus: str) -> tuple[str, str | None, str]:
+    """Return `(role, probe kind, reason)` for one physical-client row."""
+    entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
+    if entrypoints is None:
+        return "unreadable", None, "metadata unreadable"
+    if corpus == "neoforge":
+        if not entrypoints.neoforge:
+            return "library", None, "no @Mod class"
+        if entrypoints.neoforge_client_only:
+            return "client-only", "neoforge-client", "client-only @Mod"
+        return "neo-client", "neoforge-client", ""
+    kinds = set(entrypoints.kinds)
+    stages = [kind for kind in CLIENT_STAGES if kind in kinds]
+    if entrypoints.client_side_only:
+        if stages:
+            return "client-only", ",".join(stages), "environment: client"
+        return "client-only-noentry", None, "environment: client"
+    if "client" not in kinds:
+        return "library", None, "no client entrypoint"
+    if "main" not in kinds and "server" not in kinds:
+        return "client-only", ",".join(stages), "client entrypoint only"
+    return "dual-client", ",".join(stages), ""
+
+
+def classify_server_skip(path: Path, corpus: str) -> str:
+    """Explain why the server role did not run a jar."""
+    entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
+    if entrypoints is None:
+        return "metadata unreadable"
+    if ((entrypoints.client_side_only and corpus != "neoforge")
+            or entrypoints.neoforge_client_only
+            or entrypoints.kinds and "client" in entrypoints.kinds):
+        return "client-only"
+    if corpus == "neoforge" and not entrypoints.neoforge:
+        return "library (no @Mod class)"
+    if not entrypoints.kinds and not entrypoints.neoforge:
+        return "library"
+    return "no server entrypoint"
 
 
 def row_verdict(result: dict) -> str:
@@ -153,6 +201,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe", type=Path,
                         default=ROOT / "target" / "fast" / "horizon-native-java")
     parser.add_argument("--game-version", default="26.3")
+    parser.add_argument("--role", choices=("server", "client"), default="server",
+                        help="execution role (server by default; client runs the physical client census)")
     parser.add_argument("--json", type=Path, help="write the full per-jar report here")
     parser.add_argument("--limit", type=int, default=0,
                         help="probe at most N jars per corpus (0 = all)")
@@ -195,21 +245,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{name}: {len(jars)} jars", file=sys.stderr)
         todo = []
         for jar in jars:
-            kind = entrypoint_kind(jar, name)
+            if args.role == "client":
+                jar_role, kind, reason = classify_client(jar, name)
+            else:
+                jar_role, reason = None, classify_server_skip(jar, name)
+                kind = entrypoint_kind(jar, name, args.role)
             if kind is None:
-                rows.append({"jar": jar.name, "verdict": "skipped",
-                             "reason": "no server entrypoint"})
+                row = {"jar": jar.name, "verdict": "skipped", "reason": reason}
+                if jar_role:
+                    row["role"] = jar_role
+                rows.append(row)
                 continue
             closure = ledger.dependency_closure(jar, index)
-            todo.append((jar, kind, list(closure.jars), [key for key, _ in closure.missing]))
+            todo.append((jar, kind, jar_role, list(closure.jars),
+                         [key for key, _ in closure.missing]))
 
         def run(item):
-            jar, kind, deps, missing = item
+            jar, kind, jar_role, deps, missing = item
             return jar, kind, deps, missing, probe_one(probe, jar, kind, deps,
-                                                      args.game_version)
+                                                      args.game_version), jar_role
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            for jar, kind, deps, missing, result in pool.map(run, todo):
+            for jar, kind, deps, missing, result, jar_role in pool.map(run, todo):
                 status = result.get("status")
                 if status == "ok":
                     unknown = result.get("unknown_host_call_count")
@@ -226,6 +283,11 @@ def main(argv: list[str] | None = None) -> int:
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
                     }
+                    if jar_role:
+                        row["role"] = jar_role
+                    for field in ("client_keys", "hud_layers", "listeners", "unfired", "refused", "frame"):
+                        if field in result:
+                            row[field] = result[field]
                     if result.get("failed"):
                         row["failed"] = [str(item)[:400] for item in result["failed"]]
                     rows.append(row)
@@ -239,6 +301,8 @@ def main(argv: list[str] | None = None) -> int:
                         "deps": [dep.name for dep in deps],
                         "missing": missing,
                     }
+                    if jar_role:
+                        row["role"] = jar_role
                     # The calls the jar counted before it stopped. Kept for
                     # reading why it was refused; the ranking and totals stay
                     # over runs that finished, so they are not aggregated.

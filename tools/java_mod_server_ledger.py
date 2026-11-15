@@ -144,6 +144,133 @@ NEOFORGE_MOD_ANNOTATIONS = (
 )
 
 
+def _u2(data: bytes, offset: int) -> tuple[int, int]:
+    return int.from_bytes(data[offset:offset + 2], "big"), offset + 2
+
+
+def _skip_element(data: bytes, offset: int) -> int:
+    tag = chr(data[offset])
+    offset += 1
+    if tag in "BCDFIJSZs":
+        return offset + 2
+    if tag == "e":
+        return offset + 4
+    if tag == "c":
+        return offset + 2
+    if tag == "@":
+        return _skip_annotation(data, offset)
+    if tag == "[":
+        count, offset = _u2(data, offset)
+        for _ in range(count):
+            offset = _skip_element(data, offset)
+        return offset
+    return len(data)
+
+
+def _skip_annotation(data: bytes, offset: int) -> int:
+    _, offset = _u2(data, offset)  # annotation type
+    count, offset = _u2(data, offset)
+    for _ in range(count):
+        offset += 2  # element name
+        offset = _skip_element(data, offset)
+    return offset
+
+
+def neoforge_mod_dist(data: bytes) -> bool | None:
+    """Return whether the class has @Mod and is Dist.CLIENT-only.
+
+    This reads only class-level runtime annotations.  Looking for `CLIENT` in
+    a constant pool is not enough: common Forge classes call `Dist.CLIENT`
+    without being client-only @Mod containers.
+    """
+    if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
+        return None
+    try:
+        cp_count = int.from_bytes(data[8:10], "big")
+        cp: list[object | None] = [None] * cp_count
+        offset = 10
+        index = 1
+        while index < cp_count:
+            tag = data[offset]
+            offset += 1
+            if tag == 1:
+                length, offset = _u2(data, offset)
+                cp[index] = data[offset:offset + length].decode("utf-8", "replace")
+                offset += length
+            elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
+                offset += 4
+            elif tag in (5, 6):
+                offset += 8
+                index += 1
+            elif tag in (7, 8, 16, 19, 20):
+                value, offset = _u2(data, offset)
+                cp[index] = value
+            elif tag == 15:
+                offset += 3
+            else:
+                return None
+            index += 1
+        offset += 6  # access flags, this class, super class
+        interfaces, offset = _u2(data, offset)
+        offset += 2 * interfaces
+        fields, offset = _u2(data, offset)
+        for _ in range(fields):
+            offset += 6
+            count, offset = _u2(data, offset)
+            for _ in range(count):
+                offset += 2
+                length = int.from_bytes(data[offset:offset + 4], "big")
+                offset += 4 + length
+        methods, offset = _u2(data, offset)
+        for _ in range(methods):
+            offset += 6
+            count, offset = _u2(data, offset)
+            for _ in range(count):
+                offset += 2
+                length = int.from_bytes(data[offset:offset + 4], "big")
+                offset += 4 + length
+        attributes, offset = _u2(data, offset)
+        for _ in range(attributes):
+            name_index, offset = _u2(data, offset)
+            length = int.from_bytes(data[offset:offset + 4], "big")
+            offset += 4
+            name = cp[name_index]
+            if name not in ("RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations"):
+                offset += length
+                continue
+            end = offset + length
+            count, cursor = _u2(data, offset)
+            for _ in range(count):
+                type_index, cursor = _u2(data, cursor)
+                descriptor = cp[type_index]
+                pairs, cursor = _u2(data, cursor)
+                is_mod = descriptor in ("Lnet/neoforged/fml/common/Mod;",
+                                        "Lnet/minecraftforge/fml/common/Mod;")
+                client = False
+                for _ in range(pairs):
+                    element_name, cursor = _u2(data, cursor)
+                    tag = chr(data[cursor])
+                    value_start = cursor + 1
+                    if is_mod and cp[element_name] == "dist" and tag == "[":
+                        values, value_start = _u2(data, value_start)
+                        for _ in range(values):
+                            if data[value_start:value_start + 1] == b"e":
+                                enum_type, value_start = _u2(data, value_start + 1)
+                                enum_name, value_start = _u2(data, value_start)
+                                client |= cp[enum_name] == "CLIENT"
+                            else:
+                                value_start = _skip_element(data, value_start)
+                        cursor = value_start
+                    else:
+                        cursor = _skip_element(data, cursor)
+                if is_mod:
+                    return client
+            offset = end
+    except (IndexError, UnicodeError, ValueError):
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class JarEntrypoints:
     """Loader entrypoints read from a jar without running it."""
@@ -151,6 +278,11 @@ class JarEntrypoints:
     kinds: tuple[str, ...] = ()
     neoforge: bool = False
     client_side_only: bool = False
+    # NeoForge/Forge @Mod classes all declare Dist.CLIENT.  This is separate
+    # from the TOML `clientSideOnly` flag: the native scanner uses the
+    # annotation on each @Mod class to decide which physical side constructs
+    # it.
+    neoforge_client_only: bool = False
 
     @property
     def server(self) -> bool:
@@ -279,7 +411,7 @@ def fabric_entrypoint_kinds(obj: dict) -> tuple[str, ...]:
     return tuple(sorted(kinds))
 
 
-def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
+def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> JarEntrypoints | None:
     """Read a jar's loader metadata; None when the jar cannot be read.
 
     This mirrors the native reader's rule: Fabric entrypoint keys, NeoForge
@@ -292,7 +424,7 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
         with zipfile.ZipFile(path) as jar:
             names = jar.namelist()
             kinds: tuple[str, ...] = ()
-            if "fabric.mod.json" in names:
+            if "fabric.mod.json" in names and not force_neoforge:
                 raw = jar.read("fabric.mod.json").decode("utf-8", errors="replace")
                 obj = json.loads(lenient_json_text(raw))
                 if not isinstance(obj, dict):
@@ -311,17 +443,20 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                         re.search(r"(?im)^\s*clientSideOnly\s*=\s*[\"']?true[\"']?\s*$", text)
                     )
                     break
-            if client_side_only or any(kind in SERVER_ENTRYPOINT_KINDS for kind in kinds):
+            if (client_side_only and not force_neoforge) or (
+                not force_neoforge and any(kind in SERVER_ENTRYPOINT_KINDS for kind in kinds)
+            ):
                 # The server has something to execute (or the jar says it is
                 # client-only); no class scan can change that verdict.
                 return JarEntrypoints(kinds, False, client_side_only)
-            if "fabric.mod.json" in names:
+            if "fabric.mod.json" in names and not force_neoforge:
                 # A jar with Fabric metadata runs only its Fabric entrypoints,
                 # as on Fabric Loader, which never reads `@Mod`; a universal
                 # jar's NeoForge class is not a server entrypoint
                 # (`entrypoint_role.rs`).
                 return JarEntrypoints(kinds, False, client_side_only)
             neoforge = False
+            mod_dists: list[bool] = []
             for name in names:
                 if (
                     not name.endswith(".class")
@@ -331,10 +466,21 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                 ):
                     continue
                 data = jar.read(name)
-                if any(marker in data for marker in NEOFORGE_MOD_ANNOTATIONS):
+                mod_dist = neoforge_mod_dist(data)
+                if mod_dist is None and any(marker in data for marker in NEOFORGE_MOD_ANNOTATIONS):
+                    # Minimal synthetic class files used by the ledger tests
+                    # carry the annotation descriptor without an attributes
+                    # table.  Keep the conservative both-sided answer.
+                    mod_dist = False
+                if mod_dist is not None:
                     neoforge = True
-                    break
-            return JarEntrypoints(kinds, neoforge, client_side_only)
+                    mod_dists.append(mod_dist)
+            return JarEntrypoints(
+                kinds,
+                neoforge,
+                client_side_only,
+                neoforge and bool(mod_dists) and all(mod_dists),
+            )
     except (OSError, ValueError, KeyError, EOFError, RuntimeError, zipfile.BadZipFile):
         return None
 

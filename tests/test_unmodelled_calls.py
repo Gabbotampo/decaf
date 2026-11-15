@@ -120,6 +120,34 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertIsNone(TOOL.entrypoint_kind(self._fabric_jar({"client": ["demo.C"]}),
                                                "corpus-xl"))
 
+    def test_client_classification_keeps_roles_and_skip_reasons(self):
+        client = self._fabric_jar({"client": ["demo.C"]})
+        self.assertEqual(TOOL.classify_client(client, "corpus-xl"),
+                         ("client-only", "client", "client entrypoint only"))
+        dual = self._fabric_jar({"main": ["demo.M"], "client": ["demo.C"],
+                                 "server": ["demo.S"]})
+        self.assertEqual(TOOL.classify_client(dual, "corpus-xl"),
+                         ("dual-client", "main,client", ""))
+        server = self._fabric_jar({"main": ["demo.M"], "server": ["demo.S"]})
+        self.assertEqual(TOOL.classify_client(server, "corpus-xl"),
+                         ("library", None, "no client entrypoint"))
+
+    def test_fabric_environment_client_is_client_even_without_a_client_key(self):
+        import json
+        import tempfile
+        import zipfile
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        path = directory / "demo.jar"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("fabric.mod.json", json.dumps({
+                "id": "demo", "version": "1", "environment": "client",
+                "entrypoints": {"main": ["demo.Main"]},
+            }))
+        self.assertEqual(TOOL.classify_client(path, "corpus-xl"),
+                         ("client-only", "main", "environment: client"))
+        self.assertEqual(TOOL.classify_server_skip(path, "corpus-xl"), "client-only")
+
     def test_the_row_takes_the_probe_verdict(self):
         self.assertEqual(TOOL.row_verdict({"verdict": "ran-partial",
                                            "unknown_host_call_count": 0}), "ran-partial")
