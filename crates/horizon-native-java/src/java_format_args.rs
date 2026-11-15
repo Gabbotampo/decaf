@@ -35,7 +35,7 @@ impl<H: Host> Runtime<'_, H> {
             // `String.format(f, (Object[]) null)` formats every argument as
             // null.
             Value::Ref(None) => None,
-            array => Some(self.array(array).ok()?.clone()),
+            array => Some(self.array(array).ok()?.into_owned()),
         };
         let args = args.map(|values| {
             values

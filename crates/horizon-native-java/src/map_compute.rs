@@ -39,7 +39,7 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(None);
             };
             let mut pairs = Vec::new();
-            for entry in self.array(array)?.clone() {
+            for entry in self.array(array)?.into_owned() {
                 let (key, value) = map_entry_parts(&entry)?;
                 pairs.extend([key, value]);
             }
