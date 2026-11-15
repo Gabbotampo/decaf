@@ -101,6 +101,7 @@ mod host_mixin;
 mod host_neoforge_loader;
 mod host_optional;
 mod host_path;
+mod host_recursion;
 mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
@@ -2368,6 +2369,13 @@ pub trait Host {
         None
     }
 
+    /// [`Self::modelled_to_string`], with a nested walk's `StackOverflowError` thrown rather
+    /// than read as "no model" (#250): the runtime's `String.valueOf`, `Objects.toString` and
+    /// string-concatenation paths call this, so a cycle ends as Java's does.
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        Ok(self.modelled_to_string(value))
+    }
+
     /// The `(msb, lsb)` of a `new UUID(msb, lsb)` object this host saw
     /// constructed (`host_jdk_value.rs`), `None` for any other value.
     fn constructed_uuid(&self, _value: &Value) -> Option<(i64, i64)> {
@@ -3918,14 +3926,42 @@ impl StdHost {
         if jar_object::spells_key(receiver) {
             return None;
         }
-        let marker = self.synchronized_target(expect_ref(receiver)?);
-        if let Some(values) = self.view_values(marker) {
-            return Some(values);
+        // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
+        // may be another view, as deep as a jar nests them: followed in a loop, never by
+        // recursion (#250).
+        let mut marker = expect_ref(receiver)?.clone();
+        let mut reversed = false;
+        // Each hop follows one row of the view tables, so their rows bound any chain: a chain
+        // of any length a jar builds is read (#260 review); only a cycle, which no jar can
+        // build, would stop here.
+        let hops_bound = self.unmodifiable_collections.len()
+            + self.synchronized_views.len()
+            + self.reversed_views.len()
+            + 1;
+        for hops in 0..hops_bound {
+            let target = self.synchronized_target(&marker).to_owned();
+            let next = if let Some(Some(source)) = self.unmodifiable_collections.get(&target) {
+                source.clone()
+            } else if let Some((base, _)) = self.reversed_views.get(&target) {
+                reversed = !reversed;
+                base.clone()
+            } else {
+                let mut values = match self.mutable_collections.get(&target) {
+                    Some(values) => values.clone(),
+                    // A view over a collection the host keeps no row for (a literal).
+                    None if hops > 0 => {
+                        collection_values(&jar_object::stored_value(&target)).ok()?
+                    }
+                    None => return None,
+                };
+                if reversed {
+                    values.reverse();
+                }
+                return Some(values);
+            };
+            marker = next;
         }
-        if let Some(values) = self.reversed_view_values(marker) {
-            return Some(values);
-        }
-        self.mutable_collections.get(marker).cloned()
+        None
     }
 
     /// Answer `java.util.Properties` members from the map a collection keeps.
@@ -5269,6 +5305,10 @@ impl Host for StdHost {
         crate::java_tostring::modelled(self, value)
     }
 
+    fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        crate::java_tostring::modelled_checked(self, value)
+    }
+
     fn constructed_uuid(&self, value: &Value) -> Option<(i64, i64)> {
         self.constructed_uuids
             .get(jar_object::object_key(value)?)
@@ -6257,7 +6297,7 @@ impl Host for StdHost {
             ("java/util/Objects", "toString", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             ("java/lang/Math", "abs", "(I)I") => {
@@ -6383,7 +6423,7 @@ impl Host for StdHost {
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
                 let value = Self::argument(r, args, 0)?;
-                let text = self.modelled_to_string(value);
+                let text = self.modelled_to_string_checked(value)?;
                 Ok(Value::Ref(Some(text.unwrap_or_else(|| value_text(value)))))
             }
             // Chat components are a common loader/bootstrap value (mod
@@ -8470,8 +8510,8 @@ impl Host for StdHost {
                 // counted as in any collection's text).
                 ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(format!(
                     "{}={}",
-                    object_text(self, &key),
-                    object_text(self, &value)
+                    object_text(self, &key)?,
+                    object_text(self, &value)?
                 )))),
                 _ => Err(NativeError::MissingMethod(format!(
                     "{}#{}{}",
@@ -9695,6 +9735,9 @@ impl Host for StdHost {
                     && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
                     && let Some((left, right)) = rest.split_once('|')
                 {
+                    // One level of a composed consumer (#250): a chain as long as a jar
+                    // builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+                    let _level = host_recursion::enter()?;
                     self.invoke_instance(r, &composed_callback(left), args)?;
                     self.invoke_instance(r, &composed_callback(right), args)?;
                 }
@@ -9705,9 +9748,13 @@ impl Host for StdHost {
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
             ) => Ok(Value::Void),
-            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => Ok(Value::Int(
-                expect_ref(receiver).is_some_and(|marker| predicate_marker_value(marker)) as i32,
-            )),
+            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
+                let truth = match expect_ref(receiver) {
+                    Some(marker) => predicate_marker_value(marker)?,
+                    None => false,
+                };
+                Ok(Value::Int(i32::from(truth)))
+            }
             ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
@@ -11600,6 +11647,7 @@ impl host_ref::Nested for MarkerText {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(Some(match value {
             // An object prints its key, as its marker did.
             Value::Host(handle) if jar_object::is_object_handle(handle) => handle.key().to_owned(),
@@ -11623,6 +11671,7 @@ struct HostNested<'a>(Option<&'a mut StdHost>);
 
 impl host_ref::Nested for HostNested<'_> {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match value {
             // An object's own `hashCode` is jar code (or an identity hash).
             Value::Host(handle) if jar_object::is_object_handle(handle) => None,
@@ -11635,6 +11684,7 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match a {
             // `a == b` answers for any object; its own `equals` is jar code.
             Value::Host(handle) if jar_object::is_object_handle(handle) => (a == b).then_some(true),
@@ -11649,10 +11699,11 @@ impl host_ref::Nested for HostNested<'_> {
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
+        let _level = host_recursion::enter()?;
         Ok(match (value, self.0.as_deref_mut()) {
             // An object prints what its class's model prints, if one does.
             (Value::Host(handle), Some(host)) if jar_object::is_object_handle(handle) => {
-                host.modelled_to_string(value)
+                java_tostring::modelled_checked(host, value)?
             }
             (Value::Host(handle), None) if jar_object::is_object_handle(handle) => None,
             // A `Class` the host can name the kind of: a primitive, an array,
@@ -11662,7 +11713,7 @@ impl host_ref::Nested for HostNested<'_> {
             }
             (Value::Host(handle), _) => return handle.to_string(self),
             (Value::Ref(Some(text)), _) if value_class::is_plain_string(text) => Some(text.clone()),
-            (Value::Ref(Some(_)), Some(host)) => host.modelled_to_string(value),
+            (Value::Ref(Some(_)), Some(host)) => java_tostring::modelled_checked(host, value)?,
             (Value::Ref(Some(_)), None) => None,
             (other, _) => Some(value_text(other)),
         })
@@ -12650,8 +12701,19 @@ fn collection_text(
     value: &Value,
     owner_is_map: bool,
 ) -> Result<String, NativeError> {
-    let values = host_collection_values(host, value)?;
+    // One level of nested printing (#250).
+    let _level = host_recursion::enter()?;
     let marker = expect_string(value).to_owned();
+    // `Collections.unmodifiable*`'s `toString` is `c.toString()` (Java 25's `javap`): the view
+    // prints the collection it wraps, which is then the receiver `(this Collection)` compares
+    // against, never the view itself.
+    if let Some(source) = Host::unmodifiable_view_source(host, &marker)
+        .map(|source| jar_object::stored_value(&source))
+        .filter(|source| host.mutable_values(source).is_some())
+    {
+        return collection_text(host, &source, false);
+    }
+    let values = host_collection_values(host, value)?;
     let kind = marker.split('/').next().unwrap_or(&marker);
     let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
     let class = marker.split_once('#').map(|(class, _)| class);
@@ -12661,18 +12723,41 @@ fn collection_text(
             is_map_owner(class) || java_immutable::supertypes(class).contains(&"java/util/Map")
         });
     // `AbstractCollection.toString`/`AbstractMap.toString`: each element is
-    // `String.valueOf(element)`, and the collection itself inside it prints
-    // `(this Collection)`/`(this Map)`.
+    // `String.valueOf(element)`, and the collection itself inside it (`e == this`)
+    // prints `(this Collection)`/`(this Map)`. A collection is a handle, so `==` is
+    // its identity, not its text (#250: a list holding itself recursed until the
+    // native stack overflowed). A deeper cycle recurses, as on the JVM, until a
+    // `StackOverflowError` (`host_recursion.rs`).
+    // Only a class whose `toString` is `AbstractCollection`'s/`AbstractMap`'s (or checks the
+    // same way: `ConcurrentHashMap`, the reversed views, `Helpers.collectionToString`'s blocking
+    // queues) prints itself as `(this Collection)`. `CopyOnWriteArrayList` (`Arrays.toString` of
+    // its array) and the concurrent linked queues print every element, so a list holding itself
+    // recurses until a `StackOverflowError`, as on the JVM.
+    let checks_itself = !class.is_some_and(|class| {
+        matches!(
+            class,
+            "java/util/concurrent/CopyOnWriteArrayList"
+                | "java/util/concurrent/ConcurrentLinkedQueue"
+                | "java/util/concurrent/ConcurrentLinkedDeque"
+                | "java/util/concurrent/LinkedTransferQueue"
+        )
+    });
     let mut texts = Vec::with_capacity(values.len());
     for element in &values {
-        texts.push(match element {
-            Value::Ref(Some(inner)) if *inner == marker => if is_map {
+        let itself = checks_itself
+            && match element {
+                Value::Ref(Some(inner)) => *inner == marker,
+                element => object_methods::identical(element, value),
+            };
+        texts.push(if itself {
+            if is_map {
                 "(this Map)"
             } else {
                 "(this Collection)"
             }
-            .to_owned(),
-            element => object_text(host, element),
+            .to_owned()
+        } else {
+            object_text(host, element)?
         });
     }
     Ok(if is_map {
@@ -12690,33 +12775,37 @@ fn collection_text(
 /// `String.valueOf(Object)` of one value a model holds (a collection's
 /// element, an optional's payload): a box prints its value and a model
 /// object its `toString`.
-fn object_text(host: &mut StdHost, value: &Value) -> String {
-    match value {
+fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError> {
+    Ok(match value {
         Value::Boxed(boxed) => boxed.text(),
         // A handle prints its kind's `toString`; one holding an object the
-        // host cannot print is counted, and keeps the old text.
+        // host cannot print is counted, and keeps the old text. A cycle's
+        // `StackOverflowError` is thrown, as Java's is.
         Value::Host(handle) => match handle.to_string(&mut HostNested(Some(host))) {
             Ok(Some(text)) => text,
+            Err(error) if host_recursion::is_stack_overflow(&error) => return Err(error),
             _ => {
                 let _ = host.unknown_host_call(&jar_text::object_to_string());
                 host_text(value)
             }
         },
-        Value::Ref(Some(marker)) => host.modelled_to_string(value).unwrap_or_else(|| {
-            // An object no model prints (a jar object, an identity hash)
-            // is counted; the element keeps its marker in the text. A
-            // stream is counted too, and never prints its marker.
-            if stream_pipeline::is_stream_marker(marker) {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-                return stream_pipeline::STREAM_TEXT.into();
-            }
-            if crate::jar_object::packaged_object_class(value).is_some() {
-                let _ = host.unknown_host_call(&jar_text::object_to_string());
-            }
-            marker.clone()
-        }),
+        Value::Ref(Some(marker)) => {
+            java_tostring::modelled_checked(host, value)?.unwrap_or_else(|| {
+                // An object no model prints (a jar object, an identity hash)
+                // is counted; the element keeps its marker in the text. A
+                // stream is counted too, and never prints its marker.
+                if stream_pipeline::is_stream_marker(marker) {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                    return stream_pipeline::STREAM_TEXT.into();
+                }
+                if crate::jar_object::packaged_object_class(value).is_some() {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                }
+                marker.clone()
+            })
+        }
         other => value_text(other),
-    }
+    })
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -13547,10 +13636,11 @@ impl ClassFile {
         let interface_count = r.u2()? as usize;
         r.skip(interface_count * 2)?;
         let fields = read_fields(&mut r, &pool)?;
-        let methods = read_methods(&mut r, &pool)?;
+        let (methods, method_warnings) = read_methods(&mut r, &pool)?;
         let (annotations, bootstrap_methods, warnings) = read_class_attributes(&mut r, &pool)?;
-        let warnings = warnings
+        let warnings = method_warnings
             .into_iter()
+            .chain(warnings)
             .map(|warning| format!("{name}: {warning}"))
             .collect();
         Ok((
@@ -19706,21 +19796,25 @@ fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
 /// Evaluate the bounded truth surface of a predicate marker.  Java's default
 /// `Predicate` combinators are represented as markers, so they remain usable
 /// even though the interpreter does not materialize interface instances.
-fn predicate_marker_value(marker: &str) -> bool {
+///
+/// One level per combinator (#250): a chain as deep as a jar builds it ends in a
+/// `StackOverflowError`, as Java's default-method chain does.
+fn predicate_marker_value(marker: &str) -> Result<bool, NativeError> {
+    let _level = host_recursion::enter()?;
     if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
-        return !predicate_marker_value(rest);
+        return Ok(!predicate_marker_value(rest)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) && predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? && predicate_marker_value(right)?);
     }
     if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
         && let Some((left, right)) = rest.split_once('|')
     {
-        return predicate_marker_value(left) || predicate_marker_value(right);
+        return Ok(predicate_marker_value(left)? || predicate_marker_value(right)?);
     }
-    marker.starts_with("@indy:")
+    Ok(marker.starts_with("@indy:"))
 }
 
 /// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
@@ -21176,6 +21270,9 @@ impl<H: Host> Runtime<'_, H> {
         marker: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // One level of a composed callback (`andThen`, `compose`, #250): a chain as deep as a
+        // jar builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+        let _level = host_recursion::enter()?;
         // A `Stream.Builder` handle, or a push's sink handed to a
         // spliterator, is a `Consumer` (`stream_pipeline.rs`).
         if let Some(value) = self.stream_callback(marker, args)? {
@@ -24974,6 +25071,86 @@ impl<H: Host> Runtime<'_, H> {
         Ok(None)
     }
 
+    /// Where a throw that a call at `at` raised goes: this frame's handler that catches it
+    /// (its program counter and the throwable it receives), or the error leaving the frame.
+    ///
+    /// A Java throw is delivered by its class. A jar recursion past the thread's stack
+    /// ([`NativeError::CallDepthExceeded`], `frame_bound.rs`) is Java's `StackOverflowError`
+    /// (#250): a handler for it (or `Error`/`Throwable`) catches it, as on the JVM; with none it
+    /// leaves as the bound's own diagnostic. Any other error leaves with this frame's context.
+    /// Kept out of line so `invoke_frame`, which delivers at every call site, keeps a small
+    /// frame (the jar-frame bound is measured in those frames).
+    #[inline(never)]
+    fn deliver_throw(
+        &mut self,
+        error: NativeError,
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        at: usize,
+    ) -> Result<(usize, Value), NativeError> {
+        // A host walk's refusal (`host_recursion.rs`) reaches the jar here: counted before any
+        // handler sees its throw.
+        self.count_bound_refusals()?;
+        match error {
+            NativeError::UncaughtException {
+                class: thrown,
+                message,
+                frame,
+            } => {
+                if let Some(handler) = self.exception_handler(file, method, desc, at, &thrown)? {
+                    let value = self.caught_throwable(&thrown, message, frame.as_deref());
+                    return Ok((handler, value));
+                }
+                Err(NativeError::UncaughtException {
+                    class: thrown,
+                    message,
+                    frame: frame.or_else(|| Some(format!("{class}#{method} +{at}"))),
+                })
+            }
+            error @ NativeError::CallDepthExceeded { limit, .. } => {
+                // A table that cannot be read catches nothing: the bound's error stands.
+                if let Ok(Some(handler)) =
+                    self.exception_handler(file, method, desc, at, host_recursion::STACK_OVERFLOW)
+                {
+                    // The bound is the host's native stack (`frame_bound.rs`), far shallower than
+                    // the JVM's: a finite recursion Java finishes (`sum(2000)`) is refused here,
+                    // and even an endless one does not overflow where Java's would. The jar gets
+                    // Java's catchable throw; the conversion is counted, naming the bound and the
+                    // depth, so the run is never silent (#260 review). A strict host refuses.
+                    self.count_bound("frame-bound", limit)?;
+                    let value = self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
+                    return Ok((handler, value));
+                }
+                Err(error)
+            }
+            error => Err(frame_context(error, class, method, at)),
+        }
+    }
+
+    /// Count one `StackOverflowError` the runtime raised from its own `bound` at `depth`
+    /// (`java/lang/StackOverflowError#<BOUND:DEPTH>()V`): the bound decided it, not Java.
+    fn count_bound(&mut self, bound: &str, depth: usize) -> Result<(), NativeError> {
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: host_recursion::STACK_OVERFLOW.into(),
+                name: format!("<{bound}:{depth}>"),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Count the host walks' refusals since the last count (`host_recursion.rs`).
+    fn count_bound_refusals(&mut self) -> Result<(), NativeError> {
+        for (depth, times) in host_recursion::take_refusals() {
+            for _ in 0..times {
+                self.count_bound("host-walk-bound", depth)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The throwable value a Java handler receives for a throw the host or a
     /// nested frame raised, tagged with the message the throw carries.
     fn caught_throwable(
@@ -25261,6 +25438,11 @@ impl<H: Host> Runtime<'_, H> {
         let result = self.invoke_frame(class, method, desc, receiver, args);
         stack_walk::leave();
         self.depth -= 1;
+        // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
+        // host call, or one that left uncaught) is counted too.
+        if self.depth == 0 {
+            self.count_bound_refusals()?;
+        }
         result
     }
 
@@ -25424,27 +25606,16 @@ impl<H: Host> Runtime<'_, H> {
             ($at:expr, $call:expr) => {
                 match $call {
                     Ok(value) => value,
-                    Err(NativeError::UncaughtException {
-                        class: thrown,
-                        message,
-                        frame,
-                    }) => {
-                        if let Some(handler) =
-                            self.exception_handler(file, method, desc, $at, &thrown)?
-                        {
-                            let value = self.caught_throwable(&thrown, message, frame.as_deref());
-                            stack.clear();
-                            stack.push(value);
-                            pc = handler;
-                            continue;
-                        }
-                        return Err(NativeError::UncaughtException {
-                            class: thrown,
-                            message,
-                            frame: frame.or_else(|| Some(format!("{class}#{method} +{}", $at))),
-                        });
+                    // One call per site: the delivery's code lives in `deliver_throw`, so a
+                    // frame of this function stays as small as the bound measured it.
+                    Err(error) => {
+                        let (handler, value) =
+                            self.deliver_throw(error, file, class, method, desc, $at)?;
+                        stack.clear();
+                        stack.push(value);
+                        pc = handler;
+                        continue;
                     }
-                    Err(error) => return Err(frame_context(error, class, method, $at)),
                 }
             };
         }
@@ -27191,7 +27362,7 @@ impl<H: Host> Runtime<'_, H> {
                         // `String` operand is already its text.
                         for (value, argument) in captured.iter_mut().zip(&arguments) {
                             if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string(value)
+                                && let Some(text) = self.host.modelled_to_string_checked(value)?
                             {
                                 *value = Value::Ref(Some(text));
                             }
@@ -29022,7 +29193,38 @@ fn read_fields(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Field>, NativeErro
     }
     Ok(out)
 }
-fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeError> {
+/// The error a `RuntimeVisibleAnnotations` attribute nested past [`MAX_ANNOTATION_DEPTH`] gives.
+const ANNOTATIONS_TOO_DEEP: &str = "annotation values nested too deeply";
+
+/// A `RuntimeVisibleAnnotations` attribute's annotations. One nested past
+/// [`MAX_ANNOTATION_DEPTH`] is skipped with a warning naming `owner`, never failing the class
+/// (and so the jar) it sits on (#260 review): the class loads without those annotations, as an
+/// unreadable invisible annotation's class does. Any other malformed attribute fails as before.
+fn read_visible_annotations(
+    bytes: &[u8],
+    pool: &[Cp],
+    owner: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Annotation>, NativeError> {
+    match read_annotations(&mut Reader::new(bytes), pool) {
+        Err(NativeError::InvalidClass(why)) if why == ANNOTATIONS_TOO_DEEP => {
+            push_class_annotation_warning(
+                warnings,
+                format!(
+                    "{owner}: annotations nest deeper than {MAX_ANNOTATION_DEPTH} levels; skipped"
+                ),
+            );
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
+fn read_methods(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+) -> Result<(Vec<Method>, Vec<String>), NativeError> {
+    let mut warnings = Vec::new();
     let n = r.u2()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -29045,8 +29247,12 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
                 let len = c.u4()? as usize;
                 code = Some(c.bytes(len)?.to_owned());
             } else if attr == "RuntimeVisibleAnnotations" {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    &format!("method {name}{descriptor}"),
+                    &mut warnings,
+                )?);
             }
             // RuntimeInvisibleAnnotations and parameter annotations are not
             // needed for Mixin discovery; their bytes were already bounded by
@@ -29062,7 +29268,7 @@ fn read_methods(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Method>, NativeEr
             annotations,
         });
     }
-    Ok(out)
+    Ok((out, warnings))
 }
 fn skip_attributes(r: &mut Reader<'_>, pool: &[Cp]) -> Result<(), NativeError> {
     let n = r.u2()? as usize;
@@ -29108,8 +29314,12 @@ fn read_class_attributes(
         let bytes = r.bytes(length)?;
         match name.as_str() {
             "RuntimeVisibleAnnotations" => {
-                let mut body = Reader::new(bytes);
-                annotations.extend(read_annotations(&mut body, pool)?);
+                annotations.extend(read_visible_annotations(
+                    bytes,
+                    pool,
+                    "class",
+                    &mut warnings,
+                )?);
             }
             "RuntimeInvisibleAnnotations" => {
                 read_invisible_mixin_annotations(bytes, pool, &mut annotations, &mut warnings);
@@ -29228,18 +29438,46 @@ fn read_annotations(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Vec<Annotation>, 
     })
 }
 
+/// How deep annotation values may nest (an array or annotation inside another). The JVM sets
+/// no limit, but the reader is Rust recursion over the class file's bytes, which a jar chooses:
+/// three bytes per nested array would otherwise overflow the native stack while the jar loads
+/// (#250). javac writes a handful of levels; an attribute nested deeper is skipped with a warning
+/// (`read_visible_annotations`), never failing its class or jar.
+const MAX_ANNOTATION_DEPTH: usize = 64;
+
 fn read_annotation(r: &mut Reader<'_>, pool: &[Cp]) -> Result<Annotation, NativeError> {
+    read_annotation_at(r, pool, 0)
+}
+
+fn read_annotation_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<Annotation, NativeError> {
     let descriptor = utf8(pool, r.u2()?)?;
     let pair_count = r.u2()? as usize;
     let mut values = BTreeMap::new();
     for _ in 0..pair_count {
         let name = utf8(pool, r.u2()?)?;
-        values.insert(name, read_annotation_value(r, pool)?);
+        values.insert(name, read_annotation_value_at(r, pool, depth + 1)?);
     }
     Ok(Annotation { descriptor, values })
 }
 
 fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationValue, NativeError> {
+    read_annotation_value_at(r, pool, 0)
+}
+
+fn read_annotation_value_at(
+    r: &mut Reader<'_>,
+    pool: &[Cp],
+    depth: usize,
+) -> Result<AnnotationValue, NativeError> {
+    if depth > MAX_ANNOTATION_DEPTH {
+        return Err(NativeError::InvalidClass(
+            "annotation values nested too deeply",
+        ));
+    }
     match r.u1()? {
         b's' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
         b'Z' => match int_constant(pool, r.u2()?)? {
@@ -29262,14 +29500,16 @@ fn read_annotation_value(r: &mut Reader<'_>, pool: &[Cp]) -> Result<AnnotationVa
         // A class constant in an annotation is a field descriptor such as
         // `Lnet/minecraft/world/level/Level;`.
         b'c' => Ok(AnnotationValue::String(utf8(pool, r.u2()?)?)),
-        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation(
-            r, pool,
+        b'@' => Ok(AnnotationValue::Annotation(Box::new(read_annotation_at(
+            r,
+            pool,
+            depth + 1,
         )?))),
         b'[' => {
             let count = r.u2()? as usize;
             let mut items = Vec::with_capacity(count);
             for _ in 0..count {
-                items.push(read_annotation_value(r, pool)?);
+                items.push(read_annotation_value_at(r, pool, depth + 1)?);
             }
             Ok(AnnotationValue::Array(items))
         }
@@ -41863,6 +42103,73 @@ mandatory = true
             host_collection_values(&host, &entries).unwrap(),
             Vec::<Value>::new()
         );
+    }
+
+    /// Annotation values nested as deep as a class file's bytes allow are refused as an invalid
+    /// class, never read by recursion until the native stack overflows (#250); a few levels
+    /// read as ever.
+    /// A `RuntimeVisibleAnnotations` attribute nested past the depth bound is skipped with a
+    /// warning naming its owner: its class (and jar) still load (#260 review). One within the
+    /// bound reads as ever.
+    #[test]
+    fn a_too_deep_visible_annotation_is_skipped_with_a_warning() {
+        let pool = vec![
+            Cp::Empty,
+            Cp::Utf8("Ldemo/Deep;".into()),
+            Cp::Utf8("value".into()),
+            Cp::Integer(7),
+        ];
+        let attribute = |levels: usize| {
+            // One annotation `@Deep(value = [[[...7...]]])`.
+            let mut bytes = vec![0, 1, 0, 1, 0, 1, 0, 2];
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 3]);
+            bytes
+        };
+        let mut warnings = Vec::new();
+        let deep =
+            read_visible_annotations(&attribute(100), &pool, "class", &mut warnings).unwrap();
+        assert!(deep.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("class: annotations nest deeper"),
+            "{warnings:?}"
+        );
+        let mut warnings = Vec::new();
+        let shallow =
+            read_visible_annotations(&attribute(3), &pool, "class", &mut warnings).unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].descriptor, "Ldemo/Deep;");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_annotation_values_are_refused() {
+        let pool = vec![Cp::Empty, Cp::Integer(7)];
+        let nested = |levels: usize| {
+            let mut bytes = Vec::with_capacity(levels * 3 + 3);
+            for _ in 0..levels {
+                bytes.extend_from_slice(&[b'[', 0, 1]);
+            }
+            bytes.extend_from_slice(&[b'I', 0, 1]);
+            bytes
+        };
+        let deep = nested(100_000);
+        assert!(matches!(
+            read_annotation_value(&mut Reader::new(&deep), &pool),
+            Err(NativeError::InvalidClass(_))
+        ));
+        let shallow = nested(3);
+        let mut value = read_annotation_value(&mut Reader::new(&shallow), &pool).unwrap();
+        for _ in 0..3 {
+            let AnnotationValue::Array(mut items) = value else {
+                panic!("{value:?}")
+            };
+            value = items.remove(0);
+        }
+        assert_eq!(value, AnnotationValue::Int(7));
     }
 
     #[test]
