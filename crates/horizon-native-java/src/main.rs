@@ -1067,6 +1067,8 @@ fn frame_census(
             pos: [0.5, 64.0, 0.5],
             health: 20.0,
             max_health: 20.0,
+            using_item: Some(false),
+            sleeping: Some(false),
             ..ClientPlayer::default()
         }),
         level: Some(ClientLevel::default()),
@@ -1074,6 +1076,13 @@ fn frame_census(
         gui_size: [427, 240],
         window_size: [854, 480],
         gui_scale: 2.0,
+        options: horizon_native_java::client_frame::ClientOptions {
+            particles: Some("ALL".into()),
+            sensitivity: Some(0.5),
+        },
+        hit_result: Some(horizon_native_java::client_frame::ClientHitResult::Miss {
+            location: [0.5, 64.0, 0.5],
+        }),
         fps: 60,
         render_distance: 12,
         metrics: Arc::new(TextMetrics {

@@ -29,6 +29,7 @@ mod charset_decoder;
 mod checkcast;
 mod class_init;
 mod class_precedence;
+pub mod client_frame;
 pub mod client_surface;
 mod client_values;
 mod collection_base;

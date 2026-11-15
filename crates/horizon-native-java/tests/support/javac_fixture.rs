@@ -73,13 +73,18 @@ impl Fixture {
     /// [`Self::build`], packing every compiled class into the probe jar, not
     /// only `demo/`'s (a probe whose jar classes sit in other packages).
     pub fn build_every_package(test: &str, sources: &[(&str, &str)]) -> Self {
-        Self::build_packed(test, sources, &[], false, "", None)
+        Self::build_packed(test, sources, &[], false, "", None, None)
     }
 
     /// [`Self::build`] with `mod_json` as the jar's `fabric.mod.json` (its own
     /// entrypoints).
     pub fn build_with_mod_json(test: &str, sources: &[(&str, &str)], mod_json: &str) -> Self {
-        Self::build_packed(test, sources, &[], false, "demo", Some(mod_json))
+        Self::build_packed(test, sources, &[], false, "demo", Some(mod_json), None)
+    }
+
+    /// Compile a probe against a real library jar while shipping only demo classes.
+    pub fn build_with_classpath(test: &str, sources: &[(&str, &str)], classpath: &str) -> Self {
+        Self::build_packed(test, sources, &[], false, "demo", None, Some(classpath))
     }
 
     fn build_jars(
@@ -88,7 +93,7 @@ impl Fixture {
         extra: &[(&str, &[u8])],
         with_lib: bool,
     ) -> Self {
-        Self::build_packed(test, sources, extra, with_lib, "demo", None)
+        Self::build_packed(test, sources, extra, with_lib, "demo", None, None)
     }
 
     /// Compile `sources` and pack the classes under `packed` (every class
@@ -100,6 +105,7 @@ impl Fixture {
         with_lib: bool,
         packed: &str,
         mod_json: Option<&str>,
+        classpath: Option<&str>,
     ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -115,7 +121,11 @@ impl Fixture {
             .map(|home| PathBuf::from(home).join("bin/javac"))
             .unwrap_or_else(|| "javac".into());
         let mut javac = Command::new(javac);
-        javac.args(["--release", "21", "-d"]).arg(&classes);
+        javac.args(["--release", "21"]);
+        if let Some(classpath) = classpath {
+            javac.args(["-cp", classpath]);
+        }
+        javac.args(["-d"]).arg(&classes);
         for (path, source) in sources {
             let file = root.join("src").join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
