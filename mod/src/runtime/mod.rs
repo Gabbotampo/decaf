@@ -30,6 +30,7 @@ mod checkcast;
 mod class_init;
 mod class_precedence;
 pub mod client_frame;
+mod client_reload;
 pub mod client_surface;
 mod client_values;
 mod collection_base;
@@ -2674,6 +2675,28 @@ pub trait Host {
     /// has two.
     fn note_entrypoint_constructed(&mut self, _kind: &str, _class: &str, _instance: &Value) {}
 
+    /// The Fabric entrypoint rows the loader host declared for `kind`, in the
+    /// loader's invocation order.  A host that does not own loader state
+    /// exposes no rows; the runtime then keeps the call on its counted host
+    /// path instead of inventing providers.
+    fn fabric_entrypoints(&self, _kind: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// The already constructed instance for one Fabric entrypoint and the
+    /// requested interface.  Fabric caches one instance per entrypoint key;
+    /// a missing value means loading that entry failed or the host has not
+    /// constructed this provider in the current run.
+    fn fabric_entrypoint_object(
+        &self,
+        _kind: &str,
+        _class: &str,
+        _requested: &str,
+        _ordinal: usize,
+    ) -> Option<Value> {
+        None
+    }
+
     /// Sibling-jar classes this host lets the executing jar link against.
     ///
     /// `None` keeps single-jar behavior exactly as before: a symbol the
@@ -2725,6 +2748,41 @@ pub trait Host {
     /// interpreter allocates one and registers the message here. `getMessage`
     /// and `toString` then answer through the host's existing Throwable model.
     fn record_throwable(&mut self, _marker: &str, _message: Option<String>) {}
+
+    /// Throwable objects the host has retained with `addSuppressed`.
+    fn throwable_suppressed(&self, _marker: &str) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn record_throwable_suppressed(&mut self, _marker: &str, _value: Value) {}
+
+    /// Record the cause of a host-created wrapper throwable. The default host
+    /// has no throwable table, so it keeps the older message-only behavior.
+    fn record_throwable_cause(&mut self, _marker: &str, _cause: Value) {}
+
+    /// A wrapper throwable whose cause is known before its marker is created.
+    fn record_wrapped_cause(&mut self, _class: &str, _message: Option<&str>, _cause: Value) {}
+
+    /// Take a cause staged for the next throwable with this class/message.
+    fn take_wrapped_cause(&mut self, _class: &str, _message: &Option<String>) -> Option<Value> {
+        None
+    }
+
+    /// Stage wrappers are materialized only when Java catches the final
+    /// exception. Keep later stage failures until that marker exists.
+    fn record_wrapped_suppressed(&mut self, _class: &str, _message: Option<&str>, _value: Value) {}
+
+    fn take_wrapped_suppressed(&mut self, _class: &str, _message: &Option<String>) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// A constructor failure discovered while running an entrypoint. The
+    /// loader's next `getEntrypoint()` call must see the original chain.
+    fn record_fabric_entrypoint_failure(&mut self, _kind: &str, _class: &str, _cause: Value) {}
+
+    fn take_fabric_entrypoint_failure(&mut self, _kind: &str, _class: &str) -> Option<Value> {
+        None
+    }
 
     /// Return jar-owned class state retained across native callback invocations.
     /// Hosts that do not keep a resident jar instance use an empty snapshot.
@@ -3183,6 +3241,7 @@ pub struct StdHost {
     /// enough for bootstrap diagnostics without modelling Java stack traces.
     throwable_messages: BTreeMap<String, Option<String>>,
     throwable_causes: BTreeMap<String, Option<Value>>,
+    throwable_suppressed: BTreeMap<String, Vec<Value>>,
     /// Jar-owned static fields retained across entrypoint/event invocations.
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
@@ -3341,6 +3400,7 @@ impl StdHost {
             capability_requests: Vec::new(),
             throwable_messages: BTreeMap::new(),
             throwable_causes: BTreeMap::new(),
+            throwable_suppressed: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
@@ -3480,6 +3540,7 @@ impl StdHost {
         kind: &str,
         class: &str,
         requested: Option<&str>,
+        ordinal: usize,
     ) -> Option<Value> {
         if class.contains("::") || requested.is_none() {
             return None;
@@ -3491,9 +3552,23 @@ impl StdHost {
         // One object per entrypoint key (Fabric Loader 0.19.5's
         // `EntrypointStorage.add`: a new `NewEntry`, with its own instance
         // map, per key).
-        self.constructed_entrypoints
-            .get(&(kind.to_owned(), internal))
-            .cloned()
+        let object = self
+            .constructed_entrypoints
+            .get(&(kind.to_owned(), internal.clone()))
+            .cloned()?;
+        if ordinal == 0 {
+            Some(object)
+        } else {
+            // Fabric's storage creates a distinct Entry (and therefore a
+            // distinct cached instance) for every duplicate declaration. The
+            // native entrypoint runner has one constructed object for the
+            // class, so give later duplicate rows distinct handles while
+            // retaining the normal object for the first row.
+            Some(jar_object::handle(format!(
+                "{internal}#{}",
+                1_000_000 + ordinal
+            )))
+        }
     }
 
     fn empty_collection(&mut self, kind: &str) -> Value {
@@ -4241,8 +4316,7 @@ impl StdHost {
     }
 
     /// Add one bounded Fabric entrypoint container to the loader view.
-    /// Duplicate `(kind, class, provider)` rows are ignored to keep discovery
-    /// deterministic when a launcher seeds the same jar more than once.
+    /// Fabric stores every declaration, including duplicate rows.
     pub fn with_fabric_entrypoint(
         mut self,
         kind: impl Into<String>,
@@ -4254,9 +4328,7 @@ impl StdHost {
             class: class.into(),
             provider: provider.into(),
         };
-        if !self.fabric_entrypoint_containers.contains(&entry) {
-            self.fabric_entrypoint_containers.push(entry);
-        }
+        self.fabric_entrypoint_containers.push(entry);
         self
     }
 
@@ -4912,6 +4984,29 @@ impl Host for StdHost {
             .insert((kind.to_owned(), class.to_owned()), instance.clone());
     }
 
+    fn fabric_entrypoints(&self, kind: &str) -> Vec<(String, String)> {
+        let mut rows = self
+            .fabric_entrypoint_containers
+            .iter()
+            .filter(|entry| entry.kind == kind)
+            .map(|entry| (entry.class.clone(), entry.provider.clone()))
+            .collect::<Vec<_>>();
+        // Fabric's resolver presents selected mod candidates by id while
+        // retaining each metadata document's declared entrypoint order.
+        rows.sort_by(|(_, left), (_, right)| left.cmp(right));
+        rows
+    }
+
+    fn fabric_entrypoint_object(
+        &self,
+        kind: &str,
+        class: &str,
+        requested: &str,
+        ordinal: usize,
+    ) -> Option<Value> {
+        self.fabric_entrypoint_object(kind, class, Some(requested), ordinal)
+    }
+
     fn note_content_builder(&mut self, event: ContentBuilderEvent) {
         if let Some(entry) = self.content_builders.note(event) {
             // An attachment registers itself; a metadata row for the same key
@@ -5339,6 +5434,64 @@ impl Host for StdHost {
         self.throwable_messages.insert(marker.to_owned(), message);
     }
 
+    fn throwable_suppressed(&self, marker: &str) -> Option<Vec<Value>> {
+        (self.throwable_messages.contains_key(marker) || self.throwable_causes.contains_key(marker))
+            .then(|| {
+                self.throwable_suppressed
+                    .get(marker)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+    }
+
+    fn record_throwable_suppressed(&mut self, marker: &str, value: Value) {
+        self.throwable_suppressed
+            .entry(marker.to_owned())
+            .or_default()
+            .push(value);
+    }
+
+    fn record_throwable_cause(&mut self, marker: &str, cause: Value) {
+        self.throwable_causes.insert(marker.to_owned(), Some(cause));
+    }
+
+    fn record_wrapped_cause(&mut self, class: &str, message: Option<&str>, cause: Value) {
+        self.throwable_causes.insert(
+            wrapped_cause_key(class, &message.map(str::to_owned)),
+            Some(cause),
+        );
+    }
+
+    fn take_wrapped_cause(&mut self, class: &str, message: &Option<String>) -> Option<Value> {
+        self.throwable_causes
+            .remove(&wrapped_cause_key(class, message))
+            .flatten()
+    }
+
+    fn record_wrapped_suppressed(&mut self, class: &str, message: Option<&str>, value: Value) {
+        self.throwable_suppressed
+            .entry(wrapped_suppressed_key(class, &message.map(str::to_owned)))
+            .or_default()
+            .push(value);
+    }
+
+    fn take_wrapped_suppressed(&mut self, class: &str, message: &Option<String>) -> Vec<Value> {
+        self.throwable_suppressed
+            .remove(&wrapped_suppressed_key(class, message))
+            .unwrap_or_default()
+    }
+
+    fn record_fabric_entrypoint_failure(&mut self, kind: &str, class: &str, cause: Value) {
+        self.throwable_causes
+            .insert(fabric_failure_key(kind, class), Some(cause));
+    }
+
+    fn take_fabric_entrypoint_failure(&mut self, kind: &str, class: &str) -> Option<Value> {
+        self.throwable_causes
+            .remove(&fabric_failure_key(kind, class))
+            .flatten()
+    }
+
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
@@ -5383,6 +5536,9 @@ impl Host for StdHost {
         }
         if let Some(value) = self.client_static(r) {
             return value;
+        }
+        if let Some(value) = client_reload::static_field(&r.owner, &r.name, &r.descriptor) {
+            return Ok(value);
         }
         if let Some(value) = jdk_model::static_field(&r.owner, &r.name) {
             return Ok(value);
@@ -5576,6 +5732,9 @@ impl Host for StdHost {
         }
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
+        }
+        if let Some(value) = client_reload::static_call(self, r, args) {
+            return value;
         }
         if let Some(value) = jdk_model::static_call(r, args) {
             return value;
@@ -6877,6 +7036,9 @@ impl Host for StdHost {
         // The command dispatcher, builders, nodes and a running command's
         // context and source (`brigadier.rs`).
         if let Some(value) = self.brigadier_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = client_reload::host_instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = jdk_model::instance_call(r, receiver, args) {
@@ -9953,12 +10115,16 @@ impl Host for StdHost {
                     .get(1)
                     .and_then(host_class::class_name)
                     .map(str::to_owned);
-                let entries = self
+                let mut entries = self
                     .fabric_entrypoint_containers
                     .iter()
                     .filter(|entry| entry.kind == kind)
                     .cloned()
                     .collect::<Vec<_>>();
+                // Resolver selection presents providers by mod id while
+                // retaining each provider's declaration order. `invoke` uses
+                // the same stable ordering below through `fabric_entrypoints`.
+                entries.sort_by(|left, right| left.provider.cmp(&right.provider));
                 if entries.is_empty() {
                     // `EntrypointStorage.getEntrypoints` of a key no mod
                     // declares: `Collections.emptyList()`, one shared object.
@@ -9970,7 +10136,7 @@ impl Host for StdHost {
                     ));
                 }
                 let mut values = Vec::new();
-                for entry in entries {
+                for (ordinal, entry) in entries.into_iter().enumerate() {
                     if r.name == "getEntrypointContainers" {
                         values.push(host_fabric_runtime::entrypoint_container(
                             &host_fabric_runtime::ContainerParts {
@@ -9978,6 +10144,7 @@ impl Host for StdHost {
                                 class: entry.class,
                                 provider: entry.provider,
                                 requested: requested.clone(),
+                                ordinal,
                             },
                         ));
                     } else {
@@ -9985,6 +10152,7 @@ impl Host for StdHost {
                             &kind,
                             &entry.class,
                             requested.as_deref(),
+                            ordinal,
                         ) {
                             Some(object) => values.push(object),
                             None => return self.unknown_host_call(r),
@@ -10064,6 +10232,7 @@ impl Host for StdHost {
                             &parts.kind,
                             &parts.class,
                             parts.requested.as_deref(),
+                            parts.ordinal,
                         )
                     });
                 match object {
@@ -11396,6 +11565,7 @@ fn marker_id(value: &str) -> Option<String> {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
@@ -11437,6 +11607,21 @@ fn is_throwable_marker(marker: &str) -> bool {
     jar_object::marker_class(marker).is_some_and(is_throwable_owner)
 }
 
+fn wrapped_cause_key(class: &str, message: &Option<String>) -> String {
+    format!("@wrapped-cause/{class}/{message:?}")
+}
+
+fn wrapped_suppressed_key(class: &str, message: &Option<String>) -> String {
+    format!("@wrapped-suppressed/{class}/{message:?}")
+}
+
+fn fabric_failure_key(kind: &str, class: &str) -> String {
+    format!(
+        "@fabric-entrypoint-failure/{kind}/{}",
+        class.replace('.', "/")
+    )
+}
+
 /// The superclass of the JDK throwable types a mod catch block can name.
 ///
 /// A jar's own classes carry their `super_class`, but `java/lang/*` classes
@@ -11476,6 +11661,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         | "java/lang/StringIndexOutOfBoundsException"
         | "java/util/InputMismatchException" => "java/lang/IndexOutOfBoundsException",
         "java/lang/RuntimeException" => "java/lang/Exception",
+        "java/util/concurrent/CompletionException" => "java/lang/RuntimeException",
         "java/lang/ClassNotFoundException"
         | "java/lang/NoSuchMethodException"
         | "java/lang/NoSuchFieldException"
@@ -11489,6 +11675,7 @@ fn jdk_exception_superclass(owner: &str) -> Option<&'static str> {
         "java/io/FileNotFoundException"
         | "java/nio/file/NoSuchFileException"
         | "java/nio/file/FileSystemException" => "java/io/IOException",
+        "java/util/concurrent/ExecutionException" => "java/lang/Exception",
         "java/lang/ReflectiveOperationException"
         | "java/io/IOException"
         | "java/lang/InterruptedException"
@@ -11523,6 +11710,16 @@ fn exception_is_subtype(
     thrown: &str,
     catch: &str,
 ) -> bool {
+    // Loader exceptions such as `EntrypointException` live in the host's
+    // class path rather than the mod jar. Their names still carry the Java
+    // throwable contract, so a jar's ordinary `catch (Throwable/Exception)`
+    // must receive the wrapped failure instead of letting it escape.
+    if is_throwable_owner(thrown)
+        && (catch == "java/lang/Throwable"
+            || catch == "java/lang/Exception" && thrown.ends_with("Exception"))
+    {
+        return true;
+    }
     if catch == "java/lang/Object" {
         return true;
     }
@@ -12813,6 +13010,223 @@ fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError>
 }
 
 impl<H: Host> Runtime<'_, H> {
+    fn retain_entrypoint_failure(
+        &mut self,
+        first: &mut Option<(String, Value)>,
+        suppressed: &mut Vec<Value>,
+        message: String,
+        cause: Value,
+    ) {
+        if first.is_none() {
+            *first = Some((message, cause));
+            return;
+        }
+        let wrapper =
+            self.caught_throwable("java/lang/RuntimeException", Some(message.clone()), None);
+        if let Some(marker) = jar_object::instance_key(&wrapper) {
+            self.host.record_throwable_cause(marker, cause);
+        }
+        suppressed.push(wrapper);
+    }
+
+    /// The bounded Throwable state that the JDK exposes for Fabric's
+    /// aggregated entrypoint failures. Arrays are allocated by the runtime so
+    /// normal `getSuppressed()[i]` bytecode sees the real handles.
+    fn invoke_throwable_metadata(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !is_throwable_owner(&r.owner) {
+            return Ok(None);
+        }
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(marker) = jar_object::instance_key(receiver).map(str::to_owned) else {
+            return Ok(None);
+        };
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getSuppressed", "()[Ljava/lang/Throwable;") => {
+                let Some(values) = self.host.throwable_suppressed(&marker) else {
+                    return Ok(None);
+                };
+                Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+            }
+            ("addSuppressed", "(Ljava/lang/Throwable;)V") => {
+                let Some(value) = args.first().filter(|value| **value != Value::Ref(None)) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                };
+                if receiver == value {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Self-suppression not permitted".into()),
+                        frame: None,
+                    });
+                }
+                self.host
+                    .record_throwable_suppressed(&marker, value.clone());
+                Ok(Some(Value::Void))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `FabricLoaderImpl.invokeEntrypoints` walks the entrypoint rows in the
+    /// same order as `getEntrypointContainers`, obtains each cached instance,
+    /// and passes it to the supplied `Consumer`. Fabric catches `Throwable`
+    /// for every row, wraps it with the stage/provider/definition message,
+    /// gathers later failures, and continues before throwing the first
+    /// wrapper. An entrypoint loading/type error is itself an
+    /// `EntrypointException` with its original cause.
+    fn invoke_fabric_entrypoints(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "net/fabricmc/loader/api/FabricLoader"
+            || r.name != "invokeEntrypoints"
+            || r.descriptor != "(Ljava/lang/String;Ljava/lang/Class;Ljava/util/function/Consumer;)V"
+        {
+            return Ok(None);
+        }
+        let Some(Value::Host(loader)) = receiver else {
+            return Ok(None);
+        };
+        if loader.kind() != HostKind::FabricLoaderInstance {
+            return Ok(None);
+        }
+        let kind = expect_string(args.first().unwrap_or(&Value::Ref(None))).to_owned();
+        let requested = args
+            .get(1)
+            .and_then(host_class::class_name)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Class".into()))?;
+        let consumer = args
+            .get(2)
+            .ok_or_else(|| NativeError::Metadata("invokeEntrypoints requires a Consumer".into()))?
+            .clone();
+        let entries = self.host.fabric_entrypoints(&kind);
+        if entries.is_empty() {
+            // The standalone host does not know the run's loader rows. Keep
+            // this counted, as the old host path did, rather than silently
+            // answering an empty invocation.
+            self.host.unknown_operand_call(r)?;
+            return Ok(Some(Value::Void));
+        }
+        let mut first_failure: Option<(String, Value)> = None;
+        let mut suppressed_failures = Vec::new();
+        for (ordinal, (entry_class, provider)) in entries.into_iter().enumerate() {
+            let object =
+                self.host
+                    .fabric_entrypoint_object(&kind, &entry_class, requested, ordinal);
+            let Some(object) = object else {
+                let loading_message = format!(
+                    "Exception while loading entries for entrypoint '{kind}' provided by '{provider}'"
+                );
+                let cast_cause = match self
+                    .host
+                    .take_fabric_entrypoint_failure(&kind, &entry_class)
+                {
+                    Some(cause) => cause,
+                    None => self.caught_throwable(
+                        "java/lang/ClassCastException",
+                        Some(format!(
+                            "entrypoint {entry_class} is not assignable to {requested}"
+                        )),
+                        None,
+                    ),
+                };
+                let loading = self.caught_throwable(
+                    "net/fabricmc/loader/api/EntrypointException",
+                    Some(loading_message),
+                    None,
+                );
+                if let Some(marker) = jar_object::instance_key(&loading) {
+                    self.host.record_throwable_cause(marker, cast_cause);
+                }
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                self.retain_entrypoint_failure(
+                    &mut first_failure,
+                    &mut suppressed_failures,
+                    stage_message,
+                    loading,
+                );
+                continue;
+            };
+            let accepted = match self.run_functional(
+                (
+                    "java/util/function/Consumer",
+                    "accept",
+                    "(Ljava/lang/Object;)V",
+                ),
+                &consumer,
+                &[object],
+            ) {
+                Ok(accepted) => accepted,
+                Err(NativeError::UncaughtException {
+                    class: thrown_class,
+                    message,
+                    frame,
+                }) => {
+                    let cause = self.caught_throwable(&thrown_class, message, frame.as_deref());
+                    let stage_message = format!(
+                        "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                    );
+                    self.retain_entrypoint_failure(
+                        &mut first_failure,
+                        &mut suppressed_failures,
+                        stage_message,
+                        cause,
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if !accepted {
+                self.host.unknown_operand_call(r)?;
+                let cause = self.caught_throwable(
+                    "java/lang/RuntimeException",
+                    Some("entrypoint consumer was not executable".into()),
+                    None,
+                );
+                let stage_message = format!(
+                    "Could not execute entrypoint stage '{kind}' due to errors, provided by '{provider}' at '{entry_class}'!"
+                );
+                self.retain_entrypoint_failure(
+                    &mut first_failure,
+                    &mut suppressed_failures,
+                    stage_message,
+                    cause,
+                );
+            }
+        }
+        if let Some((message, cause)) = first_failure {
+            self.host
+                .record_wrapped_cause("java/lang/RuntimeException", Some(&message), cause);
+            for suppressed in suppressed_failures {
+                self.host.record_wrapped_suppressed(
+                    "java/lang/RuntimeException",
+                    Some(&message),
+                    suppressed,
+                );
+            }
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/RuntimeException".into(),
+                message: Some(message),
+                frame: None,
+            });
+        }
+        Ok(Some(Value::Void))
+    }
+
     /// Refuse a field access on an object the resident heap collected: its
     /// fields are gone, so the access is a missed root, never its fields'
     /// defaults (#226 review). Checked where no field row exists, which is
@@ -17326,14 +17740,19 @@ impl NativeJar {
         for declaration in &self.native_declarations {
             host.declared_registrations.insert(declaration.key());
         }
-        let provider = self
-            .fabric_id
-            .as_deref()
-            .or(self.neoforge_id.as_deref())
-            .unwrap_or("unknown");
-        for (kind, entries) in &self.fabric_entrypoints {
-            for entry in entries {
-                host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+        // `record_fabric_metadata` already copied declarations from a real
+        // fabric.mod.json. Synthetic class-only jars have no metadata bytes,
+        // so retain the explicit builder path for their unit fixtures.
+        if !self.resource_bytes.contains_key("fabric.mod.json") {
+            let provider = self
+                .fabric_id
+                .as_deref()
+                .or(self.neoforge_id.as_deref())
+                .unwrap_or("unknown");
+            for (kind, entries) in &self.fabric_entrypoints {
+                for entry in entries {
+                    host = host.with_fabric_entrypoint(kind, &entry.class, provider);
+                }
             }
         }
         host
@@ -17490,7 +17909,47 @@ impl NativeJar {
                 if active.is_some() {
                     neoforge_imc::set_active(runtime.host, previous.as_deref());
                 }
-                constructed?;
+                if let Err(error) = constructed {
+                    if let NativeError::UncaughtException {
+                        class: thrown_class,
+                        message,
+                        frame,
+                    } = &error
+                    {
+                        // The default Fabric adapter reflects through
+                        // Constructor.newInstance: its LanguageAdapterException
+                        // retains an InvocationTargetException, which in turn
+                        // retains the constructor's original Throwable.
+                        let original = runtime.caught_throwable(
+                            thrown_class,
+                            message.clone(),
+                            frame.as_deref(),
+                        );
+                        let invocation = runtime.caught_throwable(
+                            "java/lang/reflect/InvocationTargetException",
+                            None,
+                            None,
+                        );
+                        if let Some(marker) = jar_object::instance_key(&invocation) {
+                            runtime.host.record_throwable_cause(marker, original);
+                        }
+                        let adapter = runtime.caught_throwable(
+                            "net/fabricmc/loader/api/LanguageAdapterException",
+                            Some(format!(
+                                "Could not instantiate class {}!",
+                                class_name.replace('/', ".")
+                            )),
+                            None,
+                        );
+                        if let Some(marker) = jar_object::instance_key(&adapter) {
+                            runtime.host.record_throwable_cause(marker, invocation);
+                        }
+                        runtime
+                            .host
+                            .record_fabric_entrypoint_failure(kind, &class_name, adapter);
+                    }
+                    return Err(error);
+                }
                 runtime
                     .host
                     .note_entrypoint_constructed(kind, &class_name, &instance);
@@ -22061,6 +22520,13 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(file) = self.class(&current) {
                 queue.extend(file.interface_names());
+            } else if current.starts_with("java/")
+                && host_ref::ClassHierarchy::is_instance(&host_ref::JdkHierarchy, &current, wanted)
+                    == Some(true)
+            {
+                // A JDK interface the jar names (`implements List`): Java 25's
+                // table knows its superinterfaces (`Collection`, #242).
+                return true;
             }
         }
         false
@@ -25138,9 +25604,17 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.caught_object(class, &message, frame) {
             return value;
         }
+        let pending_cause = self.host.take_wrapped_cause(class, &message);
+        let pending_suppressed = self.host.take_wrapped_suppressed(class, &message);
         let value = self.new_object(class);
         if let Some(marker) = expect_ref(&value) {
             self.host.record_throwable(marker, message);
+            if let Some(cause) = pending_cause {
+                self.host.record_throwable_cause(marker, cause);
+            }
+            for suppressed in pending_suppressed {
+                self.host.record_throwable_suppressed(marker, suppressed);
+            }
         }
         value
     }
@@ -25430,6 +25904,29 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// One jar frame, executed instruction by instruction.
+    fn invoke_throwable_suppressed(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "getSuppressed"
+            || r.descriptor != "()[Ljava/lang/Throwable;"
+            || !is_throwable_owner(&r.owner)
+        {
+            return Ok(None);
+        }
+        let Some(marker) = receiver.and_then(jar_object::instance_key) else {
+            return Ok(None);
+        };
+        // One store for every `addSuppressed`: the host's (#269's entrypoint failures,
+        // #278's `whenComplete`), which the heap collector traces. `None` (a throwable the
+        // host doesn't hold) falls through to the other paths.
+        let Some(values) = self.host.throwable_suppressed(marker) else {
+            return Ok(None);
+        };
+        Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -25539,6 +26036,11 @@ impl<H: Host> Runtime<'_, H> {
                 name: method.to_owned(),
                 descriptor: desc.to_owned(),
             };
+            if let Some(receiver) = receiver.as_ref()
+                && let Some(value) = client_reload::runtime_instance_call(self, &r, receiver, args)
+            {
+                return value;
+            }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
                 None => self.host.invoke(&r, args),
@@ -26745,11 +27247,21 @@ impl<H: Host> Runtime<'_, H> {
                         // A jar's own `BlockPos`/`LevelResource`: the game's
                         // members on its fields (`jar_server_values.rs`).
                         value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_throwable_suppressed(&r, receiver.as_ref())
+                    ) {
+                        value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
                     {
                         // A jar exception's inherited `Throwable` text members
                         // (`jar_throwables.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_throwable_metadata(&r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -27150,6 +27662,15 @@ impl<H: Host> Runtime<'_, H> {
                             .flatten();
                             if let Some(value) = optional {
                                 value
+                            } else if let Some(value) = invoke_or_catch!(
+                                at,
+                                self.invoke_fabric_entrypoints(
+                                    &resolved,
+                                    receiver.as_ref(),
+                                    &args,
+                                )
+                            ) {
+                                value
                             } else if matches!(
                                 resolved.owner.as_str(),
                                 "java/util/function/Function"
@@ -27195,7 +27716,16 @@ impl<H: Host> Runtime<'_, H> {
                                     } else {
                                         invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         )
                                     }
                                 } else {
@@ -27227,13 +27757,28 @@ impl<H: Host> Runtime<'_, H> {
                                         ),
                                         None => invoke_or_catch!(
                                             at,
-                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                            if let Some(value) =
+                                                client_reload::runtime_instance_call(
+                                                    self, &resolved, receiver, &args
+                                                )
+                                            {
+                                                value
+                                            } else {
+                                                self.host
+                                                    .invoke_instance(&resolved, receiver, &args)
+                                            }
                                         ),
                                     }
                                 } else {
                                     invoke_or_catch!(
                                         at,
-                                        self.host.invoke_instance(&resolved, receiver, &args)
+                                        if let Some(value) = client_reload::runtime_instance_call(
+                                            self, &resolved, receiver, &args
+                                        ) {
+                                            value
+                                        } else {
+                                            self.host.invoke_instance(&resolved, receiver, &args)
+                                        }
                                     )
                                 }
                             } else {

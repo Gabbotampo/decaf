@@ -477,6 +477,10 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// Fabric resource-loader v0's helper, one per pack type.
+    FabricResourceManagerHelper,
+    /// Vanilla's `FileToIdConverter` record.
+    FileToIdConverter,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1989,6 +1993,22 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::runtime::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricResourceManagerHelper,
+        tag: "rmh",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::client_reload::helper_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::client_reload::HELPER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FileToIdConverter,
+        tag: "ftid",
+        class: ClassRule::FromKey(crate::runtime::client_reload::converter_class),
+        canonical: never_canonical,
+        methods: &crate::runtime::client_reload::CONVERTER_METHODS,
     },
 ];
 

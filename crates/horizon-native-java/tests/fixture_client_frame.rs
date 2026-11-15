@@ -27,7 +27,7 @@ public final class Probe {
     return a.add(b)+"|"+a.subtract(1.5,2.5,-3.5)+"|"+a.scale(-2.0)
       +"|"+a.length()+"|"+a.lengthSqr()+"|"+n+"|"+a.distanceTo(b)
       +"|"+a.cross(b)+"|"+a.dot(b)+"|"+p
-      +"|"+h.getType()+"|"+h.getLocation()
+      +"|"+h.getType()+"|"+h.getType().ordinal()+"|"+h.getLocation()
       +"|"+mc.options.particles().get()+"|"+mc.options.sensitivity().get()
       +"|"+mc.getWindow().getGuiScale();
   }
@@ -67,7 +67,7 @@ fn real_client_frame_reads_match_java25_oracle() {
     host.end_client_frame();
     assert_eq!(
         printed,
-        "(-2.75, 2.5, 4.0)|(-0.25, -5.0, 7.25)|(-2.5, 5.0, -7.5)|4.677071733467427|21.875|(0.2672612419124244, -0.5345224838248488, 0.8017837257372731)|9.80114789195633|(-19.375, -15.3125, -3.75)|-16.5625|BlockPos{x=1, y=-3, z=3}|MISS|(1.25, -2.5, 3.75)|ALL|0.5|2"
+        "(-2.75, 2.5, 4.0)|(-0.25, -5.0, 7.25)|(-2.5, 5.0, -7.5)|4.677071733467427|21.875|(0.2672612419124244, -0.5345224838248488, 0.8017837257372731)|9.80114789195633|(-19.375, -15.3125, -3.75)|-16.5625|BlockPos{x=1, y=-3, z=3}|MISS|0|(1.25, -2.5, 3.75)|ALL|0.5|2"
     );
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
