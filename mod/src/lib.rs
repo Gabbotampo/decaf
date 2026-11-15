@@ -78,6 +78,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use attachments::Lifecycle;
+use game_hooks::Arg;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
     Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
@@ -86,11 +87,11 @@ use mod_api::{
     LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
     LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
-    PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent, RegistrationContext,
-    RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent, ServerAboutToStartEvent,
-    ServerHost, ServerStartedEvent, ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent,
-    ServerTickEvent, ServerTickPhase, Text,
+    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
+    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, RegisterCommandsEvent,
+    RegistrationContext, RightClickBlockEvent, RightClickItemEvent, RunModCommandEvent,
+    ServerAboutToStartEvent, ServerHost, ServerStartedEvent, ServerStartingEvent,
+    ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text,
 };
 use runtime::brigadier::{
     self, ArgumentKind, CommandInvocation as RuntimeInvocation, CommandMessage, CommandOutcome,
@@ -101,11 +102,12 @@ use runtime::events::{
     EventContext, EventFacade, EventFiring, FacadeEntity, FacadeLevel, FacadeOriginal,
     FacadePlayer, GameEvent, GameListener, HeldItems, PhaseOrdering, ServerFacts, dispatch_order,
 };
-use runtime::{ExecutionBudget, NativeJar, StdHost};
+use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
 
 mod attachments;
 mod content;
+mod game_hooks;
 mod runtime;
 mod server_facts;
 
@@ -153,6 +155,11 @@ struct State {
     /// The player leaving in the logout firing now running: their last entry, so the
     /// runtime hands out the object earlier firings did (`EventFacade::departed`).
     departed: Vec<FacadePlayer>,
+    /// `DamageSource`s handed to game-hook firings so far: each firing's is its own object.
+    damage_sources: u64,
+    /// Whether this server tick runs `MinecraftServer.tickServer` (its game-class callbacks):
+    /// decided at its start, read at its end.
+    tick_open: bool,
     /// Players a refresh dropped whose logout firing has not run yet, with their last entry.
     /// Horizon removes every player who left in one poll before the first logout hook, so the
     /// first logout's refresh drops the others too; their own firings take their entry from
@@ -195,6 +202,10 @@ struct LoadedJar {
     /// the loading stages ran (`content.rs`).
     stages_ran: usize,
     failures: Vec<String>,
+    /// The jar's game-class `@Inject`s a game hook site stands for, and the Mixin state they keep
+    /// on game objects between firings (`game_hooks.rs`).
+    hooks: runtime::GameHookRegistrations,
+    hook_state: runtime::GameHookState,
 }
 
 /// One Java command this bridge can run: its usage, the literal path that selects it, the
@@ -523,6 +534,9 @@ impl Hooks for HorizonJava {
             EventContext::default(),
             |_| true,
         );
+        self.game_hooks(Some(&mut *host), "server_stopping", |state| {
+            Some((Some(GameObject::server(state.dedicated)), Vec::new()))
+        });
         let state = self.lock();
         // One line per jar with the counts the report now holds: the report is the authority, but
         // the log must never make a jar with failing listeners look like a clean one.
@@ -546,6 +560,12 @@ impl Hooks for HorizonJava {
             EventContext::default(),
             |_| true,
         );
+        self.game_hooks(Some(&mut *host), "java_server_stopped", |state| {
+            Some((Some(GameObject::server(state.dedicated)), Vec::new()))
+        });
+        // The server, its levels, players, mobs and connections are gone: the next world's
+        // are new objects, whose Mixin state starts from their constructors.
+        game_hooks::forget_world(&mut self.lock());
     }
 
     /// One jar changed its commands (`Commands::refresh_commands`): the Java registrations cannot
@@ -724,9 +744,13 @@ impl Hooks for HorizonJava {
     /// The authoritative server tick's start and end (Fabric's `ServerTickEvents.START_SERVER_TICK`
     /// and `END_SERVER_TICK`, NeoForge's `ServerTickEvent.Pre` and `.Post`).
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
-        let game = match event.phase {
-            ServerTickPhase::ServerTickStart { .. } => GameEvent::ServerTickStart,
-            ServerTickPhase::ServerTickEnd { .. } => GameEvent::ServerTickEnd,
+        let (game, site) = match event.phase {
+            ServerTickPhase::ServerTickStart { .. } => {
+                (GameEvent::ServerTickStart, "java_server_tick_head")
+            }
+            ServerTickPhase::ServerTickEnd { .. } => {
+                (GameEvent::ServerTickEnd, "java_server_tick_tail")
+            }
             // A phase this build does not know: nothing to fire rather than a guess.
             _ => return,
         };
@@ -745,6 +769,31 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // `IntegratedServer.tickServer` pauses while nobody is on the player list (and while
+        // the game is paused, when Horizon ticks nothing): `MinecraftServer.tickServer`, its
+        // HEAD and its TAIL do not run. Horizon ticks an empty integrated server, so a tick
+        // that starts with nobody listed runs neither site; the decision holds for its end, as
+        // vanilla's placement tick runs no TAIL though the host is listed by then (#248's
+        // re-check). A dedicated server always ticks into `tickServer` (`exact_here`).
+        let open = match event.phase {
+            ServerTickPhase::ServerTickStart { .. } => {
+                let open = dedicated || !host.players().server_players().is_empty();
+                self.lock().tick_open = open;
+                open
+            }
+            _ => std::mem::take(&mut self.lock().tick_open),
+        };
+        if !open {
+            return;
+        }
+        // `tickServer(BooleanSupplier hasTimeLeft)`: the supplier is not modelled (a call
+        // refuses).
+        self.game_hooks(Some(&mut *host), site, |state| {
+            Some((
+                Some(GameObject::server(state.dedicated)),
+                vec![has_time_supplier()],
+            ))
+        });
     }
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
@@ -860,6 +909,27 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // `PlayerList.placeNewPlayer(Connection, ServerPlayer, CommonListenerCookie)` on the
+        // server's player list.
+        let (uuid, name) = (event.player, event.name);
+        self.game_hooks(Some(host), "player_logged_in", |state| {
+            // One `Connection` and one cookie per join: a relog is a new object of each.
+            let session = state.players.iter().find(|p| p.uuid == uuid)?.session;
+            let key = format!("{uuid:032x}/{session}");
+            let list = GameObject::opaque("net/minecraft/server/players/PlayerList", "main");
+            let connection = GameObject::opaque("net/minecraft/network/Connection", &key);
+            let cookie =
+                GameObject::opaque("net/minecraft/server/network/CommonListenerCookie", &key)
+                    .with_uuid(uuid)
+                    .with_name(name);
+            let player = game_hooks::player(state, uuid, 0)?;
+            let args = vec![
+                Arg::Object(connection),
+                Arg::Object(player),
+                Arg::Object(cookie),
+            ];
+            Some((Some(list), args))
+        });
     }
 
     /// A player left (Fabric's `ServerPlayConnectionEvents.DISCONNECT` and
@@ -868,7 +938,18 @@ impl Hooks for HorizonJava {
     fn player_logged_out(&self, host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
         // The leaver's last entry, taken before the refresh drops them (or kept by an earlier
         // refresh that already did): the same `ServerPlayer`.
-        let leaving = self.lock().take_leaver(event.player);
+        let leaving = {
+            let mut state = self.lock();
+            let leaving = state.take_leaver(event.player);
+            // The leaver's `ServerPlayer` is gone: what callbacks kept on it is dropped.
+            for object in leaving
+                .iter()
+                .filter_map(|entry| game_hooks::player_of(entry, 0))
+            {
+                game_hooks::forget(&mut state, &object);
+            }
+            leaving
+        };
         self.refresh_players(host);
         {
             let mut state = self.lock();
@@ -933,6 +1014,34 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // `newPlayer.restoreFrom(oldPlayer, keepEverything)`: the old player is the previous life.
+        let (uuid, keep) = (event.player, !event.was_death);
+        self.game_hooks(Some(host), "player_clone", |state| {
+            let old = game_hooks::player(state, uuid, 1)?;
+            let args = vec![
+                Arg::Object(old),
+                Arg::Value(runtime::Value::Int(i32::from(keep))),
+            ];
+            Some((Some(game_hooks::player(state, uuid, 0)?), args))
+        });
+        // The previous life is gone once `restoreFrom` returns: what callbacks kept on it is
+        // dropped, as Java collects the old `ServerPlayer`.
+        let mut state = self.lock();
+        if let Some(old) = game_hooks::player(&state, uuid, 1) {
+            game_hooks::forget(&mut state, &old);
+        }
+    }
+
+    /// A player is about to die (`ServerPlayer.die` HEAD): the game-class callbacks bound there.
+    fn player_died(&self, host: &mut dyn ServerHost, event: &mut PlayerDiedEvent<'_>) {
+        let (uuid, cause) = (event.player, event.cause.unwrap_or("unknown").to_owned());
+        self.game_hooks(Some(host), "player_died", |state| {
+            let source = game_hooks::damage_source(state, &cause);
+            Some((
+                Some(game_hooks::player(state, uuid, 0)?),
+                vec![Arg::Object(source)],
+            ))
+        });
     }
 
     /// A player moved to another dimension (Fabric's `AFTER_PLAYER_CHANGE_LEVEL`, NeoForge's
@@ -1001,6 +1110,13 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // A mob removed for any reason (killed, despawned, unloaded, through a portal) is gone
+        // as a Java object: its Mixin state goes with it. A player leaving a level is a
+        // dimension change, and Java keeps that `ServerPlayer`.
+        if event.kind != "minecraft:player" {
+            let mob = GameObject::entity(event.entity as i32, event.kind, true);
+            game_hooks::forget(&mut self.lock(), &mob);
+        }
     }
 
     /// A player broke the block at `pos` (Fabric's `PlayerBlockBreakEvents.BEFORE`, NeoForge's
@@ -1150,7 +1266,22 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
-        if fired.cancelled {
+        // `Player.attack(Entity)` HEAD: a cancel there is the hook's (the blow does nothing).
+        // Fabric's `AttackEntityCallback` runs before `Player.attack` is entered: a cancel there
+        // means the method, and its HEAD callbacks, never run. (NeoForge runs the HEAD callbacks
+        // first, then `AttackEntityEvent`: a departure for NeoForge jars.)
+        let mut cancelled = fired.cancelled;
+        if !cancelled && let Some(attacker) = self.acting_player(host) {
+            let (id, kind) = (event.entity, event.kind.to_owned());
+            cancelled |= self.game_hooks(Some(host), "attack_entity", |state| {
+                let target = game_hooks::attack_target(state, id, &kind)?;
+                Some((
+                    Some(game_hooks::player(state, attacker, 0)?),
+                    vec![Arg::Object(target)],
+                ))
+            });
+        }
+        if cancelled {
             Flow::Cancel
         } else {
             Flow::Continue
@@ -1231,6 +1362,24 @@ impl Hooks for HorizonJava {
             context,
             |_| true,
         );
+        // `LivingEntity.die(DamageSource)` HEAD, for a mob: `ServerPlayer.die` does not call it.
+        // The hook's cancel keeps the mob alive, a Mixin's skips only `die`'s body: a jar with a
+        // cancellable callback here is not run (`game_hooks.rs`).
+        // Fabric's `ALLOW_DEATH` runs in `hurtServer` before `die`: a cancel there means `die`,
+        // and its HEAD callbacks, never run. (NeoForge runs them first, then `LivingDeathEvent`:
+        // a departure for NeoForge jars.) Vanilla subclasses that work before `super.die`
+        // (Villager, Wolf, Raider...) do it after these callbacks here: a named departure.
+        if event.kind != "minecraft:player" && !fired.cancelled {
+            let (id, kind) = (event.entity as i32, event.kind.to_owned());
+            let damage = event.damage_type.to_owned();
+            self.game_hooks(Some(host), "living_death", |state| {
+                let source = game_hooks::damage_source(state, &damage);
+                Some((
+                    Some(GameObject::entity(id, &kind, true)),
+                    vec![Arg::Object(source)],
+                ))
+            });
+        }
         if fired.cancelled {
             Flow::Cancel
         } else {
@@ -1508,6 +1657,41 @@ impl HorizonJava {
     }
 
     /// The player whose action a hook hears, as the mod API's own helpers name them.
+    /// Runs the game-class Mixin callbacks bound at `site` (`game_hooks.rs`) and delivers what
+    /// they asked of the game. Answers whether one cancelled.
+    fn game_hooks(
+        &self,
+        host: Option<&mut dyn ServerHost>,
+        site: &str,
+        objects: impl FnOnce(&mut State) -> Option<(Option<GameObject>, Vec<Arg>)>,
+    ) -> bool {
+        let fired = {
+            let mut state = self.lock();
+            if !state
+                .jars
+                .iter()
+                .any(|jar| !jar.hooks.entries(site).is_empty())
+            {
+                return false;
+            }
+            // `None`: a player the firing hands over is not listed (`game_hooks::player`).
+            let Some((receiver, args)) = objects(&mut state) else {
+                game_hooks::unlisted(&mut state, site);
+                return false;
+            };
+            game_hooks::fire(&mut state, site, receiver, args)
+        };
+        if let Some(host) = host {
+            for effect in fired.effects {
+                let GameHookEffect::SystemMessage { player, text } = effect;
+                if let Some(target) = host.player(player) {
+                    let _ = target.tell(host, Text::literal(text));
+                }
+            }
+        }
+        fired.cancelled
+    }
+
     fn acting_player(&self, host: &dyn ServerHost) -> Option<u128> {
         host.players().acting_player().map(|player| player.uuid())
     }
@@ -1858,6 +2042,15 @@ fn deliver(
 
 /// A command text as the mod API's component. A translation key stays a key; styled component
 /// JSON is flattened to its plain text, which the runtime already carries beside it.
+/// A `tick(BooleanSupplier hasTimeLeft)` argument: the supplier is not modelled, so a call on it
+/// refuses (the firing fails, counted) rather than answering a made-up time.
+fn has_time_supplier() -> Arg {
+    Arg::Object(GameObject::opaque(
+        "java/util/function/BooleanSupplier",
+        "has-time-left",
+    ))
+}
+
 fn mod_text(text: &CommandText) -> Text {
     if text.translate {
         Text::translate(&text.text, Vec::new())
@@ -2216,6 +2409,8 @@ struct JarRow {
     /// The game's declaration fence would refuse them, so they are skipped; a baked content
     /// package of that namespace declares them instead.
     content_skipped: BTreeMap<String, (usize, usize)>,
+    /// Game-class Mixin callbacks: bound or not, and what their firings did (`game_hooks.rs`).
+    game_hooks: game_hooks::Tally,
 }
 
 impl JarRow {
@@ -2238,6 +2433,7 @@ impl JarRow {
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
+            game_hooks: game_hooks::Tally::default(),
         }
     }
 
@@ -2280,6 +2476,7 @@ impl JarRow {
                 "translated": self.commands_translated,
                 "refused_at_registration": self.commands_refused_at_registration,
             },
+            "game_hooks": self.game_hooks.json(),
             "content": {
                 "blocks": self.content_blocks,
                 "items": self.content_items,
@@ -2441,11 +2638,14 @@ fn load_jar(
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
+            game_hooks: game_hooks::Tally::default(),
         });
     }
     let unknown = host.unknown_host_call_count();
     let registered = host.game_listeners(&jar, true);
     let (listeners, orderings) = (registered.listeners, registered.phase_orderings);
+    let mut tally = game_hooks::Tally::default();
+    let hooks = game_hooks::register(&jar, &mut tally);
     Ok(LoadedJar {
         row: JarRow {
             file,
@@ -2466,6 +2666,7 @@ fn load_jar(
             content_blocks: 0,
             content_items: 0,
             content_skipped: BTreeMap::new(),
+            game_hooks: game_hooks::Tally::default(),
         },
         jar,
         host,
@@ -2476,6 +2677,12 @@ fn load_jar(
         commands_registered: false,
         stages_ran: ran,
         failures,
+        hooks,
+        hook_state: runtime::GameHookState::default(),
+    })
+    .map(|mut loaded| {
+        loaded.row.game_hooks = tally;
+        loaded
     })
 }
 
@@ -2496,7 +2703,8 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
         })
         .chain(state.refused.iter().map(JarRow::json))
         .collect();
-    let report = json!({ "schema": SCHEMA, "jars": rows });
+    let report =
+        json!({ "schema": SCHEMA, "jars": rows, "game_hook_sites": game_hooks::sites_json() });
     let mut bytes = serde_json::to_vec_pretty(&report).unwrap_or_default();
     bytes.push(b'\n');
     host.config_files().write(&path, &bytes)?;
@@ -2966,6 +3174,8 @@ mod tests {
                     commands_registered: false,
                     stages_ran: 1,
                     failures: Vec::new(),
+                    hooks: runtime::GameHookRegistrations::default(),
+                    hook_state: runtime::GameHookState::default(),
                 }
             })
             .collect();
