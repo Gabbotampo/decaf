@@ -33116,13 +33116,13 @@ mod tests {
             })
         );
 
-        // A concat site captures the previous concat's marker text, so a real
-        // chain nests. Each link adds one bounded prefix instead of doubling:
-        // transcription used to grow without limit here.
+        // A concat site captures the previous concat's callback, so a real
+        // chain nests. Each link's key adds one bounded prefix instead of
+        // doubling: transcription used to grow without limit here.
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
-            let captured = bounded_captured_markers(std::slice::from_ref(&value));
-            value = crate::runtime::callback_marker::lambda_from_text("demo/C#m", 0, "", "?", &captured);
+            value =
+                crate::runtime::callback_marker::lambda("demo/C#m", 0, "", None, None, vec![value], false);
         }
         let Some(marker) = crate::runtime::callback_marker::callback_text(&value) else {
             panic!("expected a callback");

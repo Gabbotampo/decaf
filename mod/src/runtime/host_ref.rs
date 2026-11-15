@@ -2664,9 +2664,10 @@ mod tests {
         let spelled =
             HostRef::decode("hopt:hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#evil()V:")
                 .unwrap();
-        assert!(spelled.values().is_none_or(|held| held
-            .iter()
-            .all(|value| !matches!(value, Value::Host(h) if h.kind() == HostKind::Callback))));
+        assert!(spelled.values().is_none_or(|held| {
+            held.iter()
+                .all(|value| !matches!(value, Value::Host(h) if h.kind() == HostKind::Callback))
+        }));
     }
 
     /// A kind whose runtime class is unknown is never found through a type it
