@@ -8,6 +8,7 @@ use crate::{MethodRef, NativeError, Runtime, Value};
 const ENUM_ENTRIES: &str = "kotlin/enums/EnumEntries";
 const ENUM_ENTRIES_LIST: &str = "kotlin/enums/EnumEntriesList";
 const LAZY: &str = "kotlin/Lazy";
+const INITIALIZED_LAZY: &str = "kotlin/InitializedLazyImpl";
 const EMPTY_LIST: &str = "kotlin/collections/EmptyList";
 const EMPTY_SET: &str = "kotlin/collections/EmptySet";
 const EMPTY_MAP: &str = "kotlin/collections/EmptyMap";
@@ -34,27 +35,58 @@ fn identity_equals(
     })
 }
 
-fn enum_entries_equals(
+fn collection_family(handle: &HostRef) -> Option<&'static str> {
+    if handle.kind() == HostKind::KotlinEnumEntries {
+        return Some("list");
+    }
+    if handle.kind() == HostKind::KotlinEmptyCollection {
+        return Some(match handle.key() {
+            "set" => "set",
+            "map" => "map",
+            _ => "list",
+        });
+    }
+    let class = handle.class()?;
+    let class = class.rsplit('/').next().unwrap_or(class);
+    if class.contains("List") || class == "ArrayList" {
+        Some("list")
+    } else if class.contains("Set") {
+        Some("set")
+    } else if class.contains("Map") {
+        Some("map")
+    } else {
+        None
+    }
+}
+
+fn collection_values(handle: &HostRef, nested: &mut dyn Nested) -> Option<Vec<Value>> {
+    if handle.kind() == HostKind::KotlinEnumEntries {
+        return handle
+            .values()
+            .and_then(|values| values.get(1..).map(ToOwned::to_owned));
+    }
+    if handle.kind() == HostKind::KotlinEmptyCollection {
+        return Some(Vec::new());
+    }
+    nested.collection_entries(&Value::Host(handle.clone()))
+}
+
+fn list_like_equals(
     handle: &HostRef,
     other: &Value,
     nested: &mut dyn Nested,
+    family: &str,
 ) -> Result<Option<bool>, NativeError> {
     let Value::Host(other) = other else {
         return Ok(Some(false));
     };
-    if other.kind() != HostKind::KotlinEnumEntries {
+    if collection_family(other) != Some(family) {
         return Ok(None);
     }
-    let Some(left) = handle
-        .values()
-        .and_then(|values| values.get(1..).map(ToOwned::to_owned))
-    else {
+    let Some(left) = collection_values(handle, nested) else {
         return Ok(None);
     };
-    let Some(right) = other
-        .values()
-        .and_then(|values| values.get(1..).map(ToOwned::to_owned))
-    else {
+    let Some(right) = collection_values(other, nested) else {
         return Ok(None);
     };
     if left.len() != right.len() {
@@ -66,6 +98,14 @@ fn enum_entries_equals(
         }
     }
     Ok(Some(true))
+}
+
+fn enum_entries_equals(
+    handle: &HostRef,
+    other: &Value,
+    nested: &mut dyn Nested,
+) -> Result<Option<bool>, NativeError> {
+    list_like_equals(handle, other, nested, "list")
 }
 
 fn enum_entries_hash(
@@ -115,15 +155,21 @@ fn enum_entries_text(
 fn empty_equals(
     handle: &HostRef,
     other: &Value,
-    _nested: &mut dyn Nested,
+    nested: &mut dyn Nested,
 ) -> Result<Option<bool>, NativeError> {
     let Value::Host(other) = other else {
         return Ok(Some(false));
     };
-    if other.kind() != HostKind::KotlinEmptyCollection {
+    let Some(family) = collection_family(handle) else {
+        return Ok(None);
+    };
+    if collection_family(other) != Some(family) {
         return Ok(None);
     }
-    Ok(Some(handle.key() == other.key()))
+    let Some(values) = collection_values(other, nested) else {
+        return Ok(None);
+    };
+    Ok(Some(values.is_empty()))
 }
 
 fn empty_hash(handle: &HostRef, _nested: &mut dyn Nested) -> Result<Option<i32>, NativeError> {
@@ -145,9 +191,17 @@ fn class_for_entries(_: &str) -> &'static str {
 }
 
 fn class_for_lazy(key: &str) -> &'static str {
-    match key.split('/').next().unwrap_or("SYNCHRONIZED") {
+    let mode = HostRef::new(HostKind::KotlinLazy, key)
+        .values()
+        .and_then(|values| values.first().cloned())
+        .and_then(|value| match value {
+            Value::Ref(Some(mode)) => Some(mode),
+            _ => None,
+        });
+    match mode.as_deref().unwrap_or("SYNCHRONIZED") {
         "NONE" => "kotlin/UnsafeLazyImpl",
         "PUBLICATION" => "kotlin/SafePublicationLazyImpl",
+        "INITIALIZED" => INITIALIZED_LAZY,
         _ => "kotlin/SynchronizedLazyImpl",
     }
 }
@@ -427,7 +481,10 @@ pub(crate) fn invoke<H: crate::Host>(
             }
             "(Lkotlin/LazyThreadSafetyMode;Lkotlin/jvm/functions/Function0;)Lkotlin/Lazy;" => {
                 let mode = crate::expect_ref(args.first()?).and_then(|v| v.rsplit('/').next())?;
-                if !matches!(mode, "SYNCHRONIZED" | "PUBLICATION" | "NONE") {
+                // The exact slice models Kotlin's synchronized holder. The
+                // JVM's publication/none implementations have distinct
+                // concurrency contracts, so leave those calls counted.
+                if mode != "SYNCHRONIZED" {
                     return None;
                 }
                 (mode, args.get(1)?.clone())
@@ -446,7 +503,7 @@ pub(crate) fn invoke<H: crate::Host>(
             &initializer,
         );
         Some(Ok(value))
-    } else if r.owner == "kotlin/LazyKt__LazyKt"
+    } else if (r.owner == "kotlin/LazyKt" || r.owner == "kotlin/LazyKt__LazyKt")
         && r.name == "lazyOf"
         && r.descriptor == "(Ljava/lang/Object;)Lkotlin/Lazy;"
     {
@@ -598,6 +655,10 @@ pub(crate) fn instance<H: crate::Host>(
             HostKind::KotlinEmptyCollection => {
                 let kind = handle.key();
                 match (r.name.as_str(), r.descriptor.as_str()) {
+                    // EmptyList/EmptySet/EmptyMap are Serializable singletons.
+                    ("readResolve", "()Ljava/lang/Object;") => {
+                        return Some(Ok(receiver.clone()));
+                    }
                     ("size", "()I") => return Some(Ok(Value::Int(0))),
                     ("isEmpty", "()Z") => return Some(Ok(Value::Int(1))),
                     ("get", "(I)Ljava/lang/Object;") if kind == "list" => {

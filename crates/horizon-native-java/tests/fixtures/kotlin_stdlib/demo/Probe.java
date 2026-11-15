@@ -13,6 +13,10 @@ import kotlin.collections.SetsKt;
 
 public final class Probe {
     enum E { A, B }
+    private static Lazy<String> kept;
+    private static int keepCalls;
+    private static Lazy<String> retry;
+    private static int retryCalls;
 
     private static String exception(int which) {
         try {
@@ -69,6 +73,73 @@ public final class Probe {
         String second = value.getValue();
         return before + "|" + initialized + "|" + first + "|" + second + "|" + calls[0]
             + "|" + value.isInitialized() + "|" + value.toString();
+    }
+
+    public static String crossCollectionEquality() {
+        List<Object> kotlinList = CollectionsKt.emptyList();
+        List<Object> jdkList = java.util.List.of();
+        Set<Object> kotlinSet = SetsKt.emptySet();
+        Set<Object> jdkSet = java.util.Set.of();
+        Map<Object,Object> kotlinMap = MapsKt.emptyMap();
+        Map<Object,Object> jdkMap = java.util.Map.of();
+        EnumEntries<E> entries = EnumEntriesKt.enumEntries(E.values());
+        List<E> ordinary = java.util.Arrays.asList(E.values());
+        return kotlinList.equals(jdkList) + "|" + jdkList.equals(kotlinList)
+            + "|" + kotlinSet.equals(jdkSet) + "|" + jdkSet.equals(kotlinSet)
+            + "|" + kotlinMap.equals(jdkMap) + "|" + jdkMap.equals(kotlinMap)
+            + "|" + entries.equals(ordinary) + "|" + kotlinList.hashCode()
+            + "|" + kotlinSet.hashCode() + "|" + kotlinMap.hashCode();
+    }
+
+    public static String lazyOf() {
+        Lazy<String> value = LazyKt.lazyOf("x");
+        return value.getClass().getName() + "|" + value.isInitialized() + "|"
+            + value.toString() + "|" + value.getValue();
+    }
+
+    public static String lazyAcrossCallbacks() {
+        kept = LazyKt.lazy(new Function0<String>() {
+            public String invoke() { keepCalls++; return "kept"; }
+        });
+        return kept.toString() + "|" + kept.isInitialized();
+    }
+
+    public static String lazyAfterCollection() {
+        for (int i = 0; i < 70000; i++) { Object[] trash = new Object[1]; }
+        return kept.getValue() + "|" + keepCalls + "|" + kept.isInitialized();
+    }
+
+    public static String lazyRetriesAfterThrow() {
+        retry = LazyKt.lazy(new Function0<String>() {
+            public String invoke() {
+                retryCalls++;
+                if (retryCalls == 1) throw new IllegalStateException("boom");
+                return "retry";
+            }
+        });
+        String first;
+        try { retry.getValue(); first = "ok"; }
+        catch (Throwable t) { first = t.getClass().getName() + "|" + t.getMessage(); }
+        return first + "|" + retry.getValue() + "|" + retryCalls + "|" + retry.isInitialized();
+    }
+
+    public static String droppedLazy() {
+        Lazy<String> value = LazyKt.lazy(new Function0<String>() {
+            public String invoke() { return "dropped"; }
+        });
+        return value.getValue();
+    }
+
+    public static String forceCollectionOnly() {
+        for (int i = 0; i < 70000; i++) { Object[] trash = new Object[1]; }
+        return "forced";
+    }
+
+    public static String readResolveIdentity() {
+        List<Object> list = CollectionsKt.emptyList();
+        return Boolean.toString(
+            ((kotlin.collections.EmptyList) (Object) list).readResolve() == (Object) list
+        );
     }
 
     public static String collections() {

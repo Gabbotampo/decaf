@@ -546,6 +546,11 @@ pub(crate) trait Nested {
     fn hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError>;
     /// `Objects.equals(a, b)`.
     fn equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError>;
+    /// The held values of a Java collection, when the host keeps its entries.
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        let _ = value;
+        None
+    }
     /// `String.valueOf(value)`.
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError>;
     /// The vanilla JSON a chat component holds now (its host's state,

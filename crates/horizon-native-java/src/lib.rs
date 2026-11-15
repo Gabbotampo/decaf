@@ -11910,6 +11910,10 @@ impl host_ref::Nested for MarkerText {
         Ok(None)
     }
 
+    fn collection_entries(&mut self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
+
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         let _level = host_recursion::enter()?;
         Ok(Some(match value {
@@ -11960,6 +11964,10 @@ impl host_ref::Nested for HostNested<'_> {
             }
             _ => Some(boxed::canonical(a) == boxed::canonical(b)),
         })
+    }
+
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        self.0.as_deref_mut()?.mutable_collection_entries(value)
     }
 
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
