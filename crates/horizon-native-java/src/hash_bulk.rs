@@ -128,7 +128,7 @@ impl<H: Host> Runtime<'_, H> {
         let sorted_source = self
             .host
             .unmodifiable_view_source(&marker)
-            .map(|source| Value::Ref(Some(source)))
+            .map(|source| crate::jar_object::stored_value(&source))
             .and_then(|source| self.host_collection_class(&source))
             .is_some_and(|class| {
                 class != "java/util/HashSet" && class != "java/util/LinkedHashSet"
@@ -265,10 +265,10 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Found(stored) => Some(stored.clone()),
             _ => None,
         };
-        let entries = self.collection_elements(receiver)?;
-        let old = stored.as_ref().map_or(Value::Ref(None), |stored| {
-            Self::stored_value(&entries, stored)
-        });
+        let old = match &stored {
+            Some(stored) => self.value_of(receiver, &table, stored)?,
+            None => Value::Ref(None),
+        };
         // Which call the function gets, if any.
         let call: Option<Vec<Value>> = match name {
             "computeIfAbsent" if old != Value::Ref(None) => {
@@ -290,7 +290,8 @@ impl<H: Host> Runtime<'_, H> {
         };
         let value = match call {
             Some(call) => {
-                let keys = table.order();
+                // The table's structure, as `HashMap.modCount` sees it.
+                let version = table.version;
                 // `int mc = modCount;`, then `if (mc != modCount) throw`.
                 let mc = self.mod_stamp(marker);
                 self.host.store_hash_table(marker, table);
@@ -301,7 +302,7 @@ impl<H: Host> Runtime<'_, H> {
                 if verdict == mod_count::ModVerdict::Unknown {
                     self.host.unknown_operand_call(r)?;
                 }
-                if verdict == mod_count::ModVerdict::Changed || table.order() != keys {
+                if verdict == mod_count::ModVerdict::Changed || table.version != version {
                     self.host.store_hash_table(marker, table);
                     return Err(NativeError::UncaughtException {
                         class: "java/util/ConcurrentModificationException".into(),
@@ -394,10 +395,18 @@ impl<H: Host> Runtime<'_, H> {
                 self.host_collection_kind(receiver) == Some(object_methods::CollectionKind::Map)
                     && self
                         .host_collection_class(receiver)
-                        // `tree_map.rs` runs `TreeMap.replaceAll`.
+                        // `tree_map.rs` runs `TreeMap.replaceAll`;
+                        // `java_immutable.rs` the unmodifiable maps that own
+                        // their entries (`Map.of`'s, `Collections.emptyMap()`,
+                        // `singletonMap`).
                         .is_some_and(|class| {
                             !class.starts_with("java/util/ImmutableCollections")
-                                && class != "java/util/TreeMap"
+                                && !matches!(
+                                    class.as_str(),
+                                    "java/util/TreeMap"
+                                        | "java/util/Collections$EmptyMap"
+                                        | "java/util/Collections$SingletonMap"
+                                )
                         })
             })
     }
@@ -416,6 +425,76 @@ impl<H: Host> Runtime<'_, H> {
         value: &Value,
         name: &str,
     ) -> Result<(), NativeError> {
+        // In place at the key's rank while the table mirrors the list (#203).
+        let marker = expect_ref(receiver).cloned();
+        let synced = marker
+            .as_deref()
+            .is_some_and(|marker| self.is_synced(marker, table));
+        if synced && let Some(marker) = marker {
+            match stored {
+                Some(stored) if *value != Value::Ref(None) => {
+                    match self.synced_position(&marker, table, &stored, 2) {
+                        Some(position) => {
+                            if let Some(list) = self.host.collection_vec_mut(&marker) {
+                                list[position + 1] = value.clone();
+                            }
+                            self.keep_synced(&marker, table, true);
+                        }
+                        None => {
+                            self.set_stored_value(receiver, &stored, value.clone())?;
+                        }
+                    }
+                    return Ok(());
+                }
+                Some(_) => {
+                    let hash = if name == "computeIfPresent" {
+                        self.java_hash(key)?
+                    } else {
+                        hash
+                    };
+                    if let Lookup::Found(node) = self.table_lookup(table, key, hash)? {
+                        match self.synced_position(&marker, table, &node, 2) {
+                            Some(position) => {
+                                if let Some(list) = self.host.collection_vec_mut(&marker) {
+                                    list.drain(position..position + 2);
+                                }
+                                table.remove(&collection_item_marker(&node));
+                                table.positions = None;
+                                self.keep_synced(&marker, table, true);
+                            }
+                            None => {
+                                let mut entries = self.collection_elements(receiver)?;
+                                let item = collection_item_marker(&node);
+                                if let Some(index) = entries
+                                    .chunks(2)
+                                    .position(|pair| collection_item_marker(&pair[0]) == item)
+                                {
+                                    entries.drain(index * 2..index * 2 + 2);
+                                    self.host.replace_mutable_collection(receiver, entries);
+                                }
+                                table.remove(&item);
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                None if *value != Value::Ref(None) && name != "computeIfPresent" => {
+                    let capacity = table.capacity();
+                    table.insert_at_head(key, hash);
+                    let mirrors = self.place_new_entry(
+                        &marker,
+                        table,
+                        key,
+                        vec![key.clone(), value.clone()],
+                        capacity,
+                        true,
+                    )?;
+                    self.keep_synced(&marker, table, mirrors);
+                    return Ok(());
+                }
+                None => return Ok(()),
+            }
+        }
         match stored {
             Some(stored) if *value != Value::Ref(None) => {
                 self.set_stored_value(receiver, &stored, value.clone())?;
@@ -446,7 +525,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(receiver)?;
                 entries.extend([key.clone(), value.clone()]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert_at_head(collection_item_marker(key), hash);
+                table.insert_at_head(key, hash);
             }
             None => {}
         }
@@ -665,35 +744,37 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// `Stream.distinct()` on a sequential stream: `DistinctOps` keeps a
-    /// `HashSet` of what it has passed on, and passes `t` on when
-    /// `seen.add(t)`.
-    pub(crate) fn hash_distinct(&mut self, values: Vec<Value>) -> Result<Vec<Value>, NativeError> {
-        let (seen, mut table) = self.new_hash_collection(false)?;
-        let mut kept = Vec::with_capacity(values.len());
-        let mut result = Ok(());
-        for value in values {
-            match self.set_add(&seen, &mut table, &value) {
-                Ok(Some(true)) => kept.push(value),
-                Ok(Some(false)) => {}
-                Ok(None) => {
-                    // Identity-hash membership: counted, kept by marker.
-                    self.host.unknown_operand_call(&stream_member(
-                        "distinct",
-                        "()Ljava/util/stream/Stream;",
-                    ))?;
-                    if !kept.contains(&value) {
-                        kept.push(value);
-                    }
-                }
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
+    /// The `HashSet` a sequential `Stream.distinct()` stage keeps
+    /// (`DistinctOps`' `seen`), made when the stage's sink begins.
+    pub(crate) fn new_distinct_set(&mut self) -> Result<Value, NativeError> {
+        let (seen, table) = self.new_hash_collection(false)?;
         self.keep_table(&seen, table);
-        result.map(|()| kept)
+        Ok(seen)
+    }
+
+    /// `DistinctOps`' `accept(t)`: `seen.add(t)`, whether `t` passes on. The
+    /// elements' own `equals`/`hashCode` run, as JDK 25's `HashSet` runs
+    /// them. `None`: a membership the table cannot decide (an identity
+    /// hash), counted; the caller decides it by value.
+    pub(crate) fn distinct_accept(
+        &mut self,
+        seen: &Value,
+        value: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        let marker = expect_ref(seen).cloned().unwrap_or_default();
+        let kind = TableKind {
+            map: false,
+            linked: false,
+        };
+        let mut table = self.take_table(&marker, kind);
+        let added = self.set_add(seen, &mut table, value);
+        self.keep_table(seen, table);
+        let added = added?;
+        if added.is_none() {
+            self.host
+                .unknown_operand_call(&stream_member("distinct", "()Ljava/util/stream/Stream;"))?;
+        }
+        Ok(added)
     }
 
     /// `Collectors.toSet()`: `HashSet::new` and `Set::add`, so the result
@@ -721,31 +802,71 @@ impl<H: Host> Runtime<'_, H> {
         result.map(|()| set)
     }
 
-    /// `Collectors.toMap(key, value[, merge])`: `HashMap::new`, then per
-    /// element `putIfAbsent` (a repeated key throws "Duplicate key k
-    /// (attempted merging values u and v)") or `merge`.
-    pub(crate) fn hash_map_collect(
+    /// The elements of `values` once each, the first of equal ones, in encounter order: what
+    /// Guava's `ImmutableSet.Builder` keeps (its own hash table, `equals`/`hashCode`). An
+    /// element whose `equals` or `hashCode` can't be answered is kept and the collect counted,
+    /// as [`Self::hash_set_collect`] does.
+    pub(crate) fn distinct_in_order(
         &mut self,
-        key_fn: &Value,
-        value_fn: &Value,
-        merge_fn: Option<&Value>,
         values: &[Value],
-    ) -> Result<Value, NativeError> {
-        let (map, mut table) = self.new_hash_collection(true)?;
-        let result =
-            self.hash_map_collect_into(&map, &mut table, key_fn, value_fn, merge_fn, values);
-        self.keep_table(&map, table);
-        result.map(|()| map)
+    ) -> Result<Vec<Value>, NativeError> {
+        let mut table = HashTable::new(None, 0.75);
+        let mut kept = Vec::new();
+        for value in values {
+            let hash = self.java_hash(value)?;
+            match self.table_lookup(&table, value, hash)? {
+                Lookup::Found(_) => {}
+                Lookup::Absent => {
+                    table.insert(value, hash);
+                    kept.push(value.clone());
+                }
+                Lookup::Unknown => {
+                    self.host.unknown_operand_call(&stream_member(
+                        "collect",
+                        "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
+                    ))?;
+                    kept.push(value.clone());
+                }
+            }
+        }
+        Ok(kept)
     }
 
-    fn hash_map_collect_into(
+    /// The `HashMap` `Collectors.toMap(key, value[, merge])`'s supplier
+    /// makes before the first element.
+    pub(crate) fn new_collector_hash_map(&mut self) -> Result<Value, NativeError> {
+        let (map, table) = self.new_hash_collection(true)?;
+        self.keep_table(&map, table);
+        Ok(map)
+    }
+
+    /// `toMap`'s accumulator for one element on its `HashMap`: the key
+    /// function, the value function, then `putIfAbsent` (a repeated key
+    /// throws "Duplicate key k (attempted merging values u and v)") or
+    /// `merge`.
+    pub(crate) fn hash_map_collect_one(
+        &mut self,
+        map: &Value,
+        state: &crate::jdk_model::ToMap,
+        element: &Value,
+    ) -> Result<(), NativeError> {
+        let marker = expect_ref(map).cloned().unwrap_or_default();
+        let kind = TableKind {
+            map: true,
+            linked: false,
+        };
+        let mut table = self.take_table(&marker, kind);
+        let result = self.hash_map_accept(map, &mut table, state, element);
+        self.keep_table(map, table);
+        result
+    }
+
+    fn hash_map_accept(
         &mut self,
         map: &Value,
         table: &mut HashTable,
-        key_fn: &Value,
-        value_fn: &Value,
-        merge_fn: Option<&Value>,
-        values: &[Value],
+        state: &crate::jdk_model::ToMap,
+        element: &Value,
     ) -> Result<(), NativeError> {
         let null_pointer = || NativeError::UncaughtException {
             class: "java/lang/NullPointerException".into(),
@@ -756,67 +877,64 @@ impl<H: Host> Runtime<'_, H> {
             "collect",
             "(Ljava/util/stream/Collector;)Ljava/lang/Object;",
         );
-        for element in values {
-            let key = self.apply_callback(key_fn, std::slice::from_ref(element))?;
-            let value = self.apply_callback(value_fn, std::slice::from_ref(element))?;
-            if value == Value::Ref(None) {
-                return Err(null_pointer());
-            }
-            let Some(merge) = merge_fn else {
-                match self.put_value(map, table, &key, value.clone(), true)? {
-                    Some(Value::Ref(None)) => {}
-                    Some(previous) => {
-                        let key = self.value_of_text(&key, "Ljava/lang/Object;", "", "toMap")?;
-                        let previous =
-                            self.value_of_text(&previous, "Ljava/lang/Object;", "", "toMap")?;
-                        let value =
-                            self.value_of_text(&value, "Ljava/lang/Object;", "", "toMap")?;
-                        return Err(NativeError::UncaughtException {
-                            class: "java/lang/IllegalStateException".into(),
-                            message: Some(format!(
-                                "Duplicate key {key} (attempted merging values {previous} and {value})"
-                            )),
-                            frame: None,
-                        });
-                    }
-                    None => {
-                        self.host.unknown_operand_call(&counted)?;
-                        table.tainted = true;
-                    }
+        let key = self.apply_callback(&state.key_fn, std::slice::from_ref(element))?;
+        let value = self.apply_callback(&state.value_fn, std::slice::from_ref(element))?;
+        if value == Value::Ref(None) {
+            return Err(null_pointer());
+        }
+        let Some(merge) = state.merge_fn.as_ref() else {
+            match self.put_value(map, table, &key, value.clone(), true)? {
+                Some(Value::Ref(None)) => {}
+                Some(previous) => {
+                    let key = self.value_of_text(&key, "Ljava/lang/Object;", "", "toMap")?;
+                    let previous =
+                        self.value_of_text(&previous, "Ljava/lang/Object;", "", "toMap")?;
+                    let value = self.value_of_text(&value, "Ljava/lang/Object;", "", "toMap")?;
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalStateException".into(),
+                        message: Some(format!(
+                            "Duplicate key {key} (attempted merging values {previous} and {value})"
+                        )),
+                        frame: None,
+                    });
                 }
-                continue;
-            };
-            // `HashMap.merge(key, value, merge)`.
-            table.begin_compute();
-            let hash = self.java_hash(&key)?;
-            match self.table_lookup(table, &key, hash)? {
-                Lookup::Unknown => {
+                None => {
                     self.host.unknown_operand_call(&counted)?;
                     table.tainted = true;
                 }
-                Lookup::Absent => {
-                    let mut entries = self.collection_elements(map)?;
-                    entries.extend([key.clone(), value]);
-                    self.host.replace_mutable_collection(map, entries);
-                    table.insert_at_head(collection_item_marker(&key), hash);
-                }
-                Lookup::Found(stored) => {
-                    let entries = self.collection_elements(map)?;
-                    let old = Self::stored_value(&entries, &stored);
-                    let merged = if old == Value::Ref(None) {
-                        value
-                    } else {
-                        self.apply_callback(merge, &[old, value])?
+            }
+            return Ok(());
+        };
+        // `HashMap.merge(key, value, merge)`.
+        table.begin_compute();
+        let hash = self.java_hash(&key)?;
+        match self.table_lookup(table, &key, hash)? {
+            Lookup::Unknown => {
+                self.host.unknown_operand_call(&counted)?;
+                table.tainted = true;
+            }
+            Lookup::Absent => {
+                let mut entries = self.collection_elements(map)?;
+                entries.extend([key.clone(), value]);
+                self.host.replace_mutable_collection(map, entries);
+                table.insert_at_head(&key, hash);
+            }
+            Lookup::Found(stored) => {
+                let entries = self.collection_elements(map)?;
+                let old = Self::stored_value(&entries, &stored);
+                let merged = if old == Value::Ref(None) {
+                    value
+                } else {
+                    self.apply_callback(merge, &[old, value])?
+                };
+                if merged == Value::Ref(None) {
+                    let kind = TableKind {
+                        map: true,
+                        linked: false,
                     };
-                    if merged == Value::Ref(None) {
-                        let kind = TableKind {
-                            map: true,
-                            linked: false,
-                        };
-                        self.remove_node(map, kind, table, &stored, None)?;
-                    } else {
-                        self.set_stored_value(map, &stored, merged)?;
-                    }
+                    self.remove_node(map, kind, table, &stored, None)?;
+                } else {
+                    self.set_stored_value(map, &stored, merged)?;
                 }
             }
         }
