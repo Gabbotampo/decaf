@@ -1344,7 +1344,7 @@ impl StdHost {
         // `Event.DEFAULT_PHASE` and the `EventPriority` constants: what a
         // listener's order is registered with (`order.rs`).
         if r.owner == FABRIC_EVENT && r.name == "DEFAULT_PHASE" {
-            return Some(crate::runtime::host_ids::identifier_of_text(order::DEFAULT_PHASE));
+            return Some(crate::runtime::host_ids::static_identifier(order::DEFAULT_PHASE));
         }
         if order::PRIORITY_CLASSES.contains(&r.owner.as_str())
             && order::PRIORITIES.contains(&r.name.as_str())
