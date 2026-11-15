@@ -47,13 +47,34 @@ def row_key(corpus: str, row: dict, role: str) -> tuple[str, str, str, str]:
 
 
 def call_counts(row: dict | None) -> dict[str, int]:
+    """Counted calls of a row: `calls` for a run, `counted_before_error` for a refusal."""
     result: dict[str, int] = defaultdict(int)
-    for item in (row or {}).get("calls") or []:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            result[str(item[0])] += int(item[1])
-        elif isinstance(item, dict) and "call" in item:
-            result[str(item["call"])] += int(item.get("count", 0))
+    for field in ("calls", "counted_before_error"):
+        for item in (row or {}).get(field) or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                result[str(item[0])] += int(item[1])
+            elif isinstance(item, dict) and "call" in item:
+                result[str(item["call"])] += int(item.get("count", 0))
     return dict(result)
+
+
+# Fields compared through their own columns; every OTHER field that differs is listed by name, so a
+# refused row that now stops somewhere else (new `error`/`stage`) or a run whose `failed`, `frame`
+# or listener evidence changed is never reported as unchanged (rc261d: the tool missed two such rows).
+CALL_FIELDS = {"calls", "counted_before_error"}
+SHOWN_FIELDS = {"jar", "mode", "role", "verdict", "unknown"} | CALL_FIELDS
+
+
+def other_changes(left: dict | None, right: dict | None) -> list[dict]:
+    left, right = left or {}, right or {}
+    changes = []
+    for field in sorted((set(left) | set(right)) - SHOWN_FIELDS):
+        if left.get(field) != right.get(field):
+            def short(value) -> str:
+                text = json.dumps(value, sort_keys=True) if not isinstance(value, str) else value
+                return text if len(text) <= 160 else text[:157] + "..."
+            changes.append({"field": field, "base": short(left.get(field)), "merged": short(right.get(field))})
+    return changes
 
 
 def payload_rows(payload: dict, role: str) -> dict[tuple[str, str, str, str], dict]:
@@ -111,7 +132,9 @@ def moved_jars(base: dict, merged: dict, role: str, flaky: set[tuple[str, str, s
         old_calls, new_calls = call_counts(left), call_counts(right)
         same_verdict = (left or {}).get("verdict") == (right or {}).get("verdict")
         same_unknown = (left or {}).get("unknown") == (right or {}).get("unknown")
-        if left is not None and right is not None and same_verdict and same_unknown and old_calls == new_calls:
+        others = other_changes(left, right)
+        if left is not None and right is not None and same_verdict and same_unknown and old_calls == new_calls \
+                and not others:
             continue
         # Per-call deltas: `vanished` holds calls counted fewer times after the merge (by how many),
         # `appeared` calls counted more times; a call that disappears entirely is the full count.
@@ -123,7 +146,7 @@ def moved_jars(base: dict, merged: dict, role: str, flaky: set[tuple[str, str, s
                       "base_verdict": (left or {}).get("verdict", "(absent)"),
                       "merged_verdict": (right or {}).get("verdict", "(absent)"),
                       "base_unknown": (left or {}).get("unknown"), "merged_unknown": (right or {}).get("unknown"),
-                      "attribution": "", "vanished": vanished, "appeared": appeared})
+                      "attribution": "", "vanished": vanished, "appeared": appeared, "other_changes": others})
     return moved
 
 
@@ -152,13 +175,16 @@ def markdown(report: dict) -> str:
         def labels(data: dict) -> str:
             return ", ".join(f"{key}={data[key]}" for key in sorted(data) if key not in {"corpus", "mode", "role", "jars", "unknown_total"}) or "—"
         lines.append(f"| {source.get('corpus', group)} | {source.get('mode', '—')} | {source.get('role', '—')} | {left.get('unknown_total', 0)} | {right.get('unknown_total', 0)} | {labels(left)} | {labels(right)} |")
-    lines += ["", "## Deterministic changed rows", "", "Every row whose verdict, unknown count or counted calls changed (flaky rows excluded). Vanished/appeared are per-call count deltas.", "", "| Corpus | Mode | Role | Jar | Base → merged | Unknown | Vanished calls | Appeared calls | EXACT/SILENT attribution |", "|---|---|---|---|---|---|---|---|---|"]
+    lines += ["", "## Deterministic changed rows", "", "Every row whose verdict, unknown count or counted calls changed (flaky rows excluded). Vanished/appeared are per-call count deltas.", "", "| Corpus | Mode | Role | Jar | Base → merged | Unknown | Vanished calls | Appeared calls | Other changed fields | EXACT/SILENT attribution |", "|---|---|---|---|---|---|---|---|---|---|"]
+    def others(values: list[dict]) -> str:
+        cell = "<br>".join(f"`{entry['field']}`: {entry['base']} → {entry['merged']}" for entry in values) or "—"
+        return cell.replace("|", "\\|")
     for item in report["moved"]:
         def calls(values: list[dict]) -> str:
             return "<br>".join(f"`{entry['call']}` ({entry['count']})" for entry in values) or "—"
-        lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {item['attribution']} |")
+        lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {others(item.get('other_changes', []))} | {item['attribution']} |")
     if not report["moved"]:
-        lines.append("| — | — | — | — | — | — | — | — | — |")
+        lines.append("| — | — | — | — | — | — | — | — | — | — |")
     lines += ["", "## Flaky rows", ""]
     if report["flaky"]:
         lines += ["| Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|"]
@@ -177,6 +203,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--corpus", action="append", required=True, metavar="NAME=DIR")
     p.add_argument("--fabric-loader", type=Path)
     p.add_argument("--provider-dir", type=Path, action="append", default=[])
+    p.add_argument("--game-block-classes", type=Path,
+                   help="exact vanilla block closure JSON passed to both census probes")
     p.add_argument("--role", choices=("server", "client", "both"), default="both")
     p.add_argument("--dependency-mode", choices=("both", "alone", "closure"), default="both")
     p.add_argument("--jobs", type=int, default=4)
@@ -198,7 +226,7 @@ def build_probe(checkout: Path, target: Path, output: Path) -> None:
     output.chmod(output.stat().st_mode | 0o111)
 
 
-def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role: str, path: Path) -> dict:
+def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role: str, path: Path, *, include_game_table: bool = False) -> dict:
     command = [sys.executable, str(base_checkout / "tools" / "unmodelled_calls.py"), "--probe", str(probe), "--json", str(path), "--jobs", str(args.jobs), "--role", role, "--dependency-mode", args.dependency_mode]
     for corpus in args.corpus:
         command += ["--corpus", corpus]
@@ -206,6 +234,8 @@ def run_census(base_checkout: Path, probe: Path, args: argparse.Namespace, role:
         command += ["--fabric-loader", str(args.fabric_loader)]
     for provider in args.provider_dir:
         command += ["--provider-dir", str(provider)]
+    if include_game_table and args.game_block_classes:
+        command += ["--game-block-classes", str(args.game_block_classes.expanduser().resolve())]
     subprocess.run(command, cwd=base_checkout, check=True)
     return json.loads(path.read_text())
 
@@ -248,13 +278,18 @@ def main(argv: list[str] | None = None) -> int:
     roles = ["server", "client"] if args.role == "both" else [args.role]
     reports: dict[str, dict] = {}
     output = ""
+    # The merged probe runs under the merged checkout driver, so flags added
+    # by main or the head are available. The base probe keeps its own driver
+    # and option set; the prepared table is passed only to the merged run.
     for role in roles:
         repetitions: dict[str, list[dict]] = {"base": [], "merged": []}
         for label, probe in (("base", base_probe), ("merged", merged_probe)):
             for number in range(args.repeat):
-                # Both probes run under the BASE checkout's driver, so the flags mean the same thing.
+                # Each probe uses its matching checkout driver; the merged run can use new flags.
                 path = root / f"{role}-{label}-{number}.json"
-                payload = run_census(base_checkout, probe, args, role, path)
+                driver = merged_checkout if label == "merged" else base_checkout
+                payload = run_census(driver, probe, args, role, path,
+                                     include_game_table=(label == "merged"))
                 payload["sha"] = base_sha if label == "base" else merged_sha
                 repetitions[label].append(payload)
         report = compare_payloads(repetitions["base"][0], repetitions["merged"][0], repetitions, role)

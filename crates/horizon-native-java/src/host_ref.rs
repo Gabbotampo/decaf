@@ -405,6 +405,8 @@ pub enum HostKind {
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
+    /// A pure network StreamCodec factory result.
+    StreamCodec,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -790,6 +792,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
     (
         HostKind::TypeToken,
         &crate::host_type_token::TOKEN_CLASS_SIDE,
+    ),
+    (
+        HostKind::StreamCodec,
+        &crate::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
 ];
 
@@ -1960,6 +1966,14 @@ const KINDS: &[KindInfo] = &[
         // declared type alone, and two such handles prove nothing.
         canonical: crate::host_codec::opaque_canonical,
         methods: &crate::host_codec::OPAQUE_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StreamCodec,
+        tag: "scdc",
+        class: ClassRule::FromKey(crate::stream_codec::class_of_key),
+        // Every factory call allocates a new implementation object.
+        canonical: always_canonical,
+        methods: &crate::stream_codec::STREAM_CODEC_METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,

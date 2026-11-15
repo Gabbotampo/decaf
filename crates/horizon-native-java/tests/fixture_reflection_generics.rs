@@ -8,6 +8,9 @@
 //! raw type with `List.class` — so this test pins the branch a mod takes, not
 //! just the marker text.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -180,7 +183,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-generics-{test}-{}-{unique}",
             std::process::id()
         ));
