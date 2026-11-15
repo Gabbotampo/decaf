@@ -1537,7 +1537,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.models_class(name)
     }
 
-    fn throwable_message(&self, marker: &str) -> Option<String> {
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         self.inner.throwable_message(marker)
     }
 
