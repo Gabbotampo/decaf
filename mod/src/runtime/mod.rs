@@ -10142,6 +10142,16 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
+                "()Ljava/util/Collection;",
+            ) => Ok(self.cached_unmodifiable_collection(
+                receiver,
+                "getDependencies",
+                "java/util/Collections$UnmodifiableCollection",
+                Vec::new(),
+            )),
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getDependencies",
                 "()Ljava/util/Map;",
             ) => Ok(self.cached_unmodifiable_collection(
                 receiver,
