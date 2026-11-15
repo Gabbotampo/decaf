@@ -384,7 +384,7 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 None
             };
-            table.insert(entry, hash);
+            table.insert(entry, hash)?;
         }
         if table.linked || table.order_unknown() {
             return Ok(());
@@ -1142,7 +1142,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Lookup::Absent => {
                     let capacity = table.capacity();
-                    table.insert(key, hash);
+                    table.insert(key, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1177,7 +1177,7 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Absent => {
                 entries.extend([key.clone(), value]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(key, hash);
+                table.insert(key, hash)?;
                 Ok(Some(Value::Ref(None)))
             }
         }
@@ -1200,7 +1200,7 @@ impl<H: Host> Runtime<'_, H> {
                     && self.is_synced(&marker, table)
                 {
                     let capacity = table.capacity();
-                    table.insert(element, hash);
+                    table.insert(element, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1215,7 +1215,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(receiver)?;
                 entries.push(element.clone());
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(element, hash);
+                table.insert(element, hash)?;
                 Ok(Some(true))
             }
         }
@@ -1321,7 +1321,7 @@ impl<H: Host> Runtime<'_, H> {
         source: &Value,
     ) -> Result<(), NativeError> {
         let entries = self.collection_elements(source)?;
-        table.presize(entries.len() / 2);
+        table.presize(entries.len() / 2)?;
         for pair in entries.chunks(2) {
             let [key, value] = pair else { continue };
             if self
