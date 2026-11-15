@@ -1805,20 +1805,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_jdk_constant::TIME_UNIT_METHODS,
     },
     KindInfo {
-        kind: HostKind::StackWalkerOption,
-        tag: "swopt",
-        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
-        // One object per enum constant.
-        canonical: always_canonical,
-        methods: &crate::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
-    },
-    KindInfo {
         kind: HostKind::CodingErrorAction,
         tag: "cea",
         class: ClassRule::Fixed("java/nio/charset/CodingErrorAction"),
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::CODING_ERROR_ACTION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StackWalkerOption,
+        tag: "swopt",
+        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
+        // One object per enum constant.
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
     },
     KindInfo {
         kind: HostKind::UnicodeBlock,
