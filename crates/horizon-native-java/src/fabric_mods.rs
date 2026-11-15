@@ -463,21 +463,12 @@ impl StdHost {
                 let people = (0..count)
                     .map(|index| loader::pointed(Pointed::Person, id, &format!("/{key}/{index}")))
                     .collect::<Vec<_>>();
-                if schema == 0 {
-                    Ok(self.cached_unmodifiable_collection(
-                        receiver,
-                        &r.name,
-                        "java/util/Collections$UnmodifiableCollection",
-                        people,
-                    ))
-                } else {
-                    Ok(self.cached_unmodifiable_collection(
-                        receiver,
-                        &r.name,
-                        "java/util/Collections$UnmodifiableCollection",
-                        people,
-                    ))
-                }
+                Ok(self.cached_unmodifiable_collection(
+                    receiver,
+                    &r.name,
+                    "java/util/Collections$UnmodifiableCollection",
+                    people,
+                ))
             }
             // `V1ModMetadata` holds `ContactInformation.EMPTY` without one.
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
