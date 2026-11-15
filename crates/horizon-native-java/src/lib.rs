@@ -24217,7 +24217,7 @@ impl<H: Host> Runtime<'_, H> {
                         self.file_kind(&path) == file_attributes::FileKind::Directory,
                     )),
                     ("length", "()J") => Value::Long(self.io_file_bytes.get(&path).map_or_else(
-                        || self.io_files.get(&path).map_or(0, str::len) as i64,
+                        || self.io_files.get(&path).map_or(0, String::len) as i64,
                         |bytes| bytes.len() as i64,
                     )),
                     ("getName", "()Ljava/lang/String;") => Value::Ref(Some(
