@@ -6,6 +6,9 @@
 //! .equals("x")` was `true`). Every expected string is what this class
 //! printed on Java 25 (OpenJDK 25.0.5, `javac --release 17`, two runs alike).
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
@@ -186,7 +189,7 @@ fn javac() -> PathBuf {
 /// Compile the fixture into a jar; each test passes its own tag so parallel
 /// tests never share a build root.
 fn jar(tag: &str) -> NativeJar {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-host-values-{tag}-{}",
         std::process::id()
     ));

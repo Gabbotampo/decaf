@@ -1,4 +1,7 @@
 //! Log4j 2.26.0 Level fixture compiled against a signature-only API stub.
+#[path = "support/scratch.rs"]
+mod scratch;
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
@@ -65,7 +68,7 @@ fn compile_api_stub() -> (PathBuf, String) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-log4j-api-stub-{}-{unique}",
         std::process::id()
     ));
