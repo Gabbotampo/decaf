@@ -13285,11 +13285,27 @@ fn array_operand_error(
     }
 }
 
+/// Maximum number of [`Value`] slots one jar-controlled array materialization
+/// may create. `Value` is 32 bytes on the 64-bit arcweld/Linux build, so the
+/// bound is about 512 MiB before the array table's HashMap overhead. It keeps
+/// a hostile jar from touching unbounded overcommitted memory; exceeding it is
+/// a refusal because the runtime cannot answer whether HotSpot would have had
+/// enough heap for the allocation.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
+
+/// The interpreter cannot answer an allocation whose host representation is
+/// over the fixed safety bound. Include both values so the refusal identifies
+/// the requested materialization and the limit that stopped it.
+fn array_bound_error(elements: u128) -> NativeError {
+    NativeError::Metadata(format!(
+        "array of {elements} elements exceeds the runtime's bound of {MAX_ARRAY_ELEMENTS}"
+    ))
+}
+
 /// An array creation's length. A negative one is the JVM's
 /// `NegativeArraySizeException` (its message is the length), which a jar's
-/// handler may catch. Positive lengths are kept intact; allocation below uses
-/// `try_reserve_exact` so an array the host cannot represent is an explicit
-/// `OutOfMemoryError`, rather than the old artificial one-megabyte refusal.
+/// handler may catch. Positive lengths are preserved and checked before their
+/// elements are materialized.
 fn array_length(value: i32) -> Result<usize, NativeError> {
     if value < 0 {
         return Err(NativeError::UncaughtException {
@@ -13298,28 +13314,32 @@ fn array_length(value: i32) -> Result<usize, NativeError> {
             frame: None,
         });
     }
-    usize::try_from(value).map_err(|_| array_out_of_memory())
+    usize::try_from(value).map_err(|_| array_bound_error(u128::from(u32::MAX) + 1))
 }
 
-/// The error a Java array allocation reports when the host cannot reserve its
-/// element storage. The exact threshold is host-memory dependent on HotSpot;
-/// this is therefore a refusal with the real Java exception type, never a
-/// fabricated metadata error.
-fn array_out_of_memory() -> NativeError {
-    NativeError::UncaughtException {
-        class: "java/lang/OutOfMemoryError".into(),
-        message: None,
-        frame: None,
-    }
+/// Check the total number of arrays' elements a `multianewarray` will create.
+/// Only the supplied dimensions count: a partial array leaves its remaining
+/// dimensions null and does not materialize their elements.
+fn array_total_elements(counts: &[usize]) -> Result<(), NativeError> {
+    let total = counts
+        .iter()
+        .fold(1_u128, |total, &count| total.saturating_mul(count as u128));
+    (total <= MAX_ARRAY_ELEMENTS as u128)
+        .then_some(())
+        .ok_or_else(|| array_bound_error(total))
 }
 
 /// Allocate repeated array elements without allowing Rust's allocator failure
-/// to abort the whole probe process.
+/// to abort the whole probe process. Allocation failure is a refusal, never a
+/// guessed catchable Java `OutOfMemoryError`.
 fn repeated_array_values(value: Value, length: usize) -> Result<Vec<Value>, NativeError> {
+    if length > MAX_ARRAY_ELEMENTS {
+        return Err(array_bound_error(length as u128));
+    }
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
-        .map_err(|_| array_out_of_memory())?;
+        .map_err(|_| array_bound_error(length as u128))?;
     values.resize(length, value);
     Ok(values)
 }
@@ -21543,7 +21563,7 @@ impl<H: Host> Runtime<'_, H> {
             let mut values = Vec::new();
             values
                 .try_reserve_exact(length)
-                .map_err(|_| array_out_of_memory())?;
+                .map_err(|_| array_bound_error(length as u128))?;
             for _ in 0..length {
                 values.push(self.new_multidim_array(component, &counts[1..])?);
             }
@@ -21975,7 +21995,14 @@ impl<H: Host> Runtime<'_, H> {
                 let element = return_desc(&r.descriptor)
                     .trim_start_matches('[')
                     .to_owned();
-                let mut values = Vec::with_capacity(end.saturating_sub(start));
+                let copy_len = end.saturating_sub(start);
+                if copy_len > MAX_ARRAY_ELEMENTS {
+                    return Err(array_bound_error(copy_len as u128));
+                }
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(copy_len)
+                    .map_err(|_| array_bound_error(copy_len as u128))?;
                 for index in start..end {
                     values.push(
                         source
@@ -26129,6 +26156,7 @@ impl<H: Host> Runtime<'_, H> {
                             .map(|count| array_length(*count))
                             .collect::<Result<Vec<_>, _>>()
                     );
+                    invoke_or_catch!(at, array_total_elements(&counts));
                     stack.push(invoke_or_catch!(
                         at,
                         self.new_multidim_array(&descriptor, &counts)

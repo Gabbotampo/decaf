@@ -8,7 +8,7 @@
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
-use horizon_native_java::{StdHost, Value};
+use horizon_native_java::{NativeError, StdHost, Value};
 
 const PROBE: &str = r#"package demo;
 
@@ -26,6 +26,21 @@ public final class Probe {
         int length = reachX2 * reachX2 * reachX2 / 4;
         byte[] cache = new byte[length];
         return length + ":" + cache.length + ":" + cache[0] + ":" + cache[length - 1];
+    }
+
+    public static String atBound() {
+        byte[] data = new byte[1 << 24];
+        return data.length + ":" + data[0] + ":" + data[data.length - 1];
+    }
+
+    public static String overBound() {
+        try { byte[] ignored = new byte[(1 << 24) + 1]; return "caught"; }
+        catch (Throwable t) { return "caught:" + t.getClass().getName(); }
+    }
+
+    public static String multidimOverBound() {
+        try { int[][] ignored = new int[65536][65536]; return "caught"; }
+        catch (Throwable t) { return "caught:" + t.getClass().getName(); }
     }
 
     public static String dimensions() {
@@ -57,6 +72,7 @@ public final class Probe {
 fn array_lengths_match_java_25() {
     let fixture = javac_fixture::Fixture::build("array-lengths", &[("demo/Probe.java", PROBE)]);
     let cases = [
+        ("atBound", "16777216:0:0"),
         ("computed", "4194304:4194304:0:0"),
         ("dimensions", "0:2:3:true:0:0:true"),
         (
@@ -92,4 +108,35 @@ fn array_lengths_match_java_25() {
         "differ from JDK 25:\n{}",
         failures.join("\n")
     );
+
+    for method in ["overBound", "multidimOverBound"] {
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        let result = fixture.jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        let expected = match method {
+            "overBound" => "array of 16777217 elements exceeds the runtime's bound of 16777216",
+            "multidimOverBound" => {
+                "array of 4294967296 elements exceeds the runtime's bound of 16777216"
+            }
+            _ => unreachable!(),
+        };
+        match result {
+            Err(NativeError::Metadata(message)) => {
+                assert!(message.starts_with(expected), "{method}: {message}");
+            }
+            other => {
+                panic!("{method} should refuse without entering catch(Throwable), got {other:?}")
+            }
+        }
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{method} counted a host call"
+        );
+    }
 }
