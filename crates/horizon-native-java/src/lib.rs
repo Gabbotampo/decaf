@@ -34,6 +34,7 @@ mod collection_callback;
 mod collection_store;
 mod color_collection;
 mod commons_io;
+mod commons_lang;
 mod commons_pair;
 mod concurrent_sync;
 pub mod content;
@@ -188,6 +189,7 @@ mod reflect_names;
 mod reflect_override;
 mod regex_calls;
 mod registry_contents;
+mod registry_lookup;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
@@ -2856,6 +2858,11 @@ pub trait Host {
         None
     }
 
+    /// A fresh immutable JDK collection with the exact unmodifiable class.
+    fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
+        None
+    }
+
     /// `Arrays.asList` over the array `array` (`window`: a view's `subList`,
     /// from `offset`) holding `values`: a fixed-size view that the runtime
     /// keeps in step with the array (`array_views.rs`), for a host that
@@ -5330,6 +5337,16 @@ impl Host for StdHost {
         }
     }
 
+    fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
+        let owner = match kind {
+            "list" => "java/util/List",
+            "set" => "java/util/Set",
+            "map" => "java/util/Map",
+            _ => return None,
+        };
+        Some(self.unmodifiable_from(owner, "of", kind, values))
+    }
+
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
@@ -5603,6 +5620,19 @@ impl Host for StdHost {
             return Ok(Value::Ref(Some(format!("enum/{}/{}", r.owner, r.name))));
         }
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            // Fabric Biome API's four shared modification phases are opaque
+            // singleton values. Their identity is all this map needs.
+            (
+                "net/fabricmc/fabric/api/biome/v1/ModificationPhase",
+                "ADDITIONS" | "REMOVALS" | "REPLACEMENTS" | "POST_PROCESSING",
+                "Lnet/fabricmc/fabric/api/biome/v1/ModificationPhase;",
+            ) => host_fabric_runtime::modification_phase(&r.name)
+                .ok_or_else(|| NativeError::UnknownHostCall(r.clone())),
+            (
+                "net/fabricmc/fabric/api/resource/v1/reloader/ResourceReloaderKeys$Server",
+                "FUNCTIONS",
+                "Lnet/minecraft/resources/Identifier;",
+            ) => Ok(host_ids::static_identifier("minecraft:functions")),
             ("java/time/Duration", "ZERO", "Ljava/time/Duration;") => Ok(duration_value(0)),
             // TimeUnit constants carry their name; the conversion accessors
             // multiply by that unit's nanosecond factor.
@@ -5742,6 +5772,9 @@ impl Host for StdHost {
         }
         // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
         if let Some(value) = self.guava_text(r, None, args) {
+            return value;
+        }
+        if let Some(value) = commons_lang::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = self.neoforge_loader_call(r, args) {
@@ -7001,6 +7034,9 @@ impl Host for StdHost {
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
+        if let Some(value) = registry_lookup::instance_call(self, r, receiver, args) {
+            return value;
+        }
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -7848,6 +7884,13 @@ impl Host for StdHost {
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -7858,6 +7901,13 @@ impl Host for StdHost {
                     if is_queue_owner(owner) =>
                 {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -7866,6 +7916,13 @@ impl Host for StdHost {
                 }
                 (owner, "push", "(Ljava/lang/Object;)Z") if is_queue_owner(owner) => {
                     let value = Self::argument(r, args, 0)?.clone();
+                    if queue_rejects_null(owner) && value == Value::Ref(None) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
                     self.mutable_collections
                         .entry(marker.to_owned())
                         .or_default()
@@ -11026,6 +11083,7 @@ fn resource_key_identifier(value: &Value) -> Option<(String, String)> {
 /// the same registry id here. This is a lookup table only: no class is loaded
 /// and no game registry is inspected.
 const REGISTRY_STATICS: &[(&str, &str)] = &[
+    ("REGISTRY", "minecraft:root"),
     ("ITEM", "minecraft:item"),
     ("BLOCK", "minecraft:block"),
     ("ENTITY_TYPE", "minecraft:entity_type"),
@@ -12629,10 +12687,21 @@ fn is_list_like_owner(owner: &str) -> bool {
 /// `peek` and `push` are the queue-only members modelled above them; the
 /// table is FIFO, which is what a `PriorityQueue`'s own iteration order is not,
 /// but is a bounded order the interpreter can reproduce deterministically.
+fn queue_rejects_null(owner: &str) -> bool {
+    matches!(
+        owner,
+        "java/util/ArrayDeque"
+            | "java/util/concurrent/ConcurrentLinkedQueue"
+            | "java/util/concurrent/ConcurrentLinkedDeque"
+    )
+}
+
+/// Every queue a jar constructs directly.
 fn is_queue_owner(owner: &str) -> bool {
     matches!(
         owner,
-        "java/util/Queue"
+        "java/util/LinkedList"
+            | "java/util/Queue"
             | "java/util/Deque"
             | "java/util/BlockingQueue"
             | "java/util/BlockingDeque"
@@ -25341,6 +25410,11 @@ impl<H: Host> Runtime<'_, H> {
     /// constants were declared in supplies the position. A receiver that is not
     /// such a marker, or a class this invocation never initialized, stays with
     /// the host's answer.
+    pub(crate) fn enum_ordinal_of(&self, value: &Value) -> Option<i32> {
+        let marker = expect_ref(value)?;
+        self.enum_constants.get(marker).map(|(_, ordinal)| *ordinal)
+    }
+
     fn declared_enum_ordinal(&mut self, marker: &str) -> Result<Option<Value>, NativeError> {
         let Some((class, name)) = marker
             .strip_prefix("enum/")
