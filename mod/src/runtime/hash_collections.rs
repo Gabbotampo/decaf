@@ -901,6 +901,15 @@ impl<H: Host> Runtime<'_, H> {
         {
             return false;
         }
+        // `List.add(Object)` stores the reference and never observes an
+        // argument collection's iteration order. In particular, a two-entry
+        // `MapN` is an opaque element here; counting its salt-dependent
+        // layout would both over-count and make a plain add look like a map
+        // traversal (#254). `addAll` remains order-sensitive because it
+        // copies the source's elements.
+        if r.name == "add" && r.descriptor == "(Ljava/lang/Object;)Z" {
+            return false;
+        }
         !matches!(
             (r.owner.as_str(), r.name.as_str()),
             (
