@@ -134,6 +134,8 @@ pub enum GameEvent {
     /// NeoForge/Forge `RegisterCommandsEvent`): the listener registers on the
     /// Brigadier façade (`brigadier.rs`).
     RegisterCommands,
+    /// The client builds its Brigadier command tree (Fabric ClientCommandRegistrationCallback).
+    ClientRegisterCommands,
     // Client events: the window's own points fire them, never a server
     // (`client_surface` holds the façade they see).
     /// The client finished starting, before its first tick (Fabric
@@ -172,7 +174,7 @@ pub enum GameEvent {
 
 impl GameEvent {
     /// Every event, in declaration order (the bit order of [`Self::bit`]).
-    pub const ALL: [GameEvent; 42] = [
+    pub const ALL: [GameEvent; 43] = [
         GameEvent::ServerStarting,
         GameEvent::ServerStarted,
         GameEvent::ServerStopping,
@@ -203,6 +205,7 @@ impl GameEvent {
         GameEvent::PlayerCopy,
         GameEvent::PlayerChangeLevel,
         GameEvent::RegisterCommands,
+        GameEvent::ClientRegisterCommands,
         GameEvent::ClientStarted,
         GameEvent::ClientStopping,
         GameEvent::ClientTickStart,
@@ -250,6 +253,7 @@ impl GameEvent {
             GameEvent::PlayerCopy => "player_copy",
             GameEvent::PlayerChangeLevel => "player_change_level",
             GameEvent::RegisterCommands => "register_commands",
+            GameEvent::ClientRegisterCommands => "client_register_commands",
             GameEvent::ClientStarted => "client_started",
             GameEvent::ClientStopping => "client_stopping",
             GameEvent::ClientTickStart => "client_tick_start",
@@ -293,7 +297,8 @@ impl GameEvent {
     pub fn is_client(self) -> bool {
         matches!(
             self,
-            GameEvent::ClientStarted
+            GameEvent::ClientRegisterCommands
+                | GameEvent::ClientStarted
                 | GameEvent::ClientStopping
                 | GameEvent::ClientTickStart
                 | GameEvent::ClientTickEnd
@@ -357,6 +362,8 @@ enum Shape {
     ChangeLevel,
     /// `(CommandDispatcher, CommandBuildContext, Commands.CommandSelection)`
     Commands,
+    /// (CommandDispatcher, CommandBuildContext)
+    ClientCommands,
     /// `(Minecraft)`
     Minecraft,
     /// `(ClientLevel)`
@@ -668,6 +675,17 @@ const FABRIC_FIELDS: &[FabricField] = &[
     },
     // Client events (`fabric-lifecycle-events-v1`, `fabric-networking-api-v1`
     // of the same Fabric API), fired by the window only.
+    // Client command callbacks build the same Brigadier tree as the server
+    // command callback; the client census records the tree but never executes
+    // a command or a renderer.
+    FabricField {
+        owner: "net/fabricmc/fabric/api/client/command/v2/ClientCommandRegistrationCallback",
+        field: "EVENT",
+        method: "register",
+        descriptor: "(Lcom/mojang/brigadier/CommandDispatcher;Lnet/minecraft/commands/CommandBuildContext;)V",
+        event: GameEvent::ClientRegisterCommands,
+        shape: Shape::ClientCommands,
+    },
     fabric(
         client_lifecycle!("ClientTickEvents"),
         "END_CLIENT_TICK",
@@ -2472,6 +2490,10 @@ fn fabric_arguments(shape: Shape, firing: &EventFiring) -> Result<Vec<Value>, Na
                 )),
             ]
         }
+        Shape::ClientCommands => vec![
+            crate::runtime::host_brigadier::dispatcher(),
+            crate::runtime::host_brigadier::build_context(),
+        ],
         Shape::Minecraft => vec![crate::runtime::game_object::client_value(
             crate::runtime::client_surface::MINECRAFT.into(),
         )],
