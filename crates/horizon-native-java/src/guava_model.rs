@@ -30,26 +30,100 @@ const RUNTIME_TYPE: &str = "#runtimeTypeLjava/lang/reflect/Type;";
 /// The concrete JDK class returned by Guava's no-argument collection
 /// factories, as constructed by Guava 33.6.0.
 pub(crate) fn empty_factory_class(r: &MethodRef) -> Option<&'static str> {
-    if !r.descriptor.starts_with("()") {
-        return None;
-    }
-    match (r.owner.as_str(), r.name.as_str()) {
-        ("com/google/common/collect/Maps", "newHashMap") => Some("java/util/HashMap"),
-        ("com/google/common/collect/Maps", "newLinkedHashMap") => Some("java/util/LinkedHashMap"),
-        ("com/google/common/collect/Maps", "newIdentityHashMap") => {
-            Some("java/util/IdentityHashMap")
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("com/google/common/collect/Maps", "newHashMap", "()Ljava/util/HashMap;") => {
+            Some("java/util/HashMap")
         }
-        ("com/google/common/collect/Maps", "newConcurrentMap") => {
-            Some("java/util/concurrent/ConcurrentHashMap")
+        ("com/google/common/collect/Maps", "newLinkedHashMap", "()Ljava/util/LinkedHashMap;") => {
+            Some("java/util/LinkedHashMap")
         }
-        ("com/google/common/collect/Lists", "newArrayList") => Some("java/util/ArrayList"),
-        ("com/google/common/collect/Lists", "newLinkedList") => Some("java/util/LinkedList"),
-        ("com/google/common/collect/Sets", "newHashSet") => Some("java/util/HashSet"),
-        ("com/google/common/collect/Sets", "newIdentityHashSet") => {
+        (
+            "com/google/common/collect/Maps",
+            "newIdentityHashMap",
+            "()Ljava/util/IdentityHashMap;",
+        ) => Some("java/util/IdentityHashMap"),
+        (
+            "com/google/common/collect/Maps",
+            "newConcurrentMap",
+            "()Ljava/util/concurrent/ConcurrentMap;",
+        ) => Some("java/util/concurrent/ConcurrentHashMap"),
+        ("com/google/common/collect/Lists", "newArrayList", "()Ljava/util/ArrayList;") => {
+            Some("java/util/ArrayList")
+        }
+        ("com/google/common/collect/Lists", "newLinkedList", "()Ljava/util/LinkedList;") => {
+            Some("java/util/LinkedList")
+        }
+        ("com/google/common/collect/Sets", "newHashSet", "()Ljava/util/HashSet;") => {
+            Some("java/util/HashSet")
+        }
+        ("com/google/common/collect/Sets", "newLinkedHashSet", "()Ljava/util/LinkedHashSet;") => {
+            Some("java/util/LinkedHashSet")
+        }
+        ("com/google/common/collect/Sets", "newConcurrentHashSet", "()Ljava/util/Set;") => {
+            Some("java/util/concurrent/ConcurrentHashMap$KeySetView")
+        }
+        ("com/google/common/collect/Sets", "newIdentityHashSet", "()Ljava/util/Set;") => {
             Some("java/util/Collections$SetFromMap")
         }
         _ => None,
     }
+}
+
+/// Exact Guava expected-size/capacity factories. Negative arguments are
+/// checked before constructing the JDK collection, with Guava's message.
+pub(crate) fn sized_factory_class(
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<&'static str, NativeError>> {
+    let (class, label) = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        (
+            "com/google/common/collect/Maps",
+            "newHashMapWithExpectedSize",
+            "(I)Ljava/util/HashMap;",
+        ) => ("java/util/HashMap", "expectedSize"),
+        (
+            "com/google/common/collect/Maps",
+            "newLinkedHashMapWithExpectedSize",
+            "(I)Ljava/util/LinkedHashMap;",
+        ) => ("java/util/LinkedHashMap", "expectedSize"),
+        (
+            "com/google/common/collect/Lists",
+            "newArrayListWithCapacity",
+            "(I)Ljava/util/ArrayList;",
+        ) => ("java/util/ArrayList", "initialArraySize"),
+        (
+            "com/google/common/collect/Lists",
+            "newArrayListWithExpectedSize",
+            "(I)Ljava/util/ArrayList;",
+        ) => ("java/util/ArrayList", "arraySize"),
+        (
+            "com/google/common/collect/Sets",
+            "newHashSetWithExpectedSize",
+            "(I)Ljava/util/HashSet;",
+        ) => ("java/util/HashSet", "expectedSize"),
+        (
+            "com/google/common/collect/Sets",
+            "newLinkedHashSetWithExpectedSize",
+            "(I)Ljava/util/LinkedHashSet;",
+        ) => ("java/util/LinkedHashSet", "expectedSize"),
+        _ => return None,
+    };
+    let size = match args.first() {
+        Some(Value::Int(size)) => *size,
+        _ => {
+            return Some(Err(NativeError::Metadata(
+                "Guava size argument is not int".into(),
+            )));
+        }
+    };
+    if size < 0 {
+        return Some(Err(NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some(format!("{label} cannot be negative but was: {size}")),
+            frame: None,
+        }));
+    }
+    Some(Ok(class))
 }
 
 fn map_ref(name: &str, descriptor: &str) -> MethodRef {
@@ -100,6 +174,53 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(result) = sized_factory_class(r, args) {
+            let class = result?;
+            return Ok(self.host.empty_mutable_collection(class));
+        }
+        if let Some(class) = empty_factory_class(r) {
+            return Ok(self.host.empty_mutable_collection(class));
+        }
+        if let Some((class, values, map)) = self.collection_factory_values(r, args)? {
+            let collection = self.host.empty_mutable_collection(class).ok_or_else(|| {
+                NativeError::Metadata("Guava collection factory has no host collection".into())
+            })?;
+            let (owner, name, descriptor) = if map {
+                (
+                    "java/util/Map",
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                )
+            } else {
+                ("java/util/Collection", "add", "(Ljava/lang/Object;)Z")
+            };
+            if map {
+                for pair in values.as_chunks::<2>().0 {
+                    self.host.invoke_instance(
+                        &MethodRef {
+                            owner: owner.into(),
+                            name: name.into(),
+                            descriptor: descriptor.into(),
+                        },
+                        &collection,
+                        pair,
+                    )?;
+                }
+            } else {
+                for value in values {
+                    self.host.invoke_instance(
+                        &MethodRef {
+                            owner: owner.into(),
+                            name: name.into(),
+                            descriptor: descriptor.into(),
+                        },
+                        &collection,
+                        &[value],
+                    )?;
+                }
+            }
+            return Ok(Some(collection));
+        }
         if let Some(value) = self.invoke_memoized_supplier(r, receiver, args)? {
             return Ok(Some(value));
         }
@@ -204,6 +325,54 @@ impl<H: Host> Runtime<'_, H> {
             "com/google/common/collect/MapMaker" => self.invoke_map_maker(r, receiver, args),
             _ => Ok(None),
         }
+    }
+
+    /// Materialize the array and map-copy overloads whose elements are owned
+    /// by the interpreter. Iterator/Iterable overloads remain in guava_text,
+    /// where the host already owns their bounded iteration state.
+    fn collection_factory_values(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<(&'static str, Vec<Value>, bool)>, NativeError> {
+        let (class, map, array) = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "com/google/common/collect/Lists",
+                "newArrayList",
+                "([Ljava/lang/Object;)Ljava/util/ArrayList;",
+            ) => ("java/util/ArrayList", false, true),
+            (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "([Ljava/lang/Object;)Ljava/util/HashSet;",
+            ) => ("java/util/HashSet", false, true),
+            (
+                "com/google/common/collect/Maps",
+                "newHashMap",
+                "(Ljava/util/Map;)Ljava/util/HashMap;",
+            ) => ("java/util/HashMap", true, false),
+            (
+                "com/google/common/collect/Maps",
+                "newLinkedHashMap",
+                "(Ljava/util/Map;)Ljava/util/LinkedHashMap;",
+            ) => ("java/util/LinkedHashMap", true, false),
+            _ => return Ok(None),
+        };
+        let source = args
+            .first()
+            .ok_or_else(|| NativeError::Metadata("Guava factory argument is missing".into()))?;
+        if matches!(source, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        if array {
+            return Ok(Some((class, self.array(source)?.clone(), map)));
+        }
+        let values = runtime_collection_values(&*self.host, source)?;
+        Ok(Some((class, values, map)))
     }
 
     /// `ImmutableSet.of(...)` and `ImmutableMap.of(...)`/`ImmutableBiMap.of`,

@@ -5508,6 +5508,9 @@ impl Host for StdHost {
         if let Some(value) = self.brigadier_invoke(r, args) {
             return value;
         }
+        if let Some(result) = guava_model::sized_factory_class(r, args) {
+            return result.map(|class| self.empty_collection_class(class));
+        }
         if let Some(class) = guava_model::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
         }
