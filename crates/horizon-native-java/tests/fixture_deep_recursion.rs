@@ -9,8 +9,9 @@
 //!
 //! A jar's own recursion is bounded by the thread's stack (`frame_bound.rs`) and caught as Java's
 //! `StackOverflowError`. That bound nests far fewer frames than HotSpot's default stack, so a
-//! caught overflow from it is counted (`java/lang/StackOverflowError#<frame-bound>`): the jar's
-//! recursion may have finished on the JVM.
+//! caught overflow from it is counted, naming the bound and its depth
+//! (`java/lang/StackOverflowError#<frame-bound:DEPTH>`, #260): the jar's recursion may have
+//! finished on the JVM.
 //!
 //! `fixtures/deep_recursion/demo/Probe.java` runs unchanged on both sides; its `main` on Java 25
 //! with the 26.3 server's gson-2.14.0 printed `java25.txt`. The Gson stubs exist only for `javac`.
@@ -40,8 +41,8 @@ const SERIALIZED_NAME_STUB: &str = "package com.google.gson.annotations;\n\
 @java.lang.annotation.Target({java.lang.annotation.ElementType.FIELD})\n\
 public @interface SerializedName { String value(); String[] alternate() default {}; }\n";
 
-/// The count a frame-bound `StackOverflowError` leaves when a jar catches it.
-const FRAME_BOUND: &str = "java/lang/StackOverflowError#<frame-bound>()V";
+/// The count a frame-bound `StackOverflowError` leaves when a jar catches it (its depth follows).
+const FRAME_BOUND: &str = "java/lang/StackOverflowError#<frame-bound:";
 
 fn expected(method: &str) -> &'static str {
     ORACLE
@@ -111,7 +112,8 @@ fn a_million_frame_recursion_is_a_caught_stack_overflow() {
     let fixture = fixture();
     let (text, unknown) = run(&fixture, "deepRecursion");
     assert_eq!(text, expected("deepRecursion"), "{unknown:?}");
-    assert_eq!(unknown, [FRAME_BOUND]);
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert!(unknown[0].starts_with(FRAME_BOUND), "{unknown:?}");
 }
 
 /// A document holding two of one field's names (Gson keeps the last in document order, `b`) is a

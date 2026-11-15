@@ -63,6 +63,10 @@ fn table_kind_of(class: &str) -> Option<TableKind> {
             map: true,
             linked: true,
         },
+        "java/util/concurrent/ConcurrentHashMap" => TableKind {
+            map: true,
+            linked: false,
+        },
         "java/util/HashSet" => TableKind {
             map: false,
             linked: false,
@@ -73,6 +77,24 @@ fn table_kind_of(class: &str) -> Option<TableKind> {
         },
         _ => return None,
     })
+}
+
+/// `ConcurrentHashMap` rejects null keys and values before any hash-table
+/// mutation. The ordinary JDK map path accepts both, so this check is tied to
+/// the receiver's concrete class by the caller.
+fn concurrent_map_rejects_null(r: &MethodRef, args: &[Value]) -> bool {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("put" | "putIfAbsent" | "replace" | "merge" | "containsValue", _) => {
+            args.iter().any(|value| matches!(value, Value::Ref(None)))
+        }
+        ("remove" | "get" | "getOrDefault" | "containsKey", _) => args
+            .first()
+            .is_some_and(|value| matches!(value, Value::Ref(None))),
+        ("computeIfAbsent" | "computeIfPresent" | "compute", _) => args
+            .first()
+            .is_some_and(|value| matches!(value, Value::Ref(None))),
+        _ => false,
+    }
 }
 
 /// Where a key is, as `HashMap.getNode` would find it.
@@ -149,6 +171,19 @@ impl<H: Host> Runtime<'_, H> {
             kind = table_kind_of(&class);
         }
         let kind = kind?;
+        // The Guava factory hands out a host Collection handle. Keep its
+        // exact ConcurrentHashMap semantics, but do not turn every jar-owned
+        // ConcurrentHashMap constructor into a synthetic hash table: those
+        // objects still need the ordinary counted path used before this PR.
+        if class == "java/util/concurrent/ConcurrentHashMap"
+            && !matches!(
+                value,
+                Value::Host(handle)
+                    if handle.kind() == crate::runtime::host_ref::HostKind::Collection
+            )
+        {
+            return None;
+        }
         self.host.has_mutable_collection(marker).then_some(kind)
     }
 
@@ -585,6 +620,16 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
+        if self.host_collection_class(receiver).as_deref()
+            == Some("java/util/concurrent/ConcurrentHashMap")
+            && concurrent_map_rejects_null(r, args)
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
@@ -895,10 +940,25 @@ impl<H: Host> Runtime<'_, H> {
         {
             return false;
         }
+        // Guava's immutableEnumMap copies an enum keyed map into the
+        // enum's deterministic order; it does not expose Map.of's salted
+        // iteration order to the host model.
+        if r.owner == "com/google/common/collect/Maps" && r.name == "immutableEnumMap" {
+            return false;
+        }
         if self
             .member_owner(&r.owner, &r.name, &r.descriptor)
             .is_some_and(|(_, jar)| jar)
         {
+            return false;
+        }
+        // `List.add(Object)` stores the reference and never observes an
+        // argument collection's iteration order. In particular, a two-entry
+        // `MapN` is an opaque element here; counting its salt-dependent
+        // layout would both over-count and make a plain add look like a map
+        // traversal (#254). `addAll` remains order-sensitive because it
+        // copies the source's elements.
+        if r.name == "add" && r.descriptor == "(Ljava/lang/Object;)Z" {
             return false;
         }
         !matches!(

@@ -77,16 +77,9 @@ fn self_containing_collections_answer_as_java_25() {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let text = fixture.text_on(&mut host, method);
         let unknown = host.unknown_host_calls();
-        // A jar recursion caught at the jar-frame bound is counted (`fixture_deep_recursion.rs`):
-        // `compareToCycle` recurses without end, `streamChains` runs its last chain where such a
-        // recursion was caught. The bound cannot tell an endless recursion from a deep one.
-        let counted: &[&str] = if matches!(method, "streamChains" | "compareToCycle") {
-            &["java/lang/StackOverflowError#<frame-bound>()V"]
-        } else {
-            &[]
-        };
-        let names: Vec<&str> = unknown.iter().map(|(call, _)| call.as_str()).collect();
-        if text != expected(method) || names != counted {
+        // Java's own overflow (a cycle) is answered by a bound's throw, which is counted
+        // (`host_recursion.rs`, `frame_bound.rs`); nothing else may be.
+        if text != expected(method) || unknown.iter().any(|(call, _)| !is_bound(call)) {
             failures.push(format!(
                 "{method}\n  java:   {}\n  native: {text}\n  unknown: {unknown:?}",
                 expected(method)
@@ -94,4 +87,51 @@ fn self_containing_collections_answer_as_java_25() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A `StackOverflowError` one of the runtime's own bounds raised, counted (#260 review): the
+/// jar-frame bound or a host walk's.
+fn is_bound(call: &str) -> bool {
+    call.starts_with("java/lang/StackOverflowError#<frame-bound:")
+        || call.starts_with("java/lang/StackOverflowError#<host-walk-bound:")
+}
+
+/// Depths Java answers but the runtime's bounds may not reach, on any build and thread: a finite
+/// recursion inside `catch (Throwable)` (the frame bound nests ~50 jar frames unoptimised on
+/// 8 MiB, ~780 optimised), a 1,000-deep nested list (a host walk level costs tens of KiB of native
+/// stack), and a `Hashtable` inside itself (Java skips it while the hash is in progress). Each is
+/// Java's answer or the bound's counted throw, never a silent other path (#260 review B1, B2).
+#[test]
+fn depths_java_answers_are_exact_or_counted() {
+    let fixture = javac_fixture::Fixture::build(
+        "self-containing-depths",
+        &[
+            ("com/google/gson/Gson.java", GSON_STUB),
+            ("com/google/gson/JsonElement.java", JSON_ELEMENT_STUB),
+            ("com/google/gson/JsonObject.java", JSON_OBJECT_STUB),
+            (
+                "demo/Probe.java",
+                include_str!("fixtures/self_containing/demo/Probe.java"),
+            ),
+            (
+                "demo/DeepAnnotated.java",
+                include_str!("fixtures/self_containing/demo/DeepAnnotated.java"),
+            ),
+        ],
+    );
+    for method in ["finiteRecursion", "deepNestedList", "hashtableSelf"] {
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        let text = fixture.text_on(&mut host, method);
+        let unknown = host.unknown_host_calls();
+        let counted = unknown.iter().any(|(call, _)| is_bound(call));
+        assert!(
+            text == expected(method) || counted,
+            "{method}: silent {text}, Java {}, unknown {unknown:?}",
+            expected(method)
+        );
+        assert!(
+            unknown.iter().all(|(call, _)| is_bound(call)),
+            "{method}: {unknown:?}"
+        );
+    }
 }

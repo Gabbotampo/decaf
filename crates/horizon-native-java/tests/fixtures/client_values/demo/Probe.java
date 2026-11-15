@@ -57,6 +57,8 @@ public class Probe {
     java.awt.Color red = java.awt.Color.RED;
     p("awt_text", red); p("awt_hash", red.hashCode()); p("awt_same", red == java.awt.Color.red);
     p("awt_pink_text", java.awt.Color.PINK); p("awt_pink_hash", java.awt.Color.PINK.hashCode());
+    p("awt_lightgray", java.awt.Color.lightGray == java.awt.Color.LIGHT_GRAY);
+    p("awt_darkgray", java.awt.Color.darkGray == java.awt.Color.DARK_GRAY);
     // Forgery: text spelled like the old markers.
     String head = "client";
     Object fs = head + "/style/§l", fc = "key-category/" + "minecraft:misc", fm = head + "/minecraft";
@@ -70,6 +72,7 @@ public class Probe {
     p("forged_style_instanceof", (fs instanceof Style) + "," + (fs instanceof String));
     p("forged_class", fm.getClass().getName());
     try { Object c = (KeyMapping.Category) fc; p("forged_cast", "ok"); } catch (ClassCastException x) { p("forged_cast", "CCE"); }
+    try { Object v = "client/Vec3"; p("forged_vec3_cast", ((net.minecraft.world.phys.Vec3) v).toString()); } catch (ClassCastException x) { p("forged_vec3_cast", "CCE"); }
     TextColor tg2 = TextColor.fromLegacyFormat(ChatFormatting.GOLD);
     var ig = new IdentityHashMap<Object, Integer>(); ig.put(tg, 1); ig.put(tg2, 2);
     var ib = new IdentityHashMap<Object, Integer>(); ib.put(bold, 1); ib.put(bold.withBold(true), 2);
@@ -86,6 +89,23 @@ public class Probe {
   /** A jar's own `new Category(id)` against the registered one (Java `cat_equals_new=true`). */
   public static String newCategory() {
     return String.valueOf(KeyMapping.Category.MISC.equals(new KeyMapping.Category(Identifier.withDefaultNamespace("misc"))));
+  }
+
+  public static String nullCategory() {
+    return String.valueOf(new KeyMapping("null", 0, null).getCategory());
+  }
+
+  public static String ownCategorySet() {
+    KeyMapping.Category a = new KeyMapping.Category(Identifier.withDefaultNamespace("same"));
+    KeyMapping.Category b = new KeyMapping.Category(Identifier.withDefaultNamespace("same"));
+    return String.valueOf(new HashSet<Object>(List.of(a, b)).size());
+  }
+
+  /** A mapping returns the exact Category object passed to its constructor. */
+  public static String ownCategoryMapping() {
+    KeyMapping.Category own = new KeyMapping.Category(Identifier.withDefaultNamespace("own"));
+    KeyMapping mapping = new KeyMapping("own", 0, own);
+    return String.valueOf(mapping.getCategory() == own) + "," + String.valueOf(mapping.getCategory().equals(own));
   }
 
   /** A second registration of one id (Java `cat_register_twice=IAE`). */

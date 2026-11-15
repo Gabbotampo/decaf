@@ -33,6 +33,15 @@ const MUTATORS: &[&str] = &[
     "clear",
     "set",
     "sort",
+    "put",
+    "putAll",
+    "putIfAbsent",
+    "replace",
+    "replaceAll",
+    "compute",
+    "computeIfAbsent",
+    "computeIfPresent",
+    "merge",
     "replaceAll",
     "put",
     "putAll",
@@ -314,12 +323,25 @@ impl StdHost {
     /// or `map`): a new view reading `source` live. `None` when `source` is no
     /// object.
     pub(crate) fn unmodifiable_view(&mut self, kind: &str, source_value: &Value) -> Option<Value> {
+        let class = view_class(kind, crate::runtime::jar_object::object_class(source_value));
+        self.unmodifiable_view_as(class, source_value)
+    }
+
+    /// A new unmodifiable view of the JDK class `class` reading `source_value`
+    /// live, whatever the source's own class: `Collections.unmodifiable*`
+    /// picks `class` from the source ([`Self::unmodifiable_view`]), while
+    /// `UnmodifiableList.subList` keeps its own class (#251). `None` when
+    /// `source_value` is no object.
+    pub(crate) fn unmodifiable_view_as(
+        &mut self,
+        class: &str,
+        source_value: &Value,
+    ) -> Option<Value> {
         let source = expect_ref(source_value)?.clone();
-        let source_class = crate::runtime::jar_object::object_class(source_value);
         // A counter that never moves back: the collector shrinks the table, so its size
         // would hand a new view a live one's key (#249).
         let marker = crate::runtime::jar_object::collection_key_for(
-            view_class(kind, source_class),
+            class,
             crate::runtime::jar_object::CollectionFamily::Immutable,
             self.next_unmodifiable_collection,
         );
