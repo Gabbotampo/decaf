@@ -270,6 +270,13 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(text) = self.host.modelled_to_string_checked(value)? {
                 return Ok(text);
             }
+            // No model prints it: a `String` is its own text, anything else
+            // (a host marker, a stream, an object) is counted, never shown
+            // as its key without a count.
+            if !matches!(value, Value::Ref(Some(text)) if crate::value_class::is_plain_string(text))
+            {
+                self.host.unknown_operand_call(&object_to_string())?;
+            }
         }
         Ok(java_value_text(value, desc))
     }
