@@ -16,8 +16,18 @@
 //!
 //! The cyclic cases Java prints instead of recursing (`(this Collection)`, `(this Map)`,
 //! `Arrays.deepToString`'s `[...]`) are answered by the walks themselves, before they recurse.
+//!
+//! **Every refusal is counted** (#260 review). The bound is the host's own native stack, not
+//! Java's: one level of a host walk costs tens of KiB of it (more than 80 KiB unoptimised), so a
+//! 1,000-deep nested list Java prints is refused here, and even a real cycle's overflow is not one
+//! Java reproduces at the same point. The throw keeps the process alive and the jar's handler
+//! running, but the answer is the bound's, not Java's: each refusal is recorded here with the depth
+//! it was refused at, and the runtime counts it (`Runtime::count_bound_refusals`,
+//! `java/lang/StackOverflowError#<host-walk-bound:DEPTH>`) where the throw reaches a jar frame and
+//! when the execution ends, so a run that met the bound is never silent.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 use crate::runtime::NativeError;
 use crate::runtime::frame_bound::FRAME_STACK_FLOOR;
@@ -33,6 +43,17 @@ pub(crate) const UNKNOWN_STACK_DEPTH: usize = 256;
 
 thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
+    /// The refusals not yet counted: how many at each depth.
+    static REFUSED: RefCell<BTreeMap<usize, usize>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// The refusals since the last call, as `(depth, how many)`: each is the caller's to count.
+pub(crate) fn take_refusals() -> Vec<(usize, usize)> {
+    REFUSED.with(|refused| {
+        std::mem::take(&mut *refused.borrow_mut())
+            .into_iter()
+            .collect()
+    })
 }
 
 /// One level of a nested walk; dropping it leaves the level.
@@ -62,6 +83,7 @@ pub(crate) fn enter() -> Result<Level, NativeError> {
             None => depth >= UNKNOWN_STACK_DEPTH,
         };
     if spent {
+        REFUSED.with(|refused| *refused.borrow_mut().entry(depth).or_default() += 1);
         return Err(stack_overflow());
     }
     DEPTH.with(|cell| cell.set(depth + 1));
@@ -99,11 +121,15 @@ mod tests {
             walk(levels)
         }
         let before = DEPTH.with(Cell::get);
+        let _ = take_refusals();
         let mut levels = 0;
         let error = walk(&mut levels).unwrap_err();
         assert!(is_stack_overflow(&error), "{error:?}");
         assert!(levels > 0 && levels <= MAX_HOST_WALK_DEPTH, "{levels}");
         assert_eq!(DEPTH.with(Cell::get), before);
+        // The refusal is recorded once, at the depth the walk reached, for the runtime to count.
+        assert_eq!(take_refusals(), [(before + levels, 1)]);
+        assert!(take_refusals().is_empty());
     }
 
     /// A composed predicate as deep as a jar builds it (`p = p.negate()` in a loop) ends in a

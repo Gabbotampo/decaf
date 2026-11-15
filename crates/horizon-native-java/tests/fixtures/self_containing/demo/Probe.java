@@ -166,9 +166,47 @@ public final class Probe {
         return t(() -> a.compareTo(a));
     }
 
+    static int sum(int n) {
+        return n == 0 ? 0 : n + sum(n - 1);
+    }
+
+    /** A finite recursion Java finishes, inside a handler that would swallow an overflow. */
+    public static String finiteRecursion() {
+        try {
+            return String.valueOf(sum(2000));
+        } catch (Throwable e) {
+            return "caught " + e.getClass().getSimpleName();
+        }
+    }
+
+    /** Two equal 1,000-deep nested lists, no cycle: Java prints, hashes and compares them. */
+    public static String deepNestedList() {
+        List<Object> a = new ArrayList<>();
+        List<Object> b = new ArrayList<>();
+        List<Object> x = a;
+        List<Object> y = b;
+        for (int i = 0; i < 1000; i++) {
+            List<Object> nx = new ArrayList<>();
+            List<Object> ny = new ArrayList<>();
+            x.add(nx);
+            y.add(ny);
+            x = nx;
+            y = ny;
+        }
+        return t(() -> a.toString().length()) + "," + t(() -> a.hashCode()) + "," + t(() -> a.equals(b));
+    }
+
+    /** `Hashtable.hashCode` skips a table inside itself while its hash is in progress. */
+    public static String hashtableSelf() {
+        Hashtable<Object, Object> ht = new Hashtable<>();
+        ht.put("k", ht);
+        return t(() -> ht.hashCode());
+    }
+
     public static void main(String[] args) throws Exception {
         for (String m : new String[] {"listSelf", "setSelf", "mapSelf", "nestedCycle", "hashSelf", "equalsSelf",
-                "arraysSelf", "gsonCycle", "comparatorChain", "compareToCycle", "streamChains", "selfPrinting", "viewChain"}) {
+                "arraysSelf", "gsonCycle", "comparatorChain", "compareToCycle", "streamChains", "selfPrinting", "viewChain",
+                "finiteRecursion", "deepNestedList", "hashtableSelf"}) {
             System.out.println(m + "=" + Probe.class.getMethod(m).invoke(null));
         }
     }

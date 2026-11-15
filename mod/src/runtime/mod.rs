@@ -24935,6 +24935,9 @@ impl<H: Host> Runtime<'_, H> {
         desc: &str,
         at: usize,
     ) -> Result<(usize, Value), NativeError> {
+        // A host walk's refusal (`host_recursion.rs`) reaches the jar here: counted before any
+        // handler sees its throw.
+        self.count_bound_refusals()?;
         match error {
             NativeError::UncaughtException {
                 class: thrown,
@@ -24951,11 +24954,17 @@ impl<H: Host> Runtime<'_, H> {
                     frame: frame.or_else(|| Some(format!("{class}#{method} +{at}"))),
                 })
             }
-            error @ NativeError::CallDepthExceeded { .. } => {
+            error @ NativeError::CallDepthExceeded { limit, .. } => {
                 // A table that cannot be read catches nothing: the bound's error stands.
                 if let Ok(Some(handler)) =
                     self.exception_handler(file, method, desc, at, host_recursion::STACK_OVERFLOW)
                 {
+                    // The bound is the host's native stack (`frame_bound.rs`), far shallower than
+                    // the JVM's: a finite recursion Java finishes (`sum(2000)`) is refused here,
+                    // and even an endless one does not overflow where Java's would. The jar gets
+                    // Java's catchable throw; the conversion is counted, naming the bound and the
+                    // depth, so the run is never silent (#260 review). A strict host refuses.
+                    self.count_bound("frame-bound", limit)?;
                     let value = self.caught_throwable(host_recursion::STACK_OVERFLOW, None, None);
                     return Ok((handler, value));
                 }
@@ -24963,6 +24972,28 @@ impl<H: Host> Runtime<'_, H> {
             }
             error => Err(frame_context(error, class, method, at)),
         }
+    }
+
+    /// Count one `StackOverflowError` the runtime raised from its own `bound` at `depth`
+    /// (`java/lang/StackOverflowError#<BOUND:DEPTH>()V`): the bound decided it, not Java.
+    fn count_bound(&mut self, bound: &str, depth: usize) -> Result<(), NativeError> {
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: host_recursion::STACK_OVERFLOW.into(),
+                name: format!("<{bound}:{depth}>"),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Count the host walks' refusals since the last count (`host_recursion.rs`).
+    fn count_bound_refusals(&mut self) -> Result<(), NativeError> {
+        for (depth, times) in host_recursion::take_refusals() {
+            for _ in 0..times {
+                self.count_bound("host-walk-bound", depth)?;
+            }
+        }
+        Ok(())
     }
 
     /// The throwable value a Java handler receives for a throw the host or a
@@ -25252,6 +25283,11 @@ impl<H: Host> Runtime<'_, H> {
         let result = self.invoke_frame(class, method, desc, receiver, args);
         stack_walk::leave();
         self.depth -= 1;
+        // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
+        // host call, or one that left uncaught) is counted too.
+        if self.depth == 0 {
+            self.count_bound_refusals()?;
+        }
         result
     }
 
