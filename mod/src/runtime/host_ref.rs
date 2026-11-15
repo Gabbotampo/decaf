@@ -447,6 +447,7 @@ pub enum HostKind {
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
+    DfuCodec,
     /// A `java.lang.reflect.Type` that is no class (`ParameterizedType`,
     /// `TypeVariable`, `WildcardType`, `GenericArrayType`): key the node
     /// (`host_reflect_type.rs`).
@@ -2028,6 +2029,15 @@ const KINDS: &[KindInfo] = &[
         // One node, one object.
         canonical: always_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DfuCodec,
+        tag: "dfuc",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_codec::dfu_codec_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_codec::DFU_CODEC_METHODS,
     },
     KindInfo {
         kind: HostKind::ReflectType,

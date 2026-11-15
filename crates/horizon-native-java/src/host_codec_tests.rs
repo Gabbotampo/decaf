@@ -122,7 +122,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         // An identity hash held: counted.
         ("identityHeld", Counted),
         // An unmodelled codec constant (Java `truetrue`): counted.
-        ("opaqueCodec", Counted),
+        ("opaqueCodec", Exact("truetrue")),
         // A library's codec constants are one object each: identity, `equals`, hash
         // collections exact, the constants' reads counted (#199 F2).
         (
@@ -130,8 +130,16 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
             CountedAs("truefalsetruefalsetruefalse2true1truefalse1true"),
         ),
         // `Set.of` refuses one constant twice and prints it (DFU's `toString`).
-        ("codecDuplicate", CountedAs("duplicate element: String")),
-        ("codecText", CountedAs("String|Int|Bool")),
+        (
+            "codecSingletons",
+            Exact("truetruetruetruetruetruetruetruetruetruetruetruetruefalse"),
+        ),
+        ("codecDuplicate", Exact("duplicate element: String")),
+        ("codecText", Exact("String|Int|Bool")),
+        (
+            "dfuConstruction",
+            CountedAs("true|false|true|false|true|true|false|true"),
+        ),
         // A pair is never equal to a JDK object (#199 F4).
         ("pairVsJdk", Exact("falsefalsefalsefalsefalse")),
     ];

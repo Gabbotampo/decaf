@@ -46,6 +46,7 @@ mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
+mod dfu_codec;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -5934,6 +5935,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = dfu_codec::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
@@ -28178,6 +28182,8 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = dfu_codec::invoke(&r, receiver.as_ref(), &args) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

@@ -47,6 +47,19 @@ public final class HostCodecs {
     return out.toString();
   }
 
+  /** PR1 DFU construction: static singleton, fresh field/xmap nodes, and callback retention. */
+  public static String dfuConstruction() {
+    Codec<Integer> codec = Codec.INT;
+    Object field = codec.fieldOf("n");
+    Object getter = ((com.mojang.serialization.MapCodec<Integer>) field).forGetter((Integer x) -> x);
+    Object mapped = codec.xmap(x -> x + 1, x -> x - 1);
+    Object record = com.mojang.serialization.codecs.RecordCodecBuilder.create(i -> (App) null);
+    return (codec == Codec.INT) + "|" + ((Object) codec == (Object) Codec.STRING) + "|" + (field instanceof com.mojang.serialization.MapCodec)
+        + "|" + (field == codec.fieldOf("n")) + "|" + (getter instanceof com.mojang.serialization.codecs.RecordCodecBuilder)
+        + "|" + (mapped instanceof Codec) + "|" + (mapped == codec.xmap(x -> x + 1, x -> x - 1))
+        + "|" + (record instanceof Codec);
+  }
+
   /** A pair hands back its values; equal by them, a new object each time; text and hash. */
   public static String pairs() {
     Pair<Integer, String> p = Pair.of(1, "a");
@@ -122,6 +135,16 @@ public final class HostCodecs {
   }
 
   /** `Set.of` refuses one constant twice, printing it (DataFixerUpper's `toString`). */
+  /** Every DataFixerUpper Codec constant is one canonical object. */
+  public static String codecSingletons() {
+    return "" + (Codec.BOOL == Codec.BOOL) + (Codec.BYTE == Codec.BYTE) + (Codec.SHORT == Codec.SHORT)
+        + (Codec.INT == Codec.INT) + (Codec.LONG == Codec.LONG) + (Codec.FLOAT == Codec.FLOAT)
+        + (Codec.DOUBLE == Codec.DOUBLE) + (Codec.STRING == Codec.STRING) + (Codec.BYTE_BUFFER == Codec.BYTE_BUFFER)
+        + (Codec.INT_STREAM == Codec.INT_STREAM) + (Codec.LONG_STREAM == Codec.LONG_STREAM)
+        + (Codec.PASSTHROUGH == Codec.PASSTHROUGH) + (Codec.EMPTY == Codec.EMPTY)
+        + ((Object) Codec.INT == (Object) Codec.LONG);
+  }
+
   public static String codecDuplicate() {
     try {
       return "" + Set.of(Codec.STRING, Codec.STRING).size();
