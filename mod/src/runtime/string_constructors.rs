@@ -328,6 +328,43 @@ fn decode_bytes<H: Host>(
     Ok(Some(charset.decode(bytes)))
 }
 
+/// Read a `char[]` and build the same UTF-16 text as the corresponding
+/// `String(char[])` constructor. `String.valueOf` and `copyValueOf` delegate
+/// to that constructor in the JDK, including its range and null checks.
+fn char_array_text<H: Host>(
+    runtime: &Runtime<'_, H>,
+    r: &MethodRef,
+    args: &[Value],
+    range: bool,
+) -> Result<Option<String>, NativeError> {
+    let units = match args.first() {
+        Some(array @ Value::Host(_)) => runtime
+            .array(array)?
+            .iter()
+            .map(|value| match value {
+                Value::Int(code) => *code,
+                _ => 0,
+            })
+            .collect::<Vec<_>>(),
+        _ => {
+            return Err(thrown(
+                "java/lang/NullPointerException",
+                "Cannot read the array length because \"value\" is null".into(),
+            ));
+        }
+    };
+    let (offset, count) = if range {
+        let offset = expect_int(r, StdHost::argument(r, args, 1)?)?;
+        let count = expect_int(r, StdHost::argument(r, args, 2)?)?;
+        check_range(offset, count, units.len())?;
+        (offset as usize, count as usize)
+    } else {
+        (0, units.len())
+    };
+    let slice = &units[offset..offset + count];
+    Ok(String::from_utf16(&slice.iter().map(|unit| *unit as u16).collect::<Vec<_>>()).ok())
+}
+
 /// The text a `String` constructor builds; `Ok(None)` for a constructor
 /// counted by [`count`] (see the module comment).
 pub(crate) fn build<H: Host>(
@@ -379,17 +416,8 @@ pub(crate) fn build<H: Host>(
                 None => Ok(None),
             };
         }
-        "([C)V" => {
-            let units = codes(runtime, "value")?;
-            String::from_utf16(&units.iter().map(|unit| *unit as u16).collect::<Vec<_>>()).ok()
-        }
-        "([CII)V" => {
-            let units = codes(runtime, "value")?;
-            let (offset, count) = (int(1)?, int(2)?);
-            check_range(offset, count, units.len())?;
-            let slice = &units[offset as usize..(offset + count) as usize];
-            String::from_utf16(&slice.iter().map(|unit| *unit as u16).collect::<Vec<_>>()).ok()
-        }
+        "([C)V" => char_array_text(runtime, r, args, false)?,
+        "([CII)V" => char_array_text(runtime, r, args, true)?,
         "([III)V" => {
             let points = codes(runtime, "codePoints")?;
             let (offset, count) = (int(1)?, int(2)?);
@@ -413,6 +441,26 @@ pub(crate) fn build<H: Host>(
         _ => None,
     };
     Ok(text)
+}
+
+/// Model the static `String.valueOf(char[])`, `valueOf(char[], int, int)`,
+/// `copyValueOf(char[])` and `copyValueOf(char[], int, int)` overloads.
+/// An unpaired surrogate cannot be represented by the native string value, so
+/// the exact call is retained as an unknown just as the constructor is.
+pub(crate) fn value_of<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    let range = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("java/lang/String", "valueOf" | "copyValueOf", "([C)Ljava/lang/String;") => false,
+        ("java/lang/String", "valueOf" | "copyValueOf", "([CII)Ljava/lang/String;") => true,
+        _ => return Ok(None),
+    };
+    match char_array_text(runtime, r, args, range)? {
+        Some(text) => Ok(Some(Value::Ref(Some(text)))),
+        None => runtime.host.unknown_operand_call(r).map(Some),
+    }
 }
 
 /// Count `r` when it is a `java.lang.String` constructor; `Some(Void)` then

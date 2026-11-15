@@ -19,6 +19,9 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = string_constructors::value_of(self, r, args)? {
+            return Ok(Some(value));
+        }
         // Loggers named after a class (`jdk_model.rs`).
         if let Some(value) = self.invoke_logger_factory(r, args)? {
             return Ok(Some(value));

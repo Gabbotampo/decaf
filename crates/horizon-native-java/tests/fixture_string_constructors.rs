@@ -60,6 +60,11 @@ public final class Ctors {
   public static String buffer() { return new String(new StringBuffer("bf")); }
   // "q"
   public static String reference() { Function<char[], String> f = String::new; return f.apply(new char[] {'q'}); }
+  // Java 25: "abcd|bc|abcd|bc"
+  public static String valueOfChars() { char[] c = {'a', 'b', 'c', 'd'}; return String.valueOf(c) + "|" + String.valueOf(c, 1, 2) + "|" + String.copyValueOf(c) + "|" + String.copyValueOf(c, 1, 2); }
+  // Java 25: the delegated constructor's exact checks and messages.
+  public static String valueOfErrors() { char[] c = {'a', 'b', 'c', 'd'}; return attempt(() -> String.valueOf((char[]) null)) + "|" + attempt(() -> String.valueOf(c, -1, 2)) + "|" + attempt(() -> String.copyValueOf(c, 3, 2)) + "|" + attempt(() -> String.copyValueOf(c, 2, -1)); }
+  public static String valueOfUnpaired() { return String.valueOf(new char[] {'a', '\uD800'}); }
   // "0"
   public static String supplier() { Supplier<String> f = String::new; return "" + f.get().length(); }
   // "mh"
@@ -68,6 +73,7 @@ public final class Ctors {
         String.class, java.lang.invoke.MethodType.methodType(void.class, String.class));
     return (String) h.invoke("mh");
   }
+  static String attempt(Supplier<String> f) { try { return f.get(); } catch (RuntimeException e) { return e.getClass().getSimpleName() + ":" + e.getMessage(); } }
 }
 "#;
 
@@ -133,6 +139,11 @@ fn modelled_constructors_answer_java_25() {
         ("charsRange", "bc"),
         ("codePoints", "a\u{1F600}b"),
         ("reference", "q"),
+        ("valueOfChars", "abcd|bc|abcd|bc"),
+        (
+            "valueOfErrors",
+            "NullPointerException:Cannot read the array length because \"value\" is null|StringIndexOutOfBoundsException:Range [-1, -1 + 2) out of bounds for length 4|StringIndexOutOfBoundsException:Range [3, 3 + 2) out of bounds for length 4|StringIndexOutOfBoundsException:Range [2, 2 + -1) out of bounds for length 4",
+        ),
         ("bytes", "hi"),
         ("bytesRange", "b"),
         ("bytesCharset", "\u{e9}"),
@@ -164,6 +175,30 @@ fn modelled_constructors_answer_java_25() {
             host.unknown_host_calls()
         );
     }
+}
+
+/// Static char-array helpers with an unpaired surrogate remain counted under
+/// their own Java member, just as the constructor path does.
+#[test]
+fn unpaired_value_of_stays_counted() {
+    let jar = jar();
+    let mut host = StdHost::new();
+    jar.invoke_method_with_args(
+        "demo.Ctors",
+        "valueOfUnpaired",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    )
+    .unwrap();
+    assert!(
+        host.unknown_host_calls().iter().any(|(call, count)| call
+            == "java/lang/String#valueOf([C)Ljava/lang/String;"
+            && *count == 1),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
 
 #[test]
