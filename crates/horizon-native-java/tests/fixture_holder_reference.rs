@@ -151,7 +151,7 @@ fn self_registered_holders_match_java_25() {
     let expected_bound = EXPECTED
         .replace("Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]' from registry Registry[ResourceKey[minecraft:root / minecraft:item] (Stable)]", "value")
         .replace("truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|falsefalse|Reference{ResourceKey[minecraft:item / demo:item]=null}", "truefalse|truefalse|Optional[ResourceKey[minecraft:item / demo:item]]|Left[ResourceKey[minecraft:item / demo:item]]|REFERENCE|truefalse|Reference{ResourceKey[minecraft:item / demo:item]=value}");
-    assert_eq!(bound, Value::Ref(Some(expected_bound.into())));
+    assert_eq!(bound, Value::Ref(Some(expected_bound)));
 
     assert!(REAL_ORACLE.contains("before|"));
     assert!(REAL_ORACLE.contains("after|"));
