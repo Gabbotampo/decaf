@@ -167,7 +167,8 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(by_mode["closure"]["verdict"], "refused")
         self.assertIn("missing dependency absent", by_mode["closure"]["error"])
         self.assertEqual(report["totals"]["alone"]["wide"]["ran-hollow"], 1)
-        self.assertEqual(report["totals"]["closure"]["wide"]["refused"], 1)
+        self.assertNotIn("refused", report["totals"]["closure"]["wide"])
+        self.assertEqual(len(report["corpora"]["wide"]["closure_regressions"]), 1)
 
     def test_dependency_failure_is_a_regression_outside_closure_totals(self):
         rows = [
