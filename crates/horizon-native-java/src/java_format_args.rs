@@ -13,8 +13,8 @@ use crate::java_format::{self, Arg};
 impl<H: Host> Runtime<'_, H> {
     /// `String.format(locale, format, args)`'s text, or `None` when the
     /// formatter cannot answer it exactly. `locale` is `None` for the
-    /// overloads without one (the default locale, which the bounded host
-    /// treats as `en_US`).
+    /// overloads without one (the player's default FORMAT locale, which the
+    /// bounded host cannot provide).
     pub(crate) fn java_format(
         &mut self,
         locale: Option<&Value>,
