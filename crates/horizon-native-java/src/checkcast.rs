@@ -512,6 +512,13 @@ impl<H: Host> Runtime<'_, H> {
     /// [`Self::known_instance_of`] for an object of the class `class`, before
     /// one exists (a `ServiceLoader` provider the loader is about to build).
     pub(crate) fn class_known_instance_of(&self, class: &str, target: &str) -> Option<bool> {
+        if self.class(class).is_some_and(|file| {
+            file.interface_names()
+                .iter()
+                .any(|interface| interface == target)
+        }) {
+            return Some(true);
+        }
         let target_is_interface = self
             .class(target)
             .and_then(class_access)
@@ -715,19 +722,10 @@ impl<H: Host> Runtime<'_, H> {
         }
         // A JDK value the runtime builds itself (a collection, a stream, a
         // builder): JDK classes never extend or implement a jar type.
-        let jdk_kind = [
-            "string-builder/",
-            "stream/",
-            "list/",
-            "set/",
-            "map/",
-        ]
-        .iter()
-        .any(|prefix| marker.starts_with(prefix))
-            || matches!(
-                marker,
-                                "list" | "set" | "map" | "true" | "false"
-            )
+        let jdk_kind = ["string-builder/", "stream/"]
+            .iter()
+            .any(|prefix| marker.starts_with(prefix))
+            || matches!(marker, "true" | "false")
             // An object `new` made of a JDK class (`java/util/ArrayList#3`).
             || crate::jar_object::value_marker_class(value).is_some_and(|class| class.starts_with("java/"));
         if jdk_kind {
@@ -957,7 +955,9 @@ impl<H: Host> Runtime<'_, H> {
 /// Mixins') for a jar class, `None` where the chain leaves them.
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
     fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
-        self.host.described_instance_of(key, wanted)
+        self.host
+            .described_instance_of(key, wanted)
+            .or_else(|| self.host.game_instance_of(key, wanted))
     }
 
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {

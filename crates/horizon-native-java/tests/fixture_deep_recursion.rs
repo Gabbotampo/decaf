@@ -92,6 +92,7 @@ fn gson_writes_enums_and_serialized_names_as_java_25() {
         "shallowRecursion",
         "sodiumOptions",
         "enumValues",
+        "enumMapKeys",
         "annotatedFields",
     ] {
         let (text, unknown) = run(&fixture, method);

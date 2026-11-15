@@ -867,6 +867,11 @@ impl<H: Host> Runtime<'_, H> {
             Value::Boxed(boxed @ Boxed::Character(_)) => {
                 Some(format!("\"{}\"", style.escape(&boxed.text())))
             }
+            // A `Float` box (a `float` field too): `Gson`'s float adapter
+            // checks the value widened to a `double` before writing it.
+            Value::Boxed(Boxed::Float(bits)) if !f32::from_bits(*bits).is_finite() => {
+                Some(non_finite_text(f64::from(f32::from_bits(*bits)), style)?)
+            }
             Value::Boxed(boxed) => Some(boxed.text()),
             Value::Int(value) => Some(value.to_string()),
             Value::Long(value) => Some(if style.long_strings() {
@@ -877,42 +882,16 @@ impl<H: Host> Runtime<'_, H> {
             Value::Float(value) => {
                 if value.is_finite() {
                     Some(format!("{value}"))
-                } else if style.special_floats() {
-                    Some(if value.is_nan() {
-                        "NaN".into()
-                    } else if *value > 0.0 {
-                        "Infinity".into()
-                    } else {
-                        "-Infinity".into()
-                    })
                 } else {
-                    // Gson's `JsonWriter.value(double)` refusal.
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some(
-                            "NaN is not a valid double value as per JSON specification. \
-                             To override this behavior, use \
-                             GsonBuilder.serializeSpecialFloatingPointValues() method."
-                                .into(),
-                        ),
-                        frame: None,
-                    });
+                    Some(non_finite_text(*value, style)?)
                 }
             }
             // A marker, or an object by its key (`jar_object.rs`).
             Value::Ref(Some(_)) | Value::Host(_) => {
                 let marker = expect_ref(value).map_or("", String::as_str);
-                // A jar enum constant serializes as its name.
-                if let Some(name) = marker
-                    .strip_prefix("enum/")
-                    .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
-                {
-                    Some(format!("\"{}\"", style.escape(name)))
-                } else if let Some(constant) = self.enum_constants.get(marker) {
-                    // Gson's `EnumTypeAdapter`, never a reflective walk of the constant.
-                    let name = constant.0.clone();
-                    self.gson_enum_name(value, &name)
-                        .map(|name| format!("\"{}\"", style.escape(&name)))
+                // Gson's `EnumTypeAdapter`, never a reflective walk of the constant.
+                if let Some(name) = self.gson_enum_text(value) {
+                    Some(format!("\"{}\"", style.escape(&name)))
                 } else if let Some(kind) = gson_marker_kind(self.host, value) {
                     let values = runtime_collection_values(self.host, value)?;
                     if kind == "map" {
@@ -982,8 +961,11 @@ impl<H: Host> Runtime<'_, H> {
             }
             first = false;
             out.push_str(&style.line(depth + 1));
+            let Some(key_text) = self.gson_map_key_text(&key) else {
+                return Ok(None);
+            };
             out.push('"');
-            out.push_str(&style.escape(&value_text(&key)));
+            out.push_str(&style.escape(&key_text));
             out.push('"');
             out.push_str(style.colon());
             let Some(text) = self.gson_to_json(&value, style, depth + 1)? else {
@@ -1120,6 +1102,27 @@ impl<H: Host> Runtime<'_, H> {
             GsonNames::Unknown => None,
         }
     }
+
+    /// The one enum name path shared by values and map keys.
+    fn gson_enum_text(&self, value: &Value) -> Option<String> {
+        let marker = expect_ref(value)?;
+        if let Some((name, _)) = self.enum_constants.get(marker) {
+            return self.gson_enum_name(value, name);
+        }
+        marker
+            .strip_prefix("enum/")
+            .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name.to_owned()))
+    }
+
+    /// Gson writes enum map keys using the enum adapter name, never the marker.
+    fn gson_map_key_text(&self, key: &Value) -> Option<String> {
+        if let Some(marker) = expect_ref(key)
+            && (marker.starts_with("enum/") || self.enum_constants.contains_key(marker))
+        {
+            return self.gson_enum_text(key);
+        }
+        Some(value_text(key))
+    }
 }
 
 /// `java.lang.NullPointerException`, as Gson's `Objects.requireNonNull` raises
@@ -1176,21 +1179,60 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
         let class = marker
             .split_once('#')
             .map_or(marker.as_str(), |(class, _)| class);
-        return if is_map_owner(class) {
+        // A map whichever class the host made it (Guava's
+        // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
+        // (#253 review).
+        return if is_map_owner(class)
+            || crate::runtime::java_immutable::supertypes(class).contains(&"java/util/Map")
+        {
             Some("map")
         } else {
             Some("list")
         };
     }
-    match gson_collection_kind(marker) {
-        Some("map") => Some("map"),
-        Some(_) => Some("list"),
-        None => None,
+    // A collection is a handle the host holds (#156 P14d2): no text is one.
+    None
+}
+
+/// A primitive field's value as Gson's adapter for its type writes it: the
+/// interpreter holds a `boolean` and a `char` as an `int`, so `true` would
+/// print `1` and `'a'` `97` (#253 re-check: a config written with booleans
+/// then failed to read back), the same two rows as #307's writer; and a
+/// `float` as a `double`, so `0.1f` would print `0.10000000149011612`: it is
+/// boxed, and the box goes through Gson's NaN/infinity check (#253 re-check
+/// B7). A `byte`/`short` prints the same either way.
+#[allow(dead_code)]
+fn primitive_box(descriptor: &str, value: Value) -> Value {
+    match (descriptor, &value) {
+        ("Z", Value::Int(int)) => Value::Boxed(Boxed::Boolean(*int != 0)),
+        ("C", Value::Int(int)) => Value::Boxed(Boxed::Character(*int as u16)),
+        ("F", Value::Float(float)) => Value::Boxed(Boxed::float(*float)),
+        _ => value,
     }
 }
 
-fn gson_collection_kind(marker: &str) -> Option<&str> {
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    matches!(kind, "list" | "set" | "map").then_some(kind)
+/// A NaN or infinite `double` (or `float`, widened) as Gson writes it:
+/// `NaN`/`Infinity`/`-Infinity` under `serializeSpecialFloatingPointValues`,
+/// else `Gson.checkValidFloatingPoint`'s `IllegalArgumentException`, naming
+/// the value as `Double.toString` prints it (#253 re-check B7).
+fn non_finite_text(value: f64, style: &GsonStyle) -> Result<String, NativeError> {
+    let shown = if value.is_nan() {
+        "NaN"
+    } else if value > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    if style.special_floats() {
+        return Ok(shown.into());
+    }
+    Err(NativeError::UncaughtException {
+        class: "java/lang/IllegalArgumentException".into(),
+        message: Some(format!(
+            "{shown} is not a valid double value as per JSON specification. \
+             To override this behavior, use \
+             GsonBuilder.serializeSpecialFloatingPointValues() method."
+        )),
+        frame: None,
+    })
 }

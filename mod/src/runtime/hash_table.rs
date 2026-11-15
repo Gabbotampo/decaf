@@ -44,7 +44,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::runtime::{Value, collection_item_marker};
+use crate::runtime::{NativeError, Value, collection_item_marker};
 
 /// `HashMap.DEFAULT_INITIAL_CAPACITY`.
 const DEFAULT_CAPACITY: usize = 16;
@@ -172,6 +172,12 @@ impl HashTable {
         if self.len() <= 1 {
             return false;
         }
+        // A linked table iterates in insertion order, which the host's list is, wherever
+        // its keys hash (an unplaced key, a tree bin): only access order or an unknown fill
+        // order hide it (#156 P14e: a map's `entrySet()` view of identity-hashed keys).
+        if self.linked {
+            return self.access_order || self.tainted;
+        }
         !self.unplaced.is_empty() || self.treeified || self.access_order || self.tainted
     }
 
@@ -260,8 +266,10 @@ impl HashTable {
         }
     }
 
-    /// `HashMap.resize()`.
-    fn resize(&mut self) {
+    /// `HashMap.resize()`. The constructor is lazy, so this is the first
+    /// place a large requested table is refused: Java would allocate the
+    /// backing array here, not in `HashMap.<init>`.
+    fn resize(&mut self) -> Result<(), NativeError> {
         self.version += 1;
         self.synced = None;
         let old_cap = self.bins.len();
@@ -271,7 +279,7 @@ impl HashTable {
         if old_cap > 0 {
             if old_cap >= MAXIMUM_CAPACITY {
                 self.threshold = i64::from(i32::MAX);
-                return;
+                return Ok(());
             }
             new_cap = old_cap << 1;
             if new_cap < MAXIMUM_CAPACITY && old_cap >= DEFAULT_CAPACITY {
@@ -291,6 +299,9 @@ impl HashTable {
                 i64::from(i32::MAX)
             };
         }
+        if new_cap > crate::runtime::MAX_ARRAY_ELEMENTS {
+            return Err(crate::runtime::array_bound_error(new_cap as u128));
+        }
         self.threshold = new_thr;
         let mut bins = vec![Vec::new(); new_cap];
         for (index, bin) in std::mem::take(&mut self.bins).into_iter().enumerate() {
@@ -301,22 +312,24 @@ impl HashTable {
             }
         }
         self.bins = bins;
+        Ok(())
     }
 
     /// `treeifyBin`: a table below 64 bins resizes instead.
-    fn treeify_bin(&mut self) {
+    fn treeify_bin(&mut self) -> Result<(), NativeError> {
         if self.bins.len() < MIN_TREEIFY_CAPACITY {
-            self.resize();
+            self.resize()?;
         } else {
             self.treeified = true;
         }
+        Ok(())
     }
 
     /// `putMapEntries`' pre-sizing for `mappings` more entries, before they
     /// are put one by one.
-    pub(crate) fn presize(&mut self, mappings: usize) {
+    pub(crate) fn presize(&mut self, mappings: usize) -> Result<(), NativeError> {
         if mappings == 0 {
-            return;
+            return Ok(());
         }
         if self.bins.is_empty() {
             let wanted = (mappings as f64 / f64::from(self.load_factor)).ceil();
@@ -330,32 +343,34 @@ impl HashTable {
             }
         } else {
             while mappings as i64 > self.threshold && self.bins.len() < MAXIMUM_CAPACITY {
-                self.resize();
+                self.resize()?;
             }
         }
+        Ok(())
     }
 
     /// The start of `computeIfAbsent`/`compute`/`merge`: they resize before
     /// they search, whether or not the key is there, when the size already
     /// passed the threshold or no table is allocated.
-    pub(crate) fn begin_compute(&mut self) {
+    pub(crate) fn begin_compute(&mut self) -> Result<(), NativeError> {
         if self.len() as i64 > self.threshold || self.bins.is_empty() {
-            self.resize();
+            self.resize()?;
         }
+        Ok(())
     }
 
     /// `putVal`'s insertion of `key`, whose `hashCode()` is `hash` (`None`:
     /// an identity hash): allocate, append to the bin's tail, treeify a bin
     /// that already held 8 nodes, resize past the threshold.
-    pub(crate) fn insert(&mut self, key: &Value, hash: Option<i32>) {
+    pub(crate) fn insert(&mut self, key: &Value, hash: Option<i32>) -> Result<(), NativeError> {
         let marker = collection_item_marker(key);
         let size = self.len() as i64;
+        if self.bins.is_empty() {
+            self.resize()?;
+        }
         self.version += 1;
         self.synced = None;
         self.index.insert(marker.clone(), hash.map(spread));
-        if self.bins.is_empty() {
-            self.resize();
-        }
         if let Some(hash) = hash {
             let spread = spread(hash);
             let bin = spread as u32 as usize & (self.bins.len() - 1);
@@ -366,27 +381,32 @@ impl HashTable {
                 hash: spread,
             });
             if held >= TREEIFY_THRESHOLD {
-                self.treeify_bin();
+                self.treeify_bin()?;
             }
         } else {
             self.unplaced.insert(marker, key.clone());
         }
         if size + 1 > self.threshold {
-            self.resize();
+            self.resize()?;
         }
+        Ok(())
     }
 
     /// `computeIfAbsent`/`compute`/`merge`'s insertion (after
     /// [`Self::begin_compute`]): the bin's head, treeifying a bin that
     /// already held 7 nodes, and no resize afterwards.
-    pub(crate) fn insert_at_head(&mut self, key: &Value, hash: Option<i32>) {
+    pub(crate) fn insert_at_head(
+        &mut self,
+        key: &Value,
+        hash: Option<i32>,
+    ) -> Result<(), NativeError> {
         let marker = collection_item_marker(key);
+        if self.bins.is_empty() {
+            self.resize()?;
+        }
         self.version += 1;
         self.synced = None;
         self.index.insert(marker.clone(), hash.map(spread));
-        if self.bins.is_empty() {
-            self.resize();
-        }
         if let Some(hash) = hash {
             let spread = spread(hash);
             let bin = spread as u32 as usize & (self.bins.len() - 1);
@@ -400,11 +420,12 @@ impl HashTable {
                 },
             );
             if held >= TREEIFY_THRESHOLD - 1 {
-                self.treeify_bin();
+                self.treeify_bin()?;
             }
         } else {
             self.unplaced.insert(marker, key.clone());
         }
+        Ok(())
     }
 
     /// Unlink the node `marker`.
@@ -448,10 +469,12 @@ mod tests {
     fn table_of(keys: &[&str]) -> HashTable {
         let mut table = HashTable::new(None, 0.75);
         for key in keys {
-            table.insert(
-                &Value::Ref(Some((*key).into())),
-                Some(java_string_hash(key)),
-            );
+            table
+                .insert(
+                    &Value::Ref(Some((*key).into())),
+                    Some(java_string_hash(key)),
+                )
+                .unwrap();
         }
         table
     }
@@ -476,7 +499,7 @@ mod tests {
         // `new HashMap<>(0)`: the first put allocates one bin with threshold
         // `(int) (1 * 0.75f) = 0`, so it resizes to two at once.
         let mut table = HashTable::new(Some(0), 0.75);
-        table.insert(&Value::Int(1), Some(1));
+        table.insert(&Value::Int(1), Some(1)).unwrap();
         assert_eq!(table.bins.len(), 2);
         assert_eq!(table.threshold, 1);
     }

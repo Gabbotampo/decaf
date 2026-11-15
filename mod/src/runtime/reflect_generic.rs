@@ -398,7 +398,9 @@ impl<H: Host> Runtime<'_, H> {
             | "java/lang/Double"
             | "java/lang/Class"
             | "java/util/UUID"
-            | "java/util/Optional" => PUBLIC | FINAL,
+            | "java/util/Optional"
+            // gson-2.14.0's `public final class LinkedTreeMap` (#253 re-check).
+            | "com/google/gson/internal/LinkedTreeMap" => PUBLIC | FINAL,
             "java/lang/Object" => PUBLIC,
             "java/lang/Number" | "java/lang/Enum" | "java/lang/Record" => PUBLIC | ABSTRACT,
             "java/util/List"

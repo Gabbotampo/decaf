@@ -2,5 +2,6 @@ deepRecursion=SOE true 2
 shallowRecursion=3
 sodiumOptions={\n  "quality": {\n    "hidden_fluid_culling": true,\n    "split_mode": "OFF",\n    "tagged": "second"\n  },\n  "performance": {\n    "chunk_builder_threads": 0,\n    "chunk_build_defer_mode": "ONE_FRAME_AHEAD"\n  }\n}
 enumValues="ZERO_FRAMES"|"OFF"|"first"|"second"|"C"|["ALWAYS","SAFE","first"]
+enumMapKeys={"second":1}|{"OFF":1}
 annotatedFields={"n":3,"t":"x","plain_field":1,"letter":"q","off":false}|5|y|2
 ambiguousAlternates=b

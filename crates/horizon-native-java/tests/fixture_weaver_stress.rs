@@ -9,6 +9,9 @@
 //! instruction boundary; a fresh `URLClassLoader` over a jar checks sixteen
 //! inputs against the original class, and the last test pins the rejections.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ClassFile, MethodRef, MixinInjectionPlan, ReturnMode, callback_info_returnable_class,
     weave_class, weave_class_with_extras, weave_return,
@@ -144,7 +147,7 @@ struct Scratch(PathBuf);
 #[rustfmt::skip]
 impl Scratch {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("horizon-native-java-weaver-stress-{name}-{}", std::process::id()));
+        let root = scratch::unique_path(&format!("horizon-native-java-weaver-stress-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         Self(root)

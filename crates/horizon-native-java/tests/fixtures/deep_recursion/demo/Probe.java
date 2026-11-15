@@ -5,7 +5,9 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.annotations.SerializedName;
 import java.lang.reflect.Modifier;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Deep Java recursion and Gson's enum writer (the client census's Sodium abort).
@@ -99,6 +101,15 @@ public final class Probe {
             + gson.toJson(List.of(DeferMode.ALWAYS, Split.SAFE, Tagged.A));
     }
 
+    public static String enumMapKeys() {
+        Gson gson = new GsonBuilder().create();
+        Map<Tagged, Integer> tagged = new LinkedHashMap<>();
+        tagged.put(Tagged.B, 1);
+        Map<Split, Integer> split = new LinkedHashMap<>();
+        split.put(Split.OFF, 1);
+        return gson.toJson(tagged) + "|" + gson.toJson(split);
+    }
+
     public static class Renamed {
         @SerializedName("n")
         public int number = 3;
@@ -128,6 +139,7 @@ public final class Probe {
         System.out.println("shallowRecursion=" + shallowRecursion());
         System.out.println("sodiumOptions=" + sodiumOptions());
         System.out.println("enumValues=" + enumValues());
+        System.out.println("enumMapKeys=" + enumMapKeys());
         System.out.println("annotatedFields=" + annotatedFields());
         System.out.println("ambiguousAlternates=" + ambiguousAlternates());
     }

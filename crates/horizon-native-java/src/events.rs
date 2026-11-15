@@ -941,6 +941,18 @@ pub(crate) fn bus_event(class: &str) -> Option<(GameEvent, EventLoader)> {
         .map(|(_, event)| (*event, loader))
 }
 
+/// Fabric client registrations whose moments are outside the bounded frame phase.
+/// Keep them in the census's unfired table: accepting a registration does not
+/// mean that a synthetic tick may fire it at the wrong time.
+fn unfired_client_fabric_field(owner: &str, field: &str) -> bool {
+    matches!(
+        owner,
+        "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientChunkEvents"
+            | "net/fabricmc/fabric/api/client/event/lifecycle/v1/ClientEntityEvents"
+            | "net/fabricmc/fabric/api/client/screen/v1/ScreenEvents"
+    ) && !field.is_empty()
+}
+
 /// The API field a Fabric event handle (`host_events.rs`) names.
 fn fabric_field(event: &Value) -> Option<&'static FabricField> {
     let (owner, field) = crate::host_events::fabric_field_of(event)?;
@@ -1482,6 +1494,21 @@ impl StdHost {
         // resource) answer from the firing's server facts. Outside a firing
         // there are none, so only what a marker holds by itself answers (a rule's id and default, a resource's id).
         if facade_server::owns(text) {
+            // A registry's `keySet()`: a set of its own (#156 P14d2).
+            let ids = match self.game_event.as_deref() {
+                Some(firing) => facade_server::key_set(&firing.facade.server, text, r),
+                None => facade_server::key_set(&ServerFacts::default(), text, r),
+            };
+            if let Some(ids) = ids {
+                return Some(ids.map(|ids| {
+                    self.factory_unmodifiable(
+                        "java/util/Collections",
+                        "unmodifiableSet",
+                        "set",
+                        ids,
+                    )
+                }));
+            }
             return Some(match self.game_event.as_deref() {
                 Some(firing) => facade_server::answer(&firing.facade.server, text, r, args),
                 None => facade_server::answer(&ServerFacts::default(), text, r, args),
@@ -2068,6 +2095,12 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         let Some(source) = crate::host_events::fabric_event_name(event) else {
             return;
         };
+        if let Some((owner, field)) = crate::host_events::fabric_field_of(event)
+            && unfired_client_fabric_field(&owner, &field)
+        {
+            count_unsupported(out, source);
+            return;
+        }
         let Some(row) = fabric_field(event) else {
             count_unsupported(out, source);
             return;
