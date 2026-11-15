@@ -1671,6 +1671,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_fabric_runtime::OBJECT_METHODS,
     },
     KindInfo {
+        kind: HostKind::FabricModificationPhase,
+        tag: "fmp",
+        class: ClassRule::Fixed("net/fabricmc/fabric/api/biome/v1/ModificationPhase"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_fabric_runtime::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricStaticIdentifier,
+        tag: "fsi",
+        class: ClassRule::Fixed("net/minecraft/resources/Identifier"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_ids::IDENTIFIER_METHODS,
+    },
+    KindInfo {
         kind: HostKind::JarObject,
         tag: "obj",
         class: ClassRule::FromKey(crate::runtime::jar_object::class_of_key),
