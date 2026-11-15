@@ -27426,6 +27426,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        client_surface::text::runtime_call(self, receiver.as_ref(), &r, &args)
+                            .transpose()
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         dfu_pair_ops::runtime_call(
                             self,
                             &r,
