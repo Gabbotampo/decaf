@@ -13,15 +13,17 @@
 //!   charsets every JVM must ship (`StandardCharsets`) are known; any other
 //!   name raises `UnsupportedCharsetException`, as a JVM without that charset
 //!   would.
-//! * `logger/<name>`: a log4j, slf4j, `java.util.logging` or Mojang
-//!   `LogUtils` logger. Nothing is written anywhere: every level reports
-//!   disabled and every logging call returns without effect, which is what a
-//!   logger configured to drop the mod's output does.
+//! * a logger (a `HostKind::Logger` handle, `host_jdk.rs`): log4j, slf4j,
+//!   `java.util.logging`, `System.Logger` or Mojang `LogUtils`. Nothing is
+//!   written anywhere: every level reports disabled and every logging call
+//!   returns without effect, which is what a logger configured to drop the
+//!   mod's output does.
 //!
 //! The module also answers `Path.resolveSibling`, which the host's path model
 //! lacked. Paths stay virtual (`host_path.rs`): no call in this file reads or
 //! writes the host filesystem.
 
+use crate::host_jdk::logger_value;
 use crate::{MethodRef, NativeError, Value, expect_ref, expect_string};
 
 /// The canonical names of the charsets `java.nio.charset.StandardCharsets`
@@ -37,15 +39,9 @@ const STANDARD_CHARSETS: &[(&str, &str)] = &[
 
 /// Prefix of a modelled `Charset` marker.
 const CHARSET_PREFIX: &str = "charset/";
-/// Prefix of a modelled logger marker.
-const LOGGER_PREFIX: &str = "logger/";
 
 fn charset_value(canonical: &str) -> Value {
     Value::Ref(Some(format!("{CHARSET_PREFIX}{canonical}")))
-}
-
-fn logger_value(name: &str) -> Value {
-    Value::Ref(Some(format!("{LOGGER_PREFIX}{name}")))
 }
 
 /// The canonical name `Charset.forName` resolves `name` to, matching the
@@ -82,12 +78,17 @@ fn is_logger_owner(owner: &str) -> bool {
     )
 }
 
-/// The logger name a factory argument names: a `String` as is, a `Class`
-/// marker (an internal name) as its binary name, and anything else as the
-/// root logger's empty name.
-fn logger_name(args: &[Value]) -> String {
+/// The logger name a factory argument names: a `String` as it is, a `Class`
+/// (an internal name, by the factory's declared parameter) as its binary
+/// name, and anything else as the root logger's empty name.
+fn logger_name(r: &MethodRef, args: &[Value]) -> String {
     match args.first() {
-        Some(Value::Ref(Some(text))) => text.replace('/', "."),
+        Some(class) if r.descriptor.starts_with("(Ljava/lang/Class;") => {
+            crate::host_class::class_name(class)
+                .unwrap_or_default()
+                .replace('/', ".")
+        }
+        Some(Value::Ref(Some(text))) => text.clone(),
         _ => String::new(),
     }
 }
@@ -150,11 +151,6 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(comparator));
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
-        // `Arrays.asList(new T[0])`: the shared empty array has no elements,
-        // so the list is empty rather than a one-element list holding it.
-        ("java/util/Arrays", "asList", "([Ljava/lang/Object;)Ljava/util/List;") if matches!(args.first(), Some(Value::Ref(Some(marker))) if marker == "array/empty") => {
-            Some(Ok(Value::Ref(Some("list".into()))))
-        }
         // `Modifier`'s predicates over the access flags reflection answers
         // (`Field.getModifiers`): config frameworks check `isPublic`/`isStatic`
         // before they read a field, and the neutral `false` made every field
@@ -219,31 +215,44 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let name = args.first().map(expect_string).unwrap_or_default();
             Some(Ok(Value::Int(i32::from(canonical_charset(name).is_some()))))
         }
-        // Logger factories. A descriptor that answers a logger type is enough:
-        // log4j's overloads take a `String`, a `Class`, an `Object` and an
-        // optional `MessageFactory`, and all of them name the logger by their
-        // first argument.
-        ("org/apache/logging/log4j/LogManager", "getLogger" | "getFormatterLogger", descriptor)
-            if descriptor.ends_with(")Lorg/apache/logging/log4j/Logger;") =>
-        {
-            Some(Ok(logger_value(&logger_name(args))))
+        // Logger factories. log4j's `String` overload names the logger by
+        // its text; the no-argument, `Class` and `Object` overloads name it by
+        // a class, which only the runtime knows (`invoke_logger_factory`). A
+        // `null` name (the caller's class) and the `MessageFactory` overloads
+        // (one logger per name and factory) are left counted.
+        (
+            "org/apache/logging/log4j/LogManager",
+            "getLogger" | "getFormatterLogger",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        ) => {
+            let api = if r.name == "getLogger" {
+                "log4j"
+            } else {
+                "log4j-formatter"
+            };
+            match args.first() {
+                Some(Value::Ref(Some(name))) => Some(Ok(logger_value(api, name))),
+                _ => None,
+            }
         }
-        ("org/apache/logging/log4j/LogManager", "getRootLogger", _) => Some(Ok(logger_value(""))),
+        ("org/apache/logging/log4j/LogManager", "getRootLogger", _) => {
+            Some(Ok(logger_value("log4j", "")))
+        }
         ("org/slf4j/LoggerFactory", "getLogger", descriptor)
             if descriptor.ends_with(")Lorg/slf4j/Logger;") =>
         {
-            Some(Ok(logger_value(&logger_name(args))))
+            Some(Ok(logger_value("slf4j", &logger_name(r, args))))
         }
         // Mojang's `LogUtils.getLogger()` names the caller's class through a
         // stack walk; the bounded runtime has no stack to walk, so the logger
         // is anonymous. Its name is never observable through a disabled logger.
         ("com/mojang/logging/LogUtils", "getLogger", "()Lorg/slf4j/Logger;") => {
-            Some(Ok(logger_value("")))
+            Some(Ok(logger_value("mojang", "")))
         }
         ("java/util/logging/Logger", "getLogger", descriptor)
             if descriptor.ends_with(")Ljava/util/logging/Logger;") =>
         {
-            Some(Ok(logger_value(&logger_name(args))))
+            Some(Ok(logger_value("jul", &logger_name(r, args))))
         }
         // `System.getLogger(String[, ResourceBundle])`: the JDK's
         // `System.Logger` is answered by the same disabled-logger model as
@@ -252,14 +261,11 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         ("java/lang/System", "getLogger", descriptor)
             if descriptor.ends_with(")Ljava/lang/System$Logger;") =>
         {
-            Some(Ok(logger_value(&logger_name(args))))
+            Some(Ok(logger_value("system", &logger_name(r, args))))
         }
-        ("java/util/logging/Logger", "getGlobal" | "getAnonymousLogger", _) => {
-            Some(Ok(logger_value(if r.name == "getGlobal" {
-                "global"
-            } else {
-                ""
-            })))
+        ("java/util/logging/Logger", "getGlobal", _) => Some(Ok(logger_value("jul", "global"))),
+        ("java/util/logging/Logger", "getAnonymousLogger", _) => {
+            Some(Ok(logger_value("jul-anonymous", "")))
         }
         // The single runtime object. `availableProcessors` and the memory
         // reads already answer on it (a single-threaded bounded runtime is one
@@ -276,7 +282,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         // the JVM: the caller stores the pattern and only a matcher needs it.
         ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;") => {
             let pattern = expect_string(args.first()?);
-            Some(Ok(Value::Ref(Some(format!("regex-pattern/{pattern}")))))
+            Some(Ok(crate::host_jdk_constant::pattern(pattern)))
         }
         // The default filesystem. Its watch services are `watch_service.rs`'s;
         // no call here touches the host's disk.
@@ -297,19 +303,10 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             "net/fabricmc/fabric/api/resource/v1/ResourceLoader",
             "get",
             "(Lnet/minecraft/server/packs/PackType;)Lnet/fabricmc/fabric/api/resource/v1/ResourceLoader;",
-        ) => {
-            let kind = args
-                .first()
-                .map(expect_string)
-                .unwrap_or("SERVER_DATA")
-                .rsplit('/')
-                .next()
-                .unwrap_or("SERVER_DATA")
-                .to_owned();
-            Some(Ok(Value::Ref(Some(format!(
-                "fabric-resource-loader/{kind}"
-            )))))
-        }
+        ) => args
+            .first()
+            .and_then(crate::host_fabric_runtime::resource_loader)
+            .map(Ok),
         _ => None,
     }
 }
@@ -369,16 +366,12 @@ pub(crate) fn instance_call(
         )
         .then(|| Ok(Value::Ref(Some(kind.to_owned()))));
     }
-    let marker = expect_ref(receiver)?;
-    if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
-        return charset_call(r, canonical, args);
-    }
-    if let Some(name) = marker.strip_prefix(LOGGER_PREFIX)
-        && (is_logger_owner(&r.owner) || r.owner == "java/lang/Object")
+    if let Some(name) = crate::host_jdk::logger_name(receiver)
+        && is_logger_owner(&r.owner)
     {
-        return logger_call(r, name);
+        return logger_call(r, &name);
     }
-    if let Some(kind) = marker.strip_prefix("fabric-resource-loader/") {
+    if crate::host_fabric_runtime::is_resource_loader(receiver) {
         return match (r.name.as_str(), r.descriptor.as_str()) {
             // Registration is kept nowhere: with no resource reload modelled,
             // there is no event to fire the listener from, and pretending one
@@ -391,19 +384,19 @@ pub(crate) fn instance_call(
                 "addListenerOrdering",
                 "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/resources/Identifier;)V",
             ) => Some(Ok(Value::Void)),
-            ("toString", "()Ljava/lang/String;") => {
-                Some(Ok(Value::Ref(Some(format!("ResourceLoader[{kind}]")))))
-            }
             _ => None,
         };
     }
-    if let Some(pattern) = marker.strip_prefix("regex-pattern/") {
+    // A compiled `Pattern` (`host_jdk_constant.rs`): its text.
+    if let Some(pattern) = crate::host_jdk_constant::pattern_text(receiver) {
         return match (r.name.as_str(), r.descriptor.as_str()) {
-            ("pattern" | "toString", "()Ljava/lang/String;") => {
-                Some(Ok(Value::Ref(Some(pattern.to_owned()))))
-            }
+            ("pattern" | "toString", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some(pattern)))),
             _ => None,
         };
+    }
+    let marker = expect_ref(receiver)?;
+    if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
+        return charset_call(r, canonical, args);
     }
     if marker == "file-system/default" {
         // `newWatchService` is `watch_service.rs`'s.
@@ -480,18 +473,73 @@ fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Va
 /// bounded runtime refuses rather than spinning on.
 pub(crate) const MAX_SPLITERATOR_ELEMENTS: usize = 4096;
 
-/// Prefix of the consumer `StreamSupport.stream` hands a jar spliterator's
-/// `tryAdvance`: `accept(value)` appends to the stream marker that follows.
-pub(crate) const COLLECTING_CONSUMER_PREFIX: &str = "@fn:collect:";
+/// A `Collectors.toMap` collection in progress: its functions and what it
+/// has collected so far. The stream push feeds it one element at a time
+/// (`stream_pipeline.rs`), so the key and value functions run interleaved
+/// with the stages, as JDK 25's `ReduceOps` runs a collector's accumulator.
+///
+/// `Collectors.toMap` collects into a host `HashMap` (`map`, made by
+/// [`crate::Runtime::begin_to_map`] as the sink's `begin` runs `HashMap::new`)
+/// through `hash_bulk.rs`'s `putIfAbsent`/`merge`, so the result iterates in
+/// JDK 25's table order. Guava's collectors keep `entries` in encounter
+/// order, as an `ImmutableMap` does.
+#[derive(Clone, Debug)]
+pub(crate) struct ToMap {
+    pub(crate) key_fn: Value,
+    pub(crate) value_fn: Value,
+    pub(crate) merge_fn: Option<Value>,
+    guava: bool,
+    entries: Vec<(Value, Value)>,
+    map: Option<Value>,
+    /// The 4-argument form's map supplier (`TreeMap::new`, ...).
+    supplier: Option<Value>,
+}
 
-/// Prefix of a `Collectors.toMap` collector marker: the key and value
-/// functions (and the optional merge function) as escaped capture markers.
-const TO_MAP_COLLECTOR_PREFIX: &str = "collector/to-map/";
+impl ToMap {
+    /// The state for a built-in `toMap` collector (`host_collector.rs`), `None` for any other.
+    pub(crate) fn begin(collector: &Value) -> Result<Option<Self>, NativeError> {
+        let Some(crate::host_collector::Builtin::ToMap { guava, functions }) =
+            crate::host_collector::builtin(collector)
+        else {
+            return Ok(None);
+        };
+        let (key_fn, value_fn, merge_fn, supplier) = match functions.as_slice() {
+            [key, value] => (key.clone(), value.clone(), None, None),
+            [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone()), None),
+            [key, value, merge, supplier] if !guava => (
+                key.clone(),
+                value.clone(),
+                Some(merge.clone()),
+                Some(supplier.clone()),
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(Self {
+            key_fn,
+            value_fn,
+            merge_fn,
+            guava,
+            entries: Vec::new(),
+            map: None,
+            supplier,
+        }))
+    }
 
-/// The leading operand that marks a `to-map` collector as Guava's.
-const GUAVA_COLLECTOR_FLAG: &str = "@guava";
+    /// The collected map.
+    pub(crate) fn finish(self) -> Value {
+        if let Some(map) = self.map {
+            return map;
+        }
+        let flat = self
+            .entries
+            .into_iter()
+            .flat_map(|(key, value)| [key, value])
+            .collect::<Vec<_>>();
+        super::collection_value("map", &flat)
+    }
+}
 
-/// The `Collectors.toMap` overloads the host answers with a collector marker.
+/// The `Collectors.toMap` overloads the host answers with a collector handle.
 pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
     // Guava's immutable-map collectors (`ImmutableMap.toImmutableMap`,
     // `Maps.toImmutableEnumMap`, WorldEdit's platform table) collect the same
@@ -506,27 +554,27 @@ pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
         "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;" => {
             2
         }
-        // The merge overload, and the one that also names the map supplier:
-        // the bounded map keeps insertion order whichever map type was asked
-        // for, so the supplier is not called.
-        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;"
-        | "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;" => {
+        // The merge overload (`HashMap::new`).
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;" => {
             3
+        }
+        // The one that also names the map supplier: the supplier makes the
+        // map and each element is `map.merge(k, v, merge)` on it
+        // (`ToMap::supplier`).
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"
+            if !guava =>
+        {
+            4
         }
         _ => return None,
     };
-    let mut parts = args
-        .iter()
-        .take(functions)
-        .map(super::value_marker)
-        .collect::<Vec<_>>();
-    if guava {
-        parts.insert(0, GUAVA_COLLECTOR_FLAG.to_owned());
-    }
-    let parts = parts.join(",");
-    Some(Value::Ref(Some(format!(
-        "{TO_MAP_COLLECTOR_PREFIX}{parts}"
-    ))))
+    // A new `CollectorImpl` per call, holding the functions (`host_collector.rs`).
+    Some(crate::host_collector::collector(
+        crate::host_collector::Builtin::ToMap {
+            guava,
+            functions: args.iter().take(functions).cloned().collect(),
+        },
+    ))
 }
 
 impl crate::StdHost {
@@ -555,12 +603,7 @@ impl crate::StdHost {
         if matches!(source, Value::Ref(None)) {
             return Some(Err(null_pointer()));
         }
-        let values = match super::host_collection_values(self, source).and_then(|items| {
-            items
-                .iter()
-                .map(|item| super::parse_collection_value(item))
-                .collect::<Result<Vec<_>, _>>()
-        }) {
+        let values = match super::host_collection_values(self, source) {
             Ok(values) => values,
             Err(error) => return Some(Err(error)),
         };
@@ -751,13 +794,11 @@ fn platform_supertypes(class: &str) -> &'static [&'static str] {
 /// `marker instanceof wanted` for a boxed value or a JDK collection object
 /// (`java/util/ArrayList#3`, `java/util/LinkedHashMap#neutral0`).
 pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
-    if crate::reflect_generic::annotated_type_instance_of(marker, wanted) {
-        return true;
-    }
     let Some((class, _)) = marker.split_once('#') else {
         return false;
     };
-    class_instance_of(class, wanted)
+    // `[I#0` is a string: arrays are handles (`host_array.rs`).
+    !crate::host_array::handle_only_class(class) && class_instance_of(class, wanted)
 }
 
 /// Whether an instance of the platform class `class` is a `wanted`.
@@ -843,14 +884,6 @@ pub(crate) fn class_access_flags(file: &crate::ClassFile) -> Option<u16> {
     reader.u2().ok()
 }
 
-/// Whether `marker` names an object this runtime or the host built
-/// (`owner/Class#n`), as opposed to string text.
-fn is_object_marker(marker: &str) -> bool {
-    marker.rsplit_once('#').is_some_and(|(class, number)| {
-        class.contains('/') && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
-    })
-}
-
 impl<H: crate::Host> crate::Runtime<'_, H> {
     /// `String.join(separator, CharSequence...)` and `String.join(separator,
     /// Iterable)`: command feedback builds its lines with them. The varargs
@@ -871,11 +904,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         };
         let elements: Vec<Value> = match r.descriptor.as_str() {
             "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
-                let Some(values) = args
-                    .get(1)
-                    .and_then(expect_ref)
-                    .and_then(|array| self.arrays.get(array))
-                else {
+                let Some(values) = args.get(1).and_then(|array| self.owned_array(array)) else {
                     return Ok(None);
                 };
                 values.clone()
@@ -888,12 +917,6 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     return Ok(None);
                 };
                 items
-                    .iter()
-                    .map(|item| {
-                        crate::parse_collection_value(item)
-                            .unwrap_or_else(|_| Value::Ref(Some(item.clone())))
-                    })
-                    .collect()
             }
             _ => return Ok(None),
         };
@@ -903,12 +926,10 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let mut parts = Vec::with_capacity(elements.len());
         for value in std::iter::once(separator).chain(&elements) {
             let text = match value {
-                Value::Ref(Some(marker)) if self.string_builders.contains_key(marker) => {
-                    self.string_builders[marker].clone()
+                value if self.builder_text(value).is_some() => {
+                    self.builder_text(value).cloned().unwrap_or_default()
                 }
-                Value::Ref(Some(marker))
-                    if crate::jar_text::object_marker_class(marker).is_some() =>
-                {
+                value if crate::jar_object::packaged_object_class(value).is_some() => {
                     match self.runtime_value_of(value, "java/lang/String", "join")? {
                         Some(Value::Ref(Some(text))) => text,
                         Some(_) => "null".to_owned(),
@@ -958,8 +979,15 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         if r.owner != "java/lang/Class" || r.descriptor != "()Z" {
             return None;
         }
-        let name = expect_ref(receiver?)?;
-        let file = self.class(name)?;
+        let name = crate::host_class::class_name(receiver?)?;
+        // A primitive, an array or a JDK class: `isInterface` from Java 25's
+        // table (`List.class.isInterface()`); the rest is the host's.
+        let Some(file) = self.class(name) else {
+            return (r.name == "isInterface")
+                .then(|| crate::host_class::table_is_interface(name))
+                .flatten()
+                .map(|interface| Value::Int(i32::from(interface)));
+        };
         let flags = class_access_flags(file)?;
         let answer = match r.name.as_str() {
             "isInterface" => flags & 0x0200 != 0,
@@ -994,9 +1022,11 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let Some(marker) = expect_ref(receiver) else {
             return Ok(None);
         };
-        let text = match self.string_builders.get(marker) {
+        let text = match self.builder_text(receiver) {
             Some(text) => text.clone(),
-            None if is_object_marker(marker) => return Ok(None),
+            None if crate::jar_object::packaged_object_class(receiver).is_some() => {
+                return Ok(None);
+            }
             None => marker.clone(),
         };
         let (name, descriptor) = match (r.name.as_str(), r.descriptor.as_str()) {
@@ -1076,7 +1106,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         {
             return None;
         }
-        let (class, _) = expect_ref(receiver?)?.split_once('#')?;
+        let class = crate::jar_object::object_class(receiver?)?;
         let Some((owner, true)) = self.member_owner(class, &r.name, &r.descriptor) else {
             return None;
         };
@@ -1140,182 +1170,129 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             values.push(crate::path_value(path));
         }
         values.extend(found.into_iter().map(|entry| crate::path_value(&entry)));
-        Ok(self.new_stream(class, method, values))
+        // `spliteratorUnknownSize` over the directory iterator: not `SIZED`.
+        let stream = self.new_stream(class, method, values);
+        Ok(stream)
     }
 
-    /// `accept(value)` on the consumer [`Self::stream_support_stream`] passes
-    /// to a spliterator: append the value to the stream being built.
-    pub(crate) fn collecting_consumer_accept(
-        &mut self,
-        marker: &str,
-        args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
-        let Some(stream) = marker.strip_prefix(COLLECTING_CONSUMER_PREFIX) else {
-            return Ok(None);
-        };
-        let values = self.streams.get_mut(stream).ok_or_else(|| {
-            NativeError::Metadata("collecting consumer outlived its stream".into())
-        })?;
-        if values.len() >= MAX_SPLITERATOR_ELEMENTS {
-            return Err(NativeError::Metadata(format!(
-                "StreamSupport.stream source yielded more than {MAX_SPLITERATOR_ELEMENTS} elements"
-            )));
-        }
-        values.push(args.first().cloned().unwrap_or(Value::Ref(None)));
-        Ok(Some(Value::Void))
-    }
-
-    /// `StreamSupport.stream(spliterator, parallel)` over a spliterator the
-    /// jar implements (typically a `Spliterators.AbstractSpliterator`
-    /// subclass wrapping a `ServiceLoader` iterator).
-    ///
-    /// The JVM's stream pulls elements through `tryAdvance`; the bounded
-    /// stream is eager, so the jar's `tryAdvance` runs until it answers
-    /// `false`, each element landing in the new stream through a collecting
-    /// consumer. `parallel` changes nothing about which elements a sequential
-    /// pull sees. A spliterator the runtime did not build (a host collection's)
-    /// is left to the host.
-    pub(crate) fn stream_support_stream(
-        &mut self,
-        r: &MethodRef,
-        args: &[Value],
-        class: &str,
-        method: &str,
-    ) -> Result<Option<Value>, NativeError> {
-        if r.owner != "java/util/stream/StreamSupport"
-            || r.name != "stream"
-            || r.descriptor != "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;"
-        {
-            return Ok(None);
-        }
-        let Some(spliterator) = args.first() else {
-            return Ok(None);
-        };
-        if matches!(spliterator, Value::Ref(None)) {
-            return Err(NativeError::UncaughtException {
-                class: "java/lang/NullPointerException".into(),
-                message: None,
-                frame: None,
-            });
-        }
-        let Some(receiver_class) = self.receiver_class(spliterator).map(str::to_owned) else {
-            return Ok(None);
-        };
-        const TRY_ADVANCE: &str = "(Ljava/util/function/Consumer;)Z";
-        let Some((owner, true)) = self.member_owner(&receiver_class, "tryAdvance", TRY_ADVANCE)
-        else {
-            return Ok(None);
-        };
-        let stream = self.new_stream(class, method, Vec::new());
-        let marker = expect_ref(&stream).cloned().unwrap_or_default();
-        let consumer = Value::Ref(Some(format!("{COLLECTING_CONSUMER_PREFIX}{marker}")));
-        // Each advance yields at most one element, so the element bound in
-        // `collecting_consumer_accept` also bounds this loop; the extra step
-        // covers an advance that answers `true` without yielding.
-        for _ in 0..=MAX_SPLITERATOR_ELEMENTS {
-            let advanced = self.invoke(
-                &owner,
-                "tryAdvance",
-                TRY_ADVANCE,
-                Some(spliterator.clone()),
-                std::slice::from_ref(&consumer),
-            )?;
-            if !matches!(advanced, Value::Int(value) if value != 0) {
-                return Ok(Some(stream));
-            }
-        }
-        Err(NativeError::Metadata(format!(
-            "StreamSupport.stream source advanced more than {MAX_SPLITERATOR_ELEMENTS} times"
-        )))
-    }
-
-    /// `stream.collect(Collectors.toMap(key, value[, merge]))`.
-    ///
-    /// Keys keep the stream's order. A repeated key without a merge function
-    /// raises the JVM's `IllegalStateException` ("Duplicate key ..."); with
-    /// one, the merged value replaces the earlier one in place. A `null`
-    /// value raises `NullPointerException`, as `HashMap.merge` does.
+    /// `stream.collect(Collectors.toMap(key, value[, merge]))` over a value
+    /// list: [`Self::accept_to_map`] for each element in order, then
+    /// [`ToMap::finish`].
     pub(crate) fn collect_to_map(
         &mut self,
-        collector: &str,
+        collector: &Value,
         values: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let Some(payload) = collector.strip_prefix(TO_MAP_COLLECTOR_PREFIX) else {
+        let Some(mut state) = self.begin_to_map(collector)? else {
             return Ok(None);
         };
-        let mut markers = super::split_capture_markers(payload)?;
-        let guava = markers
-            .first()
-            .is_some_and(|marker| marker == GUAVA_COLLECTOR_FLAG);
-        if guava {
-            markers.remove(0);
-        }
-        let functions = markers
-            .into_iter()
-            .map(|marker| super::parse_collection_value(&marker))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (key_fn, value_fn, merge_fn) = match functions.as_slice() {
-            [key, value] => (key.clone(), value.clone(), None),
-            [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone())),
-            _ => return Ok(None),
-        };
-        if !guava {
-            // `HashMap::new` with `putIfAbsent`/`merge` (`hash_bulk.rs`).
-            let map = self.hash_map_collect(&key_fn, &value_fn, merge_fn.as_ref(), values)?;
-            return Ok(Some(map));
-        }
-        let mut entries: Vec<(Value, Value)> = Vec::new();
         for element in values {
-            let key = self.apply_function(&key_fn, element)?;
-            let value = self.apply_function(&value_fn, element)?;
-            if matches!(value, Value::Ref(None)) {
+            self.accept_to_map(&mut state, element)?;
+        }
+        Ok(Some(state.finish()))
+    }
+
+    /// [`ToMap::begin`], and for `Collectors.toMap` the `HashMap::new` its
+    /// supplier runs before the first element.
+    pub(crate) fn begin_to_map(&mut self, collector: &Value) -> Result<Option<ToMap>, NativeError> {
+        let Some(mut state) = ToMap::begin(collector)? else {
+            return Ok(None);
+        };
+        if let Some(supplier) = state.supplier.clone() {
+            // `mapFactory.get()` in the sink's `begin`.
+            let map = self.call_sam("java/util/function/Supplier", &supplier, &[])?;
+            if map == Value::Ref(None) {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
                     message: None,
                     frame: None,
                 });
             }
-            let existing = entries
-                .iter()
-                .position(|(other, _)| super::value_marker(other) == super::value_marker(&key));
-            match (existing, &merge_fn) {
-                (None, _) => entries.push((key, value)),
-                (Some(index), Some(merge)) => {
-                    let earlier = entries[index].1.clone();
-                    let merged = self.apply_callback(merge, &[earlier, value])?;
-                    entries[index].1 = merged;
-                }
-                (Some(index), None) if guava => {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some(format!(
-                            "Multiple entries with same key: {key}={} and {key}={}",
-                            super::value_text(&entries[index].1),
-                            super::value_text(&value),
-                            key = super::value_text(&key),
-                        )),
-                        frame: None,
-                    });
-                }
-                (Some(index), None) => {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalStateException".into(),
-                        message: Some(format!(
-                            "Duplicate key {} (attempted merging values {} and {})",
-                            super::value_text(&key),
-                            super::value_text(&entries[index].1),
-                            super::value_text(&value)
-                        )),
-                        frame: None,
-                    });
-                }
+            state.map = Some(map);
+        } else if !state.guava {
+            state.map = Some(self.new_collector_hash_map()?);
+        }
+        Ok(Some(state))
+    }
+
+    /// `toMap`'s accumulator for one element: the key function, then the
+    /// value function, then the insert. A repeated key without a merge
+    /// function raises the JVM's `IllegalStateException` ("Duplicate key
+    /// ..."); with one, the merged value replaces the earlier one in place.
+    /// A `null` value raises `NullPointerException`, as `HashMap.merge` does.
+    pub(crate) fn accept_to_map(
+        &mut self,
+        state: &mut ToMap,
+        element: &Value,
+    ) -> Result<(), NativeError> {
+        if let (Some(map), Some(merge)) = (
+            state.map.clone(),
+            state.supplier.as_ref().and(state.merge_fn.clone()),
+        ) {
+            // `toMap(k, v, merge, mapFactory)`'s accumulator:
+            // `map.merge(keyMapper.apply(t), valueMapper.apply(t), merge)`.
+            let key = self.apply_function(&state.key_fn, element)?;
+            let value = self.apply_function(&state.value_fn, element)?;
+            self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Map",
+                "merge",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+                &map,
+                &[key, value, merge],
+            )?;
+            return Ok(());
+        }
+        if let Some(map) = state.map.clone() {
+            // `Collectors.toMap`: `putIfAbsent` or `merge` on the `HashMap`.
+            return self.hash_map_collect_one(&map, state, element);
+        }
+        let key = self.apply_function(&state.key_fn, element)?;
+        let value = self.apply_function(&state.value_fn, element)?;
+        if matches!(value, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let existing = state
+            .entries
+            .iter()
+            .position(|(other, _)| super::value_marker(other) == super::value_marker(&key));
+        match (existing, state.merge_fn.clone()) {
+            (None, _) => state.entries.push((key, value)),
+            (Some(index), Some(merge)) => {
+                let earlier = state.entries[index].1.clone();
+                let merged = self.apply_callback(&merge, &[earlier, value])?;
+                state.entries[index].1 = merged;
+            }
+            (Some(index), None) if state.guava => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "Multiple entries with same key: {key}={} and {key}={}",
+                        super::value_text(&state.entries[index].1),
+                        super::value_text(&value),
+                        key = super::value_text(&key),
+                    )),
+                    frame: None,
+                });
+            }
+            (Some(index), None) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalStateException".into(),
+                    message: Some(format!(
+                        "Duplicate key {} (attempted merging values {} and {})",
+                        super::value_text(&key),
+                        super::value_text(&state.entries[index].1),
+                        super::value_text(&value)
+                    )),
+                    frame: None,
+                });
             }
         }
-        let flat = entries
-            .into_iter()
-            .flat_map(|(key, value)| [key, value])
-            .collect::<Vec<_>>();
-        Ok(Some(super::collection_value("map", &flat)))
+        Ok(())
     }
 
     fn apply_function(&mut self, function: &Value, element: &Value) -> Result<Value, NativeError> {
@@ -1361,6 +1338,108 @@ pub(crate) fn java_string_hash(text: &str) -> i32 {
     text.encode_utf16().fold(0i32, |hash, unit| {
         hash.wrapping_mul(31).wrapping_add(i32::from(unit))
     })
+}
+
+impl<H: crate::Host> crate::Runtime<'_, H> {
+    /// The logger factories whose name may depend on a class, which only the
+    /// runtime knows: log4j's `LogManager.getLogger`/`getFormatterLogger`
+    /// with no argument (the caller's class, `StackLocatorUtil.getCallerClass`),
+    /// a `String` (`null`: the caller's), a `Class` (`null`: the caller's) or
+    /// an `Object` (its class; `null`: the caller's), a class named by
+    /// `Class.getCanonicalName()` (else `getName()`) as log4j-api 2.26's
+    /// `LoggerContext.getLogger(Class)` does, each with an optional
+    /// `MessageFactory` (counted, see below); and Mojang's
+    /// `LogUtils.getLogger()`, slf4j's logger of the caller's class, named by
+    /// `getName()`. A name the runtime cannot tell (a class it does not hold
+    /// with a `$`, a value of unknown class, no caller frame) is counted and
+    /// answered with the best name it has. `None` for any other call.
+    pub(crate) fn invoke_logger_factory(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let caller = || {
+            crate::stack_walk::snapshot()
+                .first()
+                .map(|(class, _)| class.clone())
+        };
+        if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
+            == (
+                "com/mojang/logging/LogUtils",
+                "getLogger",
+                "()Lorg/slf4j/Logger;",
+            )
+        {
+            return Ok(Some(match caller() {
+                Some(class) => logger_value("slf4j", &class.replace('/', ".")),
+                None => {
+                    self.host.unknown_operand_call(r)?;
+                    logger_value("mojang", "")
+                }
+            }));
+        }
+        let api = match (r.owner.as_str(), r.name.as_str()) {
+            ("org/apache/logging/log4j/LogManager", "getLogger") => "log4j",
+            ("org/apache/logging/log4j/LogManager", "getFormatterLogger") => "log4j-formatter",
+            _ => return Ok(None),
+        };
+        if !r.descriptor.ends_with(")Lorg/apache/logging/log4j/Logger;") {
+            return Ok(None);
+        }
+        // An overload taking a `MessageFactory` caches one logger per name
+        // and factory, which the runtime cannot compare: answered (a mod
+        // logs through it) but counted, under a key no other logger shares.
+        let parameters = crate::descriptor_arguments(&r.descriptor);
+        let (api, first) = match parameters.as_slice() {
+            [] => (api, None),
+            [first] => (api, Some(first.as_str())),
+            [first, factory] if factory == "Lorg/apache/logging/log4j/message/MessageFactory;" => {
+                self.host.unknown_operand_call(r)?;
+                ("log4j-factory", Some(first.as_str()))
+            }
+            _ => return Ok(None),
+        };
+        let class = match (first, args.first()) {
+            (None, _)
+            | (
+                Some("Ljava/lang/String;" | "Ljava/lang/Class;" | "Ljava/lang/Object;"),
+                Some(Value::Ref(None)),
+            ) => caller(),
+            // A name is the logger's name as it is.
+            (Some("Ljava/lang/String;"), Some(Value::Ref(Some(name)))) => {
+                return Ok(Some(logger_value(api, name)));
+            }
+            (Some("Ljava/lang/Class;"), Some(class))
+                if crate::host_class::class_name(class).is_some() =>
+            {
+                crate::host_class::class_name(class).map(|class| class.replace('.', "/"))
+            }
+            (Some("Ljava/lang/Object;"), Some(value)) => {
+                crate::class_of_value(value).or_else(|| {
+                    expect_ref(value)
+                        .filter(|text| crate::value_class::is_plain_string(text))
+                        .map(|_| "java/lang/String".to_owned())
+                })
+            }
+            _ => return Ok(None),
+        };
+        let name = match class
+            .as_deref()
+            .map(|class| (class, self.canonical_class_name(class)))
+        {
+            Some((_, Some(Some(name)))) => name,
+            Some((class, Some(None))) => class.replace('/', "."),
+            Some((class, None)) => {
+                self.host.unknown_operand_call(r)?;
+                class.replace('/', ".")
+            }
+            None => {
+                self.host.unknown_operand_call(r)?;
+                String::new()
+            }
+        };
+        Ok(Some(logger_value(api, &name)))
+    }
 }
 
 #[cfg(test)]
@@ -1441,12 +1520,15 @@ mod tests {
 
     #[test]
     fn logger_factories_answer_a_named_disabled_logger() {
-        let by_class = method(
+        // The `Class`/`Object`/no-argument overloads are named by a class
+        // the runtime knows (`invoke_logger_factory`; fixture_host_values_p2b
+        // checks them against Java 25); the host answers the `String` one.
+        let by_name = method(
             "org/apache/logging/log4j/LogManager",
             "getLogger",
-            "(Ljava/lang/Class;)Lorg/apache/logging/log4j/Logger;",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
         );
-        let logger = static_call(&by_class, &[text("xaero/lib/XaeroLib")])
+        let logger = static_call(&by_name, &[text("xaero.lib.XaeroLib")])
             .unwrap()
             .unwrap();
         assert_ne!(logger, Value::Ref(None));
@@ -1485,23 +1567,6 @@ mod tests {
                 .unwrap(),
             Value::Void
         );
-    }
-
-    #[test]
-    fn arrays_as_list_of_the_empty_array_is_an_empty_list() {
-        let as_list = method(
-            "java/util/Arrays",
-            "asList",
-            "([Ljava/lang/Object;)Ljava/util/List;",
-        );
-        assert_eq!(
-            static_call(&as_list, &[text("array/empty")])
-                .unwrap()
-                .unwrap(),
-            text("list")
-        );
-        // A runtime-owned array is the interpreter's to expand.
-        assert!(static_call(&as_list, &[text("array/demo/Probe/run/0")]).is_none());
     }
 
     #[test]

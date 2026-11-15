@@ -22,11 +22,9 @@
 //! - a bare jar class name (how `ServiceLoader` hands out a jar provider) is
 //!   read as an instance of that class, as `instanceof` already reads it; a
 //!   `Class` object of the same name is not told apart;
-//! - the exception message is `class A cannot be cast to class B` without the
-//!   JVM's module/loader clause (`(A is in module java.base of loader
-//!   'bootstrap'; B is in unnamed module of loader 'app')`), except when both
-//!   classes are in `java.base`, where it is the JVM's whole message
-//!   (`(A and B are in module java.base of loader 'bootstrap')`);
+//! - the exception message names a jar's or the game's class as in the
+//!   unnamed module of loader `app` (a plain `java -cp` run): in the game its
+//!   loader is Knot's, whose name carries an identity hash no run can know;
 //! - a lambda (an `@indy:` marker) cast to a jar *interface* passes uncounted:
 //!   the marker does not record which functional interface the lambda
 //!   implements, and javac only emits such a cast after an erased generic read.
@@ -53,55 +51,120 @@ pub(crate) enum HostCast {
     /// (a collection whose JDK class the host does not track, a game
     /// object): counted.
     Unknown,
+    /// Provably not the class, but the value's exact class (which the
+    /// exception's message names) is unknown: counted, and still a
+    /// `ClassCastException`. Passing the cast would hand the jar a typed lie.
+    FailsCounted,
 }
 
-/// Whether the JDK class `class` is in module `java.base` (the packages a
-/// cast message can name; the few JDK packages outside it are excluded).
-fn in_java_base(class: &str) -> bool {
-    // An array class is in its element type's module; a primitive array in
-    // `java.base`.
-    if let Some(element) = class.strip_prefix('[') {
-        let element = element.trim_start_matches('[');
-        return match element.strip_prefix('L').and_then(|e| e.strip_suffix(';')) {
-            Some(element) => in_java_base(element),
-            None => true,
-        };
+/// The system modules Java 25's boot layer defines to the platform and the
+/// application class loaders (`Module.getClassLoader().getName()`); every
+/// other system module is the bootstrap loader's.
+const PLATFORM_MODULES: &[&str] = &[
+    "java.compiler",
+    "java.net.http",
+    "java.scripting",
+    "java.se",
+    "java.security.jgss",
+    "java.smartcardio",
+    "java.sql",
+    "java.sql.rowset",
+    "java.transaction.xa",
+    "java.xml.crypto",
+    "jdk.accessibility",
+    "jdk.charsets",
+    "jdk.crypto.cryptoki",
+    "jdk.dynalink",
+    "jdk.graal.compiler",
+    "jdk.graal.compiler.management",
+    "jdk.httpserver",
+    "jdk.jsobject",
+    "jdk.localedata",
+    "jdk.naming.dns",
+    "jdk.security.auth",
+    "jdk.security.jgss",
+    "jdk.xml.dom",
+    "jdk.zipfs",
+];
+const APP_MODULES: &[&str] = &[
+    "jdk.attach",
+    "jdk.compiler",
+    "jdk.crypto.ec",
+    "jdk.editpad",
+    "jdk.hotspot.agent",
+    "jdk.internal.ed",
+    "jdk.internal.jvmstat",
+    "jdk.internal.le",
+    "jdk.internal.md",
+    "jdk.internal.opt",
+    "jdk.jartool",
+    "jdk.javadoc",
+    "jdk.jcmd",
+    "jdk.jconsole",
+    "jdk.jdeps",
+    "jdk.jdi",
+    "jdk.jdwp.agent",
+    "jdk.jlink",
+    "jdk.jpackage",
+    "jdk.jshell",
+    "jdk.jstatd",
+    "jdk.unsupported.desktop",
+];
+
+/// Where the JVM says class `class` lives, as a cast message names it: its
+/// module (`module java.base`, or `unnamed module` for a jar's or the game's
+/// class) and its loader's name. An array class lives where its element
+/// class does; a primitive array in `java.base`. A jar's class is the
+/// application loader's, as in a plain `java -cp` run: in the game a mod's
+/// loader is Knot's, whose name carries an identity hash no run can know.
+fn module_and_loader(class: &str) -> (String, &'static str) {
+    let element = class.trim_start_matches('[');
+    let element = match element.strip_prefix('L').and_then(|e| e.strip_suffix(';')) {
+        Some(element) => element,
+        None if element.len() < class.len() => "java/lang/Object",
+        None => element,
+    };
+    match crate::runtime::jdk_closure::module_of(element) {
+        Some(module) if PLATFORM_MODULES.contains(&module) => {
+            (format!("module {module}"), "platform")
+        }
+        Some(module) if APP_MODULES.contains(&module) => (format!("module {module}"), "app"),
+        Some(module) => (format!("module {module}"), "bootstrap"),
+        None => ("unnamed module".to_owned(), "app"),
     }
-    const BASE: &[&str] = &[
-        "java/lang/",
-        "java/util/",
-        "java/io/",
-        "java/nio/",
-        "java/math/",
-        "java/net/",
-        "java/time/",
-        "java/text/",
-        // `sun.nio.fs.UnixPath`, the watch service's classes.
-        "sun/nio/",
-    ];
-    const ELSEWHERE: &[&str] = &[
-        "java/lang/instrument/",
-        "java/lang/management/",
-        "java/util/logging/",
-        "java/util/prefs/",
-        "java/net/http/",
-    ];
-    BASE.iter().any(|prefix| class.starts_with(prefix))
-        && !ELSEWHERE.iter().any(|prefix| class.starts_with(prefix))
+}
+
+/// The `ClassCastException` of a cast that fails where the runtime does not
+/// know the value's exact class: the cast is counted by the caller, and the
+/// message, which in Java names that class first, names only the target
+/// (never a marker).
+pub(crate) fn cast_failed_counted(target: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/ClassCastException".into(),
+        message: Some(format!(
+            "cannot be cast to class {}",
+            target.replace('/', ".")
+        )),
+        frame: None,
+    }
 }
 
 /// The `ClassCastException` `checkcast target` throws for an object of
-/// `runtime_class` (internal names). Two `java.base` classes get the JVM's
-/// whole message (`SharedRuntime::generate_class_cast_message`); otherwise
-/// the module/loader clause is left out (a named departure, above).
-fn class_cast_exception(runtime_class: &str, target: &str) -> NativeError {
+/// `runtime_class` (internal names), with the JVM's message
+/// (`SharedRuntime::generate_class_cast_message`): both classes, then where
+/// each lives ([`module_and_loader`]), once when they share it.
+pub(crate) fn class_cast_exception(runtime_class: &str, target: &str) -> NativeError {
     let (from, to) = (runtime_class.replace('/', "."), target.replace('/', "."));
-    let message = if in_java_base(runtime_class) && in_java_base(target) {
+    let (from_module, from_loader) = module_and_loader(runtime_class);
+    let (to_module, to_loader) = module_and_loader(target);
+    let message = if (&from_module, from_loader) == (&to_module, to_loader) {
         format!(
-            "class {from} cannot be cast to class {to} ({from} and {to} are in module java.base of loader 'bootstrap')"
+            "class {from} cannot be cast to class {to} ({from} and {to} are in {from_module} of loader '{from_loader}')"
         )
     } else {
-        format!("class {from} cannot be cast to class {to}")
+        format!(
+            "class {from} cannot be cast to class {to} ({from} is in {from_module} of loader '{from_loader}'; {to} is in {to_module} of loader '{to_loader}')"
+        )
     };
     NativeError::UncaughtException {
         class: "java/lang/ClassCastException".into(),
@@ -129,6 +192,37 @@ impl<H: Host> Runtime<'_, H> {
         if *value == Value::Ref(None) || target == "java/lang/Object" {
             return Ok(());
         }
+        // A `String` spelling an object's key is a `String`, certainly: no
+        // other value is that text (`jar_object.rs`).
+        if let Value::Ref(Some(text)) = value
+            && crate::runtime::jar_object::spells_key(value)
+        {
+            if crate::runtime::value_class::string_instance_of(text, target) {
+                return Ok(());
+            }
+            return Err(class_cast_exception("java/lang/String", target));
+        }
+        // A reference's text cast to `Class` or a reflective `Type` shape: no
+        // text is either (classes and types are handles, `host_class.rs`,
+        // `host_reflect_type.rs`). A plain string, however it is spelled
+        // (`"int"`, `"java/lang/String"`), throws Java's CCE (#156 P13c); a
+        // host marker is counted (the exception's class is not known).
+        if let Value::Ref(Some(text)) = value
+            && matches!(
+                target,
+                "java/lang/Class"
+                    | "java/lang/reflect/ParameterizedType"
+                    | "java/lang/reflect/TypeVariable"
+                    | "java/lang/reflect/WildcardType"
+                    | "java/lang/reflect/GenericArrayType"
+                    | "java/lang/reflect/Type"
+            )
+        {
+            if crate::runtime::value_class::is_plain_string(text) {
+                return Err(class_cast_exception("java/lang/String", target));
+            }
+            return self.count_cast(value, target);
+        }
         // A host handle is its kind's class, and only a handle is one of a
         // handle kind's classes (`host_ref.rs`): `(String) Optional.empty()`
         // and `(Optional<?>) "text"` throw.
@@ -138,6 +232,10 @@ impl<H: Host> Runtime<'_, H> {
                 return Err(class_cast_exception(&runtime_class, target));
             }
             Some(HostCast::Unknown) => return self.count_cast(value, target),
+            Some(HostCast::FailsCounted) => {
+                self.count_cast(value, target)?;
+                return Err(cast_failed_counted(target));
+            }
             None => {}
         }
         // A JDK throwable target and a throwable value: the JDK hierarchy
@@ -148,9 +246,103 @@ impl<H: Host> Runtime<'_, H> {
             }
             return Err(class_cast_exception(&runtime_class, target));
         }
+        // A live stream is a pipeline stage of its stream interface: a cast to
+        // that interface, `BaseStream` or `AutoCloseable` passes; any other
+        // fails, naming a stage class the runtime does not model (counted,
+        // and never passed: its marker would become a jar `String`).
+        if let Value::Ref(Some(text)) = value
+            && self.is_live_stream(text)
+        {
+            if self.live_stream_instance_of(text, target) == Some(true) {
+                return Ok(());
+            }
+            self.count_cast(value, target)?;
+            return Err(cast_failed_counted(target));
+        }
+        // A plain `String`, or a `stream/...` text that is no live stream (a
+        // jar `String` spelled like one), is never a stream: Java's CCE.
+        if crate::runtime::stream_pipeline::is_stream_interface(target)
+            && let Value::Ref(Some(text)) = value
+            && (crate::runtime::value_class::is_plain_string(text)
+                || (text.starts_with("stream/") && !self.is_live_stream(text)))
+        {
+            return Err(class_cast_exception("java/lang/String", target));
+        }
+        // An object of a JDK class (`new ThreadPoolExecutor(..)`) cast to a
+        // JDK type: Java 25's table decides; a class outside it is counted,
+        // never a silent pass.
+        if let Some(verdict) = self.jdk_object_instance_of(value, target) {
+            return match verdict {
+                Some(true) => Ok(()),
+                Some(false) => Err(class_cast_exception(
+                    crate::runtime::jar_object::object_class(value).unwrap_or_default(),
+                    target,
+                )),
+                None => self.count_cast(value, target),
+            };
+        }
+        // A jar object (or jar enum constant) cast to a JDK type or an array
+        // (#242): its class chain decides, the held class files up to the
+        // class it leaves the jar at and Java 25's table above, as the JVM's
+        // `checkcast` does. A chain that leaves through a class the runtime
+        // does not hold, or a Mixin that could add the interface, is counted.
+        if (target.starts_with('[') || crate::runtime::jdk_closure::in_jdk_package(target))
+            && self.class(target).is_none()
+            && let Some(class) = self.cast_object_class(value)
+        {
+            let verdict = if target.starts_with('[') {
+                // A jar class is never an array class.
+                Verdict::No
+            } else {
+                let is_interface =
+                    host_ref::ClassHierarchy::is_interface(&host_ref::JdkHierarchy, target);
+                self.hierarchy_verdict(&class, target, is_interface)
+            };
+            return match verdict {
+                Verdict::Yes => Ok(()),
+                Verdict::No => Err(class_cast_exception(&class, target)),
+                Verdict::Unknown => self.count_cast(value, target),
+            };
+        }
         let Some(target_file) = self.class(target) else {
-            // A JDK or game target: the runtime models those values by marker
-            // and keeps its previous behaviour.
+            // A plain `String` (`"hcoll:java/util/ArrayList#neutral0"`) cast
+            // to a JDK type: `String` is final and its supertypes
+            // are known, so Java's answer is exact (#208 review, #167). A
+            // `Class` is a handle (#156 P13c): `"int"` or a held class's name
+            // is that `String`.
+            // The game's objects are handles or `game/`/`client/` markers,
+            // never plain text, and so are Brigadier's (`host_brigadier.rs`):
+            // a cast of a `String` to one of their classes is as exact, but
+            // for a text shaped like a class name, which the host answers for
+            // an object it does not model (`net/minecraft/core/Registry`).
+            // A client class every object of which is a handle (#156 P16d,
+            // `game_object::handle_only_class`) is never text, a class-name
+            // text included.
+            if let Value::Ref(Some(text)) = value
+                && crate::runtime::value_class::is_plain_string(text)
+                && (crate::runtime::jdk_closure::in_jdk_package(target)
+                    || crate::runtime::game_object::handle_only_class(target)
+                    || ((target.starts_with("net/minecraft/")
+                        || target.starts_with("com/mojang/brigadier/"))
+                        && !crate::runtime::value_class::class_name_shaped(text)))
+            {
+                if crate::runtime::value_class::string_instance_of(text, target) {
+                    return Ok(());
+                }
+                return Err(class_cast_exception("java/lang/String", target));
+            }
+            // A library class (no class file here), or a game class and a
+            // class-name text: the host still answers some of their objects
+            // as plain-looking text (Fabric Loader's
+            // `SemanticVersion`, a class name in jankson: ff926cd7), so a plain
+            // `String` cast to one is counted, never a silent pass nor a throw
+            // (#167).
+            if let Value::Ref(Some(text)) = value
+                && crate::runtime::value_class::is_plain_string(text)
+                && !crate::runtime::value_class::STRING_TYPES.contains(&target)
+            {
+                return self.count_cast(value, target);
+            }
             return Ok(());
         };
         let target_is_interface =
@@ -158,6 +350,11 @@ impl<H: Host> Runtime<'_, H> {
         let (verdict, runtime_class) = self.cast_verdict(value, target, target_is_interface);
         match verdict {
             Verdict::Yes => Ok(()),
+            // A stream's class is a pipeline stage's own, which the
+            // exception's message would name: counted, its marker never shown.
+            Verdict::No if expect_ref(value).is_some_and(|marker| self.is_live_stream(marker)) => {
+                self.count_cast(value, target)
+            }
             Verdict::No => Err(class_cast_exception(
                 runtime_class.as_deref().unwrap_or("java/lang/Object"),
                 target,
@@ -172,11 +369,32 @@ impl<H: Host> Runtime<'_, H> {
         let cast = MethodRef {
             owner: target.to_owned(),
             name: "<checkcast>".into(),
-            descriptor: format!("(Ljava/lang/Object;)L{target};"),
+            // An array class is already a descriptor (`[I`).
+            descriptor: if target.starts_with('[') {
+                format!("(Ljava/lang/Object;){target}")
+            } else {
+                format!("(Ljava/lang/Object;)L{target};")
+            },
         };
         self.host
             .invoke(&cast, std::slice::from_ref(value))
             .map(|_| ())
+    }
+
+    /// `value instanceof target` for an object of a JDK class the run does not
+    /// hold (`new StringBuilder()`, `new ThreadPoolExecutor(..)`) against a JDK
+    /// type, from Java 25's table (`jdk_closure.rs`): `Some(None)` when the
+    /// class is outside it (the caller counts), `None` for any other value or
+    /// target.
+    pub(crate) fn jdk_object_instance_of(
+        &self,
+        value: &Value,
+        target: &str,
+    ) -> Option<Option<bool>> {
+        let class = crate::runtime::jar_object::object_class(value)?;
+        let jdk = crate::runtime::jdk_closure::in_jdk_package;
+        (self.class(class).is_none() && self.class(target).is_none() && jdk(class) && jdk(target))
+            .then(|| host_ref::ClassHierarchy::is_instance(&host_ref::JdkHierarchy, class, target))
     }
 
     /// `checkcast target` (and `Class.cast`) where a host handle decides it:
@@ -186,18 +404,28 @@ impl<H: Host> Runtime<'_, H> {
     /// class where the runtime knows it exactly. `None` when no handle is
     /// involved.
     pub(crate) fn host_cast(&self, value: &Value, target: &str) -> Option<HostCast> {
-        if let Value::Host(handle) = value {
+        // An object casts by its class's chain, as below (`jar_object.rs`).
+        if let Value::Host(handle) = value
+            && !crate::runtime::jar_object::is_object_handle(handle)
+        {
             return Some(match handle.instance_of(target, self) {
                 Some(true) => HostCast::Fits,
                 // The exception names the exact class: unknown, counted.
                 Some(false) => match handle.class() {
                     Some(class) => HostCast::Throws(class.to_owned()),
-                    None => HostCast::Unknown,
+                    None => HostCast::FailsCounted,
                 },
                 None => HostCast::Unknown,
             });
         }
-        HostKind::of_class(target)?;
+        // A String spelled like a registry, holder or builder once was.
+        if let Some(class) = crate::runtime::host_registry::retired_marker_cast(value, target) {
+            return Some(HostCast::Throws(class));
+        }
+        // An array class's objects are array handles only (`host_array.rs`).
+        if !target.starts_with('[') {
+            HostKind::of_class(target)?;
+        }
         if *value == Value::Ref(None) {
             return Some(HostCast::Fits);
         }
@@ -232,29 +460,35 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// The exact class of a value that is no handle, where the runtime knows
-    /// it: a string, a box, an array whose component was recorded, a jar
-    /// object, a JDK object a jar constructed
-    /// (`java/util/ArrayList#3`). Not a host model's collection or entry,
-    /// whose JDK class (`List12` or `ListN`, `KeyValueHolder`) is not kept.
-    fn exact_class(&self, value: &Value) -> Option<String> {
+    /// it: a string, a box, a jar object, a JDK object a jar constructed
+    /// (`java/util/ArrayList#3`), an unmodifiable collection the host made as
+    /// Java's class (`List12`, `Collections$EmptyList`, #156 P14c). Not a
+    /// host model's other collections (an unmodelled call's answer, a
+    /// `subList`: `#neutral`, whose class is the host's stand-in) or entries.
+    pub(super) fn exact_class(&self, value: &Value) -> Option<String> {
+        if let Value::Host(handle) = value
+            && handle.kind() == crate::runtime::host_ref::HostKind::Collection
+        {
+            return crate::runtime::jar_object::collection_key(handle.key())
+                .filter(|_| handle.key().contains("#immutable"))
+                .map(|(class, _)| class.to_owned());
+        }
         let marker = match value {
+            Value::Host(handle) if crate::runtime::jar_object::is_object_handle(handle) => handle.key(),
             Value::Ref(Some(marker)) => marker,
             Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Boxed(_) => {
                 return class_of_value(value);
             }
             _ => return None,
         };
-        if crate::runtime::value_class::is_plain_string(marker) {
+        if matches!(value, Value::Ref(_)) && crate::runtime::value_class::is_plain_string(marker) {
             return Some("java/lang/String".into());
-        }
-        if let Some(component) = self.array_component(marker) {
-            return Some(crate::runtime::value_class::array_class_marker(&component));
         }
         // `class#n`: an object `new` built (a host model's own copies use
         // other serials, `#neutral0`, `#immutable0`). A `Class` is not told
         // apart: its marker is a bare class name, which a `ServiceLoader`
         // provider instance shares.
-        let class = crate::runtime::jar_text::object_marker_class(marker)?;
+        let class = crate::runtime::jar_object::packaged_object_class(value)?;
         (self.class(class).is_some() || class.starts_with("java/")).then(|| class.to_owned())
     }
 
@@ -275,6 +509,20 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// [`Self::known_instance_of`] for an object of the class `class`, before
+    /// one exists (a `ServiceLoader` provider the loader is about to build).
+    pub(crate) fn class_known_instance_of(&self, class: &str, target: &str) -> Option<bool> {
+        let target_is_interface = self
+            .class(target)
+            .and_then(class_access)
+            .map(|access| access & ACC_INTERFACE != 0);
+        match self.hierarchy_verdict(class, target, target_is_interface) {
+            Verdict::Yes => Some(true),
+            Verdict::No => Some(false),
+            Verdict::Unknown => None,
+        }
+    }
+
     /// Whether an `instanceof target` the opcode's models all answered `false`
     /// is a guess rather than a known "no".
     ///
@@ -289,17 +537,42 @@ impl<H: Host> Runtime<'_, H> {
     /// call.
     ///
     /// Named limit: a JDK target (`java/`, `javax/`, `jdk/`) keeps the
-    /// uncounted `false`, as before. The JDK models answer for the JDK
-    /// objects they build, and an opaque marker against a JDK interface
-    /// is left for a later change.
+    /// uncounted `false` for anything but a jar object (whose chain decides,
+    /// #242). The JDK models answer for the JDK objects they build, and an
+    /// opaque marker against a JDK interface is left for a later change.
     pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
         let marker = match value {
             Value::Ref(Some(marker)) => marker.as_str(),
+            // An object: by its class's chain, below.
+            Value::Host(handle) if crate::runtime::jar_object::is_object_handle(handle) => handle.key(),
             // A host handle whose kind cannot tell (`host_ref.rs`).
             Value::Host(handle) => return handle.instance_of(target, self).is_none(),
             // `null` is never an instance; a box is a JDK object.
             _ => return false,
         };
+        // Every array is a handle (`host_array.rs`): no other value is one.
+        if target.starts_with('[') {
+            return false;
+        }
+        // An object of a JDK class against a JDK type: a guess exactly when
+        // Java 25's table cannot tell (a class outside it).
+        if let Some(verdict) = self.jdk_object_instance_of(value, target) {
+            return verdict.is_none();
+        }
+        // A jar object against a JDK type: a guess exactly where its cast is
+        // counted (#242), the chain leaving through a class or interface no
+        // table describes.
+        if crate::runtime::jdk_closure::in_jdk_package(target)
+            && self.class(target).is_none()
+            && let Some(class) = self.cast_object_class(value)
+        {
+            let is_interface =
+                host_ref::ClassHierarchy::is_interface(&host_ref::JdkHierarchy, target);
+            return matches!(
+                self.hierarchy_verdict(&class, target, is_interface),
+                Verdict::Unknown
+            );
+        }
         if ["java/", "javax/", "jdk/"]
             .iter()
             .any(|prefix| target.starts_with(prefix))
@@ -307,15 +580,18 @@ impl<H: Host> Runtime<'_, H> {
             return false;
         }
         // `String` is final and in `java.base`, so a text `instanceof String`
-        // accepts is no jar, game or loader type. (`checkcast` still counts a
-        // string cast to a jar type: a departure there, not here.)
-        if crate::runtime::value_class::is_plain_string(marker) {
+        // accepts is no jar, game or loader type. `checkcast` throws for most
+        // such text (#167) but counts a class-name-shaped text and a library
+        // target, which a host stand-in may be (`RegisterEvent.getRegistry`,
+        // Fabric Loader's version); `instanceof`, a pattern, `Class.isInstance`
+        // and `Class.cast` still answer those exactly as for a `String` (a
+        // known gap, #167's review).
+        if matches!(value, Value::Ref(_)) && crate::runtime::value_class::is_plain_string(marker) {
             return false;
         }
         // An object a library model built itself: the model knows its whole
         // type, so its `false` is an answer.
-        if crate::runtime::gson_tree::is_tree(marker) || crate::runtime::neoforge_loader::container_type_known(marker)
-        {
+        if crate::runtime::gson_tree::is_tree(value) {
             return false;
         }
         if self.class(target).is_some() {
@@ -327,6 +603,23 @@ impl<H: Host> Runtime<'_, H> {
         !matches!(self.cast_verdict(value, target, None).0, Verdict::No)
     }
 
+    /// The held class of a jar object (an object handle) or of a jar enum
+    /// constant (`enum/<class>/<NAME>`); `None` for any other value, a
+    /// `String` spelling a class name included.
+    fn cast_object_class(&self, value: &Value) -> Option<String> {
+        let class = match value {
+            Value::Host(handle) if crate::runtime::jar_object::is_object_handle(handle) => {
+                crate::runtime::jar_object::object_class(value)?
+            }
+            Value::Ref(Some(marker)) => marker
+                .strip_prefix("enum/")
+                .and_then(|rest| rest.rsplit_once('/'))
+                .map(|(class, _)| class)?,
+            _ => return None,
+        };
+        self.class(class).is_some().then(|| class.to_owned())
+    }
+
     /// The class of a jar (or linked) object or enum constant marker, as
     /// `checkcast` reads it; `None` for any other value.
     pub(super) fn known_object_class(&self, value: &Value) -> Option<String> {
@@ -334,7 +627,7 @@ impl<H: Host> Runtime<'_, H> {
         marker
             .strip_prefix("enum/")
             .and_then(|rest| rest.rsplit_once('/').map(|(class, _)| class))
-            .or_else(|| marker.split_once('#').map(|(class, _)| class))
+            .or_else(|| crate::runtime::jar_object::object_class(value))
             .or(Some(marker.as_str()))
             .filter(|class| self.class(class).is_some())
             .map(str::to_owned)
@@ -347,6 +640,8 @@ impl<H: Host> Runtime<'_, H> {
         target_is_interface: Option<bool>,
     ) -> (Verdict, Option<String>) {
         let marker = match value {
+            // An object answers by its class's chain, below.
+            Value::Host(handle) if crate::runtime::jar_object::is_object_handle(handle) => handle.key(),
             // A host handle answers by its kind's class (`host_ref.rs`).
             Value::Host(handle) => {
                 let verdict = match handle.instance_of(target, self) {
@@ -361,8 +656,27 @@ impl<H: Host> Runtime<'_, H> {
                 return (Verdict::No, class_of_value(value));
             }
             Value::Void | Value::Ref(None) => return (Verdict::Yes, None),
+            // A `String` spelling an object's key: its supertypes only.
+            Value::Ref(Some(text)) if crate::runtime::jar_object::spells_key(value) => {
+                let verdict = if crate::runtime::value_class::string_instance_of(text, target) {
+                    Verdict::Yes
+                } else {
+                    Verdict::No
+                };
+                return (verdict, Some("java/lang/String".into()));
+            }
             Value::Ref(Some(marker)) => marker.as_str(),
         };
+        // A `stream/...` text that is no live stream is a jar `String`
+        // spelled like one (`stream_pipeline::stream_marker`).
+        if marker.starts_with("stream/") && !self.is_live_stream(marker) {
+            let verdict = if self.forged_stream_instance_of(marker, target) {
+                Verdict::Yes
+            } else {
+                Verdict::No
+            };
+            return (verdict, Some("java/lang/String".into()));
+        }
         if marker.starts_with("@indy:") {
             // A lambda is an instance of its functional interface only.
             return match target_is_interface {
@@ -387,7 +701,7 @@ impl<H: Host> Runtime<'_, H> {
         let object_class = marker
             .strip_prefix("enum/")
             .and_then(|rest| rest.rsplit_once('/').map(|(class, _)| class))
-            .or_else(|| marker.split_once('#').map(|(class, _)| class))
+            .or_else(|| crate::runtime::jar_object::object_class(value))
             // A jar provider `ServiceLoader` hands out is its bare class name;
             // `instanceof` reads such a marker as an instance of that class,
             // and the cast agrees with it.
@@ -415,11 +729,27 @@ impl<H: Host> Runtime<'_, H> {
                                 "list" | "set" | "map" | "true" | "false"
             )
             // An object `new` made of a JDK class (`java/util/ArrayList#3`).
-            || marker
-                .split_once('#')
-                .is_some_and(|(class, _)| class.starts_with("java/"));
+            || crate::runtime::jar_object::value_marker_class(value).is_some_and(|class| class.starts_with("java/"));
         if jdk_kind {
             return (Verdict::No, class_of_value(value));
+        }
+        // A plain `String` (#167): final, with exactly its JDK supertypes, so
+        // no jar class or interface; a Mixin cannot add one to it. (A jar
+        // class's name, `ServiceLoader`'s provider, is read above.) A text
+        // shaped like a class name stays counted: the host answers some
+        // objects it does not model by their class's name
+        // (`RegisterEvent.getRegistry`, `registrar`), and a Mixin may give
+        // that class a jar interface.
+        if matches!(value, Value::Ref(_))
+            && crate::runtime::value_class::is_plain_string(marker)
+            && !crate::runtime::value_class::class_name_shaped(marker)
+        {
+            let verdict = if crate::runtime::value_class::string_instance_of(marker, target) {
+                Verdict::Yes
+            } else {
+                Verdict::No
+            };
+            return (verdict, Some("java/lang/String".into()));
         }
         (Verdict::Unknown, None)
     }
@@ -427,10 +757,11 @@ impl<H: Host> Runtime<'_, H> {
     /// Walk `class`'s superclasses and interfaces for `target`.
     ///
     /// Leaving the classes the runtime holds is definitive for a JDK class
-    /// (it never extends or implements a jar type) and for a class target (a
-    /// game or library class cannot extend a jar class); for an interface
-    /// target a Mixin may add the interface to the game superclass, so the
-    /// answer is unknown.
+    /// (it never extends or implements a jar type) and for a jar class target
+    /// (a game or library class cannot extend a jar class). It is unknown for
+    /// a JDK class target that is not final (the unheld class may extend it)
+    /// and for an interface target (a Mixin may add the interface to the game
+    /// superclass).
     fn hierarchy_verdict(
         &self,
         class: &str,
@@ -463,7 +794,19 @@ impl<H: Host> Runtime<'_, H> {
                         None => Verdict::Unknown,
                     };
                 }
+                // Every class is an `Object`, held or not.
+                if target == "java/lang/Object" {
+                    return Verdict::Yes;
+                }
                 if target_is_interface == Some(false) {
+                    // A JDK class target may be any superclass of the unheld
+                    // class (a `missing.Base extends Number`): only a final
+                    // one in Java 25's table is proved out (#267 review).
+                    if crate::runtime::jdk_closure::in_jdk_package(target)
+                        && !crate::runtime::jdk_closure::class(target).is_some_and(|class| class.is_final)
+                    {
+                        return Verdict::Unknown;
+                    }
                     return Verdict::No;
                 }
                 return Verdict::Unknown;
@@ -519,6 +862,16 @@ impl<H: Host> Runtime<'_, H> {
             }
             match self.class(&current) {
                 Some(file) => queue.extend(file.interface_names()),
+                // A JDK interface never extends a type outside the JDK, and
+                // Java 25's table decides a JDK target (#242).
+                None if current.starts_with("java/")
+                    && (!crate::runtime::jdk_closure::in_jdk_package(target)
+                        || host_ref::ClassHierarchy::is_instance(
+                            &host_ref::JdkHierarchy,
+                            &current,
+                            target,
+                        )
+                        .is_some()) => {}
                 None if !held_target => return true,
                 None if !PLATFORM.iter().any(|prefix| current.starts_with(prefix)) => {
                     return true;
@@ -534,23 +887,68 @@ impl<H: Host> Runtime<'_, H> {
     /// or a mixin class that implements it (a "duck" interface), naming
     /// `class` among its targets. The class file of `class` does not list
     /// that interface, so the plain walk cannot see it.
-    fn mixin_adds_interface(&self, class: &str, target: &str) -> bool {
-        self.classes.values().any(|mixin| {
-            let provides = mixin.name == target
-                || mixin.interface_names().iter().any(|interface| {
-                    interface == target || self.interface_extends(interface, target)
-                });
-            provides
-                && mixin
-                    .annotations
-                    .iter()
-                    .filter(|annotation| annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR)
-                    .any(|annotation| {
-                        mixin_target_owners(annotation)
-                            .iter()
-                            .any(|owner| owner == class)
+    pub(crate) fn mixin_adds_interface(&self, class: &str, target: &str) -> bool {
+        self.mixins_targeting(class)
+            .iter()
+            .filter_map(|name| self.classes.get(name))
+            .any(|mixin| {
+                mixin.name == target
+                    || mixin.interface_names().iter().any(|interface| {
+                        interface == target || self.interface_extends(interface, target)
                     })
-        })
+            })
+    }
+
+    /// The interfaces the jar's `@Mixin`s add to `class`, in the order Mixin
+    /// appends them after the class's own (`Class.getInterfaces()` of the
+    /// woven class): an accessor interface that is itself the mixin, or the
+    /// interfaces a mixin class implements.
+    pub(crate) fn mixin_added_interfaces(&self, class: &str) -> Vec<String> {
+        let mut added = Vec::new();
+        for mixin in self
+            .mixins_targeting(class)
+            .iter()
+            .filter_map(|name| self.classes.get(name))
+        {
+            let accessor = class_access(mixin).is_some_and(|access| access & ACC_INTERFACE != 0);
+            let interfaces = if accessor {
+                vec![mixin.name.clone()]
+            } else {
+                mixin.interface_names()
+            };
+            for interface in interfaces {
+                if !added.contains(&interface) {
+                    added.push(interface);
+                }
+            }
+        }
+        added
+    }
+
+    /// The jar's `@Mixin` classes that name `class` among their targets, from
+    /// the index built once per runtime (`Runtime::mixin_index`).
+    fn mixins_targeting(&self, class: &str) -> &[String] {
+        self.mixin_index
+            .get_or_init(|| {
+                let mut index: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for mixin in self.classes.values() {
+                    for annotation in mixin
+                        .annotations
+                        .iter()
+                        .filter(|annotation| annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR)
+                    {
+                        for owner in mixin_target_owners(annotation) {
+                            let mixins = index.entry(owner).or_default();
+                            if !mixins.contains(&mixin.name) {
+                                mixins.push(mixin.name.clone());
+                            }
+                        }
+                    }
+                }
+                index
+            })
+            .get(class)
+            .map_or(&[], Vec::as_slice)
     }
 }
 
@@ -558,6 +956,10 @@ impl<H: Host> Runtime<'_, H> {
 /// (`host_ref.rs`): the JDK's for a JDK class, the held classes' (and
 /// Mixins') for a jar class, `None` where the chain leaves them.
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
+    fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+        self.host.described_instance_of(key, wanted)
+    }
+
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
         if wanted == "java/lang/Object" || class == wanted {
             return Some(true);
@@ -586,11 +988,15 @@ impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
         }
     }
 
-    /// A held class's own `ACC_INTERFACE`; Java 25's table for a JDK class.
+    /// A held class's own `ACC_INTERFACE`; a class a host kind owns, its class side's answer
+    /// (`host_ref::ClassSide`); Java 25's table for a JDK class.
     fn is_interface(&self, class: &str) -> Option<bool> {
         match self.class(class) {
             Some(file) => class_access(file).map(|access| access & ACC_INTERFACE != 0),
-            None => host_ref::JdkHierarchy.is_interface(class),
+            None => HostKind::owning_class(class)
+                .and_then(HostKind::class_side)
+                .and_then(|side| (side.is_interface)(class))
+                .or_else(|| host_ref::JdkHierarchy.is_interface(class)),
         }
     }
 }

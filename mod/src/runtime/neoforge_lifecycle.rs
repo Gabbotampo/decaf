@@ -28,11 +28,11 @@
 //!
 //! # The event objects
 //!
-//! An event is a marker (`neoforge-lifecycle|<class>|<container>`). The host answers what the
-//! loader's classes answer:
+//! An event is a host handle of its class and container (`host_game_event.rs`). The host answers
+//! what the loader's classes answer:
 //!
 //! * `ModLifecycleEvent#getContainer`: the container the event was built for, the same
-//!   `neoforge-mod-container/<id>/<version>` the `@Mod` constructor received;
+//!   container handle the `@Mod` constructor received (the event's key holds its mod id);
 //! * `ParallelDispatchEvent#enqueueWork(Runnable|Supplier)`: `DeferredWorkQueue#enqueueWork`
 //!   appends the work to the step's queue and answers its `CompletableFuture`. `runTasks` runs the
 //!   queue in enqueue order once every container's event was posted; a task that throws is
@@ -82,7 +82,6 @@ const PROCESS_IMC: &str = "net/neoforged/fml/event/lifecycle/InterModProcessEven
 const LOAD_COMPLETE: &str = "net/neoforged/fml/event/lifecycle/FMLLoadCompleteEvent";
 const PAYLOAD_HANDLERS: &str = "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent";
 const NEOFORGE_CLIENT: &str = "net/neoforged/neoforge/client/";
-const EVENT_MARKER: &str = "neoforge-lifecycle|";
 
 /// One step of NeoForge's loading after the constructors, in the order it runs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,45 +154,10 @@ pub(crate) fn delivered(class: &str, server: bool) -> bool {
     }
 }
 
-/// The event marker of `class`, built for `container` (none for `RegisterPayloadHandlersEvent`).
-fn event_marker(class: &str, container: Option<&str>) -> Value {
-    Value::Ref(Some(format!(
-        "{EVENT_MARKER}{class}|{}",
-        container.unwrap_or_default()
-    )))
-}
-
-/// `(class, container)` of an event marker.
-fn parse_event(marker: &str) -> Option<(&str, &str)> {
-    marker.strip_prefix(EVENT_MARKER)?.split_once('|')
-}
-
-/// `instanceof` on an event marker: its class, every superclass in NeoForge's table, and
-/// `IModBusEvent` (every lifecycle event is one).
-pub(crate) fn instance_of(marker: &str, wanted: &str) -> bool {
-    let Some((class, _)) = parse_event(marker) else {
-        return false;
-    };
-    if wanted == "java/lang/Object" || wanted == "net/neoforged/fml/event/IModBusEvent" {
-        return true;
-    }
-    let mut at = class.to_owned();
-    for _ in 0..16 {
-        if at == wanted {
-            return true;
-        }
-        match crate::runtime::neoforge_bus::table_superclass(&at) {
-            Some(parent) => at = parent,
-            None => return false,
-        }
-    }
-    false
-}
-
 /// One piece of work `enqueueWork` queued.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeferredTask {
-    /// The container that queued it (`TaskInfo.owner`).
+    /// The mod id of the container that queued it (`TaskInfo.owner`).
     pub container: String,
     /// The `Runnable` or `Supplier`.
     pub work: Value,
@@ -209,10 +173,11 @@ impl StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Value> {
-        let (class, container) = parse_event(expect_ref(receiver)?)?;
+        let (class, container) = crate::runtime::host_game_event::lifecycle_parts(receiver)?;
+        let container = container.unwrap_or_default();
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("getContainer", "()Lnet/neoforged/fml/ModContainer;") if !container.is_empty() => {
-                Some(Value::Ref(Some(container.to_owned())))
+                Some(self.neoforge_container(&container))
             }
             (
                 "enqueueWork",
@@ -222,7 +187,7 @@ impl StdHost {
                 let work = args.first()?.clone();
                 let tasks = &mut self.neoforge_bus.deferred;
                 tasks.push(DeferredTask {
-                    container: container.to_owned(),
+                    container,
                     work,
                     supplier: r.descriptor.contains("Supplier"),
                 });
@@ -248,16 +213,6 @@ pub(crate) fn count_unrouted_payloads(host: &mut StdHost, why: &str) {
 }
 
 impl NativeJar {
-    /// The container marker FML hands this jar's container `id` (`entry_constructor_args`).
-    fn container_marker(&self, id: &str) -> String {
-        let version = if self.neoforge_id.as_deref() == Some(id) {
-            self.neoforge_version.as_deref().unwrap_or("unknown")
-        } else {
-            "unknown"
-        };
-        format!("neoforge-mod-container/{id}/{version}")
-    }
-
     /// Posts `stage`'s event to this jar's containers. Answers one line per post a listener ended
     /// by throwing (that container's post stops there, as `EventBus#post` rethrows).
     pub fn run_loading_stage(
@@ -266,13 +221,18 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Vec<String> {
+        // Every `RegisterEvent` fires between construction and common setup: from here on a
+        // holder is bound (`host_registry::Binding`).
+        if stage != LoadingStage::Construct {
+            host.holders_bound();
+        }
         let server = host.environment_type == "SERVER";
         let class = stage.event(server);
         let containers = self.neoforge_container_ids();
         let mut failures = Vec::new();
         if stage == LoadingStage::NetworkSetup {
             // `ModLoader.postEvent`: one event, phase by phase, every container within a phase.
-            let event = event_marker(class, None);
+            let event = crate::runtime::host_game_event::lifecycle_event(class, None);
             for priority in 0..5u8 {
                 for id in &containers {
                     let listeners = self.posted_listeners(host, class, id, Some(priority));
@@ -285,7 +245,7 @@ impl NativeJar {
             return failures;
         }
         for id in &containers {
-            let event = event_marker(class, Some(&self.container_marker(id)));
+            let event = crate::runtime::host_game_event::lifecycle_event(class, Some(id));
             let listeners = self.posted_listeners(host, class, id, None);
             if let Err(failure) = self.post(stage, id, &listeners, &event, host, budget) {
                 failures.push(failure);
@@ -389,11 +349,7 @@ impl NativeJar {
                     .or_default() += 1;
                 continue;
             };
-            let container = task
-                .container
-                .strip_prefix("neoforge-mod-container/")
-                .and_then(|rest| rest.split('/').next())
-                .unwrap_or(&task.container);
+            let container = &task.container;
             // `DeferredWorkQueue.lambda$makeRunnable$0` runs a task with its owner active.
             let previous = crate::runtime::neoforge_imc::set_active(host, Some(container));
             let ran = self.invoke_listener_callback(&callback, Vec::new(), host, budget);
@@ -408,15 +364,16 @@ impl NativeJar {
     /// How a queued `Runnable#run` or `Supplier#get` is reached: a lambda or method reference, or
     /// a jar object's method.
     fn work_callback(&self, task: &DeferredTask) -> Option<ListenerCallback> {
-        let text = expect_ref(&task.work)?;
-        if text.starts_with("@indy:") {
+        if let Some(text) = expect_ref(&task.work)
+            && text.starts_with("@indy:")
+        {
             let marker = crate::runtime::parse_callback_marker(text).ok()?;
             return Some(ListenerCallback::Indy {
                 target: marker.target,
                 captures: marker.captures,
             });
         }
-        let (class, _) = text.split_once('#')?;
+        let class = crate::runtime::jar_object::object_class(&task.work)?;
         let (name, descriptor) = if task.supplier {
             ("get", "()Ljava/lang/Object;")
         } else {

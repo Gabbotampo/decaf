@@ -18,7 +18,10 @@ impl<H: Host> Runtime<'_, H> {
                 "net/minecraft/util/StringRepresentable",
                 "fromEnum",
                 "(Ljava/util/function/Supplier;)Lnet/minecraft/util/StringRepresentable$EnumCodec;",
-            ) => Some(Value::Ref(Some("string-representable-codec".into()))),
+                // `fromEnumWithMapping` builds `new EnumCodec<>(..)`: an object
+                // of that class, one per call (it was text a cast read as a
+                // `String`, #236's re-check).
+            ) => Some(self.new_object("net/minecraft/util/StringRepresentable$EnumCodec")),
             _ => None,
         }
     }

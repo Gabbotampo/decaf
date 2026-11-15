@@ -40,11 +40,11 @@
 
 use crate::runtime::{
     Host, MethodRef, NativeError, Runtime, Value, is_collection_owner, is_map_owner,
-    parse_collection_value, runtime_collection_values,
+    runtime_collection_values,
 };
 
 /// `java/util/function/Consumer.accept`.
-const ACCEPT_OBJECT: (&str, &str, &str) = (
+pub(crate) const ACCEPT_OBJECT: (&str, &str, &str) = (
     "java/util/function/Consumer",
     "accept",
     "(Ljava/lang/Object;)V",
@@ -86,6 +86,8 @@ impl<H: Host> Runtime<'_, H> {
         let map = is_map_owner(&r.owner);
         let receiver = match receiver {
             Some(receiver @ Value::Ref(Some(_))) => receiver,
+            // A collection a jar `new`ed (`jar_object.rs`).
+            Some(receiver) if crate::runtime::jar_object::is_object(receiver) => receiver,
             _ => return Ok(None),
         };
         let values = match runtime_collection_values(self.host, receiver) {
@@ -147,7 +149,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(it) = receiver else {
             return Ok(None);
         };
-        let Some(marker) = crate::runtime::expect_ref(it).cloned() else {
+        let Some(marker) = crate::runtime::host_iterator::marker(it).cloned() else {
             return Ok(None);
         };
         let Some((start, len, source)) = self.host.host_iterator(&marker) else {
@@ -263,11 +265,8 @@ impl<H: Host> Runtime<'_, H> {
 }
 
 /// The host's collection values, each parsed back into a `Value`.
-fn owned_values(values: &[String]) -> Result<Vec<Value>, NativeError> {
-    values
-        .iter()
-        .map(|value| parse_collection_value(value))
-        .collect()
+fn owned_values(values: &[Value]) -> Result<Vec<Value>, NativeError> {
+    Ok(values.to_vec())
 }
 
 /// Where a JDK iterator's `forEachRemaining` leaves its cursor when the

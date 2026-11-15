@@ -59,8 +59,10 @@ pub(crate) const ITEM: &str = "game/item/";
 const STACK_DESCRIPTOR: &str = "()Lnet/minecraft/world/item/ItemStack;";
 const HAND_ENUM: &str = "enum/net/minecraft/world/InteractionHand/";
 
+/// A façade value: a `game/…` marker's handle (`game_object.rs`, #156
+/// P16b); `block-pos/` text until P16c.
 fn marker(text: String) -> Value {
-    Value::Ref(Some(text))
+    crate::runtime::game_object::server_value(text)
 }
 
 fn refuse(r: &MethodRef) -> Result<Value, NativeError> {
@@ -77,7 +79,9 @@ pub(crate) fn border_marker(dimension: &str) -> Value {
 fn identity(text: &str, r: &MethodRef, args: &[Value]) -> Option<Value> {
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("equals", "(Ljava/lang/Object;)Z") => Some(Value::Int(i32::from(
-            args.first().and_then(expect_ref).is_some_and(|o| o == text),
+            args.first()
+                .and_then(crate::runtime::game_object::text)
+                .is_some_and(|o| o == text),
         ))),
         ("hashCode", "()I") => Some(Value::Int(stable_hash(text))),
         _ => None,
@@ -123,7 +127,7 @@ pub(crate) fn border_answer(
         // `isWithinBounds(pos.getX(), pos.getZ())`, the ints widened.
         ("isWithinBounds", "(Lnet/minecraft/core/BlockPos;)Z") => args
             .first()
-            .and_then(expect_ref)
+            .and_then(crate::runtime::game_object::text)
             .and_then(|text| text.strip_prefix("block-pos/"))
             .and_then(|coords| {
                 let mut parts = coords.split(',').map(|part| part.parse::<i32>().ok());
@@ -287,7 +291,7 @@ mod tests {
             ),
             Some(Value::Int(1))
         );
-        let pos = Value::Ref(Some("block-pos/31,64,11".into()));
+        let pos = crate::runtime::game_object::value("block-pos/31,64,11").unwrap();
         assert_eq!(
             border(
                 bounds,
@@ -366,7 +370,8 @@ mod tests {
             Arc::new(facade),
             context,
         )));
-        let player = |uuid: u128| Value::Ref(Some(format!("game/player/{uuid:032x}")));
+        let player =
+            |uuid: u128| crate::runtime::game_object::server_value(format!("game/player/{uuid:032x}"));
         let hand = |name: &str| Value::Ref(Some(format!("{HAND_ENUM}{name}")));
         let player_class = "net/minecraft/world/entity/player/Player";
         let in_hand = call(
@@ -414,7 +419,7 @@ mod tests {
         // Another player's hands were not read for this firing.
         assert!(ask(&player(0xb0b), &in_hand, &[hand("MAIN_HAND")]).is_err());
         // The level's border is the one the game gave.
-        let level = Value::Ref(Some("game/level/minecraft:overworld".into()));
+        let level = crate::runtime::game_object::server_value("game/level/minecraft:overworld".into());
         let get_border = call(
             "net/minecraft/server/level/ServerLevel",
             "getWorldBorder",

@@ -112,14 +112,21 @@ impl<H: Host> Runtime<'_, H> {
             .host
             .view_copy_source(marker)
             .or_else(|| self.host.unmodifiable_view_source(marker))
-            .map_or_else(|| value.clone(), |source| Value::Ref(Some(source)));
+            .map_or_else(
+                || value.clone(),
+                |source| crate::jar_object::stored_value(&source),
+            );
         let class = self.host_collection_class(&source)?;
         Some((source, fail_fast(&class)?))
     }
 
     /// A collection's structure: its elements in order, or a map's keys.
     fn structure_of(&self, source: &Value, how: FailFast) -> Result<Vec<String>, NativeError> {
-        let items = runtime_collection_values(self.host, source)?;
+        // Compared as their encoded items (#156 P14b keeps `Value`s here).
+        let items: Vec<String> = runtime_collection_values(self.host, source)?
+            .iter()
+            .map(collection_item_marker)
+            .collect();
         Ok(match how {
             FailFast::MapKeys => items.into_iter().step_by(2).collect(),
             FailFast::SetElements => {
@@ -182,7 +189,11 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb9)) else {
             return Ok(None);
         };
-        let Some(marker) = expect_ref(receiver).cloned() else {
+        // A collection by its key, or an iterator handle by its table key (`host_iterator.rs`).
+        let Some(marker) = expect_ref(receiver)
+            .or_else(|| crate::host_iterator::marker(receiver))
+            .cloned()
+        else {
             return Ok(None);
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
@@ -201,7 +212,7 @@ impl<H: Host> Runtime<'_, H> {
                     .flatten()
                     .map(|layout| (layout.head(), structure.len()));
                 let iterator = self.host.invoke_instance(r, receiver, args)?;
-                if let Some(iterator) = expect_ref(&iterator) {
+                if let Some(iterator) = crate::host_iterator::marker(&iterator) {
                     self.host.store_iterator_guard(
                         iterator,
                         IteratorGuard {
@@ -234,7 +245,7 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(cursor) = self.host.iterator_cursor(&marker) else {
                     return Ok(None);
                 };
-                let source = Value::Ref(Some(guard.source.clone()));
+                let source = crate::jar_object::stored_value(&guard.source);
                 let size = runtime_collection_values(self.host, &source)?.len();
                 let more = if not_equal {
                     cursor != size
@@ -250,7 +261,7 @@ impl<H: Host> Runtime<'_, H> {
                 if guard.deque_cursor.is_some() {
                     return self.deque_next(r, &marker, guard).map(Some);
                 }
-                let source = Value::Ref(Some(guard.source.clone()));
+                let source = crate::jar_object::stored_value(&guard.source);
                 let how = match guard.cursor {
                     Some(true) => FailFast::ArrayList,
                     Some(false) => FailFast::Cursor,
@@ -528,13 +539,13 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             });
         }
-        let source = Value::Ref(Some(guard.source.clone()));
+        let source = crate::jar_object::stored_value(&guard.source);
         let Some(layout) = self.host.deque_layout(&guard.source) else {
             // The layout is no longer known: the host's snapshot, counted.
             self.host.unknown_operand_call(r)?;
             return self
                 .host
-                .invoke_instance(r, &Value::Ref(Some(marker.to_owned())), &[]);
+                .invoke_instance(r, &crate::jar_object::stored_value(marker), &[]);
         };
         let live = self.collection_elements(&source)?;
         let element = layout.slot(cursor, &live);
@@ -559,13 +570,13 @@ impl<H: Host> Runtime<'_, H> {
         iterator: &Value,
         action: &Value,
     ) -> Result<Option<Value>, NativeError> {
-        let Some(marker) = expect_ref(iterator).cloned() else {
+        let Some(marker) = crate::host_iterator::marker(iterator).cloned() else {
             return Ok(None);
         };
         let Some(mut guard) = self.host.iterator_guard(&marker) else {
             return Ok(None);
         };
-        let source = Value::Ref(Some(guard.source.clone()));
+        let source = crate::jar_object::stored_value(&guard.source);
         let class = self.host_collection_class(&source).unwrap_or_default();
         const ACCEPT: (&str, &str, &str) = (
             "java/util/function/Consumer",

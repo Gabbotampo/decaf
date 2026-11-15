@@ -242,12 +242,9 @@ fn class_get_name(descriptor: &str) -> String {
 
 /// The class of an object `new` made of a JDK class `jdk_supertypes` lists
 /// (`java/util/ArrayList#3`).
-fn jdk_object_class(marker: &str) -> Option<&str> {
-    let (class, number) = marker.split_once('#')?;
-    (!number.is_empty()
-        && number.bytes().all(|byte| byte.is_ascii_digit())
-        && jdk_supertypes::is_listed(class))
-    .then_some(class)
+fn jdk_object_class(value: &Value) -> Option<&str> {
+    let class = crate::runtime::jar_object::object_class(value)?;
+    jdk_supertypes::is_listed(class).then_some(class)
 }
 
 fn thrown(class: &str, message: String) -> NativeError {
@@ -744,15 +741,15 @@ impl<H: Host> Runtime<'_, H> {
         if field_class == "java/lang/Object" {
             return Some(true);
         }
-        if let Some(marker) = expect_ref(value) {
-            // `String` is final: a string is an instance of its own
-            // supertypes and nothing else.
-            if value_class::is_plain_string(marker) {
-                return Some(value_class::string_instance_of(marker, field_class));
-            }
-            if let Some(class) = jdk_object_class(marker) {
-                return jdk_supertypes::jdk_instance_of(class, field_class);
-            }
+        // `String` is final: a string is an instance of its own supertypes
+        // and nothing else.
+        if let Value::Ref(Some(marker)) = value
+            && value_class::is_plain_string(marker)
+        {
+            return Some(value_class::string_instance_of(marker, field_class));
+        }
+        if let Some(class) = jdk_object_class(value) {
+            return jdk_supertypes::jdk_instance_of(class, field_class);
         }
         if let Some((of, _)) = unbox(value) {
             return box_assignable(field_class, of.box_class())
@@ -780,11 +777,15 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(class) = self.known_object_class(value) {
             return Some(class.replace('/', "."));
         }
-        let marker = expect_ref(value)?;
-        if let Some(class) = jdk_object_class(marker) {
+        if let Some(class) = jdk_object_class(value) {
             return Some(class.replace('/', "."));
         }
-        value_class::is_plain_string(marker).then(|| "java.lang.String".to_owned())
+        match value {
+            Value::Ref(Some(marker)) if value_class::is_plain_string(marker) => {
+                Some("java.lang.String".to_owned())
+            }
+            _ => None,
+        }
     }
 
     /// The accessor's receiver check: none for a static field; otherwise an
@@ -809,12 +810,23 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.constant_value_of(field)?,
             }
         } else {
-            let Some(object) = expect_ref(object) else {
+            let Some(key) = crate::runtime::jar_object::instance_key(object) else {
                 return Ok(None);
             };
-            self.fields
-                .get(&format!("{object}|{}", field.static_key()))
-                .cloned()
+            let held = self
+                .fields
+                .get(&format!("{key}|{}", field.static_key()))
+                .cloned();
+            if held.is_none()
+                && let Some(collected) = crate::runtime::jar_object::object_key(object)
+                && self.host.object_collected(collected)
+            {
+                return Err(NativeError::Metadata(format!(
+                    "the jar's object {collected} was collected while still reachable (a missed heap root); field {}",
+                    field.static_key()
+                )));
+            }
+            held
         };
         let value = held.unwrap_or_else(|| Value::default_for(field.descriptor));
         Ok(match Prim::of_descriptor(field.descriptor) {
@@ -832,7 +844,7 @@ impl<H: Host> Runtime<'_, H> {
     fn store(&mut self, field: &Target<'_>, object: &Value, value: Value) {
         if field.is_static() {
             self.static_fields.insert(field.static_key(), value);
-        } else if let Some(object) = expect_ref(object) {
+        } else if let Some(object) = crate::runtime::jar_object::instance_key(object) {
             self.fields
                 .insert(format!("{object}|{}", field.static_key()), value);
         }
