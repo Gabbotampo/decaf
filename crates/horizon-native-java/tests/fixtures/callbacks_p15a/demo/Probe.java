@@ -44,6 +44,32 @@ public final class Probe {
         out.append("nulls=").append(t(() -> p.and(null))).append(',').append(t(() -> p.or(null))).append(',')
             .append(t(() -> c.andThen(null))).append(',').append(t(() -> f.compose(null))).append(',')
             .append(t(() -> f.andThen(null))).append('\n');
+        // Composites run their sides in the combinator's order (#258), `and`/`or`
+        // short-circuiting, through left-nested chains and a captured `|`.
+        Predicate<Integer> yes = i -> true;
+        Predicate<Integer> no = i -> false;
+        java.util.List<String> log = new java.util.ArrayList<>();
+        Predicate<Integer> loud = i -> log.add("q" + i);
+        Consumer<Integer> c1 = i -> log.add("a" + i);
+        Consumer<Integer> c2 = i -> log.add("b" + i);
+        Consumer<Integer> c3 = i -> log.add("c" + i);
+        String bar = "x|y";
+        Predicate<String> has = s -> s.contains(bar);
+        Function<String, String> f1 = s -> s + bar;
+        Function<String, String> f2 = s -> "[" + s + "]";
+        BiConsumer<String, String> b1 = (x, y) -> log.add(x + y);
+        BiFunction<String, String, String> join = (x, y) -> x + y;
+        out.append("composed=").append(yes.and(no).test(1)).append(',').append(no.negate().test(1))
+            .append(',').append(no.or(yes).test(1)).append(',').append(yes.and(yes).and(no.negate()).test(1))
+            .append(',').append(no.and(loud).test(2)).append(',').append(yes.or(loud).test(3))
+            .append(',').append(no.or(loud).test(4)).append(',').append(has.and(has.negate()).test("x|y"))
+            .append(',').append(has.or(has).test("x|y")).append('\n');
+        c1.andThen(c2).andThen(c3).accept(1);
+        c1.andThen(c2.andThen(c3)).accept(2);
+        b1.andThen(b1).accept("p", "q");
+        out.append("chains=").append(log).append(',').append(f1.andThen(f2).andThen(f2).apply("a"))
+            .append(',').append(f2.compose(f1).compose(f2).apply("z")).append(',')
+            .append(join.andThen(f2).andThen(f1).apply("m", "n")).append('\n');
         return out.toString();
     }
 

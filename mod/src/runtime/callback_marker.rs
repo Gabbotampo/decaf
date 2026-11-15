@@ -170,6 +170,27 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     }
 }
 
+/// The text of a two-sided combinator's result (`p.and(q)`, `c.andThen(d)`,
+/// `f.compose(g)`): `@fn:<op>:<n>:<left><right>`, `n` the byte length of
+/// `left`. The length makes a side that is itself a composite, or holds a
+/// `|`, read back whole: the old `left|right` form cut
+/// `c1.andThen(c2).andThen(c3)` at the inner composite's bar, so the chain
+/// ran nothing (#258). P15c holds the sides by reference instead.
+pub(crate) fn composite(op: &str, left: &str, right: &str) -> String {
+    format!("@fn:{op}:{}:{left}{right}", left.len())
+}
+
+/// The two sides of a [`composite`] whose combinator is `op`.
+pub(crate) fn composite_sides<'a>(text: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let rest = text
+        .strip_prefix("@fn:")?
+        .strip_prefix(op)?
+        .strip_prefix(':')?;
+    let (length, sides) = rest.split_once(':')?;
+    let length: usize = length.parse().ok()?;
+    Some((sides.get(..length)?, sides.get(length..)?))
+}
+
 /// A live callback token naming `name` and nothing a call could run, for
 /// tests that hand a host a listener without a jar behind it.
 #[doc(hidden)]
@@ -199,5 +220,21 @@ mod tests {
         let forged = live.replacen(tag(), "x", 1);
         assert!(!is_callback(&forged) && parse(&forged).is_err());
         assert!(!is_callback("@indy:demo/Mod#init:4:demo/Mod#lambda$0()V:"));
+    }
+
+    #[test]
+    fn a_nested_composite_reads_back_whole() {
+        let inner = composite("consumer.then", "a|1", "b");
+        let outer = composite("consumer.then", &inner, "c");
+        assert_eq!(
+            composite_sides(&outer, "consumer.then"),
+            Some((inner.as_str(), "c"))
+        );
+        assert_eq!(composite_sides(&inner, "consumer.then"), Some(("a|1", "b")));
+        assert_eq!(composite_sides(&outer, "function.then"), None);
+        assert_eq!(
+            composite_sides("@fn:consumer.then:9:ab", "consumer.then"),
+            None
+        );
     }
 }

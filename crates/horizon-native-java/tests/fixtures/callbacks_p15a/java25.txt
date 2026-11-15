@@ -1,3 +1,5 @@
 forged=false,java.lang.ClassCastException:class java.lang.String cannot be cast to class java.lang.Runnable (java.lang.String and java.lang.Runnable are in module java.base of loader 'bootstrap'),false,@indy:demo/Probe#exact:0:java/lang/Runnable:demo/Probe#evil()V:,java.lang.String
 instanceof=true,false,false,true,false,true,false
 nulls=java.lang.NullPointerException:null,java.lang.NullPointerException:null,java.lang.NullPointerException:null,java.lang.NullPointerException:null,java.lang.NullPointerException:null
+composed=false,true,true,true,false,true,true,false,true
+chains=[q4, a1, b1, c1, a2, b2, c2, pq, pq],[[ax|y]],[[z]x|y],[mn]x|y

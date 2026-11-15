@@ -9660,8 +9660,8 @@ impl Host for StdHost {
             // `test` true for any lambda, `get` null, uncounted).
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
                 if let Some(marker) = receiver_marker.as_deref()
-                    && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
-                    && let Some((left, right)) = rest.split_once('|') =>
+                    && let Some((left, right)) =
+                        callback_marker::composite_sides(marker, "consumer.then") =>
             {
                 self.invoke_instance(r, &composed_callback(left), args)?;
                 self.invoke_instance(r, &composed_callback(right), args)?;
@@ -19636,17 +19636,19 @@ fn functional_composition_marker(
             "java/util/function/Predicate",
             "and",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:predicate.and:{receiver_marker}|{}",
-            other().unwrap_or("@fn:predicate.false")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "predicate.and",
+            receiver_marker,
+            other().unwrap_or("@fn:predicate.false"),
         )))),
         (
             "java/util/function/Predicate",
             "or",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:predicate.or:{receiver_marker}|{}",
-            other().unwrap_or("@fn:predicate.false")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "predicate.or",
+            receiver_marker,
+            other().unwrap_or("@fn:predicate.false"),
         )))),
         ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => Some(
             Value::Ref(Some(format!("@fn:predicate.not:{receiver_marker}"))),
@@ -19655,25 +19657,28 @@ fn functional_composition_marker(
             "java/util/function/Consumer",
             "andThen",
             "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:consumer.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:consumer.empty")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "consumer.then",
+            receiver_marker,
+            other().unwrap_or("@fn:consumer.empty"),
         )))),
         (
             "java/util/function/Function",
             "compose",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.compose:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "function.compose",
+            receiver_marker,
+            other().unwrap_or("@fn:function.empty"),
         )))),
         (
             "java/util/function/Function",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "function.then",
+            receiver_marker,
+            other().unwrap_or("@fn:function.empty"),
         )))),
         // The two-argument forms compose the same way: running the composite
         // hands both arguments to each consumer, and a `BiFunction`'s result to
@@ -19683,17 +19688,19 @@ fn functional_composition_marker(
             "java/util/function/BiConsumer",
             "andThen",
             "(Ljava/util/function/BiConsumer;)Ljava/util/function/BiConsumer;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:consumer.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:consumer.empty")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "consumer.then",
+            receiver_marker,
+            other().unwrap_or("@fn:consumer.empty"),
         )))),
         (
             "java/util/function/BiFunction",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/BiFunction;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
+        ) => Some(Value::Ref(Some(crate::runtime::callback_marker::composite(
+            "function.then",
+            receiver_marker,
+            other().unwrap_or("@fn:function.empty"),
         )))),
         _ => None,
     }?;
@@ -21054,6 +21061,111 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Run a combinator's composite (`callback_marker::composite`) the way
+    /// its JDK default method does: both sides in the combinator's order,
+    /// `and`/`or` short-circuiting, `negate` flipping (#258: predicates were
+    /// never run here, and a left-nested chain was cut at the wrong bar).
+    /// `None` when `marker` is no composite.
+    fn run_composite(
+        &mut self,
+        marker: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        use callback_marker::composite_sides;
+        let sam = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let test = || {
+            sam(
+                "java/util/function/Predicate",
+                "test",
+                "(Ljava/lang/Object;)Z",
+            )
+        };
+        let apply = || {
+            sam(
+                "java/util/function/Function",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+        };
+        // `BiConsumer.andThen` and `BiFunction.andThen` hand both arguments
+        // to the first side.
+        let (accept, first_apply) = if args.len() == 2 {
+            (
+                sam(
+                    "java/util/function/BiConsumer",
+                    "accept",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                ),
+                sam(
+                    "java/util/function/BiFunction",
+                    "apply",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                ),
+            )
+        } else {
+            (
+                sam(
+                    "java/util/function/Consumer",
+                    "accept",
+                    "(Ljava/lang/Object;)V",
+                ),
+                apply(),
+            )
+        };
+        if let Some((left, right)) = composite_sides(marker, "consumer.then") {
+            self.run_composite_side(left, &accept, args)?;
+            self.run_composite_side(right, &accept, args)?;
+            return Ok(Some(Value::Void));
+        }
+        if let Some((left, right)) = composite_sides(marker, "function.then") {
+            let value = self.run_composite_side(left, &first_apply, args)?;
+            return self.run_composite_side(right, &apply(), &[value]).map(Some);
+        }
+        if let Some((left, right)) = composite_sides(marker, "function.compose") {
+            // `f.compose(g)` applies `g` first, then `f`.
+            let value = self.run_composite_side(right, &apply(), args)?;
+            return self.run_composite_side(left, &apply(), &[value]).map(Some);
+        }
+        let truth = |value: &Value| matches!(value, Value::Int(flag) if *flag != 0);
+        for (op, short_circuit) in [("predicate.and", false), ("predicate.or", true)] {
+            if let Some((left, right)) = composite_sides(marker, op) {
+                let first = truth(&self.run_composite_side(left, &test(), args)?);
+                let answer = if first == short_circuit {
+                    first
+                } else {
+                    truth(&self.run_composite_side(right, &test(), args)?)
+                };
+                return Ok(Some(Value::Int(i32::from(answer))));
+            }
+        }
+        if let Some(inner) = marker.strip_prefix("@fn:predicate.not:") {
+            let inner = truth(&self.run_composite_side(inner, &test(), args)?);
+            return Ok(Some(Value::Int(i32::from(!inner))));
+        }
+        Ok(None)
+    }
+
+    /// One side of a composite run as `sam` (`Predicate.test`...): its own
+    /// body, or, where the runtime cannot run it, the host's call, which
+    /// counts it. A side is never skipped or answered `null` silently.
+    fn run_composite_side(
+        &mut self,
+        side: &str,
+        sam: &MethodRef,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        // A side may be a host handle's encoded form (`callback_text`).
+        let side = composed_callback(side);
+        match self.invoke_callback(&side, args)? {
+            Some(value) => box_callback_result(self, &side, value, &sam.descriptor),
+            None => self.host.invoke_instance(sam, &side, args),
+        }
+    }
+
     fn invoke_callback(
         &mut self,
         marker: &Value,
@@ -21067,39 +21179,17 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(marker) else {
             return Ok(None);
         };
-        // A composition marker closes over the two callbacks it joined. Running
-        // it means running both, in the order the combinator defines — not
-        // answering the marker itself.
         // `Function.identity()` / `UnaryOperator.identity()` (`string_code_points.rs`).
         if marker == string_code_points::FUNCTION_IDENTITY
             || marker == string_code_points::UNARY_IDENTITY
         {
             return Ok(Some(args.first().cloned().unwrap_or(Value::Ref(None))));
         }
-        if let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            // A side may be a host handle's encoded form (`callback_text`).
-            self.invoke_callback(&composed_callback(left), args)?;
-            self.invoke_callback(&composed_callback(right), args)?;
-            return Ok(Some(Value::Void));
-        }
-        if let Some(rest) = marker.strip_prefix("@fn:function.then:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            let value = self
-                .invoke_callback(&Value::Ref(Some(left.to_owned())), args)?
-                .unwrap_or(Value::Ref(None));
-            return self.invoke_callback(&Value::Ref(Some(right.to_owned())), &[value]);
-        }
-        if let Some(rest) = marker.strip_prefix("@fn:function.compose:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            // `f.compose(g)` applies `g` first, then `f`.
-            let value = self
-                .invoke_callback(&Value::Ref(Some(right.to_owned())), args)?
-                .unwrap_or(Value::Ref(None));
-            return self.invoke_callback(&Value::Ref(Some(left.to_owned())), &[value]);
+        // A composition marker closes over the callbacks it joined. Running
+        // it means running them, in the order the combinator defines — not
+        // answering the marker itself.
+        if let Some(value) = self.run_composite(marker, args)? {
+            return Ok(Some(value));
         }
         let Ok(callback) = parse_callback_marker(marker) else {
             return Ok(None);

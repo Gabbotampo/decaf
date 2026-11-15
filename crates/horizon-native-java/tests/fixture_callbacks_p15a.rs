@@ -7,6 +7,9 @@
 //! * a lambda is an instance of its call site's functional interface and that
 //!   interface's supertypes only (a JDK one's, a jar one's);
 //! * every combinator refuses a `null` operand (`Objects.requireNonNull`);
+//! * a composite runs its sides in its combinator's order (#258): `and`/`or`
+//!   short-circuit, `negate` flips, a left-nested `andThen` chain runs every
+//!   link, and a side capturing a `|` reads back whole;
 //! * a lambda's `toString` (its hidden class) and a failing cast's message are
 //!   counted, and its text is never printed;
 //! * the host counts a functional interface's method on a callback it holds,
