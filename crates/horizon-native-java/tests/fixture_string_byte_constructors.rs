@@ -28,11 +28,15 @@ fn byte_constructors_decode_like_jdk_25() {
     );
     assert_eq!(
         fixture.text_on(&mut host, "malformed"),
-        "+65533|+65533+65533+65533|+65533A|+65533+65533(+65533"
+        "+65533|+65533+65533+65533|+65533A|+65533+65533(+65533|+65533+65533+65533+65533"
     );
     assert_eq!(
         fixture.text_on(&mut host, "unknownName"),
         "UnsupportedEncodingException:default"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "differential"),
+        "220000|8940964167532627793"
     );
     assert_eq!(
         host.unknown_host_call_count(),

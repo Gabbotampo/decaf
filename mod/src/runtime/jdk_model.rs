@@ -49,19 +49,59 @@ fn charset_value(canonical: &str) -> Value {
 /// aliases.
 pub(crate) fn canonical_charset(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
-    Some(match lower.as_str() {
-        "utf-8" | "utf8" | "unicode-1-1-utf-8" => "UTF-8",
-        // Not `default`: JDK 25's `Charset.forName("default")` throws
-        // `UnsupportedCharsetException`, as `new String(bytes, "default")`
-        // throws `UnsupportedEncodingException`.
-        "us-ascii" | "ascii" | "iso646-us" | "us" | "ascii7" | "646" => "US-ASCII",
-        "iso-8859-1" | "iso8859_1" | "iso8859-1" | "latin1" | "l1" | "iso_8859-1" | "cp819" => {
-            "ISO-8859-1"
-        }
-        "utf-16" | "utf16" | "utf_16" => "UTF-16",
-        "utf-16be" | "utf_16be" | "x-utf-16be" => "UTF-16BE",
-        "utf-16le" | "utf_16le" | "x-utf-16le" => "UTF-16LE",
-        _ => return None,
+    // Generated from Charset.forName(...).aliases() plus canonical names on
+    // Temurin 25.0.5+8; matching is the JDK's case-insensitive lookup.
+    const UTF8: &[&str] = &["unicode-1-1-utf-8", "utf-8", "utf8"];
+    const ASCII: &[&str] = &[
+        "646",
+        "ansi_x3.4-1968",
+        "ansi_x3.4-1986",
+        "ascii",
+        "ascii7",
+        "cp367",
+        "csascii",
+        "ibm367",
+        "iso-ir-6",
+        "iso646-us",
+        "iso_646.irv:1983",
+        "iso_646.irv:1991",
+        "us",
+        "us-ascii",
+    ];
+    const UTF16: &[&str] = &["utf-16", "utf16", "utf_16"];
+    const UTF16BE: &[&str] = &["utf-16be", "utf_16be", "x-utf-16be"];
+    const UTF16LE: &[&str] = &["utf-16le", "utf_16le", "x-utf-16le"];
+    const LATIN1: &[&str] = &[
+        "819",
+        "8859_1",
+        "cp819",
+        "csisolatin1",
+        "ibm-819",
+        "ibm819",
+        "iso-8859-1",
+        "iso-ir-100",
+        "iso8859-1",
+        "iso8859_1",
+        "iso_8859-1",
+        "iso_8859-1:1987",
+        "iso_8859_1",
+        "l1",
+        "latin1",
+    ];
+    Some(if UTF8.contains(&lower.as_str()) {
+        "UTF-8"
+    } else if ASCII.contains(&lower.as_str()) {
+        "US-ASCII"
+    } else if LATIN1.contains(&lower.as_str()) {
+        "ISO-8859-1"
+    } else if UTF16.contains(&lower.as_str()) {
+        "UTF-16"
+    } else if UTF16BE.contains(&lower.as_str()) {
+        "UTF-16BE"
+    } else if UTF16LE.contains(&lower.as_str()) {
+        "UTF-16LE"
+    } else {
+        return None;
     })
 }
 
@@ -1486,6 +1526,69 @@ mod tests {
                 ),
                 "{unknown}"
             );
+        }
+    }
+
+    #[test]
+    fn every_java25_standard_charset_alias_resolves() {
+        let for_name = method(
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        );
+        for (canonical, aliases) in [
+            ("UTF-8", ["unicode-1-1-utf-8", "utf-8", "utf8"].as_slice()),
+            (
+                "US-ASCII",
+                [
+                    "646",
+                    "ansi_x3.4-1968",
+                    "ansi_x3.4-1986",
+                    "ascii",
+                    "ascii7",
+                    "cp367",
+                    "csascii",
+                    "ibm367",
+                    "iso-ir-6",
+                    "iso646-us",
+                    "iso_646.irv:1983",
+                    "iso_646.irv:1991",
+                    "us",
+                    "us-ascii",
+                ]
+                .as_slice(),
+            ),
+            (
+                "ISO-8859-1",
+                [
+                    "819",
+                    "8859_1",
+                    "cp819",
+                    "csisolatin1",
+                    "ibm-819",
+                    "ibm819",
+                    "iso-8859-1",
+                    "iso-ir-100",
+                    "iso8859-1",
+                    "iso8859_1",
+                    "iso_8859-1",
+                    "iso_8859-1:1987",
+                    "iso_8859_1",
+                    "l1",
+                    "latin1",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for alias in aliases {
+                let value = static_call(&for_name, &[text(alias)]).unwrap().unwrap();
+                let name = method("java/nio/charset/Charset", "name", "()Ljava/lang/String;");
+                assert_eq!(
+                    instance_call(&name, &value, &[]).unwrap().unwrap(),
+                    text(canonical),
+                    "{alias}"
+                );
+            }
         }
     }
 
