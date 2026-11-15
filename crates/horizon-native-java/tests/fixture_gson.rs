@@ -104,9 +104,18 @@ public final class Probe {
 
     public static final class ArmorConfig {}
 
+    public static final class StaticOnlyConfig {
+        public static int value = 7;
+    }
+
     public static String armorConfig() {
         Gson gson = new GsonBuilder().create();
         return scalar(gson.fromJson(new StringReader("{}"), ArmorConfig.class));
+    }
+
+    public static String staticOnlyConfig() {
+        Gson gson = new GsonBuilder().create();
+        return scalar(gson.fromJson(new StringReader("{}"), StaticOnlyConfig.class));
     }
 
     public static String roundTrip() {
@@ -437,15 +446,15 @@ fn gson_numeric_edge_cases_match_java25() {
         );
         assert_eq!(
             call(mode, "NaN"),
-            "D:NaN:7ff8000000000000|NaN|NaN:7ff8000000000000|NaN:7fc00000"
+            "NaN|NaN|NaN:7ff8000000000000|NaN:7fc00000"
         );
         assert_eq!(
             call(mode, "Infinity"),
-            "D:Infinity:7ff0000000000000|Infinity|Infinity:7ff0000000000000|Infinity:7f800000"
+            "Infinity|Infinity|Infinity:7ff0000000000000|Infinity:7f800000"
         );
         assert_eq!(
             call(mode, "-Infinity"),
-            "D:-Infinity:fff0000000000000|-Infinity|-Infinity:fff0000000000000|-Infinity:ff800000"
+            "-Infinity|-Infinity|-Infinity:fff0000000000000|-Infinity:ff800000"
         );
     }
     assert_eq!(
@@ -464,6 +473,21 @@ fn unsupported_jar_class_from_reader_is_counted() {
     let mut host = StdHost::new();
     let value = fixture
         .call_with_host("armorConfig", "()Ljava/lang/String;", &[], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("null".into())));
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson"))
+    );
+}
+
+#[test]
+fn static_only_jar_class_from_reader_is_counted() {
+    let fixture = Fixture::build("static-only-jar-class");
+    let mut host = StdHost::new();
+    let value = fixture
+        .call_with_host("staticOnlyConfig", "()Ljava/lang/String;", &[], &mut host)
         .unwrap();
     assert_eq!(value, Value::Ref(Some("null".into())));
     assert!(

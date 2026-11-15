@@ -308,6 +308,13 @@ impl<H: Host> Runtime<'_, H> {
             Tree::Null => Some(Value::Ref(None)),
             Tree::Str(text) => Some(Value::Ref(Some(text.clone()))),
             Tree::Bool(flag) => Some(Value::Boxed(Boxed::Boolean(*flag))),
+            // Gson's ObjectTypeAdapter reads lenient unquoted NaN/Infinity
+            // through JsonReader.nextString(), so these special tokens remain
+            // Strings for Object. Ordinary JSON numbers, including overflow,
+            // use the default Double policy.
+            Tree::Num(text) if matches!(text.as_str(), "NaN" | "Infinity" | "-Infinity") => {
+                Some(Value::Ref(Some(text.clone())))
+            }
             Tree::Num(text) => json_double(text).map(Value::Float),
             Tree::Array(elements) => {
                 let mut values = Vec::with_capacity(elements.len());
@@ -501,7 +508,14 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         let fields = self.gson_fields(class);
-        if fields.is_empty() {
+        // Gson's reflective adapter has no useful instance target when the
+        // class contains only static, synthetic, or otherwise excluded
+        // fields. Keep this counted rather than materializing an empty jar
+        // object (the mc-armor-hud config shape).
+        if !fields
+            .iter()
+            .any(|(_, _, _, access)| access & 0x0008 == 0 && style.includes_field(*access))
+        {
             return Ok(None);
         }
         self.ensure_initialized(class)?;
