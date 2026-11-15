@@ -240,6 +240,10 @@ pub(crate) fn guava_superclass(class: &str) -> Option<&'static str> {
             "com/google/common/collect/ImmutableCollection"
         }
         "com/google/common/collect/ImmutableCollection" => "java/util/AbstractCollection",
+        // The game's `NonNullList<E> extends AbstractList<E>` with no
+        // interfaces of its own (26.3 `javap`), the inventory list's class
+        // (#253 re-check).
+        crate::client_surface::NON_NULL_LIST => "java/util/AbstractList",
         _ => return None,
     })
 }

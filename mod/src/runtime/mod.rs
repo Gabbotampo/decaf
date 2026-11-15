@@ -7503,10 +7503,12 @@ impl Host for StdHost {
         {
             // The game's `NonNullList` (an inventory's list): its own rules
             // (no `null`, a fixed size for `withSize`) are not modelled, so a
-            // mutator is counted (#255 review).
+            // mutator is counted (#255 review), and so is `subList`, whose
+            // `AbstractList$SubList` window would carry the same rules
+            // (#253 re-check), whatever the owner the call names.
             if jar_object::collection_key(marker).is_some_and(|_| {
                 jar_object::collection_class(marker) == client_surface::NON_NULL_LIST
-            }) && java_immutable::is_mutator(&r.name)
+            }) && (java_immutable::is_mutator(&r.name) || r.name == "subList")
             {
                 return self.unknown_host_call(r);
             }
@@ -12251,7 +12253,7 @@ pub(crate) fn map_entry_parts(value: &Value) -> Result<(Value, Value), NativeErr
     ))
 }
 
-fn is_collection_owner(owner: &str) -> bool {
+pub(crate) fn is_collection_owner(owner: &str) -> bool {
     is_list_owner(owner)
         || is_set_owner(owner)
         || is_map_owner(owner)
@@ -19820,455 +19822,6 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// Largest JSON document the bounded Gson surface accepts. Config files in
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
-/// Deepest JSON nesting `Gson.fromJson` materializes.
-const MAX_GSON_DEPTH: usize = 32;
-
-/// Parse one JSON document and materialize it for `Gson.fromJson`.
-///
-/// The target class decides between a primitive, a modelled `String`, and the
-/// collection/map markers the interpreter already understands. A document
-/// that nests past [`MAX_GSON_DEPTH`] or measures over
-/// [`MAX_GSON_JSON_BYTES`] is refused with a bounded reason, never replaced by
-/// an empty value.
-fn gson_document(text: &str) -> Result<Option<serde_json::Value>, NativeError> {
-    // Gson answers `null` for an empty document; a config file that does not
-    // exist yet is read through `Files.newBufferedReader` as an empty stream,
-    // and the caller's null check is the next step.
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    if text.len() > MAX_GSON_JSON_BYTES {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document is {} bytes; the bounded parser reads at most {MAX_GSON_JSON_BYTES}",
-            text.len()
-        )));
-    }
-    // Gson's lenient parser accepts the `//` and `/* */` comments a
-    // hand-maintained lang or config file carries; strip them outside string
-    // literals before the bounded JSON reader sees the bytes.
-    let json: serde_json::Value =
-        serde_json::from_str(&strip_json_comments(text)).map_err(|error| {
-            NativeError::Metadata(format!("Gson.fromJson rejected the document: {error}"))
-        })?;
-    let depth = gson_json_depth(&json, 0);
-    if depth > MAX_GSON_DEPTH {
-        return Err(NativeError::Metadata(format!(
-            "Gson.fromJson document nests {depth} levels; the bounded parser reads at most {MAX_GSON_DEPTH}"
-        )));
-    }
-    Ok(Some(json))
-}
-
-/// Remove the `//` and `/* */` comments a lenient Gson read accepts.
-///
-/// The scan tracks string literals and escapes, so a `//` inside a value stays
-/// part of the value. A leading byte-order mark is dropped too: a file written
-/// by an editor that adds one is still valid to Gson.
-fn strip_json_comments(text: &str) -> String {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut out = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(character) = characters.next() {
-        if in_string {
-            out.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            out.push(character);
-            continue;
-        }
-        if character == '/' {
-            match characters.peek() {
-                Some('/') => {
-                    characters.next();
-                    for next in characters.by_ref() {
-                        if next == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    characters.next();
-                    let mut previous = '\0';
-                    for next in characters.by_ref() {
-                        if previous == '*' && next == '/' {
-                            break;
-                        }
-                        previous = next;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        out.push(character);
-    }
-    out
-}
-
-fn gson_json_depth(json: &serde_json::Value, depth: usize) -> usize {
-    if depth > MAX_GSON_DEPTH {
-        return depth;
-    }
-    match json {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        serde_json::Value::Object(values) => values
-            .values()
-            .map(|value| gson_json_depth(value, depth + 1))
-            .max()
-            .unwrap_or(depth),
-        _ => depth,
-    }
-}
-
-fn gson_list_target(class: &str) -> bool {
-    is_collection_owner(class) && !is_map_owner(class)
-}
-
-fn gson_set_target(class: &str) -> bool {
-    is_set_owner(class)
-}
-
-fn gson_map_target(class: &str) -> bool {
-    is_map_owner(class)
-}
-
-fn gson_json_number(number: &serde_json::Number, class: &str) -> Value {
-    match class {
-        "int"
-        | "java/lang/Integer"
-        | "short"
-        | "java/lang/Short"
-        | "byte"
-        | "java/lang/Byte"
-        | "char"
-        | "java/lang/Character" => number.as_i64().map_or_else(
-            || Value::Float(number.as_f64().unwrap_or(0.0)),
-            |value| Value::Int(value as i32),
-        ),
-        "long" | "java/lang/Long" => number
-            .as_i64()
-            .map_or_else(|| Value::Float(number.as_f64().unwrap_or(0.0)), Value::Long),
-        "float" | "java/lang/Float" | "double" | "java/lang/Double" => {
-            Value::Float(number.as_f64().unwrap_or(0.0))
-        }
-        _ => {
-            if let Some(value) = number.as_i64() {
-                if let Ok(value) = i32::try_from(value) {
-                    Value::Int(value)
-                } else {
-                    Value::Long(value)
-                }
-            } else if let Some(value) = number.as_u64() {
-                match i32::try_from(value) {
-                    Ok(value) => Value::Int(value),
-                    Err(_) => Value::Float(number.as_f64().unwrap_or(0.0)),
-                }
-            } else {
-                Value::Float(number.as_f64().unwrap_or(0.0))
-            }
-        }
-    }
-}
-
-/// The JDK class Gson 2.x builds for a collection or map target: the
-/// target's own class when it is a concrete JDK collection, else its default
-/// (`ArrayList`, `LinkedHashSet`; for a map `LinkedTreeMap`, which no model
-/// holds, so `LinkedHashMap` stands in: the same insertion order).
-fn gson_collection_class<'a>(class: &'a str, kind: &str) -> &'a str {
-    const CONCRETE: &[&str] = &[
-        "java/util/ArrayList",
-        "java/util/LinkedList",
-        "java/util/HashSet",
-        "java/util/LinkedHashSet",
-        "java/util/TreeSet",
-        "java/util/HashMap",
-        "java/util/LinkedHashMap",
-        "java/util/TreeMap",
-        "java/util/concurrent/ConcurrentHashMap",
-    ];
-    if CONCRETE.contains(&class) {
-        return class;
-    }
-    // `ConstructorConstructor`'s sorted defaults (#253 review).
-    match class {
-        "java/util/SortedSet" | "java/util/NavigableSet" => return "java/util/TreeSet",
-        "java/util/SortedMap" | "java/util/NavigableMap" => return "java/util/TreeMap",
-        _ => {}
-    }
-    match kind {
-        "set" => "java/util/LinkedHashSet",
-        "map" => "java/util/LinkedHashMap",
-        _ => "java/util/ArrayList",
-    }
-}
-
-/// The call a Gson collection is made for, counted on a host that makes none.
-const GSON_FROM_JSON: (&str, &str, &str) = (
-    "com/google/gson/Gson",
-    "fromJson",
-    "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-);
-
-impl<H: Host> Runtime<'_, H> {
-    /// Gson's value for `json` read as `class`: a collection, map or array
-    /// is an object of its own (#156 P14d2), never text.
-    fn gson_json_value(
-        &mut self,
-        json: &serde_json::Value,
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        if matches!(json, serde_json::Value::Null) {
-            return Ok(Value::Ref(None));
-        }
-        if class.starts_with('[') {
-            return match json {
-                serde_json::Value::Array(values) => self.gson_json_array(values, class),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON array for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        if gson_list_target(class) {
-            return match json {
-                serde_json::Value::Array(values) => self.gson_json_collection(
-                    values,
-                    class,
-                    if gson_set_target(class) {
-                        "set"
-                    } else {
-                        "list"
-                    },
-                ),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON array for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        if gson_map_target(class) {
-            return match json {
-                serde_json::Value::Object(values) => self.gson_json_map(values, class),
-                other => Err(NativeError::Metadata(format!(
-                    "Gson.fromJson expected a JSON object for {class}, got {}",
-                    gson_json_kind(other)
-                ))),
-            };
-        }
-        match json {
-            serde_json::Value::Bool(value) => Ok(match class {
-                "java/lang/String" => Value::Ref(Some(value.to_string())),
-                _ => Value::Int(i32::from(*value)),
-            }),
-            serde_json::Value::Number(number) => Ok(gson_json_number(number, class)),
-            serde_json::Value::String(value) => Ok(Value::Ref(Some(value.clone()))),
-            serde_json::Value::Array(values) => self.gson_json_collection(values, class, "list"),
-            serde_json::Value::Object(values) => self.gson_json_map(values, class),
-            serde_json::Value::Null => Ok(Value::Ref(None)),
-        }
-    }
-
-    /// A JSON array read as the array class `class`: an array of that class
-    /// whose elements are each read as its component type, as Gson's
-    /// adapters read them. An element no adapter here reads (a jar class's
-    /// object, which needs the reflective adapter) is counted, never stored
-    /// with the wrong type (#253 review).
-    fn gson_json_array(
-        &mut self,
-        values: &[serde_json::Value],
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        let component = &class[1..];
-        let mut materialized = Vec::with_capacity(values.len());
-        for value in values {
-            match self.gson_array_element(value, component)? {
-                Some(element) => materialized.push(element),
-                None => {
-                    let r = crate::runtime::stream_pipeline::wanted(
-                        GSON_FROM_JSON.0,
-                        GSON_FROM_JSON.1,
-                        GSON_FROM_JSON.2,
-                    );
-                    return self.host.unknown_operand_call(&r);
-                }
-            }
-        }
-        Ok(self.new_array_value(class, materialized))
-    }
-
-    /// One element of a JSON array read as the component `descriptor`, or
-    /// `None` where Gson's adapter would read something this does not model
-    /// (or throw).
-    fn gson_array_element(
-        &mut self,
-        json: &serde_json::Value,
-        descriptor: &str,
-    ) -> Result<Option<Value>, NativeError> {
-        use serde_json::Value as Json;
-        let integer = |json: &Json| json.as_i64();
-        Ok(match (descriptor, json) {
-            (_, Json::Null) if descriptor.len() == 1 => None,
-            (_, Json::Null) => Some(Value::Ref(None)),
-            // `ObjectTypeAdapter` (#253 review).
-            ("Ljava/lang/Object;", _) => self.gson_object_adapter(json)?,
-            // `TypeAdapters.STRING`: a string, an integer's text, a boolean's.
-            ("Ljava/lang/String;", Json::String(text)) => Some(Value::Ref(Some(text.clone()))),
-            ("Ljava/lang/String;", Json::Number(number)) if number.is_i64() || number.is_u64() => {
-                Some(Value::Ref(Some(number.to_string())))
-            }
-            ("Ljava/lang/String;", Json::Bool(flag)) => Some(Value::Ref(Some(flag.to_string()))),
-            // `TypeAdapters.INTEGER`/`LONG`: `nextInt`/`nextLong`.
-            ("I" | "Ljava/lang/Integer;", _) => integer(json)
-                .and_then(|n| i32::try_from(n).ok())
-                .map(Value::Int),
-            ("J" | "Ljava/lang/Long;", _) => integer(json).map(Value::Long),
-            // `TypeAdapters.SHORT`/`BYTE`: `nextInt`, a `JsonSyntaxException`
-            // past 65535 or 255 (or below the type's minimum), then the
-            // narrowing cast. Their boxes are classes no value here carries:
-            // counted.
-            ("S", _) => integer(json)
-                .filter(|n| (i64::from(i16::MIN)..=65535).contains(n))
-                .map(|n| Value::Int(i32::from(n as i16))),
-            ("B", _) => integer(json)
-                .filter(|n| (i64::from(i8::MIN)..=255).contains(n))
-                .map(|n| Value::Int(i32::from(n as i8))),
-            // `nextDouble`, and for a `float` its narrowing.
-            ("D" | "Ljava/lang/Double;", Json::Number(number)) => number.as_f64().map(Value::Float),
-            ("F", Json::Number(number)) => {
-                number.as_f64().map(|n| Value::Float(f64::from(n as f32)))
-            }
-            ("Z", Json::Bool(flag)) => Some(Value::Int(i32::from(*flag))),
-            ("Ljava/lang/Boolean;", Json::Bool(flag)) => Some(boolean_value(*flag)),
-            // A nested array, or a collection or map the converters read.
-            (nested, _) if nested.starts_with('[') => Some(self.gson_json_value(json, nested)?),
-            (object, _) if object.starts_with('L') && object.ends_with(';') => {
-                let class = &object[1..object.len() - 1];
-                if gson_list_target(class) || gson_map_target(class) {
-                    Some(self.gson_json_value(json, class)?)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-    }
-
-    /// Gson's `ObjectTypeAdapter` (`ToNumberPolicy.DOUBLE`): a string, a
-    /// `Double`, a `Boolean`, `null`, an `ArrayList` of the same; `None` for
-    /// an object, which it reads as a `LinkedTreeMap` no model holds.
-    fn gson_object_adapter(
-        &mut self,
-        json: &serde_json::Value,
-    ) -> Result<Option<Value>, NativeError> {
-        use serde_json::Value as Json;
-        Ok(match json {
-            Json::Null => Some(Value::Ref(None)),
-            Json::String(text) => Some(Value::Ref(Some(text.clone()))),
-            Json::Bool(flag) => Some(boolean_value(*flag)),
-            Json::Number(number) => number.as_f64().map(Value::Float),
-            Json::Array(values) => {
-                let mut elements = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(element) = self.gson_object_adapter(value)? else {
-                        return Ok(None);
-                    };
-                    elements.push(element);
-                }
-                Some(self.new_host_collection("java/util/ArrayList", elements, GSON_FROM_JSON)?)
-            }
-            Json::Object(_) => None,
-        })
-    }
-
-    /// A JSON array read as the collection `class` (`kind`: `list`/`set`).
-    /// The element type is not resolved (that needs the declared type
-    /// arguments): elements read as `Object`.
-    fn gson_json_collection(
-        &mut self,
-        values: &[serde_json::Value],
-        class: &str,
-        kind: &str,
-    ) -> Result<Value, NativeError> {
-        let mut materialized = Vec::with_capacity(values.len());
-        for value in values {
-            materialized.push(self.gson_json_value(value, "java/lang/Object")?);
-        }
-        let class = gson_collection_class(class, kind);
-        if kind == "list" {
-            return self.new_host_collection(class, materialized, GSON_FROM_JSON);
-        }
-        // A set takes each element through its own `add`, as Gson's
-        // `CollectionTypeAdapterFactory` does: a `TreeSet` sorts, every set
-        // drops a repeat (#253 review).
-        let set = self.new_host_collection(class, Vec::new(), GSON_FROM_JSON)?;
-        for element in materialized {
-            self.call_virtual(
-                crate::runtime::jdk_call::Site::Interface,
-                "java/util/Set",
-                "add",
-                "(Ljava/lang/Object;)Z",
-                &set,
-                &[element],
-            )?;
-        }
-        Ok(set)
-    }
-
-    /// A JSON object read as the map `class`: each member through the map's
-    /// own `put`, as Gson's `MapTypeAdapterFactory` does (a `TreeMap` sorts
-    /// its keys).
-    fn gson_json_map(
-        &mut self,
-        values: &serde_json::Map<String, serde_json::Value>,
-        class: &str,
-    ) -> Result<Value, NativeError> {
-        let map = self.new_host_collection(
-            gson_collection_class(class, "map"),
-            Vec::new(),
-            GSON_FROM_JSON,
-        )?;
-        for (key, value) in values {
-            let value = self.gson_json_value(value, "java/lang/Object")?;
-            self.call_virtual(
-                crate::runtime::jdk_call::Site::Interface,
-                "java/util/Map",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                &map,
-                &[Value::Ref(Some(key.clone())), value],
-            )?;
-        }
-        Ok(map)
-    }
-}
-
-fn gson_json_kind(json: &serde_json::Value) -> &'static str {
-    match json {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "a boolean",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "an array",
-        serde_json::Value::Object(_) => "an object",
-    }
-}
 
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
@@ -24305,205 +23858,39 @@ impl<H: Host> Runtime<'_, H> {
             .unwrap_or_default()
     }
 
-    /// `Gson.fromJson` for a document whose target is the jar's own class.
-    ///
-    /// Gson's reflective adapter allocates the object without running a
-    /// constructor and sets the declared instance fields, and a config class
-    /// then reads them back through ordinary field accesses. The interpreter
-    /// does the same: the field table is keyed by the declaring class, so the
-    /// accessors the mod generates find what the document declared. A document
-    /// that names no field this class declares, or a class the runtime does not
-    /// hold, keeps the previous JSON-shaped answer.
+    /// `Gson.fromJson(text, target)` (`r`) for a target that is not one of
+    /// Gson's tree classes: Gson's answer as its adapter for the declared type
+    /// reads it (`gson_tree/typed.rs`), or the call counted where that is not
+    /// reproduced, never a JSON-shaped stand-in (#253 re-check). `target` is
+    /// `None` when the declared type itself is not known (a `TypeToken` or
+    /// `Type` the runtime cannot read).
     fn gson_from_json(
         &mut self,
+        r: &MethodRef,
         text: &str,
-        class: &str,
+        target: Option<GenericType>,
         style: &gson_model::GsonStyle,
     ) -> Result<Value, NativeError> {
-        let Some(json) = gson_document(text)? else {
-            return Ok(Value::Ref(None));
-        };
-        let class = class.replace('.', "/");
-        if let Some(value) = self.gson_materialize(&json, &class, style)? {
+        if let Some(target) = target
+            && let Some(value) = self.gson_read_text(text, &target, style)?
+        {
             return Ok(value);
         }
-        self.gson_json_value(&json, &class)
+        self.host.unknown_operand_call(r)
     }
 
-    /// The erased runtime type a `TypeToken` names.
-    ///
-    /// A token subclass declares its type argument in its `Signature`; when
-    /// that resolves, the token behaves like the same class literal would.
-    /// A token the model cannot read answers `Object`, which the JSON shape
-    /// still materializes into a map or a list.
-    fn type_token_class(&self, _token: &Value) -> String {
-        "java/lang/Object".into()
-    }
-
-    /// Allocate one instance of `class` and inject the document's fields.
-    fn gson_materialize(
-        &mut self,
-        json: &serde_json::Value,
-        class: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        let serde_json::Value::Object(document) = json else {
-            return Ok(None);
-        };
-        if class.starts_with("java/") || !self.has_class(class) {
-            return Ok(None);
+    /// The declared type a `TypeToken` or `Type` argument holds: Gson's
+    /// canonical type, a JDK `java.lang.reflect` type, or a `Class`.
+    fn gson_target(&self, value: &Value) -> Option<GenericType> {
+        if *value == Value::Ref(None) {
+            return None;
         }
-        let fields = self.gson_fields(class);
-        if fields.is_empty() {
-            return Ok(None);
-        }
-        self.ensure_initialized(class)?;
-        let value = self.new_object(class);
-        for (declaring, name, descriptor, access) in fields {
-            if !style.includes_field(access) {
-                continue;
-            }
-            // The naming policy names the JSON key on the way in too.
-            let Some(raw) = document.get(&style.field_name(&name)) else {
-                continue;
-            };
-            let Some(field_value) = self.gson_field_value(raw, &descriptor, style)? else {
-                return Ok(None);
-            };
-            let field = MethodRef {
-                owner: declaring,
-                name,
-                descriptor,
-            };
-            if access & 0x0008 != 0 {
-                // Gson sets a static field through reflection; the
-                // invocation's static table is the same field here.
-                self.static_fields
-                    .insert(Self::static_field_key(&field), field_value);
-            } else if let Some(key) = instance_field_key(&value, &field) {
-                self.fields.insert(key, field_value);
-            }
-        }
-        Ok(Some(value))
-    }
-
-    /// Convert one JSON value to the field descriptor it must land in.
-    ///
-    /// A shape the runtime cannot represent answers `None`, and the caller
-    /// keeps the JSON-shaped value rather than an object with masked fields.
-    fn gson_field_value(
-        &mut self,
-        json: &serde_json::Value,
-        descriptor: &str,
-        style: &gson_model::GsonStyle,
-    ) -> Result<Option<Value>, NativeError> {
-        if json.is_null() {
-            return Ok(Some(Value::Ref(None)));
-        }
-        Ok(Some(match descriptor {
-            "Ljava/lang/String;" => match json {
-                serde_json::Value::String(text) => Value::Ref(Some(text.clone())),
-                serde_json::Value::Bool(flag) => Value::Ref(Some(flag.to_string())),
-                serde_json::Value::Number(number) => Value::Ref(Some(number.to_string())),
-                _ => return Ok(None),
-            },
-            "Z" => match json {
-                serde_json::Value::Bool(flag) => Value::Int(i32::from(*flag)),
-                _ => return Ok(None),
-            },
-            "B" | "S" | "I" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "J" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "F" | "D" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Boolean;" => match json {
-                serde_json::Value::Bool(flag) => boolean_value(*flag),
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Byte;" | "Ljava/lang/Short;" | "Ljava/lang/Integer;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Int(number as i32),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Long;" => match json {
-                serde_json::Value::Number(number) => match number.as_i64() {
-                    Some(number) => Value::Long(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            "Ljava/lang/Float;" | "Ljava/lang/Double;" => match json {
-                serde_json::Value::Number(number) => match number.as_f64() {
-                    Some(number) => Value::Float(number),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            },
-            // A collection or map field: Gson's own class for it (#156 P14d2).
-            descriptor @ ("Ljava/util/List;"
-            | "Ljava/util/Collection;"
-            | "Ljava/util/ArrayList;"
-            | "Ljava/util/LinkedList;") => match json {
-                serde_json::Value::Array(values) => {
-                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "list")?
-                }
-                _ => return Ok(None),
-            },
-            descriptor @ ("Ljava/util/Set;"
-            | "Ljava/util/HashSet;"
-            | "Ljava/util/LinkedHashSet;") => match json {
-                serde_json::Value::Array(values) => {
-                    self.gson_json_collection(values, &descriptor[1..descriptor.len() - 1], "set")?
-                }
-                _ => return Ok(None),
-            },
-            descriptor @ ("Ljava/util/Map;"
-            | "Ljava/util/HashMap;"
-            | "Ljava/util/LinkedHashMap;") => match json {
-                serde_json::Value::Object(values) => {
-                    self.gson_json_map(values, &descriptor[1..descriptor.len() - 1])?
-                }
-                _ => return Ok(None),
-            },
-            descriptor if descriptor.starts_with("L") && descriptor.ends_with(';') => {
-                let class = &descriptor[1..descriptor.len() - 1];
-                if !self.has_class(class) {
-                    return Ok(None);
-                }
-                match json {
-                    serde_json::Value::Object(_) => {
-                        match self.gson_materialize(json, class, style)? {
-                            Some(value) => value,
-                            None => return Ok(None),
-                        }
-                    }
-                    // A JSON string for a jar class is its enum constant name.
-                    serde_json::Value::String(name) => {
-                        Value::Ref(Some(format!("enum/{class}/{name}")))
-                    }
-                    _ => return Ok(None),
-                }
-            }
-            _ => return Ok(None),
-        }))
+        let value = self.gson_token_type(value).unwrap_or_else(|| value.clone());
+        crate::runtime::host_gson_type::any_node(&value)
+            .or_else(|| generic_type_marker(&value))
+            .or_else(|| {
+                host_class::class_name(&value).map(|name| GenericType::Class(name.to_owned()))
+            })
     }
 
     /// Answer the bounded `com.google.gson` surface config code reaches.
@@ -24511,7 +23898,7 @@ impl<H: Host> Runtime<'_, H> {
     /// The adapter models the two calls that make a config bootstrap work:
     /// `Gson.fromJson` for primitives, `String` and JSON-shaped collections and
     /// maps, and `Gson.toJson` back to text. The parsed document is bounded by
-    /// [`MAX_GSON_JSON_BYTES`] and [`MAX_GSON_DEPTH`]; a malformed document is
+    /// [`MAX_GSON_JSON_BYTES`] and the tree parser's 255 levels; a malformed document is
     /// rejected with a named reason instead of answering `null` or an empty
     /// string. Objects of a jar's own class are not instantiated (that needs
     /// field injection the native path does not model), so their JSON shape is
@@ -24670,8 +24057,8 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, text, Some(target), &style)?))
                     }
                     ("fromJson", "(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;") => {
                         let reader = args.first().and_then(expect_ref).ok_or_else(|| {
@@ -24690,13 +24077,11 @@ impl<H: Host> Runtime<'_, H> {
                             .ok_or_else(|| {
                                 NativeError::Metadata("Gson.fromJson needs a Class".into())
                             })?;
-                        let class = &class;
-                        Ok(Some(self.gson_from_json(&text, class, &style)?))
+                        let target = GenericType::Class(class.replace('.', "/"));
+                        Ok(Some(self.gson_from_json(r, &text, Some(target), &style)?))
                     }
-                    // `Gson.fromJson(Reader, TypeToken)` takes the token's erased
-                    // type: a document that is an object becomes a map and an
-                    // array a list, which is what every JSON-shaped token resolves
-                    // to in the bounded adapter.
+                    // `Gson.fromJson(.., TypeToken)` reads the token's whole type
+                    // (`List<Integer>`'s elements as `Integer`, #253 re-check).
                     (
                         "fromJson",
                         "(Ljava/io/Reader;Lcom/google/gson/reflect/TypeToken;)Ljava/lang/Object;",
@@ -24721,7 +24106,7 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         } else {
                             let text = args
                                 .first()
@@ -24734,9 +24119,9 @@ impl<H: Host> Runtime<'_, H> {
                                 .ok_or_else(|| {
                                     NativeError::Metadata("Gson.fromJson needs a TypeToken".into())
                                 })?;
-                            (text, self.type_token_class(token))
+                            (text, self.gson_target(token))
                         };
-                        Ok(Some(self.gson_from_json(&text, &class, &style)?))
+                        Ok(Some(self.gson_from_json(r, &text, class, &style)?))
                     }
                     (
                         "fromJson",
@@ -24745,16 +24130,9 @@ impl<H: Host> Runtime<'_, H> {
                         let text = args.first().map(expect_string).ok_or_else(|| {
                             NativeError::Metadata("Gson.fromJson needs a JSON string".into())
                         })?;
-                        let raw = args
-                            .get(1)
-                            .and_then(generic_type_marker)
-                            .and_then(|value| match value {
-                                GenericType::Class(name) => Some(name),
-                                GenericType::Parameterized { raw, .. } => Some(raw),
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "java/lang/Object".into());
-                        Ok(Some(self.gson_from_json(text, &raw, &style)?))
+                        let text = text.to_owned();
+                        let target = args.get(1).and_then(|ty| self.gson_target(ty));
+                        Ok(Some(self.gson_from_json(r, &text, target, &style)?))
                     }
                     _ => Ok(None),
                 }
