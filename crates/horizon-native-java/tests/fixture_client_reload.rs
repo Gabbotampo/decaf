@@ -60,7 +60,7 @@ fn registrations_and_file_converter_match_java_25() {
     );
     for (method, expected) in [
         ("fabric", "true|duplicate"),
-        ("v1", "true|true|minecraft:atlas"),
+        ("v1", "true|minecraft:atlas"),
         (
             "converter",
             "demo:textures/foo/bar.json|demo:foo/bar|true|textures|.json",
@@ -86,4 +86,34 @@ fn registrations_and_file_converter_match_java_25() {
             host.unknown_host_calls()
         );
     }
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let answer = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "builtin",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert_eq!(answer.unwrap(), Value::Ref(Some("false".into())));
+    assert_eq!(
+        host.unknown_host_calls().len(),
+        1,
+        "builtin pack remains counted"
+    );
+
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let answer = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "malformed",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert_eq!(
+        answer.unwrap(),
+        Value::Ref(Some("Range [9, -4) out of bounds for length 1".into()))
+    );
+    assert!(host.unknown_host_calls().is_empty());
 }

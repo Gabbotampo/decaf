@@ -3,6 +3,7 @@
 
 use crate::host_ref::{HostKind, HostRef, Methods, Nested, instance_of_class};
 use crate::{Host, MethodRef, NativeError, Runtime, StdHost, Value};
+use std::collections::BTreeMap;
 
 const HELPER_API: &str = "net/fabricmc/fabric/api/resource/ResourceManagerHelper";
 const CONVERTER: &str = "net/minecraft/resources/FileToIdConverter";
@@ -121,6 +122,128 @@ fn duplicate(class: &str, message: String) -> NativeError {
     }
 }
 
+fn null_pointer(message: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NullPointerException".into(),
+        message: Some(message.into()),
+        frame: None,
+    }
+}
+
+fn listener_identity(value: &Value) -> Option<String> {
+    match value {
+        Value::Host(handle) => Some(format!("{}:{}", handle.kind() as usize, handle.key())),
+        _ => None,
+    }
+}
+
+fn listener_key(resource: &str, listener: &Value) -> Option<String> {
+    Some(format!(
+        "{PREFIX}{resource}\0listener\0{}",
+        listener_identity(listener)?
+    ))
+}
+
+fn order_key(resource: &str) -> String {
+    format!("{PREFIX}{resource}\0order")
+}
+
+fn append_order(fields: &mut BTreeMap<String, Value>, resource: &str, id: &str) {
+    let key = order_key(resource);
+    let mut order = match fields.get(&key) {
+        Some(Value::Ref(Some(order))) => order.clone(),
+        _ => String::new(),
+    };
+    if !order.is_empty() {
+        order.push('\0');
+    }
+    order.push_str(id);
+    fields.insert(key, Value::Ref(Some(order)));
+}
+
+fn register_in(
+    fields: &mut BTreeMap<String, Value>,
+    resource: &str,
+    id: &str,
+    listener: &Value,
+    duplicate_class: &str,
+    duplicate_id_message: String,
+    duplicate_listener_message: String,
+) -> Result<(), NativeError> {
+    let key = state_key(resource, id);
+    if fields.contains_key(&key) {
+        return Err(duplicate(duplicate_class, duplicate_id_message));
+    }
+    if let Some(listener_key) = listener_key(resource, listener)
+        && let Some(Value::Ref(Some(old_id))) = fields.get(&listener_key)
+    {
+        return Err(duplicate(
+            duplicate_class,
+            duplicate_listener_message.replace("{old}", old_id),
+        ));
+    }
+    fields.insert(key, Value::Ref(Some("registered".into())));
+    if let Some(listener_key) = listener_key(resource, listener) {
+        fields.insert(listener_key, Value::Ref(Some(id.into())));
+    }
+    append_order(fields, resource, id);
+    Ok(())
+}
+
+fn add_order(
+    fields: &mut BTreeMap<String, Value>,
+    resource: &str,
+    first: &str,
+    second: &str,
+) -> Result<(), NativeError> {
+    if first == second {
+        return Err(duplicate(
+            "java/lang/IllegalArgumentException",
+            "Tried to add a phase that depends on itself.".into(),
+        ));
+    }
+    fields.insert(
+        format!("{PREFIX}{resource}\0edge\0{first}\0{second}"),
+        Value::Ref(Some("ordered".into())),
+    );
+    Ok(())
+}
+
+fn id_argument(value: Option<&Value>, message: &str) -> Result<Option<String>, NativeError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Ref(None)) {
+        return Err(null_pointer(message));
+    }
+    Ok(registration_id(value))
+}
+
+fn collection_items<H: Host>(runtime: &Runtime<'_, H>, value: &Value) -> Option<Vec<Value>> {
+    runtime.host.mutable_collection_values(value).or_else(|| {
+        matches!(value, Value::Ref(Some(_)))
+            .then(|| crate::collection_values(value).ok())
+            .flatten()
+    })
+}
+
+fn invoke_dependency_method<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    class: &str,
+    listener: Value,
+) -> Result<Value, NativeError> {
+    match runtime.invoke(
+        class,
+        "getFabricDependencies",
+        "()Ljava/util/Collection;",
+        Some(listener.clone()),
+        &[],
+    ) {
+        Err(NativeError::MissingMethod(_)) => Ok(Value::Ref(Some("list/".into()))),
+        result => result,
+    }
+}
+
 pub(crate) fn static_field(owner: &str, name: &str, descriptor: &str) -> Option<Value> {
     if matches!(
         owner,
@@ -180,14 +303,6 @@ pub(crate) fn static_call(
                 .unwrap_or_else(|| Err(NativeError::UnknownHostCall(r.clone()))),
         ),
         (
-            "net/fabricmc/fabric/api/resource/ResourceManagerHelper",
-            "registerBuiltinResourcePack",
-            _,
-        ) => Some(Ok(Value::Int(1))),
-        ("net/fabricmc/fabric/api/resource/v1/ResourceLoader", "registerBuiltinPack", _) => {
-            Some(Ok(Value::Int(1)))
-        }
-        (
             "net/fabricmc/fabric/api/resource/v1/DataResourceLoader",
             "get",
             "()Lnet/fabricmc/fabric/api/resource/v1/DataResourceLoader;",
@@ -204,20 +319,51 @@ pub(crate) fn static_call(
     }
 }
 
-fn id_transform(handle: &HostRef, id: &Value, to_file: bool) -> Option<Value> {
-    let (prefix, extension) = parts(handle)?;
-    let id = id_text(id)?;
-    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
-    let path = if to_file {
-        format!("{prefix}/{path}{extension}")
-    } else {
-        path.strip_prefix(&format!("{prefix}/"))?
-            .strip_suffix(&extension)?
-            .to_owned()
-    };
-    Some(crate::host_ids::identifier(namespace, &path))
+fn substring_error(begin: i64, end: i64, length: i64) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/StringIndexOutOfBoundsException".into(),
+        message: Some(format!(
+            "Range [{begin}, {end}) out of bounds for length {length}"
+        )),
+        frame: None,
+    }
 }
 
+fn id_transform(handle: &HostRef, id: &Value, to_file: bool) -> Result<Value, NativeError> {
+    let Some((prefix, extension)) = parts(handle) else {
+        return Err(NativeError::UnknownHostCall(MethodRef {
+            owner: CONVERTER.into(),
+            name: "fileToId".into(),
+            descriptor:
+                "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/resources/Identifier;".into(),
+        }));
+    };
+    let Some(id) = id_text(id) else {
+        return Err(null_pointer(
+            "Cannot invoke \"net.minecraft.resources.Identifier.getPath()\" because \"id\" is null",
+        ));
+    };
+    let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
+    if to_file {
+        return Ok(crate::host_ids::identifier(
+            namespace,
+            &format!("{prefix}/{path}{extension}"),
+        ));
+    }
+    // FileToIdConverter.fileToId deliberately performs two unchecked
+    // String.substring calls.  It does not first test prefix/extension.
+    let begin = prefix.len() as i64 + 1;
+    let end = path.len() as i64 - extension.len() as i64;
+    if begin < 0 || end < begin || end > path.len() as i64 {
+        return Err(substring_error(begin, end, path.len() as i64));
+    }
+    Ok(crate::host_ids::identifier(
+        namespace,
+        &path[begin as usize..end as usize],
+    ))
+}
+
+#[allow(clippy::question_mark)]
 pub(crate) fn host_instance_call(
     host: &mut StdHost,
     r: &MethodRef,
@@ -228,37 +374,72 @@ pub(crate) fn host_instance_call(
         == Some(crate::events::GameEvent::ClientReloadListeners)
     {
         if r.name == "addListener" {
-            let Some(id) = id_text(args.first()?) else {
-                return Some(Err(NativeError::UnknownHostCall(r.clone())));
+            let Some(id) =
+                (match id_argument(args.first(), "The listener identifier should not be null.") {
+                    Ok(id) => id,
+                    Err(error) => return Some(Err(error)),
+                })
+            else {
+                return None;
             };
-            let key = state_key("neoforge-client", id);
-            if host.persistent_static_fields.contains_key(&key) {
-                return Some(Err(duplicate(
+            let Some(listener) = args.get(1) else {
+                return None;
+            };
+            if matches!(listener, Value::Ref(None)) {
+                return Some(Err(null_pointer("The listener should not be null.")));
+            }
+            return Some(
+                register_in(
+                    &mut host.persistent_static_fields,
+                    "neoforge-client",
+                    &id,
+                    listener,
                     "java/lang/IllegalArgumentException",
                     format!("Attempted to register two reload listeners for the same key: {id}"),
-                )));
-            }
-            host.persistent_static_fields
-                .insert(key, Value::Ref(Some("registered".into())));
-            return Some(Ok(Value::Void));
+                    format!("Attempted to register two reload listeners for the same key: {id}"),
+                )
+                .map(|_| Value::Void),
+            );
         }
         if r.name == "addDependency" {
-            let first = registration_id(args.first()?)?;
-            let second = registration_id(args.get(1)?)?;
-            for id in [first, second] {
-                let known = id.starts_with("minecraft:")
-                    || id.starts_with("fabric:")
-                    || host
-                        .persistent_static_fields
-                        .contains_key(&state_key("neoforge-client", &id));
-                if !known {
+            let Some(first) = (match id_argument(
+                args.first(),
+                "The first listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            let Some(second) = (match id_argument(
+                args.get(1),
+                "The second listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            for id in [&first, &second] {
+                if !host
+                    .persistent_static_fields
+                    .contains_key(&state_key("neoforge-client", id))
+                {
                     return Some(Err(duplicate(
                         "java/lang/IllegalArgumentException",
                         format!("Unknown reload listener: {id}"),
                     )));
                 }
             }
-            return Some(Ok(Value::Void));
+            return Some(
+                add_order(
+                    &mut host.persistent_static_fields,
+                    "neoforge-client",
+                    &first,
+                    &second,
+                )
+                .map(|_| Value::Void),
+            );
         }
     }
     let Value::Host(handle) = receiver else {
@@ -273,32 +454,49 @@ pub(crate) fn host_instance_call(
         (
             "idToFile",
             "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/resources/Identifier;",
-        ) => id_transform(handle, args.first()?, true).ok_or_else(missing),
+        ) => id_transform(handle, args.first()?, true),
         (
             "fileToId",
             "(Lnet/minecraft/resources/Identifier;)Lnet/minecraft/resources/Identifier;",
-        ) => id_transform(handle, args.first()?, false).ok_or_else(missing),
+        ) => id_transform(handle, args.first()?, false),
         ("extensionMatches", "(Lnet/minecraft/resources/Identifier;)Z") => {
-            let answer = id_text(args.first()?)
-                .is_some_and(|id| parts(handle).is_some_and(|(_, ext)| id.ends_with(&ext)));
+            let Some(id) = id_text(args.first()?) else {
+                if matches!(args.first(), Some(Value::Ref(None))) {
+                    return Some(Err(null_pointer(
+                        "Cannot invoke \"net.minecraft.resources.Identifier.getPath()\" because \"id\" is null",
+                    )));
+                }
+                return Some(Err(missing()));
+            };
+            let (_, path) = id.split_once(':').unwrap_or(("minecraft", id));
+            let answer = parts(handle).is_some_and(|(_, ext)| path.ends_with(&ext));
             Ok(Value::Int(i32::from(answer)))
         }
         ("prefixMatches", "(Lnet/minecraft/resources/Identifier;)Z") => {
-            let answer = id_text(args.first()?).is_some_and(|id| {
-                parts(handle).is_some_and(|(prefix, _)| {
-                    id.split_once(':')
-                        .is_some_and(|(_, path)| path.starts_with(&prefix))
-                })
-            });
+            let Some(id) = id_text(args.first()?) else {
+                if matches!(args.first(), Some(Value::Ref(None))) {
+                    return Some(Err(null_pointer(
+                        "Cannot invoke \"net.minecraft.resources.Identifier.getPath()\" because \"id\" is null",
+                    )));
+                }
+                return Some(Err(missing()));
+            };
+            let (_, path) = id.split_once(':').unwrap_or(("minecraft", id));
+            let answer = parts(handle).is_some_and(|(prefix, _)| path.starts_with(&prefix));
             Ok(Value::Int(i32::from(answer)))
         }
         ("matches", "(Lnet/minecraft/resources/Identifier;)Z") => {
-            let answer = id_text(args.first()?).is_some_and(|id| {
-                parts(handle).is_some_and(|(prefix, ext)| {
-                    id.split_once(':')
-                        .is_some_and(|(_, path)| path.starts_with(&prefix) && path.ends_with(&ext))
-                })
-            });
+            let Some(id) = id_text(args.first()?) else {
+                if matches!(args.first(), Some(Value::Ref(None))) {
+                    return Some(Err(null_pointer(
+                        "Cannot invoke \"net.minecraft.resources.Identifier.getPath()\" because \"id\" is null",
+                    )));
+                }
+                return Some(Err(missing()));
+            };
+            let (_, path) = id.split_once(':').unwrap_or(("minecraft", id));
+            let answer = parts(handle)
+                .is_some_and(|(prefix, ext)| path.starts_with(&prefix) && path.ends_with(&ext));
             Ok(Value::Int(i32::from(answer)))
         }
         ("prefix", "()Ljava/lang/String;") => parts(handle)
@@ -315,19 +513,24 @@ fn register(
     runtime: &mut Runtime<'_, impl Host>,
     resource: &str,
     id: &str,
-    class: &str,
-    message: String,
+    listener: &Value,
+    duplicate_class: &str,
+    duplicate_id_message: String,
+    duplicate_listener_message: String,
 ) -> Result<Value, NativeError> {
-    let key = state_key(resource, id);
-    if runtime.static_fields.contains_key(&key) {
-        return Err(duplicate(class, message));
-    }
-    runtime
-        .static_fields
-        .insert(key, Value::Ref(Some("registered".into())));
+    register_in(
+        &mut runtime.static_fields,
+        resource,
+        id,
+        listener,
+        duplicate_class,
+        duplicate_id_message,
+        duplicate_listener_message,
+    )?;
     Ok(Value::Void)
 }
 
+#[allow(clippy::question_mark)]
 pub(crate) fn runtime_instance_call<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
@@ -351,44 +554,133 @@ pub(crate) fn runtime_instance_call<H: Host>(
             r.name.as_str(),
             "registerReloadListener" | "registerReloader" | "addReloadListener"
         ) {
-            let id = if r
+            let has_explicit_id = r
                 .descriptor
-                .starts_with("(Lnet/minecraft/resources/Identifier;")
-            {
-                registration_id(args.first()?)?
+                .starts_with("(Lnet/minecraft/resources/Identifier;");
+            let (id, listener, invokes_dependencies) = if has_explicit_id {
+                let Some(id) =
+                    (match id_argument(args.first(), "The listener identifier should not be null.")
+                    {
+                        Ok(id) => id,
+                        Err(error) => return Some(Err(error)),
+                    })
+                else {
+                    return None;
+                };
+                let Some(listener) = args.get(1).cloned() else {
+                    return None;
+                };
+                if matches!(listener, Value::Ref(None)) {
+                    return Some(Err(null_pointer("The listener should not be null.")));
+                }
+                (id, listener, false)
             } else {
-                let listener = args.first()?.clone();
-                let class = crate::jar_object::object_class(&listener)?.to_owned();
-                let id = match runtime.invoke(
+                let Some(listener) = args.first().cloned() else {
+                    return None;
+                };
+                if matches!(listener, Value::Ref(None)) {
+                    return Some(Err(null_pointer(
+                        "Cannot invoke \"net.fabricmc.fabric.api.resource.IdentifiableResourceReloadListener.getFabricId()\" because \"listener\" is null",
+                    )));
+                }
+                let Some(class) = crate::jar_object::object_class(&listener).map(str::to_owned)
+                else {
+                    return None;
+                };
+                let id_value = match runtime.invoke(
                     &class,
                     "getFabricId",
                     "()Lnet/minecraft/resources/Identifier;",
-                    Some(listener),
+                    Some(listener.clone()),
                     &[],
                 ) {
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                registration_id(&id)?
+                let Some(id) = (match id_argument(
+                    Some(&id_value),
+                    "The listener identifier should not be null.",
+                ) {
+                    Ok(id) => id,
+                    Err(error) => return Some(Err(error)),
+                }) else {
+                    return None;
+                };
+                (id, listener, true)
             };
-            return Some(register(
+            let duplicate_listener = format!(
+                "Resource listener with ID {id} already in resource listener set with ID {{old}}!"
+            );
+            if let Err(error) = register(
                 runtime,
                 &resource,
                 &id,
+                &listener,
                 "java/lang/IllegalStateException",
                 format!("Tried to register resource listener {id} twice!"),
-            ));
-        }
-        if r.name == "addListenerOrdering" {
-            let first = id_text(args.first()?)?;
-            let second = id_text(args.get(1)?)?;
-            if first == second {
-                return Some(Err(duplicate(
-                    "java/lang/IllegalArgumentException",
-                    "Tried to add a phase that depends on itself.".into(),
-                )));
+                duplicate_listener,
+            ) {
+                return Some(Err(error));
+            }
+            if invokes_dependencies {
+                let Some(class) = crate::jar_object::object_class(&listener).map(str::to_owned)
+                else {
+                    return None;
+                };
+                let deps = match invoke_dependency_method(runtime, &class, listener) {
+                    Ok(value) => value,
+                    Err(error) => return Some(Err(error)),
+                };
+                if matches!(deps, Value::Ref(None)) {
+                    return Some(Err(null_pointer(
+                        "Cannot invoke \"java.util.Collection.forEach(java.util.function.Consumer)\" because the return value of \"net.fabricmc.fabric.api.resource.IdentifiableResourceReloadListener.getFabricDependencies()\" is null",
+                    )));
+                }
+                let Some(items) = collection_items(runtime, &deps) else {
+                    return None;
+                };
+                for dependency in items {
+                    let Some(dependency) = (match id_argument(
+                        Some(&dependency),
+                        "The dependency identifier should not be null.",
+                    ) {
+                        Ok(id) => id,
+                        Err(error) => return Some(Err(error)),
+                    }) else {
+                        return None;
+                    };
+                    if let Err(error) =
+                        add_order(&mut runtime.static_fields, &resource, &dependency, &id)
+                    {
+                        return Some(Err(error));
+                    }
+                }
             }
             return Some(Ok(Value::Void));
+        }
+        if r.name == "addListenerOrdering" {
+            let Some(first) = (match id_argument(
+                args.first(),
+                "The first listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            let Some(second) = (match id_argument(
+                args.get(1),
+                "The second listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            return Some(
+                add_order(&mut runtime.static_fields, &resource, &first, &second)
+                    .map(|_| Value::Void),
+            );
         }
         return None;
     }
@@ -396,32 +688,69 @@ pub(crate) fn runtime_instance_call<H: Host>(
         == Some(crate::events::GameEvent::ClientReloadListeners)
     {
         if r.name == "addListener" {
-            let id = id_text(args.first()?)?.to_owned();
+            let Some(id) =
+                (match id_argument(args.first(), "The listener identifier should not be null.") {
+                    Ok(id) => id,
+                    Err(error) => return Some(Err(error)),
+                })
+            else {
+                return None;
+            };
+            let Some(listener) = args.get(1).cloned() else {
+                return None;
+            };
+            if matches!(listener, Value::Ref(None)) {
+                return Some(Err(null_pointer("The listener should not be null.")));
+            }
             return Some(register(
                 runtime,
                 "neoforge-client",
                 &id,
+                &listener,
                 "java/lang/IllegalArgumentException",
+                format!("Attempted to register two reload listeners for the same key: {id}"),
                 format!("Attempted to register two reload listeners for the same key: {id}"),
             ));
         }
         if r.name == "addDependency" {
-            let first = id_text(args.first()?)?;
-            let second = id_text(args.get(1)?)?;
-            for id in [first, second] {
-                let known = id.starts_with("minecraft:")
-                    || id.starts_with("fabric:")
-                    || runtime
-                        .static_fields
-                        .contains_key(&state_key("neoforge-client", id));
-                if !known {
+            let Some(first) = (match id_argument(
+                args.first(),
+                "The first listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            let Some(second) = (match id_argument(
+                args.get(1),
+                "The second listener identifier should not be null.",
+            ) {
+                Ok(id) => id,
+                Err(error) => return Some(Err(error)),
+            }) else {
+                return None;
+            };
+            for id in [&first, &second] {
+                if !runtime
+                    .static_fields
+                    .contains_key(&state_key("neoforge-client", id))
+                {
                     return Some(Err(duplicate(
                         "java/lang/IllegalArgumentException",
                         format!("Unknown reload listener: {id}"),
                     )));
                 }
             }
-            return Some(Ok(Value::Void));
+            return Some(
+                add_order(
+                    &mut runtime.static_fields,
+                    "neoforge-client",
+                    &first,
+                    &second,
+                )
+                .map(|_| Value::Void),
+            );
         }
     }
     None
@@ -439,6 +768,7 @@ mod tests {
         let id = crate::host_ids::identifier_of_text("demo:foo/bar");
         assert_eq!(
             id_transform(handle, &id, true)
+                .ok()
                 .and_then(|v| crate::host_ids::identifier_key(&v).map(str::to_owned)),
             Some("demo:textures/foo/bar.json".into())
         );
@@ -448,6 +778,7 @@ mod tests {
                 &crate::host_ids::identifier_of_text("demo:textures/foo/bar.json"),
                 false
             )
+            .ok()
             .and_then(|v| crate::host_ids::identifier_key(&v).map(str::to_owned)),
             Some("demo:foo/bar".into())
         );
