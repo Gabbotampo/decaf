@@ -398,6 +398,8 @@ pub enum HostKind {
     /// DataFixerUpper's `Pair.of(..)`: key `[serial, first, second]`
     /// (`host_codec.rs`).
     DfuPair,
+    /// DataFixerUpper Either values keyed by side and payload.
+    DfuEither,
     /// An unmodelled codec call's answer: key its declared codec type
     /// (`host_codec.rs`).
     OpaqueCodec,
@@ -437,6 +439,8 @@ pub enum HostKind {
     TimeUnit,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
+    /// A `StackWalker.Option` enum constant: key its name.
+    StackWalkerOption,
     /// A `Character.UnicodeBlock` constant: key its name.
     UnicodeBlock,
     /// A `Locale` constant: key `<language>_<country>`.
@@ -490,6 +494,18 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
+    HttpClient,
+    /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
+    HttpClientBuilder,
+    /// A Java 25 immutable `HttpRequest` (`http_client.rs`).
+    HttpRequest,
+    /// A Java 25 `HttpRequest.Builder`; setters preserve this identity.
+    HttpRequestBuilder,
+    /// A typed `HttpClient.Version` enum constant.
+    HttpClientVersion,
+    /// A typed `HttpClient.Redirect` enum constant.
+    HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
     /// Commons Lang's class-loader-local Consumers.nop singleton.
@@ -1890,6 +1906,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_codec::PAIR_METHODS,
     },
     KindInfo {
+        kind: HostKind::DfuEither,
+        tag: "deither",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_either::either_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_either::EITHER_METHODS,
+    },
+    KindInfo {
         kind: HostKind::OpaqueCodec,
         tag: "ocdc",
         class: ClassRule::Unknown {
@@ -1997,6 +2022,14 @@ const KINDS: &[KindInfo] = &[
         // One object per constant.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::CODING_ERROR_ACTION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::StackWalkerOption,
+        tag: "swopt",
+        class: ClassRule::Fixed("java/lang/StackWalker$Option"),
+        // One object per enum constant.
+        canonical: always_canonical,
+        methods: &crate::runtime::host_jdk_constant::STACK_WALKER_OPTION_METHODS,
     },
     KindInfo {
         kind: HostKind::UnicodeBlock,
@@ -2191,6 +2224,56 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::runtime::host_service::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClient,
+        tag: "hc",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientBuilder,
+        tag: "hcb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::client_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::CLIENT_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequest,
+        tag: "hr",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpRequestBuilder,
+        tag: "hrb",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::http_client::request_builder_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::REQUEST_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientVersion,
+        tag: "hcv",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Version"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::HttpClientRedirect,
+        tag: "hcr",
+        class: ClassRule::Fixed("java/net/http/HttpClient$Redirect"),
+        canonical: always_canonical,
+        methods: &crate::runtime::http_client::ENUM_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricResourceManagerHelper,
