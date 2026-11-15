@@ -133,7 +133,9 @@ fn class_path_host(fixture: &Fixture) -> StdHost {
 
 /// NeoForge: the mod is an automatic named module. The fixture jar is a
 /// Fabric jar, so its rows are seeded by hand instead of by `seed_host`
-/// (which marks the run as Fabric's).
+/// (which marks the run as Fabric's): a NeoForge jar's metadata and no
+/// `module-info.class`, so the host knows the module is automatic (a host
+/// that does not know counts the lookup).
 fn module_host() -> StdHost {
     [
         "demo/Good",
@@ -143,9 +145,10 @@ fn module_host() -> StdHost {
         "demo/Hidden",
     ]
     .into_iter()
-    .fold(StdHost::new(), |host, provider| {
-        host.with_service_provider("demo/Api", provider)
-    })
+    .fold(
+        StdHost::new().with_resource("META-INF/neoforge.mods.toml", "neoforge-mods-toml"),
+        |host, provider| host.with_service_provider("demo/Api", provider),
+    )
 }
 
 const SCE: &str = "java.util.ServiceConfigurationError: demo.Api:";

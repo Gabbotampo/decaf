@@ -195,20 +195,14 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Ok(None);
         }
-        let Some(mod_id) = receiver
-            .and_then(expect_ref)
-            .and_then(|marker| marker.strip_prefix("neoforge-mod-container/"))
-            .and_then(|rest| rest.split_once('/'))
-            .map(|(id, _)| id.to_owned())
-        else {
+        let Some(mod_id) = receiver.and_then(crate::host_neoforge_loader::container_id) else {
             return Ok(None);
         };
+        // 12.0.12's four types (an older `COMMON`/`SERVER` has no ordinal).
         let Some(kind) = args
             .first()
-            .and_then(expect_ref)
-            .and_then(|marker| marker.strip_prefix("fml-config-type/"))
-            .filter(|kind| matches!(*kind, "LOCAL" | "CLIENT" | "SYNCED" | "STARTUP"))
-            .map(str::to_owned)
+            .filter(|kind| crate::host_neoforge_loader::config_type_ordinal(kind).is_some())
+            .and_then(crate::host_neoforge_loader::config_type_name)
         else {
             return Ok(None);
         };
@@ -429,9 +423,6 @@ impl<H: Host> Runtime<'_, H> {
                     // `stream().allMatch`: stops at the first element refused.
                     let mut all = true;
                     for element in elements {
-                        let Ok(element) = parse_value_marker(&element) else {
-                            return Ok(Tested::Unknown);
-                        };
                         match self.invoke_callback(&element_validator, &[element])? {
                             Some(answer) if truthy(&answer) => {}
                             Some(_) => {

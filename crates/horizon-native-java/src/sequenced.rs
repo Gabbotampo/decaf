@@ -79,9 +79,10 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
 
 impl StdHost {
     /// The elements a reversed view reads: its list's current ones, backwards.
-    pub(crate) fn reversed_view_values(&self, marker: &str) -> Option<Vec<String>> {
+    pub(crate) fn reversed_view_values(&self, marker: &str) -> Option<Vec<Value>> {
         let (base, _) = self.reversed_views.get(marker)?;
-        let mut values = host_collection_values(self, &Value::Ref(Some(base.clone()))).ok()?;
+        let mut values =
+            host_collection_values(self, &crate::jar_object::stored_value(base)).ok()?;
         values.reverse();
         Some(values)
     }
@@ -127,7 +128,7 @@ impl StdHost {
     fn end_value(&self, receiver: &Value, first: bool) -> Result<Value, NativeError> {
         let values = host_collection_values(self, receiver)?;
         let end = if first { values.first() } else { values.last() };
-        parse_collection_value(end.ok_or_else(no_such_element)?)
+        end.cloned().ok_or_else(no_such_element)
     }
 
     /// The mutable table behind `marker`, seeded from its current elements
@@ -138,10 +139,7 @@ impl StdHost {
         marker: &str,
     ) -> Result<&mut Vec<Value>, NativeError> {
         if !self.mutable_collections.contains_key(marker) {
-            let values = host_collection_values(self, receiver)?
-                .iter()
-                .map(|value| parse_collection_value(value))
-                .collect::<Result<Vec<_>, _>>()?;
+            let values = host_collection_values(self, receiver)?;
             self.mutable_collections.insert(marker.to_owned(), values);
         }
         Ok(self
@@ -205,15 +203,30 @@ impl StdHost {
         let class = marker.split_once('#').map_or(marker, |(class, _)| class);
         let view = match class {
             "java/util/LinkedList" => LINKED_VIEW,
-            "java/util/ArrayList" | "java/util/ImmutableCollections$ListN" => RANDOM_ACCESS_VIEW,
+            // Every unmodifiable list the host makes (`java_immutable.rs`),
+            // as when they all reported `ListN`.
+            "java/util/ArrayList"
+            | "java/util/ImmutableCollections$ListN"
+            | "java/util/ImmutableCollections$List12"
+            | "java/util/Collections$EmptyList"
+            | "java/util/Collections$SingletonList"
+            | "com/google/common/collect/RegularImmutableList"
+            | "com/google/common/collect/SingletonImmutableList" => RANDOM_ACCESS_VIEW,
             _ if marker == "list" || marker.starts_with("list/") => RANDOM_ACCESS_VIEW,
             _ => return None,
         };
         let modifiable = !self.unmodifiable_collections.contains_key(marker);
-        let view_marker = format!("{view}#reversed{}", self.reversed_views.len());
+        let view_marker = crate::jar_object::collection_key_for(
+            view,
+            crate::jar_object::CollectionFamily::Reversed,
+            self.next_reversed_view,
+        );
+        self.next_reversed_view += 1;
         self.reversed_views
             .insert(view_marker.clone(), (marker.to_owned(), modifiable));
-        Some(Value::Ref(Some(view_marker)))
+        // A view of its own (#156 P14c): `list.reversed() == list.reversed()`
+        // is false, as each call makes a new `ReverseOrderListView`.
+        Some(crate::jar_object::collection(view_marker))
     }
 
     /// A member of a reversed view: a mutator maps onto its list, and
@@ -228,7 +241,7 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         let name = r.name.as_str();
         if name == "reversed" && r.descriptor.starts_with("()L") {
-            return Some(Ok(Value::Ref(Some(base.to_owned()))));
+            return Some(Ok(crate::jar_object::stored_value(base)));
         }
         if !java_immutable::is_mutator(name) {
             return None;
@@ -236,7 +249,7 @@ impl StdHost {
         if !modifiable {
             return Some(Err(unsupported()));
         }
-        let list = Value::Ref(Some(base.to_owned()));
+        let list = crate::jar_object::stored_value(base);
         let value = || args.first().cloned().unwrap_or(Value::Ref(None));
         Some(match (name, r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => self

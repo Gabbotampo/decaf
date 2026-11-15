@@ -44,6 +44,7 @@ across corpora is run once and shares its outcome.
 from __future__ import annotations
 
 import argparse
+from functools import cmp_to_key
 import hashlib
 import io
 import json
@@ -224,6 +225,9 @@ class Declaration:
     mod_id: str
     version: str = "?"
     depends: tuple[str, ...] = ()
+    # Required dependency ids paired with the loader-declared version range.
+    # `depends` remains the compatibility API used by pack partitioning.
+    requirements: tuple[tuple[str, str], ...] = ()
     breaks: tuple[str, ...] = ()
     content: tuple[tuple[str, str, str], ...] = ()
     # Ids the jar satisfies besides its own: jar-in-jar modules' ids and every
@@ -233,6 +237,68 @@ class Declaration:
     client_only: bool = False
     error: str = ""
 
+
+_MAVEN_SET = re.compile(r"([\[(])\s*([^,\]]*)\s*,\s*([^\])]*)\s*([\])])")
+
+
+def _maven_tokens(version: str) -> tuple[object, ...]:
+    """The useful ComparableVersion ordering for corpus version strings."""
+    value = version.strip().lower().replace("_", "-")
+    tokens: list[object] = []
+    for token in re.findall(r"\d+|[a-z]+", value):
+        tokens.append(int(token) if token.isdigit() else token)
+    return tuple(tokens or [0])
+
+
+def _compare_maven_versions(left: str, right: str) -> int:
+    a, b = _maven_tokens(left), _maven_tokens(right)
+    qualifier_order = {"alpha": 1, "a": 1, "beta": 2, "b": 2, "milestone": 3,
+                       "m": 3, "rc": 4, "cr": 4, "snapshot": 5, "": 6,
+                       "sp": 7}
+    for index in range(max(len(a), len(b))):
+        x = a[index] if index < len(a) else 0
+        y = b[index] if index < len(b) else 0
+        if x == y:
+            continue
+        if isinstance(x, int) and isinstance(y, str):
+            y = qualifier_order.get(y, 8)
+        elif isinstance(x, str) and isinstance(y, int):
+            x = qualifier_order.get(x, 8)
+        elif isinstance(x, str) and isinstance(y, str):
+            x = qualifier_order.get(x, 8)
+            y = qualifier_order.get(y, 8)
+        return 1 if x > y else -1
+    return 0
+
+
+def _maven_interval(version: str, expression: str) -> bool:
+    match = _MAVEN_SET.fullmatch(expression.strip())
+    if not match:
+        return _compare_maven_versions(version, expression.strip()) == 0
+    opening, lower, upper, closing = match.groups()
+    lower, upper = lower.strip(), upper.strip()
+    if lower:
+        comparison = _compare_maven_versions(version, lower)
+        if comparison < 0 or comparison == 0 and opening == "(":
+            return False
+    if upper:
+        comparison = _compare_maven_versions(version, upper)
+        if comparison > 0 or comparison == 0 and closing == ")":
+            return False
+    return True
+
+
+def maven_version_satisfies(version: str, requirement: str | tuple[str, ...]) -> bool:
+    """Match NeoForge's Maven VersionRange syntax. Fabric is oracle-backed."""
+    if isinstance(requirement, (tuple, list)):
+        return any(maven_version_satisfies(version, item) for item in requirement)
+    expression = (requirement or "*").strip()
+    if expression in ("", "*"):
+        return True
+    if expression.startswith(("[", "(")):
+        intervals = re.findall(r"[\[(][^\])]+[\])]", expression)
+        return any(_maven_interval(version, item) for item in intervals) if intervals else False
+    return _maven_interval(version, expression)
 
 def _lenient_json(text: str) -> str:
     """Escape raw control characters inside JSON strings, as the native reader does."""
@@ -267,6 +333,19 @@ def _id_list(value: object) -> tuple[str, ...]:
     return ()
 
 
+def _requirements(value: object) -> tuple[tuple[str, str], ...]:
+    """Return dependency ids with their Fabric version expressions."""
+    if not isinstance(value, dict):
+        return tuple((ident, "*") for ident in _id_list(value))
+    rows = []
+    for ident, requirement in value.items():
+        if isinstance(ident, str):
+            values = requirement if isinstance(requirement, list) else [requirement]
+            values = values or ["*"]
+            rows.extend((ident, str(item) if item is not None else "*") for item in values)
+    return tuple(sorted(set(rows)))
+
+
 def _native_content(raw: bytes) -> tuple[tuple[str, str, str], ...]:
     """Declared registry rows from `META-INF/horizon-native.json`."""
     value = json.loads(_lenient_json(raw.decode("utf-8", errors="replace")))
@@ -297,7 +376,9 @@ def _toml_value(raw: str) -> str:
     return text.split("#", 1)[0].strip()
 
 
-def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, tuple[str, ...], bool]:
+def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[
+    str, str, tuple[str, ...], tuple[tuple[str, str], ...], bool
+]:
     """Bounded NeoForge/Forge metadata: first mod id, required deps, client-only.
 
     The two formats disagree on what a dependency with no flag means. NeoForge's
@@ -309,19 +390,23 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
     """
     ident = version = ""
     required: list[str] = []
+    requirements: list[tuple[str, str]] = []
     client_only = False
     section = "none"
     dependency_id = ""
     dependency_required = neoforge
     dependency_client = False
+    dependency_range = "*"
 
     def flush() -> None:
-        nonlocal dependency_id, dependency_required, dependency_client
+        nonlocal dependency_id, dependency_required, dependency_client, dependency_range
         if dependency_id and dependency_required and not dependency_client:
             required.append(dependency_id)
+            requirements.append((dependency_id, dependency_range or "*"))
         dependency_id = ""
         dependency_required = neoforge
         dependency_client = False
+        dependency_range = "*"
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -358,8 +443,10 @@ def _toml_declarations(text: str, *, neoforge: bool = False) -> tuple[str, str, 
                 dependency_required = value.lower() == "true"
             elif key == "side":
                 dependency_client = value.upper() == "CLIENT"
+            elif key in ("versionRange", "version"):
+                dependency_range = value or "*"
     flush()
-    return ident, version, tuple(sorted(set(required))), client_only
+    return ident, version, tuple(sorted(set(required))), tuple(sorted(set(requirements))), client_only
 
 
 def _nested_ids(jar: zipfile.ZipFile) -> tuple[str, ...]:
@@ -417,22 +504,25 @@ def read_declaration(path: Path) -> Declaration:
                     raise ValueError("fabric.mod.json has no string id")
                 nested = tuple(sorted(set(nested) | set(_id_list(value.get("provides", [])))))
                 depends = _id_list(value.get("depends", {})) + _id_list(value.get("requires", {}))
+                requirements = _requirements(value.get("depends", {}))
+                requirements += _requirements(value.get("requires", {}))
                 breaks = _id_list(value.get("breaks", {})) + _id_list(value.get("conflicts", {}))
                 return Declaration(
                     path, ident, str(value.get("version", "?")),
-                    tuple(sorted(set(depends))), tuple(sorted(set(breaks))),
+                    tuple(sorted(set(depends))), tuple(sorted(set(requirements))),
+                    tuple(sorted(set(breaks))),
                     content, nested,
                     str(value.get("environment", "")).lower() == "client",
                 )
             for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
                 if name in names:
-                    ident, version, depends, client_only = _toml_declarations(
+                    ident, version, depends, requirements, client_only = _toml_declarations(
                         jar.read(name).decode("utf-8", errors="replace"),
                         neoforge=name == "META-INF/neoforge.mods.toml")
                     if not ident:
                         raise ValueError(f"{name} has no modId")
                     return Declaration(
-                        path, ident, version or "?", depends, (), content, nested,
+                        path, ident, version or "?", depends, requirements, (), content, nested,
                         client_only,
                     )
             if nested:
@@ -502,11 +592,15 @@ def load_pack(pack: Path, rows: dict[str, LedgerRow], *, no_metadata: bool = Fal
 
 def _dependency_targets(jar: PackJar, pack_by_id: dict[str, list[PackJar]]) -> list[PackJar]:
     targets: list[PackJar] = []
-    for dependency in jar.declaration.depends:
+    requirements = jar.declaration.requirements or tuple(
+        (dependency, "*") for dependency in jar.declaration.depends
+    )
+    for dependency, requirement in requirements:
         key = dependency.lower()
         if key in PLATFORM_IDS:
             continue
-        targets.extend(pack_by_id.get(key, []))
+        targets.extend(target for target in pack_by_id.get(key, [])
+                       if maven_version_satisfies(target.declaration.version, requirement))
     return targets
 
 
@@ -1510,14 +1604,19 @@ def _provider_index(jars: list[PackJar]) -> dict[str, list[PackJar]]:
         for ident in ids:
             index.setdefault(ident, []).append(jar)
     for ident, providers in index.items():
-        # A jar whose own mod id *is* the dependency is the canonical provider;
-        # then a jar that carries the id as a nested module (fabric-api carries
-        # 44 submodules, but so do mods bundling a single one); only then does
-        # the newest version win.
-        providers.sort(key=lambda jar: (jar.mod_id.lower() == ident,
-                                        len(jar.declaration.nested_ids),
-                                        _version_key(jar.declaration.version), jar.name),
-                       reverse=True)
+        # The loader chooses the newest provider that satisfies the predicate.
+        # Prefer an actual module over a `provides` alias only as a deterministic
+        # tie-break; nested-id count is never a version-selection signal.
+        def compare(left: PackJar, right: PackJar) -> int:
+            own = (left.mod_id.lower() == ident) - (right.mod_id.lower() == ident)
+            if own:
+                return -own
+            version = _compare_maven_versions(left.declaration.version,
+                                               right.declaration.version)
+            if version:
+                return -version
+            return (left.name > right.name) - (left.name < right.name)
+        providers.sort(key=cmp_to_key(compare))
     return index
 
 
@@ -1530,6 +1629,12 @@ def _closure(batch: list[PackJar], index: dict[str, list[PackJar]]) -> list[Pack
     queue = list(batch)
     while queue:
         jar = queue.pop(0)
+        requirements = jar.declaration.requirements or tuple(
+            (dependency, "*") for dependency in jar.declaration.depends
+        )
+        by_id: dict[str, list[str]] = {}
+        for dependency, requirement in requirements:
+            by_id.setdefault(dependency.lower(), []).append(requirement)
         for dependency in jar.declaration.depends:
             key = dependency.lower()
             if key in PLATFORM_IDS or key in ids:
@@ -1537,6 +1642,9 @@ def _closure(batch: list[PackJar], index: dict[str, list[PackJar]]) -> list[Pack
             providers = [provider for provider in index.get(key, [])
                          if provider.path not in chosen
                          and provider.mod_id.lower() not in ids]
+            predicates = tuple(by_id.get(key, ("*",)))
+            providers = [provider for provider in providers
+                         if maven_version_satisfies(provider.declaration.version, predicates)]
             if not providers:
                 continue
             provider = providers[0]

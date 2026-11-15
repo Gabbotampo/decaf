@@ -24,11 +24,131 @@
 use super::*;
 
 const TYPE_TOKEN: &str = "com/google/common/reflect/TypeToken";
-const TOKEN_PREFIX: &str = "typetoken/";
-const CACHE_BUILDER: &str = "guava-cache-builder";
-const LOADER_PREFIX: &str = "guava-cache-loader/";
 /// The captured type a `TypeToken` subclass object keeps, under its marker.
 const RUNTIME_TYPE: &str = "#runtimeTypeLjava/lang/reflect/Type;";
+
+/// The concrete JDK class returned by Guava's no-argument collection
+/// factories, as constructed by Guava 33.6.0.
+pub(crate) fn empty_factory_class(r: &MethodRef) -> Option<&'static str> {
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("com/google/common/collect/Maps", "newHashMap", "()Ljava/util/HashMap;") => {
+            Some("java/util/HashMap")
+        }
+        ("com/google/common/collect/Maps", "newLinkedHashMap", "()Ljava/util/LinkedHashMap;") => {
+            Some("java/util/LinkedHashMap")
+        }
+        (
+            "com/google/common/collect/Maps",
+            "newIdentityHashMap",
+            "()Ljava/util/IdentityHashMap;",
+        ) => Some("java/util/IdentityHashMap"),
+        (
+            "com/google/common/collect/Maps",
+            "newConcurrentMap",
+            "()Ljava/util/concurrent/ConcurrentMap;",
+        ) => Some("java/util/concurrent/ConcurrentHashMap"),
+        ("com/google/common/collect/Lists", "newArrayList", "()Ljava/util/ArrayList;") => {
+            Some("java/util/ArrayList")
+        }
+        ("com/google/common/collect/Lists", "newLinkedList", "()Ljava/util/LinkedList;") => {
+            Some("java/util/LinkedList")
+        }
+        ("com/google/common/collect/Sets", "newHashSet", "()Ljava/util/HashSet;") => {
+            Some("java/util/HashSet")
+        }
+        ("com/google/common/collect/Sets", "newLinkedHashSet", "()Ljava/util/LinkedHashSet;") => {
+            Some("java/util/LinkedHashSet")
+        }
+        ("com/google/common/collect/Sets", "newConcurrentHashSet", "()Ljava/util/Set;") => {
+            Some("java/util/concurrent/ConcurrentHashMap$KeySetView")
+        }
+        ("com/google/common/collect/Sets", "newIdentityHashSet", "()Ljava/util/Set;") => {
+            Some("java/util/Collections$SetFromMap")
+        }
+        _ => None,
+    }
+}
+
+/// Exact Guava expected-size/capacity factories. Negative arguments are
+/// checked before constructing the JDK collection, with Guava's message.
+pub(crate) fn sized_factory_class(
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<&'static str, NativeError>> {
+    let (class, label) = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        (
+            "com/google/common/collect/Maps",
+            "newHashMapWithExpectedSize",
+            "(I)Ljava/util/HashMap;",
+        ) => ("java/util/HashMap", "expectedSize"),
+        (
+            "com/google/common/collect/Maps",
+            "newLinkedHashMapWithExpectedSize",
+            "(I)Ljava/util/LinkedHashMap;",
+        ) => ("java/util/LinkedHashMap", "expectedSize"),
+        (
+            "com/google/common/collect/Lists",
+            "newArrayListWithCapacity",
+            "(I)Ljava/util/ArrayList;",
+        ) => ("java/util/ArrayList", "initialArraySize"),
+        (
+            "com/google/common/collect/Lists",
+            "newArrayListWithExpectedSize",
+            "(I)Ljava/util/ArrayList;",
+        ) => ("java/util/ArrayList", "arraySize"),
+        (
+            "com/google/common/collect/Sets",
+            "newHashSetWithExpectedSize",
+            "(I)Ljava/util/HashSet;",
+        ) => ("java/util/HashSet", "expectedSize"),
+        (
+            "com/google/common/collect/Sets",
+            "newLinkedHashSetWithExpectedSize",
+            "(I)Ljava/util/LinkedHashSet;",
+        ) => ("java/util/LinkedHashSet", "expectedSize"),
+        _ => return None,
+    };
+    let size = match args.first() {
+        Some(Value::Int(size)) => *size,
+        _ => {
+            return Some(Err(NativeError::Metadata(
+                "Guava size argument is not int".into(),
+            )));
+        }
+    };
+    if size < 0 {
+        return Some(Err(NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some(format!("{label} cannot be negative but was: {size}")),
+            frame: None,
+        }));
+    }
+    let backing = if class == "java/util/ArrayList" {
+        if label == "arraySize" {
+            (size as u128)
+                .saturating_add(5)
+                .saturating_add((size / 10) as u128)
+        } else {
+            size as u128
+        }
+    } else {
+        // Guava's Maps.capacity feeds HashMap's tableSizeFor.  The table
+        // starts at one for expected sizes below three, then ceil(n/.75),
+        // and caps at the JDK's maximum table size.
+        let capacity = if size < 3 {
+            (size + 1) as u128
+        } else if size < (1 << 30) {
+            ((size as u128) * 4).div_ceil(3)
+        } else {
+            1u128 << 30
+        };
+        capacity.next_power_of_two()
+    };
+    if backing > crate::runtime::MAX_ARRAY_ELEMENTS as u128 {
+        return Some(Err(crate::runtime::array_bound_error(backing)));
+    }
+    Some(Ok(class))
+}
 
 fn map_ref(name: &str, descriptor: &str) -> MethodRef {
     MethodRef {
@@ -70,14 +190,6 @@ fn boxed_class(primitive: &str) -> Option<&'static str> {
     })
 }
 
-/// Java's `String.hashCode` of `text`, so a token's hash is stable and the
-/// same for equal types.
-fn java_string_hash(text: &str) -> i32 {
-    text.encode_utf16().fold(0i32, |hash, unit| {
-        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
-    })
-}
-
 impl<H: Host> Runtime<'_, H> {
     /// The Guava calls this module answers, or `None`.
     pub(super) fn invoke_guava(
@@ -86,23 +198,68 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(result) = sized_factory_class(r, args) {
+            let class = result?;
+            return Ok(self.host.empty_mutable_collection(class));
+        }
+        if let Some(class) = empty_factory_class(r) {
+            return Ok(self.host.empty_mutable_collection(class));
+        }
+        if let Some((class, values, map)) = self.collection_factory_values(r, args)? {
+            let collection = self.host.empty_mutable_collection(class).ok_or_else(|| {
+                NativeError::Metadata("Guava collection factory has no host collection".into())
+            })?;
+            let (owner, name, descriptor) = if map {
+                (
+                    "java/util/Map",
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                )
+            } else {
+                ("java/util/Collection", "add", "(Ljava/lang/Object;)Z")
+            };
+            if map {
+                for pair in values.as_chunks::<2>().0 {
+                    self.host.invoke_instance(
+                        &MethodRef {
+                            owner: owner.into(),
+                            name: name.into(),
+                            descriptor: descriptor.into(),
+                        },
+                        &collection,
+                        pair,
+                    )?;
+                }
+            } else {
+                for value in values {
+                    self.host.invoke_instance(
+                        &MethodRef {
+                            owner: owner.into(),
+                            name: name.into(),
+                            descriptor: descriptor.into(),
+                        },
+                        &collection,
+                        &[value],
+                    )?;
+                }
+            }
+            return Ok(Some(collection));
+        }
         if let Some(value) = self.invoke_memoized_supplier(r, receiver, args)? {
             return Ok(Some(value));
         }
         if !r.owner.starts_with("com/google/common/")
-            && !receiver
-                .and_then(expect_ref)
-                .is_some_and(|marker| marker.starts_with(TOKEN_PREFIX))
+            && !receiver.is_some_and(|token| crate::runtime::host_type_token::token_type(token).is_some())
         {
             // A jar `TypeToken` subclass object answers through its type even
             // when the call site names the subclass.
             // The receiver's own class decides: a member the subclass does
             // not declare is `TypeToken`'s (`toString` through `Object`).
-            if let Some(marker) = receiver.and_then(expect_ref)
+            if let Some(marker) = receiver.and_then(crate::runtime::jar_object::object_key)
                 && self
                     .fields
                     .contains_key(&format!("{marker}|{TYPE_TOKEN}{RUNTIME_TYPE}"))
-                && let Some((class, _)) = marker.split_once('#')
+                && let Some(class) = crate::runtime::jar_object::key_class(marker)
                 && self
                     .member_owner(class, &r.name, &r.descriptor)
                     .is_some_and(|(owner, jar_owned)| !jar_owned && owner == TYPE_TOKEN)
@@ -123,14 +280,12 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     match value {
-                        Value::Ref(Some(marker)) if self.arrays.contains_key(marker) => {
+                        array if self.owned_array(array).is_some() => {
                             values.extend(self.array(value)?.clone());
                         }
                         other => {
                             let items = runtime_collection_values(&*self.host, other)?;
-                            for item in items {
-                                values.push(parse_collection_value(&item)?);
-                            }
+                            values.extend(items);
                         }
                     }
                 }
@@ -161,10 +316,13 @@ impl<H: Host> Runtime<'_, H> {
                     "(Lcom/google/common/base/Function;)Lcom/google/common/cache/CacheLoader;"
                     | "(Lcom/google/common/base/Supplier;)Lcom/google/common/cache/CacheLoader;",
                 ) => {
-                    let Some(function) = args.first().and_then(expect_ref) else {
+                    let Some(function) = args
+                        .first()
+                        .filter(|function| **function != Value::Ref(None))
+                    else {
                         return Err(thrown("java/lang/NullPointerException", None));
                     };
-                    Ok(Some(Value::Ref(Some(format!("{LOADER_PREFIX}{function}")))))
+                    Ok(Some(crate::runtime::host_guava::cache_loader(function)))
                 }
                 // A jar `CacheLoader` subclass runs its own constructor body.
                 ("<init>", "()V") => Ok(Some(Value::Void)),
@@ -191,6 +349,54 @@ impl<H: Host> Runtime<'_, H> {
             "com/google/common/collect/MapMaker" => self.invoke_map_maker(r, receiver, args),
             _ => Ok(None),
         }
+    }
+
+    /// Materialize the array and map-copy overloads whose elements are owned
+    /// by the interpreter. Iterator/Iterable overloads remain in guava_text,
+    /// where the host already owns their bounded iteration state.
+    fn collection_factory_values(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<(&'static str, Vec<Value>, bool)>, NativeError> {
+        let (class, map, array) = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "com/google/common/collect/Lists",
+                "newArrayList",
+                "([Ljava/lang/Object;)Ljava/util/ArrayList;",
+            ) => ("java/util/ArrayList", false, true),
+            (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "([Ljava/lang/Object;)Ljava/util/HashSet;",
+            ) => ("java/util/HashSet", false, true),
+            (
+                "com/google/common/collect/Maps",
+                "newHashMap",
+                "(Ljava/util/Map;)Ljava/util/HashMap;",
+            ) => ("java/util/HashMap", true, false),
+            (
+                "com/google/common/collect/Maps",
+                "newLinkedHashMap",
+                "(Ljava/util/Map;)Ljava/util/LinkedHashMap;",
+            ) => ("java/util/LinkedHashMap", true, false),
+            _ => return Ok(None),
+        };
+        let source = args
+            .first()
+            .ok_or_else(|| NativeError::Metadata("Guava factory argument is missing".into()))?;
+        if matches!(source, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        if array {
+            return Ok(Some((class, self.array(source)?.clone(), map)));
+        }
+        let values = runtime_collection_values(&*self.host, source)?;
+        Ok(Some((class, values, map)))
     }
 
     /// `ImmutableSet.of(...)` and `ImmutableMap.of(...)`/`ImmutableBiMap.of`,
@@ -323,9 +529,8 @@ impl<H: Host> Runtime<'_, H> {
             Some(value) => value,
             None => {
                 // A jar `Supplier` implementation runs its own `get`.
-                let class = expect_ref(&delegate)
-                    .and_then(|marker| marker.split_once('#'))
-                    .map(|(class, _)| class.to_owned())
+                let class = crate::runtime::jar_object::object_class(&delegate)
+                    .map(str::to_owned)
                     .unwrap_or_default();
                 const GET: &str = "()Ljava/lang/Object;";
                 match self.member_owner(&class, "get", GET) {
@@ -400,31 +605,28 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// The `Type` marker a token names: a `typetoken/` marker's suffix, or
-    /// the type a jar subclass object captured.
-    fn token_type(&self, token: &Value) -> Option<String> {
-        let marker = expect_ref(token)?;
-        if let Some(inner) = marker.strip_prefix(TOKEN_PREFIX) {
-            return Some(inner.to_owned());
+    /// The `Type` marker a token names: a `TypeToken.of` handle's
+    /// (`host_type_token.rs`), or the type a jar subclass object captured.
+    pub(crate) fn token_type(&self, token: &Value) -> Option<Value> {
+        if let Some(inner) = crate::runtime::host_type_token::token_type(token) {
+            return Some(inner);
         }
-        match self
-            .fields
+        let marker = crate::runtime::jar_object::object_key(token)?;
+        self.fields
             .get(&format!("{marker}|{TYPE_TOKEN}{RUNTIME_TYPE}"))
-        {
-            Some(Value::Ref(Some(inner))) => Some(inner.clone()),
-            _ => None,
-        }
+            .filter(|inner| crate::runtime::host_gson_type::any_node(inner).is_some())
+            .cloned()
     }
 
-    fn token_value(inner: &str) -> Value {
-        Value::Ref(Some(format!("{TOKEN_PREFIX}{inner}")))
+    fn token_value(inner: &Value) -> Value {
+        crate::runtime::host_type_token::token(inner)
     }
 
-    /// The raw class a type marker erases to.
-    fn raw_class(inner: &str) -> String {
-        match decode_generic_type(inner) {
-            Some(GenericType::Parameterized { raw, .. }) => raw,
-            Some(GenericType::Wildcard { upper, .. }) => upper.first().map_or_else(
+    /// The raw class a type erases to.
+    fn raw_class(node: &GenericType) -> String {
+        match node {
+            GenericType::Parameterized { raw, .. } => raw.clone(),
+            GenericType::Wildcard { upper, .. } => upper.first().map_or_else(
                 || "java/lang/Object".to_owned(),
                 |bound| match bound {
                     GenericType::Class(name) => name.clone(),
@@ -432,20 +634,19 @@ impl<H: Host> Runtime<'_, H> {
                     _ => "java/lang/Object".to_owned(),
                 },
             ),
-            Some(GenericType::Variable { bounds, .. }) => bounds.first().map_or_else(
-                || "java/lang/Object".to_owned(),
-                |bound| match bound {
-                    GenericType::Class(name) => name.clone(),
-                    GenericType::Parameterized { raw, .. } => raw.clone(),
-                    _ => "java/lang/Object".to_owned(),
-                },
-            ),
-            Some(GenericType::Class(name)) => name,
-            None => inner.to_owned(),
+            // A variable's erasure is its first bound's, which its declaration
+            // holds; the model keeps `Object` (as it did for a use-site
+            // variable, whose bounds were never written).
+            GenericType::Variable { .. } => "java/lang/Object".to_owned(),
+            GenericType::Array(component) => match component.as_ref() {
+                GenericType::Parameterized { raw, .. } => format!("[L{raw};"),
+                _ => "[Ljava/lang/Object;".to_owned(),
+            },
+            GenericType::Class(name) => name.clone(),
         }
     }
 
-    fn invoke_type_token(
+    pub(crate) fn invoke_type_token(
         &mut self,
         r: &MethodRef,
         receiver: Option<&Value>,
@@ -457,26 +658,39 @@ impl<H: Host> Runtime<'_, H> {
                 "(Ljava/lang/Class;)Lcom/google/common/reflect/TypeToken;"
                 | "(Ljava/lang/reflect/Type;)Lcom/google/common/reflect/TypeToken;",
             ) => {
-                let Some(inner) = args.first().and_then(expect_ref) else {
+                let Some(inner) = args.first().filter(|value| **value != Value::Ref(None)) else {
                     return Err(thrown("java/lang/NullPointerException", None));
                 };
+                // A `Type` the model holds: a `Class`, a JDK or a Gson node;
+                // anything else (a jar's own `Type`) counted. Text is never a
+                // `Type` (#156 P13c): a `(Type)` cast of a String throws first.
+                let modelled = crate::runtime::host_gson_type::any_node(inner).is_some();
+                if !modelled {
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
                 return Ok(Some(Self::token_value(inner)));
             }
             // `new TypeToken<T>() {}`: the anonymous subclass's generic
             // superclass names `T`. A subclass that does not parameterize
             // `TypeToken` is Guava's "must be parameterized" error.
             ("<init>", "()V") => {
-                let Some(marker) = receiver.and_then(expect_ref).cloned() else {
+                let Some(marker) = receiver
+                    .and_then(crate::runtime::jar_object::object_key)
+                    .map(str::to_owned)
+                else {
                     return Ok(None);
                 };
-                let Some((class, _)) = marker.split_once('#') else {
+                let Some(class) = crate::runtime::jar_object::key_class(&marker) else {
                     return Ok(None);
                 };
+                let scope = crate::runtime::reflect_generic::class_scope(class, self.class(class));
                 let captured = self
                     .class(class)
                     .and_then(ClassFile::class_signature)
                     .as_deref()
-                    .and_then(crate::runtime::reflect_generic::parse_class_signature)
+                    .and_then(|signature| {
+                        crate::runtime::reflect_generic::parse_class_signature(signature, scope)
+                    })
                     .and_then(|(superclass, _)| match superclass {
                         GenericType::Parameterized { raw, args, .. } if raw == TYPE_TOKEN => {
                             args.into_iter().next()
@@ -489,6 +703,7 @@ impl<H: Host> Runtime<'_, H> {
                         Some(format!("{} isn't parameterized", class.replace('/', "."))),
                     ));
                 };
+                // The `Type` itself, as Guava's `runtimeType` field holds it.
                 self.fields.insert(
                     format!("{marker}|{TYPE_TOKEN}{RUNTIME_TYPE}"),
                     generic_type_value(&captured),
@@ -500,38 +715,74 @@ impl<H: Host> Runtime<'_, H> {
         let Some(inner) = receiver.and_then(|token| self.token_type(token)) else {
             return Ok(None);
         };
+        let Some(node) = crate::runtime::host_gson_type::any_node(&inner) else {
+            return Ok(None);
+        };
+        let class = match &node {
+            GenericType::Class(name) => Some(name.as_str()),
+            _ => None,
+        };
         Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-            ("getType", "()Ljava/lang/reflect/Type;") => Value::Ref(Some(inner)),
-            ("getRawType", "()Ljava/lang/Class;") => Value::Ref(Some(Self::raw_class(&inner))),
+            // `runtimeType`: the very `Type` the token was made from.
+            ("getType", "()Ljava/lang/reflect/Type;") => inner.clone(),
+            ("getRawType", "()Ljava/lang/Class;") => {
+                crate::runtime::host_class::class_value(&Self::raw_class(&node))
+            }
             ("wrap", "()Lcom/google/common/reflect/TypeToken;") => {
-                Self::token_value(boxed_class(&inner).unwrap_or(&inner))
+                match class.and_then(boxed_class) {
+                    Some(boxed) => Self::token_value(&crate::runtime::host_class::class_value(boxed)),
+                    None => receiver.cloned().unwrap_or(Value::Ref(None)),
+                }
             }
             ("unwrap", "()Lcom/google/common/reflect/TypeToken;") => {
                 let primitive = [
                     "boolean", "byte", "char", "short", "int", "long", "float", "double", "void",
                 ]
                 .into_iter()
-                .find(|primitive| boxed_class(primitive) == Some(inner.as_str()));
-                Self::token_value(primitive.unwrap_or(&inner))
-            }
-            ("isPrimitive", "()Z") => Value::Int(i32::from(boxed_class(&inner).is_some())),
-            ("isArray", "()Z") => Value::Int(i32::from(inner.starts_with('['))),
-            ("getComponentType", "()Lcom/google/common/reflect/TypeToken;") => {
-                match inner.strip_prefix('[') {
-                    Some(element) => Self::token_value(&erased_field_type(element)),
-                    None => Value::Ref(None),
+                .find(|primitive| class.is_some() && boxed_class(primitive) == class);
+                match primitive {
+                    Some(primitive) => {
+                        Self::token_value(&crate::runtime::host_class::class_value(primitive))
+                    }
+                    None => receiver.cloned().unwrap_or(Value::Ref(None)),
                 }
             }
+            ("isPrimitive", "()Z") => Value::Int(i32::from(class.and_then(boxed_class).is_some())),
+            ("isArray", "()Z") => Value::Int(i32::from(
+                class.is_some_and(|name| name.starts_with('['))
+                    || matches!(node, GenericType::Array(_)),
+            )),
+            ("getComponentType", "()Lcom/google/common/reflect/TypeToken;") => match &node {
+                GenericType::Class(name) => match name.strip_prefix('[') {
+                    Some(element) => Self::token_value(&crate::runtime::host_class::class_value(
+                        &erased_field_type(element),
+                    )),
+                    None => Value::Ref(None),
+                },
+                GenericType::Array(component) => Self::token_value(&generic_type_value(component)),
+                _ => Value::Ref(None),
+            },
+            // `runtimeType.equals(that.runtimeType)` for another token;
+            // `false` for anything that is not one. Two types the model
+            // cannot compare are counted.
             ("equals", "(Ljava/lang/Object;)Z") => {
-                let other = args.first().and_then(|value| self.token_type(value));
-                Value::Int(i32::from(other.as_deref() == Some(inner.as_str())))
+                let other = args
+                    .first()
+                    .ok_or_else(|| thrown("java/lang/NullPointerException", None))?;
+                let equal = match self.token_type(other) {
+                    Some(theirs) => crate::runtime::host_type_token::types_equal(&inner, &theirs),
+                    None if crate::runtime::jar_object::object_key(other).is_some() => None,
+                    None => Some(false),
+                };
+                match equal {
+                    Some(equal) => Value::Int(i32::from(equal)),
+                    None => return self.host.unknown_operand_call(r).map(Some),
+                }
             }
-            ("hashCode", "()I") => Value::Int(java_string_hash(&inner)),
+            // `runtimeType.hashCode()`: a class's identity hash.
+            ("hashCode", "()I") => return self.host.unknown_operand_call(r).map(Some),
             ("toString", "()Ljava/lang/String;") => {
-                Value::Ref(Some(decode_generic_type(&inner).map_or_else(
-                    || class_type_display(&inner),
-                    |node| generic_type_display(&node),
-                )))
+                Value::Ref(Some(crate::runtime::host_type_token::guava_type_text(&node)))
             }
             (
                 "isSubtypeOf" | "isSupertypeOf",
@@ -539,15 +790,13 @@ impl<H: Host> Runtime<'_, H> {
             ) => {
                 let other = args
                     .first()
-                    .and_then(|value| {
-                        self.token_type(value)
-                            .or_else(|| expect_ref(value).cloned())
-                    })
+                    .and_then(|value| self.token_type(value).or_else(|| Some(value.clone())))
+                    .and_then(|value| crate::runtime::host_gson_type::any_node(&value))
                     .ok_or_else(|| thrown("java/lang/NullPointerException", None))?;
                 let (sub, sup) = if r.name == "isSubtypeOf" {
-                    (Self::raw_class(&inner), Self::raw_class(&other))
+                    (Self::raw_class(&node), Self::raw_class(&other))
                 } else {
-                    (Self::raw_class(&other), Self::raw_class(&inner))
+                    (Self::raw_class(&other), Self::raw_class(&node))
                 };
                 // Raw assignability; type arguments are not compared.
                 Value::Int(i32::from(
@@ -564,12 +813,15 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // A fresh builder per `newBuilder()`/`from(spec)` (`host_guava.rs`).
         if r.name == "newBuilder" || r.name == "from" {
-            return Ok(Some(Value::Ref(Some(CACHE_BUILDER.into()))));
+            let marker = self.new_object("guava-cache-builder");
+            return Ok(Some(crate::runtime::host_guava::cache_builder(marker)));
         }
-        if receiver.and_then(expect_ref).map(String::as_str) != Some(CACHE_BUILDER) {
+        let Some(builder) = receiver.filter(|builder| crate::runtime::host_guava::is_cache_builder(builder))
+        else {
             return Ok(None);
-        }
+        };
         if r.name == "build" {
             let Some(cache) = self.host.empty_mutable_collection("map") else {
                 return Ok(None);
@@ -584,26 +836,22 @@ impl<H: Host> Runtime<'_, H> {
             }
             return Ok(Some(cache));
         }
-        // Size, expiry, reference strength, listeners and stats settings keep
-        // the builder.
+        // Size, expiry, reference strength, listeners and stats settings
+        // answer the builder itself.
         Ok(r.descriptor
             .ends_with(")Lcom/google/common/cache/CacheBuilder;")
-            .then(|| Value::Ref(Some(CACHE_BUILDER.into()))))
+            .then(|| builder.clone()))
     }
 
     /// Run a cache's loader for `key`.
     fn cache_load(&mut self, loader: &Value, key: &Value) -> Result<Value, NativeError> {
-        if let Some(function) =
-            expect_ref(loader).and_then(|marker| marker.strip_prefix(LOADER_PREFIX))
-        {
-            let function = Value::Ref(Some(function.to_owned()));
+        if let Some(function) = crate::runtime::host_guava::cache_loader_function(loader) {
             return Ok(self
                 .invoke_callback(&function, std::slice::from_ref(key))?
                 .unwrap_or(Value::Ref(None)));
         }
-        let class = expect_ref(loader)
-            .and_then(|marker| marker.split_once('#'))
-            .map(|(class, _)| class.to_owned())
+        let class = crate::runtime::jar_object::object_class(loader)
+            .map(str::to_owned)
             .unwrap_or_default();
         const LOAD: &str = "(Ljava/lang/Object;)Ljava/lang/Object;";
         match self.member_owner(&class, "load", LOAD) {
@@ -791,10 +1039,7 @@ impl<H: Host> Runtime<'_, H> {
             let set =
                 this.host
                     .invoke_instance(&map_ref("keySet", "()Ljava/util/Set;"), &map, &[])?;
-            runtime_collection_values(&*this.host, &set)?
-                .iter()
-                .map(|item| parse_collection_value(item))
-                .collect()
+            runtime_collection_values(&*this.host, &set)
         };
         Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
             ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
@@ -864,9 +1109,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut all = Vec::new();
                 for key in keys(self)? {
                     let collection = self.host.invoke_instance(&get, &map, &[key])?;
-                    for item in runtime_collection_values(&*self.host, &collection)? {
-                        all.push(parse_collection_value(&item)?);
-                    }
+                    all.extend(runtime_collection_values(&*self.host, &collection)?);
                 }
                 collection_value("list", &all)
             }
@@ -910,7 +1153,7 @@ impl<H: Host> Runtime<'_, H> {
             ));
         };
         let marker = marker.to_owned();
-        let answer = || Ok(Some(Value::Ref(Some(marker.clone()))));
+        let answer = || Ok(Some(crate::runtime::jar_object::stored_value(&marker)));
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("<init>", "()V") => Ok(Some(Value::Void)),
             ("initialCapacity" | "concurrencyLevel", "(I)Lcom/google/common/collect/MapMaker;") => {

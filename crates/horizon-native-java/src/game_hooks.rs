@@ -8,9 +8,11 @@
 //!
 //! - **Identity.** The host describes each object it passes as a
 //!   [`GameObject`]: its vanilla class, entity id, UUID, name, position and the
-//!   few other facts it already knows at the hook point. The interpreter sees a
-//!   stable marker (`game/player/<uuid>`, `game/entity/<id>`, `game/server`),
-//!   so the same entity is the same object at every firing.
+//!   few other facts it already knows at the hook point. The interpreter sees
+//!   a game handle (#156 P16e, `game_object.rs`) keyed as the server's own
+//!   objects are (`game/player/<uuid>/<session>.<life>/<id>`,
+//!   `game/entity/<id>`, `game/server`), so the same entity is the same object
+//!   at every firing and in every tier, and a respawned player is a new one.
 //! - **Members.** A call on a marker answers from that description when the
 //!   member is one this module models (`getUUID`, `getId`, `getX`,
 //!   `getScoreboardName`, `level`, `getServer`...). Any other member, any
@@ -19,8 +21,8 @@
 //!   what to do; nothing answers a neutral value the game never produced.
 //! - **Mixin state.** Fields a Mixin class adds to its target (`shogi$cooldowns`)
 //!   live in a [`GameHookState`] the host keeps per jar, keyed by the object's
-//!   marker, so a value a callback stores on a player is there at the player's
-//!   next tick. The Mixin class's no-argument constructor runs once per object,
+//!   handle key, so a value a callback stores on a player is there at the
+//!   player's next tick, and gone after a respawn (a new `ServerPlayer`). The Mixin class's no-argument constructor runs once per object,
 //!   the first time a callback of that class sees it, which is where `javac`
 //!   puts the field initialisers Mixin would merge into the target.
 //!
@@ -111,6 +113,11 @@ pub struct GameObject {
     /// an empty hand is `("minecraft:air", 0)`, as vanilla's `ItemStack.EMPTY`.
     pub main_hand: Option<(String, i32)>,
     pub off_hand: Option<(String, i32)>,
+    /// A player's session (logins) and life (respawns) on this server, as
+    /// the bridge counts them (`events::FacadePlayer`): one `ServerPlayer`
+    /// object each. `None` for a player the host does not count, whose key
+    /// names no session (comparisons counted).
+    pub incarnation: Option<(u32, u32)>,
 }
 
 impl GameObject {
@@ -133,16 +140,18 @@ impl GameObject {
             address: None,
             main_hand: None,
             off_hand: None,
+            incarnation: None,
         }
     }
 
-    /// A server player, keyed by UUID so it is the same object after a
-    /// respawn, as the player's data is.
+    /// A server player. Give it [`Self::with_incarnation`] and
+    /// [`Self::with_entity_id`]: a respawn builds a new `ServerPlayer`, which
+    /// is a new object with fresh Mixin state.
     pub fn player(uuid: u128, name: &str) -> Self {
         let mut object = Self::new(
             GameObjectKind::Player,
             "net/minecraft/server/level/ServerPlayer",
-            uuid_text_of(uuid),
+            format!("{uuid:032x}"),
         );
         object.uuid = Some(uuid);
         object.name = Some(name.to_owned());
@@ -209,7 +218,7 @@ impl GameObject {
         } else {
             "net/minecraft/server/MinecraftServer"
         };
-        let mut object = Self::new(GameObjectKind::Server, class, "main".to_owned());
+        let mut object = Self::new(GameObjectKind::Server, class, String::new());
         object.dedicated = Some(dedicated);
         object
     }
@@ -231,7 +240,7 @@ impl GameObject {
         let mut object = Self::new(
             GameObjectKind::Item,
             "net/minecraft/world/item/Item",
-            id.replace([':', '/'], "_"),
+            id.to_owned(),
         );
         object.type_id = Some(id.to_owned());
         object
@@ -247,6 +256,11 @@ impl GameObject {
         )
     }
 
+    /// A player's session and life (`events::FacadePlayer`).
+    pub fn with_incarnation(mut self, session: u32, life: u32) -> Self {
+        self.incarnation = Some((session, life));
+        self
+    }
     pub fn with_entity_id(mut self, id: i32) -> Self {
         self.entity_id = Some(id);
         self
@@ -290,20 +304,37 @@ impl GameObject {
         self
     }
 
-    /// The marker the interpreter sees for this object.
+    /// The key of this object's game handle, as the server's tiers key the
+    /// same object (`game_object.rs`): a player by UUID, session, life and
+    /// id; any entity by id; an item type by registry id.
     pub fn marker(&self) -> String {
-        let kind = match self.kind {
-            GameObjectKind::Player => "player",
-            GameObjectKind::Living | GameObjectKind::Entity => "entity",
-            GameObjectKind::ItemEntity => "item",
-            GameObjectKind::ItemStack => "stack",
-            GameObjectKind::Level => "level",
-            GameObjectKind::Server => "server",
-            GameObjectKind::Profile => "profile",
-            GameObjectKind::Item => "itemtype",
-            GameObjectKind::Opaque => "opaque",
-        };
-        format!("{GAME_OBJECT_PREFIX}{kind}/{}", self.key)
+        let key = &self.key;
+        match self.kind {
+            GameObjectKind::Player => match (self.incarnation, self.entity_id) {
+                (Some((session, life)), Some(id)) => {
+                    format!("{GAME_OBJECT_PREFIX}player/{key}/{session}.{life}/{id}")
+                }
+                (Some((session, life)), None) => {
+                    format!("{GAME_OBJECT_PREFIX}player/{key}/{session}.{life}")
+                }
+                (None, _) => format!("{GAME_OBJECT_PREFIX}player/{key}"),
+            },
+            GameObjectKind::Living | GameObjectKind::Entity | GameObjectKind::ItemEntity => {
+                format!("{GAME_OBJECT_PREFIX}entity/{key}")
+            }
+            GameObjectKind::ItemStack => format!("{GAME_OBJECT_PREFIX}stack/{key}"),
+            GameObjectKind::Level => format!("{GAME_OBJECT_PREFIX}level/{key}"),
+            GameObjectKind::Server => format!("{GAME_OBJECT_PREFIX}server"),
+            GameObjectKind::Profile => format!("{GAME_OBJECT_PREFIX}profile/{key}"),
+            GameObjectKind::Item => format!("{GAME_OBJECT_PREFIX}item/{key}"),
+            GameObjectKind::Opaque => format!("{GAME_OBJECT_PREFIX}opaque/{key}"),
+        }
+    }
+
+    /// The game handle a callback receives for this object (#156 P16e).
+    pub fn value(&self) -> Value {
+        let marker = self.marker();
+        crate::game_object::value(&marker).unwrap_or(Value::Ref(Some(marker)))
     }
 
     /// The vanilla classes this object is an instance of, most specific
@@ -380,11 +411,11 @@ impl GameHookContext {
         self.server = facts;
     }
 
-    /// Add `object` and answer the value a callback receives for it.
+    /// Add `object` and answer the game handle a callback receives for it.
     pub fn insert(&mut self, object: GameObject) -> Value {
-        let marker = object.marker();
-        self.objects.insert(marker.clone(), object);
-        Value::Ref(Some(marker))
+        let value = object.value();
+        self.objects.insert(object.marker(), object);
+        value
     }
 
     /// The object a marker names in this firing.
@@ -464,9 +495,30 @@ struct MixinModel {
     /// `class#name descriptor` (the interpreter's field-key suffix) of every
     /// `@Shadow` field of a Mixin class.
     shadow_fields: BTreeSet<String>,
+    /// Mixin class that extends a game class (`abstract class M extends
+    /// Player`) → the fields (`name descriptor`) its own chain declares: any
+    /// other field it reads or writes as `M#field` is the game superclass's.
+    game_heirs: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// How far a Mixin class's own superclass chain is followed.
+const MAX_HEIR_CHAIN: usize = 32;
+
 impl MixinModel {
+    /// Whether the field key suffix `owner#name descriptor` names a field of
+    /// the game object itself: a game class's, or one a Mixin class inherits
+    /// from the game class it extends. The model holds none of them.
+    fn game_field(&self, field: &str) -> bool {
+        let Some((owner, member)) = field.split_once('#') else {
+            return false;
+        };
+        is_game_class(owner)
+            || self
+                .game_heirs
+                .get(owner)
+                .is_some_and(|declared| !declared.contains(member))
+    }
+
     fn build(classes: &BTreeMap<String, ClassFile>) -> Self {
         let mut model = Self::default();
         for (name, class) in classes {
@@ -495,6 +547,26 @@ impl MixinModel {
             model
                 .interfaces
                 .insert(name.clone(), class.interface_names());
+            // The fields this class's own chain declares, if that chain
+            // leaves the jar at a game class.
+            let mut declared = BTreeSet::new();
+            let mut current = Some(class);
+            let mut exit = String::new();
+            for _ in 0..MAX_HEIR_CHAIN {
+                let Some(file) = current else {
+                    break;
+                };
+                declared.extend(
+                    file.fields
+                        .iter()
+                        .map(|field| format!("{}{}", field.name, field.descriptor)),
+                );
+                exit = file.super_name.clone();
+                current = classes.get(&exit);
+            }
+            if current.is_none() && is_game_class(&exit) {
+                model.game_heirs.insert(name.clone(), declared);
+            }
             let (fields, methods) = member_annotations(class).unwrap_or_default();
             for (member, descriptors) in fields {
                 if descriptors.iter().any(|d| d == MIXIN_SHADOW_DESCRIPTOR) {
@@ -609,22 +681,41 @@ fn is_game_class(owner: &str) -> bool {
 /// field initialiser). A factory that takes elements or an expected size is
 /// not listed and stays an unknown call.
 fn empty_collection_factory(r: &MethodRef) -> Option<&'static str> {
-    if !r.descriptor.starts_with("()") {
-        return None;
-    }
-    match (r.owner.as_str(), r.name.as_str()) {
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("com/google/common/collect/Maps", "newHashMap", "()Ljava/util/HashMap;") => {
+            Some("java/util/HashMap")
+        }
+        ("com/google/common/collect/Maps", "newLinkedHashMap", "()Ljava/util/LinkedHashMap;") => {
+            Some("java/util/LinkedHashMap")
+        }
         (
             "com/google/common/collect/Maps",
-            "newHashMap" | "newLinkedHashMap" | "newConcurrentMap",
-        ) => Some("map"),
+            "newIdentityHashMap",
+            "()Ljava/util/IdentityHashMap;",
+        ) => Some("java/util/IdentityHashMap"),
         (
-            "com/google/common/collect/Lists",
-            "newArrayList" | "newLinkedList" | "newCopyOnWriteArrayList",
-        ) => Some("list"),
-        (
-            "com/google/common/collect/Sets",
-            "newHashSet" | "newLinkedHashSet" | "newConcurrentHashSet",
-        ) => Some("set"),
+            "com/google/common/collect/Maps",
+            "newConcurrentMap",
+            "()Ljava/util/concurrent/ConcurrentMap;",
+        ) => Some("java/util/concurrent/ConcurrentHashMap"),
+        ("com/google/common/collect/Lists", "newArrayList", "()Ljava/util/ArrayList;") => {
+            Some("java/util/ArrayList")
+        }
+        ("com/google/common/collect/Lists", "newLinkedList", "()Ljava/util/LinkedList;") => {
+            Some("java/util/LinkedList")
+        }
+        ("com/google/common/collect/Sets", "newHashSet", "()Ljava/util/HashSet;") => {
+            Some("java/util/HashSet")
+        }
+        ("com/google/common/collect/Sets", "newLinkedHashSet", "()Ljava/util/LinkedHashSet;") => {
+            Some("java/util/LinkedHashSet")
+        }
+        ("com/google/common/collect/Sets", "newConcurrentHashSet", "()Ljava/util/Set;") => {
+            Some("java/util/concurrent/ConcurrentHashMap$KeySetView")
+        }
+        ("com/google/common/collect/Sets", "newIdentityHashSet", "()Ljava/util/Set;") => {
+            Some("java/util/Collections$SetFromMap")
+        }
         _ => None,
     }
 }
@@ -653,11 +744,6 @@ fn is_host_value_class(owner: &str) -> bool {
         "net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type"
             | "net/minecraft/world/level/storage/LevelResource"
     )
-}
-
-/// A value marker the bootstrap host built and models the members of.
-fn is_host_value_marker(marker: &str) -> bool {
-    marker.starts_with("component/") || marker.starts_with("uuid/")
 }
 
 fn uuid_text_of(uuid: u128) -> String {
@@ -707,15 +793,12 @@ impl<H: Host> GameHookHost<'_, H> {
         r: &MethodRef,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        // `Object`'s own members hold for every object, live or not.
-        match (r.name.as_str(), r.descriptor.as_str()) {
-            ("<init>", "()V") if r.owner == "java/lang/Object" => return Ok(Value::Void),
-            ("hashCode", "()I") => return Ok(Value::Int(stable_hash(marker))),
-            ("equals", "(Ljava/lang/Object;)Z") => {
-                let other = args.first().and_then(expect_ref);
-                return Ok(Value::Int(i32::from(other.is_some_and(|o| o == marker))));
-            }
-            _ => {}
+        // `Object`'s `equals`, `hashCode` and `toString` are the handle
+        // kind's (`game_object.rs`: an entity by its id), answered before here.
+        if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
+            == ("java/lang/Object", "<init>", "()V")
+        {
+            return Ok(Value::Void);
         }
         let object = self.object(marker)?;
         let fact = |value: Option<Value>| value.ok_or_else(|| unmodelled(marker, r));
@@ -730,11 +813,6 @@ impl<H: Host> GameHookHost<'_, H> {
         let player = object.kind == GameObjectKind::Player;
         let string = |text: &str| Value::Ref(Some(text.to_owned()));
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("toString", "()Ljava/lang/String;") => Ok(string(&format!(
-                "{}[{}]",
-                object.class.rsplit('/').next().unwrap_or_default(),
-                object.name.as_deref().unwrap_or(&object.key)
-            ))),
             ("getId", "()I") if entity => fact(object.entity_id.map(Value::Int)),
             // `permissions()`: the player's level's permission set.
             ("permissions", _) if player && object.uuid.is_some() => {
@@ -775,16 +853,24 @@ impl<H: Host> GameHookHost<'_, H> {
             ("getName" | "getDisplayName", "()Lnet/minecraft/network/chat/Component;")
                 if entity =>
             {
-                fact(
-                    object
-                        .name
-                        .as_deref()
-                        .map(|name| Value::Ref(Some(format!("component/literal/{name}")))),
-                )
+                fact(object.name.as_deref().map(crate::host_component::literal))
             }
             ("sendSystemMessage", "(Lnet/minecraft/network/chat/Component;)V") if player => {
                 let uuid = object.uuid.ok_or_else(|| unmodelled(marker, r))?;
-                let text = args.first().map(component_text).unwrap_or_default();
+                // The component as it is when sent (`host_component.rs`).
+                let text = match args.first() {
+                    Some(value) => {
+                        match crate::facade_text::json_now(value, self.inner.component_states()) {
+                            Some(json) => crate::facade_text::plain(&json),
+                            // A component no read resolves (past the bound, a cycle).
+                            None if crate::host_component::is_component(value) => {
+                                return Err(unmodelled(marker, r));
+                            }
+                            None => crate::game_object::text(value).cloned().unwrap_or_default(),
+                        }
+                    }
+                    None => String::new(),
+                };
                 self.context
                     .effects
                     .push(GameHookEffect::SystemMessage { player: uuid, text });
@@ -810,9 +896,9 @@ impl<H: Host> GameHookHost<'_, H> {
                     .objects
                     .values()
                     .find(|o| o.kind == GameObjectKind::Server)
-                    .map(GameObject::marker)
+                    .map(GameObject::value)
                     .ok_or_else(|| unmodelled(marker, r))?;
-                Ok(Value::Ref(Some(server)))
+                Ok(server)
             }
             ("isClientSide", "()Z") if object.kind == GameObjectKind::Level => Ok(Value::Int(0)),
             ("isDedicatedServer", "()Z") if object.kind == GameObjectKind::Server => {
@@ -970,46 +1056,14 @@ impl<H: Host> GameHookHost<'_, H> {
                 }),
             );
         }
-        // An `Identifier` value: its text and parts, as vanilla prints them.
-        if let Some(id) = text.strip_prefix("identifier/")
-            && let Some((namespace, path)) = id.split_once(':')
-        {
-            let answer = match (r.name.as_str(), r.descriptor.as_str()) {
-                ("toString", "()Ljava/lang/String;") => Value::Ref(Some(id.to_owned())),
-                ("getNamespace", "()Ljava/lang/String;") => Value::Ref(Some(namespace.to_owned())),
-                ("getPath", "()Ljava/lang/String;") => Value::Ref(Some(path.to_owned())),
-                // `Identifier.hashCode`: `31 * namespace.hashCode() + path.hashCode()`.
-                ("hashCode", "()I") => Value::Int(
-                    stable_hash(namespace)
-                        .wrapping_mul(31)
-                        .wrapping_add(stable_hash(path)),
-                ),
-                ("equals", "(Ljava/lang/Object;)Z") => Value::Int(i32::from(
-                    args.first().and_then(expect_ref).is_some_and(|o| o == text),
-                )),
-                _ => return None,
-            };
-            return Some(Ok(answer));
-        }
-        // `BuiltInRegistries.ITEM.getKey(item)` for an item the firing names.
-        if text == "registry/minecraft:item"
-            && r.name == "getKey"
-            && r.descriptor == "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;"
-        {
-            let id = args
-                .first()
-                .and_then(Self::is_game_object)
-                .and_then(|item| self.context.object(item))
-                .filter(|item| item.kind == GameObjectKind::Item)
-                .and_then(|item| item.type_id.clone())?;
-            return Some(Ok(identifier_parse(&id)));
-        }
         let address = text.strip_prefix(SOCKET_ADDRESS)?;
         Some(match (r.name.as_str(), r.descriptor.as_str()) {
             ("toString", "()Ljava/lang/String;") => Ok(Value::Ref(Some(address.to_owned()))),
             ("hashCode", "()I") => Ok(Value::Int(stable_hash(address))),
             ("equals", "(Ljava/lang/Object;)Z") => Ok(Value::Int(i32::from(
-                args.first().and_then(expect_ref).is_some_and(|o| o == text),
+                args.first()
+                    .and_then(crate::game_object::text)
+                    .is_some_and(|o| o == text),
             ))),
             _ => Err(NativeError::Metadata(format!(
                 "game hook value {text} does not model {}#{}{}",
@@ -1019,7 +1073,7 @@ impl<H: Host> GameHookHost<'_, H> {
     }
 
     fn is_game_object(value: &Value) -> Option<&str> {
-        expect_ref(value)
+        crate::game_object::text(value)
             .map(String::as_str)
             .filter(|marker| marker.starts_with(GAME_OBJECT_PREFIX))
     }
@@ -1032,6 +1086,319 @@ fn is_fabric_event_invoker(value: &Value) -> bool {
 }
 
 impl<H: Host> Host for GameHookHost<'_, H> {
+    // Every member the bootstrap host answers is forwarded to it, so a callback's collections,
+    // hash tables, iterators, console and counted operands behave as an entrypoint's do (#246's
+    // review: the trait defaults answered silently here, a respawned player's two lives were two
+    // `HashSet` entries, a player printed as `null`). The members below these forwards are this
+    // tier's own: game objects, `@Shadow` members and the calls only the hook point answers.
+    fn neoforge_attachments(
+        &mut self,
+    ) -> Option<(
+        &mut neoforge_attachments::AttachmentState,
+        &mut BTreeMap<String, usize>,
+    )> {
+        self.inner.neoforge_attachments()
+    }
+
+    fn clone_original_of(&self, text: &str) -> Option<u128> {
+        self.inner.clone_original_of(text)
+    }
+
+    fn neoforge_bus(
+        &mut self,
+    ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
+        self.inner.neoforge_bus()
+    }
+
+    fn neoforge_imc(
+        &mut self,
+    ) -> Option<(&mut neoforge_imc::ImcHandle, &mut BTreeMap<String, usize>)> {
+        self.inner.neoforge_imc()
+    }
+
+    fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        self.inner.unknown_operand_call(r)
+    }
+
+    fn modelled_to_string(&mut self, value: &Value) -> Option<String> {
+        self.inner.modelled_to_string(value)
+    }
+
+    fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
+        self.inner.mutable_collection_entries(value)
+    }
+
+    fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        self.inner.replace_mutable_collection(value, values)
+    }
+
+    fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
+        self.inner.unmodifiable_view_source(marker)
+    }
+
+    fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {
+        self.inner.unmodifiable_list_view_as(class, source)
+    }
+
+    fn has_mutable_collection(&self, marker: &str) -> bool {
+        self.inner.has_mutable_collection(marker)
+    }
+
+    fn collection_generation(&self, marker: &str) -> Option<u64> {
+        self.inner.collection_generation(marker)
+    }
+
+    fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
+        self.inner.collection_slice(marker)
+    }
+
+    fn collection_vec_mut(&mut self, marker: &str) -> Option<&mut Vec<Value>> {
+        self.inner.collection_vec_mut(marker)
+    }
+
+    fn take_hash_table(&mut self, marker: &str) -> Option<hash_table::HashTable> {
+        self.inner.take_hash_table(marker)
+    }
+
+    fn store_hash_table(&mut self, marker: &str, table: hash_table::HashTable) {
+        self.inner.store_hash_table(marker, table)
+    }
+
+    fn collection_comparator(&self, marker: &str) -> Option<Value> {
+        self.inner.collection_comparator(marker)
+    }
+
+    fn set_collection_comparator(&mut self, marker: &str, comparator: Value) {
+        self.inner.set_collection_comparator(marker, comparator)
+    }
+
+    fn take_red_black_tree(&mut self, marker: &str) -> Option<tree_map::RedBlackTree> {
+        self.inner.take_red_black_tree(marker)
+    }
+
+    fn store_red_black_tree(&mut self, marker: &str, tree: tree_map::RedBlackTree) {
+        self.inner.store_red_black_tree(marker, tree)
+    }
+
+    fn take_probe_table(&mut self, marker: &str) -> Option<immutable_collections::ProbeTable> {
+        self.inner.take_probe_table(marker)
+    }
+
+    fn store_probe_table(&mut self, marker: &str, table: immutable_collections::ProbeTable) {
+        self.inner.store_probe_table(marker, table)
+    }
+
+    fn note_view_copy(&mut self, marker: &str, source: &str) {
+        self.inner.note_view_copy(marker, source)
+    }
+
+    fn is_view_copy(&self, marker: &str) -> bool {
+        self.inner.is_view_copy(marker)
+    }
+
+    fn iterator_guard(&self, marker: &str) -> Option<iteration_guard::IteratorGuard> {
+        self.inner.iterator_guard(marker)
+    }
+
+    fn store_iterator_guard(&mut self, marker: &str, guard: iteration_guard::IteratorGuard) {
+        self.inner.store_iterator_guard(marker, guard)
+    }
+
+    fn iterator_cursor(&self, marker: &str) -> Option<usize> {
+        self.inner.iterator_cursor(marker)
+    }
+
+    fn view_copy_source(&self, marker: &str) -> Option<String> {
+        self.inner.view_copy_source(marker)
+    }
+
+    fn note_view_kind(&mut self, marker: &str, kind: &str) {
+        self.inner.note_view_kind(marker, kind)
+    }
+
+    fn view_copy_kind(&self, marker: &str) -> Option<String> {
+        self.inner.view_copy_kind(marker)
+    }
+
+    fn view_copies_of(&self, source: &str) -> Vec<String> {
+        self.inner.view_copies_of(source)
+    }
+
+    fn synchronized_wrapped(&self, value: &Value) -> Option<Value> {
+        self.inner.synchronized_wrapped(value)
+    }
+
+    fn mod_stamp(&self, marker: &str) -> mod_count::ModStamp {
+        self.inner.mod_stamp(marker)
+    }
+
+    fn store_mod_stamp(&mut self, marker: &str, stamp: mod_count::ModStamp) {
+        self.inner.store_mod_stamp(marker, stamp)
+    }
+
+    fn sub_list_link(&self, marker: &str) -> Option<mod_count::SubListLink> {
+        self.inner.sub_list_link(marker)
+    }
+
+    fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
+        self.inner.store_sub_list_link(marker, link)
+    }
+
+    fn sub_lists_of(&self, parent: &str) -> Vec<(String, mod_count::SubListLink)> {
+        self.inner.sub_lists_of(parent)
+    }
+
+    fn new_list_iterator(&mut self, state: host_list_iterator::ListIter) -> Option<String> {
+        self.inner.new_list_iterator(state)
+    }
+
+    fn list_iterator(&self, marker: &str) -> Option<host_list_iterator::ListIter> {
+        self.inner.list_iterator(marker)
+    }
+
+    fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
+        self.inner.store_list_iterator(marker, state)
+    }
+
+    fn sub_lists_of_any(&self) -> usize {
+        self.inner.sub_lists_of_any()
+    }
+
+    fn deque_layout(&self, marker: &str) -> Option<array_deque::DequeLayout> {
+        self.inner.deque_layout(marker)
+    }
+
+    fn store_deque_layout(&mut self, marker: &str, layout: Option<array_deque::DequeLayout>) {
+        self.inner.store_deque_layout(marker, layout)
+    }
+
+    fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
+        self.inner.host_iterator(marker)
+    }
+
+    fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
+        self.inner.host_iterator_next(marker)
+    }
+
+    fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
+        self.inner.set_host_iterator_cursor(marker, cursor)
+    }
+
+    fn write_console(&mut self, text: &str) {
+        self.inner.write_console(text)
+    }
+
+    fn resource_stream_bytes(&mut self, marker: &str, limit: Option<usize>) -> Option<Vec<u8>> {
+        self.inner.resource_stream_bytes(marker, limit)
+    }
+
+    fn note_content_builder(&mut self, event: ContentBuilderEvent) {
+        self.inner.note_content_builder(event)
+    }
+
+    fn platform_class_present(&self, name: &str) -> bool {
+        self.inner.platform_class_present(name)
+    }
+
+    fn unmodifiable_list(&mut self, values: Vec<Value>) -> Option<Value> {
+        self.inner.unmodifiable_list(values)
+    }
+
+    fn factory_collection(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner.factory_collection(owner, name, kind, values)
+    }
+
+    // A `@Shadow` field is the game object's own: refused (`get_static`); any other instance
+    // field is the bootstrap host's.
+    fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if self
+            .model
+            .shadow_fields
+            .contains(&format!("{}#{}{}", r.owner, r.name, r.descriptor))
+        {
+            return self.get_static(r);
+        }
+        // A game class's own field read on a game object (`player.connection`): the model
+        // holds none, so the read refuses as a `@Shadow` one does, never the bootstrap host's
+        // `null` (#248's review: cpm's `ServerPlayer.connection` read answered null, and the
+        // NPE that followed looked like cpm's own).
+        if Self::is_game_object(receiver).is_some()
+            && self
+                .model
+                .game_field(&format!("{}#{}{}", r.owner, r.name, r.descriptor))
+        {
+            return Err(NativeError::Metadata(format!(
+                "game hook callback reads the game's field {}#{} on a game object, which is not modelled",
+                r.owner, r.name
+            )));
+        }
+        self.inner.get_field(receiver, r)
+    }
+
+    /// What the firing describes `key` as (its vanilla hierarchy and the interfaces the jar's
+    /// Mixins add to it): `Some(true)` where the description names `wanted`, never a proof of
+    /// `false` (a description lists no vanilla interface), so anything else is counted.
+    fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
+        self.context.object(key)?;
+        self.host_instance_of(key, wanted).then_some(true)
+    }
+
+    fn empty_iterator(&mut self) -> Value {
+        self.inner.empty_iterator()
+    }
+
+    fn empty_enumeration(&mut self) -> Value {
+        self.inner.empty_enumeration()
+    }
+
+    fn new_enumeration(&mut self, over: crate::host_iterator::EnumerationOver) -> Option<Value> {
+        self.inner.new_enumeration(over)
+    }
+
+    fn enumeration_over(&self, marker: &str) -> Option<crate::host_iterator::EnumerationOver> {
+        self.inner.enumeration_over(marker)
+    }
+
+    fn store_enumeration(&mut self, marker: &str, over: crate::host_iterator::EnumerationOver) {
+        self.inner.store_enumeration(marker, over);
+    }
+
+    fn constructed_uuid(&self, value: &Value) -> Option<(i64, i64)> {
+        self.inner.constructed_uuid(value)
+    }
+
+    fn component_states(&self) -> Option<&crate::host_component::States> {
+        self.inner.component_states()
+    }
+
+    fn component_states_mut(&mut self) -> Option<&mut crate::host_component::States> {
+        self.inner.component_states_mut()
+    }
+
+    fn feedback_calls_supplier(&self, source: &Value, broadcast: bool) -> Option<Option<bool>> {
+        self.inner.feedback_calls_supplier(source, broadcast)
+    }
+
+    fn send_feedback(
+        &mut self,
+        r: &MethodRef,
+        component: &Value,
+        broadcast: bool,
+    ) -> Result<Value, NativeError> {
+        self.inner.send_feedback(r, component, broadcast)
+    }
+
+    fn note_entrypoint_constructed(&mut self, kind: &str, class: &str, instance: &Value) {
+        self.inner
+            .note_entrypoint_constructed(kind, class, instance);
+    }
+
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         // An instance-field read the callbacks never wrote reaches the host
         // too. A Mixin `@Shadow` field is the game object's own field, which
@@ -1050,10 +1417,19 @@ impl<H: Host> Host for GameHookHost<'_, H> {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
-        if let Some(kind) = empty_collection_factory(r) {
-            return self.inner.empty_mutable_collection(kind).ok_or_else(|| {
+        if let Some(result) = guava_model::sized_factory_class(r, args) {
+            let class = result?;
+            return self.inner.empty_mutable_collection(class).ok_or_else(|| {
                 NativeError::Metadata(format!(
-                    "game hook callback calls {}#{}{}, and the host models no {kind}",
+                    "game hook callback calls {}#{}{}, and the host models no collection",
+                    r.owner, r.name, r.descriptor
+                ))
+            });
+        }
+        if let Some(class) = empty_collection_factory(r) {
+            return self.inner.empty_mutable_collection(class).ok_or_else(|| {
+                NativeError::Metadata(format!(
+                    "game hook callback calls {}#{}{}, and the host models no collection",
                     r.owner, r.name, r.descriptor
                 ))
             });
@@ -1079,6 +1455,11 @@ impl<H: Host> Host for GameHookHost<'_, H> {
                 ))
             });
         }
+        // A cast or `instanceof` the description cannot settle is counted by the bootstrap
+        // host, never a refusal that ends the firing (#246's review).
+        if is_game_class(&r.owner) && matches!(r.name.as_str(), "<checkcast>" | "<instanceof>") {
+            return self.inner.invoke(r, args);
+        }
         if is_game_class(&r.owner) && !is_value_constructor(r) {
             return Err(NativeError::Metadata(format!(
                 "game hook callback calls {}#{}{}, which the hook tier does not model",
@@ -1096,7 +1477,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
     ) -> Result<Value, NativeError> {
         // The server's saved data (storage, types, a `SavedData`'s dirty
         // flag) lives on the jar's bootstrap host, across firings.
-        if facade_saved_data::owns_call(r, expect_ref(receiver).map(String::as_str)) {
+        if facade_saved_data::owns_call(r, crate::game_object::text(receiver).map(String::as_str)) {
             return self.inner.invoke_instance(r, receiver, args);
         }
         // A Fabric `Event`'s invoker is a host marker, not the jar's own
@@ -1109,32 +1490,55 @@ impl<H: Host> Host for GameHookHost<'_, H> {
                 r.owner, r.name, r.descriptor
             )));
         }
-        if let Some(text) = expect_ref(receiver).cloned()
+        if let Some(text) = crate::game_object::text(receiver).cloned()
             && let Some(answer) = self.answer_value(&text, r, args)
         {
             return answer;
+        }
+        // `BuiltInRegistries.ITEM.getKey(item)` for an item the firing names.
+        if crate::host_registry::registry_id(receiver) == Some("minecraft:item")
+            && r.name == "getKey"
+            && r.descriptor == "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;"
+            && let Some(id) = args
+                .first()
+                .and_then(Self::is_game_object)
+                .and_then(|item| self.context.object(item))
+                .filter(|item| item.kind == GameObjectKind::Item)
+                .and_then(|item| item.type_id.clone())
+        {
+            return Ok(identifier_parse(&id));
         }
         if let Some(marker) = Self::is_game_object(receiver) {
             let marker = marker.to_owned();
             return self.answer(&marker, r, args);
         }
+        // A host handle (an `Identifier`, a `ResourceKey`) is a value the
+        // bootstrap host models (`host_ids.rs`).
         if is_game_class(&r.owner)
             && !is_host_value_class(&r.owner)
-            && !expect_ref(receiver).is_some_and(|marker| is_host_value_marker(marker))
+            && !matches!(receiver, Value::Host(_))
         {
             return Err(NativeError::Metadata(format!(
                 "game hook callback calls {}#{}{} on {}, which the hook tier does not model",
                 r.owner,
                 r.name,
                 r.descriptor,
-                expect_ref(receiver).map_or("null", String::as_str)
+                crate::game_object::text(receiver).map_or("null", String::as_str)
             )));
         }
         self.inner.invoke_instance(r, receiver, args)
     }
 
-    fn mutable_collection_values(&self, value: &Value) -> Option<Vec<String>> {
+    fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.inner.mutable_collection_values(value)
+    }
+
+    fn holds_collection(&self, value: &Value) -> bool {
+        self.inner.holds_collection(value)
+    }
+
+    fn collection_len(&self, value: &Value) -> Option<usize> {
+        self.inner.collection_len(value)
     }
 
     fn is_jdk_list_of(&self, marker: &str) -> bool {
@@ -1157,7 +1561,7 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.models_class(name)
     }
 
-    fn throwable_message(&self, marker: &str) -> Option<String> {
+    fn throwable_message(&self, marker: &str) -> Option<Option<String>> {
         self.inner.throwable_message(marker)
     }
 
@@ -1185,8 +1589,42 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.store_persistent_heap(heap)
     }
 
+    fn object_collected(&self, key: &str) -> bool {
+        self.inner.object_collected(key)
+    }
+
+    fn pause_collections(&mut self, paused: bool) {
+        self.inner.pause_collections(paused);
+    }
+
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn array_view(
+        &mut self,
+        array: &str,
+        offset: usize,
+        values: Vec<Value>,
+        window: bool,
+    ) -> Option<Value> {
+        self.inner.array_view(array, offset, values, window)
+    }
+
+    fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
+        self.inner.array_view_of(marker)
+    }
+
+    fn has_array_views(&self, array: &str) -> bool {
+        self.inner.has_array_views(array)
+    }
+
+    fn array_written(&mut self, array: &str, values: &[Value]) {
+        self.inner.array_written(array, values);
+    }
+
+    fn changed_array_views(&mut self) -> Vec<(String, usize, Vec<Value>)> {
+        self.inner.changed_array_views()
     }
 
     fn counted_unknown_calls(&self) -> usize {
@@ -1413,6 +1851,7 @@ impl NativeJar {
         let mut initialized = state.initialized.clone();
         let mut runtime = Runtime {
             classes: &self.classes,
+            mixin_index: std::cell::OnceCell::new(),
             linked,
             host: &mut wrapped,
             calls: 0,
@@ -1424,6 +1863,7 @@ impl NativeJar {
             next_object: state.next_object.max(GAME_HOOK_OBJECT_BASE),
             streams: BTreeMap::new(),
             next_stream: 0,
+            pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             string_readers: BTreeMap::new(),
@@ -1439,6 +1879,8 @@ impl NativeJar {
             anchor_hooks: None,
             modify_hooks: None,
             pending_skipped_new: Vec::new(),
+            stream_plan: Default::default(),
+            store_verdict: Default::default(),
             depth: 0,
             budget,
         };
@@ -1458,19 +1900,26 @@ impl NativeJar {
                     runtime.callback_infos.set_actual(&marker, actual.clone())?;
                 }
                 let before = hook_shapes::callback_info_snapshot(runtime.callback_infos, &marker)?;
-                let callback_receiver = is_instance.then(|| {
-                    receiver
-                        .clone()
-                        .unwrap_or_else(|| Value::Ref(Some(entry.callback.owner.clone())))
-                });
+                // No game object handed over: an object of the Mixin class
+                // stands for it (its name is a `String`, #156 P13c; #156 P16).
+                let callback_receiver = if is_instance {
+                    Some(match receiver.clone() {
+                        Some(receiver) => receiver,
+                        None => runtime.new_object(&entry.callback.owner),
+                    })
+                } else {
+                    None
+                };
                 // The first callback of a Mixin class on a game object runs the
                 // class's constructor on it: `javac` put the Mixin's field
                 // initialisers there, which real Mixin merges into the target's
                 // constructors. A Mixin that extends a game class has no
                 // no-argument constructor to run, and its fields start at Java's
                 // defaults.
-                if let Some(Value::Ref(Some(object))) = &callback_receiver
-                    && object.starts_with(GAME_OBJECT_PREFIX)
+                if let Some(object) = callback_receiver
+                    .as_ref()
+                    .and_then(crate::game_object::text)
+                    .filter(|object| object.starts_with(GAME_OBJECT_PREFIX))
                     && initialized.insert(format!("{}|{object}", entry.callback.owner))
                     && self
                         .classes
@@ -1519,7 +1968,7 @@ impl NativeJar {
                     // declared cancellable.
                     if after != before {
                         return Err(NativeError::Metadata(format!(
-                            "uncaught exception java/util/concurrent/CancellationException: game hook callback {}#{}{} cancelled or set the result of {}#{}, which its @Inject does not declare cancellable",
+                            "uncaught exception org/spongepowered/asm/mixin/injection/callback/CancellationException: game hook callback {}#{}{} cancelled or set the result of {}#{}, which its @Inject does not declare cancellable",
                             entry.callback.owner,
                             entry.callback.name,
                             entry.callback.descriptor,
@@ -1535,16 +1984,22 @@ impl NativeJar {
                     break;
                 }
             }
-            // A write to a `@Shadow` field is a write to the game object's own
-            // field, which the host never sees: that callback did not do what
-            // it meant to, so the firing fails instead of keeping the write.
-            if let Some(key) = runtime.fields.keys().find(|key| {
-                key.split_once('|').is_some_and(|(object, field)| {
-                    object.starts_with(GAME_OBJECT_PREFIX) && model.shadow_fields.contains(field)
-                })
+            // A write to a `@Shadow` field, a game class's field or one a
+            // Mixin inherits from the game class it extends is a write to the
+            // game object's own field, which the host never sees: that
+            // callback did not do what it meant to, so the firing fails
+            // instead of keeping the write (#248's review).
+            if let Some((key, shadow)) = runtime.fields.keys().find_map(|key| {
+                let (object, field) = key.split_once('|')?;
+                if !object.starts_with(GAME_OBJECT_PREFIX) {
+                    return None;
+                }
+                let shadow = model.shadow_fields.contains(field);
+                (shadow || model.game_field(field)).then_some((key, shadow))
             }) {
+                let through = if shadow { " through @Shadow" } else { "" };
                 return Err(NativeError::Metadata(format!(
-                    "game hook callback writes the game's field {key} through @Shadow, which the host does not apply"
+                    "game hook callback writes the game's field {key}{through}, which the host does not apply"
                 )));
             }
             if !resident
@@ -1585,10 +2040,23 @@ impl NativeJar {
                 state.fields = game;
             }
             state.arrays.clear();
+            // Every value a game object's field holds, of any kind (an
+            // `Optional` names its object in its key), through the heap's
+            // one root text (#226 review).
+            // What the firing hands the game (each callback's result and the
+            // value a target returns) is a root of this store too; the game
+            // retains what it keeps longer (`StdHost::retain`).
+            let returned_value = returned
+                .as_ref()
+                .and_then(|returned| returned.as_ref().ok())
+                .cloned()
+                .flatten();
             let roots = state
                 .fields
                 .values()
-                .filter_map(|value| expect_ref(value).cloned())
+                .chain(&results)
+                .chain(returned_value.as_ref())
+                .filter_map(|value| crate::heap::value_text(value).map(str::to_owned))
                 .collect();
             let persistence = runtime.persist_class_state();
             let heap = runtime.persist_resident_heap_with(roots);
@@ -1606,5 +2074,51 @@ impl NativeJar {
             returned: returned.transpose()?.flatten(),
             results,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{EventFacade, FacadePlayer};
+
+    /// A hook callback's player is the object the event tier hands out for
+    /// the same player (`events::player_marker`): one key, so `==` holds
+    /// across tiers, and a respawn's new life is another object.
+    #[test]
+    fn a_hook_player_is_the_event_tiers_player() {
+        let uuid = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let facade = |life| EventFacade {
+            players: vec![FacadePlayer {
+                uuid,
+                name: "Alex".into(),
+                level: None,
+                entity_id: Some(7),
+                session: 2,
+                life,
+            }],
+            ..EventFacade::default()
+        };
+        let event = crate::game_object::player_value(&facade(0), uuid);
+        let (Value::Host(hook), Value::Host(event)) = (hook_value(uuid, 0), event) else {
+            panic!("not handles")
+        };
+        assert_eq!(hook.same_object(&event), Some(true));
+        let Value::Host(respawned) = hook_value(uuid, 1) else {
+            panic!("not a handle")
+        };
+        assert_eq!(hook.same_object(&respawned), Some(false));
+        let Value::Host(event_respawned) = crate::game_object::player_value(&facade(1), uuid)
+        else {
+            panic!("not a handle")
+        };
+        assert_eq!(respawned.same_object(&event_respawned), Some(true));
+    }
+
+    fn hook_value(uuid: u128, life: u32) -> Value {
+        GameObject::player(uuid, "Alex")
+            .with_incarnation(2, life)
+            .with_entity_id(7)
+            .value()
     }
 }

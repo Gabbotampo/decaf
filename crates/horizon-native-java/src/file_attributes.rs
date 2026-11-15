@@ -181,12 +181,11 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        if let Some(marker) = receiver.and_then(expect_ref).filter(|marker| {
-            marker
-                .rsplit_once('#')
-                .is_some_and(|(class, _)| class == ATTRIBUTES_CLASS)
-        }) {
-            return self.attributes_call(r, &marker.clone());
+        if let Some(marker) = receiver
+            .and_then(crate::jar_object::object_key)
+            .filter(|marker| crate::jar_object::key_class(marker) == Some(ATTRIBUTES_CLASS))
+        {
+            return self.attributes_call(r, marker);
         }
         // `UnixPath.equals`/`hashCode` are the path kind's row (`host_path.rs`).
         if r.owner == "java/nio/file/Path"
@@ -300,8 +299,10 @@ impl<H: Host> Runtime<'_, H> {
         };
         match StdHost::argument(r, args, 1)? {
             Value::Ref(None) => return Err(thrown("java/lang/NullPointerException", None)),
-            Value::Ref(Some(class)) if class == BASIC => {}
-            Value::Ref(Some(class)) if class == POSIX => return self.host.unknown_operand_call(r),
+            class if crate::host_class::class_name(class) == Some(BASIC) => {}
+            class if crate::host_class::class_name(class) == Some(POSIX) => {
+                return self.host.unknown_operand_call(r);
+            }
             _ => return Err(thrown("java/lang/UnsupportedOperationException", None)),
         }
         if !self.no_link_options(args.get(2)) {

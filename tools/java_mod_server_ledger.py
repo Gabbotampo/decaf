@@ -144,6 +144,134 @@ NEOFORGE_MOD_ANNOTATIONS = (
 )
 
 
+def _u2(data: bytes, offset: int) -> tuple[int, int]:
+    return int.from_bytes(data[offset:offset + 2], "big"), offset + 2
+
+
+def _skip_element(data: bytes, offset: int) -> int:
+    tag = chr(data[offset])
+    offset += 1
+    if tag in "BCDFIJSZs":
+        return offset + 2
+    if tag == "e":
+        return offset + 4
+    if tag == "c":
+        return offset + 2
+    if tag == "@":
+        return _skip_annotation(data, offset)
+    if tag == "[":
+        count, offset = _u2(data, offset)
+        for _ in range(count):
+            offset = _skip_element(data, offset)
+        return offset
+    return len(data)
+
+
+def _skip_annotation(data: bytes, offset: int) -> int:
+    _, offset = _u2(data, offset)  # annotation type
+    count, offset = _u2(data, offset)
+    for _ in range(count):
+        offset += 2  # element name
+        offset = _skip_element(data, offset)
+    return offset
+
+
+def neoforge_mod_dist(data: bytes) -> frozenset[str] | None:
+    """Return the complete @Mod `dist` set, or None when there is no @Mod.
+
+    This reads only class-level runtime annotations.  Looking for `CLIENT` in
+    a constant pool is not enough: common Forge classes call `Dist.CLIENT`
+    without being client-only @Mod containers.
+    """
+    if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
+        return None
+    try:
+        cp_count = int.from_bytes(data[8:10], "big")
+        cp: list[object | None] = [None] * cp_count
+        offset = 10
+        index = 1
+        while index < cp_count:
+            tag = data[offset]
+            offset += 1
+            if tag == 1:
+                length, offset = _u2(data, offset)
+                cp[index] = data[offset:offset + length].decode("utf-8", "replace")
+                offset += length
+            elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
+                offset += 4
+            elif tag in (5, 6):
+                offset += 8
+                index += 1
+            elif tag in (7, 8, 16, 19, 20):
+                value, offset = _u2(data, offset)
+                cp[index] = value
+            elif tag == 15:
+                offset += 3
+            else:
+                return None
+            index += 1
+        offset += 6  # access flags, this class, super class
+        interfaces, offset = _u2(data, offset)
+        offset += 2 * interfaces
+        fields, offset = _u2(data, offset)
+        for _ in range(fields):
+            offset += 6
+            count, offset = _u2(data, offset)
+            for _ in range(count):
+                offset += 2
+                length = int.from_bytes(data[offset:offset + 4], "big")
+                offset += 4 + length
+        methods, offset = _u2(data, offset)
+        for _ in range(methods):
+            offset += 6
+            count, offset = _u2(data, offset)
+            for _ in range(count):
+                offset += 2
+                length = int.from_bytes(data[offset:offset + 4], "big")
+                offset += 4 + length
+        attributes, offset = _u2(data, offset)
+        for _ in range(attributes):
+            name_index, offset = _u2(data, offset)
+            length = int.from_bytes(data[offset:offset + 4], "big")
+            offset += 4
+            name = cp[name_index]
+            if name not in ("RuntimeVisibleAnnotations", "RuntimeInvisibleAnnotations"):
+                offset += length
+                continue
+            end = offset + length
+            count, cursor = _u2(data, offset)
+            for _ in range(count):
+                type_index, cursor = _u2(data, cursor)
+                descriptor = cp[type_index]
+                pairs, cursor = _u2(data, cursor)
+                is_mod = descriptor in ("Lnet/neoforged/fml/common/Mod;",
+                                        "Lnet/minecraftforge/fml/common/Mod;")
+                dists: set[str] = set()
+                for _ in range(pairs):
+                    element_name, cursor = _u2(data, cursor)
+                    tag = chr(data[cursor])
+                    value_start = cursor + 1
+                    if is_mod and cp[element_name] == "dist" and tag == "[":
+                        values, value_start = _u2(data, value_start)
+                        for _ in range(values):
+                            if data[value_start:value_start + 1] == b"e":
+                                _, value_start = _u2(data, value_start + 1)
+                                enum_name, value_start = _u2(data, value_start)
+                                if cp[enum_name] in ("CLIENT", "DEDICATED_SERVER"):
+                                    dists.add(cp[enum_name])
+                            else:
+                                value_start = _skip_element(data, value_start)
+                        cursor = value_start
+                    else:
+                        cursor = _skip_element(data, cursor)
+                if is_mod:
+                    return frozenset(dists)
+            offset = end
+    except (IndexError, UnicodeError, ValueError):
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class JarEntrypoints:
     """Loader entrypoints read from a jar without running it."""
@@ -151,6 +279,13 @@ class JarEntrypoints:
     kinds: tuple[str, ...] = ()
     neoforge: bool = False
     client_side_only: bool = False
+    # NeoForge/Forge @Mod classes all declare Dist.CLIENT.  This is separate
+    # from the TOML `clientSideOnly` flag: the native scanner uses the
+    # annotation on each @Mod class to decide which physical side constructs
+    # it.
+    neoforge_client_only: bool = False
+    neoforge_server_only: bool = False
+    fabric_environment: str = "*"
 
     @property
     def server(self) -> bool:
@@ -279,7 +414,18 @@ def fabric_entrypoint_kinds(obj: dict) -> tuple[str, ...]:
     return tuple(sorted(kinds))
 
 
-def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
+def forge_client_side_only(text: str) -> bool:
+    """Read Forge's root-level `clientSideOnly`, before TOML tables."""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("["):
+            return False
+        if re.fullmatch(r"clientSideOnly\s*=\s*[\"']?true[\"']?", line, re.I):
+            return True
+    return False
+
+
+def read_jar_entrypoints(path: Path | None, *, force_neoforge: bool = False) -> JarEntrypoints | None:
     """Read a jar's loader metadata; None when the jar cannot be read.
 
     This mirrors the native reader's rule: Fabric entrypoint keys, NeoForge
@@ -292,7 +438,7 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
         with zipfile.ZipFile(path) as jar:
             names = jar.namelist()
             kinds: tuple[str, ...] = ()
-            if "fabric.mod.json" in names:
+            if "fabric.mod.json" in names and not force_neoforge:
                 raw = jar.read("fabric.mod.json").decode("utf-8", errors="replace")
                 obj = json.loads(lenient_json_text(raw))
                 if not isinstance(obj, dict):
@@ -300,28 +446,29 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                 kinds = fabric_entrypoint_kinds(obj)
                 # `"environment": "client"` keeps a Fabric mod off a server
                 # (a multi-loader jar's NeoForge `@Mod` class included).
-                fabric_client_only = obj.get("environment") == "client"
+                fabric_environment = str(obj.get("environment", "*"))
+                fabric_client_only = fabric_environment == "client"
             else:
+                fabric_environment = "*"
                 fabric_client_only = False
             client_side_only = fabric_client_only
-            for name in ("META-INF/neoforge.mods.toml", "META-INF/mods.toml"):
-                if name in names:
-                    text = jar.read(name).decode("utf-8", errors="replace")
-                    client_side_only = fabric_client_only or bool(
-                        re.search(r"(?im)^\s*clientSideOnly\s*=\s*[\"']?true[\"']?\s*$", text)
-                    )
-                    break
-            if client_side_only or any(kind in SERVER_ENTRYPOINT_KINDS for kind in kinds):
+            if "META-INF/mods.toml" in names:
+                text = jar.read("META-INF/mods.toml").decode("utf-8", errors="replace")
+                client_side_only = fabric_client_only or forge_client_side_only(text)
+            if (client_side_only and not force_neoforge) or (
+                not force_neoforge and any(kind in SERVER_ENTRYPOINT_KINDS for kind in kinds)
+            ):
                 # The server has something to execute (or the jar says it is
                 # client-only); no class scan can change that verdict.
-                return JarEntrypoints(kinds, False, client_side_only)
-            if "fabric.mod.json" in names:
+                return JarEntrypoints(kinds, False, client_side_only, fabric_environment=fabric_environment)
+            if "fabric.mod.json" in names and not force_neoforge:
                 # A jar with Fabric metadata runs only its Fabric entrypoints,
                 # as on Fabric Loader, which never reads `@Mod`; a universal
                 # jar's NeoForge class is not a server entrypoint
                 # (`entrypoint_role.rs`).
-                return JarEntrypoints(kinds, False, client_side_only)
+                return JarEntrypoints(kinds, False, client_side_only, fabric_environment=fabric_environment)
             neoforge = False
+            mod_dists: list[frozenset[str]] = []
             for name in names:
                 if (
                     not name.endswith(".class")
@@ -331,10 +478,18 @@ def read_jar_entrypoints(path: Path | None) -> JarEntrypoints | None:
                 ):
                     continue
                 data = jar.read(name)
-                if any(marker in data for marker in NEOFORGE_MOD_ANNOTATIONS):
+                mod_dist = neoforge_mod_dist(data)
+                if mod_dist is not None:
                     neoforge = True
-                    break
-            return JarEntrypoints(kinds, neoforge, client_side_only)
+                    mod_dists.append(mod_dist)
+            return JarEntrypoints(
+                kinds,
+                neoforge,
+                client_side_only,
+                neoforge and bool(mod_dists) and all(dists == frozenset({"CLIENT"}) for dists in mod_dists),
+                neoforge and bool(mod_dists) and all(dists == frozenset({"DEDICATED_SERVER"}) for dists in mod_dists),
+                fabric_environment,
+            )
     except (OSError, ValueError, KeyError, EOFError, RuntimeError, zipfile.BadZipFile):
         return None
 
@@ -382,6 +537,7 @@ class Closure:
     jars: tuple[Path, ...] = ()
     ids: tuple[str, ...] = ()
     missing: tuple[tuple[str, str], ...] = ()
+    missing_requirements: tuple[tuple[str, str, str], ...] = ()
 
 
 def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
@@ -405,59 +561,73 @@ def corpus_jars(directories: list[Path]) -> list[hybrid_pack.PackJar]:
 def provider_index(jars: list[hybrid_pack.PackJar]) -> dict[str, list[hybrid_pack.PackJar]]:
     """Each id (own, `provides` alias or nested module) and its providers, best first.
 
-    The hybrid tool's order: a jar whose own id is the dependency first, then one
-    that carries it as a nested module, then the newest version.
+    Providers are ordered by newest compatible version; an own-id provider only
+    breaks a same-version tie with a `provides` alias.
     """
     return hybrid_pack._provider_index(jars)
 
 
 def canonical_provider(providers: list[hybrid_pack.PackJar]) -> hybrid_pack.PackJar:
-    """The provider a dependency should get, from the index's best-first list.
+    """Return the newest compatible provider from the pre-ranked index.
 
-    A mod that bundles a library as jar-in-jar provides every id the library
-    does: Distant Horizons nests Fabric API's root and its 44 modules, so the
-    index's "most nested ids" order would hand `fabric-api-base` to Distant
-    Horizons and run a whole second mod beside the jar under test. The library
-    itself is the provider: a candidate whose own id another candidate nests
-    wins, and the index's order breaks the remaining ties.
+    When equal-version candidates exist, prefer the standalone module over a
+    carrier that nests that module. This is a tie-break after version matching,
+    never a nested-id count or a way to select an older provider.
     """
-    bundled = {ident.lower() for provider in providers
+    newest = providers[0].declaration.version
+    same_version = [provider for provider in providers
+                    if hybrid_pack._compare_maven_versions(provider.declaration.version,
+                                                           newest) == 0]
+    bundled = {ident.lower() for provider in same_version
                for ident in provider.declaration.nested_ids}
-    for provider in providers:
+    for provider in same_version:
         if provider.mod_id.lower() in bundled:
             return provider
-    return providers[0]
+    return same_version[0]
 
 
 def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
-                       declaration: hybrid_pack.Declaration | None = None) -> Closure:
+                       declaration: hybrid_pack.Declaration | None = None,
+                       version_matcher=None) -> Closure:
     """The declared dependency closure of `jar`, resolved against `index`.
 
     Every required id is satisfied by the platform (`minecraft`, `fabricloader`,
     `neoforge`, ...), by an id the closure already holds (the jar's own id, its
     `provides` aliases and jar-in-jar modules, and the same for each provider it
     pulled in), or by the best provider in the index; anything else is missing.
-    Version ranges are not checked: the newest provider stands in for the range,
-    which is what the corpus can offer.
+    Providers are filtered by the declared Fabric or NeoForge version range. A
+    provider with the wrong version is missing from this closure; it is never
+    linked as a host and the census reports the unresolved id.
     """
     root = declaration or hybrid_pack.read_declaration(jar)
+    version_matcher = version_matcher or hybrid_pack.maven_version_satisfies
     target = hybrid_pack.PackJar(jar, None, root)
     held = {target.mod_id.lower()} | {ident.lower() for ident in root.nested_ids}
     chosen: dict[Path, hybrid_pack.PackJar] = {}
     missing: dict[str, str] = {}
+    missing_requirements: dict[str, tuple[str, str]] = {}
     queue = [target]
     while queue:
         current = queue.pop(0)
+        requirements = current.declaration.requirements or tuple(
+            (dependency, "*") for dependency in current.declaration.depends
+        )
+        by_id: dict[str, list[str]] = {}
+        for dependency, requirement in requirements:
+            by_id.setdefault(dependency.lower(), []).append(requirement)
         for dependency in current.declaration.depends:
             key = dependency.lower()
             if key in hybrid_pack.PLATFORM_IDS or key in held:
                 continue
+            predicates = tuple(by_id.get(key, ("*",)))
             providers = [provider for provider in index.get(key, [])
                          if provider.path.resolve() != jar.resolve()
                          and provider.path not in chosen
-                         and provider.mod_id.lower() not in held]
+                         and provider.mod_id.lower() not in held
+                         and version_matcher(provider.declaration.version, predicates)]
             if not providers:
                 missing.setdefault(key, current.mod_id)
+                missing_requirements.setdefault(key, (current.mod_id, ", ".join(predicates)))
                 continue
             provider = canonical_provider(providers)
             chosen[provider.path] = provider
@@ -467,16 +637,25 @@ def dependency_closure(jar: Path, index: dict[str, list[hybrid_pack.PackJar]],
     # An id first missed and then provided by a later provider's nested module
     # is not missing after all.
     missing = {key: by for key, by in missing.items() if key not in held}
+    missing_requirements = {
+        key: value for key, value in missing_requirements.items() if key not in held
+    }
     deps = sorted(chosen.values(), key=lambda item: item.name)
     return Closure(tuple(item.path for item in deps), tuple(item.mod_id for item in deps),
-                   tuple(sorted(missing.items())))
+                   tuple(sorted(missing.items())),
+                   tuple(sorted((key, by, requirement)
+                                for key, (by, requirement) in missing_requirements.items())))
 
 
 def missing_dependency_row(jar: Path, closure: Closure) -> Row:
     """The row of a jar the ledger did not start: its closure cannot be completed."""
     ident, version = metadata(jar)
-    named = ", ".join(key if by.lower() == ident.lower() else f"{key} (needed by {by})"
-                      for key, by in closure.missing)
+    ranges = {key: requirement for key, _, requirement in closure.missing_requirements}
+    named = ", ".join(
+        (key if by.lower() == ident.lower() else f"{key} (needed by {by})")
+        + (f" [{ranges[key]}]" if key in ranges and ranges[key] not in ("", "*") else "")
+        for key, by in closure.missing
+    )
     return Row(jar.name, ident, version, "unresolved", "", "?", reason=bounded(
         f"missing-dependency: {named}", MAX_CAUSE), recommend=MISSING_DEPENDENCY,
         deps=closure.ids)
