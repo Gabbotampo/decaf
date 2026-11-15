@@ -252,13 +252,17 @@ def main(argv: list[str] | None = None) -> int:
     roles = ["server", "client"] if args.role == "both" else [args.role]
     reports: dict[str, dict] = {}
     output = ""
+    # The table flag was introduced by this PR, so use the merged driver's
+    # parser for both separately-built probes when it is requested. The probe
+    # binaries remain the base and merged builds respectively.
+    driver_checkout = merged_checkout if args.game_block_classes else base_checkout
     for role in roles:
         repetitions: dict[str, list[dict]] = {"base": [], "merged": []}
         for label, probe in (("base", base_probe), ("merged", merged_probe)):
             for number in range(args.repeat):
                 # Both probes run under the BASE checkout's driver, so the flags mean the same thing.
                 path = root / f"{role}-{label}-{number}.json"
-                payload = run_census(base_checkout, probe, args, role, path)
+                payload = run_census(driver_checkout, probe, args, role, path)
                 payload["sha"] = base_sha if label == "base" else merged_sha
                 repetitions[label].append(payload)
         report = compare_payloads(repetitions["base"][0], repetitions["merged"][0], repetitions, role)
