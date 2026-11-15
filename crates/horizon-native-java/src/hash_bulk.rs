@@ -121,10 +121,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = expect_ref(receiver).cloned() else {
             return Ok(None);
         };
-        let copy_like = self.host.is_view_copy(&marker)
-            || marker.starts_with("set/")
-            || marker.starts_with("set#")
-            || marker.contains("#immutable");
+        let copy_like = self.host.is_view_copy(&marker) || marker.contains("#immutable");
         let sorted_source = self
             .host
             .unmodifiable_view_source(&marker)
