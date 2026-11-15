@@ -64,6 +64,9 @@ const RETIRED_PREFIXES: &[&str] = &[
     "list#",
     "set#",
     "map#",
+    // StackWalker.Option moved to a typed host handle; old marker-shaped
+    // text remains an ordinary String.
+    "enum/java/lang/StackWalker$Option/",
 ];
 
 /// Whether a reference `marker` is a plain `java.lang.String` and `wanted`
