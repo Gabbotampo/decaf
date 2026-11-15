@@ -445,6 +445,8 @@ pub enum HostKind {
     KotlinEmptyCollection,
     /// A `TimeUnit` constant: key its name (`host_jdk_constant.rs`).
     TimeUnit,
+    /// A RoundingMode constant keyed by name.
+    RoundingMode,
     /// A `CodingErrorAction` constant: key its name.
     CodingErrorAction,
     /// A `StackWalker.Option` enum constant: key its name.
@@ -516,7 +518,9 @@ pub enum HostKind {
     HttpClientRedirect,
     /// Fabric resource-loader v0's helper, one per pack type.
     FabricResourceManagerHelper,
-    /// Vanilla's `FileToIdConverter` record.
+    /// Commons Lang's class-loader-local Consumers.nop singleton.
+    CommonsNop,
+    /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
 }
 
@@ -2057,6 +2061,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_jdk_constant::TIME_UNIT_METHODS,
     },
     KindInfo {
+        kind: HostKind::RoundingMode,
+        tag: "rmode",
+        class: ClassRule::Fixed("java/math/RoundingMode"),
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::ROUNDING_MODE_METHODS,
+    },
+    KindInfo {
         kind: HostKind::CodingErrorAction,
         tag: "cea",
         class: ClassRule::Fixed("java/nio/charset/CodingErrorAction"),
@@ -2324,6 +2335,15 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: always_canonical,
         methods: &crate::client_reload::HELPER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CommonsNop,
+        tag: "cnop",
+        class: ClassRule::Unknown {
+            declared: crate::commons_lang::consumer_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::FileToIdConverter,
