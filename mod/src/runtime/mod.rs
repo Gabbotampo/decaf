@@ -4053,6 +4053,36 @@ impl StdHost {
         None
     }
 
+    /// The defaults object chained from a `Properties` receiver, if any.
+    fn properties_defaults(&self, marker: &str) -> Option<String> {
+        self.cached_collections
+            .get(&(marker.to_owned(), "properties.defaults".to_owned()))
+            .cloned()
+    }
+
+    /// A `Properties.getProperty` lookup: own entries shadow the defaults
+    /// chain, and each link is a real host collection edge for the collector.
+    fn properties_value(&self, marker: &str, key: &Value) -> Option<Value> {
+        let mut current = Some(marker.to_owned());
+        let mut seen = BTreeSet::new();
+        while let Some(owner) = current
+            && seen.insert(owner.clone())
+        {
+            if let Some(value) = self.mutable_collections.get(&owner).and_then(|values| {
+                values
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .find(|pair| pair[0] == *key)
+                    .map(|pair| pair[1].clone())
+            }) {
+                return Some(value);
+            }
+            current = self.properties_defaults(&owner);
+        }
+        None
+    }
+
     /// Answer `java.util.Properties` members from the map a collection keeps.
     ///
     /// A loader bootstrap reads a jar's own `.properties` file through
@@ -4102,40 +4132,44 @@ impl StdHost {
             }
             ("getProperty", "(Ljava/lang/String;)Ljava/lang/String;") => {
                 let key = Self::argument(r, args, 0)?.clone();
-                let found = self
-                    .mutable_collections
-                    .get(marker)
-                    .and_then(|values| {
-                        values
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .find(|pair| pair[0] == key)
-                            .map(|pair| pair[1].clone())
-                    })
-                    .unwrap_or(Value::Ref(None));
-                Ok(Some(found))
+                if matches!(&key, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(Some(
+                    self.properties_value(marker, &key)
+                        .unwrap_or(Value::Ref(None)),
+                ))
             }
             ("getProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") => {
                 let key = Self::argument(r, args, 0)?.clone();
+                if matches!(&key, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
                 let fallback = Self::argument(r, args, 1)?.clone();
-                let found = self
-                    .mutable_collections
-                    .get(marker)
-                    .and_then(|values| {
-                        values
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .find(|pair| pair[0] == key)
-                            .map(|pair| pair[1].clone())
-                    })
-                    .unwrap_or(fallback);
-                Ok(Some(found))
+                Ok(Some(
+                    self.properties_value(marker, &key).unwrap_or(fallback),
+                ))
             }
-            ("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") => {
+            // `Properties.setProperty` returns `Object` (it is `Hashtable.put`
+            // underneath), so `javac` emits this descriptor, not a `String` one.
+            ("setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;") => {
                 let key = Self::argument(r, args, 0)?.clone();
                 let value = Self::argument(r, args, 1)?.clone();
+                if matches!(&key, Value::Ref(None)) || matches!(&value, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
                 let values = self
                     .mutable_collections
                     .entry(marker.to_owned())
@@ -4148,25 +4182,12 @@ impl StdHost {
                 values.extend([key, value]);
                 Ok(Some(Value::Ref(None)))
             }
-            ("stringPropertyNames", "()Ljava/util/Set;") => {
-                let keys = self
-                    .mutable_collections
-                    .get(marker)
-                    .map(|values| {
-                        values
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .map(|pair| pair[0].clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let marker = self.empty_collection("set");
-                if let Some(marker) = expect_ref(&marker) {
-                    self.mutable_collections.insert(marker.to_owned(), keys);
-                }
-                Ok(Some(marker))
-            }
+            ("stringPropertyNames", "()Ljava/util/Set;")
+            | ("keys", "()Ljava/util/Enumeration;")
+            | ("propertyNames", "()Ljava/util/Enumeration;")
+            | ("entrySet", "()Ljava/util/Set;")
+            | ("keySet", "()Ljava/util/Set;")
+            | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
             // JDK 25's `store` writes a `#` line with `new Date().toString()`
             // (the clock and the time zone) before the key-sorted entries,
             // `list` walks the table in hash order, and `save` is `store` with
@@ -6201,7 +6222,7 @@ impl Host for StdHost {
             ("java/util/Optional", "empty", "()Ljava/util/Optional;") => Ok(empty_optional()),
             ("java/util/Optional", "of", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
                 let value = Self::argument(r, args, 0)?;
-                if matches!(value, Value::Ref(None)) {
+                if matches!(&value, Value::Ref(None)) {
                     return Err(NativeError::Metadata(
                         "java/util/Optional.of received null".into(),
                     ));
@@ -6449,7 +6470,7 @@ impl Host for StdHost {
                 "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             ) => {
                 let value = Self::argument(r, args, 0)?;
-                if !matches!(value, Value::Ref(None)) {
+                if !matches!(&value, Value::Ref(None)) {
                     return Ok(value.clone());
                 }
                 let fallback = Self::argument(r, args, 1)?;
@@ -6475,7 +6496,7 @@ impl Host for StdHost {
                     && descriptor.ends_with(")Ljava/lang/Object;") =>
             {
                 let value = Self::argument(r, args, 0)?;
-                if matches!(value, Value::Ref(None)) {
+                if matches!(&value, Value::Ref(None)) {
                     // A mod's `try { Objects.requireNonNull(x) } catch
                     // (NullPointerException ignored)` is real control flow, so
                     // this raises the NPE the JVM would raise; the interpreter
@@ -7667,7 +7688,7 @@ impl Host for StdHost {
                 .zip(expect_ref(requested))
                 .is_some_and(|(capability, requested)| capability == requested);
             return Ok(self.lazy_optional(
-                (matches_capability && !matches!(value, Value::Ref(None))).then_some(value),
+                (matches_capability && !matches!(&value, Value::Ref(None))).then_some(value),
             ));
         }
         if (r.owner == "net/minecraft/world/level/Level"
@@ -7841,10 +7862,24 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            if r.owner == "java/util/Properties"
-                && let Some(value) = self.properties_member(r, marker, args)?
-            {
-                return Ok(value);
+            if r.owner == "java/util/Properties" {
+                if r.name == "<init>" && r.descriptor == "(Ljava/util/Properties;)V" {
+                    if let Ok(defaults) = Self::argument(r, args, 0)
+                        && let Some(defaults) = expect_ref(defaults)
+                    {
+                        self.cached_collections.insert(
+                            (marker.to_owned(), "properties.defaults".to_owned()),
+                            defaults.to_owned(),
+                        );
+                    }
+                    return Ok(Value::Void);
+                }
+                if r.name == "<init>" && r.descriptor == "()V" {
+                    return Ok(Value::Void);
+                }
+                if let Some(value) = self.properties_member(r, marker, args)? {
+                    return Ok(value);
+                }
             }
             match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
                 (owner, "<init>", "(Ljava/util/Map;)V") if is_map_owner(owner) => {
@@ -9670,8 +9705,43 @@ impl Host for StdHost {
             {
                 self.unknown_host_call(r)
             }
+            (owner, "name", "()Ljava/lang/String;")
+                if host_jdk_constant::stack_walker_option_name(receiver).is_some()
+                    && owner == "java/lang/StackWalker$Option" =>
+            {
+                Ok(Value::Ref(Some(
+                    host_jdk_constant::stack_walker_option_name(receiver)
+                        .expect("guarded StackWalker.Option")
+                        .to_owned(),
+                )))
+            }
+            (owner, "ordinal", "()I")
+                if host_jdk_constant::stack_walker_option_name(receiver).is_some()
+                    && owner == "java/lang/StackWalker$Option" =>
+            {
+                let name = host_jdk_constant::stack_walker_option_name(receiver)
+                    .expect("guarded StackWalker.Option");
+                let ordinal = [
+                    "RETAIN_CLASS_REFERENCE",
+                    "DROP_METHOD_INFO",
+                    "SHOW_REFLECT_FRAMES",
+                    "SHOW_HIDDEN_FRAMES",
+                ]
+                .iter()
+                .position(|candidate| *candidate == name)
+                .unwrap_or(0);
+                Ok(Value::Int(ordinal as i32))
+            }
             ("java/lang/Enum", "name", "()Ljava/lang/String;")
             | ("java/lang/Enum", "toString", "()Ljava/lang/String;") => {
+                Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
+            }
+            // `Enum.name()` is final, and `javac` names the constant's own
+            // class as the owner (`StackWalker.Option.name()`), so a platform
+            // enum marker `enum/<owner>/<NAME>` answers it on that owner too.
+            (owner, "name", "()Ljava/lang/String;")
+                if is_platform_enum_constant(receiver, owner) =>
+            {
                 Ok(Value::Ref(Some(enum_name(receiver).to_owned())))
             }
             ("java/lang/Enum", "ordinal", "()I") => Ok(Value::Int(enum_ordinal(receiver))),
@@ -10872,6 +10942,9 @@ fn class_of_text(marker: &str) -> Option<String> {
     if jar_object::spells_key_text(marker) {
         return Some("java/lang/String".into());
     }
+    if marker.starts_with("enum/java/lang/StackWalker$Option/") {
+        return Some("java/lang/String".into());
+    }
     if let Some((class, _)) = marker.split_once('#') {
         // A text `#` in a string (`#ff0000`, `[I#0`) names no class.
         if value_class::is_plain_string(marker) {
@@ -11376,6 +11449,15 @@ fn enum_name(value: &Value) -> &str {
     expect_string(value)
         .rsplit_once('/')
         .map_or_else(|| expect_string(value), |(_, name)| name)
+}
+
+/// Whether `value` is a platform enum constant's `enum/<owner>/<NAME>` marker
+/// of exactly `owner`, a class the host models.
+fn is_platform_enum_constant(value: &Value, owner: &str) -> bool {
+    expect_ref(value)
+        .and_then(|marker| marker.strip_prefix("enum/"))
+        .and_then(|rest| rest.rsplit_once('/'))
+        .is_some_and(|(class, _)| class == owner && host_models_class(class))
 }
 
 fn enum_ordinal(value: &Value) -> i32 {
@@ -26877,7 +26959,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 0xc6 | 0xc7 => {
                     let value = pop(&mut stack, class, method, at)?;
-                    let is_null = matches!(value, Value::Ref(None));
+                    let is_null = matches!(&value, Value::Ref(None));
                     let take = if op == 0xc6 { is_null } else { !is_null };
                     let offset = read_i16(code, &mut pc)?;
                     let suppressed = self.dispatch_jump_anchor(op, at, class, method, desc)?
@@ -27590,6 +27672,21 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         invoke_or_catch!(at, format_java_string_call(self, &r, &args))
+                    } else if r.owner == "java/lang/String"
+                        && r.name == "formatted"
+                        && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
+                        && let Some(format) = receiver.clone()
+                        && let [values] = args.as_slice()
+                    {
+                        // `text.formatted(args)` is `String.format(text, args)`.
+                        // A call the formatter refuses goes to the host as
+                        // the `formatted` call it is, so the count names it.
+                        match self.java_format(None, &format, values) {
+                            Some(text) => Value::Ref(Some(text)),
+                            None => {
+                                invoke_or_catch!(at, self.host.invoke_instance(&r, &format, &args))
+                            }
+                        }
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_string_join(&r, &args))
                     {
@@ -32595,7 +32692,6 @@ mod tests {
             ("%04x", "[Ljava/lang/Object;#0", "0007"),
             ("%1$d", "[Ljava/lang/Object;#0", "7"),
             ("%+d", "[Ljava/lang/Object;#0", "+7"),
-            ("%b|%f|%x", "[Ljava/lang/Object;#1", "false|0.000001|fffe"),
         ] {
             assert_eq!(
                 format(pattern, args),
@@ -32603,15 +32699,40 @@ mod tests {
                 "{pattern}"
             );
         }
+        // A default-locale `%f` is outside the bounded host's locale knowledge.
+        assert_eq!(
+            format("%b|%f|%x", "[Ljava/lang/Object;#1"),
+            Value::Ref(None)
+        );
         // `%a` of an `Integer` throws on the JDK: the call is the host's,
         // counted, not an approximation.
         assert_eq!(format("%a", "[Ljava/lang/Object;#0"), Value::Ref(None));
+        drop(format);
+        let locale_method = MethodRef {
+            owner: "java/lang/String".into(),
+            name: "format".into(),
+            descriptor:
+                "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;".into(),
+        };
+        assert_eq!(
+            format_java_string_call(
+                &mut runtime,
+                &locale_method,
+                &[
+                    crate::runtime::host_jdk_constant::locale("en", "US"),
+                    Value::Ref(Some("%b|%f|%x".into())),
+                    host_array::handle("[Ljava/lang/Object;#1"),
+                ],
+            )
+            .unwrap(),
+            Value::Ref(Some("false|0.000001|fffe".into()))
+        );
         assert_eq!(
             host.unknown_host_calls(),
             vec![(
                 "java/lang/String#format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
                     .to_owned(),
-                1
+                2
             )]
         );
     }
