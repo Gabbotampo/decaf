@@ -16,7 +16,7 @@
 //!   calls, `gcUse`).
 //!
 //! Every case's answer and counted calls are pinned. The answers that are
-//! not Java's are named below; all are counted but #285's.
+//! not Java's are named below; all are counted.
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -49,10 +49,6 @@ const COUNTED: &[(&str, &[&str])] = &[
     (
         "cmpEqualsText",
         &["java/lang/String#contentEquals(Ljava/lang/CharSequence;)Z"],
-    ),
-    (
-        "entryOfLambdaCast",
-        &["java/lang/CharSequence#<checkcast>(Ljava/lang/Object;)Ljava/lang/CharSequence;"],
     ),
     ("cmpHashCodeText", &["java/lang/Object#hashCode()I"]),
     (
@@ -90,12 +86,6 @@ const COUNTED: &[(&str, &[&str])] = &[
 const DEPARTURES: &[(&str, &str)] = &[
     // `String.contentEquals` is not modelled: counted.
     ("cmpEqualsText", "false,false,false,false"),
-    // A jar `String` spelled `list/hobj:...` still decodes jar objects
-    // (#285, P14's text collections); no callback comes out of it.
-    (
-        "listForgeJarObject",
-        "got,got,got,got,got,got,got,got,ran=true,log=null",
-    ),
     // A comparator's `hashCode` is its identity hash: counted, so two
     // answer alike.
     ("cmpHashCodeText", "true,false,false"),

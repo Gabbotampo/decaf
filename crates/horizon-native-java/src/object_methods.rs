@@ -223,10 +223,13 @@ impl<H: Host> Runtime<'_, H> {
                 // A game id compares and hashes by its key (`host_ids.rs`).
                 crate::host_ids::pure_equality(value)
                     || is_map_entry(value)
-                        && map_entry_parts(value).is_ok_and(|(key, entry)| {
-                            self.pure_equality_at(&key, depth + 1)
-                                && self.pure_equality_at(&entry, depth + 1)
-                        })
+                        && self
+                            .host
+                            .map_entry_parts(value)
+                            .is_some_and(|(key, entry)| {
+                                self.pure_equality_at(&key, depth + 1)
+                                    && self.pure_equality_at(&entry, depth + 1)
+                            })
             }
             Equality::Jar { equals, hash_code } => {
                 if depth >= MAX_PURITY_DEPTH {
@@ -310,6 +313,14 @@ impl<H: Host> Runtime<'_, H> {
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::host_recursion::enter()?;
+        // A Gson tree element hashes as `JsonElement.hashCode` (`gson_tree::element_hash`,
+        // Gson 2.14's bytecode: an integral `JsonPrimitive` by its `long`, any other number by
+        // `doubleToLongBits`), consistent with the `equals` `java_equals` answers for it: equal
+        // elements with different hashes (`1` and `1.0`) stay two keys, as in Java (#221 re-check
+        // 4, B9). An element it cannot hash (`JsonNull`'s identity hash) is unknown.
+        if crate::gson_tree::is_tree_element(value) {
+            return self.element_hash(value);
+        }
         match self.equality_of(value) {
             Equality::Null => Ok(Some(0)),
             Equality::Identity
@@ -545,35 +556,6 @@ impl<H: Host> Runtime<'_, H> {
                 // give (two equal keys from different constructions of an
                 // identity-`equals` kind) is counted and never replaced by
                 // key equality: the two stay distinct (§2.1).
-                // A host map entry and a jar's own `Map.Entry`:
-                // `KeyValueHolder.equals`/`HashMap.Node.equals` read the other
-                // entry's `getKey`, then (keys equal) its `getValue`, and compare
-                // with `Objects.equals`.
-                if let Some((key, value)) = crate::host_entry::parts(a)
-                    && self.jar_map_entry(b)
-                {
-                    let descriptor = "()Ljava/lang/Object;";
-                    let theirs = self.call_virtual(
-                        crate::jdk_call::Site::Interface,
-                        "java/util/Map$Entry",
-                        "getKey",
-                        descriptor,
-                        b,
-                        &[],
-                    )?;
-                    if !self.objects_equals(&key, &theirs)? {
-                        return Ok(false);
-                    }
-                    let theirs = self.call_virtual(
-                        crate::jdk_call::Site::Interface,
-                        "java/util/Map$Entry",
-                        "getValue",
-                        descriptor,
-                        b,
-                        &[],
-                    )?;
-                    return self.objects_equals(&value, &theirs);
-                }
                 if let Value::Host(handle) = a
                     && !crate::jar_object::is_object_handle(handle)
                 {
@@ -612,17 +594,6 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     };
                 }
-                if is_map_entry(a) {
-                    // `Map.Entry.equals`: an entry with `Objects.equals` keys
-                    // and values.
-                    if !is_map_entry(b) {
-                        return Ok(false);
-                    }
-                    let (left_key, left_value) = map_entry_parts(a)?;
-                    let (right_key, right_value) = map_entry_parts(b)?;
-                    return Ok(self.objects_equals(&left_key, &right_key)?
-                        && self.objects_equals(&left_value, &right_value)?);
-                }
                 let kotlin_collection = |value: &Value| {
                     matches!(
                         value,
@@ -659,6 +630,28 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return self.list_equals(a, b);
                 }
+                if self.host_collection_kind(a) == Some(CollectionKind::Set)
+                    && self.host_collection_kind(b) == Some(CollectionKind::Set)
+                {
+                    return self.abstract_set_equals(a, b);
+                }
+                // A Gson tree element (`JsonObject`, `JsonArray`, `JsonPrimitive`...):
+                // `JsonElement.equals` by contents (`gson_tree.rs`), wherever a collection
+                // compares its elements (a `LinkedHashMap` keyed by equal `JsonObject`s merges
+                // them, #221 review B7). One it cannot type is counted.
+                if crate::gson_tree::is_tree_element(a) {
+                    return match self.element_equals(a, b)? {
+                        Some(equal) => Ok(equal),
+                        None => {
+                            self.host.unknown_operand_call(&MethodRef {
+                                owner: "com/google/gson/JsonElement".into(),
+                                name: "equals".into(),
+                                descriptor: EQUALS.into(),
+                            })?;
+                            Ok(false)
+                        }
+                    };
+                }
                 // `File.equals`: the same path text (`UnixFileSystem.compare`).
                 if let Some(path) = self.file_path(a) {
                     return Ok(self.file_path(b) == Some(path));
@@ -693,6 +686,48 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(a == b)
             }
         }
+    }
+
+    /// `AbstractSet.equals` between two sets the host holds, wherever a collection compares
+    /// its elements (`List.contains`, a `HashSet`'s or `HashMap`'s bins, `Set.of`'s duplicate
+    /// check): `o == this`, then the sizes, then `containsAll(o)`, `this.contains(e)` run
+    /// through the dispatch for each of `o`'s elements, a `ClassCastException` or
+    /// `NullPointerException` answering `false`. Two sets with their own handles (two maps'
+    /// `entrySet()` views, #221 review B5) compare by contents, as a direct `equals` does.
+    pub(crate) fn abstract_set_equals(
+        &mut self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<bool, NativeError> {
+        if identical(a, b) {
+            return Ok(true);
+        }
+        let theirs = self.collection_elements(b)?;
+        if self.collection_elements(a)?.len() != theirs.len() {
+            return Ok(false);
+        }
+        for element in &theirs {
+            let found = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Set",
+                "contains",
+                "(Ljava/lang/Object;)Z",
+                a,
+                std::slice::from_ref(element),
+            );
+            match found {
+                Ok(Value::Int(0)) => return Ok(false),
+                Ok(_) => {}
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
     }
 
     /// `Objects.equals(a, b)`: `a == b || a != null && a.equals(b)`.
@@ -929,18 +964,6 @@ impl<H: Host> Runtime<'_, H> {
                 crate::kotlin_stdlib::instance(self, r, receiver.unwrap_or(&Value::Ref(None)), args)
         {
             return value.map(Some);
-        }
-        // A host map entry's `equals`: `KeyValueHolder.equals` asks the other
-        // object's `getKey`/`getValue`, which a jar's own `Map.Entry` runs
-        // here (`java_equals`), not the kind's row.
-        if handle.kind() == crate::host_ref::HostKind::MapEntry
-            && r.name == "equals"
-            && r.descriptor == EQUALS
-            && let [other] = args
-        {
-            let receiver = Value::Host(handle.clone());
-            let equal = self.java_equals(&receiver, other)?;
-            return Ok(Some(Value::Int(i32::from(equal))));
         }
         // A callback's `toString`: counted, a text answered (`host_ref_text`).
         if handle.kind() == crate::host_ref::HostKind::Callback
@@ -1218,9 +1241,9 @@ impl<H: Host> Runtime<'_, H> {
     }
 }
 
-/// Whether a value is the host's `Map.Entry` (`host_entry.rs`).
+/// Whether a value is one of the host's `Map.Entry` handles (`host_map_entry.rs`).
 pub(crate) fn is_map_entry(value: &Value) -> bool {
-    crate::host_entry::parts(value).is_some()
+    crate::host_map_entry::is_entry(value)
 }
 
 /// `a.equals(b)` for a string or a box `a`: equal values of the same kind. A
@@ -1290,16 +1313,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(crate::jar_object::collection_class(handle.key()).to_owned());
         }
+        // No text is a collection (#156 P14d2): only an object `new` made of
+        // a JDK collection class, or of a jar subclass of one, has a row.
         let marker = expect_ref(value)?;
-        let (head, _) = marker
-            .split_once(['#', '/'])
-            .unwrap_or((marker.as_str(), ""));
-        match head {
-            "list" => return Some("java/util/ArrayList".into()),
-            "set" => return Some("java/util/LinkedHashSet".into()),
-            "map" => return Some("java/util/LinkedHashMap".into()),
-            _ => {}
-        }
         let mut class = crate::jar_object::key_class(marker)
             .or_else(|| marker.split_once('#').map(|(class, _)| class))?
             .to_owned();
@@ -1545,6 +1561,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
+    }
+
+    fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        self.runtime.host.map_entry_parts(value)
     }
 
     fn server_value_key(&mut self, value: &Value) -> Option<Option<String>> {

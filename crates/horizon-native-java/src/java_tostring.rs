@@ -19,7 +19,7 @@ pub(crate) fn owner(value: &Value) -> Option<String> {
         return None;
     }
     // The optionals are host handles (`host_ref.rs`), printed through
-    // [`modelled`].
+    // [`modelled`], and so are the map entries (`host_map_entry.rs`).
     // Prefix families the host models before any class marker.
     let prefix = [("charset/", "java/nio/charset/Charset")];
     for (prefix, owner) in prefix {
@@ -34,16 +34,6 @@ pub(crate) fn owner(value: &Value) -> Option<String> {
         && crate::host_models_class(class)
     {
         return Some("java/lang/Enum".to_owned());
-    }
-    // A collection marker: `list/a,b`, `set/...`, `map/k,v`, immutable forms
-    // `list#i1/...`, and the bare empty kinds.
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    match kind {
-        "list" => return Some("java/util/List".to_owned()),
-        "set" => return Some("java/util/Set".to_owned()),
-        "map" => return Some("java/util/Map".to_owned()),
-        _ => {}
     }
     // A class marker (`class#n`): only a class the host models has a body to
     // answer, so a jar object keeps the caller's text. A builder's text lives

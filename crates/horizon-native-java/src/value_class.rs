@@ -46,6 +46,8 @@ const RETIRED_PREFIXES: &[&str] = &[
     "enumeration/",
     "list-iterator/",
     "collector/",
+    // Map entries are handles (#156 P14e, `host_map_entry.rs`).
+    "map-entry/",
     // The client's objects and values are game handles (#156 P16d,
     // `client_values.rs`, `game_object::client_value`).
     "client/",
@@ -56,6 +58,16 @@ const RETIRED_PREFIXES: &[&str] = &[
     "game-rule/",
     // Every `game/…` object is a handle (#156 P16b, P16e).
     "game/",
+    // Collections are handles (#156 P14d2): the `list/…`, `set/…`, `map/…`
+    // literals are gone, and a text spelled like one is a `String`.
+    "list/",
+    "set/",
+    "map/",
+    // Their generation (`list#3/…`) and immutable (`list#i1/…`, `set#i0`)
+    // spellings too (#255 review).
+    "list#",
+    "set#",
+    "map#",
     // StackWalker.Option moved to a typed host handle; old marker-shaped
     // text remains an ordinary String.
     "enum/java/lang/StackWalker$Option/",
@@ -92,6 +104,12 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 /// handles, never text (`host_array.rs`, `host_brigadier.rs`): a text spelled
 /// like their old markers ([`RETIRED_PREFIXES`]) or their keys (`[I#0`,
 /// `color-collection#0`) is a `String`.
+/// A class whose objects are collection handles: a collection or map type,
+/// or a class the collection model gives supertypes.
+fn collection_class(class: &str) -> bool {
+    crate::is_collection_owner(class) || !crate::java_immutable::supertypes(class).is_empty()
+}
+
 pub(crate) fn is_plain_string(marker: &str) -> bool {
     if RETIRED_PREFIXES
         .iter()
@@ -119,11 +137,19 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
     if crate::jar_object::spells_key_text(marker) {
         return true;
     }
+    // A host map entry's key (`<class>#entry<n>`/`#node<n>`, #156 P14e) is a handle's,
+    // never text.
+    if crate::host_map_entry::spells_entry_key(marker) {
+        return true;
+    }
     if let Some((class, _)) = marker.split_once('#')
         && !class.is_empty()
         && !class.contains([':', ' '])
     {
-        return host_array::handle_only_class(class);
+        // A collection is a handle (#156 P14d2), and the keys the host writes
+        // read as plain above: `java/util/ArrayList#x` or
+        // `net/minecraft/core/NonNullList#x` is text (#253 re-check).
+        return host_array::handle_only_class(class) || collection_class(class);
     }
     if !marker.contains('#') && class_of_text(marker).is_some() {
         return false;
@@ -359,6 +385,15 @@ mod tests {
             "java/util/ArrayList#neutral0",
             "java/util/ImmutableCollections$ListN#immutable3",
             "java/util/ReverseOrderListView$Rand#reversed0",
+            // Spelled like the old collection literals (#156 P14d2): a
+            // collection is a handle.
+            "list/4",
+            "set/ra,rb",
+            "map/rk,rv",
+            // A collection class with a suffix the host never writes: a
+            // collection is a handle (#253 re-check).
+            "java/util/ArrayList#weird0",
+            "net/minecraft/core/NonNullList#x",
             // Spelled like a class (#156 P13c): a `Class` is a handle.
             "java/lang/String",
             "demo/Probe$Foo",
@@ -382,8 +417,6 @@ mod tests {
             "",
         )));
         for marker in [
-            "java/util/ArrayList#weird0",
-            "list/4",
             "registry/minecraft:item",
             "string-builder/2",
             // A marker kind ahead of a capitalized segment is no class name.

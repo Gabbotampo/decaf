@@ -800,6 +800,11 @@ impl<H: Host> Runtime<'_, H> {
             Value::Boxed(boxed @ Boxed::Character(_)) => {
                 Some(format!("\"{}\"", style.escape(&boxed.text())))
             }
+            // A `Float` box (a `float` field too): `Gson`'s float adapter
+            // checks the value widened to a `double` before writing it.
+            Value::Boxed(Boxed::Float(bits)) if !f32::from_bits(*bits).is_finite() => {
+                Some(non_finite_text(f64::from(f32::from_bits(*bits)), style)?)
+            }
             Value::Boxed(boxed) => Some(boxed.text()),
             Value::Int(value) => Some(value.to_string()),
             Value::Long(value) => Some(if style.long_strings() {
@@ -810,26 +815,8 @@ impl<H: Host> Runtime<'_, H> {
             Value::Float(value) => {
                 if value.is_finite() {
                     Some(format!("{value}"))
-                } else if style.special_floats() {
-                    Some(if value.is_nan() {
-                        "NaN".into()
-                    } else if *value > 0.0 {
-                        "Infinity".into()
-                    } else {
-                        "-Infinity".into()
-                    })
                 } else {
-                    // Gson's `JsonWriter.value(double)` refusal.
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some(
-                            "NaN is not a valid double value as per JSON specification. \
-                             To override this behavior, use \
-                             GsonBuilder.serializeSpecialFloatingPointValues() method."
-                                .into(),
-                        ),
-                        frame: None,
-                    });
+                    Some(non_finite_text(*value, style)?)
                 }
             }
             // A marker, or an object by its key (`jar_object.rs`).
@@ -956,7 +943,7 @@ impl<H: Host> Runtime<'_, H> {
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            members.push((style.field_name(&name), value));
+            members.push((style.field_name(&name), primitive_box(&descriptor, value)));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -1066,21 +1053,59 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
         let class = marker
             .split_once('#')
             .map_or(marker.as_str(), |(class, _)| class);
-        return if is_map_owner(class) {
+        // A map whichever class the host made it (Guava's
+        // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
+        // (#253 review).
+        return if is_map_owner(class)
+            || crate::java_immutable::supertypes(class).contains(&"java/util/Map")
+        {
             Some("map")
         } else {
             Some("list")
         };
     }
-    match gson_collection_kind(marker) {
-        Some("map") => Some("map"),
-        Some(_) => Some("list"),
-        None => None,
+    // A collection is a handle the host holds (#156 P14d2): no text is one.
+    None
+}
+
+/// A primitive field's value as Gson's adapter for its type writes it: the
+/// interpreter holds a `boolean` and a `char` as an `int`, so `true` would
+/// print `1` and `'a'` `97` (#253 re-check: a config written with booleans
+/// then failed to read back), the same two rows as #307's writer; and a
+/// `float` as a `double`, so `0.1f` would print `0.10000000149011612`: it is
+/// boxed, and the box goes through Gson's NaN/infinity check (#253 re-check
+/// B7). A `byte`/`short` prints the same either way.
+fn primitive_box(descriptor: &str, value: Value) -> Value {
+    match (descriptor, &value) {
+        ("Z", Value::Int(int)) => Value::Boxed(Boxed::Boolean(*int != 0)),
+        ("C", Value::Int(int)) => Value::Boxed(Boxed::Character(*int as u16)),
+        ("F", Value::Float(float)) => Value::Boxed(Boxed::float(*float)),
+        _ => value,
     }
 }
 
-fn gson_collection_kind(marker: &str) -> Option<&str> {
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    matches!(kind, "list" | "set" | "map").then_some(kind)
+/// A NaN or infinite `double` (or `float`, widened) as Gson writes it:
+/// `NaN`/`Infinity`/`-Infinity` under `serializeSpecialFloatingPointValues`,
+/// else `Gson.checkValidFloatingPoint`'s `IllegalArgumentException`, naming
+/// the value as `Double.toString` prints it (#253 re-check B7).
+fn non_finite_text(value: f64, style: &GsonStyle) -> Result<String, NativeError> {
+    let shown = if value.is_nan() {
+        "NaN"
+    } else if value > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    if style.special_floats() {
+        return Ok(shown.into());
+    }
+    Err(NativeError::UncaughtException {
+        class: "java/lang/IllegalArgumentException".into(),
+        message: Some(format!(
+            "{shown} is not a valid double value as per JSON specification. \
+             To override this behavior, use \
+             GsonBuilder.serializeSpecialFloatingPointValues() method."
+        )),
+        frame: None,
+    })
 }

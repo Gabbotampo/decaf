@@ -533,11 +533,13 @@ mod tests {
     /// on (#261 round-3 S1, `"A"×4094 + ",tail"` cut right after its `\`).
     #[test]
     fn a_builder_marker_is_no_callback() {
-        assert!(holds_callback(
-            "list/hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#r()V:"
-        ));
-        assert!(holds_callback("list/hopt:hcb:@fn:identity/function:"));
-        assert!(!holds_callback("list/hhcb:3"));
+        // An `HttpClient.Builder`'s marker (tag `hcb`) names no callback,
+        // alone or inside other text. (No runtime-made text holds a callback
+        // since #255 and #261; what `holds_callback` still answers for a
+        // jar's own `String` is #330.)
+        for text in ["hhcb:3", "list/hhcb:3", "a,hhcb:3", "hopt:hhcb:3"] {
+            assert!(!holds_callback(text), "{text}");
+        }
     }
 
     #[test]

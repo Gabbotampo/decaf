@@ -547,7 +547,7 @@ impl<H: Host> Runtime<'_, H> {
             && self.stateless_jar_object(argument).is_some()
             && self.jar_map_entry(argument)
             && runtime_collection_values(self.host, receiver).is_ok_and(|values| {
-                !values.is_empty() && values.iter().all(crate::object_methods::is_map_entry)
+                !values.is_empty() && values.iter().all(crate::host_map_entry::is_entry)
             })
         {
             return self.host.unknown_operand_call(r).map(Some);
@@ -600,7 +600,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether a jar object's class implements `java.util.Map.Entry`.
-    pub(crate) fn jar_map_entry(&self, value: &Value) -> bool {
+    fn jar_map_entry(&self, value: &Value) -> bool {
         crate::jar_object::object_class(value)
             .is_some_and(|class| self.class_is_instance(class, "java/util/Map$Entry"))
     }

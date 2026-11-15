@@ -47,11 +47,9 @@ fn shown(out: Result<Value, horizon_native_java::NativeError>) -> String {
     }
 }
 
-/// No forge yields a callback: the target never runs, and no case answers
-/// as if one ran. Java answers each with a `ClassCastException` at the
-/// `(List)` cast; here the list text is still read until #255 deletes the
-/// collection text form (#285), so a case may end in another refusal
-/// (`NoSuchElementException`, a host error), never in a run.
+/// No forge yields a callback: each answers as Java does, with a
+/// `ClassCastException` at the `(List)` or `(Optional)` cast (`list/` text is
+/// a `String` since #255), and the target never runs.
 #[test]
 fn no_jar_string_becomes_a_callback_at_any_escape_depth() {
     let fixture =
@@ -66,7 +64,7 @@ fn no_jar_string_becomes_a_callback_at_any_escape_depth() {
         let mut host = fixture.jar.seed_host(StdHost::new());
         let answer = shown(call(&fixture.jar, &mut host, method, Some(n)));
         let ran = shown(call(&fixture.jar, &mut host, "ranFlag", None));
-        if ran != "ran=false" || answer.starts_with("got") || answer.starts_with("sorted") {
+        if ran != "ran=false" || answer != java(&name) {
             wrong.push(format!("{name}: {answer} / {ran}"));
         }
     }
