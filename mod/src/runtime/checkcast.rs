@@ -966,7 +966,9 @@ impl<H: Host> Runtime<'_, H> {
 /// Mixins') for a jar class, `None` where the chain leaves them.
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
     fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
-        self.host.described_instance_of(key, wanted)
+        self.host
+            .described_instance_of(key, wanted)
+            .or_else(|| self.host.game_instance_of(key, wanted))
     }
 
     fn declared_interfaces(&self, class: &str) -> Option<Vec<String>> {
