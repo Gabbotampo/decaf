@@ -842,7 +842,7 @@ impl<H: Host> Runtime<'_, H> {
             }),
             Value::Float(value) => {
                 if value.is_finite() {
-                    Some(format!("{value}"))
+                    Some(crate::jdk_float_text::double_to_string(*value))
                 } else {
                     Some(non_finite_text(*value, style)?)
                 }
