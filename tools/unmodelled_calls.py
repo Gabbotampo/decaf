@@ -410,12 +410,19 @@ def result_row(jar: Path, kind: str, result: dict, deps: list[Path],
             if field in result:
                 row[field] = result[field]
         return row
+    error = str(result.get("error"))
+    wall_guard = "wall-clock hang guard" in error
     row = {
-        "jar": jar.name, "mode": mode, "verdict": "refused", "kind": kind,
+        "jar": jar.name, "mode": mode,
+        "verdict": "nondeterministic" if wall_guard else "refused", "kind": kind,
         "classification": "alone-result" if mode == "alone" else "closure-result",
-        "stage": result.get("stage"), "error": str(result.get("error"))[:400],
+        "stage": result.get("stage"), "error": error[:400],
         "deps": [dep.name for dep in deps], "missing": missing,
     }
+    if wall_guard:
+        # A wall guard is a host-load outcome, never an ordinary refusal. Keep
+        # it as a loud census marker so repeat comparisons reject the row.
+        row["nondeterministic"] = "wall-clock-hang-guard"
     before = result.get("unknown_host_calls")
     if isinstance(before, list) and before:
         row["counted_before_error"] = before

@@ -53,7 +53,7 @@ use super::*;
 /// The deterministic interpreter-step bound of one plugin call.
 pub(crate) const CONFIG_PLUGIN_CALL_INSTRUCTIONS: usize = 2_000_000;
 /// A distant final hang guard; normal refusal names the instruction bound.
-pub(crate) const CONFIG_PLUGIN_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const CONFIG_PLUGIN_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Companion Mixins one `getMixins()` may add.
 const MAX_COMPANION_MIXINS: usize = 512;

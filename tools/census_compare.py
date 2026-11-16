@@ -62,7 +62,7 @@ def call_counts(row: dict | None) -> dict[str, int]:
 # refused row that now stops somewhere else (new `error`/`stage`) or a run whose `failed`, `frame`
 # or listener evidence changed is never reported as unchanged (rc261d: the tool missed two such rows).
 CALL_FIELDS = {"calls", "counted_before_error"}
-SHOWN_FIELDS = {"jar", "mode", "role", "verdict", "unknown"} | CALL_FIELDS
+SHOWN_FIELDS = {"jar", "mode", "role", "verdict", "unknown", "nondeterministic"} | CALL_FIELDS
 
 
 def other_changes(left: dict | None, right: dict | None) -> list[dict]:
@@ -155,6 +155,18 @@ def flaky_rows(flaky: dict[tuple[str, str, str, str], list[dict]]) -> list[dict]
             for key, runs in sorted(flaky.items())]
 
 
+def nondeterministic_rows(payload: dict) -> list[dict]:
+    rows = []
+    for corpus, data in (payload.get("corpora") or {}).items():
+        for row in data.get("rows", []):
+            if row.get("nondeterministic"):
+                rows.append({"corpus": str(corpus), "mode": row.get("mode"),
+                             "role": row.get("role"), "jar": row.get("jar"),
+                             "marker": row.get("nondeterministic"),
+                             "error": row.get("error")})
+    return rows
+
+
 def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]], role: str) -> dict:
     # Keep baseline and head repetition failures separate. A known flaky main row
     # must not make a deterministic head look flaky, and the census needs to say
@@ -170,6 +182,8 @@ def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]
     return {"base": {"sha": base.get("sha"), "totals": totals(base, role, excluded)},
             "merged": {"sha": merged.get("sha"), "totals": totals(merged, role, excluded)},
             "moved": moved_jars(base, merged, role, excluded),
+            "nondeterministic": {"base": nondeterministic_rows(base),
+                                 "merged": nondeterministic_rows(merged)},
             "flaky": flaky_rows(all_flaky),
             "base_flaky": flaky_rows(flaky_by_binary.get("base", {})),
             "merged_flaky": flaky_rows(flaky_by_binary.get("merged", {}))}
@@ -195,6 +209,16 @@ def markdown(report: dict) -> str:
         lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {others(item.get('other_changes', []))} | {item['attribution']} |")
     if not report["moved"]:
         lines.append("| — | — | — | — | — | — | — | — | — | — |")
+    lines += ["", "## Non-deterministic wall guards", "",
+              "A row here fired the distant wall-clock hang guard. It is marked nondeterministic and is never treated as an ordinary refusal.", "",
+              "| Binary | Corpus | Mode | Role | Jar | Marker | Error |", "|---|---|---|---|---|---|---|"]
+    guards = report.get("nondeterministic", {})
+    for binary in ("base", "merged"):
+        for item in guards.get(binary, []):
+            error = str(item.get("error") or "").replace("|", "\\|")
+            lines.append(f"| {binary} | {item['corpus']} | {item['mode']} | {item.get('role', '—')} | `{item['jar']}` | `{item['marker']}` | {error} |")
+    if not guards.get("base") and not guards.get("merged"):
+        lines.append("| — | — | — | — | — | — | — |")
     lines += ["", "## Repetition stability", "",
               "The merged/head rows must be byte-identical across repetitions; baseline flakes are listed separately.", "",
               "| Binary | Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|---|"]

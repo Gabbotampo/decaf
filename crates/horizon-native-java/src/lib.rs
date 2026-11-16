@@ -15441,8 +15441,12 @@ pub enum NativeError {
         /// The frame the check ran in.
         class: String,
         method: String,
-        /// How long the budget allowed.
+        /// How long the wall-clock guard allowed.
         budget: std::time::Duration,
+        /// Instructions charged when the check fired.
+        instructions: usize,
+        /// The deterministic bound, when this was an instruction refusal.
+        instruction_limit: Option<usize>,
     },
     /// The fail-closed host mode rejected a call with no bounded model.
     UnknownHostCall(MethodRef),
@@ -15496,11 +15500,22 @@ impl std::fmt::Display for NativeError {
                 class,
                 method,
                 budget,
-            } => write!(
-                f,
-                "native interpreter exceeded its {:.1}s execution budget at {class}#{method}",
-                budget.as_secs_f64()
-            ),
+                instructions,
+                instruction_limit,
+            } => {
+                if let Some(limit) = instruction_limit {
+                    write!(
+                        f,
+                        "native interpreter exceeded its deterministic instruction budget of {limit} steps (at {instructions}) at {class}#{method}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "native interpreter exceeded its wall-clock hang guard of {:.1}s at {class}#{method}",
+                        budget.as_secs_f64()
+                    )
+                }
+            }
             _ => write!(f, "{self:?}"),
         }
     }
@@ -19007,6 +19022,18 @@ impl NativeJar {
         }
         persistence?;
         io_persistence?;
+        if std::env::var_os("HORIZON_TRACE_BUDGET").is_some()
+            && budget.instruction_limit().is_some()
+        {
+            eprintln!(
+                "native-budget {}#{} instructions={} limit={:?} wall={:?}",
+                target.owner,
+                target.name,
+                runtime.instructions,
+                budget.instruction_limit(),
+                budget.limit(),
+            );
+        }
         result
     }
 
@@ -26654,6 +26681,8 @@ impl<H: Host> Runtime<'_, H> {
             class: class.to_owned(),
             method: method.to_owned(),
             budget: self.budget.limit().unwrap_or_default(),
+            instructions: self.instructions,
+            instruction_limit: self.budget.instruction_limit(),
         }
     }
 
@@ -35004,10 +35033,14 @@ modId="minecraft"
                 class,
                 method,
                 budget,
+                instructions,
+                instruction_limit,
             } => {
                 assert_eq!(class, "demo/Spin");
                 assert_eq!(method, "spin");
                 assert_eq!(budget, limit);
+                assert_eq!(instructions, 0);
+                assert_eq!(instruction_limit, None);
             }
             other => panic!("expected the execution budget, got {other:?}"),
         }
