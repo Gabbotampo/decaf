@@ -24005,16 +24005,28 @@ impl<H: Host> Runtime<'_, H> {
         // An annotation the lookup handed out answers its own members, so
         // `found.value()` reads the class file's value instead of dispatching
         // into an interface that has no code.
-        if let Some(marker) = receiver.and_then(expect_ref)
-            && let Some(annotation) = self.annotations.get(marker).cloned()
+        if let Some(marker) = receiver.and_then(|value| match value {
+            Value::Host(handle) if handle.kind() == HostKind::AnnotationProxy => Some(handle.key()),
+            _ => None,
+        }) && let Some(annotation) = self.annotations.get(marker).cloned()
         {
             if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
-                if r.name == "equals" && args.first().and_then(expect_ref) == Some(marker) {
+                if r.name == "equals"
+                    && args.first().is_some_and(|value| {
+                        matches!(value, Value::Host(handle)
+                            if handle.kind() == HostKind::AnnotationProxy
+                                && handle.key() == marker)
+                    })
+                {
                     return Ok(Some(Value::Int(1)));
                 }
                 if let Some(value) = self.annotation_object_method(&annotation, r, args)? {
                     return Ok(Some(value));
                 }
+                // An annotation proxy's identity-bearing member is not answerable
+                // from class-file spellings alone; count it instead of falling
+                // through to Object.equals and manufacturing false.
+                return self.host.unknown_operand_call(r).map(Some);
             } else {
                 return Ok(Some(self.annotation_member(&annotation, r)?));
             }
@@ -25075,7 +25087,7 @@ impl<H: Host> Runtime<'_, H> {
         );
         self.next_annotation = self.next_annotation.saturating_add(1);
         self.annotations.insert(marker.clone(), annotation);
-        Value::Ref(Some(marker))
+        Value::Host(HostRef::new(HostKind::AnnotationProxy, marker))
     }
 
     /// One member query on an annotation value. Only the shapes the class-file

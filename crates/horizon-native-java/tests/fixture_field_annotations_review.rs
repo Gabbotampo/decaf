@@ -18,6 +18,12 @@ import java.lang.reflect.Method;
 enum E { A, B }
 
 @Retention(RetentionPolicy.RUNTIME)
+@interface Marker {}
+
+@Retention(RetentionPolicy.RUNTIME)
+@interface C { Class<?>[] value(); }
+
+@Retention(RetentionPolicy.RUNTIME)
 @interface A {
   byte b() default 1; char c() default 'q'; double d() default 2.0; float f() default 1.0f;
   int i() default 3; E en() default E.A; Class<?> cls() default String.class; long l() default 4L;
@@ -35,6 +41,16 @@ class Parent {}
 
 final class Child extends Parent {}
 
+@C({String.class})
+class ArrayEqualLeft {}
+
+@C({String.class})
+class ArrayEqualRight {}
+
+@C({String.class, Integer.class})
+class ArrayUnequalLength {}
+
+@Marker
 @A(b=(byte)3, c='x', d=2.5, f=1.5f, i=5, en=E.B, cls=String.class, l=6L,
    sa={"x", "y"}, n=@N(x=4), na={@N(x=4), @N(x=8)}, s="hi", sh=(short)4,
    ia={1, 2}, z=true, ea={E.A, E.B}, ca={String.class, int.class})
@@ -50,6 +66,34 @@ public final class Probe {
 
   @A(f=Float.NaN, d=Double.POSITIVE_INFINITY)
   static final class Special {}
+
+  static final class FakeMarker implements Marker {
+    @Override public Class<? extends java.lang.annotation.Annotation> annotationType() {
+      return Marker.class;
+    }
+  }
+
+  public static String classArrayEquals() {
+    C left = ArrayEqualLeft.class.getAnnotation(C.class);
+    C right = ArrayEqualRight.class.getAnnotation(C.class);
+    return Boolean.toString(left.equals(right));
+  }
+
+  public static String classArrayUnequal() {
+    C left = ArrayEqualLeft.class.getAnnotation(C.class);
+    C right = ArrayUnequalLength.class.getAnnotation(C.class);
+    return Boolean.toString(left.equals(right));
+  }
+
+  public static String stringForgery() {
+    Marker marker = Probe.class.getAnnotation(Marker.class);
+    return Boolean.toString(marker.equals("annotation/Ldemo/Marker;/0"));
+  }
+
+  public static String jarAnnotationImplementation() {
+    Marker marker = Probe.class.getAnnotation(Marker.class);
+    return Boolean.toString(marker.equals(new FakeMarker()));
+  }
 
   public static String inherited() {
     I value = Child.class.getAnnotation(I.class);
@@ -84,6 +128,55 @@ fn special_float_annotation_values_match_java_25_oracle() {
         fixture.text_on(&mut host, "specials"),
         "@A(b=(byte)0x01, c='q', d=1.0/0.0, f=0.0f/0.0f, i=3, en=A, cls=java.lang.String.class, l=4L, sa={}, n=@N(x=7), na={}, s=\"def\", sh=2, ia={}, z=false, ea={}, ca={})"
     );
+}
+
+#[test]
+fn class_member_array_equal_row_is_counted() {
+    let fixture = Fixture::build(
+        "field-annotations-class-array-equal",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // Java 25 oracle: true. Class members compare by VM identity; this runtime
+    // deliberately counts the unsupported equal-length element comparison.
+    let _ = fixture.text_on(&mut host, "classArrayEquals");
+    assert!(host.unknown_host_call_count() > 0);
+}
+
+#[test]
+fn class_member_array_unequal_row_is_exact() {
+    let fixture = Fixture::build(
+        "field-annotations-class-array-unequal",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // Java 25 oracle: false. Arrays.equals checks length before member identity.
+    assert_eq!(fixture.text_on(&mut host, "classArrayUnequal"), "false");
+    assert_eq!(host.unknown_host_call_count(), 0);
+}
+
+#[test]
+fn string_forgery_row_is_false() {
+    let fixture = Fixture::build(
+        "field-annotations-string-forgery",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // Java 25 oracle: false. A String spelling the proxy key is still a String.
+    assert_eq!(fixture.text_on(&mut host, "stringForgery"), "false");
+}
+
+#[test]
+fn jar_annotation_implementation_row_is_counted() {
+    let fixture = Fixture::build(
+        "field-annotations-jar-annotation",
+        &[("demo/Probe.java", PROBE)],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // Java 25 oracle: true. A jar class implementing the annotation interface
+    // needs type.isInstance and is counted until that dynamic identity is held.
+    let _ = fixture.text_on(&mut host, "jarAnnotationImplementation");
+    assert!(host.unknown_host_call_count() > 0);
 }
 
 #[test]

@@ -4,6 +4,26 @@
 //! module supplies the JDK `AnnotationInvocationHandler` object contract.
 
 use super::*;
+use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods};
+
+pub(crate) fn class_of_key(key: &str) -> &str {
+    key.strip_prefix("annotation/L")
+        .and_then(|rest| rest.split_once(';').map(|(name, _)| name))
+        .unwrap_or("java/lang/annotation/Annotation")
+}
+
+fn annotation_instance_of(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    hierarchy.is_instance(class_of_key(handle.key()), wanted)
+}
+
+pub(crate) const METHODS: Methods = Methods {
+    instance_of: annotation_instance_of,
+    ..crate::runtime::host_events::DECLARED_TYPE_METHODS
+};
 
 #[derive(Clone)]
 struct Member {
@@ -236,13 +256,14 @@ impl<H: Host> Runtime<'_, H> {
             else {
                 return Some(false);
             };
-            return Some(
-                left.len() == right.len()
-                    && left.iter().zip(right).all(|(left, right)| {
-                        self.annotation_value_equal(left, right, element)
-                            .unwrap_or(false)
-                    }),
-            );
+            if left.len() != right.len() {
+                return Some(false);
+            }
+            let mut equal = true;
+            for (left, right) in left.iter().zip(right) {
+                equal &= self.annotation_value_equal(left, right, element)?;
+            }
+            return Some(equal);
         }
         match (left, right, descriptor) {
             (AnnotationValue::Annotation(left), AnnotationValue::Annotation(right), descriptor)
@@ -291,20 +312,26 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 match other {
                     Value::Ref(None) => Ok(Some(Value::Int(0))),
-                    Value::Ref(Some(marker)) if !marker.starts_with("annotation/") => {
-                        Ok(Some(Value::Int(0)))
-                    }
-                    Value::Ref(Some(marker)) => {
-                        let Some(other) = self.annotations.get(marker) else {
+                    Value::Ref(_) => Ok(Some(Value::Int(0))),
+                    Value::Host(handle) if handle.kind() == HostKind::AnnotationProxy => {
+                        let Some(other) = self.annotations.get(handle.key()) else {
                             return Ok(None);
                         };
                         Ok(self
                             .annotation_equal(annotation, other)
                             .map(|equal| Value::Int(i32::from(equal))))
                     }
-                    // A dynamic annotation proxy is not one of our stored
-                    // markers; its identity/member behavior remains COUNTED.
-                    Value::Host(_) => Ok(None),
+                    Value::Host(handle) => {
+                        let wanted = annotation
+                            .descriptor
+                            .strip_prefix('L')
+                            .and_then(|name| name.strip_suffix(';'))
+                            .unwrap_or(&annotation.descriptor);
+                        match handle.instance_of(wanted, self) {
+                            Some(false) => Ok(Some(Value::Int(0))),
+                            _ => Ok(None),
+                        }
+                    }
                     _ => Ok(Some(Value::Int(0))),
                 }
             }
