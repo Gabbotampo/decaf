@@ -7,28 +7,7 @@ mod javac_fixture;
 use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 
-const EXPECTED: &[(&str, &str)] = &[
-    (
-        "tags",
-        "TagKey[minecraft:entity_type / minecraft:freeze_immune_entity_types]|minecraft:freeze_immune_entity_types|ResourceKey[minecraft:root / minecraft:entity_type]|truetrue|true|falsefalsefalse|net.minecraft.tags.TagKey",
-    ),
-    (
-        "categories",
-        "BENEFICIALBENEFICIAL0BLUE|1RED|2BLUE|truetrue-2",
-    ),
-    (
-        "attrs",
-        "attribute.test|5.0,-2.0,10.0|true|-2.0,-2.0,10.0,2.5|true|true|net.minecraft.world.entity.ai.attributes.RangedAttribute",
-    ),
-    (
-        "invalid",
-        "Minimum value cannot be bigger than maximum value!;Default value cannot be lower than minimum value!;Default value cannot be bigger than maximum value!;",
-    ),
-    (
-        "attrsEdges",
-        "normal|true|bff0000000000000,4008000000000000,bff0000000000000,0,8000000000000000|NaN,NaN,0|4000000000000000,4024000000000000,NaN|4000000000000000,4024000000000000,0|8000000000000000,8000000000000000|0|0|8000000000000000|8000000000000000|NaN|0",
-    ),
-];
+const JAVA25: &[u8] = include_bytes!("fixtures/vanilla_values/java25.txt");
 
 const SOURCES: &[(&str, &str)] = &[
     (
@@ -73,23 +52,7 @@ const SOURCES: &[(&str, &str)] = &[
     ),
     (
         "demo/Probe.java",
-        r#"package demo;
-import net.minecraft.tags.*; import net.minecraft.world.entity.*; import net.minecraft.world.effect.*; import net.minecraft.world.entity.ai.attributes.*;
-public final class Probe {
-  public static String tags() { TagKey<EntityType<?>> t=EntityTypeTags.FREEZE_IMMUNE_ENTITY_TYPES; Object s="tag-key/registry/minecraft:entity_type|minecraft:freeze_immune_entity_types"; return t+"|"+t.location()+"|"+t.registry()+"|"+t.isFor(t.registry())+t.equals(EntityTypeTags.FREEZE_IMMUNE_ENTITY_TYPES)+"|"+(t==EntityTypeTags.FREEZE_IMMUNE_ENTITY_TYPES)+"|"+(s instanceof TagKey)+s.equals(t)+t.equals(s)+"|"+t.getClass().getName(); }
-  public static String categories() { MobEffectCategory b=MobEffectCategory.BENEFICIAL; return b.name()+b.toString()+b.ordinal()+b.getTooltipFormatting().name()+"|"+MobEffectCategory.HARMFUL.ordinal()+MobEffectCategory.HARMFUL.getTooltipFormatting().name()+"|"+MobEffectCategory.NEUTRAL.ordinal()+MobEffectCategory.NEUTRAL.getTooltipFormatting().name()+"|"+(b==MobEffectCategory.BENEFICIAL)+b.equals(MobEffectCategory.BENEFICIAL)+b.compareTo(MobEffectCategory.NEUTRAL); }
-  public static String attrs() { RangedAttribute a=new RangedAttribute("attribute.test",5,-2,10); Attribute same=a.setSyncable(true); return a.getDescriptionId()+"|"+a.getDefaultValue()+","+a.getMinValue()+","+a.getMaxValue()+"|"+a.isClientSyncable()+"|"+a.sanitizeValue(Double.NaN)+","+a.sanitizeValue(-3)+","+a.sanitizeValue(12)+","+a.sanitizeValue(2.5)+"|"+(same==a)+"|"+(a instanceof Attribute)+"|"+a.getClass().getName(); }
-  public static String invalid() { StringBuilder o=new StringBuilder(); for(double[] x:new double[][]{{5,2,1},{1,2,3},{4,1,3}}) { try {new RangedAttribute("x",x[0],x[1],x[2]);o.append("ok");} catch(IllegalArgumentException e){o.append(e.getMessage());} o.append(';');} return o.toString(); }
-  static String bits(double d) { return Double.isNaN(d) ? "NaN" : Long.toHexString(Double.doubleToRawLongBits(d)); }
-  public static String attrsEdges() { RangedAttribute normal=new RangedAttribute("normal",2,-1,3); RangedAttribute maxNan=new RangedAttribute("maxNan",2,0,Double.NaN); RangedAttribute minNan=new RangedAttribute("minNan",2,Double.NaN,10); RangedAttribute valueNan=new RangedAttribute("valueNan",Double.NaN,0,10); RangedAttribute maxNegZero=new RangedAttribute("maxNegZero",0,-1,-0.0); return (normal.getDescriptionId()==null?"null":normal.getDescriptionId())+"|"+(new RangedAttribute(null,2,0,10).getDescriptionId()==null)+"|"+bits(normal.sanitizeValue(Double.NaN))+","+bits(normal.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(normal.sanitizeValue(Double.NEGATIVE_INFINITY))+","+bits(normal.sanitizeValue(+0.0))+","+bits(normal.sanitizeValue(-0.0))+"|"+bits(maxNan.sanitizeValue(2))+","+bits(maxNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(maxNan.sanitizeValue(Double.NaN))+"|"+bits(minNan.sanitizeValue(2))+","+bits(minNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(minNan.sanitizeValue(Double.NaN))+"|"+bits(valueNan.sanitizeValue(2))+","+bits(valueNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(valueNan.sanitizeValue(Double.NaN))+"|"+bits(maxNegZero.sanitizeValue(+0.0))+","+bits(maxNegZero.sanitizeValue(-0.0))+"|"
-    +bits(new RangedAttribute("zero",0.0,0.0,0.0).sanitizeValue(0.0))+"|"
-    +bits(new RangedAttribute("minNegZero",0.0,-0.0,0.0).sanitizeValue(0.0))+"|"
-    +bits(new RangedAttribute("maxNegZero2",0.0,0.0,-0.0).sanitizeValue(0.0))+"|"
-    +bits(new RangedAttribute("valueNegZero",0.0,0.0,0.0).sanitizeValue(-0.0))+"|"
-    +bits(new RangedAttribute("maxNan2",0.0,0.0,Double.NaN).sanitizeValue(2.0))+"|"
-    +bits(new RangedAttribute("valueNan2",0.0,0.0,10.0).sanitizeValue(Double.NaN)); }
-}
-"#,
+        include_str!("fixtures/vanilla_values/demo/Probe.java"),
     ),
 ];
 
@@ -100,12 +63,18 @@ fn fixture() -> Fixture {
 #[test]
 fn vanilla_values_match_java_25_and_forged_marker_stays_string() {
     let fixture = fixture();
-    for (method, expected) in EXPECTED {
+    let oracle = std::str::from_utf8(JAVA25).expect("java25.txt is UTF-8");
+    for method in ["tags", "categories", "attrs", "invalid", "attrsEdges"] {
+        let prefix = format!("{method}=");
+        let expected = oracle
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("missing {method} row in java25.txt"));
         let mut host = fixture.jar.seed_host(StdHost::new());
         let got = fixture.text_on(&mut host, method);
-        assert_eq!(got, *expected, "{method}");
+        assert_eq!(got, expected, "{method}");
         let unknown = host.unknown_host_calls();
-        if *method == "tags" {
+        if method == "tags" {
             assert!(
                 unknown
                     .iter()
