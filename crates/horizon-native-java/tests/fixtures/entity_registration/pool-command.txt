@@ -1,0 +1,4 @@
+Captured with Temurin Java 25.0.5+8 (`java -version`) against the real 26.3 server-game.jar and its real libraries:
+CP=~/ava/minecraft-26.3-server-game.jar:$(python3 -c "import pathlib; print(\":\".join(map(str,pathlib.Path(\"libraries\").rglob(\"*.jar\"))))")
+javac -cp "$CP" PoolProbe.java
+java -cp ".:$CP" PoolProbe 2>&1 | sed -n "s/^\\[[^]]*\\] \\[main/INFO\\]: \\[STDOUT\\]: //p" > vanilla_entity_data_pool.tsv
