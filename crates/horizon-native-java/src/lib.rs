@@ -4,6 +4,8 @@
 //! Fabric metadata, and executes a small no-argument bytecode subset. Calls
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -12,6 +14,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
+
+#[cfg(test)]
+static TEST_STDOUT_TRACE: Mutex<String> = Mutex::new(String::new());
+
+#[cfg(test)]
+pub(crate) fn take_test_stdout() -> String {
+    std::mem::take(&mut *TEST_STDOUT_TRACE.lock().unwrap())
+}
 
 mod annotation_proxy;
 mod annotation_values;
@@ -5584,6 +5594,8 @@ impl Host for StdHost {
     }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
+        #[cfg(test)]
+        TEST_STDOUT_TRACE.lock().unwrap().push_str(text);
     }
 
     fn reserve_dfu_codec(

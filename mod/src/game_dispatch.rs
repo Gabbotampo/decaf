@@ -356,17 +356,7 @@ fn dispatch_state(
     }
     Ok(answer)
 }
-#[cfg(test)]
-static EFFECT_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
-    #[cfg(test)]
-    {
-        let GameHookEffect::SystemMessage { text, .. } = &effect;
-        EFFECT_TRACE.lock().unwrap().push(text.clone());
-        let _ = host;
-        return;
-    }
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
             if let Some(target) = host.player(player) {
@@ -455,8 +445,11 @@ mod tests {
         ))
     }
 
-    fn effect_trace() -> Vec<String> {
-        std::mem::take(&mut *EFFECT_TRACE.lock().unwrap())
+    fn stdout_trace() -> Vec<String> {
+        crate::runtime::take_test_stdout()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     #[test]
@@ -518,47 +511,48 @@ mod tests {
     }
     #[test]
     fn cross_jar_priority_load_and_declaration_order() {
+        let _ = crate::runtime::take_test_stdout();
         let java = HorizonJava::default();
         java.lock().jars = vec![
             load(
                 "high",
                 "High",
-                "@Mixin(value=Player.class, priority=1500) public class High { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"high\")); } }",
+                "@Mixin(value=Player.class, priority=1500) public class High { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { System.out.println(\"high\"); } }",
             ),
             load(
                 "low",
                 "Low",
-                "@Mixin(value=Player.class, priority=500) public class Low { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"low\")); } }",
+                "@Mixin(value=Player.class, priority=500) public class Low { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { System.out.println(\"low\"); } }",
             ),
         ];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(effect_trace(), ["low", "high"]);
+        assert_eq!(stdout_trace(), ["low", "high"]);
 
         java.lock().jars = vec![
             load(
                 "first",
                 "First",
-                "@Mixin(Player.class) public class First { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"first\")); } }",
+                "@Mixin(Player.class) public class First { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { System.out.println(\"first\"); } }",
             ),
             load(
                 "second",
                 "Second",
-                "@Mixin(Player.class) public class Second { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"second\")); } }",
+                "@Mixin(Player.class) public class Second { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { System.out.println(\"second\"); } }",
             ),
         ];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(effect_trace(), ["first", "second"]);
+        assert_eq!(stdout_trace(), ["first", "second"]);
 
         java.lock().jars = vec![load(
             "decl",
             "Decl",
-            "@Mixin(Player.class) public class Decl { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void a(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"a\")); } @Inject(method=\"tick\", at=@At(\"HEAD\")) private void b(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"b\")); } }",
+            "@Mixin(Player.class) public class Decl { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void a(CallbackInfo ci) { System.out.println(\"a\"); } @Inject(method=\"tick\", at=@At(\"HEAD\")) private void b(CallbackInfo ci) { System.out.println(\"b\"); } }",
         )];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(effect_trace(), ["a", "b"]);
+        assert_eq!(stdout_trace(), ["a", "b"]);
     }
 
     #[test]
