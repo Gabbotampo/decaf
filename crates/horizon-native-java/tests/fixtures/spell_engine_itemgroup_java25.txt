@@ -1,0 +1,5 @@
+event=net.fabricmc.fabric.impl.base.event.ArrayBackedEvent
+invoker0=net.fabricmc.fabric.impl.creativetab.CreativeModeTabEventsImpl$$Lambda/0x000001e0010aeb98@679b62af
+register_return=void
+invoker1=net.fabricmc.fabric.impl.creativetab.CreativeModeTabEventsImpl$$Lambda/0x000001e0010aeb98
+same_event=true
