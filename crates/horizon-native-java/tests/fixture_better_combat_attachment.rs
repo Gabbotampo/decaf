@@ -2,7 +2,7 @@
 mod javac_fixture;
 const PROBE: &str = include_str!("fixtures/better_combat/Probe.java");
 const ORACLE: &str = include_str!("fixtures/better_combat/java25.txt");
-const PREDICATE_STUB: &str = r#"package net.fabricmc.fabric.api.attachment.v1; public interface AttachmentSyncPredicate { static AttachmentSyncPredicate all(){return null;} static AttachmentSyncPredicate targetOnly(){return null;} static AttachmentSyncPredicate allButTarget(){return null;} }"#;
+const PREDICATE_STUB: &str = r#"package net.fabricmc.fabric.api.attachment.v1; public interface AttachmentSyncPredicate { boolean test(AttachmentTarget t, net.minecraft.server.level.ServerPlayer p); static AttachmentSyncPredicate all(){return null;} static AttachmentSyncPredicate targetOnly(){return null;} static AttachmentSyncPredicate allButTarget(){return null;} }"#;
 #[test]
 fn attachment_predicate_rows_match_java25() {
     let fixture = javac_fixture::Fixture::build(
@@ -12,6 +12,14 @@ fn attachment_predicate_rows_match_java25() {
             (
                 "net/fabricmc/fabric/api/attachment/v1/AttachmentSyncPredicate.java",
                 PREDICATE_STUB,
+            ),
+            (
+                "net/fabricmc/fabric/api/attachment/v1/AttachmentTarget.java",
+                "package net.fabricmc.fabric.api.attachment.v1; public interface AttachmentTarget {}",
+            ),
+            (
+                "net/minecraft/server/level/ServerPlayer.java",
+                "package net.minecraft.server.level; public class ServerPlayer implements net.fabricmc.fabric.api.attachment.v1.AttachmentTarget {}",
             ),
         ],
     );
