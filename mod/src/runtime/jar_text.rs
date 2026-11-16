@@ -293,7 +293,7 @@ impl<H: Host> Runtime<'_, H> {
                 self.host.unknown_operand_call(&object_to_string())?;
             }
         }
-        java_value_text(&mut *self.host, value, desc)
+        Ok(java_value_text(value, desc))
     }
 
     /// The calls that stringify a jar object, answered with its real

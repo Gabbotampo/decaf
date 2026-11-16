@@ -116,11 +116,6 @@ fn collection_class(class: &str) -> bool {
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
-    // Only the process-local random-tagged stream marker is a runtime object.
-    // A jar String with the same public shape but another tag is still a String.
-    if marker.starts_with("stream/") {
-        return !crate::runtime::stream_pipeline::is_stream_marker(marker);
-    }
     if RETIRED_PREFIXES
         .iter()
         .any(|prefix| marker.starts_with(prefix))

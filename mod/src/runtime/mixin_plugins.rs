@@ -29,8 +29,7 @@
 //! or edits the node stops at the node's first member, which names it.
 //!
 //! **The bound.** Every call runs on a strict host (an unmodelled host call
-
-//! fails instead of answering a neutral value) under its own deterministic instruction budget and distant wall-clock hang guard.
+//! fails instead of answering a neutral value) under its own 250 ms budget.
 //! A failure in steps 1–3, 5 or 6 refuses the whole config with the step and
 //! the member it stopped at; a failure in one `shouldApplyMixin` (or its
 //! `preApply`/`postApply`) refuses that Mixin only, and the session goes on,
@@ -50,10 +49,9 @@
 
 use super::*;
 
-/// The deterministic interpreter-step bound of one plugin call.
-pub(crate) const CONFIG_PLUGIN_CALL_INSTRUCTIONS: usize = 2_000_000;
-/// A distant final hang guard; normal refusal names the instruction bound.
-pub(crate) const CONFIG_PLUGIN_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+/// The wall-clock bound of one plugin call.
+pub(crate) const CONFIG_PLUGIN_CALL_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 /// Companion Mixins one `getMixins()` may add.
 const MAX_COMPANION_MIXINS: usize = 512;
@@ -329,10 +327,7 @@ impl NativeJar {
                 name: name.into(),
                 descriptor: descriptor.into(),
             };
-            let budget = ExecutionBudget::deterministic(
-                CONFIG_PLUGIN_CALL_INSTRUCTIONS,
-                CONFIG_PLUGIN_WALL_CAP,
-            );
+            let budget = ExecutionBudget::within(CONFIG_PLUGIN_CALL_BUDGET);
             self.invoke_persistent(&target, Some(this.clone()), args, host, &budget)
                 .map(Some)
                 .map_err(|error| format!("{name}: {}", failure_text(&error)))

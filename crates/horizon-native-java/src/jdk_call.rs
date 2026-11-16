@@ -434,12 +434,7 @@ impl<H: Host> Runtime<'_, H> {
                 limit: self.depth,
             });
         }
-        if self.budget.wall_expired()
-            || self
-                .budget
-                .instruction_limit()
-                .is_some_and(|limit| self.instructions >= limit)
-        {
+        if self.budget.expired() {
             return Err(self.budget_exceeded(&r.owner, &r.name));
         }
         self.depth += 1;

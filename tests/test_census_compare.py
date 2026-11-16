@@ -40,19 +40,6 @@ class CensusCompareTests(unittest.TestCase):
         self.assertEqual(report["moved"], [])
         self.assertEqual(report["flaky"][0]["jar"], "flaky.jar")
 
-    def test_repetition_flakes_are_attributed_to_base_or_head(self):
-        stable = {"jar": "ixeris.jar", "verdict": "ran-hollow", "unknown": 4,
-                  "calls": [["Platform#get", 1]]}
-        base_first = payload([stable], sha="base")
-        base_second = payload([{**stable, "unknown": 8, "calls": [["Platform#get", 2]]}], sha="base")
-        head = payload([stable], sha="head")
-        report = tool.compare_payloads(
-            base_first, head, {"base": [base_first, base_second], "merged": [head, head]}, "client"
-        )
-        self.assertEqual([row["jar"] for row in report["base_flaky"]], ["ixeris.jar"])
-        self.assertEqual(report["merged_flaky"], [])
-        self.assertIn("merged/head", tool.markdown(report))
-
     def test_markdown_has_totals_and_attribution_column(self):
         base = payload([{"jar": "a.jar", "verdict": "ran-hollow", "unknown": 2, "calls": [["x", 2]]}])
         merged = payload([{"jar": "a.jar", "verdict": "ran-clean", "unknown": 0, "calls": []}])

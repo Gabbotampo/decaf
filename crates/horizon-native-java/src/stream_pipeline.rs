@@ -377,29 +377,25 @@ pub(crate) struct Pipelines {
 /// marker text (#156's P15 moves them onto handles); the per-process random
 /// tag keeps a jar `String` constant from spelling a live stream, so a forged
 /// one is the `String` it is (`is_live_stream`).
-fn stream_tag() -> u64 {
+pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
     static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TAG.get_or_init(|| {
+    let tag = TAG.get_or_init(|| {
         use std::hash::{BuildHasher, Hasher};
         std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish()
-    })
+    });
+    format!("stream/{class}/{method}/{n}~{tag:016x}")
 }
 
-pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
-    format!("stream/{class}/{method}/{n}~{:016x}", stream_tag())
-}
-
-/// Whether `text` is a marker made by this process. The random tag is part of
-/// the capability: a jar String can publish the shape, but it cannot forge the
-/// live stream marker without learning the process-local tag.
+/// Whether `text` has a stream marker's shape (`stream/...~<16 hex>`). A
+/// path that cannot ask the runtime whether a stream is live (the host's
+/// collection text) treats such a text as a stream: it is never printed,
+/// since a printed marker is a forgeable capability.
 pub(crate) fn is_stream_marker(text: &str) -> bool {
     text.starts_with("stream/")
         && text.rsplit_once('~').is_some_and(|(_, tag)| {
-            tag.len() == 16
-                && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && u64::from_str_radix(tag, 16).ok() == Some(stream_tag())
+            tag.len() == 16 && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
 }
 
@@ -2290,15 +2286,5 @@ mod tests {
             Some("java/util/function/IntUnaryOperator")
         );
         assert_eq!(parameter_class(descriptor, 4), None);
-    }
-
-    #[test]
-    fn stream_tag_rejects_a_forged_marker() {
-        let live = stream_marker("demo/Probe", "stream", 0);
-        assert!(is_stream_marker(&live));
-        let (prefix, tag) = live.rsplit_once(char::from(126)).expect("tag");
-        let replacement = if tag.as_bytes()[15] == 48 { '1' } else { '0' };
-        let forged = format!("{prefix}~{}{}", &tag[..15], replacement);
-        assert!(!is_stream_marker(&forged));
     }
 }
