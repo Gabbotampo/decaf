@@ -321,7 +321,7 @@ impl StdHost {
                 {
                     Some(self.jar_metadata(r, receiver, &id, &document, args))
                 } else if Self::builtin_fabric_mod(&id) {
-                    Some(self.builtin_metadata(r, &id))
+                    Some(self.builtin_metadata(r, receiver, &id))
                 } else {
                     None
                 }
@@ -431,15 +431,32 @@ impl StdHost {
     pub(crate) fn counted_metadata_collection(
         &mut self,
         r: &MethodRef,
+        receiver: &Value,
     ) -> Result<Value, NativeError> {
         self.unknown_host_call(r)?;
-        Ok(
-            self.empty_collection(if r.descriptor.contains("Ljava/util/Map;") {
-                "map"
-            } else {
-                "list"
-            }),
-        )
+        let class = if r.descriptor.contains("Ljava/util/Map;") {
+            "map"
+        } else {
+            "list"
+        };
+        let cache = cache_identity(receiver).map(|identity| (identity, r.name.clone()));
+        if let Some(cache) = cache.as_ref()
+            && let Some(marker) = self.cached_collections.get(cache).cloned()
+            && self.mutable_collections.contains_key(&marker)
+            && self
+                .persistent_static_fields
+                .values()
+                .any(|value| expect_ref(value) == Some(&marker))
+        {
+            return Ok(crate::jar_object::collection(marker));
+        }
+        let made = self.empty_collection(class);
+        if let Some(cache) = cache
+            && let Some(marker) = expect_ref(&made)
+        {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        Ok(made)
     }
 
     fn jar_metadata(
@@ -478,7 +495,7 @@ impl StdHost {
                 )
             )
         {
-            return self.counted_metadata_collection(r);
+            return self.counted_metadata_collection(r, receiver);
         }
         let dependencies = || -> Vec<Value> {
             [
@@ -607,7 +624,12 @@ impl StdHost {
     /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
     /// `Minecraft` and its version the game version a caller seeded (counted
     /// without one).
-    fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
+    fn builtin_metadata(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        id: &str,
+    ) -> Result<Value, NativeError> {
         if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
             return Ok(text(id));
         }
@@ -631,7 +653,7 @@ impl StdHost {
             (
                 "getAuthors" | "getContributors" | "getLicense" | "getProvides" | "getDependencies",
                 "()Ljava/util/Collection;",
-            ) => return self.counted_metadata_collection(r),
+            ) => return self.counted_metadata_collection(r, receiver),
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
                 Some(loader::empty_contact())
             }

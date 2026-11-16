@@ -11332,7 +11332,7 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides" | "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
-            ) => self.counted_metadata_collection(r),
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
@@ -11342,7 +11342,7 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
                 "()Ljava/util/Collection;" | "()Ljava/util/Map;",
-            ) => self.counted_metadata_collection(r),
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/Version",
                 "getFriendlyString" | "getRaw" | "toString",
