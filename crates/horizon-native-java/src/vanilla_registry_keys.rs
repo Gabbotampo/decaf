@@ -74,3 +74,16 @@ mod captured_walk_tests {
         assert_eq!((correct, counted, wrong), (43, 0, 0));
     }
 }
+
+#[cfg(test)]
+mod method_semantics_tests {
+    #[test]
+    fn canonical_key_exposes_registry_and_identifier_parts() {
+        let key =
+            crate::host_ids::resource_key_named("minecraft:enchantment", "minecraft:knockback");
+        assert_eq!(
+            crate::host_ids::resource_key_parts(&key),
+            Some(("minecraft:enchantment".into(), "minecraft:knockback".into()))
+        );
+    }
+}
