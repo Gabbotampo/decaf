@@ -23,10 +23,10 @@ public final class Probe {
     Event<CreativeModeTabEvents.ModifyOutput> second = CreativeModeTabEvents.modifyOutputEvent(key);
     String eventClass = first.getClass().getName();
     String same = Boolean.toString(first == second);
-    first.register(output -> fired = true);
     String registerReturn = "void";
-    return "event=" + eventClass + "\ninvoker0=" + eventClass
-      + "\nregister_return=" + registerReturn + "\nsame_event=" + same
+    first.register(output -> fired = true);
+    return "event=" + eventClass
+      + "\nsame_event=" + same + "\nregister_return=" + registerReturn
       + "\nlistener_fired=" + fired + "\n";
   }
 }
