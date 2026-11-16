@@ -37,14 +37,6 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     None
 }
 pub(crate) fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, NativeError>> {
-    let key = jar_object::instance_key(receiver)?;
-    if !key.starts_with("item-template/") {
-        return None;
-    }
-    match r.name.as_str() {
-        "withCount" => Some(Ok(receiver.clone())),
-        "create" => Some(Ok(Value::Ref(None))),
-        "count" => Some(Ok(Value::Int(1))),
-        _ => None,
-    }
+    let _ = (r, receiver);
+    None
 }
