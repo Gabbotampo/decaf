@@ -247,6 +247,7 @@ mod stream_pipeline;
 mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
+mod thread_local;
 mod tim_sort;
 mod tree_map;
 mod type_switch;
@@ -2491,6 +2492,10 @@ pub trait Host {
     fn modelled_to_string(&mut self, _value: &Value) -> Option<String> {
         None
     }
+    /// Exact text for a host registry whose lifecycle state is modelled.
+    fn registry_text(&self, _value: &Value) -> Option<String> {
+        None
+    }
 
     /// [`Self::modelled_to_string`], with a nested walk's `StackOverflowError` thrown rather
     /// than read as "no model" (#250): the runtime's `String.valueOf`, `Objects.toString` and
@@ -3433,6 +3438,8 @@ pub struct StdHost {
     /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
     /// every entry the host saw registered (`registry_contents.rs`).
     jar_registries: BTreeSet<String>,
+    /// Built-in registry ids and whether every observed registration stayed stable.
+    registry_lifecycles: BTreeMap<String, bool>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3619,6 +3626,13 @@ impl Default for StdHost {
 }
 
 impl StdHost {
+    pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
+        self.registry_lifecycles
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| crate::vanilla_registries::is_built_in(id))
+    }
+
     pub fn new() -> Self {
         Self {
             properties: BTreeMap::from([
@@ -3689,6 +3703,7 @@ impl StdHost {
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
             jar_registries: BTreeSet::new(),
+            registry_lifecycles: BTreeMap::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -4769,6 +4784,30 @@ impl StdHost {
         &self.registrations
     }
 
+    /// Record a registry entry whose id and value were observed by a bounded
+    /// `Registry.registerForHolder` call.  The row is deliberately kept in
+    /// the same table as `Registry.register` so later holder lookups can only
+    /// answer for registrations this runtime actually saw.
+    pub(crate) fn record_observed_registry(&mut self, registry: &str, id: String, value: Value) {
+        self.registrations.push(RegistryEntry {
+            registry: registry.to_owned(),
+            id,
+            value,
+            declaration: None,
+        });
+    }
+
+    pub(crate) fn observed_registry_entry(
+        &self,
+        registry: &str,
+        id: &str,
+    ) -> Option<&RegistryEntry> {
+        self.registrations
+            .iter()
+            .rev()
+            .find(|entry| entry.registry == registry && entry.id == id)
+    }
+
     /// The property chain recorded for a constructed item marker, in the
     /// builder's own vocabulary (`stacksTo`, `durability`, `rarity`, ...).
     ///
@@ -5148,22 +5187,48 @@ impl StdHost {
         Some(Value::Void)
     }
 
+    fn registration_lifecycle_stable(value: &Value) -> Option<bool> {
+        match value {
+            Value::Ref(Some(text)) => match text.as_str() {
+                "registration/stable" | "lifecycle/stable" => Some(true),
+                "registration/experimental" | "lifecycle/experimental" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn registry_register(
         &mut self,
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Option<Value> {
-        if r.owner != "net/minecraft/core/Registry" || r.name != "register" || args.len() < 2 {
+        if !matches!(
+            r.owner.as_str(),
+            "net/minecraft/core/Registry"
+                | "net/minecraft/core/MappedRegistry"
+                | "net/minecraft/core/DefaultedMappedRegistry"
+        ) || r.name != "register"
+            || args.len() < 2
+        {
             return None;
         }
+        let registration_info = receiver.is_some()
+            && r.descriptor
+                == "(Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;Lnet/minecraft/core/RegistrationInfo;)Lnet/minecraft/core/Holder$Reference;";
+        let value_index = if registration_info {
+            args.len().checked_sub(2)?
+        } else {
+            args.len().checked_sub(1)?
+        };
         let registry = receiver
             .into_iter()
             .chain(args.iter())
             .find_map(host_registry::registry_id)?
             .to_owned();
         let registry = registry.as_str();
-        let id = args.iter().find_map(|value| {
+        let id = args[..value_index].iter().find_map(|value| {
             if let Some(id) = host_ids::identifier_key(value) {
                 let (namespace, path) = id.split_once(':')?;
                 return Some(format!("{namespace}:{path}"));
@@ -5172,9 +5237,24 @@ impl StdHost {
             // through the key rather than a bare identifier. Without reading
             // the id out of the key the host answers null and the caller's
             // static field ends up null. An unnamed key names no id.
-            resource_key_identifier(value).map(|(namespace, path)| format!("{namespace}:{path}"))
+            if let Some((namespace, path)) = resource_key_identifier(value) {
+                return Some(format!("{namespace}:{path}"));
+            }
+            // The legacy overload accepts a String and parses it as an
+            // Identifier (`minecraft:` is the default namespace). Only the
+            // pre-value arguments are inspected, so a registered String value
+            // cannot be mistaken for its id.
+            let text = expect_ref(value)?;
+            let (namespace, path) = text.split_once(':').unwrap_or(("minecraft", text));
+            (!namespace.is_empty() && !path.is_empty()).then(|| format!("{namespace}:{path}"))
         })?;
-        let value = args.last().cloned().unwrap_or(Value::Void);
+        let value = args.get(value_index).cloned().unwrap_or(Value::Void);
+        let lifecycle = if registration_info {
+            args.last().and_then(Self::registration_lifecycle_stable)
+        } else {
+            Some(true)
+        };
+        host_registry::note_registry_lifecycle(self, registry, lifecycle);
         let key = format!("{registry}/{id}");
         // An id the jar's metadata already describes stays opaque: the
         // metadata is the explicit adapter for that row, so inference must not
@@ -6182,6 +6262,13 @@ impl Host for StdHost {
         crate::java_tostring::modelled(self, value)
     }
 
+    fn registry_text(&self, value: &Value) -> Option<String> {
+        match crate::host_registry::registry_text(self, value) {
+            Some(Value::Ref(Some(text))) => Some(text),
+            _ => None,
+        }
+    }
+
     fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         crate::java_tostring::modelled_checked(self, value)
     }
@@ -6407,6 +6494,12 @@ impl Host for StdHost {
         // field's own type says which object it is: `Registries.X` is the
         // registry's key (`ResourceKey[minecraft:root / X]`),
         // `BuiltInRegistries.X` the registry (`host_registry.rs`).
+        if r.owner == "net/minecraft/core/RegistrationInfo"
+            && r.name == "BUILT_IN"
+            && r.descriptor == "Lnet/minecraft/core/RegistrationInfo;"
+        {
+            return Ok(Value::Ref(Some("registration/stable".into())));
+        }
         if let Some(id) = registry_static_id(&r.owner, &r.name) {
             return Ok(if r.descriptor == "Lnet/minecraft/resources/ResourceKey;" {
                 host_ids::registry_key_of(id)
@@ -6743,6 +6836,30 @@ impl Host for StdHost {
         }
         if let Some(value) = host_registry_holder::static_call(self, r, args) {
             return value;
+        }
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "com/mojang/serialization/Lifecycle",
+                "stable",
+                "()Lcom/mojang/serialization/Lifecycle;",
+            ) => {
+                return Ok(Value::Ref(Some("lifecycle/stable".into())));
+            }
+            (
+                "com/mojang/serialization/Lifecycle",
+                "experimental",
+                "()Lcom/mojang/serialization/Lifecycle;",
+            ) => {
+                return Ok(Value::Ref(Some("lifecycle/experimental".into())));
+            }
+            (
+                "net/minecraft/core/RegistrationInfo",
+                "experimental",
+                "()Lnet/minecraft/core/RegistrationInfo;",
+            ) => {
+                return Ok(Value::Ref(Some("registration/experimental".into())));
+            }
+            _ => {}
         }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
@@ -7459,43 +7576,28 @@ impl Host for StdHost {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_div_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "floorMod", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_mod_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "addExact", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("long overflow"))
             }
             // Java's float extrema: a NaN operand gives NaN, and -0.0 < 0.0.
             ("java/lang/Math", "max", "(DD)D") => {
@@ -7530,10 +7632,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 let quotient = i64::from(left) / i64::from(right);
                 let remainder = i64::from(left) % i64::from(right);
@@ -7548,10 +7647,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 // Java computes `a - floorDiv(a, b) * b` in i32 arithmetic, so
                 // a negative divisor produces a negative remainder and the
@@ -7572,10 +7668,7 @@ impl Host for StdHost {
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(Value::Int)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("integer overflow"))
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
@@ -8051,6 +8144,12 @@ impl Host for StdHost {
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
+        if r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && let Some(value) = host_registry::registry_text(self, receiver)
+        {
+            return Ok(value);
+        }
         if matches!(receiver, Value::Host(handle) if !jar_object::is_object_handle(handle))
             && (matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
@@ -15352,6 +15451,24 @@ fn array_index(value: i32) -> Result<usize, NativeError> {
     usize::try_from(value).map_err(|_| NativeError::Metadata("array index is negative".into()))
 }
 
+/// A catchable `java.lang.ArithmeticException` with the JDK's message.
+///
+/// Integer division by zero and `Math`'s exact operations throw it as a
+/// `RuntimeException` a jar can catch, so it travels as a Java throwable the
+/// frame's handler table can take, not as an interpreter error.
+fn arithmetic_exception(message: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/ArithmeticException".into(),
+        message: Some(message.into()),
+        frame: None,
+    }
+}
+
+/// `idiv`/`irem`/`ldiv`/`lrem` and `Math.floorDiv`/`floorMod` by zero.
+fn divide_by_zero() -> NativeError {
+    arithmetic_exception("/ by zero")
+}
+
 /// The throwable a Java array access raises for an index outside the array.
 ///
 /// `ArrayIndexOutOfBoundsException` is a catchable `RuntimeException`, and
@@ -22313,6 +22430,25 @@ impl<H: Host> Runtime<'_, H> {
         self.callback_infos.open(marker)
     }
 
+    /// Compose Gson's bounded shape with the exact JsonWriter state used by
+    /// the writer overloads. Unsupported shapes return None so the call is
+    /// counted instead of receiving made-up text.
+    fn gson_to_json_string(
+        &mut self,
+        value: &Value,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Option<String>, NativeError> {
+        let Some(text) = self.gson_to_json(value, style, 0)? else {
+            return Ok(None);
+        };
+        let mut writer = gson_writer::State::new("gson-toJson-object".into());
+        writer.apply_tree_style(&style.tree_style());
+        let prefix = gson_model::non_executable_prefix(style).unwrap_or("");
+        let fragment = writer.raw_tree(format!("{prefix}{text}"))?;
+        writer.close_document()?;
+        Ok(Some(fragment))
+    }
+
     /// Answer the bounded `CallbackInfo` surface for the object this execution
     /// owns.
     ///
@@ -23859,6 +23995,33 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `name` is `wanted` or a subclass (or implementor) of it.
+    pub(crate) fn jar_method_owner(
+        &self,
+        class: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<String> {
+        self.member_owner(class, name, descriptor)
+            .and_then(|(owner, jar)| jar.then_some(owner))
+    }
+
+    pub(crate) fn jar_extends(&self, class: &str, wanted: &str) -> bool {
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            if current == wanted {
+                return true;
+            }
+            let Some(file) = self.class(&current) else {
+                return false;
+            };
+            if file.super_name.is_empty() || file.super_name == current {
+                return false;
+            }
+            current = file.super_name.clone();
+        }
+        false
+    }
+
     pub(crate) fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
         let mut current = jar_object::marker_class_or_text(name).to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
@@ -25739,9 +25902,25 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = thread_local::call(self, r, receiver, args) {
+            return value.map(Some);
+        }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // A game codec factory whose result a class only stores.
         if let Some(value) = stream_codec::static_call(r, args) {
             return Ok(Some(value));
+        }
+        if let Some(value) = receiver
+            .and_then(|receiver| stream_codec::runtime_instance_call(self, r, Some(receiver), args))
+        {
+            return value.map(Some);
+        }
+        if let Some(value) =
+            receiver.and_then(|receiver| stream_codec::instance_call(r, receiver, args))
+        {
+            return value.map(Some);
         }
         if let Some(value) = self.invoke_game_codec_factory(r) {
             return Ok(Some(value));
@@ -27394,15 +27573,11 @@ impl<H: Host> Runtime<'_, H> {
                     (name, descriptor)
                         if name == "toJson" && descriptor.ends_with(")Ljava/lang/String;") =>
                     {
-                        match self.gson_to_json(
+                        match self.gson_to_json_string(
                             args.first().unwrap_or(&Value::Ref(None)),
                             &style,
-                            0,
                         )? {
-                            Some(text) => Ok(Some(Value::Ref(Some(format!(
-                                "{}{text}",
-                                gson_model::non_executable_prefix(&style).unwrap_or("")
-                            ))))),
+                            Some(text) => Ok(Some(Value::Ref(Some(text)))),
                             // A value with no honest JSON shape is a counted
                             // unknown, never made-up text.
                             None => self
@@ -28255,7 +28430,7 @@ impl<H: Host> Runtime<'_, H> {
     /// inside the callee's frame counted one extra frame per lazily initialized
     /// class on the chain (two of the 12 that refused
     /// `structure_layout_optimizer`).
-    fn invoke(
+    pub(crate) fn invoke(
         &mut self,
         class: &str,
         method: &str,
@@ -28666,11 +28841,10 @@ impl<H: Host> Runtime<'_, H> {
                         0x6c => java_int_div(lhs, rhs),
                         _ => java_int_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Int(value));
+                    .ok_or_else(divide_by_zero);
+                    // A zero divisor is a catchable `ArithmeticException`, so
+                    // the frame's own table decides where it lands.
+                    stack.push(Value::Int(invoke_or_catch!(at, value)));
                 }
                 0x61 | 0x65 | 0x69 | 0x6d | 0x71 => {
                     let rhs = pop_long(&mut stack, class, method, at)?;
@@ -28682,11 +28856,8 @@ impl<H: Host> Runtime<'_, H> {
                         0x6d => java_long_div(lhs, rhs),
                         _ => java_long_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Long(value));
+                    .ok_or_else(divide_by_zero);
+                    stack.push(Value::Long(invoke_or_catch!(at, value)));
                 }
                 // fadd/dadd, fsub/dsub, fmul/dmul, fdiv/ddiv, frem/drem. The
                 // `f*` half rounds to `f32` after the operation, exactly as a
@@ -29858,6 +30029,12 @@ impl<H: Host> Runtime<'_, H> {
                         ))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        thread_local::call(self, &r, receiver.as_ref(), &args)
+                            .map_or(Ok(None), |value| value.map(Some))
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
                     ) {
                         // A JDK skeleton's body or a JDK interface default the
@@ -29914,6 +30091,11 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
                         // `new String(...)` builds no text yet: counted.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -38627,11 +38809,15 @@ mandatory = true
         );
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MAX), Value::Int(1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MIN), Value::Int(-1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
     }
 

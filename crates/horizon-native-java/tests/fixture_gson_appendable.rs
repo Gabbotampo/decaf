@@ -157,6 +157,31 @@ public final class Probe {
     StringWriter out = new StringWriter(); JsonWriter w = new JsonWriter(out); w.setIndent("\t"); w.setHtmlSafe(false); w.setSerializeNulls(true); gson.toJson(o, w);
     return q(out.toString()) + "|after=" + w.isHtmlSafe() + "," + w.getSerializeNulls();
   }
+  static final class NestedConfig {
+    String label; int amount;
+    NestedConfig(String label, int amount) { this.label = label; this.amount = amount; }
+  }
+  static final class Config {
+    String name; int count; boolean enabled; double ratio; String nullable;
+    java.util.List<String> tags; java.util.Map<String,Integer> values; NestedConfig nested;
+    Config() {
+      name = "<cfg>"; count = -9; enabled = true; ratio = -98.0; nullable = null;
+      tags = new java.util.ArrayList<>(); tags.add("<a>"); tags.add("b");
+      values = new java.util.LinkedHashMap<>(); values.put("x", 96); values.put("y", 17);
+      nested = new NestedConfig("n0", 47);
+    }
+  }
+  public static String objectToJson() {
+    Config value = new Config();
+    Gson compact = new Gson();
+    Gson pretty = new GsonBuilder().setPrettyPrinting().create();
+    Gson nulls = new GsonBuilder().setPrettyPrinting().serializeNulls().create();
+    Gson safe = new GsonBuilder().setPrettyPrinting().serializeNulls().disableHtmlEscaping().create();
+    return compact.toJson(value) + "|P=" + pretty.toJson(value).replace("\n", "\\n")
+      + "|N=" + nulls.toJson(value).replace("\n", "\\n")
+      + "|H=" + safe.toJson(value).replace("\n", "\\n");
+  }
+
   static final class FakeWriter extends Writer {
     public void write(char[] value, int off, int len) {}
     public void flush() {}
@@ -361,5 +386,15 @@ fn unsupported_appendable_is_counted() {
         host.unknown_host_calls()
             .iter()
             .all(|(call, _)| !call.contains("JsonWriter#setIndent"))
+    );
+}
+
+#[test]
+fn object_to_json_matches_captured_java25_gson_oracle_byte_for_byte() {
+    let f = Fixture::new();
+    let actual = format!("{}\n", f.text("objectToJson"));
+    assert_eq!(
+        actual.as_bytes(),
+        include_bytes!("fixtures/gson_tojson_object/oracle/java25.txt")
     );
 }
