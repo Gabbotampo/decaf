@@ -34315,6 +34315,7 @@ mod tests {
     /// decoder; the call stays counted instead of selecting a wrong template.
     #[test]
     fn subclass_constructors_stay_counted() {
+        let _ = take_test_stdout();
         let mut host = StdHost::new();
         host.set_strict_unknown_host_calls(true);
         let call = MethodRef {
