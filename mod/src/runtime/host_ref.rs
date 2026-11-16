@@ -2024,8 +2024,8 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::ThreadLocal,
         tag: "thrl",
-        class: ClassRule::Fixed("java/lang/ThreadLocal"),
-        // A withInitial call allocates one holder object.
+        class: ClassRule::FromKey(crate::runtime::thread_local::class_of_key),
+        // A withInitial call allocates the JDK private SuppliedThreadLocal object.
         canonical: always_canonical,
         methods: &crate::runtime::thread_local::THREAD_LOCAL_METHODS,
     },

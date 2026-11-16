@@ -10,6 +10,11 @@ use crate::runtime::host_ref::{HostKind, HostRef, Methods};
 use crate::runtime::{MethodRef, NativeError, Runtime, Value};
 
 const THREAD_LOCAL: &str = "java/lang/ThreadLocal";
+
+/// `withInitial` returns the private JDK implementation, not ThreadLocal itself.
+pub(crate) fn class_of_key(_key: &str) -> &str {
+    "java/lang/ThreadLocal$SuppliedThreadLocal"
+}
 static NEXT_HOLDER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const THREAD_LOCAL_METHODS: Methods = crate::runtime::host_events::DECLARED_TYPE_METHODS;
@@ -31,7 +36,7 @@ fn parts(value: &Value) -> Option<(String, Value)> {
 fn null_supplier() -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/NullPointerException".into(),
-        message: Some("supplier".into()),
+        message: None,
         frame: None,
     }
 }

@@ -11,6 +11,10 @@ import java.util.function.Supplier;
 public final class Probe {
   private static int calls;
 
+  private static final class Custom extends ThreadLocal<String> {
+    @Override protected String initialValue() { return "custom" + (++calls); }
+  }
+
   private static String supplied() {
     ThreadLocal<String> local = ThreadLocal.withInitial(() -> "v" + (++calls));
     String first = local.get();
@@ -19,7 +23,16 @@ public final class Probe {
     String third = local.get();
     local.remove();
     String fourth = local.get();
-    return first + "|" + second + "|" + third + "|" + fourth + "|" + calls;
+    return first + "|" + second + "|" + third + "|" + fourth + "|" + calls
+        + "|" + localClass(local);
+  }
+
+  private static String localClass(ThreadLocal<String> local) {
+    return local.getClass().getName();
+  }
+
+  public static String subclassOracle() {
+    return new Custom().get();
   }
 
   private static String nullSupplier() {
@@ -42,10 +55,35 @@ fn thread_local_values_match_java_25() {
     let fixture = Fixture::build("thread-local", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
     let value = fixture.text_on(&mut host, "values");
-    assert_eq!(value, "v1|v1|set|v2|2|NullPointerException:supplier");
+    assert_eq!(
+        value,
+        "v1|v1|set|v2|2|java.lang.ThreadLocal$SuppliedThreadLocal|NullPointerException:null"
+    );
     assert!(
         host.unknown_host_calls().is_empty(),
         "counted: {:?}",
+        host.unknown_host_calls()
+    );
+
+    // Java 25 oracle: subclassOracle=custom3. The jar-owned subclass is a
+    // JarObject, so its virtual ThreadLocal#get remains COUNTED rather than
+    // being answered with a neutral value.
+    let _ = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "subclassOracle",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .expect("subclass call should complete while remaining counted");
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("java/lang/ThreadLocal#get")),
+        "subclass get must stay counted: {:?}",
         host.unknown_host_calls()
     );
 }

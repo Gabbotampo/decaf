@@ -191,10 +191,10 @@ fn network_methods_remain_counted() {
         &[],
         &mut host,
     );
-    assert!(
-        matches!(answer, Ok(Value::Ref(Some(ref text))) if text == "null"),
-        "{answer:?}"
-    );
+    // Java 25 oracle: encodeDecode=java.lang.NullPointerException. The
+    // encode/decode calls are intentionally COUNTED, so do not pin the
+    // interpreter's neutral return value as an answer.
+    let _ = answer;
     let unknown = host.unknown_host_calls();
     assert!(
         unknown.iter().any(|(call, _)| call.contains("#encode")),
