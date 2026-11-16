@@ -98,6 +98,45 @@ pub struct HostRef {
     /// `&String` the text readers take (`expect_ref`, [`Self::key_text`]).
     key: Arc<String>,
     origin: u64,
+    /// A callback's row (`callback_marker::Row`): its target and the values
+    /// it holds, exactly. Not part of the value either: the key names the
+    /// object. Only the runtime makes rows; a handle decoded from text has
+    /// none.
+    row: Option<Arc<crate::callback_marker::Row>>,
+    /// The values [`Self::of_values`] was given, exactly: a callback among
+    /// them keeps its row (#261 round-3 S1). Not part of the value: the key
+    /// names them. A handle decoded from text has none, and its key is read
+    /// back as untrusted text, so no callback comes out of it at any depth
+    /// (#261 round-3 B1).
+    held: Option<Arc<Vec<Value>>>,
+}
+
+/// A chain a jar builds in a loop (`p = p.negate()` 200,000 times,
+/// `Optional.of(Optional.of(…))`) nests one handle per link: dropping it
+/// recursively would overflow the native stack. Each handle hands the rows
+/// and held values only it holds to one loop instead.
+impl Drop for HostRef {
+    fn drop(&mut self) {
+        fn take(handle: &mut HostRef, pending: &mut Vec<Value>) {
+            if let Some(row) = handle.row.take()
+                && let Ok(mut row) = Arc::try_unwrap(row)
+            {
+                pending.extend(row.take_values());
+            }
+            if let Some(held) = handle.held.take()
+                && let Ok(held) = Arc::try_unwrap(held)
+            {
+                pending.extend(held);
+            }
+        }
+        let mut pending = Vec::new();
+        take(self, &mut pending);
+        while let Some(value) = pending.pop() {
+            if let Value::Host(mut handle) = value {
+                take(&mut handle, &mut pending);
+            }
+        }
+    }
 }
 
 /// The next [`HostRef::origin`]: only ever compared for equality, never shown.
@@ -234,6 +273,8 @@ pub enum HostKind {
     /// A NeoForge `DeferredHolder` or Forge `RegistryObject`: key the loader,
     /// the registration's serial and the entry's key.
     Holder,
+    /// A `Holder.Reference` returned by a jar-owned `Registry.registerForHolder`: key the registry key, id and value.
+    RegistryHolder,
     /// The value a holder's registration registered: key the serial.
     Registered,
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
@@ -314,6 +355,7 @@ pub enum HostKind {
     FabricModMetadata,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
+    FabricModOriginKind,
     /// A Fabric metadata `Person`: key the mod id and JSON pointer.
     FabricPerson,
     /// A Fabric `ContactInformation`: key the mod id and JSON pointer, or no
@@ -390,6 +432,10 @@ pub enum HostKind {
     /// An object `new` (or a model) allocated: key `class#n`
     /// (`jar_object.rs`), one key per allocation.
     JarObject,
+    /// A modelled `java.io.Writer` allocation. Its key is `class#n`, but the
+    /// separate kind keeps Gson from accepting an arbitrary jar object as a
+    /// writer sink.
+    Writer,
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
@@ -407,6 +453,8 @@ pub enum HostKind {
     OpaqueCodec,
     /// A pure network StreamCodec factory result.
     StreamCodec,
+    /// An explicitly seeded Minecraft RandomSource or positional factory.
+    RandomSource,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -513,6 +561,12 @@ pub enum HostKind {
     /// NeoForge's `ModList`, `FMLLoader` or `LoadingModList`: key the class
     /// (`host_service.rs`).
     LoaderSingleton,
+    /// A lambda or method reference (`invokedynamic`, a reflective
+    /// `metafactory`), a functional combinator's result (`p.and(q)`,
+    /// `c.andThen(d)`) or `Function.identity()`: key its marker text
+    /// (`callback_marker.rs`, #156 P15a). A handle, never a `String`: no
+    /// String model reads it, so its text cannot be read out or forged.
+    Callback,
     /// A Java 25 `HttpClient` built by its builder (`http_client.rs`).
     HttpClient,
     /// A Java 25 `HttpClient.Builder`; setters preserve this identity.
@@ -669,6 +723,14 @@ pub(crate) trait ClassHierarchy {
         crate::jdk_closure::class(class).map(|row| row.is_interface)
     }
 
+    /// The interfaces a held class or interface declares directly
+    /// (`getInterfaces()`), `None` when the class is not held: a lambda's
+    /// `instanceof` walks its functional interface's superinterfaces with it
+    /// (`callback_marker.rs`).
+    fn declared_interfaces(&self, _class: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// What the host's own description of the object keyed `key` says about `wanted` (a
     /// game-hook firing's objects, `game_hooks.rs`); `None` when it describes none.
     fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
@@ -797,6 +859,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::StreamCodec,
         &crate::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
+    (HostKind::RandomSource, &crate::random_source::CLASS_SIDE),
 ];
 
 /// One row of the kind table.
@@ -1277,6 +1340,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_registry::HOLDER_METHODS,
     },
     KindInfo {
+        kind: HostKind::RegistryHolder,
+        tag: "rhold",
+        class: ClassRule::Fixed("net/minecraft/core/Holder$Reference"),
+        canonical: always_canonical,
+        methods: &crate::host_registry_holder::METHODS,
+    },
+    KindInfo {
         kind: HostKind::Registered,
         tag: "rgd",
         class: ClassRule::Unknown {
@@ -1625,6 +1695,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_fabric_loader::ORIGIN_METHODS,
     },
     KindInfo {
+        kind: HostKind::FabricModOriginKind,
+        tag: "fmok",
+        class: ClassRule::Fixed(crate::mod_origin::ORIGIN_KIND),
+        canonical: always_canonical,
+        methods: &crate::mod_origin::KIND_METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricPerson,
         tag: "fper",
         class: ClassRule::Unknown {
@@ -1921,6 +1998,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::Writer,
+        tag: "wrtr",
+        class: ClassRule::FromKey(crate::jar_object::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::jar_object::JAR_OBJECT,
+    },
+    KindInfo {
         kind: HostKind::Class,
         tag: "cls",
         // `FromKey`, not `Fixed`, until #156 P13c: a fixed class's objects are
@@ -1974,6 +2058,13 @@ const KINDS: &[KindInfo] = &[
         // Every factory call allocates a new implementation object.
         canonical: always_canonical,
         methods: &crate::stream_codec::STREAM_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RandomSource,
+        tag: "rand",
+        class: ClassRule::FromKey(crate::random_source::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::random_source::METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,
@@ -2323,6 +2414,18 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_service::METHODS,
     },
     KindInfo {
+        kind: HostKind::Callback,
+        tag: "cb",
+        // A hidden class the metafactory spins (or the JDK's lambda class
+        // for a combinator): never known; `instance_of` answers from the
+        // interfaces it implements (`callback_marker::METHODS`).
+        class: ClassRule::Unknown {
+            declared: crate::callback_marker::declared_types,
+        },
+        canonical: crate::callback_marker::canonical,
+        methods: &crate::callback_marker::METHODS,
+    },
+    KindInfo {
         kind: HostKind::HttpClient,
         tag: "hc",
         class: ClassRule::Unknown {
@@ -2488,23 +2591,47 @@ impl HostRef {
             kind,
             key: Arc::new(key.into()),
             origin: NEXT_ORIGIN.fetch_add(1, AtomicOrdering::Relaxed),
+            row: None,
+            held: None,
         }
     }
 
+    /// A callback handle keyed `key` that carries `row` (`callback_marker.rs`).
+    pub(crate) fn with_row(kind: HostKind, key: String, row: crate::callback_marker::Row) -> Self {
+        let mut handle = Self::new(kind, key);
+        handle.row = Some(Arc::new(row));
+        handle
+    }
+
+    /// The row a callback handle carries: every callback the runtime made
+    /// has one; a handle decoded from text never does.
+    pub(crate) fn row(&self) -> Option<&crate::callback_marker::Row> {
+        self.row.as_deref()
+    }
+
     /// A handle whose key holds `values`: each value's marker, separators
-    /// escaped, joined with `,`. No values is the empty key.
+    /// escaped, joined with `,`. No values is the empty key. The handle keeps
+    /// the values themselves too ([`Self::values`]).
     pub(crate) fn of_values(kind: HostKind, values: &[Value]) -> Self {
         let key = values
             .iter()
             .map(crate::value_marker)
             .collect::<Vec<_>>()
             .join(",");
-        Self::new(kind, key)
+        let mut handle = Self::new(kind, key);
+        handle.held = Some(Arc::new(values.to_vec()));
+        handle
     }
 
-    /// The values [`Self::of_values`] put in the key, `None` when one does
-    /// not parse.
+    /// The values a handle holds: exactly what [`Self::of_values`] was
+    /// given, or, for a handle rebuilt from a key, the key read back as
+    /// untrusted text (`parse_value_marker`), so no callback comes out of
+    /// text at any depth however its escapes nest (#261 round-3 B1). `None`
+    /// when a marker does not parse.
     pub(crate) fn values(&self) -> Option<Vec<Value>> {
+        if let Some(held) = &self.held {
+            return Some(held.as_ref().clone());
+        }
         if self.key.is_empty() {
             return Some(Vec::new());
         }
@@ -2513,6 +2640,12 @@ impl HostRef {
             .iter()
             .map(|marker| crate::parse_value_marker(marker).ok())
             .collect()
+    }
+
+    /// The values the runtime gave this handle ([`Self::of_values`]),
+    /// without reading text: what the collector traces.
+    pub(crate) fn held(&self) -> &[Value] {
+        self.held.as_deref().map_or(&[], Vec::as_slice)
     }
 
     pub fn kind(&self) -> HostKind {
@@ -2617,10 +2750,16 @@ impl HostRef {
         format!("h{}:{}", self.kind.info().tag, self.key)
     }
 
-    /// Read [`Self::encode`] back.
+    /// Read [`Self::encode`] back from text: never a callback, nor a handle
+    /// that yields one at any depth. A decoded handle has no row and holds
+    /// no values but its key's text, which [`Self::values`] reads back as
+    /// untrusted text again, so however a jar nests and escapes `hcb:`, no
+    /// text becomes a callback (#261 round-3 B1). A callback reaches a jar
+    /// only as the handle the runtime made.
     pub(crate) fn decode(text: &str) -> Option<Self> {
         let (tag, key) = text.strip_prefix('h')?.split_once(':')?;
-        Some(Self::new(HostKind::from_tag(tag)?, key))
+        let kind = HostKind::from_tag(tag)?;
+        (kind != HostKind::Callback).then(|| Self::new(kind, key))
     }
 }
 
@@ -2645,11 +2784,26 @@ mod tests {
                 info.kind
             );
             let handle = HostRef::new(info.kind, "a,b\\c:d");
-            assert_eq!(HostRef::decode(&handle.encode()), Some(handle.clone()));
+            // From text, a callback (or a handle holding one) is nothing.
+            if info.kind == HostKind::Callback {
+                assert_eq!(HostRef::decode(&handle.encode()), None);
+            } else {
+                assert_eq!(HostRef::decode(&handle.encode()), Some(handle.clone()));
+            }
             if let ClassRule::Fixed(class) = info.class {
                 assert_eq!(HostKind::of_class(class), Some(info.kind));
             }
         }
+        // Nor does a handle decoded from text yield one from its key (an
+        // optional of a lambda spelled by a jar): it is read back as text
+        // again.
+        let spelled =
+            HostRef::decode("hopt:hcb:@indy:demo/A#m:0:java/lang/Runnable:demo/A#evil()V:")
+                .unwrap();
+        assert!(spelled.values().is_none_or(|held| {
+            held.iter()
+                .all(|value| !matches!(value, Value::Host(h) if h.kind() == HostKind::Callback))
+        }));
     }
 
     /// A kind whose runtime class is unknown is never found through a type it

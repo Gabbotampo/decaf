@@ -52,8 +52,7 @@ pub use order::{ListenerOrder, PhaseOrdering, dispatch_order};
 
 use crate::{
     ExecutionBudget, HostInvocation, MethodRef, NativeError, NativeJar, StdHost, Value, arg_count,
-    component_value, expect_ref, facade_server, parse_callback_marker, return_desc, stable_hash,
-    uuid_value,
+    component_value, expect_ref, facade_server, return_desc, stable_hash, uuid_value,
 };
 
 pub use crate::facade_server::{GameRuleValue, ServerFacts};
@@ -1962,12 +1961,14 @@ fn context_subject(facade: &EventFacade, context: &EventContext) -> Option<Value
         .map(|entity| crate::game_object::entity_value(facade, entity.id))
 }
 
-/// The last `@indy:` argument of a registration call: its listener.
-pub(crate) fn indy_argument(args: &[Value]) -> Option<&str> {
-    args.iter().rev().find_map(|value| match value {
-        Value::Ref(Some(text)) if text.starts_with("@indy:") => Some(text.as_str()),
-        _ => None,
-    })
+/// The last lambda argument of a registration call: its listener (an error
+/// when the lambda could not be read back).
+pub(crate) fn indy_argument(
+    args: &[Value],
+) -> Option<Result<crate::callback_marker::Callback, NativeError>> {
+    args.iter()
+        .rev()
+        .find_map(crate::callback_marker::read_lambda)
 }
 
 /// An object argument whose class the jar declares: `cls#N`.
@@ -2119,7 +2120,7 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
             ListenerOrder::default_phase()
         };
         let callback = if let Some(indy) = indy_argument(&invocation.args) {
-            match parse_callback_marker(indy) {
+            match indy {
                 Ok(marker) => ListenerCallback::Indy {
                     target: marker.target,
                     captures: marker.captures,
@@ -2191,7 +2192,7 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
             // parameter: the target's last (a bound receiver or captured
             // values come before it).
             let class = class.or_else(|| {
-                let marker = parse_callback_marker(indy_argument(&invocation.args)?).ok()?;
+                let marker = indy_argument(&invocation.args)?.ok()?;
                 let arguments = crate::descriptor_arguments(&marker.target.descriptor);
                 let last = arguments.last()?;
                 Some(last.strip_prefix('L')?.strip_suffix(';')?.to_owned())
@@ -2238,7 +2239,7 @@ fn push_bus_listener(
         count_unsupported(out, class.to_owned());
         return;
     };
-    let callback = match indy_argument(&invocation.args).map(parse_callback_marker) {
+    let callback = match indy_argument(&invocation.args) {
         Some(Ok(marker)) => ListenerCallback::Indy {
             target: marker.target,
             captures: marker.captures,
@@ -2559,10 +2560,7 @@ impl NativeJar {
             if self.classes.contains_key(&target.owner) {
                 break;
             }
-            let Some(Value::Ref(Some(inner))) = captures.first() else {
-                break;
-            };
-            let Ok(inner) = parse_callback_marker(inner) else {
+            let Some(inner) = captures.first().and_then(crate::callback_marker::lambda_of) else {
                 break;
             };
             let mut next = inner.captures;
