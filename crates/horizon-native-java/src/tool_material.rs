@@ -104,7 +104,17 @@ pub(crate) fn instance_call(
         return None;
     }
     let key = jar_object::instance_key(receiver)?;
-    let name = key.rsplit_once('#')?.1;
+    let id = key.rsplit_once('#')?.1.parse::<usize>().ok()?;
+    let name = [
+        "WOOD",
+        "STONE",
+        "COPPER",
+        "IRON",
+        "DIAMOND",
+        "GOLD",
+        "NETHERITE",
+    ]
+    .get(id.checked_sub(800000)?)?;
     let x = row(name)?;
     let v = match r.name.as_str() {
         "durability" => Value::Int(x.durability),
