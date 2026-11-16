@@ -114,9 +114,11 @@ fn gson_writes_enums_and_serialized_names_as_java_25() {
 #[test]
 fn gson_complex_map_key_serialization_is_counted() {
     let fixture = fixture();
-    let expected_unknown =
-        "com/google/gson/Gson#toJson(Ljava/lang/Object;)Ljava/lang/String;";
-    for method in ["enumMapKeysWithComplexFlag", "enumObjectMapKeyWithComplexFlag"] {
+    let expected_unknown = "com/google/gson/Gson#toJson(Ljava/lang/Object;)Ljava/lang/String;";
+    for method in [
+        "enumMapKeysWithComplexFlag",
+        "enumObjectMapKeyWithComplexFlag",
+    ] {
         let (text, unknown) = run(&fixture, method);
         assert_eq!(text, "counted", "{method}: {unknown:?}");
         assert_eq!(unknown, vec![expected_unknown], "{method}");
