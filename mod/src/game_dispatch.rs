@@ -246,9 +246,6 @@ struct HookTarget {
 }
 #[cfg(test)]
 static STATE_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static REENTRY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
-
 fn dispatch_state(
     state: &mut State,
     dispatch: GameDispatch<'_>,
