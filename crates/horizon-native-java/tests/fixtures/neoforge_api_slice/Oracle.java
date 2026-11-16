@@ -12,6 +12,7 @@ import net.neoforged.neoforgespi.language.IModFileInfo;
 import net.neoforged.neoforgespi.language.IModInfo;
 import net.neoforged.neoforgespi.language.IModLanguageLoader;
 import net.neoforged.neoforgespi.locating.ForgeFeature;
+import net.neoforged.neoforge.network.registration.HandlerThread;
 import org.apache.maven.artifact.versioning.DefaultArtifactVersion;
 
 public final class Oracle {
@@ -68,6 +69,31 @@ public final class Oracle {
     System.out.println("activeEventBusIdentity=" + (active.getEventBus() == bus && active.getEventBus() == active.getEventBus()));
     System.out.println("activeInfoModId=" + active.getModInfo().getModId());
     System.out.println("activeInfoVersion=" + active.getModInfo().getVersion());
-    System.out.println("registrarClass=" + new net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent().registrar("1").getClass().getName());
+    net.neoforged.neoforge.network.registration.PayloadRegistrar registrar =
+        new net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent().registrar("1");
+    net.neoforged.neoforge.network.registration.PayloadRegistrar versioned = registrar.versioned("2");
+    net.neoforged.neoforge.network.registration.PayloadRegistrar optional = registrar.optional();
+    net.neoforged.neoforge.network.registration.PayloadRegistrar threaded = registrar.executesOn(HandlerThread.MAIN);
+    boolean emptyVersionNoThrow;
+    try {
+      registrar.versioned("");
+      emptyVersionNoThrow = true;
+    } catch (Throwable error) {
+      emptyVersionNoThrow = false;
+    }
+    String badCast;
+    try {
+      String ignored = (String) (Object) registrar;
+      badCast = "no-error";
+    } catch (ClassCastException error) {
+      badCast = error.getMessage();
+    }
+    System.out.println("registrarClass=" + registrar.getClass().getName());
+    System.out.println("registrarVersionedDistinct=" + (registrar != versioned));
+    System.out.println("registrarOptionalDistinct=" + (registrar != optional));
+    System.out.println("registrarExecutesOnDistinct=" + (registrar != threaded));
+    System.out.println("registrarEmptyVersionNoThrow=" + emptyVersionNoThrow);
+    System.out.println("registrarCast=" + (((Object) registrar) instanceof net.neoforged.neoforge.network.registration.PayloadRegistrar));
+    System.out.println("registrarBadCast=" + badCast);
   }
 }

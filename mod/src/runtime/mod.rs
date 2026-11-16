@@ -2193,6 +2193,10 @@ pub struct PayloadRegistration {
     pub payload_type: Value,
     pub codec: Value,
     pub handler: Value,
+    /// Registrar state copied into this registration by NeoForge's immutable builder.
+    pub version: Value,
+    pub optional: bool,
+    pub thread: Value,
 }
 
 /// Metadata for one Fabric `EntrypointContainer` exposed by the bounded
@@ -5035,6 +5039,9 @@ impl StdHost {
                 payload_type,
                 codec: Value::Ref(None),
                 handler,
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         Some(Value::Int(1))
@@ -5080,6 +5087,9 @@ impl StdHost {
                 payload_type: payload_type.clone(),
                 codec,
                 handler: Value::Ref(None),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         // `CustomPacketPayload.TypeAndCodec`: a non-null pair marker.
@@ -11823,9 +11833,6 @@ impl Host for StdHost {
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
                 ) =>
             {
-                if matches!(r.name.as_str(), "versioned" | "optional" | "executesOn") {
-                    return self.unknown_host_call(r);
-                }
                 if matches!(
                     r.name.as_str(),
                     "playToServer"
@@ -11836,11 +11843,21 @@ impl Host for StdHost {
                         | "configurationBidirectional"
                 ) && args.len() >= 3
                 {
+                    let state = crate::runtime::neoforge_payload::state(receiver).unwrap_or(
+                        crate::runtime::neoforge_payload::RegistrarState {
+                            version: Value::Ref(None),
+                            optional: false,
+                            thread: Value::Ref(None),
+                        },
+                    );
                     self.payload_registrations.push(PayloadRegistration {
                         direction: r.name.clone(),
                         payload_type: args[0].clone(),
                         codec: args[1].clone(),
                         handler: args[2].clone(),
+                        version: state.version,
+                        optional: state.optional,
+                        thread: state.thread,
                     });
                 }
                 Ok(receiver.clone())
@@ -11859,6 +11876,9 @@ impl Host for StdHost {
                     payload_type: args[1].clone(),
                     codec: args[2].clone(),
                     handler: args[4].clone(),
+                    version: Value::Ref(None),
+                    optional: false,
+                    thread: Value::Ref(None),
                 });
                 Ok(receiver.clone())
             }
@@ -43696,6 +43716,9 @@ mandatory = true
                 payload_type: Value::Ref(Some("payload-type".into())),
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
 
@@ -43811,6 +43834,9 @@ mandatory = true
                 payload_type: Value::Ref(Some("message-class".into())),
                 codec: Value::Ref(Some("encoder".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
     }

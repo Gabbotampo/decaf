@@ -113,13 +113,38 @@ public final class Probe {
     }
 
     private static String answeredRows(ModLoadingContext context, ModContainer container) {
+        RegisterPayloadHandlersEvent event = new RegisterPayloadHandlersEvent();
+        PayloadRegistrar registrar = event.registrar("1");
+        PayloadRegistrar versioned = registrar.versioned("2");
+        PayloadRegistrar optional = registrar.optional();
+        PayloadRegistrar threaded = registrar.executesOn(null);
+        boolean emptyVersionNoThrow;
+        try {
+            registrar.versioned("");
+            emptyVersionNoThrow = true;
+        } catch (Throwable error) {
+            emptyVersionNoThrow = false;
+        }
+        String badCast;
+        try {
+            String ignored = (String) (Object) registrar;
+            badCast = "no-error";
+        } catch (ClassCastException error) {
+            badCast = error.getMessage();
+        }
         return "contextIdentity=" + (context == ModLoadingContext.get()) + "\n"
             + "activeModId=" + container.getModId() + "\n"
             + "activeNamespace=" + container.getNamespace() + "\n"
             + "activeEventBusIdentity=" + (container.getEventBus() == container.getEventBus()) + "\n"
             + "activeInfoModId=" + container.getModInfo().getModId() + "\n"
             + "activeInfoVersion=" + container.getModInfo().getVersion() + "\n"
-            + "registrarClass=" + new RegisterPayloadHandlersEvent().registrar("1").getClass().getName();
+            + "registrarClass=" + registrar.getClass().getName() + "\n"
+            + "registrarVersionedDistinct=" + (registrar != versioned) + "\n"
+            + "registrarOptionalDistinct=" + (registrar != optional) + "\n"
+            + "registrarExecutesOnDistinct=" + (registrar != threaded) + "\n"
+            + "registrarEmptyVersionNoThrow=" + emptyVersionNoThrow + "\n"
+            + "registrarCast=" + (((Object) registrar) instanceof PayloadRegistrar) + "\n"
+            + "registrarBadCast=" + badCast;
     }
 
     public static String answered() { return active; }
@@ -128,10 +153,12 @@ public final class Probe {
         ModContainer container = ModLoadingContext.get().getActiveContainer();
         container.registerExtensionPoint(Extension.class, new Extension());
         PayloadRegistrar registrar = new RegisterPayloadHandlersEvent().registrar("1");
-        PayloadRegistrar refined = registrar.versioned("2");
-        registrar.optional();
-        registrar.executesOn(null);
-        if (refined != null) refined.playToServer(null, null, null);
+        PayloadRegistrar versioned = registrar.versioned("2");
+        PayloadRegistrar optional = registrar.optional();
+        PayloadRegistrar threaded = registrar.executesOn(null);
+        versioned.playToServer(null, null, null);
+        optional.playToServer(null, null, null);
+        threaded.playToServer(null, null, null);
         return "done";
     }
 
@@ -232,32 +259,50 @@ fn neoforge_loader_oracle_rows_and_counted_unknowns_are_exact() {
     let before_unknown = host.unknown_host_calls().to_vec();
     let before_payloads = host.payload_registrations().len();
     assert_eq!(text(&jar, &mut host, "counted"), "done",);
-    for needle in [
-        "net/neoforged/fml/ModContainer#registerExtensionPoint(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
+    let register_call = "net/neoforged/fml/ModContainer#registerExtensionPoint(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V";
+    let before_register = before_unknown
+        .iter()
+        .find(|(call, _)| call == register_call)
+        .map_or(0, |(_, count)| *count);
+    let after_register = host
+        .unknown_host_calls()
+        .iter()
+        .find(|(call, _)| call == register_call)
+        .map_or(0, |(_, count)| *count);
+    assert!(
+        after_register > before_register,
+        "registerExtensionPoint was not counted"
+    );
+    for refinement in [
         "net/neoforged/neoforge/network/registration/PayloadRegistrar#versioned(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
         "net/neoforged/neoforge/network/registration/PayloadRegistrar#optional()Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
         "net/neoforged/neoforge/network/registration/PayloadRegistrar#executesOn(Lnet/neoforged/neoforge/network/registration/HandlerThread;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
     ] {
         let before = before_unknown
             .iter()
-            .find(|(call, _)| call == needle)
+            .find(|(call, _)| call == refinement)
             .map_or(0, |(_, count)| *count);
         let after = host
             .unknown_host_calls()
             .iter()
-            .find(|(call, _)| call == needle)
+            .find(|(call, _)| call == refinement)
             .map_or(0, |(_, count)| *count);
-        assert!(
-            after > before,
-            "{needle} was not counted; unknown={:?}",
-            host.unknown_host_calls()
+        assert_eq!(
+            after, before,
+            "exact refinement unexpectedly counted: {refinement}"
         );
     }
-    assert_eq!(
-        host.payload_registrations().len(),
-        before_payloads,
-        "a counted refinement must not silently record an unrefined channel"
-    );
+    assert_eq!(host.payload_registrations().len(), before_payloads + 3);
+    let registrations = &host.payload_registrations()[before_payloads..];
+    assert_eq!(registrations[0].version, Value::Ref(Some("2".into())));
+    assert!(!registrations[0].optional);
+    assert_eq!(registrations[0].thread, Value::Ref(Some("MAIN".into())));
+    assert_eq!(registrations[1].version, Value::Ref(Some("1".into())));
+    assert!(registrations[1].optional);
+    assert_eq!(registrations[1].thread, Value::Ref(Some("MAIN".into())));
+    assert_eq!(registrations[2].version, Value::Ref(Some("1".into())));
+    assert!(!registrations[2].optional);
+    assert_eq!(registrations[2].thread, Value::Ref(None));
     let mut datagen = jar.seed_host(StdHost::new().with_mod("demo", "1.0"));
     let before = datagen.unknown_host_call_count();
     let _ = text(&jar, &mut datagen, "dataGen");
