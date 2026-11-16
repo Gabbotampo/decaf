@@ -22709,10 +22709,6 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
-        eprintln!(
-            "CALLBACK target={:?} captures={:?} args={:?}",
-            callback.target, callback.captures, args
-        );
         // The callback target may live in a linked library jar, so resolve it
         // the same way a frame resolves its own class: the host's modelled
         // surface wins over a lookalike class in the pack.
