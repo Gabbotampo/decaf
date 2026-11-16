@@ -74,8 +74,14 @@ fn java25_compare_to_receivers_are_exact_or_throw() {
         ("boxed", "-2,-103,-1,-1,-1,1"),
         ("characterBoolean", "-25|-1"),
         ("enums", "1|-1|ClassCastException:null"),
-        ("mixed", "ClassCastException:class java.lang.Long cannot be cast to class java.lang.Integer (java.lang.Long and java.lang.Integer are in module java.base of loader 'bootstrap')|ClassCastException:class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')"),
-        ("nulls", "NullPointerException:Cannot read field \"value\" because \"anotherByte\" is null|NullPointerException:Cannot read field \"value\" because \"anotherShort\" is null|NullPointerException:Cannot read field \"value\" because \"anotherInteger\" is null|NullPointerException:Cannot read field \"value\" because \"anotherLong\" is null|NullPointerException:Cannot read field \"value\" because \"anotherFloat\" is null|NullPointerException:Cannot read field \"value\" because \"anotherDouble\" is null|NullPointerException:Cannot read field \"value\" because \"anotherCharacter\" is null|NullPointerException:Cannot read field \"value\" because \"b\" is null|NullPointerException:Cannot read field \"value\" because \"anotherString\" is null"),
+        (
+            "mixed",
+            "ClassCastException:class java.lang.Long cannot be cast to class java.lang.Integer (java.lang.Long and java.lang.Integer are in module java.base of loader 'bootstrap')|ClassCastException:class java.lang.Integer cannot be cast to class java.lang.String (java.lang.Integer and java.lang.String are in module java.base of loader 'bootstrap')",
+        ),
+        (
+            "nulls",
+            "NullPointerException:Cannot read field \"value\" because \"anotherByte\" is null|NullPointerException:Cannot read field \"value\" because \"anotherShort\" is null|NullPointerException:Cannot read field \"value\" because \"anotherInteger\" is null|NullPointerException:Cannot read field \"value\" because \"anotherLong\" is null|NullPointerException:Cannot read field \"value\" because \"anotherFloat\" is null|NullPointerException:Cannot read field \"value\" because \"anotherDouble\" is null|NullPointerException:Cannot read field \"value\" because \"anotherCharacter\" is null|NullPointerException:Cannot read field \"value\" because \"b\" is null|NullPointerException:Cannot read field \"value\" because \"anotherString\" is null",
+        ),
         ("jarAndForgery", "-1|-1|-1"),
     ];
     for (method, expected) in cases {

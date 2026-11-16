@@ -228,14 +228,14 @@ pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> 
             frame: None,
         });
     }
-    if matches!(b, Value::Ref(None)) {
-        if let Some(message) = null_compare_message(a) {
-            return Err(NativeError::UncaughtException {
-                class: "java/lang/NullPointerException".into(),
-                message: Some(message.into()),
-                frame: None,
-            });
-        }
+    if matches!(b, Value::Ref(None))
+        && let Some(message) = null_compare_message(a)
+    {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(message.into()),
+            frame: None,
+        });
     }
     // Each boxed bridge casts its argument to the same final class. Keep the
     // logical Integer representation (`Value::Int`) paired with Boxed::Integer,
