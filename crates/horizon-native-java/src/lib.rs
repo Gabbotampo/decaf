@@ -8020,6 +8020,22 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if r.owner == "java/util/regex/Pattern"
+            && r.name == "matcher"
+            && r.descriptor == "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
+        {
+            if let Some(pattern) = host_jdk_constant::pattern_text(receiver) {
+                if let Some(input) = args.first().and_then(|v| match v {
+                    Value::Ref(Some(s)) => Some(s.clone()),
+                    _ => None,
+                }) {
+                    return Ok(Value::Host(host_ref::HostRef::of_values(
+                        host_ref::HostKind::Matcher,
+                        &[Value::Ref(Some(pattern)), Value::Ref(Some(input))],
+                    )));
+                }
+            }
+        }
         if matches!(receiver, Value::Host(h) if h.kind() == host_ref::HostKind::Matcher)
             && r.owner == "java/util/regex/Matcher"
         {
