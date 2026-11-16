@@ -19,7 +19,7 @@ use super::*;
 impl ClassFile {
     /// The `AnnotationDefault` value of one annotation member, read from the
     /// class bytes on demand like [`ClassFile::field_annotations`].
-    pub(super) fn annotation_default(&self, member: &str) -> Option<AnnotationValue> {
+    fn annotation_default(&self, member: &str) -> Option<AnnotationValue> {
         let mut r = Reader::new(&self.raw);
         if r.u4().ok()? != 0xCAFE_BABE {
             return None;
