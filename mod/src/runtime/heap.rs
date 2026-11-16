@@ -1496,6 +1496,7 @@ mod tests {
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "ranged_attributes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
