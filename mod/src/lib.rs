@@ -107,6 +107,7 @@ use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
 
 mod attachments;
+mod client;
 mod content;
 mod game_hooks;
 mod runtime;
@@ -129,6 +130,7 @@ const LOG: &str = "Horizon Java";
 #[derive(Default)]
 pub struct HorizonJava {
     state: Mutex<State>,
+    client: Mutex<client::State>,
 }
 
 #[derive(Default)]
@@ -1503,10 +1505,17 @@ impl Hooks for HorizonJava {
     }
 
     /// The client finished its first load (NeoForge's `FMLClientSetupEvent`), once per process.
-    /// A dedicated server never fires it. No client jar runs yet, so the hook logs the moment and
-    /// nothing else.
+    /// A dedicated server never fires it. The client owner runs its resident jars here before the
+    /// native setup notification returns.
     fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        log::info!("{LOG} {}: client setup", env!("CARGO_PKG_VERSION"));
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        client.ensure_loaded();
+        let rows = client.report_rows().count();
+        log::info!("{LOG}: stored {rows} client report row(s)");
+        log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
     }
 }
 
