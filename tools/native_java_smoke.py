@@ -569,6 +569,12 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "at": "HEAD",
             "invoke_target": None,
             "cancellable": False,
+            "method_descriptor": "(I)V",
+            "ordinal": None,
+            "opcode": None,
+            "shift": None,
+            "by": None,
+            "slice": None,
         },
         {
             "target": "demo/Target",
@@ -579,6 +585,12 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "at": "INVOKE",
             "invoke_target": "demo/Probe#mark(Ljava/lang/String;)V",
             "cancellable": False,
+            "method_descriptor": "(I)V",
+            "ordinal": None,
+            "opcode": None,
+            "shift": None,
+            "by": None,
+            "slice": None,
         },
         {
             "target": "demo/Target",
@@ -589,6 +601,12 @@ def expect_mixin_probe(archive: Path) -> dict | None:
             "at": "RETURN",
             "invoke_target": None,
             "cancellable": False,
+            "method_descriptor": "(I)V",
+            "ordinal": None,
+            "opcode": None,
+            "shift": None,
+            "by": None,
+            "slice": None,
         },
     ]
     expected_targets = ["demo/Target#run(I)V"]

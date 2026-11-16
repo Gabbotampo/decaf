@@ -418,6 +418,22 @@ pub enum AnnotationValue {
 /// An empty `at` is the bounded `@Overwrite` shape: the callback takes the
 /// target's whole body, so neither the caller's arguments nor the target's
 /// body are visible to it.  [`MixinInjectionPlan::overwrite`] builds it.
+/// The selector values as declared on one Mixin annotation.  The probe keeps
+/// these raw values separate from executable plans so JSON can report the
+/// annotation without reverse-mapping runtime distances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinPlanSelectors {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    pub at: String,
+    pub ordinal: Option<i32>,
+    pub opcode: Option<u8>,
+    pub shift: Option<String>,
+    pub by: Option<i32>,
+    pub slice_from: Option<String>,
+    pub slice_to: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
@@ -16505,6 +16521,115 @@ impl NativeJar {
     /// accepted forms stays out of this executable set and is reported by
     /// [`Self::unresolved_invoke_plans`].  `FIELD`, `NEW` and `JUMP` selectors
     /// remain on the JVM fallback instead of being approximated.
+    /// Raw selector values for every injection, redirect and modify annotation.
+    pub fn mixin_plan_selectors(&self) -> Vec<MixinPlanSelectors> {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const KINDS: &[&str] = &[
+            "Lorg/spongepowered/asm/mixin/injection/Inject;",
+            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyArg;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;",
+        ];
+        let mut rows = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class.annotations.iter().find(|a| a.descriptor == MIXIN) else {
+                continue;
+            };
+            let targets = mixin_target_owners(mixin);
+            for method in &class.methods {
+                let callback = MethodRef {
+                    owner: class.name.clone(),
+                    name: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                };
+                for annotation in method
+                    .annotations
+                    .iter()
+                    .filter(|a| KINDS.contains(&a.descriptor.as_str()))
+                {
+                    let specs = annotation
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = annotation
+                        .values
+                        .get("at")
+                        .map(annotation_anchor_selectors)
+                        .unwrap_or_default();
+                    let annotation_slice = annotation
+                        .values
+                        .get("slice")
+                        .and_then(|value| annotation_slice_entries(value).into_iter().next());
+                    for owner in &targets {
+                        for spec in &specs {
+                            let Some((name, descriptor)) = split_injection_method(spec) else {
+                                continue;
+                            };
+                            for anchor in &anchors {
+                                let slice_from = anchor.slice_from.clone().or_else(|| {
+                                    annotation_slice.as_ref().and_then(|s| s.0.clone())
+                                });
+                                let slice_to = anchor.slice_to.clone().or_else(|| {
+                                    annotation_slice.as_ref().and_then(|s| s.1.clone())
+                                });
+                                rows.push(MixinPlanSelectors {
+                                    target: MethodRef {
+                                        owner: owner.clone(),
+                                        name: name.to_owned(),
+                                        descriptor: descriptor.to_owned(),
+                                    },
+                                    callback: callback.clone(),
+                                    at: anchor.anchor.clone(),
+                                    ordinal: anchor.ordinal,
+                                    opcode: anchor.opcode,
+                                    shift: anchor
+                                        .shift
+                                        .clone()
+                                        .map(|value| {
+                                            value.rsplit('.').next().unwrap_or(&value).to_owned()
+                                        })
+                                        .filter(|value| {
+                                            matches!(value.as_str(), "BEFORE" | "AFTER" | "BY")
+                                        }),
+                                    by: anchor.by,
+                                    slice_from,
+                                    slice_to,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            (
+                &a.target.owner,
+                &a.target.name,
+                &a.target.descriptor,
+                &a.callback.owner,
+                &a.callback.name,
+                &a.callback.descriptor,
+                &a.at,
+                a.ordinal,
+                a.opcode,
+            )
+                .cmp(&(
+                    &b.target.owner,
+                    &b.target.name,
+                    &b.target.descriptor,
+                    &b.callback.owner,
+                    &b.callback.name,
+                    &b.callback.descriptor,
+                    &b.at,
+                    b.ordinal,
+                    b.opcode,
+                ))
+        });
+        rows.dedup();
+        rows
+    }
+
     pub fn mixin_injection_plans(&self) -> Vec<MixinInjectionPlan> {
         self.mixin_plan_scan().0
     }
