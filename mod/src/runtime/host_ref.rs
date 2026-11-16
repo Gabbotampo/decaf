@@ -241,6 +241,10 @@ pub enum HostKind {
     ResourceKey,
     /// `net.minecraft.tags.TagKey`: key `registry|location`, or `?…`.
     TagKey,
+    /// Canonical vanilla `MobEffectCategory` enum constants.
+    MobEffectCategory,
+    /// A freshly constructed vanilla `RangedAttribute`.
+    RangedAttribute,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -439,6 +443,9 @@ pub enum HostKind {
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
+    /// A runtime-owned annotation proxy; its key carries the held annotation
+    /// interface descriptor but is never a String marker.
+    AnnotationProxy,
     /// A chat component (`MutableComponent`): key a serial per allocation, then its vanilla
     /// JSON, keys sorted
     /// (`host_component.rs`).
@@ -458,6 +465,8 @@ pub enum HostKind {
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
+    /// A bounded DataFixerUpper construction node retaining nested codecs and callbacks.
+    DfuCodec,
     /// A `java.lang.reflect.Type` that is no class (`ParameterizedType`,
     /// `TypeVariable`, `WildcardType`, `GenericArrayType`): key the node
     /// (`host_reflect_type.rs`).
@@ -1256,6 +1265,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_ids::TAG_KEY_METHODS,
     },
     KindInfo {
+        kind: HostKind::MobEffectCategory,
+        tag: "mec",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY),
+        canonical: always_canonical,
+        methods: &crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RangedAttribute,
+        tag: "rattr",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::RANGED_ATTRIBUTE),
+        canonical: never_canonical,
+        methods: &crate::runtime::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
         kind: HostKind::BlockItemId,
         tag: "bii",
         class: ClassRule::Fixed(crate::runtime::host_ids::BLOCK_ITEM_ID),
@@ -2023,6 +2046,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_class::CLASS_METHODS,
     },
     KindInfo {
+        kind: HostKind::AnnotationProxy,
+        tag: "anpr",
+        class: ClassRule::FromKey(crate::runtime::annotation_proxy::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::annotation_proxy::METHODS,
+    },
+    KindInfo {
         kind: HostKind::Component,
         tag: "comp",
         class: ClassRule::FromKey(crate::runtime::host_component::component_class),
@@ -2082,6 +2112,15 @@ const KINDS: &[KindInfo] = &[
         // One node, one object.
         canonical: always_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DfuCodec,
+        tag: "dfuc",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::dfu_codec::dfu_codec_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::dfu_codec::DFU_CODEC_METHODS,
     },
     KindInfo {
         kind: HostKind::ReflectType,
