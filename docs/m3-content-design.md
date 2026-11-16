@@ -3,8 +3,8 @@
 The question M3 answers is not *how* a Java `Item` or `Block` becomes content — the runtime already
 records that — but *when*. A Java jar registers content while its entrypoint runs; the game's item and
 block registries are built once, before the first resource or world loads, and never change again in
-that process. This page lists every moment the fork (arismoko/horizon; written against pinned commit
-`c4bcfcca5effdfa7d6bd759eeae60550c48ab5ac`, the mod now pins `1cc882b8e089a240354d142e3fd115938ce140d7`)
+that process. This page lists every moment the fork (sunrise-org/sunrise; written against the pinned Sunrise commit
+`a87e07f5f8bb584315a3915ae45503d94c713904`)
 lets a mod add an item or block, what the runtime can
 say about one, and the options for carrying a jar's declarations across that timing gap.
 
@@ -43,12 +43,12 @@ registry is already immutable.
 
 | # | Way | Declared at | Read at | Assets |
 |---|---|---|---|---|
-| 1 | Content declaration files `data/<id>/horizon/{block,item}/<path>.json` in a `.hmod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo horizon-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`horizon-mod-content.stamp`) | The same `.hmod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
+| 1 | Content declaration files `data/<id>/horizon/{block,item}/<path>.json` in a `.hmod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo sunrise-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`sunrise-mod-content.stamp`) | The same `.hmod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
 | 2 | Native code declarations: `Hooks::blocks` (`native_blocks`) and `Hooks::items` (`native_items`), NeoForge's `RegisterEvent` drained from `DeferredRegister.Blocks`/`.Items` | at the game's **Registration** phase, by `mods::freeze_declarations` (`crates/horizon-client/src/game.rs`), once per process | immediately, into the same content root that reads (1); together with a content mod of the same id when one is on, else as a synthetic mod with no files ("the template's look") | None of its own. A native mod's package may carry `assets/<its own id>/`, but the content fence (`Content::check_namespace`) refuses another namespace |
 | 3 | A native mod's own `assets/`/`data/` in its `.hmod` | package time | every resource/data load as a pack layer | Its own namespaces only, plus vanilla/convention tags and vanilla atlases |
 | 4 | World/game-load registration | — | — | There is none. The item/block name↔id tables are immutable once built; world load only maps saved names to numeric ids, `/reload` reloads resources and data, not content. Content selection is frozen while a world is open, and a mod installed then is read on the next start |
 
-Phases: `Packages → Registration → Setup → Config → World` (`crates/horizon-mod-api/src/phase.rs`).
+Phases: `Packages → Registration → Setup → Config → World` (`crates/sunrise-mod-api/src/phase.rs`).
 Registration is the last moment before content is built, and its only hooks are `native_*`
 declaration collectors (`blocks`, `items`, component types, tint sources, model properties,
 standalone models, block entity types). They take a `RegistrationContext`, which has no host, no
@@ -180,14 +180,14 @@ at the content root.
 ## (d) Fork seams, named
 
 1. **The declaration types are not exported to mods.** `Hooks::blocks`/`items` take
-   `horizon_mod_package::content::{Block, Item}` (generated `BlocksEvent`/`ItemsEvent`), but
-   `horizon-mod-api` re-exports neither the crate nor the types, and a native mod may not depend on
-   `horizon-mod-package` (path dependencies are not allowed, and a git copy is a different crate
+   `sunrise_mod_package::content::{Block, Item}` (generated `BlocksEvent`/`ItemsEvent`), but
+   `sunrise-mod-api` re-exports neither the crate nor the types, and a native mod may not depend on
+   `sunrise-mod-package` (path dependencies are not allowed, and a git copy is a different crate
    instance). A mod can only build them as `let mut b = Default::default(); b.id = ...` and let
    inference find the type. *NeoForge*: `DeferredRegister.Blocks`/`.Items` and
    `BlockBehaviour.Properties` are on the mod's classpath; *Fabric*: `Registry.register`,
-   `Item.Settings`/`FabricItemSettings`. Fix: `pub use horizon_mod_package::content::{Block, Item,
-   Rarity, BlockProperties};` (or named aliases) from `horizon-mod-api`, and document it.
+   `Item.Settings`/`FabricItemSettings`. Fix: `pub use sunrise_mod_package::content::{Block, Item,
+   Rarity, BlockProperties};` (or named aliases) from `sunrise-mod-api`, and document it.
 2. **No game/config folder in `RegistrationContext`.** A mod that must read files before the
    registries freeze has no `ConfigFiles` (first available in Config) and no game-directory read, so
    the bridge uses `std::fs` on the working directory. *NeoForge*: `FMLPaths.GAMEDIR`/

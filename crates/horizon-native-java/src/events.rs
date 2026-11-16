@@ -1709,7 +1709,7 @@ impl StdHost {
                 // `player_logged_out` listener hears about a player the server
                 // has already removed (`Hooks::player_logged_out`). Reading a
                 // name still needs the listed record, and a dimension is not
-                // part of `PlayerRef` at the pinned mod API (`arismoko/horizon#2747`).
+                // part of `PlayerRef` at the pinned mod API (`sunrise-org/sunrise#2747`).
                 match (name, returns) {
                     ("getUUID", _) => return uuid_value(&uuid_text(*uuid)).ok(),
                     ("getStringUUID", _) => return Some(marker(uuid_text(*uuid))),
@@ -2979,7 +2979,7 @@ mod tests {
     /// removed them from its player list, which is the moment
     /// `player_logged_out` fires (baguettelib reads `getUUID` there). A name
     /// read has no `PlayerRef` source and still refuses; the dimension read
-    /// (`arismoko/horizon#2747`) is deliberately not answered.
+    /// (`sunrise-org/sunrise#2747`) is deliberately not answered.
     #[test]
     fn a_leaving_player_answers_its_uuid_and_refuses_its_name() {
         let call = |owner: &str, name: &str, descriptor: &str| MethodRef {

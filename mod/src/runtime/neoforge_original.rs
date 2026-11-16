@@ -1,5 +1,5 @@
 //! The old player of a clone (`PlayerEvent.Clone#getOriginal`, Fabric `COPY_FROM`'s `oldPlayer`)
-//! as an attachment holder, while the clone batch is open (arismoko/horizon#3040).
+//! as an attachment holder, while the clone batch is open (sunrise-org/sunrise#3040).
 //!
 //! NeoForge's `ServerPlayer.restoreFrom(old, keepEverything)` posts `Clone(this, old, wasDeath)`
 //! with the old `ServerPlayer` still whole: its attachment map holds every value it had, copied
