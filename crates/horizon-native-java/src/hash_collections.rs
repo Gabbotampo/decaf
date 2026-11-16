@@ -386,6 +386,10 @@ impl<H: Host> Runtime<'_, H> {
             };
             table.insert(entry, hash)?;
         }
+        if table.order_unknown() {
+            self.host
+                .mark_nondeterministic("java-random-hash-collection-order");
+        }
         if table.linked || table.order_unknown() {
             return Ok(());
         }
@@ -633,7 +637,12 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(marker) = expect_ref(arg)
                 && let Some(table) = self.host.take_hash_table(marker)
             {
-                tainted_argument |= table.order_unknown();
+                let order_unknown = table.order_unknown();
+                if order_unknown {
+                    self.host
+                        .mark_nondeterministic("java-random-hash-collection-order");
+                }
+                tainted_argument |= order_unknown;
                 self.host.store_hash_table(marker, table);
             }
         }
@@ -702,6 +711,10 @@ impl<H: Host> Runtime<'_, H> {
                 let function = function.clone();
                 let unknown = self.host.take_hash_table(&marker).map(|table| {
                     let unknown = table.order_unknown();
+                    if unknown {
+                        self.host
+                            .mark_nondeterministic("java-random-hash-collection-order");
+                    }
                     self.host.store_hash_table(&marker, table);
                     unknown
                 });
@@ -718,6 +731,10 @@ impl<H: Host> Runtime<'_, H> {
                 let callback = callback.clone();
                 let unknown = self.host.take_hash_table(&marker).map(|table| {
                     let unknown = table.order_unknown();
+                    if unknown {
+                        self.host
+                            .mark_nondeterministic("java-random-hash-collection-order");
+                    }
                     self.host.store_hash_table(&marker, table);
                     unknown
                 });
@@ -815,6 +832,10 @@ impl<H: Host> Runtime<'_, H> {
             self.resync_hash_table(receiver)?;
             let table = self.take_table(&marker, kind);
             let unknown = table.order_unknown();
+            if unknown {
+                self.host
+                    .mark_nondeterministic("java-random-hash-collection-order");
+            }
             self.host.store_hash_table(&marker, table);
             if unknown {
                 self.host.unknown_operand_call(r)?;
@@ -895,6 +916,10 @@ impl<H: Host> Runtime<'_, H> {
             self.resync_hash_table(map)?;
             let table = self.take_table(&marker, table_kind);
             let unknown = table.order_unknown();
+            if unknown {
+                self.host
+                    .mark_nondeterministic("java-random-hash-collection-order");
+            }
             self.host.store_hash_table(&marker, table);
             if unknown {
                 return self.count_and_continue(r);
@@ -1108,6 +1133,10 @@ impl<H: Host> Runtime<'_, H> {
                     .and_then(|marker| {
                         let table = self.host.take_hash_table(&marker)?;
                         let unknown = table.order_unknown();
+                        if unknown {
+                            self.host
+                                .mark_nondeterministic("java-random-hash-collection-order");
+                        }
                         self.host.store_hash_table(&marker, table);
                         Some(unknown)
                     })
@@ -1405,6 +1434,10 @@ impl<H: Host> Runtime<'_, H> {
         args: &mut [Value],
     ) -> Result<Option<Value>, NativeError> {
         let unknown = table.order_unknown();
+        if unknown {
+            self.host
+                .mark_nondeterministic("java-random-hash-collection-order");
+        }
         if unknown && !order_insensitive(&r.name) {
             return self.count_and_continue(r);
         }
