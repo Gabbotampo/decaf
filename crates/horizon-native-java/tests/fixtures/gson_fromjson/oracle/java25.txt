@@ -1,0 +1,10 @@
+config=123|7|true|inner|2|4|SECOND|alias|constructor
+defaults=null|0|false|constructor
+booleanFieldBoxing=true
+unsafe=json
+token=token
+element=element
+abstractCase=com.google.gson.JsonIOException|Abstract classes can't be instantiated! Adjust the R8 configuration or register an InstanceCreator or a TypeAdapter for this type. Class name: demo.Probe$Abs
+See https://github.com/google/gson/blob/main/Troubleshooting.md#r8-abstract-class
+interfaceCase=com.google.gson.JsonIOException|Interfaces can't be instantiated! Register an InstanceCreator or a TypeAdapter for this type. Interface name: demo.Probe$Intf
+recordCase=4|ok|ctor
