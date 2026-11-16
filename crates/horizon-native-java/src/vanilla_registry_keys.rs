@@ -34,13 +34,13 @@ mod tests {
             name: "KNOCKBACK".into(),
             descriptor: KEY.into(),
         };
-        assert_eq!(
-            static_field(&r),
-            Some(crate::host_ids::resource_key_named(
-                "minecraft:enchantment",
-                "knockback"
-            ))
-        );
+        let field = static_field(&r).unwrap();
+        let created = crate::host_ids::resource_key_named("minecraft:enchantment", "knockback");
+        assert_eq!(field, created);
+        match (field, created) {
+            (Value::Host(a), Value::Host(b)) => assert!(a.same_object(&b)),
+            _ => panic!("expected canonical host keys"),
+        }
     }
 }
 #[cfg(test)]
