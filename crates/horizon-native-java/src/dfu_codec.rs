@@ -692,19 +692,11 @@ pub(crate) fn runtime_instance_call<H: Host>(
             let Some(arity) = product_arity_from_descriptor(&r.descriptor) else {
                 return Ok(None);
             };
-            if !(1..=16).contains(&arity)
-                || args.len() != arity
-                || args
-                    .iter()
-                    .any(|value| tag(value).as_deref() != Some(GETTER))
-            {
+            if !(1..=16).contains(&arity) || args.len() != arity {
                 return runtime_refuse(
                     runtime,
                     r,
-                    format!(
-                        "RecordCodecBuilder group arity {} is outside 1..16 or has non-field arguments",
-                        arity
-                    ),
+                    format!("RecordCodecBuilder group arity {} is outside 1..16", arity),
                 );
             }
             let mut values = vec![Value::Int(arity as i32)];
@@ -722,13 +714,6 @@ pub(crate) fn runtime_instance_call<H: Host>(
         let Some(constructor) = args.get(1).filter(|value| is_callback(value)) else {
             return Ok(None);
         };
-        if args.first().and_then(tag).as_deref() != Some(INSTANCE) {
-            return runtime_refuse(
-                runtime,
-                r,
-                "Products.apply receiver is not a RecordCodecBuilder Instance".into(),
-            );
-        }
         return match node(
             runtime.host,
             APPLIED,
