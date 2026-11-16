@@ -780,6 +780,29 @@ impl<H: Host> Runtime<'_, H> {
         style: &GsonStyle,
         depth: usize,
     ) -> Result<Option<String>, NativeError> {
+        self.gson_to_json_mode(value, style, depth, false)
+    }
+
+    /// The tree adapter uses the same bounded reflection model as the writer,
+    /// but its extra answers must not alter `Gson.toJson` itself.  In
+    /// particular, Gson's writer keeps source-number spelling and does not
+    /// know the native collection markers used by the interpreter.
+    pub(crate) fn gson_to_json_tree(
+        &mut self,
+        value: &Value,
+        style: &GsonStyle,
+        depth: usize,
+    ) -> Result<Option<String>, NativeError> {
+        self.gson_to_json_mode(value, style, depth, true)
+    }
+
+    fn gson_to_json_mode(
+        &mut self,
+        value: &Value,
+        style: &GsonStyle,
+        depth: usize,
+        tree_mode: bool,
+    ) -> Result<Option<String>, NativeError> {
         // One level of a nested value (#250): Gson recurses through a cycle until a
         // `StackOverflowError`, and so does this writer.
         let _level = crate::host_recursion::enter()?;
@@ -791,8 +814,8 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
             // Arrays are reflected as JSON arrays, preserving primitive and
             // reference elements exactly as Gson's TypeAdapterRuntimeTypeWrapper.
-            Value::Host(handle) if handle.kind() == crate::HostKind::Array => {
-                self.gson_array_text(&self.array(value)?.clone(), style, depth)?
+            Value::Host(handle) if tree_mode && handle.kind() == crate::HostKind::Array => {
+                self.gson_array_text(&self.array(value)?.clone(), style, depth, tree_mode)?
             }
             // A host model's object (`Optional`): Gson reflects its private
             // fields, which JDK 25's module system refuses; not answered.
@@ -815,7 +838,11 @@ impl<H: Host> Runtime<'_, H> {
             }),
             Value::Float(value) => {
                 if value.is_finite() {
-                    Some(format_java_float(*value))
+                    Some(if tree_mode {
+                        format_java_float(*value)
+                    } else {
+                        format!("{value}")
+                    })
                 } else if style.special_floats() {
                     Some(if value.is_nan() {
                         "NaN".into()
@@ -843,33 +870,42 @@ impl<H: Host> Runtime<'_, H> {
                 let marker = expect_ref(value).map_or("", String::as_str);
                 // A jar enum constant serializes as its name. The runtime's
                 // enum constructor table preserves the name for object handles.
-                let enum_name = self
-                    .enum_constants
-                    .get(crate::jar_object::object_key(value).unwrap_or_default())
-                    .map(|(name, _)| name.as_str())
-                    .or_else(|| {
-                        marker
-                            .strip_prefix("enum/")
-                            .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
-                    });
-                let enum_name = enum_name.and_then(|name| {
-                    crate::jar_object::object_class(value)
-                        .and_then(|class| self.gson_enum_name(class, name))
-                        .or_else(|| Some(name.to_owned()))
-                });
+                let enum_name = if tree_mode {
+                    self.enum_constants
+                        .get(crate::jar_object::object_key(value).unwrap_or_default())
+                        .map(|(name, _)| name.as_str())
+                        .or_else(|| {
+                            marker
+                                .strip_prefix("enum/")
+                                .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
+                        })
+                } else {
+                    marker
+                        .strip_prefix("enum/")
+                        .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
+                };
+                let enum_name = if tree_mode {
+                    enum_name.and_then(|name| {
+                        crate::jar_object::object_class(value)
+                            .and_then(|class| self.gson_enum_name(class, name))
+                            .or_else(|| Some(name.to_owned()))
+                    })
+                } else {
+                    enum_name.map(str::to_owned)
+                };
                 if let Some(name) = enum_name {
                     Some(format!("\"{}\"", style.escape(&name)))
-                } else if let Some(kind) = gson_marker_kind(self.host, value) {
+                } else if let Some(kind) = gson_marker_kind(self.host, value, tree_mode) {
                     let values = runtime_collection_values(self.host, value)?;
                     if kind == "map" {
-                        self.gson_object_text(&values, style, depth)?
+                        self.gson_object_text(&values, style, depth, tree_mode)?
                     } else {
-                        self.gson_array_text(&values, style, depth)?
+                        self.gson_array_text(&values, style, depth, tree_mode)?
                     }
                 } else if let Some(class) = crate::jar_object::object_class(value)
                     && self.class(class).is_some()
                 {
-                    self.gson_fields_text(class, marker, style, depth)?
+                    self.gson_fields_text(class, marker, style, depth, tree_mode)?
                 } else {
                     // A plain `String` value (and a marker the runtime only
                     // models as text) is a JSON string.
@@ -885,6 +921,7 @@ impl<H: Host> Runtime<'_, H> {
         values: &[Value],
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
         if values.is_empty() {
             return Ok(Some("[]".into()));
@@ -895,7 +932,7 @@ impl<H: Host> Runtime<'_, H> {
                 out.push(',');
             }
             out.push_str(&style.line(depth + 1));
-            let Some(text) = self.gson_to_json(value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -910,6 +947,7 @@ impl<H: Host> Runtime<'_, H> {
         values: &[Value],
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
         if !values.len().is_multiple_of(2) {
             return Err(NativeError::Metadata(
@@ -932,7 +970,7 @@ impl<H: Host> Runtime<'_, H> {
             out.push_str(&style.escape(&value_text(&key)));
             out.push('"');
             out.push_str(style.colon());
-            let Some(text) = self.gson_to_json(&value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(&value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -952,8 +990,9 @@ impl<H: Host> Runtime<'_, H> {
         marker: &str,
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
-        if self.class(class).is_some_and(ClassFile::is_record) {
+        if tree_mode && self.class(class).is_some_and(ClassFile::is_record) {
             return Ok(None);
         }
         let mut members: Vec<(String, Value)> = Vec::new();
@@ -977,10 +1016,12 @@ impl<H: Host> Runtime<'_, H> {
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            members.push((
-                self.gson_field_name(&declaring, &name, &descriptor, style),
-                value,
-            ));
+            let name = if tree_mode {
+                self.gson_field_name(&declaring, &name, &descriptor, style)
+            } else {
+                style.field_name(&name)
+            };
+            members.push((name, value));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -995,7 +1036,7 @@ impl<H: Host> Runtime<'_, H> {
             out.push_str(&style.escape(name));
             out.push('"');
             out.push_str(style.colon());
-            let Some(text) = self.gson_to_json(value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -1122,13 +1163,15 @@ pub(super) fn non_executable_prefix(style: &GsonStyle) -> Option<&'static str> {
 ///
 /// A neutral marker names its kind directly; a `new`-backed marker is a class
 /// name whose list/set/map family decides how its pairs or elements serialize.
-fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
-    let marker = expect_ref(value)
-        .map(String::as_str)
-        .or_else(|| crate::jar_object::object_key(value))?;
+fn gson_marker_kind<H: Host>(host: &H, value: &Value, tree_mode: bool) -> Option<&'static str> {
+    let marker = expect_ref(value).map(String::as_str).or_else(|| {
+        tree_mode
+            .then(|| crate::jar_object::object_key(value))
+            .flatten()
+    })?;
     if host.holds_collection(value) {
         let class = marker.split_once('#').map_or(marker, |(class, _)| class);
-        return if is_map_owner(class) || class.contains("Map") {
+        return if is_map_owner(class) || (tree_mode && class.contains("Map")) {
             Some("map")
         } else {
             Some("list")
