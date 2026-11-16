@@ -383,6 +383,7 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        push(self.ranged_attributes.get(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -412,6 +413,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.ranged_attributes.keys())
             .map(String::as_str)
     }
 
@@ -443,6 +445,7 @@ impl StdHost {
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
+        self.ranged_attributes.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
     }
 }
@@ -462,6 +465,10 @@ fn collectable(marker: &str) -> bool {
         !class.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
     }) {
         return true;
+    }
+    // A host-created ranged attribute is a per-allocation handle and follows the heap.
+    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
     // (`iterator/empty`) are never collected.
@@ -519,6 +526,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
+        + host.ranged_attributes.len()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -696,6 +704,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                     .len()
                 + values(&state.siblings)
                 + state.args.as_deref().map_or(0, values)
+        }))
+        .chain(host.ranged_attributes.iter().map(|(key, state)| {
+            key.len()
+                + state.description_id.as_ref().map_or(0, String::len)
+                + 4 * std::mem::size_of::<f64>()
         }))
         .sum()
 }
@@ -1506,6 +1519,7 @@ mod tests {
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "ranged_attributes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1549,6 +1563,7 @@ mod tests {
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
+            "next_ranged_attribute",
             "properties",
             "environment",
             "resources",

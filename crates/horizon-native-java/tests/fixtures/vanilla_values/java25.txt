@@ -1,0 +1,14 @@
+# Generated on arcweld with Temurin Java 25.0.5 and the real Minecraft 26.3 server jars.
+# Exact command:
+# . ~/ava/env.sh; cd ~/ava/wt/vanilla-values;
+# OR=crates/horizon-native-java/tests/fixtures/vanilla_values;
+# CP="$OR:$HOME/ava/scratch/vanilla-values/oracle/server-game.jar:$HOME/ava/scratch/vanilla-values/oracle/server.jar:$(find $HOME/ava/scratch/vanilla-values/oracle/libraries/server -name '*.jar' -print | tr '\n' ':')";
+# javac --release 21 -cp "$CP" -d "$OR/out" "$OR/demo/Probe.java" "$OR/Oracle.java";
+# nice -n 10 java -cp "$OR/out:$CP" Oracle > /tmp/vanilla-values-real-stdout.txt 2> /tmp/vanilla-values-real-stderr.txt;
+# awk "/\[STDOUT\]: / { sub(/^.*\[STDOUT\]: /, \"\"); print }" /tmp/vanilla-values-real-stdout.txt > /tmp/vanilla-values-real-rows.txt;
+# cat /tmp/vanilla-values-real-rows.txt > "$OR/java25.txt"
+tags=TagKey[minecraft:entity_type / minecraft:freeze_immune_entity_types]|minecraft:freeze_immune_entity_types|ResourceKey[minecraft:root / minecraft:entity_type]|truetrue|true|falsefalsefalse|net.minecraft.tags.TagKey
+categories=BENEFICIALBENEFICIAL0BLUE|1RED|2BLUE|truetrue-2
+attrs=attribute.test|5.0,-2.0,10.0|true|-2.0,-2.0,10.0,2.5|true|true|net.minecraft.world.entity.ai.attributes.RangedAttribute
+invalid=Minimum value cannot be bigger than maximum value!;Default value cannot be lower than minimum value!;Default value cannot be bigger than maximum value!;
+attrsEdges=normal|true|bff0000000000000,4008000000000000,bff0000000000000,0,8000000000000000|NaN,NaN,0|4000000000000000,4024000000000000,NaN|4000000000000000,4024000000000000,0|8000000000000000,8000000000000000|0|0|8000000000000000|8000000000000000|NaN|0

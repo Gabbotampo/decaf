@@ -241,6 +241,7 @@ mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_registries;
+mod vanilla_values;
 pub mod verdict;
 mod watch_service;
 pub mod weaver;
@@ -3398,6 +3399,8 @@ pub struct StdHost {
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
     cached_collections: BTreeMap<(String, String), String>,
+    /// Primitive state for vanilla RangedAttribute handles.
+    ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -3514,6 +3517,7 @@ pub struct StdHost {
     /// view's contents (#243's review).
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
+    next_ranged_attribute: usize,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -3621,6 +3625,7 @@ impl StdHost {
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
+            ranged_attributes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -3671,6 +3676,7 @@ impl StdHost {
             next_neutral_collection: 0,
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
+            next_ranged_attribute: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
@@ -6115,6 +6121,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = mod_origin::static_field(r) {
             return Ok(value);
         }
@@ -6366,7 +6375,7 @@ impl Host for StdHost {
     }
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
-        StdHost::random_new(self, class)
+        vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
@@ -6374,6 +6383,9 @@ impl Host for StdHost {
             self.random_bit_scope = None;
         }
         self.record(r, None, args);
+        if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
         if let Some(result) = self.random_static(r, args) {
             return result;
         }
@@ -7734,6 +7746,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
+            return result;
+        }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
@@ -25138,6 +25153,9 @@ impl<H: Host> Runtime<'_, H> {
             .or_else(|| crate::runtime::host_fabric_runtime::enum_values(&r.owner))
             && r.descriptor == format!("()[L{};", r.owner)
         {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
+        if let Some(values) = crate::runtime::vanilla_values::enum_values(r) {
             return Some(self.new_array_value(&format!("[L{};", r.owner), values));
         }
         let constants = game_enum_constants(&r.owner)?;
