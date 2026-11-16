@@ -412,7 +412,7 @@ fn gson_round_trips_primitives_strings_lists_and_maps() {
     // writes the two documents indented, so the expected text is that output.
     assert_eq!(
         fixture.text("roundTrip"),
-        "42|hello|3|2|2|{\n  \"a\": 1,\n  \"b\": \"x\"\n}|[\n  1,\n  \"two\",\n  [\n    3\n  ]\n]"
+        "42|hello|3|2|2|{\n  \"a\": 1.0,\n  \"b\": \"x\"\n}|[\n  1.0,\n  \"two\",\n  [\n    3.0\n  ]\n]"
     );
 }
 
@@ -480,7 +480,7 @@ fn output_stream_writer_and_files_reader_share_the_same_file() {
 #[test]
 fn string_writer_is_an_appendable_gson_can_write_to() {
     let fixture = Fixture::build("string-writer");
-    assert_eq!(fixture.text("stringWriter"), "[1,2]");
+    assert_eq!(fixture.text("stringWriter"), "[1.0,2.0]");
 }
 
 #[test]

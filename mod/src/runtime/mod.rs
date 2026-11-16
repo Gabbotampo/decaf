@@ -22254,6 +22254,25 @@ impl<H: Host> Runtime<'_, H> {
         self.callback_infos.open(marker)
     }
 
+    /// Compose Gson's bounded shape with the exact JsonWriter state used by
+    /// the writer overloads. Unsupported shapes return None so the call is
+    /// counted instead of receiving made-up text.
+    fn gson_to_json_string(
+        &mut self,
+        value: &Value,
+        style: &gson_model::GsonStyle,
+    ) -> Result<Option<String>, NativeError> {
+        let Some(text) = self.gson_to_json(value, style, 0)? else {
+            return Ok(None);
+        };
+        let mut writer = gson_writer::State::new("gson-toJson-object".into());
+        writer.apply_tree_style(&style.tree_style());
+        let prefix = gson_model::non_executable_prefix(style).unwrap_or("");
+        let fragment = writer.raw_tree(format!("{prefix}{text}"))?;
+        writer.close_document()?;
+        Ok(Some(fragment))
+    }
+
     /// Answer the bounded `CallbackInfo` surface for the object this execution
     /// owns.
     ///
@@ -27378,15 +27397,11 @@ impl<H: Host> Runtime<'_, H> {
                     (name, descriptor)
                         if name == "toJson" && descriptor.ends_with(")Ljava/lang/String;") =>
                     {
-                        match self.gson_to_json(
+                        match self.gson_to_json_string(
                             args.first().unwrap_or(&Value::Ref(None)),
                             &style,
-                            0,
                         )? {
-                            Some(text) => Ok(Some(Value::Ref(Some(format!(
-                                "{}{text}",
-                                gson_model::non_executable_prefix(&style).unwrap_or("")
-                            ))))),
+                            Some(text) => Ok(Some(Value::Ref(Some(text)))),
                             // A value with no honest JSON shape is a counted
                             // unknown, never made-up text.
                             None => self
