@@ -774,6 +774,49 @@ mod tests {
     }
 
     #[test]
+    fn public_dispatcher_runs_existing_callback_chain() {
+        let java = crate::HorizonJava::default();
+        let uuid = 0xa1_u128;
+        java.lock().jars.push(load(
+            "dispatchtick",
+            "DispatchTickMixin",
+            "@Mixin(Player.class) public class DispatchTickMixin { \
+               @Inject(method = \"tick\", at = @At(\"HEAD\")) \
+               private void pre(CallbackInfo ci) { System.out.println(\"dispatch/\" + ((Player)(Object)this).getUUID()); } }",
+        ));
+        java.lock().players = vec![FacadePlayer {
+            uuid,
+            name: "Alex".into(),
+            level: None,
+            entity_id: Some(7),
+            session: 1,
+            life: 0,
+        }];
+        java.refresh_game_hook_plan_bits();
+        let player = player(&java.lock(), uuid, 0).expect("listed player");
+        let mut args = [];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        let answer = java
+            .dispatch_game_hook(crate::game_dispatch::GameDispatch::new(
+                crate::game_dispatch::MethodId("java_base_player_tick_head"),
+                crate::game_dispatch::Phase::Head,
+                Some(player),
+                &mut args,
+                None,
+                &mut host,
+            ))
+            .expect("dispatch succeeds");
+        assert_eq!(answer.callbacks, 1);
+        assert!(!answer.cancelled);
+        assert_eq!(
+            stdout(&mut java.lock(), 0),
+            ["dispatch/00000000-0000-0000-0000-0000000000a1"]
+        );
+    }
+
+    #[test]
     fn player_tick_head_and_tail_run_once_per_player_in_order() {
         let java = crate::HorizonJava::default();
         java.lock().jars.push(load(
