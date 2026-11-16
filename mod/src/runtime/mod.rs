@@ -25,6 +25,7 @@ mod array_store;
 mod array_views;
 mod attachment_codec;
 mod bigdecimal_slice;
+mod block_entity_types;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -6362,6 +6363,9 @@ impl Host for StdHost {
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
         if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
+        if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
         if let Some(value) = mod_origin::static_field(r) {
