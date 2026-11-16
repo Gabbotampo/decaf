@@ -1300,7 +1300,11 @@ impl GameHookRegistrations {
     pub fn for_anchor(&self, hook: &str, anchor: &str) -> Self {
         let mut filtered = Self::default();
         for entry in self.entries(hook) {
-            let normalized = if entry.anchor.is_empty() { "HEAD" } else { entry.anchor.as_str() };
+            let normalized = if entry.anchor.is_empty() {
+                "HEAD"
+            } else {
+                entry.anchor.as_str()
+            };
             if normalized == anchor {
                 filtered.insert(entry.clone());
             }
