@@ -241,6 +241,10 @@ pub enum HostKind {
     ResourceKey,
     /// `net.minecraft.tags.TagKey`: key `registry|location`, or `?…`.
     TagKey,
+    /// Canonical vanilla `MobEffectCategory` enum constants.
+    MobEffectCategory,
+    /// A freshly constructed vanilla `RangedAttribute`.
+    RangedAttribute,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -1245,6 +1249,20 @@ const KINDS: &[KindInfo] = &[
         // Interned by `TagKey.create`.
         canonical: always_canonical,
         methods: &crate::runtime::host_ids::TAG_KEY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MobEffectCategory,
+        tag: "mec",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY),
+        canonical: always_canonical,
+        methods: &crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RangedAttribute,
+        tag: "rattr",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::RANGED_ATTRIBUTE),
+        canonical: never_canonical,
+        methods: &crate::runtime::vanilla_values::RANGED_ATTRIBUTE_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,
