@@ -241,6 +241,10 @@ pub enum HostKind {
     ResourceKey,
     /// `net.minecraft.tags.TagKey`: key `registry|location`, or `?…`.
     TagKey,
+    /// Canonical vanilla `MobEffectCategory` enum constants.
+    MobEffectCategory,
+    /// A freshly constructed vanilla `RangedAttribute`.
+    RangedAttribute,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -458,6 +462,8 @@ pub enum HostKind {
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
+    /// A bounded DataFixerUpper construction node retaining nested codecs and callbacks.
+    DfuCodec,
     /// A `java.lang.reflect.Type` that is no class (`ParameterizedType`,
     /// `TypeVariable`, `WildcardType`, `GenericArrayType`): key the node
     /// (`host_reflect_type.rs`).
@@ -1249,6 +1255,20 @@ const KINDS: &[KindInfo] = &[
         // Interned by `TagKey.create`.
         canonical: always_canonical,
         methods: &crate::host_ids::TAG_KEY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MobEffectCategory,
+        tag: "mec",
+        class: ClassRule::Fixed(crate::vanilla_values::MOB_EFFECT_CATEGORY),
+        canonical: always_canonical,
+        methods: &crate::vanilla_values::MOB_EFFECT_CATEGORY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RangedAttribute,
+        tag: "rattr",
+        class: ClassRule::Fixed(crate::vanilla_values::RANGED_ATTRIBUTE),
+        canonical: never_canonical,
+        methods: &crate::vanilla_values::RANGED_ATTRIBUTE_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,
@@ -2077,6 +2097,15 @@ const KINDS: &[KindInfo] = &[
         // One node, one object.
         canonical: always_canonical,
         methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DfuCodec,
+        tag: "dfuc",
+        class: ClassRule::Unknown {
+            declared: crate::dfu_codec::dfu_codec_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::dfu_codec::DFU_CODEC_METHODS,
     },
     KindInfo {
         kind: HostKind::ReflectType,
