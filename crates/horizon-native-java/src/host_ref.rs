@@ -357,6 +357,8 @@ pub enum HostKind {
     FabricModContainer,
     /// A Fabric `ModMetadata`: key its mod id.
     FabricModMetadata,
+    /// A Fabric metadata dependency: key its mod id and dependency kind.
+    FabricModDependency,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
     FabricModOriginKind,
@@ -443,6 +445,9 @@ pub enum HostKind {
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
+    /// A runtime-owned annotation proxy; its key carries the held annotation
+    /// interface descriptor but is never a String marker.
+    AnnotationProxy,
     /// A chat component (`MutableComponent`): key a serial per allocation, then its vanilla
     /// JSON, keys sorted
     /// (`host_component.rs`).
@@ -591,6 +596,15 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
+    /// Pure PoseStack/JOML render values.
+    RenderObject,
+    /// Pure client model-layer builder values and trees.
+    CubeDeformation,
+    PartPose,
+    CubeListBuilder,
+    MeshDefinition,
+    PartDefinition,
+    LayerDefinition,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1705,6 +1719,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_fabric_loader::OBJECT_METHODS,
     },
     KindInfo {
+        kind: HostKind::FabricModDependency,
+        tag: "fdep",
+        class: ClassRule::Unknown {
+            declared: crate::host_fabric_loader::dependency_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_fabric_loader::OBJECT_METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricModOrigin,
         tag: "fmo",
         class: ClassRule::Unknown {
@@ -2034,6 +2057,13 @@ const KINDS: &[KindInfo] = &[
         // One `Class` per name in a run (`class_precedence`, #124).
         canonical: always_canonical,
         methods: &crate::host_class::CLASS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::AnnotationProxy,
+        tag: "anpr",
+        class: ClassRule::FromKey(crate::annotation_proxy::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::annotation_proxy::METHODS,
     },
     KindInfo {
         kind: HostKind::Component,
@@ -2528,6 +2558,55 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::client_reload::converter_class),
         canonical: never_canonical,
         methods: &crate::client_reload::CONVERTER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RenderObject,
+        tag: "rmat",
+        class: ClassRule::FromKey(crate::render_math::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CubeDeformation,
+        tag: "cdef",
+        class: ClassRule::Fixed(crate::model_layers::CUBE_DEFORMATION),
+        canonical: never_canonical,
+        methods: &crate::model_layers::CUBE_DEFORMATION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PartPose,
+        tag: "ppose",
+        class: ClassRule::Fixed(crate::model_layers::PART_POSE),
+        canonical: never_canonical,
+        methods: &crate::model_layers::PART_POSE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CubeListBuilder,
+        tag: "mlbld",
+        class: ClassRule::Fixed(crate::model_layers::CUBE_LIST_BUILDER),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MeshDefinition,
+        tag: "mesh",
+        class: ClassRule::Fixed(crate::model_layers::MESH_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PartDefinition,
+        tag: "part",
+        class: ClassRule::Fixed(crate::model_layers::PART_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::LayerDefinition,
+        tag: "layer",
+        class: ClassRule::Fixed(crate::model_layers::LAYER_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
     },
 ];
 

@@ -720,7 +720,7 @@ import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 /// `isWasDeath()` returns that field: true after a death respawn (`keepEverything` false), false
 /// after an End return. The firing carries Fabric `COPY_FROM`'s `alive` (= `keepEverything`) as
 /// its flag, so a death fires with `flag: false`. `getEntity()` is the new player.
-/// `getOriginal()` is the old player the game lends for the clone hook (arismoko/horizon#3040), its
+/// `getOriginal()` is the old player the game lends for the clone hook (sunrise-org/sunrise#3040), its
 /// own marker answering the old player's facts (name, health at death); a firing without one
 /// refuses it rather than handing over the new player.
 #[test]

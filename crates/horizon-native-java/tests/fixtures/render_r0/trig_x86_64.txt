@@ -1,0 +1,5 @@
+0.1f=3f7fffe6,bae4c380,3ae4c380,3f7fffe6
+1.234567f=3f7ff0ca,bcb08062,3cb08062,3f7ff0ca
+-3.1415927f=3f7f9d83,3d6079cf,bd6079cf,3f7f9d83
+NaN=counted-by-hotspot-payload
+Infinity=counted-by-hotspot-payload

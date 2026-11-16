@@ -225,6 +225,17 @@ fn item_like(value: &Value) -> Option<&str> {
     text.strip_prefix(ITEM).or_else(|| text.strip_prefix(BLOCK))
 }
 
+/// The id accepted by `LivingEntity.hasEffect`/`getEffect`: a vanilla
+/// `Holder.Reference` or the older client-effect-holder façade value.
+fn effect_holder_id(value: &Value) -> Option<String> {
+    if let Some(id) = crate::runtime::host_registry_holder::registered_id(value) {
+        return Some(id);
+    }
+    crate::runtime::game_object::text(value)?
+        .strip_prefix(EFFECT_HOLDER)
+        .map(ToOwned::to_owned)
+}
+
 /// `Items.DIAMOND_SWORD` → `minecraft:diamond_sword`: every vanilla item and
 /// block constant is its id's path in upper case.
 pub(super) fn constant_id(field: &str) -> String {
@@ -373,11 +384,11 @@ impl StdHost {
                 self.new_collection(crate::runtime::stand_in_class("list"), effects)
             }
             ("hasEffect", "Z") => {
-                let id = crate::runtime::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
+                let id = effect_holder_id(args.first()?)?;
                 flag(p.effects.iter().any(|e| e.id == id))
             }
             ("getEffect", _) => {
-                let id = crate::runtime::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
+                let id = effect_holder_id(args.first()?)?;
                 p.effects
                     .iter()
                     .position(|e| e.id == id)

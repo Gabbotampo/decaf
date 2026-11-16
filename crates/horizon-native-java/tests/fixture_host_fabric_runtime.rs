@@ -113,7 +113,7 @@ fn run_with_output(test: &str, method: &str) -> (String, Vec<(String, usize)>, S
 /// fields (plain `getfield`s). So each is one object per container or
 /// metadata, never another mod's. (Fabric wraps them unmodifiable, which the
 /// host doesn't model yet, #238: no probe writes to them.)
-const CONTAINERS_ORACLE: &[(&str, &str)] = &[("roots", "TFFTT11"), ("metadata", "FTFT[][]")];
+const CONTAINERS_ORACLE: &[(&str, &str)] = &[("roots", "TFFTT11"), ("metadata", "FFFF[][]")];
 
 /// Two mods' containers and metadata keep their own collections: `a`'s root
 /// paths are still `a`'s after `b`'s are read, each getter answers the same
@@ -148,9 +148,251 @@ fn each_mod_container_keeps_its_own_collections() {
             other => format!("{other:?}"),
         };
         assert_eq!(&text, expected, "{method}: {:?}", host.unknown_host_calls());
+        if *method == "metadata" {
+            assert!(
+                !host.unknown_host_calls().is_empty(),
+                "{method} was not counted"
+            );
+        } else {
+            assert!(
+                host.unknown_host_calls().is_empty(),
+                "{method}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
+    }
+}
+
+/// The expected `UUUUUU` comes from Fabric Loader's bytecode: metadata's
+/// collection fields are assigned through `Collections.unmodifiableCollection`
+/// and `ModContainerImpl.getRootPaths` returns `Collections.singletonList`.
+/// Both wrappers throw `UnsupportedOperationException` from every mutator.
+#[test]
+fn metadata_collections_reject_mutation() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("metadata-mutators", &sources);
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("moda", "1.0")
+            .with_mod("modb", "1.0"),
+    );
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "mutators",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(
+            &result,
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "NNNNNU"
+        ),
+        "result={result:?}"
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("ModMetadata#getLicense")),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn unmodifiable_collection_keeps_object_equality_and_delegates_text() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build("metadata-wrapper", &sources);
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("moda", "1.0")
+            .with_mod("modb", "1.0"),
+    );
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "wrapperSemantics",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(
+            &result,
+            Ok(horizon_native_java::Value::Ref(Some(text))) if text == "TTT[]"
+        ),
+        "result={result:?}"
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("ModMetadata#getLicense")),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn populated_real_v1_metadata_uses_wrappers_and_rejects_iterator_remove() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "metadata-populated",
+        &sources,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"entrypoints":{"main":"demo.RealMetadata"},"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"dep":">=1"}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "populated",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "1:1:1:1:1:AliceUUUUUUUUUU"),
+        "{result:?}"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn a_jar_origin_paths_are_the_cached_singleton_list() {
+    let sources = sources();
+    let sources = sources
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "origin-paths",
+        &sources,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "originPaths",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "java.util.Collections$SingletonList:true:true:[/horizon/mods/probe-fixture]"),
+        "{result:?}"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn real_loader_api_fixture_preserves_all_dependency_kinds() {
+    let jar = [
+        "/Users/sparks/ava/scratch/census-dependency-closures/oracle/fabric-loader-0.19.5.jar",
+        "/Users/sparks/ava/scratch/lib-balm-enum/fabric-loader-0.19.5.jar",
+    ]
+    .iter()
+    .map(std::path::Path::new)
+    .find(|p| p.exists());
+    let Some(jar) = jar else { return };
+    let containers = sources()
+        .into_iter()
+        .find(|(name, _)| name == "demo/Containers.java")
+        .unwrap();
+    let fixture = javac_fixture::Fixture::build_with_real_classpath(
+        "real-loader-api",
+        &[(containers.0.as_str(), containers.1.as_str())],
+        jar,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"depends":{"a":">=1"},"recommends":{"b":">=1"},"suggests":{"c":">=1"},"conflicts":{"d":">=1"},"breaks":{"e":">=1"}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "dependencyKinds",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == "DEPENDS:a;RECOMMENDS:b;SUGGESTS:c;CONFLICTS:d;BREAKS:e;"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn real_loader_dependency_version_accessors_are_exact_or_counted() {
+    let jar = [
+        "/Users/sparks/ava/scratch/census-dependency-closures/oracle/fabric-loader-0.19.5.jar",
+        "/Users/sparks/ava/scratch/lib-balm-enum/fabric-loader-0.19.5.jar",
+    ]
+    .iter()
+    .map(std::path::Path::new)
+    .find(|p| p.exists());
+    let Some(jar) = jar else { return };
+    let containers = sources()
+        .into_iter()
+        .find(|(name, _)| name == "demo/Containers.java")
+        .unwrap();
+    let fixture = javac_fixture::Fixture::build_with_real_classpath(
+        "real-loader-dependency-accessors",
+        &[(containers.0.as_str(), containers.1.as_str())],
+        jar,
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"depends":{"a":">=1"},"recommends":{"b":">=1"},"suggests":{"c":">=1"},"conflicts":{"d":">=1"},"breaks":{"e":">=1"}}"#,
+    );
+    let mut host = fixture
+        .jar
+        .seed_host(StdHost::new().with_environment_type("SERVER"));
+    let result = fixture.jar.invoke_method_with_args(
+        "demo/Containers",
+        "dependencyAccessors",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    let real = "DEPENDS:a:1:1;RECOMMENDS:b:1:1;SUGGESTS:c:1:1;CONFLICTS:d:1:1;BREAKS:e:1:1;";
+    if !matches!(&result, Ok(horizon_native_java::Value::Ref(Some(text))) if text == real) {
         assert!(
-            host.unknown_host_calls().is_empty(),
-            "{method}: {:?}",
+            host.unknown_host_calls().iter().any(|(call, _)| call
+                .ends_with("ModDependency#getVersionRequirements()Ljava/util/Collection;")),
+            "result={result:?}, unknown={:?}",
+            host.unknown_host_calls()
+        );
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call
+                    .ends_with("ModDependency#getVersionIntervals()Ljava/util/List;")),
+            "result={result:?}, unknown={:?}",
             host.unknown_host_calls()
         );
     }
@@ -325,7 +567,7 @@ fn no_string_spells_a_singleton() {
     assert!(
         unknown.iter().all(
             |(call, _)| call.ends_with("#<instanceof>(Ljava/lang/Object;)Z")
-                || call.ends_with("#hashCode()I")
+                || call.contains("ModMetadata#getLicense")
         ),
         "{unknown:?}"
     );
@@ -343,4 +585,52 @@ fn a_string_cast_to_a_singleton_type_is_never_the_object() {
             assert!(!text.contains(spelled), "{text} {unknown:?}");
         }
     }
+}
+
+#[test]
+fn real_loader_v1_metadata_contract() {
+    let Ok(loader_jar) = std::env::var("FABRIC_LOADER_JAR") else {
+        eprintln!("FABRIC_LOADER_JAR is unavailable; real-loader fixture is arcweld-only");
+        return;
+    };
+    let source = include_str!("fixtures/fabric_runtime/demo/RealMetadata.java");
+    let fixture = javac_fixture::Fixture::build_with_real_classpath(
+        "real-loader-v1-metadata",
+        &[("demo/RealMetadata.java", source)],
+        std::path::Path::new(&loader_jar),
+        r#"{"id":"probe-fixture","version":"1.0","schemaVersion":1,"authors":["Alice"],"contributors":["Bob"],"license":"MIT","provides":["alias"],"depends":{"zeta":">=1","alpha":">=1"},"recommends":{"middle":">=1"}}"#,
+    );
+    let mut host = fixture.jar.seed_host(
+        StdHost::new()
+            .with_environment_type("SERVER")
+            .with_mod("probe-fixture", "1.0"),
+    );
+    fixture
+        .jar
+        .execute("demo.RealMetadata", None, "main", &mut host)
+        .expect("real metadata entrypoint");
+    let actual = match fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/RealMetadata",
+            "inspect",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .expect("real metadata probe")
+    {
+        horizon_native_java::Value::Ref(Some(text)) => text,
+        other => panic!("unexpected real metadata answer: {other:?}"),
+    };
+    assert_eq!(
+        actual,
+        "java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|java.util.Collections$UnmodifiableCollection|true|true|uoe:null|iter-uoe:null|DEPENDS,DEPENDS,RECOMMENDS,"
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
