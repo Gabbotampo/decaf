@@ -433,7 +433,6 @@ impl StdHost {
         r: &MethodRef,
         receiver: &Value,
     ) -> Result<Value, NativeError> {
-        self.unknown_host_call(r)?;
         let class = if r.descriptor.contains("Ljava/util/Map;") {
             "map"
         } else {
@@ -448,8 +447,21 @@ impl StdHost {
                 .values()
                 .any(|value| expect_ref(value) == Some(&marker))
         {
+            if self.strict_unknown_host_calls {
+                self.unknown_host_call(r)?;
+            } else {
+                let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
+                if let Some(count) = self.unknown_host_calls.get_mut(&key) {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else {
+                        self.unknown_host_calls.remove(&key);
+                    }
+                }
+            }
             return Ok(crate::runtime::jar_object::collection(marker));
         }
+        self.unknown_host_call(r)?;
         let made = self.empty_collection(class);
         if let Some(cache) = cache
             && let Some(marker) = expect_ref(&made)
