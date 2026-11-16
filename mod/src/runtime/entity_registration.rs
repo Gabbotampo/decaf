@@ -268,7 +268,7 @@ pub(crate) fn instance_call(
             let mut b = state.builders.remove(&k)?;
             let Some(id) = args
                 .first()
-                .and_then(|v| crate::runtime::host_ids::key_location(v))
+                .and_then(crate::runtime::host_ids::key_location)
                 .and_then(|v| crate::runtime::host_ids::identifier_key(&v).map(str::to_owned))
                 .or_else(|| args.first().and_then(arg_string))
             else {
