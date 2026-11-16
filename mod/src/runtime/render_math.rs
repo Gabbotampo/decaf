@@ -302,24 +302,22 @@ fn sync_pose_aliases(map: &mut BTreeMap<String, Obj>, k: &str) {
     }
 }
 fn sync_matrix_alias(map: &mut BTreeMap<String, Obj>, k: &str) {
-    if let Some(pose_key) = k.strip_suffix("/matrix4") {
-        if let Some(m) = map.get(k).and_then(|o| match o {
+    if let Some(pose_key) = k.strip_suffix("/matrix4")
+        && let Some(m) = map.get(k).and_then(|o| match o {
             Obj::M4(m) => Some(*m),
             _ => None,
-        }) {
-            if let Some(Obj::Pose(p)) = map.get_mut(pose_key) {
-                p.p = m;
-            }
-        }
-    } else if let Some(pose_key) = k.strip_suffix("/matrix3") {
-        if let Some(m) = map.get(k).and_then(|o| match o {
+        })
+        && let Some(Obj::Pose(p)) = map.get_mut(pose_key)
+    {
+        p.p = m;
+    } else if let Some(pose_key) = k.strip_suffix("/matrix3")
+        && let Some(m) = map.get(k).and_then(|o| match o {
             Obj::M3(m) => Some(*m),
             _ => None,
-        }) {
-            if let Some(Obj::Pose(p)) = map.get_mut(pose_key) {
-                p.n = m;
-            }
-        }
+        })
+        && let Some(Obj::Pose(p)) = map.get_mut(pose_key)
+    {
+        p.n = m;
     }
 }
 
