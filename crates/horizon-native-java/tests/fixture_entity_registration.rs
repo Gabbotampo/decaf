@@ -36,6 +36,6 @@ fn probe_rows_match_java25_capture() {
   ("net/minecraft/world/entity/MobCategory.java", include_str!("fixtures/entity_registration/stubs/net/minecraft/world/entity/MobCategory.java")),
  ];
  let f=javac_fixture::Fixture::build("entity-registration", &sources); let mut h=f.jar.seed_host(StdHost::new());
- let v=f.jar.invoke_method("demo/Probe","rows","()Ljava/lang/String;",None,&mut h).unwrap();
+ let v=f.jar.invoke_method("demo/Probe","rows","()Ljava/lang/String;",None,&mut h).unwrap_or_else(|e| panic!("{e:?}; unknown_count={}; unknown={:?}", h.unknown_host_call_count(), h.unknown_host_calls()));
  let Value::Ref(Some(s))=v else { panic!("{v:?}") }; assert_eq!(s, include_str!("fixtures/entity_registration/java25.txt"));
 }
