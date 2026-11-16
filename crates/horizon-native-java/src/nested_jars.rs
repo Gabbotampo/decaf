@@ -83,6 +83,14 @@ pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
         let result = host
             .link_jar(format!("{outer}!{entry}"), &nested)
             .map_err(|error| error.to_string());
+        if result.is_ok()
+            && let Some(nested_id) = nested.fabric_id.as_deref()
+        {
+            host.fabric_origins.insert(
+                nested_id.to_owned(),
+                ("nested".into(), format!("{outer}|{entry}")),
+            );
+        }
         out.push(NestedJar {
             entry: entry.clone(),
             result,

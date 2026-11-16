@@ -273,6 +273,8 @@ pub enum HostKind {
     /// A NeoForge `DeferredHolder` or Forge `RegistryObject`: key the loader,
     /// the registration's serial and the entry's key.
     Holder,
+    /// A `Holder.Reference` returned by a jar-owned `Registry.registerForHolder`: key the registry key, id and value.
+    RegistryHolder,
     /// The value a holder's registration registered: key the serial.
     Registered,
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
@@ -351,6 +353,7 @@ pub enum HostKind {
     FabricModMetadata,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
+    FabricModOriginKind,
     /// A Fabric metadata `Person`: key the mod id and JSON pointer.
     FabricPerson,
     /// A Fabric `ContactInformation`: key the mod id and JSON pointer, or no
@@ -427,6 +430,10 @@ pub enum HostKind {
     /// An object `new` (or a model) allocated: key `class#n`
     /// (`jar_object.rs`), one key per allocation.
     JarObject,
+    /// A modelled `java.io.Writer` allocation. Its key is `class#n`, but the
+    /// separate kind keeps Gson from accepting an arbitrary jar object as a
+    /// writer sink.
+    Writer,
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
@@ -444,6 +451,8 @@ pub enum HostKind {
     OpaqueCodec,
     /// A pure network StreamCodec factory result.
     StreamCodec,
+    /// An explicitly seeded Minecraft RandomSource or positional factory.
+    RandomSource,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -850,6 +859,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::StreamCodec,
         &crate::runtime::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
+    (HostKind::RandomSource, &crate::runtime::random_source::CLASS_SIDE),
 ];
 
 /// One row of the kind table.
@@ -1330,6 +1340,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_registry::HOLDER_METHODS,
     },
     KindInfo {
+        kind: HostKind::RegistryHolder,
+        tag: "rhold",
+        class: ClassRule::Fixed("net/minecraft/core/Holder$Reference"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_registry_holder::METHODS,
+    },
+    KindInfo {
         kind: HostKind::Registered,
         tag: "rgd",
         class: ClassRule::Unknown {
@@ -1671,6 +1688,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_fabric_loader::ORIGIN_METHODS,
     },
     KindInfo {
+        kind: HostKind::FabricModOriginKind,
+        tag: "fmok",
+        class: ClassRule::Fixed(crate::runtime::mod_origin::ORIGIN_KIND),
+        canonical: always_canonical,
+        methods: &crate::runtime::mod_origin::KIND_METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricPerson,
         tag: "fper",
         class: ClassRule::Unknown {
@@ -1967,6 +1991,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::Writer,
+        tag: "wrtr",
+        class: ClassRule::FromKey(crate::runtime::jar_object::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::jar_object::JAR_OBJECT,
+    },
+    KindInfo {
         kind: HostKind::Class,
         tag: "cls",
         // `FromKey`, not `Fixed`, until #156 P13c: a fixed class's objects are
@@ -2020,6 +2051,13 @@ const KINDS: &[KindInfo] = &[
         // Every factory call allocates a new implementation object.
         canonical: always_canonical,
         methods: &crate::runtime::stream_codec::STREAM_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RandomSource,
+        tag: "rand",
+        class: ClassRule::FromKey(crate::runtime::random_source::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::random_source::METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,

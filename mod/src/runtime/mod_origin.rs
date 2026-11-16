@@ -19,50 +19,105 @@
 //! Named departure: the path is the runtime's virtual mod root
 //! (`/horizon/mods/<id>`, the same value `ModContainer.getRootPaths()` answers),
 //! not the jar's real filesystem path — the runtime never exposes host paths.
-//! Every container this runtime hands out is a `PATH` origin (a loaded jar), so
-//! `NESTED` and `UNKNOWN` markers are only reachable if a jar fabricates one.
+//! Direct containers are PATH origins; jars discovered under
+//! META-INF/jars/ are NESTED origins with their parent and entry path.
+//! UNKNOWN is only reachable if a jar fabricates one.
 
 use super::*;
+use crate::runtime::host_ref::{ClassHierarchy, HostRef, Methods};
 
 const ORIGIN_OWNER: &str = "net/fabricmc/loader/api/metadata/ModOrigin";
-const ORIGIN_KIND: &str = "net/fabricmc/loader/api/metadata/ModOrigin$Kind";
-
-/// The `ModOrigin` for the container `id` names: a `PATH` origin whose one
-/// root path is the virtual mod directory (`host_fabric_loader.rs`).
-pub(super) fn origin_value(id: &str) -> Value {
-    crate::runtime::host_fabric_loader::origin("path", id)
-}
+pub(crate) const ORIGIN_KIND: &str = "net/fabricmc/loader/api/metadata/ModOrigin$Kind";
 
 /// The root path text the virtual mod directory gives a mod id.
 pub(crate) fn root_path(id: &str) -> String {
     format!("/horizon/mods/{id}")
 }
 
+fn kind_value(name: &str) -> Option<Value> {
+    matches!(name, "PATH" | "NESTED" | "UNKNOWN").then(|| {
+        Value::Host(HostRef::of_values(
+            crate::runtime::host_ref::HostKind::FabricModOriginKind,
+            &[Value::Ref(Some(name.to_owned()))],
+        ))
+    })
+}
+
+fn kind_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Host(handle) if handle.kind() == crate::runtime::host_ref::HostKind::FabricModOriginKind => {
+            handle.values()?.first().and_then(|value| match value {
+                Value::Ref(Some(name)) => Some(name.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn kind_instance_of(_: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option<bool> {
+    Some(matches!(
+        wanted,
+        "java/lang/Object"
+            | "java/lang/Enum"
+            | "java/lang/Comparable"
+            | "java/lang/constant/Constable"
+            | "java/io/Serializable"
+            | ORIGIN_KIND
+    ))
+}
+
+pub(crate) const KIND_METHODS: Methods = Methods {
+    to_string: |handle, _| Ok(kind_name(&Value::Host(handle.clone()))),
+    instance_of: kind_instance_of,
+    compare_to: Some(|handle, other, _| {
+        let left = kind_name(&Value::Host(handle.clone()));
+        let right = match other {
+            Value::Host(other)
+                if other.kind() == crate::runtime::host_ref::HostKind::FabricModOriginKind =>
+            {
+                kind_name(&Value::Host(other.clone()))
+            }
+            _ => None,
+        };
+        Ok(left.zip(right).map(|(left, right)| {
+            ["PATH", "NESTED", "UNKNOWN"]
+                .iter()
+                .position(|name| *name == left)
+                .unwrap_or_default() as i32
+                - ["PATH", "NESTED", "UNKNOWN"]
+                    .iter()
+                    .position(|name| *name == right)
+                    .unwrap_or_default() as i32
+        }))
+    }),
+    ..crate::runtime::host_fabric_loader::OBJECT_METHODS
+};
+
 /// Answer one `ModOrigin` or `ModOrigin$Kind` call, or `None` when the receiver
 /// is not an origin.
 pub(super) fn invoke(
     r: &MethodRef,
     receiver: Option<&Value>,
-    _args: &[Value],
+    args: &[Value],
     host: &mut impl crate::runtime::Host,
 ) -> Result<Option<Value>, NativeError> {
+    if receiver.is_none() && r.owner == ORIGIN_KIND {
+        return static_kind_call(r, args);
+    }
     let Some(receiver) = receiver else {
         return Ok(None);
     };
     // The kind constant (`enum/<Kind>/PATH`): its name, ordinal and text.
     if r.owner == ORIGIN_KIND {
-        let Some(named) = expect_ref(receiver)
-            .and_then(|marker| marker.strip_prefix("enum/"))
-            .and_then(|rest| rest.strip_prefix(ORIGIN_KIND))
-            .and_then(|rest| rest.strip_prefix('/'))
-        else {
+        let Some(named) = kind_name(receiver) else {
             return Ok(None);
         };
         return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
                 Value::Ref(Some(named.to_owned()))
             }
-            ("ordinal", "()I") => Value::Int(match named {
+            ("ordinal", "()I") => Value::Int(match named.as_str() {
                 "PATH" => 0,
                 "NESTED" => 1,
                 _ => 2,
@@ -79,9 +134,8 @@ pub(super) fn invoke(
         return Ok(None);
     }
     Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-        ("getKind", "()Lnet/fabricmc/loader/api/metadata/ModOrigin$Kind;") => {
-            Value::Ref(Some(format!("enum/{ORIGIN_KIND}/{named}")))
-        }
+        ("getKind", "()Lnet/fabricmc/loader/api/metadata/ModOrigin$Kind;") => kind_value(&named)
+            .ok_or_else(|| NativeError::Metadata("unknown ModOrigin.Kind".into()))?,
         ("getPaths", "()Ljava/util/List;") => {
             if kind != "path" {
                 return Err(unsupported(&format!("kind {named} doesn't have paths")));
@@ -129,6 +183,54 @@ pub(super) fn invoke(
         // an identity hash, counted, and identity) are the handle's row.
         _ => return Ok(None),
     }))
+}
+
+pub(super) fn static_field(r: &MethodRef) -> Option<Value> {
+    (r.owner == ORIGIN_KIND
+        && r.descriptor == format!("L{ORIGIN_KIND};")
+        && matches!(r.name.as_str(), "PATH" | "NESTED" | "UNKNOWN"))
+    .then(|| kind_value(&r.name))
+    .flatten()
+}
+
+pub(super) fn enum_values(r: &MethodRef) -> Option<Vec<Value>> {
+    (r.owner == ORIGIN_KIND && r.name == "values" && r.descriptor == format!("()[L{ORIGIN_KIND};"))
+        .then(|| {
+            ["PATH", "NESTED", "UNKNOWN"]
+                .into_iter()
+                .filter_map(kind_value)
+                .collect()
+        })
+}
+
+fn static_kind_call(r: &MethodRef, args: &[Value]) -> Result<Option<Value>, NativeError> {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("valueOf", "(Ljava/lang/String;)Lnet/fabricmc/loader/api/metadata/ModOrigin$Kind;") => {
+            let name = match args.first() {
+                Some(Value::Ref(Some(name))) => name.as_str(),
+                Some(Value::Ref(None)) | None => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("Name is null".into()),
+                        frame: None,
+                    });
+                }
+                _ => return Ok(None),
+            };
+            if matches!(name, "PATH" | "NESTED" | "UNKNOWN") {
+                return Ok(kind_value(name));
+            }
+            Err(NativeError::UncaughtException {
+                class: "java/lang/IllegalArgumentException".into(),
+                message: Some(format!(
+                    "No enum constant {}.{name}",
+                    ORIGIN_KIND.replace(['/', '$'], ".")
+                )),
+                frame: None,
+            })
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Fabric's refusal for an accessor the origin's kind does not support: an
