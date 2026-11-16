@@ -321,7 +321,7 @@ fn field_name(args: &[Value]) -> Result<String, &'static str> {
         .ok_or("DFU codec field-name budget exceeded (256 bytes)")
 }
 
-fn optional_parts<'a>(descriptor: &str, args: &'a [Value]) -> Option<(Value, Value)> {
+fn optional_parts(descriptor: &str, args: &[Value]) -> Option<(Value, Value)> {
     let has_lifecycle_first =
         descriptor.starts_with("(Ljava/lang/String;Lcom/mojang/serialization/Lifecycle;");
     match (has_lifecycle_first, args.get(1), args.get(2)) {
