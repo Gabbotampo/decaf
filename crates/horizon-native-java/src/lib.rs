@@ -235,6 +235,7 @@ mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_holders;
+mod vanilla_holders_table;
 mod vanilla_registries;
 pub mod verdict;
 mod watch_service;

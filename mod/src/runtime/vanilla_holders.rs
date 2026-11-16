@@ -11,101 +11,11 @@ const HOLDER: &str = "Lnet/minecraft/core/Holder;";
 const ATTRIBUTES: &str = "net/minecraft/world/entity/ai/attributes/Attributes";
 const MOB_EFFECTS: &str = "net/minecraft/world/effect/MobEffects";
 
-// These lists were read from the 26.3 static initialisers. Keeping the list
-// explicit prevents an unrelated static field with a similar name from being
-// treated as a registry entry.
-const ATTRIBUTE_FIELDS: &[&str] = &[
-    "AIR_DRAG_MODIFIER",
-    "ARMOR",
-    "ARMOR_TOUGHNESS",
-    "ATTACK_DAMAGE",
-    "ATTACK_KNOCKBACK",
-    "ATTACK_SPEED",
-    "BELOW_NAME_DISTANCE",
-    "BLOCK_BREAK_SPEED",
-    "BLOCK_INTERACTION_RANGE",
-    "BOUNCINESS",
-    "BURNING_TIME",
-    "CAMERA_DISTANCE",
-    "EXPLOSION_KNOCKBACK_RESISTANCE",
-    "ENTITY_INTERACTION_RANGE",
-    "FALL_DAMAGE_MULTIPLIER",
-    "FLYING_SPEED",
-    "FOLLOW_RANGE",
-    "FRICTION_MODIFIER",
-    "GRAVITY",
-    "JUMP_STRENGTH",
-    "KNOCKBACK_RESISTANCE",
-    "LUCK",
-    "MAX_ABSORPTION",
-    "MAX_HEALTH",
-    "MINING_EFFICIENCY",
-    "MOVEMENT_EFFICIENCY",
-    "MOVEMENT_SPEED",
-    "NAME_TAG_DISTANCE",
-    "OXYGEN_BONUS",
-    "SAFE_FALL_DISTANCE",
-    "SCALE",
-    "SNEAKING_SPEED",
-    "SPAWN_REINFORCEMENTS_CHANCE",
-    "STEP_HEIGHT",
-    "SUBMERGED_MINING_SPEED",
-    "SWEEPING_DAMAGE_RATIO",
-    "TEMPT_RANGE",
-    "WATER_MOVEMENT_EFFICIENCY",
-    "WAYPOINT_TRANSMIT_RANGE",
-    "WAYPOINT_RECEIVE_RANGE",
-];
-
-const MOB_EFFECT_FIELDS: &[&str] = &[
-    "SPEED",
-    "SLOWNESS",
-    "HASTE",
-    "MINING_FATIGUE",
-    "STRENGTH",
-    "INSTANT_HEALTH",
-    "INSTANT_DAMAGE",
-    "JUMP_BOOST",
-    "NAUSEA",
-    "REGENERATION",
-    "RESISTANCE",
-    "FIRE_RESISTANCE",
-    "WATER_BREATHING",
-    "INVISIBILITY",
-    "BLINDNESS",
-    "NIGHT_VISION",
-    "HUNGER",
-    "WEAKNESS",
-    "POISON",
-    "WITHER",
-    "HEALTH_BOOST",
-    "ABSORPTION",
-    "SATURATION",
-    "GLOWING",
-    "LEVITATION",
-    "LUCK",
-    "UNLUCK",
-    "SLOW_FALLING",
-    "CONDUIT_POWER",
-    "DOLPHINS_GRACE",
-    "BAD_OMEN",
-    "HERO_OF_THE_VILLAGE",
-    "DARKNESS",
-    "TRIAL_OMEN",
-    "RAID_OMEN",
-    "WIND_CHARGED",
-    "WEAVING",
-    "OOZING",
-    "INFESTED",
-    "BREATH_OF_THE_NAUTILUS",
-];
-
-fn lower_id(field: &str) -> String {
-    format!("minecraft:{}", field.to_ascii_lowercase())
-}
-
-fn known(field: &str, fields: &[&str]) -> Option<String> {
-    fields.contains(&field).then(|| lower_id(field))
+fn known<'a>(field: &str, fields: &'a [(&'a str, &'a str, usize)]) -> Option<(&'a str, usize)> {
+    fields
+        .iter()
+        .find(|(name, _, _)| *name == field)
+        .map(|(_, id, index)| (*id, *index))
 }
 
 fn value(registry: &str, id: &str, family: &str) -> Value {
@@ -127,12 +37,12 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         ATTRIBUTES => (
             "minecraft:attribute",
             "attribute",
-            known(&r.name, ATTRIBUTE_FIELDS)?,
+            known(&r.name, crate::runtime::vanilla_holders_table::ATTRIBUTE_FIELDS)?.0,
         ),
         MOB_EFFECTS => (
             "minecraft:mob_effect",
             "mob-effect",
-            known(&r.name, MOB_EFFECT_FIELDS)?,
+            known(&r.name, crate::runtime::vanilla_holders_table::MOB_EFFECT_FIELDS)?.0,
         ),
         _ => return None,
     };
@@ -167,6 +77,22 @@ mod tests {
     }
 
     #[test]
+    fn generated_tables_preserve_registry_order() {
+        for (index, (_, _, recorded)) in crate::runtime::vanilla_holders_table::ATTRIBUTE_FIELDS
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(index, *recorded);
+        }
+        for (index, (_, _, recorded)) in crate::runtime::vanilla_holders_table::MOB_EFFECT_FIELDS
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(index, *recorded);
+        }
+    }
+
+    #[test]
     fn vanilla_attribute_holder_has_registry_facts_and_game_value() {
         let holder = static_field(&field(ATTRIBUTES, "ARMOR")).unwrap();
         assert_eq!(
@@ -174,6 +100,11 @@ mod tests {
             Value::Ref(Some("minecraft:armor".into()))
         );
         assert_eq!(call("isBound", "()Z", &holder, &[]), Value::Int(1));
+        let spawn = static_field(&field(ATTRIBUTES, "SPAWN_REINFORCEMENTS_CHANCE")).unwrap();
+        assert_eq!(
+            call("getRegisteredName", "()Ljava/lang/String;", &spawn, &[]),
+            Value::Ref(Some("minecraft:spawn_reinforcements".into()))
+        );
         let value = call("value", "()Ljava/lang/Object;", &holder, &[]);
         assert!(matches!(
             value,

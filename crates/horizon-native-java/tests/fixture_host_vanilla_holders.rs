@@ -9,7 +9,14 @@ mod javac_fixture;
 
 use horizon_native_java::StdHost;
 
-const EXPECTED: &str = "minecraft:speed|ResourceKey[minecraft:mob_effect / minecraft:speed]|true|true|true\nfalse|false|false";
+const CAPTURED: &str = include_str!("fixtures/vanilla_holders/java25.txt");
+
+fn captured_rows() -> Vec<&'static str> {
+    CAPTURED
+        .lines()
+        .filter(|line| !line.starts_with("#"))
+        .collect()
+}
 
 const STUBS: &[(&str, &str)] = &[
     (
@@ -34,6 +41,7 @@ public class ResourceKey<T> {
 import java.util.Optional;
 import net.minecraft.resources.ResourceKey;
 public interface Holder<T> {
+  interface Reference<T> extends Holder<T> { ResourceKey<T> key(); }
   String getRegisteredName();
   Optional<ResourceKey<T>> unwrapKey();
   boolean isBound();
@@ -82,8 +90,15 @@ import net.minecraft.world.effect.MobEffects;
 public final class Probe {
   public static String speed() {
     Holder h = MobEffects.SPEED;
+    Holder.Reference raw = (Holder.Reference) h;
     Object key = h.unwrapKey().get();
-    return h.getRegisteredName()+"|"+key+"|"+h.isBound()+"|"+h.is((net.minecraft.resources.ResourceKey) key)+"|"+(h.value()==h.value());
+    return h.getRegisteredName()+"|"+key+"|"+raw.key()+"|"+h.isBound()+"|"+h.is((net.minecraft.resources.ResourceKey) key)+"|"+(h==MobEffects.SPEED)+"|"+(h.value()==h.value());
+  }
+  public static String armor() {
+    Holder h = net.minecraft.world.entity.ai.attributes.Attributes.ARMOR;
+    Holder.Reference raw = (Holder.Reference) h;
+    Object key = h.unwrapKey().get();
+    return h.getRegisteredName()+"|"+key+"|"+raw.key()+"|"+h.isBound()+"|"+h.is((net.minecraft.resources.ResourceKey) key)+"|"+(h==MobEffects.SPEED)+"|"+(h.value()==h.value());
   }
   public static String forgery() {
     Object s = "client/mob-effect/minecraft:speed";
@@ -103,7 +118,14 @@ fn vanilla_holder_facts_match_java25_oracle() {
     let fixture = fixture("vanilla-holders");
     let mut host = fixture.jar.seed_host(StdHost::new());
     let text = fixture.text_on(&mut host, "speed");
-    assert_eq!(text, EXPECTED.lines().next().unwrap());
+    assert_eq!(text, captured_rows()[0]);
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "armor"), captured_rows()[1]);
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",
@@ -116,5 +138,5 @@ fn a_string_spelled_like_the_game_value_is_not_a_holder() {
     let fixture = fixture("vanilla-holders-forgery");
     let mut host = fixture.jar.seed_host(StdHost::new());
     let text = fixture.text_on(&mut host, "forgery");
-    assert_eq!(text, EXPECTED.lines().nth(1).unwrap());
+    assert_eq!(text, captured_rows()[2]);
 }
