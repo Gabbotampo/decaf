@@ -27757,6 +27757,10 @@ impl<H: Host> Runtime<'_, H> {
             });
         let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
         match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getDeclaringClass", "()Ljava/lang/Class;") => {
+                let class = marker.and_then(|m| m.strip_prefix("enum/").and_then(|x| x.rsplit_once('/')).map(|(c, _)| c.to_owned()));
+                Ok(class.map(|c| host_class::class_value(&c)))
+            }
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
                 Ok(recorded.map(|(name, _)| Value::Ref(Some(name))))
             }
