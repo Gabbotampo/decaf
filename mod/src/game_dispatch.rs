@@ -416,6 +416,22 @@ mod tests {
         ))
     }
 
+    fn destroy_speed_dispatch(
+        java: &HorizonJava,
+        actual: f64,
+    ) -> Result<DispatchAnswer, DispatchError> {
+        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
+        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        java.dispatch_game_hook(GameDispatch::new(
+            MethodId("java_destroy_speed"),
+            Phase::Return,
+            Some(GameObject::player(1, "Alex")),
+            &mut args,
+            Some(Value::Float(actual)),
+            &mut host,
+        ))
+    }
+
     #[test]
     fn method_bitset_has_no_false_negative_for_target_spelling() {
         let bits = PlanBits::default();
@@ -480,31 +496,39 @@ mod tests {
             load(
                 "high",
                 "High",
-                "@Mixin(value=MinecraftServer.class, priority=1500) public class High { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"high\"); } }",
+                "@Mixin(value=Player.class, priority=1500) public class High { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(1.0f); } }",
             ),
             load(
                 "low",
                 "Low",
-                "@Mixin(value=MinecraftServer.class, priority=500) public class Low { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"low\"); } }",
-            ),
-            load(
-                "tie1",
-                "Tie1",
-                "@Mixin(MinecraftServer.class) public class Tie1 { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void a(CallbackInfo ci) { System.out.println(\"tie1a\"); } @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void b(CallbackInfo ci) { System.out.println(\"tie1b\"); } }",
-            ),
-            load(
-                "tie2",
-                "Tie2",
-                "@Mixin(MinecraftServer.class) public class Tie2 { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"tie2\"); } }",
+                "@Mixin(value=Player.class, priority=500) public class Low { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(2.0f); } }",
             ),
         ];
         java.refresh_game_hook_plan_bits();
-        stop_dispatch(&java, Phase::Tail).unwrap();
-        let mut state = java.lock();
-        assert_eq!(stdout(&mut state, 0), ["high"]);
-        assert_eq!(stdout(&mut state, 1), ["low"]);
-        assert_eq!(stdout(&mut state, 2), ["tie1a", "tie1b"]);
-        assert_eq!(stdout(&mut state, 3), ["tie2"]);
+        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(1.0)));
+
+        java.lock().jars = vec![
+            load(
+                "first",
+                "First",
+                "@Mixin(Player.class) public class First { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(3.0f); } }",
+            ),
+            load(
+                "second",
+                "Second",
+                "@Mixin(Player.class) public class Second { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(4.0f); } }",
+            ),
+        ];
+        java.refresh_game_hook_plan_bits();
+        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(4.0)));
+
+        java.lock().jars = vec![load(
+            "decl",
+            "Decl",
+            "@Mixin(Player.class) public class Decl { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void a(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(5.0f); } @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void b(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(6.0f); } }",
+        )];
+        java.refresh_game_hook_plan_bits();
+        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(6.0)));
     }
 
     #[test]
@@ -554,6 +578,41 @@ mod tests {
         java.refresh_game_hook_plan_bits();
         let error = stop_dispatch(&java, Phase::Tail).unwrap_err();
         assert!(error.to_string().contains("NumberFormatException"));
+        let mut state = java.lock();
+        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
+        assert_eq!(state.jars[1].row.game_hooks.ran, 0);
+        assert!(stdout(&mut state, 1).is_empty());
+    }
+
+    #[test]
+    fn non_cancellable_cancel_is_a_counted_cancellation_exception() {
+        let java = HorizonJava::default();
+        java.lock().jars = vec![
+            load(
+                "badcancel",
+                "BadCancel",
+                "@Mixin(Player.class) public class BadCancel { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\")) private void r(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(2.0f); } }",
+            ),
+            load(
+                "aftercancel",
+                "AfterCancel",
+                "@Mixin(Player.class) public class AfterCancel { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\")) private void r(BlockState s, CallbackInfoReturnable<Float> ci) { System.out.println(\"after\"); } }",
+            ),
+        ];
+        java.refresh_game_hook_plan_bits();
+        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
+        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        let error = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_destroy_speed"),
+                Phase::Return,
+                Some(GameObject::player(1, "Alex")),
+                &mut args,
+                Some(Value::Float(1.5)),
+                &mut host,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("CancellationException"));
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.failed, 1);
         assert_eq!(state.jars[1].row.game_hooks.ran, 0);
