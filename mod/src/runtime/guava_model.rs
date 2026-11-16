@@ -428,40 +428,6 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let list_field = format!("{marker}|guava#builder-list");
                 match r.name.as_str() {
-                    "add"
-                        if r.descriptor
-                            == "([Ljava/lang/Object;)Lcom/google/common/collect/ImmutableList$Builder;" =>
-                    {
-                        let values =
-                            self.host.array(args.first().ok_or_else(|| {
-                                NativeError::Metadata("missing varargs".into())
-                            })?)?;
-                        let list = match self.fields.get(&list_field).cloned() {
-                            Some(list) => list,
-                            None => {
-                                let list = self.host.empty_mutable_collection("list").ok_or_else(
-                                    || NativeError::Metadata("Guava list host missing".into()),
-                                )?;
-                                self.fields.insert(list_field.clone(), list.clone());
-                                list
-                            }
-                        };
-                        for value in values.iter() {
-                            if *value == Value::Ref(None) {
-                                return Err(thrown("java/lang/NullPointerException", None));
-                            }
-                            self.host.invoke_instance(
-                                &MethodRef {
-                                    owner: "java/util/List".into(),
-                                    name: "add".into(),
-                                    descriptor: "(Ljava/lang/Object;)Z".into(),
-                                },
-                                &list,
-                                std::slice::from_ref(value),
-                            )?;
-                        }
-                        return Ok(Some(receiver.clone()));
-                    }
                     "add" if !args.is_empty() => {
                         let list = match self.fields.get(&list_field).cloned() {
                             Some(list) => list,
