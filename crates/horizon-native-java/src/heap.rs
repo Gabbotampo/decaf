@@ -60,7 +60,7 @@ const COLLECT_SLACK: usize = 1024;
 pub struct JavaHeap {
     /// `receiver|owner#name descriptor` → value, the interpreter's own keys.
     pub(crate) fields: BTreeMap<String, Value>,
-    pub(crate) arrays: BTreeMap<String, Vec<Value>>,
+    pub(crate) arrays: BTreeMap<String, crate::array_data::ArrayData>,
     pub(crate) string_builders: BTreeMap<String, String>,
     /// Enum constants by object marker: declared name and ordinal. A later
     /// call never reruns `<clinit>`, so without these `name()` on a constant a
@@ -359,6 +359,7 @@ impl StdHost {
             }
         }
         push(self.io_paths.get(marker), out);
+        push(self.set_from_map_views.get(marker), out);
         push(self.unmodifiable_collections.get(marker), out);
         push(self.reversed_views.get(marker), out);
         push(self.synchronized_views.get(marker), out);
@@ -382,6 +383,7 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        push(self.ranged_attributes.get(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -389,6 +391,7 @@ impl StdHost {
     fn keyed_table_keys(&self) -> impl Iterator<Item = &str> {
         self.io_paths
             .keys()
+            .chain(self.set_from_map_views.keys())
             .chain(self.unmodifiable_collections.keys())
             .chain(self.reversed_views.keys())
             .chain(self.synchronized_views.keys())
@@ -410,12 +413,14 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.ranged_attributes.keys())
             .map(String::as_str)
     }
 
     /// Drop every per-object row of a collected object (`keep` false).
     fn prune_keyed_tables(&mut self, keep: impl Fn(&str) -> bool) {
         self.io_paths.retain(|key, _| keep(key));
+        self.set_from_map_views.retain(|key, _| keep(key));
         self.unmodifiable_collections.retain(|key, _| keep(key));
         self.reversed_views.retain(|key, _| keep(key));
         self.synchronized_views.retain(|key, _| keep(key));
@@ -440,6 +445,7 @@ impl StdHost {
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
+        self.ranged_attributes.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
     }
 }
@@ -459,6 +465,10 @@ fn collectable(marker: &str) -> bool {
         !class.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
     }) {
         return true;
+    }
+    // A host-created ranged attribute is a per-allocation handle and follows the heap.
+    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
     // (`iterator/empty`) are never collected.
@@ -512,9 +522,11 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.set_from_map_views.len()
         + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
+        + host.ranged_attributes.len()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -656,9 +668,14 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
         .iter()
         .map(|(key, value)| key.len() + value_bytes(value))
         .chain(
-            heap.arrays
-                .iter()
-                .map(|(key, elements)| key.len() + values(elements)),
+            // A `byte[]` takes a byte per element (`array_data.rs`); a reference array its values.
+            heap.arrays.iter().map(|(key, array)| {
+                key.len()
+                    + match array.bytes() {
+                        Some(bytes) => bytes.len(),
+                        None => values(array.references()),
+                    }
+            }),
         )
         .chain(
             heap.string_builders
@@ -669,6 +686,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
             host.mutable_collections
                 .iter()
                 .map(|(key, elements)| key.len() + values(elements)),
+        )
+        .chain(
+            host.set_from_map_views
+                .iter()
+                .map(|(key, source)| key.len() + source.len()),
         )
         .chain(
             host.iterators
@@ -682,6 +704,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                     .len()
                 + values(&state.siblings)
                 + state.args.as_deref().map_or(0, values)
+        }))
+        .chain(host.ranged_attributes.iter().map(|(key, state)| {
+            key.len()
+                + state.description_id.as_ref().map_or(0, String::len)
+                + 4 * std::mem::size_of::<f64>()
         }))
         .sum()
 }
@@ -740,6 +767,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.set_from_map_views.keys().map(String::as_str))
             .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
             .chain(host.enumerations.keys().map(String::as_str))
@@ -896,7 +924,12 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .range(prefix.clone()..)
             .take_while(|(key, _)| key.starts_with(&prefix))
             .map(|(_, value)| value);
-        let arrays = heap.arrays.get(&marker).into_iter().flatten();
+        // A typed array holds no references (`array_data.rs`): nothing to trace.
+        let arrays = heap
+            .arrays
+            .get(&marker)
+            .into_iter()
+            .flat_map(crate::array_data::ArrayData::references);
         let collections = host.mutable_collections.get(&marker).into_iter().flatten();
         let iterators = host
             .iterators
@@ -1117,9 +1150,9 @@ mod tests {
         heap.fields
             .insert(field("demo/Node#4", "next"), Value::Int(4));
         heap.arrays
-            .insert("[Ldemo/Node;#0".into(), vec![Value::Int(1)]);
+            .insert("[Ldemo/Node;#0".into(), vec![Value::Int(1)].into());
         heap.arrays
-            .insert("[Ldemo/Node;#1".into(), vec![Value::Int(2)]);
+            .insert("[Ldemo/Node;#1".into(), vec![Value::Int(2)].into());
         (host, heap)
     }
 
@@ -1479,12 +1512,14 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "set_from_map_views",
             "random_sources",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "ranged_attributes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1528,6 +1563,7 @@ mod tests {
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
+            "next_ranged_attribute",
             "properties",
             "environment",
             "resources",
@@ -1561,12 +1597,16 @@ mod tests {
             "holder_binding",
             "charset_decoders",
             "persistent_initialized_classes",
+            "dfu_codec_nodes",
+            "dfu_codec_callback_roots",
+            "dfu_codec_refusals",
             "unknown_host_calls",
             "strict_unknown_host_calls",
             "next_lazy_optional",
             "next_fabric_event",
             "next_iterator",
             "next_neutral_collection",
+            "next_set_from_map",
             "log4j_levels",
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.
             "jar_registries",
