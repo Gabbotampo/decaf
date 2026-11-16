@@ -334,7 +334,7 @@ impl HorizonJava {
         });
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let state = ACTIVE_FRAMES
-                .with(|frames| frames.borrow().last().expect("active frame").state.get());
+                .with(|frames| frames.borrow().last().expect("active frame").0.state.get());
             // SAFETY: the frame stays on this thread's stack for the closure.
             unsafe { dispatch_state(&mut *state, dispatch) }
         }));
