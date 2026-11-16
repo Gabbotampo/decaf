@@ -13043,7 +13043,6 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
         "net/minecraft/sounds/SoundSource" => &["MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS", "AMBIENT", "VOICE", "UI"],
-        "net/minecraft/sounds/SoundSource" => &["MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS", "AMBIENT", "VOICE", "UI"],
         "net/minecraft/world/entity/ai/attributes/AttributeModifier$Operation" => &["ADD_VALUE", "ADD_MULTIPLIED_BASE", "ADD_MULTIPLIED_TOTAL"],
         "net/minecraft/world/entity/HumanoidArm" => &["LEFT", "RIGHT"],
         "net/minecraft/world/entity/EquipmentSlot" => {
@@ -27738,7 +27737,8 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         if game_constant && r.owner == "net/minecraft/sounds/SoundSource" && r.name == "getName" && r.descriptor == "()Ljava/lang/String;" {
-            let name = receiver.and_then(expect_ref).and_then(|m| m.rsplit('/').next()).map(|n| match n { \MASTER\ => \master\, \MUSIC\ => \music\, \RECORDS\ => ecord\, \BLOCKS\ => lock\, \PLAYERS\ => \player\, _ => n.to_ascii_lowercase().as_str() }.to_owned());
+            let name = receiver.and_then(expect_ref).and_then(|m| m.rsplit("/").next()).map(|n| match n { "MASTER" => "master", "MUSIC" => "music", "RECORDS" => "record", "BLOCKS" => "block", "PLAYERS" => "player", _ => n.to_ascii_lowercase() }.to_owned());
+ecord\, \BLOCKS\ => lock\, \PLAYERS\ => \player\, _ => n.to_ascii_lowercase().as_str() }.to_owned());
             return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if game_constant && matches!(r.name.as_str(), "name" | "toString") {
