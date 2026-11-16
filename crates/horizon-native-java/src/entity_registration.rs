@@ -91,6 +91,10 @@ fn arg_string(v: &Value) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| expect_ref(v).cloned())
 }
+pub(crate) fn enum_values(owner: &str) -> Option<Vec<Value>> {
+    (owner == "net/minecraft/world/entity/MobCategory").then(|| ["MONSTER", "CREATURE", "AMBIENT", "AXOLOTLS", "UNDERGROUND_WATER_CREATURE", "WATER_CREATURE", "WATER_AMBIENT", "MISC"].into_iter().filter_map(category_constant).collect())
+}
+
 pub(crate) fn category_constant(name: &str) -> Option<Value> {
     let names = [
         "MONSTER",
