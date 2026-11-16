@@ -45,6 +45,7 @@ mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
+mod dfu_codec;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -238,6 +239,7 @@ mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_registries;
+mod vanilla_values;
 pub mod verdict;
 mod watch_service;
 pub mod weaver;
@@ -418,6 +420,22 @@ pub enum AnnotationValue {
 /// An empty `at` is the bounded `@Overwrite` shape: the callback takes the
 /// target's whole body, so neither the caller's arguments nor the target's
 /// body are visible to it.  [`MixinInjectionPlan::overwrite`] builds it.
+/// The selector values as declared on one Mixin annotation.  The probe keeps
+/// these raw values separate from executable plans so JSON can report the
+/// annotation without reverse-mapping runtime distances.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixinPlanSelectors {
+    pub target: MethodRef,
+    pub callback: MethodRef,
+    pub at: String,
+    pub ordinal: Option<i32>,
+    pub opcode: Option<u8>,
+    pub shift: Option<String>,
+    pub by: Option<i32>,
+    pub slice_from: Option<String>,
+    pub slice_to: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixinInjectionPlan {
     pub target: MethodRef,
@@ -2348,6 +2366,20 @@ pub trait Host {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
 
+    /// Reserve one DFU construction node and any callback roots it introduces
+    /// against this jar's lifetime budget.
+    fn reserve_dfu_codec(
+        &mut self,
+        _nodes: usize,
+        _callback_roots: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record a named DFU refusal; hosts that do not keep diagnostics may
+    /// leave it as a no-op while the call remains counted by the runtime.
+    fn dfu_codec_refused(&mut self, _reason: String) {}
+
     fn random_new(&mut self, _class: &str) -> Option<Value> {
         None
     }
@@ -3365,6 +3397,8 @@ pub struct StdHost {
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
     cached_collections: BTreeMap<(String, String), String>,
+    /// Primitive state for vanilla RangedAttribute handles.
+    ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -3442,6 +3476,10 @@ pub struct StdHost {
     /// Jar-owned static fields retained across entrypoint/event invocations.
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
+    /// Per-jar DFU construction budget, retained across callbacks.
+    dfu_codec_nodes: usize,
+    dfu_codec_callback_roots: BTreeSet<String>,
+    dfu_codec_refusals: Vec<String>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
     /// The jar's objects retained across invocations (`heap.rs`): instance
     /// fields, arrays, builders and enum identity of what its statics and
@@ -3477,6 +3515,7 @@ pub struct StdHost {
     /// view's contents (#243's review).
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
+    next_ranged_attribute: usize,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -3584,6 +3623,7 @@ impl StdHost {
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
+            ranged_attributes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -3616,6 +3656,9 @@ impl StdHost {
             throwable_causes: BTreeMap::new(),
             throwable_suppressed: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
+            dfu_codec_nodes: 0,
+            dfu_codec_callback_roots: BTreeSet::new(),
+            dfu_codec_refusals: Vec::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             log4j_levels: crate::host_log4j_level::CustomLevels::new(),
@@ -3631,6 +3674,7 @@ impl StdHost {
             next_neutral_collection: 0,
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
+            next_ranged_attribute: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
@@ -3659,6 +3703,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Named DFU construction refusals for the current jar.
+    pub fn dfu_codec_refusals(&self) -> &[String] {
+        &self.dfu_codec_refusals
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -5397,6 +5446,46 @@ impl Host for StdHost {
         self.console_out.push_str(text);
     }
 
+    fn reserve_dfu_codec(
+        &mut self,
+        nodes: usize,
+        callback_roots: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        const MAX_NODES: usize = 256;
+        const MAX_CALLBACK_ROOTS: usize = 64;
+        let next_nodes = self.dfu_codec_nodes.saturating_add(nodes);
+        if next_nodes > MAX_NODES {
+            return Err(format!(
+                "DFU codec node budget exceeded: current {}, requested {}, maximum {}",
+                self.dfu_codec_nodes, nodes, MAX_NODES
+            ));
+        }
+        let additional_roots = callback_roots
+            .iter()
+            .filter(|root| !self.dfu_codec_callback_roots.contains(*root))
+            .count();
+        let next_roots = self
+            .dfu_codec_callback_roots
+            .len()
+            .saturating_add(additional_roots);
+        if next_roots > MAX_CALLBACK_ROOTS {
+            return Err(format!(
+                "DFU codec callback-root budget exceeded: current {}, requested {}, maximum {}",
+                self.dfu_codec_callback_roots.len(),
+                additional_roots,
+                MAX_CALLBACK_ROOTS
+            ));
+        }
+        self.dfu_codec_nodes = next_nodes;
+        self.dfu_codec_callback_roots
+            .extend(callback_roots.iter().cloned());
+        Ok(())
+    }
+
+    fn dfu_codec_refused(&mut self, reason: String) {
+        self.dfu_codec_refusals.push(reason);
+    }
+
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
@@ -6030,6 +6119,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = mod_origin::static_field(r) {
             return Ok(value);
         }
@@ -6049,6 +6141,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = dfu_codec::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
@@ -6278,7 +6373,7 @@ impl Host for StdHost {
     }
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
-        StdHost::random_new(self, class)
+        vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
@@ -6286,6 +6381,9 @@ impl Host for StdHost {
             self.random_bit_scope = None;
         }
         self.record(r, None, args);
+        if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
         if let Some(result) = self.random_static(r, args) {
             return result;
         }
@@ -7646,6 +7744,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
+            return result;
+        }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
@@ -16436,6 +16537,115 @@ impl NativeJar {
     /// accepted forms stays out of this executable set and is reported by
     /// [`Self::unresolved_invoke_plans`].  `FIELD`, `NEW` and `JUMP` selectors
     /// remain on the JVM fallback instead of being approximated.
+    /// Raw selector values for every injection, redirect and modify annotation.
+    pub fn mixin_plan_selectors(&self) -> Vec<MixinPlanSelectors> {
+        const MIXIN: &str = "Lorg/spongepowered/asm/mixin/Mixin;";
+        const KINDS: &[&str] = &[
+            "Lorg/spongepowered/asm/mixin/injection/Inject;",
+            "Lorg/spongepowered/asm/mixin/injection/Redirect;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyArg;",
+            "Lorg/spongepowered/asm/mixin/injection/ModifyVariable;",
+        ];
+        let mut rows = Vec::new();
+        for class in self.classes.values() {
+            let Some(mixin) = class.annotations.iter().find(|a| a.descriptor == MIXIN) else {
+                continue;
+            };
+            let targets = mixin_target_owners(mixin);
+            for method in &class.methods {
+                let callback = MethodRef {
+                    owner: class.name.clone(),
+                    name: method.name.clone(),
+                    descriptor: method.descriptor.clone(),
+                };
+                for annotation in method
+                    .annotations
+                    .iter()
+                    .filter(|a| KINDS.contains(&a.descriptor.as_str()))
+                {
+                    let specs = annotation
+                        .values
+                        .get("method")
+                        .map(annotation_strings)
+                        .unwrap_or_default();
+                    let anchors = annotation
+                        .values
+                        .get("at")
+                        .map(annotation_anchor_selectors)
+                        .unwrap_or_default();
+                    let annotation_slice = annotation
+                        .values
+                        .get("slice")
+                        .and_then(|value| annotation_slice_entries(value).into_iter().next());
+                    for owner in &targets {
+                        for spec in &specs {
+                            let Some((name, descriptor)) = split_injection_method(spec) else {
+                                continue;
+                            };
+                            for anchor in &anchors {
+                                let slice_from = anchor.slice_from.clone().or_else(|| {
+                                    annotation_slice.as_ref().and_then(|s| s.0.clone())
+                                });
+                                let slice_to = anchor.slice_to.clone().or_else(|| {
+                                    annotation_slice.as_ref().and_then(|s| s.1.clone())
+                                });
+                                rows.push(MixinPlanSelectors {
+                                    target: MethodRef {
+                                        owner: owner.clone(),
+                                        name: name.to_owned(),
+                                        descriptor: descriptor.to_owned(),
+                                    },
+                                    callback: callback.clone(),
+                                    at: anchor.anchor.clone(),
+                                    ordinal: anchor.ordinal,
+                                    opcode: anchor.opcode,
+                                    shift: anchor
+                                        .shift
+                                        .clone()
+                                        .map(|value| {
+                                            value.rsplit('.').next().unwrap_or(&value).to_owned()
+                                        })
+                                        .filter(|value| {
+                                            matches!(value.as_str(), "BEFORE" | "AFTER" | "BY")
+                                        }),
+                                    by: anchor.by,
+                                    slice_from,
+                                    slice_to,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            (
+                &a.target.owner,
+                &a.target.name,
+                &a.target.descriptor,
+                &a.callback.owner,
+                &a.callback.name,
+                &a.callback.descriptor,
+                &a.at,
+                a.ordinal,
+                a.opcode,
+            )
+                .cmp(&(
+                    &b.target.owner,
+                    &b.target.name,
+                    &b.target.descriptor,
+                    &b.callback.owner,
+                    &b.callback.name,
+                    &b.callback.descriptor,
+                    &b.at,
+                    b.ordinal,
+                    b.opcode,
+                ))
+        });
+        rows.dedup();
+        rows
+    }
+
     pub fn mixin_injection_plans(&self) -> Vec<MixinInjectionPlan> {
         self.mixin_plan_scan().0
     }
@@ -25142,6 +25352,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(self.new_array_value(&format!("[L{};", r.owner), values));
         }
+        if let Some(values) = crate::vanilla_values::enum_values(r) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         let constants = game_enum_constants(&r.owner)?;
         if r.descriptor != format!("()[L{};", r.owner) {
             return None;
@@ -29361,6 +29574,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) =
+                        dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
