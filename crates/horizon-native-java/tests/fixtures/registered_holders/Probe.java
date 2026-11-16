@@ -15,6 +15,7 @@ import net.minecraft.world.entity.ai.attributes.Attribute;
 import net.minecraft.world.entity.ai.attributes.RangedAttribute;
 
 public final class Probe {
+    static final class Named { @Override public String toString() { return "probe:named"; } }
     static final class Effect extends MobEffect { Effect() { super(MobEffectCategory.BENEFICIAL, 1); } }
     static String facts(String label, Holder<?> holder, Identifier id, Object expected) {
         Object key = holder.unwrapKey().orElse(null);
@@ -40,5 +41,7 @@ public final class Probe {
     public static String wrapped() { Identifier id = Identifier.fromNamespaceAndPath("probe", "attribute"); Registry<Attribute> registry = new MappedRegistry<>(Registries.ATTRIBUTE, Lifecycle.stable()); Attribute value = Registry.register(registry, id, new RangedAttribute("attribute", 1.0, 0.0, 2.0)); registry.freeze(); return facts("wrapped", registry.wrapAsHolder(value), id, value); }
     public static String unbound() { ResourceKey<Attribute> key = ResourceKey.create(Registries.ATTRIBUTE, Identifier.fromNamespaceAndPath("probe", "unbound")); return referenceFacts("unbound", Holder.Reference.createStandAlone(null, key)); }
     public static String intrusive() { return referenceFacts("intrusive", Holder.Reference.createIntrusive(null, "intrusive")); }
-    public static void main(String[] args) { SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap(); System.out.println(effect()); System.out.println(attribute()); System.out.println(wrapped()); System.out.println(unbound()); System.out.println(intrusive()); }
+    public static String intrusiveRegistryOwner() { return referenceFacts("intrusiveRegistryOwner", Holder.Reference.createIntrusive((net.minecraft.core.HolderOwner) BuiltInRegistries.ATTRIBUTE, "intrusive")); }
+    public static String intrusiveJarValue() { return "intrusiveJarValue|toString=" + text(Holder.Reference.createIntrusive(null, new Named())); }
+    public static void main(String[] args) { SharedConstants.tryDetectVersion(); net.minecraft.server.Bootstrap.bootStrap(); System.out.println(effect()); System.out.println(attribute()); System.out.println(wrapped()); System.out.println(unbound()); System.out.println(intrusive()); System.out.println(intrusiveRegistryOwner()); System.out.println(intrusiveJarValue()); }
 }

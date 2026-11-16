@@ -79,7 +79,7 @@ public interface Holder<T> {
 import java.util.Optional;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
-public interface Registry<T> {
+public interface Registry<T> extends HolderOwner<T> {
   static <T> T register(Registry<? super T> registry, Identifier id, T value) { return value; }
   static <T> Holder.Reference<T> registerForHolder(Registry<? super T> registry, Identifier id, T value) { return null; }
   Holder<T> wrapAsHolder(T value);
@@ -187,8 +187,15 @@ public final class Probe {
     ResourceKey<Attribute> key = ResourceKey.create(Registries.ATTRIBUTE, Identifier.fromNamespaceAndPath("probe", "unbound"));
     return referenceFacts("unbound", Holder.Reference.createStandAlone(null, key));
   }
+  static final class Named { public String toString() { return "probe:named"; } }
   public static String intrusive() {
     return referenceFacts("intrusive", Holder.Reference.createIntrusive(null, "intrusive"));
+  }
+  public static String intrusiveRegistryOwner() {
+    return referenceFacts("intrusiveRegistryOwner", Holder.Reference.createIntrusive((net.minecraft.core.HolderOwner) BuiltInRegistries.ATTRIBUTE, "intrusive"));
+  }
+  public static String intrusiveJarValue() {
+    return "intrusiveJarValue|toString=" + text(Holder.Reference.createIntrusive(null, new Named()));
   }
 }
 "#,
@@ -214,6 +221,14 @@ fn observed_registration_holders_match_java25_oracle() {
     assert_eq!(fixture.text_on(&mut host, "wrapped"), captured_rows()[2]);
     assert_eq!(fixture.text_on(&mut host, "unbound"), captured_rows()[3]);
     assert_eq!(fixture.text_on(&mut host, "intrusive"), captured_rows()[4]);
+    assert_eq!(
+        fixture.text_on(&mut host, "intrusiveRegistryOwner"),
+        captured_rows()[5]
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "intrusiveJarValue"),
+        captured_rows()[6]
+    );
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",

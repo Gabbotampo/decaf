@@ -285,11 +285,31 @@ fn identity_equals(
     })
 }
 
-/// A `Registry`: `toString` names its lifecycle (`Registry[ResourceKey[…]
-/// (Stable)]`), which the host does not hold, and `hashCode` is an identity
-/// hash: both counted.
+/// A built-in `MappedRegistry`'s 26.3 `toString`: its root key and stable
+/// lifecycle are exact for the registry handles this host models. Unknown
+/// registry implementations remain counted.
+fn registry_to_string(
+    handle: &HostRef,
+    nested: &mut dyn Nested,
+) -> Result<Option<String>, NativeError> {
+    let Some(implementation) = handle.key().chars().next() else {
+        return Ok(None);
+    };
+    if !matches!(implementation, MAPPED | DEFAULTED_MAPPED) {
+        return Ok(None);
+    }
+    let Some(id) = handle.key().get(1..) else {
+        return Ok(None);
+    };
+    let key = crate::runtime::host_ids::registry_key_of(id);
+    let Some(key) = nested.text(&key)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!("Registry[{key} (Stable)]")))
+}
+
 pub(crate) const REGISTRY_METHODS: Methods = Methods {
-    to_string: |_, _| Ok(None),
+    to_string: registry_to_string,
     hash_code: |_, _| Ok(None),
     equals: identity_equals,
     instance_of: |handle, wanted, hierarchy| {
