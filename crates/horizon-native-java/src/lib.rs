@@ -7698,6 +7698,11 @@ impl Host for StdHost {
             && !matches!(receiver, Value::Host(handle) if jar_object::is_object_handle(handle))
         {
             let other = args.first().unwrap_or(&Value::Ref(None));
+            if matches!(other, Value::Ref(None))
+                && jdk_stream::null_compare_message(receiver).is_none()
+            {
+                return self.unknown_operand_call(r);
+            }
             return jdk_stream::natural_compare(receiver, other).map(Value::Int);
         }
 
