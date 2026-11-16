@@ -614,10 +614,15 @@ def main(argv: list[str] | None = None) -> int:
                 if mode == "alone" and via is not None:
                     rows.append({"jar": jar.name, "mode": "alone", "verdict": "skipped", "reason": reason})
                     continue
-                todo.append((jar, kind, jar_role, list(closure.jars) if mode == "closure" else [], missing if mode == "closure" else [], requirements if mode == "closure" else (), mode, closure_error if mode == "closure" else "", via))
+                exec_jar = next((d for d in closure.jars if d.name == via), jar) if via else jar
+                exec_deps = list(closure.jars) if mode == "closure" else []
+                if via and jar not in exec_deps:
+                    exec_deps.append(jar)
+                baseline_deps = [d for d in exec_deps if d != jar]
+                todo.append((jar, kind, jar_role, exec_deps, missing if mode == "closure" else [], requirements if mode == "closure" else (), mode, closure_error if mode == "closure" else "", via, exec_jar, baseline_deps))
 
         def run(item):
-            jar, kind, jar_role, deps, missing, requirements, mode, closure_error, via = item
+            jar, kind, jar_role, deps, missing, requirements, mode, closure_error, via, exec_jar, baseline_deps = item
             if closure_error:
                 result = {"status": "refused", "stage": "dependency", "error": closure_error}
             elif missing:
@@ -625,10 +630,17 @@ def main(argv: list[str] | None = None) -> int:
                           "error": missing_reason(missing, requirements)}
             else:
                 result = probe_one(
-                    probe, jar, kind, deps, args.game_version,
+                    probe, exec_jar, kind, deps, args.game_version,
                     game_block_classes,
                 )
             row = result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
+            if via and result.get("status") == "ok":
+                baseline = probe_one(probe, exec_jar, kind, baseline_deps, args.game_version, game_block_classes)
+                row["via"] = via
+                row["baseline_unknown"] = baseline.get("unknown_host_call_count")
+                row["unknown_delta"] = (result.get("unknown_host_call_count", 0) - baseline.get("unknown_host_call_count", 0))
+            elif via:
+                row["via"] = via
             if via:
                 row["via"] = via
             return row
