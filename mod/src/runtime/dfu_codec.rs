@@ -28,6 +28,8 @@ const OPTIONAL: &str = "dfu-optional";
 const XMAP: &str = "dfu-xmap";
 const MAP_XMAP: &str = "dfu-map-xmap";
 const GETTER: &str = "dfu-builder-getter";
+const UNIT: &str = "dfu-unit";
+const UNIT_CODEC: &str = "dfu-unit-codec";
 
 const CODEC_TYPES: &[&str] = &[
     CODEC,
@@ -80,7 +82,7 @@ fn map_codec(value: &Value) -> bool {
     let Some(tag) = tag(value) else {
         return false;
     };
-    if matches!(tag.as_str(), FIELD | OPTIONAL | MAP_XMAP | GETTER) {
+    if matches!(tag.as_str(), FIELD | OPTIONAL | MAP_XMAP | GETTER | UNIT) {
         return tag != GETTER;
     }
     constant_info(value).is_some_and(|(declared, name)| declared == MAP_CODEC || name == "EMPTY")
@@ -90,7 +92,7 @@ fn codec_receiver(value: &Value) -> bool {
     let Some(tag) = tag(value) else {
         return false;
     };
-    matches!(tag.as_str(), CONSTANT | XMAP) && !map_codec(value)
+    matches!(tag.as_str(), CONSTANT | XMAP | UNIT_CODEC) && !map_codec(value)
 }
 
 fn map_receiver(value: &Value) -> bool {
@@ -235,6 +237,12 @@ fn text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String>, Nat
             }
             Ok(Some(text))
         }
+        UNIT | UNIT_CODEC => {
+            let Some(value) = values.get(2) else {
+                return Ok(None);
+            };
+            Ok(nested.text(value)?.map(|text| format!("Unit[{text}]")))
+        }
         XMAP | MAP_XMAP => {
             let Some(inner) = values.get(2) else {
                 return Ok(None);
@@ -269,7 +277,7 @@ pub(crate) fn dfu_codec_types(key: &str) -> &'static [&'static str] {
         .split(',')
         .nth(1)
         .and_then(|part| part.strip_prefix('r'));
-    if matches!(tag, FIELD | OPTIONAL | MAP_XMAP)
+    if matches!(tag, FIELD | OPTIONAL | MAP_XMAP | UNIT)
         || (tag == CONSTANT && declared == Some(MAP_CODEC))
     {
         MAP_TYPES
@@ -359,6 +367,10 @@ fn optional_parts(descriptor: &str, args: &[Value]) -> Option<(Value, Value)> {
     }
 }
 
+fn receiver_held_value(value: &Value) -> Option<Value> {
+    held_values(value)?.get(2).cloned()
+}
+
 pub(crate) fn invoke(
     host: &mut dyn Host,
     r: &MethodRef,
@@ -366,6 +378,12 @@ pub(crate) fn invoke(
     args: &[Value],
 ) -> Option<Value> {
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        (MAP_CODEC, "unit", "(Ljava/lang/Object;)Lcom/mojang/serialization/MapCodec;")
+        | (
+            MAP_CODEC,
+            "unit",
+            "(Ljava/util/function/Supplier;)Lcom/mojang/serialization/MapCodec;",
+        ) => build(host, r, UNIT, vec![args.first().cloned()?]),
         (
             CODEC | PRIMITIVE,
             "fieldOf",
@@ -420,6 +438,11 @@ pub(crate) fn invoke(
             let inner = receiver.filter(|value| map_receiver(value))?.clone();
             let getter = args.first().filter(|value| is_callback(value))?.clone();
             build(host, r, GETTER, vec![inner, getter])
+        }
+        (MAP_CODEC, "codec", "()Lcom/mojang/serialization/Codec;") => {
+            let receiver = receiver.filter(|value| map_receiver(value))?;
+            (tag(receiver).as_deref() == Some(UNIT))
+                .then(|| build(host, r, UNIT_CODEC, vec![receiver_held_value(receiver)?]))?
         }
         (
             CODEC | PRIMITIVE | MAP_CODEC,

@@ -65,10 +65,9 @@ fn thread_local_values_match_java_25() {
         host.unknown_host_calls()
     );
 
-    // Java 25 oracle: subclassOracle=custom3. The jar-owned subclass is a
-    // JarObject, so its virtual ThreadLocal#get remains COUNTED rather than
-    // being answered with a neutral value.
-    let _ = fixture
+    // Java 25 oracle: subclassOracle=custom3. The jar-owned subclass's
+    // virtual initialValue override runs exactly once for its first get.
+    let subclass = fixture
         .jar
         .invoke_method_with_args(
             "demo/Probe",
@@ -78,12 +77,17 @@ fn thread_local_values_match_java_25() {
             &[],
             &mut host,
         )
-        .expect("subclass call should complete while remaining counted");
+        .expect("subclass call should complete");
+    assert!(
+        matches!(subclass, horizon_native_java::Value::Ref(Some(ref text)) if text == "custom3"),
+        "subclass={subclass:?} unknown={:?}",
+        host.unknown_host_calls()
+    );
     assert!(
         host.unknown_host_calls()
             .iter()
-            .any(|(call, _)| call.contains("java/lang/ThreadLocal#get")),
-        "subclass get must stay counted: {:?}",
+            .all(|(call, _)| !call.contains("java/lang/ThreadLocal#get")),
+        "subclass get must not be counted: {:?}",
         host.unknown_host_calls()
     );
 }

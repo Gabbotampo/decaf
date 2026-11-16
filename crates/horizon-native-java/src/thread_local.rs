@@ -33,6 +33,17 @@ fn parts(value: &Value) -> Option<(String, Value)> {
     Some((format!("thread-local|{}", handle.key()), supplier.clone()))
 }
 
+fn jar_parts<H: crate::Host>(runtime: &Runtime<'_, H>, value: &Value) -> Option<(String, String)> {
+    let class = crate::jar_object::object_class(value)?;
+    runtime.jar_extends(class, THREAD_LOCAL).then(|| {
+        let key = match value {
+            Value::Host(handle) => handle.key().to_owned(),
+            _ => String::new(),
+        };
+        (format!("thread-local|{key}"), class.to_owned())
+    })
+}
+
 fn null_supplier() -> NativeError {
     NativeError::UncaughtException {
         class: "java/lang/NullPointerException".into(),
@@ -66,10 +77,56 @@ pub(crate) fn call<H: crate::Host>(
     }
 
     let receiver = receiver?;
-    let (state_key, supplier) = parts(receiver)?;
+    if let Some((state_key, class)) = jar_parts(runtime, receiver) {
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("get", "()Ljava/lang/Object;") => {
+                if let Some(value) = runtime.fields.get(&state_key).cloned() {
+                    return Some(Ok(value));
+                }
+                let initial = MethodRef {
+                    owner: class.clone(),
+                    name: "initialValue".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                };
+                let owner = runtime.jar_method_owner(&class, &initial.name, &initial.descriptor);
+                let value = if let Some(owner) = owner {
+                    match runtime.invoke(
+                        &owner,
+                        "initialValue",
+                        "()Ljava/lang/Object;",
+                        Some(receiver.clone()),
+                        &[],
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return Some(Err(error)),
+                    }
+                } else {
+                    Value::Ref(None)
+                };
+                runtime.fields.insert(state_key, value.clone());
+                return Some(Ok(value));
+            }
+            ("set", "(Ljava/lang/Object;)V") => {
+                let value = args.first()?.clone();
+                runtime.fields.insert(state_key, value);
+                return Some(Ok(Value::Void));
+            }
+            ("remove", "()V") => {
+                runtime.fields.remove(&state_key);
+                return Some(Ok(Value::Void));
+            }
+            _ => {
+                let _ = class;
+            }
+        }
+    }
     if r.owner != THREAD_LOCAL {
         return None;
     }
+    if r.owner != THREAD_LOCAL {
+        return None;
+    }
+    let (state_key, supplier) = parts(receiver)?;
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("get", "()Ljava/lang/Object;") => {
             if let Some(value) = runtime.fields.get(&state_key).cloned() {

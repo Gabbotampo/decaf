@@ -5,6 +5,8 @@ import com.mojang.datafixers.util.Pair;
 import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.Lifecycle;
+import com.mojang.serialization.MapCodec;
+import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.codec.ByteBufCodecs;
 import java.util.*;
 
@@ -184,9 +186,46 @@ public final class HostCodecs {
     return Integer.toString(calls);
   }
 
+  /** MapCodec.unit is fresh per call, while its structural text is deterministic. */
+  public static String mapUnitIdentity() {
+    MapCodec<String> a = MapCodec.unit("alpha");
+    MapCodec<String> b = MapCodec.unit("alpha");
+    return Boolean.toString(a == b);
+  }
+
+  public static String mapUnitText() {
+    MapCodec<String> a = MapCodec.unit("alpha");
+    return a + "|" + a.codec();
+  }
+
+  public static String mapUnitCodecIdentity() {
+    MapCodec<String> a = MapCodec.unit("alpha");
+    Object first = a.codec();
+    Object second = a.codec();
+    return Boolean.toString(first == second);
+  }
+
+  /** StreamCodec.unit retains the value and enforces it on encode. */
+  public static String streamUnitIdentity() {
+    StreamCodec<Object, String> a = StreamCodec.unit("alpha");
+    StreamCodec<Object, String> b = StreamCodec.unit("alpha");
+    return Boolean.toString(a == b);
+  }
+
+  public static String streamUnitRoundTrip() {
+    StreamCodec<Object, String> a = StreamCodec.unit("alpha");
+    String decoded = a.decode(null);
+    boolean accepted;
+    try { a.encode(null, "alpha"); accepted = true; } catch (Throwable x) { accepted = false; }
+    String rejected;
+    try { a.encode(null, "beta"); rejected = "none"; }
+    catch (Throwable x) { rejected = x.getClass().getName() + "|" + x.getMessage(); }
+    return decoded + "|" + accepted + "|" + rejected;
+  }
+
   /** A network StreamCodec is not a DFU Codec and must be refused before dispatch. */
   public static String forgedDfuReceiver() {
-    Object forged = ByteBufCodecs.INT;
+    Object forged = StreamCodec.unit(1);
     if (!(forged instanceof Codec)) return "true";
     try {
       ((Codec<Object>) forged).xmap(x -> x, x -> x);
@@ -204,8 +243,8 @@ public final class HostCodecs {
   }
   /** A real game StreamCodec constant is rejected by every DFU receiver family. */
   public static String forgedDfuReceivers() {
-    Object stream = ByteBufCodecs.INT;
-    Object game = ByteBufCodecs.VAR_INT;
+    Object stream = StreamCodec.unit(1);
+    Object game = StreamCodec.unit(2);
     return "" + rejectedCodec(stream) + rejectedCodec(game) + rejectedOptional(stream) + rejectedOptional(game)
         + rejectedXmap(stream) + rejectedXmap(game) + rejectedGetter(stream) + rejectedGetter(game);
   }

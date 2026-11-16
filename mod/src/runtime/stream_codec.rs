@@ -43,6 +43,12 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Value> {
         if r.owner == STREAM_CODEC && r.name == "ofMember" {
             return Some(codec(&format!("{STREAM_CODEC_PREFIX}2"), args));
         }
+        if r.owner == STREAM_CODEC
+            && r.name == "unit"
+            && r.descriptor == "(Ljava/lang/Object;)Lnet/minecraft/network/codec/StreamCodec;"
+        {
+            return Some(codec(&format!("{STREAM_CODEC_PREFIX}3"), args));
+        }
         if r.owner == "net/minecraft/network/protocol/common/custom/CustomPacketPayload"
             && r.name == "codec"
         {
@@ -83,11 +89,50 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if !is_stream_codec(receiver) {
+        return None;
+    }
+    if class_of_value(receiver).as_deref() == Some("net/minecraft/network/codec/StreamCodec$3") {
+        let held = match receiver {
+            Value::Host(handle) => handle.held(),
+            _ => &[],
+        };
+        let instance = held.get(2).cloned();
+        match r.name.as_str() {
+            "decode" if r.descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;" => {
+                return instance.map(Ok);
+            }
+            "encode" if r.descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)V" => {
+                let expected = instance?;
+                let actual = args.get(1)?.clone();
+                if actual == expected {
+                    return Some(Ok(Value::Void));
+                }
+                let text = |value: &Value| match value {
+                    Value::Ref(Some(text)) => text.clone(),
+                    Value::Int(value) => value.to_string(),
+                    Value::Long(value) => value.to_string(),
+                    Value::Float(value) => value.to_string(),
+                    Value::Void => "null".to_owned(),
+                    other => format!("{other:?}"),
+                };
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalStateException".into(),
+                    message: Some(format!(
+                        "Can't encode '{}', expected '{}'",
+                        text(&actual),
+                        text(&expected)
+                    )),
+                    frame: None,
+                }));
+            }
+            _ => {}
+        }
+    }
     if r.owner != STREAM_CODEC
         || r.name != "map"
         || r.descriptor
             != "(Ljava/util/function/Function;Ljava/util/function/Function;)Lnet/minecraft/network/codec/StreamCodec;"
-        || !is_stream_codec(receiver)
         || args.len() != 2
     {
         return None;
@@ -96,6 +141,14 @@ pub(crate) fn instance_call(
     values.push(receiver.clone());
     values.extend_from_slice(args);
     Some(Ok(codec(&format!("{STREAM_CODEC_PREFIX}4"), &values)))
+}
+
+/// The implementation class carried by a modeled network codec handle.
+fn class_of_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Host(handle) => Some(class_of_key(handle.key()).to_owned()),
+        _ => None,
+    }
 }
 
 /// Whether a value is a modeled network codec handle.
