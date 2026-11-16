@@ -663,23 +663,17 @@ mod tests {
     use crate::runtime::Host;
 
     #[test]
-    fn random_bit_conversion_scope_is_one_shot() {
+    fn random_bit_conversion_exact_non_nan_and_counted_nan() {
         let mut host = StdHost::new();
-        let source = host.random_seeded(LEGACY, 123).unwrap();
-        let next_double = MethodRef {
-            owner: RANDOM_SOURCE.into(),
-            name: "nextDouble".into(),
-            descriptor: "()D".into(),
-        };
         let raw = MethodRef {
             owner: "java/lang/Double".into(),
             name: "doubleToRawLongBits".into(),
             descriptor: "(D)J".into(),
         };
-        let value = host.invoke_instance(&next_double, &source, &[]).unwrap();
-        let exact = host.invoke(&raw, &[value]).unwrap();
-        assert!(matches!(exact, Value::Long(_)));
-        let counted = host.invoke(&raw, &[Value::Float(1.25)]).unwrap();
+        let exact = host.invoke(&raw, &[Value::Float(1.25)]).unwrap();
+        assert_eq!(exact, Value::Long(0x3ff4_0000_0000_0000));
+        assert!(host.unknown_host_calls().is_empty());
+        let counted = host.invoke(&raw, &[Value::Float(f64::NAN)]).unwrap();
         assert!(matches!(counted, Value::Long(0)));
         assert_eq!(
             host.unknown_host_calls(),
