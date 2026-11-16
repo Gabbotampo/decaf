@@ -1485,6 +1485,7 @@ mod tests {
     #[test]
     fn render_objects_follow_the_collector() {
         let (mut host, mut heap) = graph("demo/Render#1");
+        let mut diag = StdHost::new();
         let stack = crate::render_math::new_value("", "com/mojang/blaze3d/vertex/PoseStack#10");
         crate::render_math::construct(
             &mut host.render_objects,
@@ -1493,6 +1494,7 @@ mod tests {
             &[],
         );
         let last = crate::render_math::call(
+            &mut diag,
             &mut host.render_objects,
             &crate::MethodRef {
                 owner: "com/mojang/blaze3d/vertex/PoseStack".into(),
@@ -1505,6 +1507,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let matrix = crate::render_math::call(
+            &mut diag,
             &mut host.render_objects,
             &crate::MethodRef {
                 owner: "com/mojang/blaze3d/vertex/PoseStack$Pose".into(),

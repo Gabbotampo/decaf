@@ -7654,7 +7654,10 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
-        if let Some(result) = render_math::call(&mut self.render_objects, r, receiver, args) {
+        let mut render_objects = std::mem::take(&mut self.render_objects);
+        let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
+        self.render_objects = render_objects;
+        if let Some(result) = render_result {
             return result;
         }
         if let Some(result) = self.random_instance(r, receiver, args) {
