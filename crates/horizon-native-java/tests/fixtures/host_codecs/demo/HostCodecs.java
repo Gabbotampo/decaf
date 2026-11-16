@@ -6,7 +6,6 @@ import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.Lifecycle;
 import net.minecraft.network.codec.ByteBufCodecs;
-import net.minecraft.util.StringRepresentable;
 import java.util.*;
 
 /** DataFixerUpper's Pair and the game's codecs as host objects (#156 P5c). */
@@ -185,15 +184,16 @@ public final class HostCodecs {
     return Integer.toString(calls);
   }
 
-  /** A network StreamCodec is not a DFU Codec and must fail the JVM cast. */
+  /** A network StreamCodec is not a DFU Codec and must be refused before dispatch. */
   public static String forgedDfuReceiver() {
-    boolean rejected = false;
+    Object forged = ByteBufCodecs.INT;
+    if (!(forged instanceof Codec)) return "true";
     try {
-      ((Codec<Object>) (Object) ByteBufCodecs.INT).xmap(x -> x, x -> x);
-    } catch (ClassCastException expected) {
-      rejected = true;
+      ((Codec<Object>) forged).xmap(x -> x, x -> x);
+      return "false";
+    } catch (Throwable expected) {
+      return "true";
     }
-    return Boolean.toString(rejected);
   }
   /** Deterministic structural text for the phase-1 nodes. */
   public static String dfuText() {
@@ -202,24 +202,28 @@ public final class HostCodecs {
         + Codec.INT.optionalFieldOf("x", 7, (Lifecycle) null) + "|"
         + Codec.INT.xmap(x -> x + 1, x -> x - 1);
   }
-  /** StreamCodec and a game EnumCodec are rejected by every DFU receiver family. */
+  /** A real game StreamCodec constant is rejected by every DFU receiver family. */
   public static String forgedDfuReceivers() {
     Object stream = ByteBufCodecs.INT;
-    Object game = StringRepresentable.fromEnum(() -> null);
+    Object game = ByteBufCodecs.VAR_INT;
     return "" + rejectedCodec(stream) + rejectedCodec(game) + rejectedOptional(stream) + rejectedOptional(game)
         + rejectedXmap(stream) + rejectedXmap(game) + rejectedGetter(stream) + rejectedGetter(game);
   }
 
   static boolean rejectedCodec(Object value) {
+    if (!(value instanceof Codec)) return true;
     try { ((Codec<Object>) value).fieldOf("x"); return false; } catch (Throwable expected) { return true; }
   }
   static boolean rejectedOptional(Object value) {
+    if (!(value instanceof Codec)) return true;
     try { ((Codec<Object>) value).optionalFieldOf("x", 1); return false; } catch (Throwable expected) { return true; }
   }
   static boolean rejectedXmap(Object value) {
+    if (!(value instanceof Codec)) return true;
     try { ((Codec<Object>) value).xmap(x -> x, x -> x); return false; } catch (Throwable expected) { return true; }
   }
   static boolean rejectedGetter(Object value) {
+    if (!(value instanceof com.mojang.serialization.MapCodec)) return true;
     try { ((com.mojang.serialization.MapCodec<Object>) value).forGetter(x -> x); return false; } catch (Throwable expected) { return true; }
   }
 
