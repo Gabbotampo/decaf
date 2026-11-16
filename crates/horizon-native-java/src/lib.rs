@@ -8020,19 +8020,6 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
-        if r.owner == "java/util/regex/Pattern"
-            && r.name == "matcher"
-            && r.descriptor == "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
-        {
-            if let Some(pattern) = host_jdk_constant::pattern_text(receiver) {
-                if let Some(text) = args.first().and_then(|v| match v {
-                    Value::Ref(Some(s)) => Some(s.as_str()),
-                    _ => None,
-                }) {
-                    return Ok(Value::Ref(Some(format!("regex-matcher:{pattern}:{text}"))));
-                }
-            }
-        }
         if r.owner == "java/net/URI" && r.name == "toURL" && r.descriptor == "()Ljava/net/URL;" {
             if let Some(text) = host_jdk_value::uri_text(receiver) {
                 let Some((scheme, _)) = text.split_once(':') else {
