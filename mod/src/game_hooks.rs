@@ -473,7 +473,7 @@ fn note_late_player_tick_post(row: &mut crate::JarRow) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mod_api::{
         Backend, EntityRef, Hooks, Host, HostSide, PlayerRef, PlayerTickPostEvent,
@@ -481,8 +481,8 @@ mod tests {
     };
     use std::collections::BTreeMap;
 
-    struct PlayerTickHost {
-        spectator: BTreeMap<u128, Option<bool>>,
+    pub(crate) struct PlayerTickHost {
+        pub(crate) spectator: BTreeMap<u128, Option<bool>>,
     }
 
     impl Host for PlayerTickHost {
@@ -512,7 +512,7 @@ mod tests {
             "org/spongepowered/asm/mixin/Mixin.java",
             "package org.spongepowered.asm.mixin; import java.lang.annotation.*; \
              @Retention(RetentionPolicy.RUNTIME) @Target(ElementType.TYPE) \
-             public @interface Mixin { Class<?>[] value() default {}; }",
+             public @interface Mixin { Class<?>[] value() default {}; int priority() default 1000; }",
         ),
         (
             "org/spongepowered/asm/mixin/injection/At.java",
@@ -530,6 +530,10 @@ mod tests {
             "org/spongepowered/asm/mixin/injection/callback/CallbackInfo.java",
             "package org.spongepowered.asm.mixin.injection.callback; public class CallbackInfo { \
              public void cancel() {} }",
+        ),
+        (
+            "org/spongepowered/asm/mixin/injection/callback/CallbackInfoReturnable.java",
+            "package org.spongepowered.asm.mixin.injection.callback; public class CallbackInfoReturnable<T> extends CallbackInfo { public T getReturnValue() { return null; } public void setReturnValue(T value) {} }",
         ),
         (
             "net/minecraft/world/damagesource/DamageSource.java",
@@ -727,16 +731,22 @@ mod tests {
             "package net.minecraft.world.entity; public class LivingEntity extends Entity {}",
         ),
         (
+            "net/minecraft/world/level/block/state/BlockState.java",
+            "package net.minecraft.world.level.block.state; public class BlockState {}",
+        ),
+        (
             "net/minecraft/world/entity/player/Player.java",
             "package net.minecraft.world.entity.player; \
              public class Player extends net.minecraft.world.entity.LivingEntity { \
              public void attack(net.minecraft.world.entity.Entity target) {} \
+             public float getDestroySpeed(net.minecraft.world.level.block.state.BlockState state) { return 1.0f; } \
              public void tick() {} public java.util.UUID getUUID() { return null; } }",
         ),
         (
             "net/minecraft/server/MinecraftServer.java",
             "package net.minecraft.server; public class MinecraftServer { \
-             public void tickServer(java.util.function.BooleanSupplier hasTime) {} }",
+             public void tickServer(java.util.function.BooleanSupplier hasTime) {} \
+             public void stopServer() {} }",
         ),
     ];
 
@@ -744,11 +754,13 @@ mod tests {
         import net.minecraft.world.entity.*; \
         import net.minecraft.world.entity.player.Player; \
         import net.minecraft.server.MinecraftServer; \
+        import net.minecraft.world.level.block.state.BlockState; \
         import org.spongepowered.asm.mixin.Mixin; \
         import org.spongepowered.asm.mixin.injection.*; \
-        import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; ";
+        import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; \
+        import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable; ";
 
-    fn load(id: &str, mixin: &str, body: &str) -> LoadedJar {
+    pub(crate) fn load(id: &str, mixin: &str, body: &str) -> LoadedJar {
         let path = format!("demo/{mixin}.java");
         let source = format!("{MIXIN_IMPORTS}{body}");
         let extra: Vec<(&str, &str)> = GAME
@@ -764,7 +776,7 @@ mod tests {
         loaded
     }
 
-    fn stdout(state: &mut State, jar: usize) -> Vec<String> {
+    pub(crate) fn stdout(state: &mut State, jar: usize) -> Vec<String> {
         state.jars[jar]
             .host
             .take_stdout()

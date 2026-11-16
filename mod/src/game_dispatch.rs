@@ -182,12 +182,21 @@ impl HorizonJava {
             return Ok(DispatchAnswer::default());
         }
         let owner = self as *const HorizonJava;
-        if ACTIVE_FRAMES.with(|frames| {
+        if let Some(state) = ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow()
                 .last()
-                .is_some_and(|frame| frame.owner == owner)
+                .filter(|frame| frame.owner == owner)
+                .map(|frame| frame.state.get())
         }) {
+            // SAFETY: this is the active same-thread frame; refusal is counted on every live jar
+            // before returning so census/report counters observe the unsupported re-entry.
+            unsafe {
+                for loaded in &mut (*state).jars {
+                    loaded.host.note_unknown_game_hook(dispatch.method.0);
+                    loaded.row.game_hooks.failed += 1;
+                }
+            }
             return Err(DispatchError::from_error(
                 "Java game-hook re-entry is unsupported in PR 1 (Sunrise dispatch token not available inside Java callbacks)",
             ));
@@ -365,6 +374,42 @@ impl From<NativeError> for DispatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game_hooks::tests::{PlayerTickHost, load, stdout};
+    use crate::runtime::GameObject;
+    use crate::runtime::Value;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::thread;
+
+    struct CountingAllocator;
+    static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+        }
+    }
+    #[global_allocator]
+    static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
+    fn stop_dispatch(java: &HorizonJava, phase: Phase) -> Result<DispatchAnswer, DispatchError> {
+        let mut args = [];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        java.dispatch_game_hook(GameDispatch::new(
+            MethodId("java_server_stopped"),
+            phase,
+            Some(GameObject::server(false)),
+            &mut args,
+            None,
+            &mut host,
+        ))
+    }
+
     #[test]
     fn method_bitset_has_no_false_negative_for_target_spelling() {
         let bits = PlanBits::default();
@@ -421,5 +466,229 @@ mod tests {
         bits.publish(words);
         assert!(old);
         assert!(bits.maybe_contains("new"));
+    }
+    #[test]
+    fn cross_jar_priority_load_and_declaration_order() {
+        let java = HorizonJava::default();
+        java.lock().jars = vec![
+            load(
+                "high",
+                "High",
+                "@Mixin(value=MinecraftServer.class, priority=1500) public class High { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"high\"); } }",
+            ),
+            load(
+                "low",
+                "Low",
+                "@Mixin(value=MinecraftServer.class, priority=500) public class Low { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"low\"); } }",
+            ),
+            load(
+                "tie1",
+                "Tie1",
+                "@Mixin(MinecraftServer.class) public class Tie1 { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void a(CallbackInfo ci) { System.out.println(\"tie1a\"); } @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void b(CallbackInfo ci) { System.out.println(\"tie1b\"); } }",
+            ),
+            load(
+                "tie2",
+                "Tie2",
+                "@Mixin(MinecraftServer.class) public class Tie2 { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void z(CallbackInfo ci) { System.out.println(\"tie2\"); } }",
+            ),
+        ];
+        java.refresh_game_hook_plan_bits();
+        stop_dispatch(&java, Phase::Tail).unwrap();
+        let mut state = java.lock();
+        assert_eq!(stdout(&mut state, 0), ["high"]);
+        assert_eq!(stdout(&mut state, 1), ["low"]);
+        assert_eq!(stdout(&mut state, 2), ["tie1a", "tie1b"]);
+        assert_eq!(stdout(&mut state, 3), ["tie2"]);
+    }
+
+    #[test]
+    fn return_and_tail_phases_are_exact() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load("phases", "Phases", "@Mixin(MinecraftServer.class) public class Phases { @Inject(method=\"stopServer\", at=@At(\"RETURN\")) private void r(CallbackInfo ci) { System.out.println(\"return\"); } @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"tail\"); } }"));
+        java.refresh_game_hook_plan_bits();
+        stop_dispatch(&java, Phase::Return).unwrap();
+        stop_dispatch(&java, Phase::Return).unwrap();
+        stop_dispatch(&java, Phase::Tail).unwrap();
+        assert_eq!(stdout(&mut java.lock(), 0), ["return", "return", "tail"]);
+    }
+
+    #[test]
+    fn head_cancel_default_and_set_return_value() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load("cancel", "Cancel", "@Mixin(Player.class) public class Cancel { @Inject(method=\"getDestroySpeed\", at=@At(\"HEAD\"), cancellable=true) private void c(BlockState s, CallbackInfoReturnable<Float> ci) { ci.cancel(); } }"));
+        java.refresh_game_hook_plan_bits();
+        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_destroy_speed"),
+                Phase::Head,
+                Some(GameObject::player(1, "Alex")),
+                &mut args,
+                None,
+                &mut host,
+            ))
+            .unwrap();
+        assert!(answer.cancelled);
+        assert_eq!(answer.returned, Some(Value::Float(0.0)));
+    }
+
+    #[test]
+    fn return_tail_real_result_and_last_override_win() {
+        let java = HorizonJava::default();
+        java.lock().jars = vec![
+            load(
+                "ret",
+                "Ret",
+                "@Mixin(Player.class) public class Ret { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void r(BlockState s, CallbackInfoReturnable<Float> ci) { System.out.println(\"seen\"+ci.getReturnValue()); ci.setReturnValue(2.0f); } }",
+            ),
+            load(
+                "tail",
+                "Tail",
+                "@Mixin(Player.class) public class Tail { @Inject(method=\"getDestroySpeed\", at=@At(\"TAIL\"), cancellable=true) private void t(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(3.0f); } }",
+            ),
+        ];
+        java.refresh_game_hook_plan_bits();
+        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_destroy_speed"),
+                Phase::Return,
+                Some(GameObject::player(1, "Alex")),
+                &mut args,
+                Some(Value::Float(1.5)),
+                &mut host,
+            ))
+            .unwrap();
+        assert_eq!(answer.returned, Some(Value::Float(2.0)));
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_destroy_speed"),
+                Phase::Tail,
+                Some(GameObject::player(1, "Alex")),
+                &mut args,
+                Some(Value::Float(1.5)),
+                &mut host,
+            ))
+            .unwrap();
+        assert_eq!(answer.returned, Some(Value::Float(3.0)));
+        assert!(
+            stdout(&mut java.lock(), 0)
+                .iter()
+                .any(|line| line.contains("seen1.5"))
+        );
+    }
+
+    #[test]
+    fn unload_clears_plan_snapshot_and_stops_callbacks() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load("unload", "Unload", "@Mixin(MinecraftServer.class) public class Unload { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"ran\"); } }"));
+        java.refresh_game_hook_plan_bits();
+        stop_dispatch(&java, Phase::Tail).unwrap();
+        java.lock().jars.clear();
+        java.refresh_game_hook_plan_bits();
+        assert_eq!(stop_dispatch(&java, Phase::Tail).unwrap().callbacks, 0);
+    }
+
+    #[test]
+    fn refusal_is_counted_for_reentry_and_live_plans_survive_refresh_races() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load("reentry", "Reentry", "@Mixin(MinecraftServer.class) public class Reentry { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"ran\"); } }"));
+        java.refresh_game_hook_plan_bits();
+        let state = {
+            let mut locked = java.lock();
+            std::mem::take(&mut *locked)
+        };
+        let owner = &java as *const HorizonJava;
+        ACTIVE_FRAMES.with(|frames| {
+            frames.borrow_mut().push(ActiveFrame {
+                owner,
+                state: std::cell::UnsafeCell::new(state),
+            })
+        });
+        let refused = stop_dispatch(&java, Phase::Tail).unwrap_err();
+        let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().unwrap());
+        let state = frame.state.into_inner();
+        assert!(refused.is_reentry_refusal());
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 1);
+        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
+        *java.lock() = state;
+        let java = Arc::new(java);
+        let refresh = Arc::clone(&java);
+        let refresher = thread::spawn(move || {
+            for _ in 0..20 {
+                refresh.refresh_game_hook_plan_bits();
+            }
+        });
+        let workers = (0..2)
+            .map(|_| {
+                let java = Arc::clone(&java);
+                thread::spawn(move || {
+                    (0..10)
+                        .map(|_| stop_dispatch(&java, Phase::Tail).unwrap().callbacks)
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        refresher.join().unwrap();
+        for worker in workers {
+            assert!(worker.join().unwrap().iter().all(|count| *count == 1));
+        }
+    }
+
+    #[test]
+    fn updated_args_copy_back_is_exposed_for_pr2_records() {
+        let java = HorizonJava::default();
+        let mut args = [Value::Int(9)];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        let mut words = [0; 4];
+        set_bit(&mut words, "unplanned");
+        java.plan_bits.publish(words);
+        // The record adapter owns applying this payload; PR1 proves the ABI shape without a Sunrise record.
+        let answer = DispatchAnswer {
+            updated_args: args.to_vec(),
+            ..DispatchAnswer::default()
+        };
+        assert_eq!(answer.updated_args, args);
+        let _ = java.dispatch_game_hook(GameDispatch::new(
+            MethodId("unplanned"),
+            Phase::Head,
+            None,
+            &mut args,
+            None,
+            &mut host,
+        ));
+    }
+
+    #[test]
+    fn no_plan_dispatch_is_allocation_free() {
+        struct NoopHost;
+        impl mod_api::Host for NoopHost {}
+        mod_api::impl_host_areas!(NoopHost);
+        impl mod_api::ServerHost for NoopHost {}
+        mod_api::impl_server_host_areas!(NoopHost);
+        let java = HorizonJava::default();
+        let mut args = [Value::Int(1)];
+        let mut host = NoopHost;
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("missing"),
+                Phase::Head,
+                None,
+                &mut args,
+                None,
+                &mut host,
+            ))
+            .unwrap();
+        assert_eq!(answer, DispatchAnswer::default());
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     }
 }

@@ -3791,6 +3791,14 @@ impl StdHost {
         self.unknown_host_calls.values().sum()
     }
 
+    /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
+    pub fn note_unknown_game_hook(&mut self, method: &str) {
+        *self
+            .unknown_host_calls
+            .entry(format!("game-hook re-entry: {method}"))
+            .or_default() += 1;
+    }
+
     pub(crate) fn mark_nondeterministic(&mut self, marker: &str) {
         self.nondeterministic.insert(marker.to_owned());
     }
