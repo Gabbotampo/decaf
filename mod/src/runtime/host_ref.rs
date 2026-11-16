@@ -596,6 +596,8 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
+    /// Pure PoseStack/JOML render values.
+    RenderObject,
     /// Pure client model-layer builder values and trees.
     CubeDeformation,
     PartPose,
@@ -2556,6 +2558,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::runtime::client_reload::converter_class),
         canonical: never_canonical,
         methods: &crate::runtime::client_reload::CONVERTER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RenderObject,
+        tag: "rmat",
+        class: ClassRule::FromKey(crate::runtime::render_math::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::CubeDeformation,
