@@ -13,7 +13,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/client/model/geom/builders/CubeDeformation.java",
-        "package net.minecraft.client.model.geom.builders; public class CubeDeformation { public static final CubeDeformation NONE = null; public CubeDeformation(float x){} public CubeDeformation extend(float x){return null;} public String toString(){return null;} }",
+        "package net.minecraft.client.model.geom.builders; public class CubeDeformation { public static final CubeDeformation NONE = null; public CubeDeformation(float x){} public CubeDeformation extend(float x){return null;} public CubeDeformation extend(float x,float y,float z){return null;} public String toString(){return null;} }",
     ),
     (
         "net/minecraft/client/model/geom/builders/CubeListBuilder.java",

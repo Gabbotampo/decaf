@@ -7,6 +7,7 @@ public final class Probe {
     MeshDefinition mesh = new MeshDefinition();
     PartDefinition root = mesh.getRoot();
     CubeDeformation grow = new CubeDeformation(0.25f).extend(0.5f);
+    CubeDeformation tri = new CubeDeformation(0.1f).extend(0.2f, 0.3f, 0.4f);
     CubeListBuilder builder = CubeListBuilder.create().texOffs(2, 3).mirror()
         .addBox(-1f, -2f, -3f, 4f, 5f, 6f, grow, 2f, 3f);
     CubeListBuilder visibleSet = CubeListBuilder.create()
@@ -23,6 +24,7 @@ public final class Probe {
     PartPose translated = PartPose.offset(.1f, .2f, .3f).translated(.2f, .3f, .4f);
     LayerDefinition layer = LayerDefinition.create(mesh, 32, 16);
     return (builder == builder.mirror(false)) + ","
+        + (tri != null) + ","
         + (visibleSet == visibleSet.mirror(false)) + ","
         + (explicitMirror == explicitMirror.mirror(false)) + ","
         + "head" + "," + pose.x() + "," + pose.yRot() + ","

@@ -339,7 +339,7 @@ pub(crate) fn instance(
                 let by = value_f32(args.first()?)?;
                 Some(Ok(deformation(old.map(|value| value + by))))
             }
-            ("extend", "(FFF)Lnet/minecraft/client.model.geom.builders.CubeDeformation;") => {
+            ("extend", "(FFF)Lnet/minecraft/client/model/geom/builders/CubeDeformation;") => {
                 let old = deformation_values(state, receiver)?;
                 let by = floats::<3>(args)?;
                 Some(Ok(deformation(std::array::from_fn(|i| old[i] + by[i]))))
