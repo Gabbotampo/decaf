@@ -383,6 +383,9 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        if self.render_objects.contains_key(marker) {
+            out.push(marker.to_owned());
+        }
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -412,6 +415,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.render_objects.keys())
             .map(String::as_str)
     }
 
@@ -444,6 +448,7 @@ impl StdHost {
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
+        self.render_objects.retain(|key, _| keep(key));
     }
 }
 
