@@ -297,17 +297,66 @@ def entrypoint_kind(path: Path, corpus: str, role: str = "server") -> str | None
     return None
 
 
-STANDARD_ENTRYPOINTS={"main","client","server"}
+STANDARD_ENTRYPOINTS = set(SERVER_STAGES) | set(CLIENT_STAGES)
 
-def custom_entrypoint_keys(path, corpus):
-    e=ledger.read_jar_entrypoints(path) if corpus != "neoforge" else None
-    return tuple(sorted(set(e.kinds)-STANDARD_ENTRYPOINTS)) if e else ()
 
-def consumes_entrypoint(path,key):
+def custom_entrypoint_keys(path: Path, corpus: str) -> tuple[str, ...]:
+    """Return non-lifecycle Fabric keys declared by a jar."""
+    if corpus == "neoforge":
+        return ()
+    entrypoints = ledger.read_jar_entrypoints(path)
+    if entrypoints is None:
+        return ()
+    return tuple(sorted(set(entrypoints.kinds) - STANDARD_ENTRYPOINTS))
+
+
+def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
+    """Return whether a class constant pool has an exact UTF-8 key string."""
+    if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
+        return False
+    count = int.from_bytes(data[8:10], "big")
+    offset = 10
+    for _ in range(1, count):
+        if offset >= len(data):
+            return False
+        tag = data[offset]
+        offset += 1
+        if tag == 1:
+            size = int.from_bytes(data[offset:offset + 2], "big")
+            offset += 2
+            try:
+                value = data[offset:offset + size].decode("utf-8")
+            except UnicodeDecodeError:
+                value = ""
+            if value == wanted:
+                return True
+            offset += size
+        elif tag in (3, 4):
+            offset += 4
+        elif tag in (5, 6):
+            offset += 8
+        elif tag in (7, 8, 16, 19, 20):
+            offset += 2
+        elif tag in (9, 10, 11, 12, 17, 18):
+            offset += 4
+        elif tag == 15:
+            offset += 3
+        else:
+            return False
+    return False
+
+
+def consumes_entrypoint(path: Path, key: str) -> bool:
+    """Return whether a jar contains an exact constant-pool key reference."""
     try:
-        with zipfile.ZipFile(path) as a:
-            return any(n.endswith(".class") and key.encode() in a.read(n) for n in a.namelist())
-    except (OSError,zipfile.BadZipFile): return False
+        with zipfile.ZipFile(path) as archive:
+            return any(
+                name.endswith(".class")
+                and class_has_utf8_constant(archive.read(name), key)
+                for name in archive.namelist()
+            )
+    except (OSError, zipfile.BadZipFile):
+        return False
 
 def classify_client(path: Path, corpus: str) -> tuple[str, str | None, str]:
     entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
@@ -594,18 +643,21 @@ def main(argv: list[str] | None = None) -> int:
                 closure = ledger.Closure()
                 closure_error = f"Fabric dependency predicate oracle unavailable: {fabric_oracle_error}"
             else:
-                matcher = (fabric_oracle.matches if name != "neoforge" else hybrid_pack.maven_version_satisfies)
+                matcher = fabric_oracle.matches if name != "neoforge" else hybrid_pack.maven_version_satisfies
                 closure = ledger.dependency_closure(jar, index, version_matcher=matcher)
             missing = list(closure.missing)
             requirements = closure.missing_requirements
             modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
             via = None
+            via_candidates: list[str] = []
             if kind is None and "closure" in modes:
                 for key in custom_entrypoint_keys(jar, name):
-                    consumer = next((dep for dep in closure.jars if consumes_entrypoint(dep, key)), None)
-                    if consumer is not None and entrypoint_kind(consumer, name, args.role):
-                        via, kind = consumer.name, entrypoint_kind(consumer, name, args.role)
-                        break
+                    for consumer in closure.jars:
+                        if consumes_entrypoint(consumer, key) and entrypoint_kind(consumer, name, args.role):
+                            via_candidates.append(consumer.name)
+                if via_candidates:
+                    via = via_candidates[0]
+                    kind = entrypoint_kind(next(dep for dep in closure.jars if dep.name == via), name, args.role)
             if kind is None:
                 for mode in modes:
                     rows.append({"jar": jar.name, "mode": mode, "verdict": "skipped", "reason": reason, **({"role": jar_role} if jar_role else {})})
@@ -619,10 +671,10 @@ def main(argv: list[str] | None = None) -> int:
                 if via and jar not in exec_deps:
                     exec_deps.append(jar)
                 baseline_deps = [d for d in exec_deps if d != jar]
-                todo.append((jar, kind, jar_role, exec_deps, missing if mode == "closure" else [], requirements if mode == "closure" else (), mode, closure_error if mode == "closure" else "", via, exec_jar, baseline_deps))
+                todo.append((jar, kind, jar_role, exec_deps, missing if mode == "closure" else [], requirements if mode == "closure" else (), mode, closure_error if mode == "closure" else "", via, exec_jar, baseline_deps, via_candidates))
 
         def run(item):
-            jar, kind, jar_role, deps, missing, requirements, mode, closure_error, via, exec_jar, baseline_deps = item
+            jar, kind, jar_role, deps, missing, requirements, mode, closure_error, via, exec_jar, baseline_deps, via_candidates = item
             if closure_error:
                 result = {"status": "refused", "stage": "dependency", "error": closure_error}
             elif missing:
@@ -639,9 +691,9 @@ def main(argv: list[str] | None = None) -> int:
                 row["via"] = via
                 row["baseline_unknown"] = baseline.get("unknown_host_call_count")
                 row["unknown_delta"] = (result.get("unknown_host_call_count", 0) - baseline.get("unknown_host_call_count", 0))
+                if via_candidates:
+                    row["via_candidates"] = via_candidates
             elif via:
-                row["via"] = via
-            if via:
                 row["via"] = via
             return row
 

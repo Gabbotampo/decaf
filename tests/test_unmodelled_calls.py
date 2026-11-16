@@ -449,7 +449,11 @@ class UnmodelledCallsTests(unittest.TestCase):
             root=Path(d); custom=root/"custom.jar"; consumer=root/"consumer.jar"
             meta={"id":"custom","entrypoints":{"glitchcore":["x.Main"]}}
             with zipfile.ZipFile(custom,"w") as z: z.writestr("fabric.mod.json",json.dumps(meta))
-            with zipfile.ZipFile(consumer,"w") as z: z.writestr("a/B.class",b"glitchcore")
+            with zipfile.ZipFile(consumer,"w") as z: z.writestr("a/B.class",b"\xca\xfe\xba\xbe\x00\x00\x00\x34\x00\x02\x01\x00\x0aglitchcore")
+            self.assertTrue(TOOL.consumes_entrypoint(consumer,"glitchcore"))
+            package_only=root/"package.jar"
+            with zipfile.ZipFile(package_only,"w") as z: z.writestr("x/Y.class",b"\xca\xfe\xba\xbe\x00\x00\x00\x34\x00\x02\x01\x00\x0dglitchcore/Foo")
+            self.assertFalse(TOOL.consumes_entrypoint(package_only,"glitchcore"))
             self.assertEqual(TOOL.custom_entrypoint_keys(custom,"mega"),("glitchcore",))
             self.assertTrue(TOOL.consumes_entrypoint(consumer,"glitchcore"))
 
