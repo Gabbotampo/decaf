@@ -339,26 +339,14 @@ fn ranged_instance(
         }
         ("sanitizeValue", "(D)D") => {
             let value = crate::expect_float(r, StdHost::argument(r, args, 0)?)?;
-            Ok(Value::Float(if value.is_nan() {
-                state.min_value
-            } else if value < state.min_value {
+            Ok(Value::Float(if value.is_nan() || value < state.min_value {
                 state.min_value
             } else {
-                java_min(value, state.max_value)
+                crate::java_float_min(value, state.max_value)
             }))
         }
         _ => host.unknown_host_call(r),
     }
-}
-
-fn java_min(left: f64, right: f64) -> f64 {
-    if left.is_nan() || right.is_nan() {
-        return f64::NAN;
-    }
-    if left == right {
-        return if left == 0.0 { -0.0 } else { left };
-    }
-    if left < right { left } else { right }
 }
 
 fn illegal(message: &str) -> NativeError {

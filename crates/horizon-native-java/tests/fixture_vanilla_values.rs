@@ -26,7 +26,7 @@ const EXPECTED: &[(&str, &str)] = &[
     ),
     (
         "attrsEdges",
-        "normal|true|bff0000000000000,4008000000000000,bff0000000000000,0,8000000000000000|NaN,NaN,0|4000000000000000,4024000000000000,NaN|4000000000000000,4024000000000000,0|8000000000000000,8000000000000000",
+        "normal|true|bff0000000000000,4008000000000000,bff0000000000000,0,8000000000000000|NaN,NaN,0|4000000000000000,4024000000000000,NaN|4000000000000000,4024000000000000,0|8000000000000000,8000000000000000|0|0|8000000000000000|8000000000000000|NaN|0",
     ),
 ];
 
@@ -81,7 +81,13 @@ public final class Probe {
   public static String attrs() { RangedAttribute a=new RangedAttribute("attribute.test",5,-2,10); Attribute same=a.setSyncable(true); return a.getDescriptionId()+"|"+a.getDefaultValue()+","+a.getMinValue()+","+a.getMaxValue()+"|"+a.isClientSyncable()+"|"+a.sanitizeValue(Double.NaN)+","+a.sanitizeValue(-3)+","+a.sanitizeValue(12)+","+a.sanitizeValue(2.5)+"|"+(same==a)+"|"+(a instanceof Attribute)+"|"+a.getClass().getName(); }
   public static String invalid() { StringBuilder o=new StringBuilder(); for(double[] x:new double[][]{{5,2,1},{1,2,3},{4,1,3}}) { try {new RangedAttribute("x",x[0],x[1],x[2]);o.append("ok");} catch(IllegalArgumentException e){o.append(e.getMessage());} o.append(';');} return o.toString(); }
   static String bits(double d) { return Double.isNaN(d) ? "NaN" : Long.toHexString(Double.doubleToRawLongBits(d)); }
-  public static String attrsEdges() { RangedAttribute normal=new RangedAttribute("normal",2,-1,3); RangedAttribute maxNan=new RangedAttribute("maxNan",2,0,Double.NaN); RangedAttribute minNan=new RangedAttribute("minNan",2,Double.NaN,10); RangedAttribute valueNan=new RangedAttribute("valueNan",Double.NaN,0,10); RangedAttribute maxNegZero=new RangedAttribute("maxNegZero",0,-1,-0.0); return (normal.getDescriptionId()==null?"null":normal.getDescriptionId())+"|"+(new RangedAttribute(null,2,0,10).getDescriptionId()==null)+"|"+bits(normal.sanitizeValue(Double.NaN))+","+bits(normal.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(normal.sanitizeValue(Double.NEGATIVE_INFINITY))+","+bits(normal.sanitizeValue(+0.0))+","+bits(normal.sanitizeValue(-0.0))+"|"+bits(maxNan.sanitizeValue(2))+","+bits(maxNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(maxNan.sanitizeValue(Double.NaN))+"|"+bits(minNan.sanitizeValue(2))+","+bits(minNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(minNan.sanitizeValue(Double.NaN))+"|"+bits(valueNan.sanitizeValue(2))+","+bits(valueNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(valueNan.sanitizeValue(Double.NaN))+"|"+bits(maxNegZero.sanitizeValue(+0.0))+","+bits(maxNegZero.sanitizeValue(-0.0)); }
+  public static String attrsEdges() { RangedAttribute normal=new RangedAttribute("normal",2,-1,3); RangedAttribute maxNan=new RangedAttribute("maxNan",2,0,Double.NaN); RangedAttribute minNan=new RangedAttribute("minNan",2,Double.NaN,10); RangedAttribute valueNan=new RangedAttribute("valueNan",Double.NaN,0,10); RangedAttribute maxNegZero=new RangedAttribute("maxNegZero",0,-1,-0.0); return (normal.getDescriptionId()==null?"null":normal.getDescriptionId())+"|"+(new RangedAttribute(null,2,0,10).getDescriptionId()==null)+"|"+bits(normal.sanitizeValue(Double.NaN))+","+bits(normal.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(normal.sanitizeValue(Double.NEGATIVE_INFINITY))+","+bits(normal.sanitizeValue(+0.0))+","+bits(normal.sanitizeValue(-0.0))+"|"+bits(maxNan.sanitizeValue(2))+","+bits(maxNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(maxNan.sanitizeValue(Double.NaN))+"|"+bits(minNan.sanitizeValue(2))+","+bits(minNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(minNan.sanitizeValue(Double.NaN))+"|"+bits(valueNan.sanitizeValue(2))+","+bits(valueNan.sanitizeValue(Double.POSITIVE_INFINITY))+","+bits(valueNan.sanitizeValue(Double.NaN))+"|"+bits(maxNegZero.sanitizeValue(+0.0))+","+bits(maxNegZero.sanitizeValue(-0.0))+"|"
+    +bits(new RangedAttribute("zero",0.0,0.0,0.0).sanitizeValue(0.0))+"|"
+    +bits(new RangedAttribute("minNegZero",0.0,-0.0,0.0).sanitizeValue(0.0))+"|"
+    +bits(new RangedAttribute("maxNegZero2",0.0,0.0,-0.0).sanitizeValue(0.0))+"|"
+    +bits(new RangedAttribute("valueNegZero",0.0,0.0,0.0).sanitizeValue(-0.0))+"|"
+    +bits(new RangedAttribute("maxNan2",0.0,0.0,Double.NaN).sanitizeValue(2.0))+"|"
+    +bits(new RangedAttribute("valueNan2",0.0,0.0,10.0).sanitizeValue(Double.NaN)); }
 }
 "#,
     ),
