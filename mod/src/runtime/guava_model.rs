@@ -191,14 +191,42 @@ fn boxed_class(primitive: &str) -> Option<&'static str> {
 }
 
 const BIMAP_INVERSE_FIELD: &str = "|guava#inverse";
+const BIMAP_KIND_FIELD: &str = "|guava#kind";
+const BIMAP_VIEW_FIELD: &str = "|guava#view";
+const BIMAP_VIEW_SOURCE_FIELD: &str = "|guava#view-source";
+const BIMAP_ENTRY_FIELD: &str = "|guava#entry";
+const BIMAP_ITERATOR_PREFIX: &str = "|guava#bimap-iterator|";
 
-fn bimap_marker(value: &Value) -> Option<String> {
-    let marker = crate::runtime::expect_ref(value)?;
-    matches!(
-        crate::runtime::jar_object::collection_class(marker),
-        "com/google/common/collect/HashBiMap" | "com/google/common/collect/HashBiMap$Inverse"
-    )
-    .then(|| marker.clone())
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BimapKind {
+    Root,
+    Inverse,
+    Keys,
+    Values,
+    Entries,
+}
+
+impl BimapKind {
+    fn tag(self) -> i32 {
+        match self {
+            Self::Root => 0,
+            Self::Inverse => 1,
+            Self::Keys => 2,
+            Self::Values => 4,
+            Self::Entries => 3,
+        }
+    }
+
+    fn from_tag(tag: i32) -> Option<Self> {
+        Some(match tag {
+            0 => Self::Root,
+            1 => Self::Inverse,
+            2 => Self::Keys,
+            3 => Self::Entries,
+            4 => Self::Values,
+            _ => return None,
+        })
+    }
 }
 
 fn bimap_method(name: &str, descriptor: &str) -> MethodRef {
@@ -220,12 +248,21 @@ impl<H: Host> Runtime<'_, H> {
         if (r.owner == "com/google/common/collect/ImmutableMap"
             || r.owner == "com/google/common/collect/ImmutableBiMap")
             && r.name == "copyOf"
-            && r.descriptor.starts_with("(Ljava/util/Map;")
+            && (r.descriptor.starts_with("(Ljava/util/Map;")
+                || r.descriptor.starts_with("(Ljava/lang/Iterable;"))
         {
             return self.guava_immutable_map_copy(r, args);
         }
-        if receiver.and_then(bimap_marker).is_some() {
-            return self.invoke_bimap(r, receiver, args);
+        if let Some(receiver) = receiver {
+            if self.bimap_entry_source(receiver).is_some() {
+                return self.invoke_bimap_entry(r, receiver, args);
+            }
+            if self.bimap_iterator_source(receiver).is_some() {
+                return self.invoke_bimap_iterator(r, receiver, args);
+            }
+            if self.bimap_handle_info(receiver).is_some() {
+                return self.invoke_bimap(r, Some(receiver), args);
+            }
         }
         if let Some(result) = sized_factory_class(r, args) {
             let class = result?;
@@ -515,6 +552,14 @@ impl<H: Host> Runtime<'_, H> {
                     format!("{inverse_marker}{BIMAP_INVERSE_FIELD}"),
                     map.clone(),
                 );
+                self.fields.insert(
+                    format!("{map_marker}{BIMAP_KIND_FIELD}"),
+                    Value::Int(BimapKind::Root.tag()),
+                );
+                self.fields.insert(
+                    format!("{inverse_marker}{BIMAP_KIND_FIELD}"),
+                    Value::Int(BimapKind::Inverse.tag()),
+                );
                 Ok(Some(map))
             }
             "com/google/common/collect/HashMultimap"
@@ -657,7 +702,38 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(Some(source.clone()));
             }
         }
-        let values = runtime_collection_values(&*self.host, source)?;
+        let values = if r.descriptor.starts_with("(Ljava/lang/Iterable;") {
+            let entries = runtime_collection_values(&*self.host, source)?;
+            let mut values = Vec::with_capacity(entries.len() * 2);
+            for entry in entries {
+                if entry == Value::Ref(None) {
+                    return Err(thrown(
+                        "java/lang/NullPointerException",
+                        Some("null".into()),
+                    ));
+                }
+                let key = self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/Map$Entry",
+                    "getKey",
+                    "()Ljava/lang/Object;",
+                    &entry,
+                    &[],
+                )?;
+                let value = self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/Map$Entry",
+                    "getValue",
+                    "()Ljava/lang/Object;",
+                    &entry,
+                    &[],
+                )?;
+                values.extend([key, value]);
+            }
+            values
+        } else {
+            runtime_collection_values(&*self.host, source)?
+        };
         if !values.len().is_multiple_of(2) {
             return Ok(None);
         }
@@ -715,6 +791,358 @@ impl<H: Host> Runtime<'_, H> {
             .immutable_collection_from(r.owner.as_str(), "copyOf", "map", values)
             .ok_or_else(|| NativeError::Metadata("Guava immutable map host missing".into()))?;
         Ok(Some(made))
+    }
+
+    fn bimap_handle_info(&self, value: &Value) -> Option<(String, BimapKind)> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != crate::runtime::host_ref::HostKind::Collection {
+            return None;
+        }
+        let tag = match self
+            .fields
+            .get(&format!("{}{}", handle.key(), BIMAP_KIND_FIELD))
+        {
+            Some(Value::Int(tag)) => *tag,
+            _ => return None,
+        };
+        Some((handle.key().to_owned(), BimapKind::from_tag(tag)?))
+    }
+
+    fn bimap_view_source(&self, marker: &str) -> Option<Value> {
+        self.fields
+            .get(&format!("{marker}{BIMAP_VIEW_SOURCE_FIELD}"))
+            .cloned()
+    }
+
+    fn bimap_entry_source(&self, value: &Value) -> Option<Value> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        self.fields
+            .get(&format!("{}{}", handle.key(), BIMAP_ENTRY_FIELD))
+            .cloned()
+    }
+
+    fn bimap_view_values(
+        &mut self,
+        source: &Value,
+        kind: BimapKind,
+    ) -> Result<Vec<Value>, NativeError> {
+        let pairs = self.bimap_pairs(source)?;
+        if !pairs.len().is_multiple_of(2) {
+            return Err(NativeError::Metadata("HashBiMap has odd entries".into()));
+        }
+        if matches!(kind, BimapKind::Keys | BimapKind::Values) {
+            return Ok(pairs.chunks(2).map(|pair| pair[0].clone()).collect());
+        }
+        let entries =
+            self.host
+                .mint_map_entries(source, &pairs, crate::runtime::host_map_entry::EntryMade::Node);
+        for entry in &entries {
+            if let Value::Host(handle) = entry {
+                self.fields.insert(
+                    format!("{}{}", handle.key(), BIMAP_ENTRY_FIELD),
+                    source.clone(),
+                );
+            }
+        }
+        Ok(entries)
+    }
+
+    fn bimap_view(
+        &mut self,
+        receiver: &Value,
+        source: &Value,
+        kind: BimapKind,
+    ) -> Result<Value, NativeError> {
+        let marker = crate::runtime::expect_ref(receiver)
+            .ok_or_else(|| NativeError::Metadata("HashBiMap view marker missing".into()))?;
+        let cache = format!("{marker}{BIMAP_VIEW_FIELD}{}", kind.tag());
+        if let Some(view) = self.fields.get(&cache).cloned() {
+            self.bimap_sync_view(&view, source, kind)?;
+            return Ok(view);
+        }
+        let values = self.bimap_view_values(source, kind)?;
+        let view = self
+            .host
+            .empty_mutable_collection("java/util/LinkedHashSet")
+            .ok_or_else(|| NativeError::Metadata("HashBiMap view host missing".into()))?;
+        self.host.replace_mutable_collection(&view, values);
+        let view_marker = crate::runtime::expect_ref(&view)
+            .cloned()
+            .ok_or_else(|| NativeError::Metadata("HashBiMap view handle missing".into()))?;
+        self.fields.insert(cache, view.clone());
+        self.fields.insert(
+            format!("{view_marker}{BIMAP_KIND_FIELD}"),
+            Value::Int(kind.tag()),
+        );
+        self.fields.insert(
+            format!("{view_marker}{BIMAP_VIEW_SOURCE_FIELD}"),
+            source.clone(),
+        );
+        Ok(view)
+    }
+
+    fn bimap_sync_view(
+        &mut self,
+        view: &Value,
+        source: &Value,
+        kind: BimapKind,
+    ) -> Result<(), NativeError> {
+        let values = self.bimap_view_values(source, kind)?;
+        self.host.replace_mutable_collection(view, values);
+        Ok(())
+    }
+
+    fn bimap_view_contains(
+        &mut self,
+        source: &Value,
+        kind: BimapKind,
+        wanted: &Value,
+    ) -> Result<bool, NativeError> {
+        let pairs = self.bimap_pairs(source)?;
+        for pair in pairs.chunks(2) {
+            if matches!(kind, BimapKind::Keys | BimapKind::Values)
+                && self.java_equals(&pair[0], wanted)?
+            {
+                return Ok(true);
+            }
+            if kind == BimapKind::Entries
+                && let Some((key, value)) = self.host.map_entry_parts(wanted)
+                && self.java_equals(&pair[0], &key)?
+                && self.java_equals(&pair[1], &value)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn bimap_view_remove(
+        &mut self,
+        source: &Value,
+        kind: BimapKind,
+        wanted: &Value,
+    ) -> Result<bool, NativeError> {
+        let pairs = self.bimap_pairs(source)?;
+        let index = pairs.chunks(2).position(|pair| {
+            if matches!(kind, BimapKind::Keys | BimapKind::Values) {
+                self.java_equals(&pair[0], wanted).unwrap_or(false)
+            } else if let Some((key, value)) = self.host.map_entry_parts(wanted) {
+                self.java_equals(&pair[0], &key).unwrap_or(false)
+                    && self.java_equals(&pair[1], &value).unwrap_or(false)
+            } else {
+                false
+            }
+        });
+        let Some(index) = index else {
+            return Ok(false);
+        };
+        let old_key = pairs[index * 2].clone();
+        let old_value = pairs[index * 2 + 1].clone();
+        let partner = self
+            .bimap_inverse(
+                crate::runtime::expect_ref(source)
+                    .ok_or_else(|| NativeError::Metadata("HashBiMap source missing".into()))?,
+            )
+            .ok_or_else(|| NativeError::Metadata("HashBiMap inverse missing".into()))?;
+        self.bimap_host_remove(source, &old_key)?;
+        self.bimap_host_remove(&partner, &old_value)?;
+        Ok(true)
+    }
+
+    fn bimap_view_clear(&mut self, source: &Value) -> Result<(), NativeError> {
+        let partner = self
+            .bimap_inverse(
+                crate::runtime::expect_ref(source)
+                    .ok_or_else(|| NativeError::Metadata("HashBiMap source missing".into()))?,
+            )
+            .ok_or_else(|| NativeError::Metadata("HashBiMap inverse missing".into()))?;
+        self.bimap_host_clear(source)?;
+        self.bimap_host_clear(&partner)?;
+        Ok(())
+    }
+
+    fn invoke_bimap_view(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+        source: &Value,
+        kind: BimapKind,
+    ) -> Result<Option<Value>, NativeError> {
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("size", "()I") => {
+                let values = self.bimap_view_values(source, kind)?;
+                return Ok(Some(Value::Int(values.len() as i32)));
+            }
+            ("isEmpty", "()Z") => {
+                let values = self.bimap_view_values(source, kind)?;
+                return Ok(Some(Value::Int(values.is_empty() as i32)));
+            }
+            ("contains", "(Ljava/lang/Object;)Z") => {
+                let wanted = args.first().cloned().unwrap_or(Value::Ref(None));
+                return Ok(Some(Value::Int(
+                    self.bimap_view_contains(source, kind, &wanted)? as i32,
+                )));
+            }
+            ("remove", "(Ljava/lang/Object;)Z") => {
+                let wanted = args.first().cloned().unwrap_or(Value::Ref(None));
+                return Ok(Some(Value::Int(
+                    self.bimap_view_remove(source, kind, &wanted)? as i32,
+                )));
+            }
+            ("clear", "()V") => {
+                self.bimap_view_clear(source)?;
+                return Ok(Some(Value::Void));
+            }
+            ("iterator", "()Ljava/util/Iterator;") => {
+                let values = self.bimap_view_values(source, kind)?;
+                let view_marker = crate::runtime::expect_ref(receiver).cloned().ok_or_else(|| {
+                    NativeError::Metadata("HashBiMap iterator view missing".into())
+                })?;
+                let iterator = self
+                    .host
+                    .new_host_iterator(
+                        values,
+                        Some(format!("{BIMAP_ITERATOR_PREFIX}{view_marker}")),
+                    )
+                    .ok_or_else(|| {
+                        NativeError::Metadata("HashBiMap iterator host missing".into())
+                    })?;
+                return Ok(Some(iterator));
+            }
+            _ => {}
+        }
+        if matches!(
+            r.name.as_str(),
+            "add" | "addAll" | "removeAll" | "retainAll" | "removeIf"
+        ) {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        self.bimap_sync_view(receiver, source, kind)?;
+        Ok(None)
+    }
+
+    fn bimap_iterator_source(&self, value: &Value) -> Option<String> {
+        let marker = crate::runtime::host_iterator::marker(value)?;
+        let source = self.host.host_iterator(marker)?.2?;
+        source
+            .strip_prefix(BIMAP_ITERATOR_PREFIX)
+            .map(|rest| rest.strip_suffix("|removed").unwrap_or(rest).to_owned())
+    }
+
+    fn invoke_bimap_iterator(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        _args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(iterator) = crate::runtime::host_iterator::marker(receiver).cloned() else {
+            return Ok(None);
+        };
+        let Some(view_marker) = self.bimap_iterator_source(receiver) else {
+            return Ok(None);
+        };
+        if !matches!(
+            r.owner.as_str(),
+            "java/util/Iterator" | "java/util/ListIterator"
+        ) {
+            return Ok(None);
+        }
+        let (cursor, length, source) = self
+            .host
+            .host_iterator(&iterator)
+            .ok_or_else(|| NativeError::Metadata("unknown bimap iterator".into()))?;
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("hasNext", "()Z") => Ok(Some(Value::Int((cursor < length) as i32))),
+            ("next", "()Ljava/lang/Object;") => {
+                let value = self.host.host_iterator_next(&iterator)?;
+                self.host.set_host_iterator_source(
+                    &iterator,
+                    format!("{BIMAP_ITERATOR_PREFIX}{view_marker}"),
+                );
+                Ok(Some(value))
+            }
+            ("remove", "()V") => {
+                if cursor == 0 || source.is_some_and(|s| s.ends_with("|removed")) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalStateException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let values = self
+                    .host
+                    .host_iterator_values(&iterator)
+                    .ok_or_else(|| NativeError::Metadata("bimap iterator values missing".into()))?;
+                let last = values[cursor - 1].clone();
+                let view = Value::Host(crate::runtime::host_ref::HostRef::new(
+                    crate::runtime::host_ref::HostKind::Collection,
+                    view_marker.clone(),
+                ));
+                let (_, kind) = self
+                    .bimap_handle_info(&view)
+                    .ok_or_else(|| NativeError::Metadata("bimap iterator view missing".into()))?;
+                let source = self
+                    .bimap_view_source(&view_marker)
+                    .ok_or_else(|| NativeError::Metadata("bimap iterator source missing".into()))?;
+                self.bimap_view_remove(&source, kind, &last)?;
+                self.host.set_host_iterator_source(
+                    &iterator,
+                    format!("{BIMAP_ITERATOR_PREFIX}{view_marker}|removed"),
+                );
+                Ok(Some(Value::Void))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn invoke_bimap_entry(
+        &mut self,
+        r: &MethodRef,
+        entry: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "setValue" || r.descriptor != "(Ljava/lang/Object;)Ljava/lang/Object;" {
+            return Ok(None);
+        }
+        let source = self
+            .bimap_entry_source(entry)
+            .ok_or_else(|| NativeError::Metadata("bimap entry source missing".into()))?;
+        let value = args.first().cloned().unwrap_or(Value::Ref(None));
+        if value == Value::Ref(None) {
+            return Err(thrown("java/lang/NullPointerException", None));
+        }
+        let (old_key, old_value) = self
+            .host
+            .map_entry_parts(entry)
+            .ok_or_else(|| NativeError::Metadata("bimap entry contents missing".into()))?;
+        let pairs = self.bimap_pairs(&source)?;
+        let index = self
+            .bimap_find(&pairs, 0, &old_key)?
+            .ok_or_else(|| NativeError::Metadata("bimap entry detached".into()))?;
+        if pairs
+            .chunks(2)
+            .enumerate()
+            .any(|(at, pair)| at != index && self.java_equals(&pair[1], &value).unwrap_or(false))
+        {
+            return Err(thrown(
+                "java/lang/IllegalArgumentException",
+                Some(format!(
+                    "value already present: {}",
+                    crate::runtime::value_text(&value)
+                )),
+            ));
+        }
+        let partner = self
+            .bimap_inverse(crate::runtime::expect_ref(&source).unwrap())
+            .ok_or_else(|| NativeError::Metadata("bimap entry inverse missing".into()))?;
+        self.bimap_host_put(&source, old_key.clone(), value.clone())?;
+        self.bimap_host_replace_key(&partner, &old_value, value)?;
+        Ok(Some(old_value))
     }
 
     fn bimap_inverse(&self, marker: &str) -> Option<Value> {
@@ -805,11 +1233,19 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
-        let Some(marker) = bimap_marker(receiver) else {
+        let Some((marker, kind)) = self.bimap_handle_info(receiver) else {
             return Ok(None);
         };
-        let inverse = crate::runtime::jar_object::collection_class(&marker)
-            == "com/google/common/collect/HashBiMap$Inverse";
+        if matches!(
+            kind,
+            BimapKind::Keys | BimapKind::Values | BimapKind::Entries
+        ) {
+            let source = self
+                .bimap_view_source(&marker)
+                .ok_or_else(|| NativeError::Metadata("HashBiMap view source missing".into()))?;
+            return self.invoke_bimap_view(r, receiver, args, &source, kind);
+        }
+        let inverse = kind == BimapKind::Inverse;
         let Some(other) = self.bimap_inverse(&marker) else {
             return Ok(None);
         };
@@ -944,44 +1380,19 @@ impl<H: Host> Runtime<'_, H> {
             ("isEmpty", "()Z") => Ok(Some(Value::Int(i32::from(
                 self.bimap_pairs(&root)?.is_empty(),
             )))),
-            ("values", "()Ljava/util/Collection;") => {
-                let pairs = self.bimap_pairs(&root)?;
-                let values = pairs
-                    .chunks(2)
-                    .map(|pair| {
-                        if inverse {
-                            pair[0].clone()
-                        } else {
-                            pair[1].clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let _ = values;
-                Ok(Some(self.host.invoke_instance(
-                    &bimap_method("values", "()Ljava/util/Collection;"),
-                    receiver,
-                    &[],
-                )?))
+            ("values", "()Ljava/util/Collection;" | "()Ljava/util/Set;") => {
+                // HashBiMap values() is a Set in Guava. It is the key set of
+                // the inverse map, so the same live view machinery handles
+                // values removal and iterator removal.
+                self.bimap_view(receiver, &other, BimapKind::Values)
+                    .map(Some)
             }
-            ("keySet", "()Ljava/util/Set;") => {
-                let pairs = self.bimap_pairs(&root)?;
-                let keys = pairs
-                    .chunks(2)
-                    .map(|pair| {
-                        if inverse {
-                            pair[1].clone()
-                        } else {
-                            pair[0].clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let _ = keys;
-                Ok(Some(self.host.invoke_instance(
-                    &bimap_method("keySet", "()Ljava/util/Set;"),
-                    receiver,
-                    &[],
-                )?))
-            }
+            ("keySet", "()Ljava/util/Set;") => self
+                .bimap_view(receiver, receiver, BimapKind::Keys)
+                .map(Some),
+            ("entrySet", "()Ljava/util/Set;") => self
+                .bimap_view(receiver, receiver, BimapKind::Entries)
+                .map(Some),
             _ => Ok(None),
         }
     }

@@ -2723,6 +2723,17 @@ pub trait Host {
     /// `forEachRemaining` leaves it after its action threw).
     fn set_host_iterator_cursor(&mut self, _marker: &str, _cursor: usize) {}
 
+    /// A runtime-owned iterator over a snapshot with a model-specific source tag.
+    fn new_host_iterator(&mut self, _values: Vec<Value>, _source: Option<String>) -> Option<Value> {
+        None
+    }
+
+    fn host_iterator_values(&self, _marker: &str) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn set_host_iterator_source(&mut self, _marker: &str, _source: String) {}
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -5471,10 +5482,6 @@ impl Host for StdHost {
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {
-        eprintln!(
-            "SETMAP? {value:?} keys={:?}",
-            self.set_from_map_views.keys().collect::<Vec<_>>()
-        );
         let Value::Host(handle) = value else {
             return false;
         };
@@ -5780,6 +5787,24 @@ impl Host for StdHost {
         if let Some((values, index)) = self.iterators.get_mut(marker) {
             *index = cursor.min(values.len());
         }
+    }
+
+    fn new_host_iterator(&mut self, values: Vec<Value>, source: Option<String>) -> Option<Value> {
+        let marker = format!("iterator/{}", self.next_iterator);
+        self.next_iterator = self.next_iterator.saturating_add(1);
+        self.iterators.insert(marker.clone(), (values, 0));
+        if let Some(source) = source {
+            self.iterator_sources.insert(marker.clone(), source);
+        }
+        Some(crate::runtime::host_iterator::iterator(marker))
+    }
+
+    fn host_iterator_values(&self, marker: &str) -> Option<Vec<Value>> {
+        self.iterators.get(marker).map(|(values, _)| values.clone())
+    }
+
+    fn set_host_iterator_source(&mut self, marker: &str, source: String) {
+        self.iterator_sources.insert(marker.to_owned(), source);
     }
 
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
@@ -28836,6 +28861,12 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A model handed a jar object it has no state for
                         // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_guava(&r, receiver.as_ref(), &args))
+                    {
+                        // Guava bimap views must run before the generic map-view
+                        // copy path, which otherwise detaches key/value/entry sets.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

@@ -10,6 +10,13 @@
 //! replace={a=3, b=2}|{3=a, 2=b}
 //! bimap={a=1, b=2}|[1, 2]|1|true|java.lang.IllegalArgumentException:value already present: 2|{a=1, c=2}|{1=a, 2=c}|true|{d=2}|[2]|{2=d}
 //! nulls=K=java.lang.NullPointerException:null key in entry: null=1|V=java.lang.NullPointerException:null value in entry: a=null
+//! views={a=1, b=2}|{1=a, 2=b}|true|{b=2}|{2=b}|true|{}|{}|true
+//! entry=a=1|1|{a=9, b=2}|{9=a, 2=b}
+//! iter=a|{b=2}|{2=b}
+//! iterable=com.google.common.collect.RegularImmutableMap|{a=1, b=2}
+//! iterable-bimap=com.google.common.collect.RegularImmutableBiMap|{a=1, b=2}
+//! iterable-duplicate=java.lang.IllegalArgumentException:Multiple entries with same key: a=2 and a=1
+//! iterable-null-entry=java.lang.NullPointerException:null
 
 use horizon_native_java::{NativeJar, Value};
 use std::{
@@ -25,10 +32,19 @@ const IMMUTABLE_MAP: &str = r#"package com.google.common.collect;
 import java.util.*;
 public class ImmutableMap<K,V> extends AbstractMap<K,V> {
   public static <K,V> ImmutableMap<K,V> copyOf(Map<? extends K,? extends V> map) { return null; }
+  public static <K,V> ImmutableMap<K,V> copyOf(Iterable<? extends Map.Entry<? extends K,? extends V>> entries) { return null; }
   public static <K,V> Builder<K,V> builder() { return null; }
   public static class Builder<K,V> { public Builder<K,V> put(K k,V v){return this;} public ImmutableMap<K,V> build(){return null;} }
   public V get(Object key) { return null; }
   public Set<Map.Entry<K,V>> entrySet() { return null; }
+}
+"#;
+const IMMUTABLE_BIMAP: &str = r#"package com.google.common.collect;
+import java.util.*;
+public class ImmutableBiMap<K,V> extends ImmutableMap<K,V> implements BiMap<K,V> {
+  public static <K,V> ImmutableBiMap<K,V> copyOf(Map<? extends K,? extends V> map) { return null; }
+  public static <K,V> ImmutableBiMap<K,V> copyOf(Iterable<? extends Map.Entry<? extends K,? extends V>> entries) { return null; }
+  public V forcePut(K k,V v){return null;} public BiMap<V,K> inverse(){return null;}
 }
 "#;
 const BIMAP: &str = r#"package com.google.common.collect;
@@ -37,13 +53,13 @@ public interface BiMap<K,V> extends Map<K,V> { V forcePut(K k,V v); BiMap<V,K> i
 "#;
 const HASH_BIMAP: &str = r#"package com.google.common.collect;
 import java.util.*;
-public class HashBiMap<K,V> extends AbstractMap<K,V> implements BiMap<K,V> {
+public abstract class HashBiMap<K,V> extends AbstractMap<K,V> implements BiMap<K,V> {
   public static <K,V> HashBiMap<K,V> create(){return null;}
   public V put(K k,V v){return null;} public V forcePut(K k,V v){return null;}
   public BiMap<V,K> inverse(){return null;} public V get(Object k){return null;}
   public boolean containsKey(Object k){return false;} public boolean containsValue(Object v){return false;}
   public V remove(Object k){return null;} public void clear(){} public int size(){return 0;}
-  public boolean isEmpty(){return true;} public Collection<V> values(){return null;}
+  public boolean isEmpty(){return true;} public Set<V> values(){return null;}
   public Set<K> keySet(){return null;} public Set<Map.Entry<K,V>> entrySet(){return null;}
 }
 "#;
@@ -78,6 +94,33 @@ public final class Probe {
     b.remove("a"); b.inverse().put(2,"d");
     return first+"|"+duplicate+"|"+force+"|"+b+"|"+b.values()+"|"+b.inverse();
   }
+  public static String views() {
+    HashBiMap<String,Integer> b=HashBiMap.create(); b.put("a",1); b.put("b",2);
+    Set<String> k=b.keySet(); Set<Integer> v=b.values();
+    return b+"|"+b.inverse()+"|"+k.remove("a")+"|"+b+"|"+b.inverse()+"|"+v.remove(2)+"|"+b+"|"+b.inverse()+"|"+(b.values() instanceof Set);
+  }
+  public static String entryView() {
+    HashBiMap<String,Integer> b=HashBiMap.create(); b.put("a",1); b.put("b",2);
+    Map.Entry<String,Integer> e=b.entrySet().iterator().next();
+    return e.getKey()+"="+e.getValue()+"|"+e.setValue(9)+"|"+b+"|"+b.inverse();
+  }
+  public static String iteratorRemove() {
+    HashBiMap<String,Integer> b=HashBiMap.create(); b.put("a",1); b.put("b",2);
+    Iterator<String> it=b.keySet().iterator(); String first=it.next(); it.remove();
+    return first+"|"+b+"|"+b.inverse();
+  }
+  public static String iterableCopy() {
+    Map<String,Integer> m=new LinkedHashMap<>(); m.put("a",1); m.put("b",2);
+    return ImmutableMap.copyOf(m.entrySet()).getClass().getName()+"|"+ImmutableMap.copyOf(m.entrySet())
+      +"|"+ImmutableBiMap.copyOf(m.entrySet()).getClass().getName()+"|"+ImmutableBiMap.copyOf(m.entrySet());
+  }
+  public static String iterableErrors() {
+    StringBuilder out=new StringBuilder();
+    try { List<Map.Entry<String,Integer>> l=new ArrayList<>(); l.add(new AbstractMap.SimpleEntry<>("a",1)); l.add(new AbstractMap.SimpleEntry<>("a",2)); ImmutableMap.copyOf(l); } catch(Throwable t){out.append(ex(t));}
+    try { List<Map.Entry<String,Integer>> l=new ArrayList<>(); l.add(null); ImmutableMap.copyOf(l); } catch(Throwable t){out.append("|").append(ex(t));}
+    return out.toString();
+  }
+
   public static String nulls() {
     StringBuilder s=new StringBuilder();
     try { Map<String,Integer> m=new LinkedHashMap<>();m.put(null,1);ImmutableMap.copyOf(m); } catch(Throwable t){s.append("K=").append(ex(t));}
@@ -122,6 +165,10 @@ impl Fixture {
         let classes = root.join("classes");
         let srcs = [
             ("com/google/common/collect/ImmutableMap.java", IMMUTABLE_MAP),
+            (
+                "com/google/common/collect/ImmutableBiMap.java",
+                IMMUTABLE_BIMAP,
+            ),
             ("com/google/common/collect/BiMap.java", BIMAP),
             ("com/google/common/collect/HashBiMap.java", HASH_BIMAP),
             ("demo/Probe.java", PROBE),
@@ -202,6 +249,30 @@ fn immutable_duplicate_and_null_messages() {
         "K=java.lang.NullPointerException:null key in entry: null=1|V=java.lang.NullPointerException:null value in entry: a=null"
     );
 }
+#[test]
+fn hash_bimap_views_are_live_and_write_through() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.text("views"),
+        "{a=1, b=2}|{1=a, 2=b}|true|{b=2}|{2=b}|true|{}|{}|true"
+    );
+    assert_eq!(f.text("entryView"), "a=1|1|{a=9, b=2}|{9=a, 2=b}");
+    assert_eq!(f.text("iteratorRemove"), "a|{b=2}|{2=b}");
+}
+
+#[test]
+fn immutable_copy_iterable_matches_guava() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.text("iterableCopy"),
+        "com.google.common.collect.RegularImmutableMap|{a=1, b=2}|com.google.common.collect.RegularImmutableBiMap|{a=1, b=2}"
+    );
+    assert_eq!(
+        f.text("iterableErrors"),
+        "java.lang.IllegalArgumentException:Multiple entries with same key: a=2 and a=1|java.lang.NullPointerException:null"
+    );
+}
+
 #[test]
 fn hash_bimap_put_replaces_inverse() {
     assert_eq!(Fixture::new().text("putReplace"), "{a=3, b=2}|{3=a, 2=b}");
