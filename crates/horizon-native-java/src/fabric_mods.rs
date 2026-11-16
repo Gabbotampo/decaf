@@ -447,18 +447,11 @@ impl StdHost {
                 .values()
                 .any(|value| expect_ref(value) == Some(&marker))
         {
-            if self.strict_unknown_host_calls {
-                self.unknown_host_call(r)?;
-            } else {
-                let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
-                if let Some(count) = self.unknown_host_calls.get_mut(&key) {
-                    if *count > 1 {
-                        *count -= 1;
-                    } else {
-                        self.unknown_host_calls.remove(&key);
-                    }
-                }
-            }
+            // The neutral value remains fabricated, so every observation stays
+            // counted in both normal and strict modes. The cache only preserves
+            // the identity a jar already retained; it never suppresses the
+            // unknown-host accounting.
+            self.unknown_host_call(r)?;
             return Ok(crate::jar_object::collection(marker));
         }
         self.unknown_host_call(r)?;
