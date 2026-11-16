@@ -1,4 +1,4 @@
-Captured on cytonic from the real 26.3 server-game.jar with the installed OpenJDK 27 runtime (arcweld has no JDK; the JDK-25 oracle was unavailable on the build host):
-CP=.local/minecraft/26.3/jars/server-game.jar:$(find .local/minecraft/26.3/libraries -type f -name '*.jar' | paste -sd:)
-/usr/lib/jvm/java-27-openjdk/bin/javac -cp "$CP" Probe.java
-/usr/lib/jvm/java-27-openjdk/bin/java -cp ".:$CP" Probe > java27.txt
+Captured with Java 25.0.5+8 and the real 26.3 server-game.jar. `java -version` output: openjdk version "25.0.5" 2026-10-20 LTS.
+CP=~/ava/minecraft-26.3-server-game.jar:$(python3 -c "import pathlib; print(":".join(map(str,pathlib.Path("libraries").rglob("*.jar"))))")
+javac -cp "$CP" Probe.java
+java -cp ".:$CP" Probe 2>&1 | sed -n "s/^\[[^]]*\] \[main/INFO\]: \[STDOUT\]: //p" > java25.txt

@@ -10,6 +10,11 @@ struct Builder {
     height: f64,
     fire_immune: bool,
     summon: bool,
+    serialize: bool,
+    far_from_player: bool,
+    peaceful: bool,
+    track_deltas: bool,
+    eye_height: f64,
     tracking: i32,
     interval: i32,
 }
@@ -20,6 +25,11 @@ struct Entity {
     height: f64,
     fire_immune: bool,
     summon: bool,
+    serialize: bool,
+    far_from_player: bool,
+    peaceful: bool,
+    track_deltas: bool,
+    eye_height: f64,
     tracking: i32,
     interval: i32,
     description: String,
@@ -30,8 +40,8 @@ pub(crate) struct State {
     next: u64,
     builders: BTreeMap<String, Builder>,
     entities: BTreeMap<String, Entity>,
-    dimensions: BTreeMap<String, (f64, f64)>,
-    ids: BTreeMap<String, u8>,
+    dimensions: BTreeMap<String, (f64, f64, f64)>,
+    ids: BTreeMap<String, u16>,
 }
 
 impl State {
@@ -151,9 +161,11 @@ fn serializer_handle(name: &str) -> Value {
 }
 
 fn category(v: &Value) -> Option<String> {
-    expect_ref(v)
-        .and_then(|s| s.strip_prefix("enum/net/minecraft/world/entity/MobCategory/"))
-        .map(str::to_owned)
+    category_name(v).map(str::to_owned).or_else(|| {
+        expect_ref(v)
+            .and_then(|s| s.strip_prefix("enum/net/minecraft/world/entity/MobCategory/"))
+            .map(str::to_owned)
+    })
 }
 
 pub(crate) fn static_field(
@@ -191,6 +203,7 @@ pub(crate) fn static_field(
             "ITEM_STACK",
             "BLOCK_STATE",
             "OPTIONAL_BLOCK_STATE",
+            "OPTIONAL_GLOBAL_POS",
             "BOOLEAN",
             "PARTICLE",
             "PARTICLES",
@@ -201,6 +214,7 @@ pub(crate) fn static_field(
             "OPTIONAL_LIVING_ENTITY_REFERENCE",
             "POSE",
             "CAT_VARIANT",
+            "CAT_SOUND_VARIANT",
             "FROG_VARIANT",
             "WOLF_VARIANT",
             "WOLF_SOUND_VARIANT",
@@ -235,16 +249,12 @@ pub(crate) fn static_call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     if r.owner == "net/minecraft/network/syncher/SynchedEntityData" && r.name == "defineId" {
-        let class_name = args
-            .first()
-            .and_then(crate::runtime::host_class::class_name)
-            .unwrap_or("net/minecraft/world/entity/Entity");
-        return Some(Ok(define_id(state, class_name)));
+        let class_name = args.first().and_then(crate::runtime::host_class::class_name)?;
+        return Some(define_id(state, class_name));
     }
     if r.owner == BUILDER && (r.name == "of" || r.name == "createNothing") {
-        let Some(cat) = args.get(1).or_else(|| args.first()).and_then(category) else {
-            return Some(Ok(Value::Ref(None)));
-        };
+        let cat = args.get(1).or_else(|| args.first()).and_then(category)?;
+        let far_from_player = matches!(cat.as_str(), "CREATURE" | "MISC");
         let v = handle(state, BUILDER);
         let k = key(&v).unwrap();
         state.builders.insert(
@@ -255,6 +265,11 @@ pub(crate) fn static_call(
                 height: 1.8,
                 fire_immune: false,
                 summon: true,
+                serialize: true,
+                far_from_player,
+                peaceful: true,
+                track_deltas: true,
+                eye_height: 1.53,
                 tracking: 5,
                 interval: 3,
             },
@@ -278,14 +293,11 @@ pub(crate) fn instance_call(
     if marker == BUILDER {
         if r.name == "build" {
             let mut b = state.builders.remove(&k)?;
-            let Some(id) = args
+            let id = args
                 .first()
-                .and_then(crate::runtime::host_ids::key_location) // keep source and vendored mod dispatch identical
+                .and_then(crate::runtime::host_ids::key_location)
                 .and_then(|v| crate::runtime::host_ids::identifier_key(&v).map(str::to_owned))
-                .or_else(|| args.first().and_then(arg_string))
-            else {
-                return Some(Ok(Value::Ref(None)));
-            };
+                .or_else(|| args.first().and_then(arg_string))?;
             let v = handle(state, ENTITY);
             let ek = key(&v).unwrap();
             b.width = b.width.max(0.0);
@@ -298,6 +310,11 @@ pub(crate) fn instance_call(
                     height: b.height,
                     fire_immune: b.fire_immune,
                     summon: b.summon,
+                    serialize: b.serialize,
+                    far_from_player: b.far_from_player,
+                    peaceful: b.peaceful,
+                    track_deltas: b.track_deltas,
+                    eye_height: b.eye_height,
                     tracking: b.tracking,
                     interval: b.interval,
                     description: format!("entity.{}", id.replace(':', ".")),
@@ -310,20 +327,28 @@ pub(crate) fn instance_call(
             "sized" if args.len() >= 2 => {
                 b.width = expect_float(r, &args[0]).ok()?;
                 b.height = expect_float(r, &args[1]).ok()?;
+                b.eye_height = b.height * 0.85;
             }
             "clientTrackingRange" => b.tracking = expect_int(r, args.first()?).ok()?,
             "updateInterval" => b.interval = expect_int(r, args.first()?).ok()?,
             "fireImmune" => b.fire_immune = true,
             "noSummon" => b.summon = false,
+            "noSave" => b.serialize = false,
+            "canSpawnFarFromPlayer" => b.far_from_player = true,
+            "notInPeaceful" => b.peaceful = false,
+            "dontTrackDeltas" => b.track_deltas = false,
+            "eyeHeight" => b.eye_height = expect_float(r, args.first()?).ok()?,
+            "noUpdateInterval" => b.interval = i32::MAX,
             _ => return None,
         }
         return Some(Ok(receiver.clone()));
     }
     if marker == "net/minecraft/world/entity/EntityDimensions" {
-        let (width, height) = state.dimensions.get(&k)?;
+        let (width, height, eye_height) = state.dimensions.get(&k)?;
         return Some(Ok(match r.name.as_str() {
             "width" => Value::Float(*width),
             "height" => Value::Float(*height),
+            "eyeHeight" => Value::Float(*eye_height),
             _ => return None,
         }));
     }
@@ -341,9 +366,8 @@ pub(crate) fn instance_call(
             _ => return None,
         };
         return Some(Ok(match r.name.as_str() {
-            "getName" | "getSerializedName" | "toString" => {
-                Value::Ref(Some(name.to_ascii_lowercase()))
-            }
+            "getName" | "getSerializedName" => Value::Ref(Some(name.to_ascii_lowercase())),
+            "toString" => Value::Ref(Some(name.to_owned())),
             "getDebugAbbreviation" => Value::Ref(Some(
                 match name {
                     "MONSTER" => "MO",
@@ -367,9 +391,13 @@ pub(crate) fn instance_call(
     }
     if marker == ENTITY {
         let e = state.entities.get(&k)?;
-        let (entity_width, entity_height) = (e.width, e.height);
+        let (entity_width, entity_height, entity_eye_height) = (e.width, e.height, e.eye_height);
         let out = match (r.name.as_str(), r.descriptor.as_str()) {
             ("getCategory", _) => category_constant(&e.category),
+            ("canSerialize", "()Z") => Value::Int(e.serialize as i32),
+            ("canSpawnFarFromPlayer", "()Z") => Value::Int(e.far_from_player as i32),
+            ("isAllowedInPeaceful", "()Z") => Value::Int(e.peaceful as i32),
+            ("trackDeltas", "()Z") => Value::Int(e.track_deltas as i32),
             ("clientTrackingRange", "()I") => Value::Int(e.tracking),
             ("updateInterval", "()I") => Value::Int(e.interval),
             ("fireImmune", "()Z") => Value::Int(e.fire_immune as i32),
@@ -380,7 +408,9 @@ pub(crate) fn instance_call(
             ("getDimensions", _) => {
                 let v = handle(state, "net/minecraft/world/entity/EntityDimensions");
                 let dk = key(&v).unwrap();
-                state.dimensions.insert(dk, (entity_width, entity_height));
+                state
+                    .dimensions
+                    .insert(dk, (entity_width, entity_height, entity_eye_height));
                 return Some(Ok(v));
             }
             ("getWidth", "()F") => Value::Float(e.width),
@@ -392,7 +422,7 @@ pub(crate) fn instance_call(
     None
 }
 
-pub(crate) fn define_id(state: &mut State, class_name: &str) -> Value {
+pub(crate) fn define_id(state: &mut State, class_name: &str) -> Result<Value, NativeError> {
     let next = state.ids.entry(class_name.to_owned()).or_insert_with(|| {
         if class_name == "net/minecraft/world/entity/Entity" {
             0
@@ -406,9 +436,19 @@ pub(crate) fn define_id(state: &mut State, class_name: &str) -> Value {
             0
         }
     });
+    if *next > 254 {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some(format!(
+                "Data value id is too big with {}! (Max is 254)",
+                *next
+            )),
+            frame: None,
+        });
+    }
     let id = *next;
-    *next = next.saturating_add(1);
-    jar_object::handle(format!("{ACCESSOR}#{id}"))
+    *next += 1;
+    Ok(jar_object::handle(format!("{ACCESSOR}#{id}")))
 }
 
 pub(crate) fn accessor_id(value: &Value) -> Option<i32> {
@@ -446,6 +486,6 @@ mod tests {
         .unwrap()
         .unwrap();
         let id = define_id(&mut state, "demo/ProbeEntity");
-        assert_eq!(accessor_id(&id), Some(7));
+        assert_eq!(accessor_id(&id.unwrap()), Some(7));
     }
 }
