@@ -79,7 +79,7 @@ use std::collections::BTreeMap;
 
 use crate::runtime::events::ListenerCallback;
 use crate::runtime::neoforge_event_classes::{ABSTRACT, CANCELLABLE, EVENT_CLASSES, MOD_BUS};
-use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, parse_callback_marker};
+use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref};
 
 pub(crate) use crate::runtime::host_events::{game_bus, mod_bus};
 
@@ -189,13 +189,8 @@ fn illegal_null_pointer() -> NativeError {
 }
 
 fn raw_consumer_lambda(consumer: &Value) -> bool {
-    let Some(text) = expect_ref(consumer) else {
-        return false;
-    };
-    let Some(marker) = text
-        .strip_prefix("@indy:")
-        .and_then(|_| parse_callback_marker(text).ok())
-    else {
+    // A lambda is a callback handle (`callback_marker.rs`), never text.
+    let Some(marker) = crate::runtime::callback_marker::lambda_of(consumer) else {
         return false;
     };
     crate::runtime::descriptor_arguments(&marker.target.descriptor)
@@ -451,10 +446,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Resolve the consumer event class with a TypeResolver-style environment.
     fn consumer_event_class(&self, consumer: &Value) -> Option<String> {
-        if let Some(text) = expect_ref(consumer)
-            && text.starts_with("@indy:")
-        {
-            let marker = parse_callback_marker(text).ok()?;
+        if let Some(marker) = crate::runtime::callback_marker::lambda_of(consumer) {
             let parameters = crate::runtime::descriptor_arguments(&marker.target.descriptor);
             let raw = match parameters.last() {
                 None => return self.declaring_class(&marker.target),
@@ -559,10 +551,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `accept` of a jar object (its typed `accept(Event)` when it declares one, so the bridge's
     /// cast of a game event is not needed).
     fn consumer_callback(&self, consumer: &Value, class: &str) -> Option<ListenerCallback> {
-        if let Some(text) = expect_ref(consumer)
-            && text.starts_with("@indy:")
-        {
-            let marker = parse_callback_marker(text).ok()?;
+        if let Some(marker) = crate::runtime::callback_marker::lambda_of(consumer) {
             return Some(ListenerCallback::Indy {
                 target: marker.target,
                 captures: marker.captures,

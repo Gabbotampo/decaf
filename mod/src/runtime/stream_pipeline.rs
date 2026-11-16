@@ -377,25 +377,29 @@ pub(crate) struct Pipelines {
 /// marker text (#156's P15 moves them onto handles); the per-process random
 /// tag keeps a jar `String` constant from spelling a live stream, so a forged
 /// one is the `String` it is (`is_live_stream`).
-pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
+fn stream_tag() -> u64 {
     static TAG: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let tag = TAG.get_or_init(|| {
+    *TAG.get_or_init(|| {
         use std::hash::{BuildHasher, Hasher};
         std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish()
-    });
-    format!("stream/{class}/{method}/{n}~{tag:016x}")
+    })
 }
 
-/// Whether `text` has a stream marker's shape (`stream/...~<16 hex>`). A
-/// path that cannot ask the runtime whether a stream is live (the host's
-/// collection text) treats such a text as a stream: it is never printed,
-/// since a printed marker is a forgeable capability.
+pub(crate) fn stream_marker(class: &str, method: &str, n: usize) -> String {
+    format!("stream/{class}/{method}/{n}~{:016x}", stream_tag())
+}
+
+/// Whether `text` is a marker made by this process. The random tag is part of
+/// the capability: a jar String can publish the shape, but it cannot forge the
+/// live stream marker without learning the process-local tag.
 pub(crate) fn is_stream_marker(text: &str) -> bool {
     text.starts_with("stream/")
         && text.rsplit_once('~').is_some_and(|(_, tag)| {
-            tag.len() == 16 && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+            tag.len() == 16
+                && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && u64::from_str_radix(tag, 16).ok() == Some(stream_tag())
         })
 }
 
@@ -545,22 +549,72 @@ fn is_stream_owner(owner: &str) -> bool {
     )
 }
 
+/// The call a model makes a collection for, counted on a host that makes
+/// none.
+pub(crate) fn wanted(owner: &str, name: &str, descriptor: &str) -> crate::runtime::MethodRef {
+    crate::runtime::MethodRef {
+        owner: owner.into(),
+        name: name.into(),
+        descriptor: descriptor.into(),
+    }
+}
+
 impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// An unmodifiable `ListN` holding `values` (`Stream.toList()`,
-    /// `Collectors.toUnmodifiableList()`).
-    pub(crate) fn unmodifiable_list(&mut self, values: Vec<Value>) -> Value {
-        let fallback = crate::runtime::collection_value("list", &values);
-        self.host.unmodifiable_list(values).unwrap_or(fallback)
+    /// `Collectors.toUnmodifiableList()`); counted on a host that models none.
+    pub(crate) fn unmodifiable_list(&mut self, values: Vec<Value>) -> Result<Value, NativeError> {
+        match self.host.unmodifiable_list(values) {
+            Some(list) => Ok(list),
+            None => self.host.unknown_operand_call(&wanted(
+                "java/util/stream/Stream",
+                "toList",
+                "()Ljava/util/List;",
+            )),
+        }
     }
 
     /// A new `ArrayList` of its own holding `values` (`Collectors.toList()`).
-    pub(crate) fn new_array_list(&mut self, values: Vec<Value>) -> Value {
-        match self.host.empty_mutable_collection("list") {
-            Some(list) if self.host.holds_collection(&list) => {
-                self.host.replace_mutable_collection(&list, values);
-                list
-            }
-            _ => crate::runtime::collection_value("list", &values),
+    pub(crate) fn new_array_list(&mut self, values: Vec<Value>) -> Result<Value, NativeError> {
+        self.new_host_collection(
+            "java/util/ArrayList",
+            values,
+            ("java/util/ArrayList", "<init>", "(Ljava/util/Collection;)V"),
+        )
+    }
+
+    /// What the factory `r` answers for `values`
+    /// ([`crate::runtime::Host::factory_collection`]: Java's or Guava's unmodifiable
+    /// class, its shared empty one), counted on a host that models none.
+    pub(crate) fn factory_or_count(
+        &mut self,
+        r: &crate::runtime::MethodRef,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Result<Value, NativeError> {
+        match self
+            .host
+            .factory_collection(&r.owner, &r.name, kind, values)
+        {
+            Some(made) => Ok(made),
+            None => self.host.unknown_operand_call(r),
+        }
+    }
+
+    /// A new collection of the JDK class `class` holding `values`
+    /// ([`crate::runtime::Host::make_collection`], #156 P14d2). A host that makes none
+    /// counts `wanted`, the call that asked for one: no collection is ever
+    /// text.
+    pub(crate) fn new_host_collection(
+        &mut self,
+        class: &str,
+        values: Vec<Value>,
+        wanted: (&str, &str, &str),
+    ) -> Result<Value, NativeError> {
+        match self.host.make_collection(class, values) {
+            Some(made) => Ok(made),
+            None => self
+                .host
+                .unknown_operand_call(&self::wanted(wanted.0, wanted.1, wanted.2)),
         }
     }
 
@@ -1246,7 +1300,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                 None => crate::runtime::empty_optional(),
             },
             Terminal::Fold(_, _, value) | Terminal::Container(_, value) => value,
-            Terminal::ToMap(state) => state.finish(),
+            Terminal::ToMap(state) => self.finish_to_map(*state)?,
             Terminal::Collect(_)
             | Terminal::Forward(..)
             | Terminal::Supply(..)
@@ -2236,5 +2290,15 @@ mod tests {
             Some("java/util/function/IntUnaryOperator")
         );
         assert_eq!(parameter_class(descriptor, 4), None);
+    }
+
+    #[test]
+    fn stream_tag_rejects_a_forged_marker() {
+        let live = stream_marker("demo/Probe", "stream", 0);
+        assert!(is_stream_marker(&live));
+        let (prefix, tag) = live.rsplit_once(char::from(126)).expect("tag");
+        let replacement = if tag.as_bytes()[15] == 48 { '1' } else { '0' };
+        let forged = format!("{prefix}~{}{}", &tag[..15], replacement);
+        assert!(!is_stream_marker(&forged));
     }
 }

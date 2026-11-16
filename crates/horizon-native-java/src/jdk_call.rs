@@ -321,6 +321,18 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(body) = self.jvm_selected_jar_body(&r, opcode, Some(receiver))? {
             return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
         }
+        if name == "compareTo"
+            && crate::object_methods::is_compare_to(descriptor)
+            && !matches!(
+                receiver,
+                Value::Host(handle)
+                    if crate::jar_object::is_object_handle(handle)
+                        && !self.is_enum_object(receiver)
+            )
+        {
+            let other = args.first().unwrap_or(&Value::Ref(None));
+            return Ok(Value::Int(self.natural_order(receiver, other)?));
+        }
         if let Some(value) = self.invoke_jdk_skeleton(&r, opcode, Some(receiver), args)? {
             return Ok(value);
         }
@@ -422,7 +434,12 @@ impl<H: Host> Runtime<'_, H> {
                 limit: self.depth,
             });
         }
-        if self.budget.expired() {
+        if self.budget.wall_expired()
+            || self
+                .budget
+                .instruction_limit()
+                .is_some_and(|limit| self.instructions >= limit)
+        {
             return Err(self.budget_exceeded(&r.owner, &r.name));
         }
         self.depth += 1;

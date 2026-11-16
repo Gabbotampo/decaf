@@ -9,6 +9,9 @@
 //! server would hand a listener at `server_started`: the levels it loaded, so
 //! one overworld is `1`, and after `LevelUnload` it is `0`.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{
     ExecutionBudget, NativeJar, StdHost,
     events::{EventContext, EventFacade, EventFiring, GameEvent},
@@ -121,7 +124,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-levels-{test}-{}-{unique}",
             std::process::id()
         ));

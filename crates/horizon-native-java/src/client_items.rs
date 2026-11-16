@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{MethodRef, StdHost, Value, collection_value, component_value};
+use crate::{MethodRef, StdHost, Value, component_value};
 
 use super::{ClientSnapshot, flag, int_arg, marker};
 
@@ -34,6 +34,9 @@ pub(super) const STACK: &str = "client/stack/";
 pub(super) const ITEM: &str = "client/item/";
 pub(super) const BLOCK: &str = "client/block/";
 pub(super) const INVENTORY: &str = "client/inventory";
+
+/// The game's `NonNullList` (`extends AbstractList`).
+pub(crate) const NON_NULL_LIST: &str = "net/minecraft/core/NonNullList";
 pub(super) const EFFECT: &str = "client/effect/";
 pub(super) const EFFECT_HOLDER: &str = "client/effect-holder/";
 pub(super) const MOB_EFFECT: &str = "client/mob-effect/";
@@ -222,6 +225,17 @@ fn item_like(value: &Value) -> Option<&str> {
     text.strip_prefix(ITEM).or_else(|| text.strip_prefix(BLOCK))
 }
 
+/// The id accepted by `LivingEntity.hasEffect`/`getEffect`: a vanilla
+/// `Holder.Reference` or the older client-effect-holder façade value.
+fn effect_holder_id(value: &Value) -> Option<String> {
+    if let Some(id) = crate::host_registry_holder::registered_id(value) {
+        return Some(id);
+    }
+    crate::game_object::text(value)?
+        .strip_prefix(EFFECT_HOLDER)
+        .map(ToOwned::to_owned)
+}
+
 /// `Items.DIAMOND_SWORD` → `minecraft:diamond_sword`: every vanilla item and
 /// block constant is its id's path in upper case.
 pub(super) fn constant_id(field: &str) -> String {
@@ -365,14 +379,16 @@ impl StdHost {
                 let effects: Vec<Value> = (0..p.effects.len())
                     .map(|i| marker(format!("{EFFECT}{i}")))
                     .collect();
-                collection_value("list", &effects)
+                // `activeEffects.values()`: the game's map view, which a new
+                // list stands in for (#156 P14d2).
+                self.new_collection(crate::stand_in_class("list"), effects)
             }
             ("hasEffect", "Z") => {
-                let id = crate::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
+                let id = effect_holder_id(args.first()?)?;
                 flag(p.effects.iter().any(|e| e.id == id))
             }
             ("getEffect", _) => {
-                let id = crate::game_object::text(args.first()?)?.strip_prefix(EFFECT_HOLDER)?;
+                let id = effect_holder_id(args.first()?)?;
                 p.effects
                     .iter()
                     .position(|e| e.id == id)
@@ -544,7 +560,10 @@ impl StdHost {
             ("getNonEquipmentItems", _) => {
                 let stacks: Vec<Value> =
                     (0..36).map(|i| StackSlot::Inventory(i).marker()).collect();
-                collection_value("list", &stacks)
+                // `Inventory.items`, the inventory's one `NonNullList`: its
+                // reads answer as a `List`'s, its mutators (`NonNullList`'s
+                // own rules) are counted (#255 review).
+                self.cached_collection(&marker(INVENTORY), "items", NON_NULL_LIST, true, stacks)
             }
             ("getFreeSlot", "I") => Value::Int(
                 p.inventory
@@ -600,6 +619,10 @@ fn item_member(
     Some(match (name, returns) {
         // Item.toString: its registered name.
         ("toString", _) => marker(id.to_owned()),
+        ("asItem", _) if block => {
+            let item_id = crate::vanilla_block_items::item_id(id)?;
+            marker(format!("{ITEM}{item_id}"))
+        }
         ("asItem", _) => item,
         ("getDescriptionId", _) => marker(format!(
             "{}.{namespace}.{path}",

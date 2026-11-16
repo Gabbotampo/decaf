@@ -285,7 +285,7 @@ impl<H: Host> Runtime<'_, H> {
             if *array == Value::Ref(None) {
                 return None;
             }
-            runtime.array(array).ok().cloned()
+            runtime.array(array).ok().map(std::borrow::Cow::into_owned)
         };
         match (r.owner.as_str(), r.name.as_str()) {
             ("java/util/List", "of") if varargs => {
@@ -318,7 +318,7 @@ impl<H: Host> Runtime<'_, H> {
                     if *entry == Value::Ref(None) {
                         return Err(thrown("java/lang/NullPointerException", None));
                     }
-                    let Ok((key, value)) = map_entry_parts(entry) else {
+                    let Some((key, value)) = self.host.map_entry_parts(entry) else {
                         return Ok(None);
                     };
                     pairs.extend([key, value]);
@@ -361,7 +361,12 @@ impl<H: Host> Runtime<'_, H> {
         let size = self
             .collection_elements(value)
             .map_or(0, |entries| entries.len());
-        size / if map { 2 } else { 1 } >= 2
+        let random = size / if map { 2 } else { 1 } >= 2;
+        if random {
+            self.host
+                .mark_nondeterministic("java-random-immutable-iteration");
+        }
+        random
     }
 
     /// The class of a `Set.of`/`Map.of` this module laid out.
@@ -398,10 +403,51 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb9)) else {
             return self.unordered_argument(r, args);
         };
+        // SetFromMap is a live mutable view; its retain/remove operations must
+        // reach the backing map through hash collection dispatch.
+        if self.host.is_set_from_map(receiver) {
+            return Ok(None);
+        }
+        if let ("equals", "(Ljava/lang/Object;)Z", [other]) =
+            (r.name.as_str(), r.descriptor.as_str(), args)
+            && matches!(
+                other,
+                Value::Host(handle)
+                    if matches!(
+                        handle.kind(),
+                        crate::runtime::host_ref::HostKind::KotlinEnumEntries
+                            | crate::runtime::host_ref::HostKind::KotlinEmptyCollection
+                    )
+            )
+            && let (Some(left_kind), Some(right_kind)) = (
+                self.host_collection_kind(receiver),
+                self.host_collection_kind(other),
+            )
+            && left_kind == right_kind
+        {
+            let left = self.collection_elements(receiver)?;
+            let right = self.collection_elements(other)?;
+            if left_kind == object_methods::CollectionKind::List {
+                if left.len() != right.len() {
+                    return Ok(Some(Value::Int(0)));
+                }
+                for (left, right) in left.iter().zip(&right) {
+                    if !self.objects_equals(left, right)? {
+                        return Ok(Some(Value::Int(0)));
+                    }
+                }
+                return Ok(Some(Value::Int(1)));
+            }
+            return Ok(Some(Value::Int(
+                (left.is_empty() && right.is_empty()) as i32,
+            )));
+        }
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_MAP) {
             return self.identity_map_member(r, receiver, args);
         }
-        if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET) {
+        if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET)
+            && !self.host.is_set_from_map(receiver)
+        {
             return self.identity_set_member(r, receiver, args);
         }
         if let Some(answer) = self.identity_view_member(r, receiver, args)? {
@@ -835,9 +881,12 @@ impl<H: Host> Runtime<'_, H> {
         let ambiguous = wanted.iter().any(|value| match kind.as_deref() {
             Some("keySet") => unknown(self, value, &keys),
             Some("values") => unknown(self, value, &values),
-            Some("entrySet") => map_entry_parts(value).is_ok_and(|(key, value)| {
-                unknown(self, &key, &keys) || unknown(self, &value, &values)
-            }),
+            Some("entrySet") => self
+                .host
+                .map_entry_parts(value)
+                .is_some_and(|(key, value)| {
+                    unknown(self, &key, &keys) || unknown(self, &value, &values)
+                }),
             _ => false,
         });
         if ambiguous {

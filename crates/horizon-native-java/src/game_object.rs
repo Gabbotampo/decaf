@@ -72,7 +72,7 @@ pub(crate) fn kind_of(marker: &str) -> Option<HostKind> {
     }
     let (family, _) = marker.split_once('/')?;
     Some(match family {
-        "block-pos" | "level-resource" | "key-category" => HostKind::GameValue,
+        "block-pos" | "level-resource" | "key-category" | "sound-event" => HostKind::GameValue,
         "game-rule" => HostKind::GameRegistryObject,
         "made" => HostKind::GameTransient,
         _ => return None,
@@ -104,7 +104,7 @@ fn client_kind(rest: &str) -> HostKind {
         // `OptionInstance`s and vanilla `KeyMapping`s: one per name.
         "option" | "vanilla-key" => HostKind::GameSingleton,
         name if key.is_empty() && CLIENT_SINGLETONS.contains(&name) => HostKind::GameSingleton,
-        "item" | "block" | "mob-effect" | "effect-holder" | "particle-type" => {
+        "item" | "block" | "mob-effect" | "effect-holder" | "attribute" | "particle-type" => {
             HostKind::GameRegistryObject
         }
         "style" | "text-color" | "vec3" | "awt-color" => HostKind::GameValue,
@@ -397,11 +397,14 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (_, "block-pos") => &["net/minecraft/core/BlockPos"],
         (_, "level-resource") => &["net/minecraft/world/level/storage/LevelResource"],
         (_, "game-rule") => &["net/minecraft/world/level/gamerules/GameRule"],
+        (_, "sound-event") => &["net/minecraft/sounds/SoundEvent"],
         (true, "minecraft") => &["net/minecraft/client/Minecraft"],
         (true, "level") => &["net/minecraft/client/multiplayer/ClientLevel"],
         (true, "player") => &["net/minecraft/client/player/LocalPlayer"],
         (true, "stack") => &["net/minecraft/world/item/ItemStack"],
         (true, "item") => &["net/minecraft/world/item/Item"],
+        (true, "mob-effect") => &["net/minecraft/world/effect/MobEffect"],
+        (true, "attribute") => &["net/minecraft/world/entity/ai/attributes/Attribute"],
         (true, "block") => &["net/minecraft/world/level/block/Block"],
         (true, "style") => &["net/minecraft/network/chat/Style"],
         (true, "text-color") => &["net/minecraft/network/chat/TextColor"],
@@ -520,6 +523,9 @@ pub(crate) const ENTITY_METHODS: Methods = Methods {
 pub(crate) const VALUE_METHODS: Methods = Methods {
     to_string: |handle, _| {
         let key = handle.key();
+        if let Some(value) = crate::sound_event::to_string(key) {
+            return Ok(Some(value));
+        }
         if let Some(name) = input_key_name(key) {
             return Ok(Some(name));
         }
@@ -527,9 +533,17 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
     },
     hash_code: |handle, _| {
         let key = handle.key();
-        Ok(crate::client_values::hash_code(key).or_else(|| crate::server_values::hash_code(key)))
+        Ok(crate::sound_event::hash_code(key)
+            .or_else(|| crate::client_values::hash_code(key))
+            .or_else(|| crate::server_values::hash_code(key)))
     },
     equals: |handle, other, nested| {
+        if let Value::Host(other) = other
+            && other.kind() == HostKind::GameValue
+            && let Some(result) = crate::sound_event::equals_keys(handle.key(), other.key())
+        {
+            return Ok(Some(result));
+        }
         // A jar's own `BlockPos`/`LevelResource` compares by the key its
         // fields spell (`jar_server_values.rs`); unread fields stay counted.
         let jar_key = match crate::jar_object::is_object(other)

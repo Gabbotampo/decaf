@@ -29,7 +29,8 @@
 //! or edits the node stops at the node's first member, which names it.
 //!
 //! **The bound.** Every call runs on a strict host (an unmodelled host call
-//! fails instead of answering a neutral value) under its own 250 ms budget.
+
+//! fails instead of answering a neutral value) under its own deterministic instruction budget and distant wall-clock hang guard.
 //! A failure in steps 1–3, 5 or 6 refuses the whole config with the step and
 //! the member it stopped at; a failure in one `shouldApplyMixin` (or its
 //! `preApply`/`postApply`) refuses that Mixin only, and the session goes on,
@@ -49,9 +50,10 @@
 
 use super::*;
 
-/// The wall-clock bound of one plugin call.
-pub(crate) const CONFIG_PLUGIN_CALL_BUDGET: std::time::Duration =
-    std::time::Duration::from_millis(250);
+/// The deterministic interpreter-step bound of one plugin call.
+pub(crate) const CONFIG_PLUGIN_CALL_INSTRUCTIONS: usize = 2_000_000;
+/// A distant final hang guard; normal refusal names the instruction bound.
+pub(crate) const CONFIG_PLUGIN_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Companion Mixins one `getMixins()` may add.
 const MAX_COMPANION_MIXINS: usize = 512;
@@ -327,7 +329,10 @@ impl NativeJar {
                 name: name.into(),
                 descriptor: descriptor.into(),
             };
-            let budget = ExecutionBudget::within(CONFIG_PLUGIN_CALL_BUDGET);
+            let budget = ExecutionBudget::deterministic(
+                CONFIG_PLUGIN_CALL_INSTRUCTIONS,
+                CONFIG_PLUGIN_WALL_CAP,
+            );
             self.invoke_persistent(&target, Some(this.clone()), args, host, &budget)
                 .map(Some)
                 .map_err(|error| format!("{name}: {}", failure_text(&error)))
@@ -414,21 +419,20 @@ impl NativeJar {
             .flat_map(|mixin| self.mixin_class_targets(&mixin.replace('.', "/")))
             .map(|target| binary_name(&target))
             .collect::<BTreeSet<_>>();
-        let set = |names: &BTreeSet<String>| {
-            collection_value(
-                "set",
-                &names
-                    .iter()
-                    .map(|name| java_text(Some(name)))
-                    .collect::<Vec<_>>(),
-            )
+        // Two sets of their own (#156 P14d2); a host that makes none cannot
+        // run the session.
+        let mut set = |names: &BTreeSet<String>| {
+            let names = names.iter().map(|name| java_text(Some(name))).collect();
+            host.make_collection(crate::runtime::stand_in_class("set"), names)
+                .ok_or_else(|| "acceptTargets: the host makes no collections".to_owned())
         };
+        let targets = [set(&kept_targets)?, set(&other_targets)?];
         required(
             call(
                 host,
                 "acceptTargets",
                 "(Ljava/util/Set;Ljava/util/Set;)V",
-                &[set(&kept_targets), set(&other_targets)],
+                &targets,
             )?,
             "acceptTargets",
         )?;

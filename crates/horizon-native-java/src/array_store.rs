@@ -121,7 +121,7 @@ impl<H: Host> Runtime<'_, H> {
     /// object a jar constructed, an enum constant) against a final
     /// component (only that class fits), a component it is, or a component
     /// the runtime can rule out (a jar class whose chain ends at `Object`,
-    /// `Object` itself); a lambda against a final component.
+    /// `Object` itself).
     pub(crate) fn store_fits(&self, component: &str, value: &Value) -> Option<bool> {
         if *value == Value::Ref(None) || component == "java/lang/Object" {
             return Some(true);
@@ -178,14 +178,6 @@ impl<H: Host> Runtime<'_, H> {
                 "java/lang/Object" => Some(false),
                 _ => crate::jdk_model::class_instance_of(class, component).then_some(true),
             };
-        }
-        if text.starts_with("@indy:") {
-            // A lambda's hidden class is no `String`, box or `Class`.
-            if FINAL_COMPONENTS.contains(&component) {
-                return Some(false);
-            }
-            self.class(component)?;
-            return self.known_instance_of(value, component);
         }
         // A `String` or a host marker whose class is unknown (a `Class` is
         // a handle, #156 P13c). A `String`'s components fit, or this is

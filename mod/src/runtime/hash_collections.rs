@@ -384,7 +384,11 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 None
             };
-            table.insert(entry, hash);
+            table.insert(entry, hash)?;
+        }
+        if table.order_unknown() {
+            self.host
+                .mark_nondeterministic("java-random-hash-collection-order");
         }
         if table.linked || table.order_unknown() {
             return Ok(());
@@ -485,7 +489,19 @@ impl<H: Host> Runtime<'_, H> {
                         continue;
                     }
                     match handle.equals(&stored, &mut object_methods::RuntimeNested::new(self))? {
-                        Some(true) => return Ok(Lookup::Found(stored)),
+                        // An equal key whose hash is unknown here is found only where Java's
+                        // hashes surely agree: the very same object, or a kind whose equal
+                        // values always hash alike. Anything that may hold a Gson element
+                        // (`JsonPrimitive` `1` and `1.0` are equal with different hashes),
+                        // directly or inside a list, entry or `Optional`, may sit in another
+                        // bucket in Java: unknown (#221 review 5, B9).
+                        Some(true)
+                            if object_methods::identical(key, &stored)
+                                || keeps_hash_contract(handle.kind()) =>
+                        {
+                            return Ok(Lookup::Found(stored));
+                        }
+                        Some(true) => unknown = true,
                         Some(false) => {}
                         None => unknown = true,
                     }
@@ -565,6 +581,15 @@ impl<H: Host> Runtime<'_, H> {
     /// that would show an unknown order, and answer the members that look a
     /// key up. `args[0]` may be replaced by the stored key it `equals`
     /// (`compute*`/`merge`), for the rest of the dispatch to find.
+    fn refresh_set_from_map(&mut self, value: &Value) -> Result<(), NativeError> {
+        if self.host.is_set_from_map(value)
+            && let Some(map) = self.host.set_from_map_source(value)
+        {
+            self.resync_hash_table(&map)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn invoke_hash_collection(
         &mut self,
         r: &MethodRef,
@@ -572,6 +597,15 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &mut [Value],
     ) -> Result<Option<Value>, NativeError> {
+        // A SetFromMap's order is its backing HashMap/LinkedHashMap's order.
+        // Refresh the table for both the receiver and any collection argument,
+        // so copying/printing the view sees the same live order as the map.
+        if let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb7 | 0xb9)) {
+            self.refresh_set_from_map(receiver)?;
+        }
+        for arg in args.iter() {
+            self.refresh_set_from_map(arg)?;
+        }
         if let Some(answer) = self.map_view_copy(r, opcode, receiver, args)? {
             return Ok(answer);
         }
@@ -603,7 +637,12 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(marker) = expect_ref(arg)
                 && let Some(table) = self.host.take_hash_table(marker)
             {
-                tainted_argument |= table.order_unknown();
+                let order_unknown = table.order_unknown();
+                if order_unknown {
+                    self.host
+                        .mark_nondeterministic("java-random-hash-collection-order");
+                }
+                tainted_argument |= order_unknown;
                 self.host.store_hash_table(marker, table);
             }
         }
@@ -672,6 +711,10 @@ impl<H: Host> Runtime<'_, H> {
                 let function = function.clone();
                 let unknown = self.host.take_hash_table(&marker).map(|table| {
                     let unknown = table.order_unknown();
+                    if unknown {
+                        self.host
+                            .mark_nondeterministic("java-random-hash-collection-order");
+                    }
                     self.host.store_hash_table(&marker, table);
                     unknown
                 });
@@ -688,6 +731,10 @@ impl<H: Host> Runtime<'_, H> {
                 let callback = callback.clone();
                 let unknown = self.host.take_hash_table(&marker).map(|table| {
                     let unknown = table.order_unknown();
+                    if unknown {
+                        self.host
+                            .mark_nondeterministic("java-random-hash-collection-order");
+                    }
                     self.host.store_hash_table(&marker, table);
                     unknown
                 });
@@ -763,6 +810,16 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return self.count_and_continue(r).map(Some);
             }
+            // A `keySet()`/`entrySet()` copy is an `AbstractSet`: `equals` is `containsAll` of
+            // the other set's elements, so a map's nodes and another map's holders with equal
+            // contents are equal (`HashMap.entrySet().equals(Map.of(..).entrySet())`).
+            if let Some(other) = args.first()
+                && self.host_collection_kind(receiver) == Some(object_methods::CollectionKind::Set)
+                && self.host_collection_kind(other) == Some(object_methods::CollectionKind::Set)
+            {
+                let equal = self.abstract_set_equals(receiver, other)?;
+                return Ok(Some(Some(Value::Int(i32::from(equal)))));
+            }
         }
         if !matches!(r.name.as_str(), "keySet" | "values" | "entrySet")
             || !args.is_empty()
@@ -775,6 +832,10 @@ impl<H: Host> Runtime<'_, H> {
             self.resync_hash_table(receiver)?;
             let table = self.take_table(&marker, kind);
             let unknown = table.order_unknown();
+            if unknown {
+                self.host
+                    .mark_nondeterministic("java-random-hash-collection-order");
+            }
             self.host.store_hash_table(&marker, table);
             if unknown {
                 self.host.unknown_operand_call(r)?;
@@ -803,17 +864,21 @@ impl<H: Host> Runtime<'_, H> {
             let contents: Vec<Value> = match self.host.view_copy_kind(&view).as_deref() {
                 Some("keySet") => entries.iter().step_by(2).cloned().collect(),
                 Some("values") => entries.iter().skip(1).step_by(2).cloned().collect(),
-                Some("entrySet") => entries
-                    .chunks(2)
-                    .filter_map(|pair| match pair {
-                        [key, value] => Some(map_entry_value(key, value)),
-                        _ => None,
-                    })
-                    .collect(),
+                // The map's nodes (`host_map_entry.rs`): every reading of one is one object.
+                Some("entrySet") => self.host.mint_map_entries(
+                    &crate::runtime::jar_object::stored_value(marker),
+                    &entries,
+                    crate::runtime::host_map_entry::EntryMade::Node,
+                ),
                 _ => continue,
             };
             self.host
                 .replace_mutable_collection(&crate::runtime::jar_object::stored_value(&view), contents);
+            // An entry view's members hash by their values, which the call may have changed:
+            // its table is laid out afresh (Java's `EntrySet` looks keys up in the map).
+            if self.host.view_copy_kind(&view).as_deref() == Some("entrySet") {
+                let _ = self.host.take_hash_table(&view);
+            }
         }
     }
 
@@ -851,6 +916,10 @@ impl<H: Host> Runtime<'_, H> {
             self.resync_hash_table(map)?;
             let table = self.take_table(&marker, table_kind);
             let unknown = table.order_unknown();
+            if unknown {
+                self.host
+                    .mark_nondeterministic("java-random-hash-collection-order");
+            }
             self.host.store_hash_table(&marker, table);
             if unknown {
                 return self.count_and_continue(r);
@@ -910,7 +979,12 @@ impl<H: Host> Runtime<'_, H> {
             let element = match kind {
                 "keySet" => key.clone(),
                 "values" => value,
-                _ => map_entry_value(&key, &value),
+                _ => self.host.mint_map_entry(
+                    Some(map),
+                    &key,
+                    &value,
+                    crate::runtime::host_map_entry::EntryMade::Node,
+                ),
             };
             self.run_functional(
                 (
@@ -1059,6 +1133,10 @@ impl<H: Host> Runtime<'_, H> {
                     .and_then(|marker| {
                         let table = self.host.take_hash_table(&marker)?;
                         let unknown = table.order_unknown();
+                        if unknown {
+                            self.host
+                                .mark_nondeterministic("java-random-hash-collection-order");
+                        }
                         self.host.store_hash_table(&marker, table);
                         Some(unknown)
                     })
@@ -1111,7 +1189,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Lookup::Absent => {
                     let capacity = table.capacity();
-                    table.insert(key, hash);
+                    table.insert(key, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1146,7 +1224,7 @@ impl<H: Host> Runtime<'_, H> {
             Lookup::Absent => {
                 entries.extend([key.clone(), value]);
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(key, hash);
+                table.insert(key, hash)?;
                 Ok(Some(Value::Ref(None)))
             }
         }
@@ -1169,7 +1247,7 @@ impl<H: Host> Runtime<'_, H> {
                     && self.is_synced(&marker, table)
                 {
                     let capacity = table.capacity();
-                    table.insert(element, hash);
+                    table.insert(element, hash)?;
                     let mirrors = self.place_new_entry(
                         &marker,
                         table,
@@ -1184,7 +1262,7 @@ impl<H: Host> Runtime<'_, H> {
                 let mut entries = self.collection_elements(receiver)?;
                 entries.push(element.clone());
                 self.host.replace_mutable_collection(receiver, entries);
-                table.insert(element, hash);
+                table.insert(element, hash)?;
                 Ok(Some(true))
             }
         }
@@ -1290,7 +1368,7 @@ impl<H: Host> Runtime<'_, H> {
         source: &Value,
     ) -> Result<(), NativeError> {
         let entries = self.collection_elements(source)?;
-        table.presize(entries.len() / 2);
+        table.presize(entries.len() / 2)?;
         for pair in entries.chunks(2) {
             let [key, value] = pair else { continue };
             if self
@@ -1356,6 +1434,10 @@ impl<H: Host> Runtime<'_, H> {
         args: &mut [Value],
     ) -> Result<Option<Value>, NativeError> {
         let unknown = table.order_unknown();
+        if unknown {
+            self.host
+                .mark_nondeterministic("java-random-hash-collection-order");
+        }
         if unknown && !order_insensitive(&r.name) {
             return self.count_and_continue(r);
         }
@@ -1720,4 +1802,44 @@ fn concurrent_modification_or_npe(cme: bool) -> NativeError {
         message: None,
         frame: None,
     }
+}
+
+/// Whether two equal host values of `kind` always have equal Java hashes, whatever they hold:
+/// values (types, tokens, reflective members, ids and keys, `UUID`, `Duration`...) whose
+/// `equals` and `hashCode` read the same fields of the same consistent types. A kind that can
+/// hold arbitrary objects (a collection, an entry, an `Optional`, a pair, a Gson element, a jar
+/// or game object) is not: an equal one may hash differently in Java (#221 review 5, B9).
+fn keeps_hash_contract(kind: crate::runtime::host_ref::HostKind) -> bool {
+    use crate::runtime::host_ref::HostKind as K;
+    matches!(
+        kind,
+        K::Path
+            | K::FmlPath
+            | K::Identifier
+            | K::ResourceKey
+            | K::TagKey
+            | K::BlockItemId
+            | K::MethodType
+            | K::ReflectField
+            | K::ReflectMethod
+            | K::ReflectConstructor
+            | K::Class
+            | K::ReflectType
+            | K::AnnotatedType
+            | K::GsonType
+            | K::TypeToken
+            | K::GsonTypeToken
+            | K::Collector
+            | K::Uuid
+            | K::Duration
+            | K::Uri
+            | K::Locale
+            | K::TimeUnit
+            | K::CodingErrorAction
+            | K::UnicodeBlock
+            | K::ArtifactVersion
+            | K::WorldVersion
+            | K::StackTraceElement
+            | K::Module
+    )
 }

@@ -63,8 +63,18 @@ impl<H: Host> Runtime<'_, H> {
         ) else {
             return Ok(None);
         };
+        let source_display = args
+            .first()
+            .map(crate::runtime::host_path::path_text)
+            .unwrap_or_default()
+            .to_owned();
+        let target_display = args
+            .get(1)
+            .map(crate::runtime::host_path::path_text)
+            .unwrap_or_default()
+            .to_owned();
         let options = match args.get(2) {
-            Some(value @ Value::Host(_)) => self.array(value)?.clone(),
+            Some(value @ Value::Host(_)) => self.array(value)?.into_owned(),
             _ => Vec::new(),
         };
         let (mut atomic, mut replace, mut attributes) = (false, false, false);
@@ -101,9 +111,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.unknown_operand_call(r).map(Some);
             }
             let message = if atomic {
-                format!("{source} -> {target}")
+                format!("{source_display} -> {target_display}")
             } else {
-                source
+                source_display
             };
             return Err(thrown("java/nio/file/NoSuchFileException", Some(message)));
         };
@@ -115,7 +125,7 @@ impl<H: Host> Runtime<'_, H> {
             if !replace {
                 return Err(thrown(
                     "java/nio/file/FileAlreadyExistsException",
-                    Some(target),
+                    Some(target_display.clone()),
                 ));
             }
         }
@@ -134,16 +144,21 @@ impl<H: Host> Runtime<'_, H> {
             attributes,
             text.is_empty(),
         );
+        let bytes = self.io_file_bytes.get(&source).cloned();
         if moving {
             self.io_dirs.remove(&source);
             self.io_files.remove(&source);
+            self.io_file_bytes.remove(&source);
         }
         if directory {
             self.io_dirs.insert(target.clone());
         } else {
             self.io_dirs.remove(&target);
         }
-        self.io_files.insert(target, text);
+        self.io_store_file(target.clone(), text)?;
+        if let Some(bytes) = bytes {
+            self.io_file_bytes.insert(target, bytes);
+        }
         Ok(Some(answer))
     }
 }

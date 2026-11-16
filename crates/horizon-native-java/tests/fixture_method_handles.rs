@@ -8,6 +8,9 @@
 //! The expected strings are what `java` 27 prints for the same `Probe`
 //! methods, not values read back from the interpreter.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -173,7 +176,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-method-handles-{test}-{}-{unique}",
             std::process::id()
         ));

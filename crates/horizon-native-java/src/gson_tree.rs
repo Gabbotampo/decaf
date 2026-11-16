@@ -65,7 +65,8 @@
 
 use super::*;
 
-mod parse;
+pub(crate) mod parse;
+mod typed;
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";
@@ -168,6 +169,12 @@ fn kind_of(marker: &str) -> Option<Kind> {
 
 /// The kind of a tree object, `None` for any other value (a `String`
 /// spelling one's key included).
+/// Whether `value` is a Gson tree element the host models (`JsonObject`, `JsonArray`,
+/// `JsonPrimitive`, `JsonNull`).
+pub(crate) fn is_tree_element(value: &Value) -> bool {
+    value_kind(value).is_some()
+}
+
 fn value_kind(value: &Value) -> Option<Kind> {
     crate::jar_object::object_key(value).and_then(kind_of)
 }
@@ -701,6 +708,46 @@ fn check_number(number: &Num, lenient: bool) -> NumberCheck {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// Convert a runtime-owned Gson tree back to the bounded parser shape for
+    /// the reflective fromJson adapter (`fromJson(JsonElement, Class)`).
+    pub(crate) fn gson_tree_to_parsed(
+        &mut self,
+        value: &Value,
+    ) -> Option<crate::gson_tree::parse::Tree> {
+        let marker = crate::jar_object::object_key(value)?.to_owned();
+        match kind_of(&marker)? {
+            Kind::Null => Some(crate::gson_tree::parse::Tree::Null),
+            Kind::Lazy => self
+                .lazy_text(&marker)
+                .map(crate::gson_tree::parse::Tree::Num),
+            Kind::Primitive => match self.primitive_of(&marker)? {
+                Prim::Str(text) => Some(crate::gson_tree::parse::Tree::Str(text)),
+                Prim::Bool(value) => Some(crate::gson_tree::parse::Tree::Bool(value)),
+                Prim::Num(value) => self.gson_tree_to_parsed(&value),
+            },
+            Kind::Array => {
+                let elements = self.elements_of(&marker)?;
+                let values = crate::runtime_collection_values(self.host, &elements).ok()?;
+                values
+                    .iter()
+                    .map(|value| self.gson_tree_to_parsed(value))
+                    .collect::<Option<Vec<_>>>()
+                    .map(crate::gson_tree::parse::Tree::Array)
+            }
+            Kind::Object => {
+                let members = self.members_of(&marker)?;
+                let values = crate::runtime_collection_values(self.host, &members).ok()?;
+                let mut fields = Vec::with_capacity(values.len() / 2);
+                for pair in values.as_chunks::<2>().0 {
+                    let key = crate::expect_ref(&pair[0])?.clone();
+                    fields.push((key, self.gson_tree_to_parsed(&pair[1])?));
+                }
+                Some(crate::gson_tree::parse::Tree::Object(fields))
+            }
+            Kind::Map => None,
+        }
+    }
+
     /// The Gson tree surface: `JsonElement`'s four kinds,
     /// `LazilyParsedNumber` and `JsonObject.asMap()`'s map. `Ok(None)` leaves
     /// the call to the rest of the dispatch chain.
@@ -1613,7 +1660,11 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `JsonElement.equals(other)` for a tree element; `None` when a number
     /// the comparison needs cannot be typed.
-    fn element_equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+    pub(crate) fn element_equals(
+        &mut self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<bool>, NativeError> {
         // One level of a nested element (#250): a cycle ends in a `StackOverflowError`.
         let _level = crate::host_recursion::enter()?;
         if a == b && *a != Value::Ref(None) {
@@ -1713,7 +1764,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `JsonElement.hashCode()`; `None` for a `JsonNull` anywhere (an
     /// identity hash) or an untypeable number.
-    fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+    pub(crate) fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
         // One level of a nested element (#250): a cycle ends in a `StackOverflowError`.
         let _level = crate::host_recursion::enter()?;
         let Some(kind) = value_kind(value) else {
