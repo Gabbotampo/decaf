@@ -7703,55 +7703,7 @@ impl Host for StdHost {
                 }
                 Ok(path_value(text))
             }
-            // The virtual filesystem keeps no files of its own: a path is
-            // readable only when the caller seeded the same resource name.
-            // A read of anything else reports Java's `IOException`, which a
-            // config bootstrap catches and answers by writing defaults; it
-            // never becomes a null that a later `String.split` NPEs on.
-            ("java/nio/file/Files", "exists" | "notExists", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                let exists = self.resource(path.trim_start_matches('/')).is_some();
-                Ok(Value::Int(i32::from(if r.name == "exists" {
-                    exists
-                } else {
-                    !exists
-                })))
-            }
-            ("java/nio/file/Files", "readString", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                match self.resource(path.trim_start_matches('/')) {
-                    Some(text) => Ok(Value::Ref(Some(text.to_owned()))),
-                    None => Err(NativeError::UncaughtException {
-                        class: "java/io/IOException".into(),
-                        message: Some(format!("{path}: no such file")),
-                        frame: None,
-                    }),
-                }
-            }
-            (
-                "java/nio/file/Files",
-                "createDirectories" | "createFile" | "write" | "writeString" | "delete"
-                | "deleteIfExists",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                Ok(Self::argument(r, args, 0)?.clone())
-            }
-            // Moves and copies the file model can't make (`files_move.rs`)
-            // are counted: answering the target did nothing.
-            ("java/nio/file/Files", "move" | "copy", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                self.unknown_host_call(r)
-            }
-            (
-                "java/nio/file/Files",
-                "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
+            // Filesystem state is modelled by Runtime::io_files/io_dirs in invoke_io.
             // `ResourceKey.create(registryKey, id)` interns the key of
             // `registryKey.identifier()` and `id` (`host_ids.rs`).
             ("net/minecraft/resources/ResourceKey", "create", descriptor)
@@ -26374,6 +26326,10 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         Value::Int(0)
                     }
+                    ("isReadable", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => Value::Int(i32::from(self.io_files.contains_key(&path))),
+                    ("isDirectory", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => Value::Int(i32::from(self.io_dirs.contains(&path))),
+                    ("isRegularFile", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => Value::Int(i32::from(self.io_files.contains_key(&path) && !self.io_dirs.contains(&path))),
+                    ("isSymbolicLink" | "isExecutable", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => Value::Int(0),
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
