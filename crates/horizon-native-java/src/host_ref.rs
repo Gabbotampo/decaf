@@ -334,6 +334,8 @@ pub enum HostKind {
     GuavaCacheBuilder,
     /// Guava `CacheLoader.from(function)`: key the function.
     GuavaCacheLoader,
+    /// A Guava multimap or one of its live views: key its concrete class and serial.
+    GuavaMultimap,
     /// The thread callbacks run on (`host_jdk.rs`): key `main`.
     Thread,
     /// A logger: key `of_values([api, name])`.
@@ -1614,6 +1616,13 @@ const KINDS: &[KindInfo] = &[
         // A fresh loader per `from`.
         canonical: never_canonical,
         methods: &crate::host_executors::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::GuavaMultimap,
+        tag: "gmm",
+        class: ClassRule::FromKey(crate::jar_object::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::jar_object::JAR_OBJECT,
     },
     KindInfo {
         kind: HostKind::Thread,
