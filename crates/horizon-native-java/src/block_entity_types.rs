@@ -67,7 +67,7 @@ mod tests {
     use super::*;
     #[test]
     fn captured_fields_return_canonical_handles() {
-        for line in include_str!("../tests/oracles/block_entity_types_all_java25.txt").lines() {
+        for line in include_str!("block_entity_types_all_java25.txt").lines() {
             let (name, id) = line.split_once("=").expect("oracle row");
             let id = id.strip_prefix("minecraft:").expect("minecraft id");
             let r = MethodRef {
