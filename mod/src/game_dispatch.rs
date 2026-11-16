@@ -857,6 +857,15 @@ mod tests {
             let mismatches = observations
                 .iter()
                 .filter(|observation| observation.callbacks != Some(1))
+                .map(|observation| {
+                    format!(
+                        "callbacks={:?}, error={:?}, failed={}, unknown={}",
+                        observation.callbacks,
+                        observation.error,
+                        observation.failed,
+                        observation.unknown
+                    )
+                })
                 .collect::<Vec<_>>();
             panic!("dispatch counts={counts:?}; mismatches={mismatches:?}");
         }
