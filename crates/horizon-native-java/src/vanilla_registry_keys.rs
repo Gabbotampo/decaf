@@ -16,3 +16,16 @@ mod tests {
   assert_eq!(static_field(&r), Some(crate::host_ids::resource_key_named("minecraft:enchantment","knockback")));
  }
 }
+#[cfg(test)]
+mod captured_walk_tests {
+ use super::*;
+ #[test] fn all_captured_rows_are_correct_and_interned() {
+  let mut correct=0; let mut counted=0; let mut wrong=0;
+  for line in include_str!("vanilla_enchantments_capture.txt").lines() {
+   let mut p=line.split('|'); let name=p.next().unwrap(); let registry=p.next().unwrap(); let location=p.next().unwrap();
+   let r=MethodRef{owner:ENCHANTMENTS.into(),name:name.into(),descriptor:KEY.into()};
+   match static_field(&r) { Some(Value::Host(_)) => { correct+=1; let constructed=crate::host_ids::resource_key_named(registry, location.strip_prefix("minecraft:").unwrap()); assert_eq!(static_field(&r), Some(constructed)); }, None => counted+=1, _ => wrong+=1 }
+  }
+  assert_eq!((correct,counted,wrong),(43,0,0));
+ }
+}
