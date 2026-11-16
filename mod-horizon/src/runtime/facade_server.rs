@@ -1,0 +1,960 @@
+//! Server-wide facts the game-object façades answer from.
+//!
+//! Both façades a Java callback can meet, the event listeners'
+//! (`events.rs`) and the game-hook tier's (`game_hooks.rs`), stand a few
+//! bounded markers in for the live `MinecraftServer`, its levels and players.
+//! The members those markers answered first were per-object facts (a UUID, a
+//! position, a tick count). The ones real jars reach next are about the server
+//! as a whole, and were measured as the most common refusals on a dedicated
+//! server with the corpus' listening jars (7 November 2026, 172 jars, 99
+//! refused callbacks): `MinecraftServer#getWorldPath` blocked 18 callbacks,
+//! `registryAccess` 10, `getGameRules` 4. This module answers them from a
+//! [`ServerFacts`] snapshot the game fills from its own state:
+//!
+//! - **World path.** `getWorldPath(LevelResource)` is the world folder with
+//!   the resource's id resolved under it, exactly as vanilla's
+//!   `LevelStorageAccess.getLevelPath` builds it (`world/.` for `ROOT`). The
+//!   folder is spelled inside the interpreter's virtual game folder
+//!   (`/horizon/game/...`, the same root `FabricLoader.getGameDir` answers),
+//!   because the interpreter's file system is virtual: a mod that reads a
+//!   file there finds none and writes defaults, as on a fresh world.
+//! - **Game rules.** `getGameRules()` (server or level) is one rules marker;
+//!   `GameRules.<RULE>` statics are `game-rule/<id>` markers (every 26.3 rule
+//!   id is its field name in lower case, checked against the server jar), and
+//!   `get(rule)` answers the boxed value the game holds now.
+//! - **Registries.** `registryAccess()` (server, level or player) is one
+//!   registry-access marker; `lookupOrThrow(key)` answers a registry marker
+//!   for a registry the game listed, whose `containsKey`, `keySet` and `size`
+//!   answer from the ids it holds; `keySet` iterates in vanilla's `HashMap`
+//!   order, rebuilt from the registration order the game gives. A registry
+//!   the game did not list refuses: unknown to Horizon is not the same as
+//!   missing in vanilla.
+//! - **Networking.** `ServerPlayNetworking.canSend(player, type)` answers
+//!   whether that player's client takes the channel ([`ServerFacts::client_channels`]).
+//!
+//! A second round (same corpus pack grown to 204 jars, 94 refused callbacks)
+//! added what came next by count:
+//!
+//! - **Saved data.** `getDataStorage()` (server or level) is the one storage
+//!   `facade_saved_data.rs` keeps (8 callbacks).
+//! - **The server thread.** A callback runs on the server thread, so
+//!   `getRunningThread()` is the thread `Thread.currentThread()` answers, and
+//!   `execute(runnable)`/`executeIfPossible` run the runnable at once, as
+//!   vanilla's `BlockableEventLoop.execute` does on its own thread
+//!   ([`Runtime::invoke_server_facade`]).
+//! - **Layered registries.** `registries()` is a `LayeredRegistryAccess`
+//!   whose `compositeAccess()` is the registry access above.
+//! - **Commands.** `getCommands().getDispatcher()` is the Brigadier
+//!   façade's dispatcher (`brigadier.rs`), so a command registered there
+//!   lands in the jar's command arena like a `CommandRegistrationCallback`'s.
+//! - **Permissions.** A player's `permissions()` is the permission set of
+//!   their level ([`ServerFacts::permission_levels`]).
+//!
+//! A member of these markers that is not listed refuses with
+//! [`NativeError::UnknownHostCall`] naming it, like every other façade call:
+//! a neutral value would let a callback carry on with state the game never
+//! had.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use crate::runtime::{
+    MethodRef, NativeError, Value, expect_ref, identifier_parse, path_join, path_value, stable_hash,
+};
+
+pub use crate::runtime::game_rules::GameRuleValue;
+
+/// What the game knows about the running server, beyond the per-object facts
+/// each firing passes. Every fact is optional in effect: an empty map or a
+/// `None` makes the member that needs it refuse.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServerFacts {
+    /// The world folder in the interpreter's virtual file system
+    /// (`/horizon/game/world`), without a trailing slash.
+    pub world_dir: Option<String>,
+    /// Every game rule by its id without namespace (`keep_inventory`).
+    pub game_rules: BTreeMap<String, GameRuleValue>,
+    /// Registries the game lists by id (`minecraft:block`) → their entry ids.
+    pub registries: BTreeMap<String, Arc<BTreeSet<String>>>,
+    /// The same registries' ids in the order vanilla registers them
+    /// (`MappedRegistry.register`), which decides `keySet()`'s `HashMap`
+    /// iteration order (`hash_map_order.rs`). A listed registry with no order
+    /// here refuses `keySet()` rather than answering some other order.
+    pub registration_order: BTreeMap<String, Arc<Vec<String>>>,
+    /// Per player UUID, the payload channels that player's client takes.
+    /// A player with no entry takes none (a vanilla client).
+    pub client_channels: BTreeMap<u128, BTreeSet<String>>,
+    /// `Level.getGameTime()`/`getDayTime()`: every level reads the
+    /// overworld's clock, as vanilla's derived levels do.
+    pub game_time: Option<i64>,
+    pub day_time: Option<i64>,
+    /// Per player UUID, their permission level (0-4, vanilla's op levels).
+    /// A player with no entry refuses `permissions()`.
+    pub permission_levels: BTreeMap<u128, u8>,
+}
+
+/// The rules marker every `getGameRules()` answers: vanilla's levels read the
+/// one `GameRules` the world data holds.
+const RULES: &str = "game/rules/main";
+/// The registry-access marker every `registryAccess()` answers.
+const REGISTRIES: &str = "game/registries/main";
+const REGISTRY: &str = "game/registry/";
+/// `MinecraftServer.registries()`: the layered access over the same lists.
+const LAYERED: &str = "game/registries/layered";
+/// `MinecraftServer.getCommands()`.
+const COMMANDS: &str = "game/commands";
+const GAME_RULE: &str = "game-rule/";
+const LEVEL_RESOURCE: &str = "level-resource/";
+
+const LEVEL_RESOURCE_CLASS: &str = "net/minecraft/world/level/storage/LevelResource";
+const GAME_RULES_CLASS: &str = "net/minecraft/world/level/gamerules/GameRules";
+const SERVER_PLAY_NETWORKING: &str = "net/fabricmc/fabric/api/networking/v1/ServerPlayNetworking";
+
+/// `LevelResource`'s constants and the ids vanilla gives them (26.3 server
+/// jar, `LevelResource.<clinit>`).
+const LEVEL_RESOURCES: &[(&str, &str)] = &[
+    ("PLAYER_ADVANCEMENTS_DIR", "players/advancements"),
+    ("PLAYER_STATS_DIR", "players/stats"),
+    ("PLAYER_DATA_DIR", "players/data"),
+    ("PLAYER_OLD_DATA_DIR", "players"),
+    ("LEVEL_DATA_FILE", "level.dat"),
+    ("OLD_LEVEL_DATA_FILE", "level.dat_old"),
+    ("ICON_FILE", "icon.png"),
+    ("LOCK_FILE", "session.lock"),
+    ("GENERATED_DIR", "generated"),
+    ("DATAPACK_DIR", "datapacks"),
+    ("MAP_RESOURCE_FILE", "resourcepacks/resources.zip"),
+    ("DATA", "data"),
+    ("ROOT", "."),
+];
+
+/// A façade value: a `game/…`, `level-resource/` or `game-rule/` marker's
+/// handle (`game_object.rs`, #156 P16b, P16c).
+fn marker(text: impl Into<String>) -> Value {
+    crate::runtime::game_object::server_value(text.into())
+}
+
+fn refuse(r: &MethodRef) -> Result<Value, NativeError> {
+    Err(NativeError::UnknownHostCall(r.clone()))
+}
+
+/// A static field this module models: a `LevelResource` constant or a
+/// `GameRules` rule.
+pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
+    match r.owner.as_str() {
+        LEVEL_RESOURCE_CLASS if r.descriptor == format!("L{LEVEL_RESOURCE_CLASS};") => {
+            LEVEL_RESOURCES
+                .iter()
+                .find(|(field, _)| *field == r.name)
+                .map(|(_, id)| marker(format!("{LEVEL_RESOURCE}{id}")))
+        }
+        // Only the rules the 26.3 jar declares: another name is no field of
+        // vanilla's `GameRules`, and stays counted.
+        GAME_RULES_CLASS if r.descriptor == "Lnet/minecraft/world/level/gamerules/GameRule;" => {
+            crate::runtime::game_rules::by_field(&r.name)
+                .map(|_| marker(format!("{GAME_RULE}{}", r.name.to_ascii_lowercase())))
+        }
+        _ => None,
+    }
+}
+
+/// `new LevelResource(id)`: the id to keep for the object's marker, or `None`
+/// for any other call.
+pub(crate) fn level_resource_init(r: &MethodRef, args: &[Value]) -> Option<String> {
+    (r.owner == LEVEL_RESOURCE_CLASS
+        && r.name == "<init>"
+        && r.descriptor == "(Ljava/lang/String;)V")
+        .then(|| args.first().and_then(expect_ref).cloned())
+        .flatten()
+}
+
+/// The arguments with a jar-built `LevelResource` object replaced by the
+/// value marker its id names (`resolve` answers the id `new` recorded), so
+/// [`server_member`] reads both kinds the same way.
+pub(crate) fn with_level_resources(
+    args: &[Value],
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<Value> {
+    args.iter()
+        .map(|arg| {
+            expect_ref(arg)
+                .filter(|text| text.starts_with(&format!("{LEVEL_RESOURCE_CLASS}#")))
+                .and_then(|text| resolve(text))
+                .map_or_else(|| arg.clone(), |id| marker(format!("{LEVEL_RESOURCE}{id}")))
+        })
+        .collect()
+}
+
+/// Whether `text` is a marker [`answer`] owns as a receiver.
+pub(crate) fn owns(text: &str) -> bool {
+    text == RULES
+        || text == REGISTRIES
+        || text == LAYERED
+        || text == COMMANDS
+        || text.starts_with(REGISTRY)
+        || text.starts_with(GAME_RULE)
+        || text.starts_with(LEVEL_RESOURCE)
+}
+
+/// A server-wide member on a server, level or entity marker, or `None` when
+/// `r` is not one of them (the caller's own table answers it).
+pub(crate) fn server_member(
+    facts: &ServerFacts,
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    Some(match (r.name.as_str(), r.descriptor.as_str()) {
+        (
+            "getWorldPath",
+            "(Lnet/minecraft/world/level/storage/LevelResource;)Ljava/nio/file/Path;",
+        ) => {
+            let resource = args
+                .first()
+                .and_then(crate::runtime::game_object::text)
+                .and_then(|text| text.strip_prefix(LEVEL_RESOURCE));
+            match (&facts.world_dir, resource) {
+                (Some(dir), Some(id)) => Ok(path_value(&path_join(dir, id))),
+                _ => refuse(r),
+            }
+        }
+        ("getGameRules", "()Lnet/minecraft/world/level/gamerules/GameRules;") => {
+            if facts.game_rules.is_empty() {
+                refuse(r)
+            } else {
+                Ok(marker(RULES))
+            }
+        }
+        ("registryAccess", descriptor)
+            if descriptor.starts_with("()Lnet/minecraft/core/RegistryAccess") =>
+        {
+            if facts.registries.is_empty() {
+                refuse(r)
+            } else {
+                Ok(marker(REGISTRIES))
+            }
+        }
+        ("getDataStorage", "()Lnet/minecraft/world/level/storage/SavedDataStorage;") => {
+            Ok(marker(crate::runtime::facade_saved_data::STORAGE))
+        }
+        // `Thread.currentThread()`: callbacks run on the server thread, so it
+        // is also the server's running thread.
+        ("getRunningThread", "()Ljava/lang/Thread;") => Ok(crate::runtime::host_jdk::main_thread()),
+        // The server's folder: the one the world folder sits in, as a
+        // dedicated server's `<level-name>` sits in its working directory.
+        ("getServerDirectory", "()Ljava/nio/file/Path;") => {
+            match facts
+                .world_dir
+                .as_deref()
+                .and_then(|dir| dir.rsplit_once('/'))
+            {
+                Some((parent, _)) if !parent.is_empty() => Ok(path_value(parent)),
+                _ => refuse(r),
+            }
+        }
+        ("registries", "()Lnet/minecraft/core/LayeredRegistryAccess;") => {
+            if facts.registries.is_empty() {
+                refuse(r)
+            } else {
+                Ok(marker(LAYERED))
+            }
+        }
+        ("getCommands", "()Lnet/minecraft/commands/Commands;") => Ok(marker(COMMANDS)),
+        _ => return None,
+    })
+}
+
+/// A player's server-wide member, by the player's UUID: `permissions()`.
+/// `None` when `r` is not one.
+pub(crate) fn player_member(
+    facts: &ServerFacts,
+    player: u128,
+    r: &MethodRef,
+) -> Option<Result<Value, NativeError>> {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("permissions", "()Lnet/minecraft/server/permissions/PermissionSet;") => {
+            Some(match facts.permission_levels.get(&player) {
+                // The Brigadier façade's permission set answers its queries.
+                Some(&level) => Ok(crate::runtime::host_brigadier::permission(
+                    crate::runtime::host_brigadier::PERMISSION_SET,
+                    level,
+                )),
+                None => refuse(r),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The id a registry key argument names: a `ResourceKey` in
+/// `minecraft:root` (`Registries.X`).
+fn registry_key(value: &Value) -> Option<String> {
+    let (registry, id) = crate::runtime::host_ids::resource_key_parts(value)?;
+    (registry == "minecraft:root").then_some(id)
+}
+
+/// The `namespace:path` an `Identifier` argument names.
+fn identifier_text(value: &Value) -> Option<String> {
+    crate::runtime::host_ids::identifier_key(value).map(str::to_owned)
+}
+
+/// Answer one call on a marker [`owns`] says is this module's.
+/// A registry's `keySet()`: `Collections.unmodifiableSet(byLocation.keySet())`,
+/// the ids in the bucket order of the `HashMap` vanilla registered them into.
+/// The ids only: the caller makes the set (`Host::factory_collection`, #156
+/// P14d2). `None` for any other call.
+pub(crate) fn key_set(
+    facts: &ServerFacts,
+    text: &str,
+    r: &MethodRef,
+) -> Option<Result<Vec<Value>, NativeError>> {
+    if (r.name.as_str(), r.descriptor.as_str()) != ("keySet", "()Ljava/util/Set;") {
+        return None;
+    }
+    let id = text.strip_prefix(REGISTRY)?;
+    let entries = facts.registries.get(id)?;
+    let Some((order, indices)) = facts
+        .registration_order
+        .get(id)
+        .filter(|order| order.len() == entries.len())
+        .and_then(|order| {
+            crate::runtime::hash_map_order::key_set_order(order, |id| {
+                crate::runtime::hash_map_order::identifier_hash(id)
+            })
+            .map(|indices| (order, indices))
+        })
+    else {
+        return Some(refuse(r).map(|_| Vec::new()));
+    };
+    Some(Ok(indices
+        .into_iter()
+        .map(|index| identifier_parse(&order[index]))
+        .collect()))
+}
+
+pub(crate) fn answer(
+    facts: &ServerFacts,
+    text: &str,
+    r: &MethodRef,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let descriptor = r.descriptor.as_str();
+    // `Object`'s members hold for every marker.
+    match (r.name.as_str(), descriptor) {
+        ("hashCode", "()I") => return Ok(Value::Int(stable_hash(text))),
+        ("equals", "(Ljava/lang/Object;)Z") => {
+            let same = args
+                .first()
+                .and_then(crate::runtime::game_object::text)
+                .is_some_and(|o| o == text);
+            return Ok(Value::Int(i32::from(same)));
+        }
+        _ => {}
+    }
+    if let Some(id) = text.strip_prefix(GAME_RULE) {
+        return crate::runtime::game_rules::rule_member(id, r, args).map_or_else(|| refuse(r), Ok);
+    }
+    if let Some(id) = text.strip_prefix(LEVEL_RESOURCE) {
+        return match (r.name.as_str(), descriptor) {
+            // `toString` (`/<id>`) is the handle kind's (`server_values.rs`).
+            ("id", "()Ljava/lang/String;") => Ok(Value::Ref(Some(id.to_owned()))),
+            _ => refuse(r),
+        };
+    }
+    if text == RULES {
+        let id = args
+            .first()
+            .and_then(crate::runtime::game_object::text)
+            .and_then(|t| t.strip_prefix(GAME_RULE));
+        let read: fn(GameRuleValue) -> Value = match (r.name.as_str(), descriptor) {
+            ("get", "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;") => {
+                GameRuleValue::boxed
+            }
+            // `gameRule.serialize(get(gameRule))`: `value.toString()`.
+            (
+                "getAsString",
+                "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
+            ) => |value: GameRuleValue| marker(value.serialized()),
+            _ => return refuse(r),
+        };
+        // The world's value, as the game holds it now. A rule the world
+        // lacks throws as vanilla's `get` does when vanilla lacks it too (a
+        // feature-gated rule); any other absence refuses.
+        return match id.map(|id| (id, facts.game_rules.get(id))) {
+            Some((_, Some(value))) => Ok(read(*value)),
+            Some((id, None)) => Err(crate::runtime::game_rules::missing_value(id)
+                .filter(|_| !facts.game_rules.is_empty())
+                .unwrap_or_else(|| NativeError::UnknownHostCall(r.clone()))),
+            None => refuse(r),
+        };
+    }
+    if text == LAYERED {
+        return match (r.name.as_str(), descriptor) {
+            ("compositeAccess", "()Lnet/minecraft/core/RegistryAccess$Frozen;") => {
+                Ok(marker(REGISTRIES))
+            }
+            _ => refuse(r),
+        };
+    }
+    if text == COMMANDS {
+        return match (r.name.as_str(), descriptor) {
+            ("getDispatcher", "()Lcom/mojang/brigadier/CommandDispatcher;") => {
+                Ok(crate::runtime::host_brigadier::dispatcher())
+            }
+            _ => refuse(r),
+        };
+    }
+    if text == REGISTRIES {
+        return match (r.name.as_str(), descriptor) {
+            (
+                "lookupOrThrow",
+                "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/Registry;",
+            )
+            | (
+                "lookupOrThrow",
+                "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/HolderLookup$RegistryLookup;",
+            ) => match args.first().and_then(registry_key) {
+                Some(id) if facts.registries.contains_key(&id) => {
+                    Ok(marker(format!("{REGISTRY}{id}")))
+                }
+                _ => refuse(r),
+            },
+            _ => refuse(r),
+        };
+    }
+    if let Some(id) = text.strip_prefix(REGISTRY) {
+        let Some(entries) = facts.registries.get(id) else {
+            return refuse(r);
+        };
+        return match (r.name.as_str(), descriptor) {
+            ("size", "()I") => Ok(Value::Int(i32::try_from(entries.len()).unwrap_or(i32::MAX))),
+            ("containsKey", "(Lnet/minecraft/resources/Identifier;)Z") => {
+                let wanted = args.first().and_then(identifier_text);
+                Ok(Value::Int(i32::from(
+                    wanted.is_some_and(|wanted| entries.contains(&wanted)),
+                )))
+            }
+            // `keySet()` is a host object ([`key_set`]).
+            _ => refuse(r),
+        };
+    }
+    refuse(r)
+}
+
+/// `ServerPlayNetworking.canSend(player, type|id)`: whether the player's
+/// client takes the channel. `player` is the UUID the caller's façade names
+/// for the first argument, `channel` the id the second resolves to; `None`
+/// for a call this does not model.
+pub(crate) fn can_send(
+    facts: &ServerFacts,
+    r: &MethodRef,
+    player: Option<u128>,
+    channel: Option<&str>,
+) -> Option<Result<Value, NativeError>> {
+    if r.owner != SERVER_PLAY_NETWORKING || r.name != "canSend" {
+        return None;
+    }
+    Some(match (player, channel) {
+        (Some(player), Some(channel)) => Ok(Value::Int(i32::from(
+            facts
+                .client_channels
+                .get(&player)
+                .is_some_and(|channels| channels.contains(channel)),
+        ))),
+        _ => refuse(r),
+    })
+}
+
+/// The channel id a `canSend` second argument names: an `Identifier` value,
+/// or a payload type through `type_id` (the host's packet-type table).
+pub(crate) fn channel_of(
+    value: &Value,
+    type_id: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    identifier_text(value)
+        .or_else(|| crate::runtime::game_object::text(value).and_then(|marker| type_id(marker)))
+}
+
+impl crate::runtime::StdHost {
+    /// A field of a façade object read with its receiver during a firing:
+    /// a player's `connection` is that player's connection marker, and a
+    /// connection's `player` its player (`ServerPlayNetworking.canSend`
+    /// takes either). `None` for any other read.
+    pub(crate) fn facade_field(&self, receiver: &Value, r: &MethodRef) -> Option<Value> {
+        self.game_event.as_deref()?;
+        let text = crate::runtime::game_object::text(receiver)?;
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "net/minecraft/server/level/ServerPlayer",
+                "connection",
+                "Lnet/minecraft/server/network/ServerGamePacketListenerImpl;",
+            ) => Some(marker(format!(
+                "game/connection/{:032x}",
+                crate::runtime::game_object::player_uuid(text)?
+            ))),
+            (
+                "net/minecraft/server/network/ServerGamePacketListenerImpl",
+                "player",
+                "Lnet/minecraft/server/level/ServerPlayer;",
+            ) => Some(crate::runtime::game_object::player_value(
+                &self.game_event.as_deref()?.facade,
+                u128::from_str_radix(text.strip_prefix("game/connection/")?, 16).ok()?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Instance calls of the server façade that keep state on the jar's
+    /// resident host or read the firing's facts directly: the saved data
+    /// (`facade_saved_data.rs`) and a façade player's `permissions()`.
+    /// `None` leaves the call to the listener façade (`events.rs`).
+    pub(crate) fn server_facade_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if let Some(answer) = self.saved_data.call(r, receiver, args) {
+            return Some(answer);
+        }
+        let player = crate::runtime::game_object::player_uuid(crate::runtime::game_object::text(receiver)?)?;
+        let firing = self.game_event.as_deref()?;
+        player_member(&firing.facade.server, player, r)
+    }
+}
+
+/// Owners whose `execute(Runnable)` is the server's own event loop.
+const EVENT_LOOPS: &[&str] = &[
+    "net/minecraft/server/MinecraftServer",
+    "net/minecraft/server/dedicated/DedicatedServer",
+    "net/minecraft/util/thread/ReentrantBlockableEventLoop",
+    "net/minecraft/util/thread/BlockableEventLoop",
+];
+
+impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
+    /// `CommandSourceStack.sendSuccess(supplier, broadcast)` on the running
+    /// command's source: vanilla calls `supplier.get()` inside the call, and
+    /// only when the feedback goes somewhere (`StdHost::brigadier_feedback_calls_supplier`),
+    /// so the supplier runs now, or not at all, and its component is sent as
+    /// it is then. `None` for any other call.
+    fn invoke_send_success(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "net/minecraft/commands/CommandSourceStack"
+            || r.name != "sendSuccess"
+            || r.descriptor != "(Ljava/util/function/Supplier;Z)V"
+        {
+            return Ok(None);
+        }
+        let (Some(source), [supplier, broadcast]) = (receiver, args) else {
+            return Ok(None);
+        };
+        let broadcast = matches!(broadcast, Value::Int(flag) if *flag != 0);
+        match self.host.feedback_calls_supplier(source, broadcast) {
+            None => Ok(None),
+            Some(None) => self.host.unknown_operand_call(r).map(Some),
+            Some(Some(false)) => Ok(Some(Value::Void)),
+            Some(Some(true)) => {
+                let component = match self.invoke_callback(supplier, &[])? {
+                    Some(component) => component,
+                    None => {
+                        let get = MethodRef {
+                            owner: "java/util/function/Supplier".into(),
+                            name: "get".into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        };
+                        match self.dispatch_owner(&get, 0xb9, Some(supplier)) {
+                            Some((owner, true)) => self.invoke(
+                                &owner,
+                                &get.name,
+                                &get.descriptor,
+                                Some(supplier.clone()),
+                                &[],
+                            )?,
+                            _ => return self.host.unknown_operand_call(r).map(Some),
+                        }
+                    }
+                };
+                self.host.send_feedback(r, &component, broadcast).map(Some)
+            }
+        }
+    }
+}
+
+impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
+    /// Server-façade calls that run jar code, which the host cannot do: a
+    /// saved-data type's constructor (`facade_saved_data.rs`) and a
+    /// runnable handed to the server's event loop. `None` for every other
+    /// call.
+    pub(crate) fn invoke_server_facade(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_saved_data(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_send_success(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // Chat components with style and arguments (`facade_text.rs`).
+        if let Some(value) = self.invoke_text(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        // `server.execute(task)` on the server thread: vanilla's
+        // `scheduleExecutables()` is false there (outside a running task),
+        // so the task runs now rather than being queued. Only a façade
+        // server (a `game/` marker) is the running one.
+        let on_server = receiver
+            .and_then(crate::runtime::game_object::text)
+            .is_some_and(|text| text.starts_with("game/"));
+        if on_server
+            && EVENT_LOOPS.contains(&r.owner.as_str())
+            && matches!(r.name.as_str(), "execute" | "executeIfPossible")
+            && r.descriptor == "(Ljava/lang/Runnable;)V"
+            && let [task] = args
+        {
+            return match self.invoke_callback(task, &[])? {
+                Some(_) => Ok(Some(Value::Void)),
+                None => Err(NativeError::Metadata(format!(
+                    "{}#{} got a task the interpreter cannot run: {task:?}",
+                    r.owner, r.name
+                ))),
+            };
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(owner: &str, name: &str, descriptor: &str) -> MethodRef {
+        MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        }
+    }
+
+    fn facts() -> ServerFacts {
+        ServerFacts {
+            world_dir: Some("/horizon/game/world".into()),
+            game_rules: BTreeMap::from([
+                ("keep_inventory".into(), GameRuleValue::Bool(true)),
+                ("random_tick_speed".into(), GameRuleValue::Int(3)),
+            ]),
+            registries: BTreeMap::from([(
+                "minecraft:block".into(),
+                Arc::new(BTreeSet::from([
+                    "minecraft:stone".into(),
+                    "minecraft:dirt".into(),
+                ])),
+            )]),
+            client_channels: BTreeMap::from([(7, BTreeSet::from(["demo:sync".into()]))]),
+            ..ServerFacts::default()
+        }
+    }
+
+    #[test]
+    fn world_path_resolves_the_level_resource_under_the_world_folder() {
+        let root = static_field(&call(
+            LEVEL_RESOURCE_CLASS,
+            "ROOT",
+            "Lnet/minecraft/world/level/storage/LevelResource;",
+        ))
+        .unwrap();
+        let data = static_field(&call(
+            LEVEL_RESOURCE_CLASS,
+            "PLAYER_DATA_DIR",
+            "Lnet/minecraft/world/level/storage/LevelResource;",
+        ))
+        .unwrap();
+        let get = call(
+            "net/minecraft/server/MinecraftServer",
+            "getWorldPath",
+            "(Lnet/minecraft/world/level/storage/LevelResource;)Ljava/nio/file/Path;",
+        );
+        // Vanilla resolves the id as given: `ROOT` is `world/.`.
+        assert_eq!(
+            server_member(&facts(), &get, std::slice::from_ref(&root))
+                .unwrap()
+                .unwrap(),
+            path_value("/horizon/game/world/.")
+        );
+        assert_eq!(
+            server_member(&facts(), &get, &[data]).unwrap().unwrap(),
+            path_value("/horizon/game/world/players/data")
+        );
+        // The server's own folder holds the world folder.
+        let directory = call(
+            "net/minecraft/server/MinecraftServer",
+            "getServerDirectory",
+            "()Ljava/nio/file/Path;",
+        );
+        assert_eq!(
+            server_member(&facts(), &directory, &[]).unwrap().unwrap(),
+            path_value("/horizon/game")
+        );
+        // No world folder, or a resource the model did not build: refuse.
+        let none = ServerFacts::default();
+        assert!(server_member(&none, &get, &[root]).unwrap().is_err());
+        assert!(
+            server_member(&facts(), &get, &[Value::Ref(None)])
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn game_rules_answer_the_games_values_boxed() {
+        let facts = facts();
+        let rules = server_member(
+            &facts,
+            &call(
+                "net/minecraft/server/level/ServerLevel",
+                "getGameRules",
+                "()Lnet/minecraft/world/level/gamerules/GameRules;",
+            ),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let rules = crate::runtime::game_object::text(&rules).unwrap().clone();
+        let rule = |name: &str| {
+            static_field(&call(
+                GAME_RULES_CLASS,
+                name,
+                "Lnet/minecraft/world/level/gamerules/GameRule;",
+            ))
+            .unwrap()
+        };
+        let get = call(
+            GAME_RULES_CLASS,
+            "get",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/Object;",
+        );
+        assert!(owns(&rules));
+        assert_eq!(
+            answer(&facts, &rules, &get, &[rule("KEEP_INVENTORY")]).unwrap(),
+            crate::runtime::boolean_value(true)
+        );
+        assert_eq!(
+            answer(&facts, &rules, &get, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
+            Value::Boxed(crate::runtime::Boxed::Integer(3))
+        );
+        // A rule the game does not hold, and a member the model does not
+        // list, refuse rather than answer a default.
+        assert!(answer(&facts, &rules, &get, &[rule("SPAWN_WARDENS")]).is_err());
+        let set = call(
+            GAME_RULES_CLASS,
+            "set",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;Ljava/lang/Object;Lnet/minecraft/server/MinecraftServer;)V",
+        );
+        assert!(answer(&facts, &rules, &set, &[rule("KEEP_INVENTORY")]).is_err());
+        // `getAsString` is `serialize(get(rule))`, the value's `toString()`
+        // (the oracle's `after-set` row: `true`, `7`).
+        let as_string = call(
+            GAME_RULES_CLASS,
+            "getAsString",
+            "(Lnet/minecraft/world/level/gamerules/GameRule;)Ljava/lang/String;",
+        );
+        let mut changed = facts.clone();
+        changed
+            .game_rules
+            .insert("random_tick_speed".into(), GameRuleValue::Int(7));
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("RANDOM_TICK_SPEED")]).unwrap(),
+            marker("7")
+        );
+        assert_eq!(
+            answer(&changed, &rules, &as_string, &[rule("KEEP_INVENTORY")]).unwrap(),
+            marker("true")
+        );
+        // A world without `minecart_improvements` has no `max_minecart_speed`:
+        // vanilla's `get` throws (game_rules.rs pins the message).
+        assert!(matches!(
+            answer(&facts, &rules, &get, &[rule("MAX_MINECART_SPEED")]),
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/IllegalArgumentException"
+        ));
+        // A `GameRules` field 26.3 does not declare is no rule marker.
+        assert_eq!(
+            static_field(&call(
+                GAME_RULES_CLASS,
+                "DO_DAYLIGHT_CYCLE",
+                "Lnet/minecraft/world/level/gamerules/GameRule;",
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn registry_access_looks_up_only_registries_the_game_listed() {
+        let facts = facts();
+        let access = server_member(
+            &facts,
+            &call(
+                "net/minecraft/server/MinecraftServer",
+                "registryAccess",
+                "()Lnet/minecraft/core/RegistryAccess$Frozen;",
+            ),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let access = crate::runtime::game_object::text(&access).unwrap().clone();
+        let lookup = call(
+            "net/minecraft/core/RegistryAccess$Frozen",
+            "lookupOrThrow",
+            "(Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/Registry;",
+        );
+        let blocks = answer(
+            &facts,
+            &access,
+            &lookup,
+            &[crate::runtime::host_ids::registry_key_of("minecraft:block")],
+        )
+        .unwrap();
+        let blocks = crate::runtime::game_object::text(&blocks).unwrap().clone();
+        let registry =
+            |name: &str, descriptor: &str| call("net/minecraft/core/Registry", name, descriptor);
+        assert_eq!(
+            answer(&facts, &blocks, &registry("size", "()I"), &[]).unwrap(),
+            Value::Int(2)
+        );
+        let contains = registry("containsKey", "(Lnet/minecraft/resources/Identifier;)Z");
+        assert_eq!(
+            answer(
+                &facts,
+                &blocks,
+                &contains,
+                &[crate::runtime::host_ids::identifier_of_text("minecraft:dirt")]
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            answer(
+                &facts,
+                &blocks,
+                &contains,
+                &[crate::runtime::host_ids::identifier_of_text("minecraft:glass")]
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        // Biomes are a vanilla registry the game did not list here.
+        assert!(
+            answer(
+                &facts,
+                &access,
+                &lookup,
+                &[crate::runtime::host_ids::registry_key_of("minecraft:worldgen/biome")]
+            )
+            .is_err()
+        );
+    }
+
+    /// `keySet()` iterates as vanilla's `byLocation` `HashMap` does, rebuilt
+    /// from the registration order (the expected order was printed by a
+    /// `HashMap<Identifier, _>` on a JVM, 26.3 server jar); a registry the game
+    /// listed without its order refuses rather than answering another order.
+    #[test]
+    fn a_registry_key_set_is_in_vanilla_hash_map_order() {
+        let ids = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t90",
+            "demo:t18",
+            "demo:t102",
+            "demo:t29",
+            "demo:t113",
+            "demo:t1709",
+            "demo:t124",
+            "demo:t1808",
+        ]
+        .map(str::to_owned);
+        let mut facts = facts();
+        facts.registries.insert(
+            "minecraft:item".into(),
+            Arc::new(ids.iter().cloned().collect()),
+        );
+        facts
+            .registration_order
+            .insert("minecraft:item".into(), Arc::new(ids.to_vec()));
+        let key_set_call = call("net/minecraft/core/Registry", "keySet", "()Ljava/util/Set;");
+        let expected: Vec<Value> = [
+            "minecraft:stone",
+            "demo:t1",
+            "demo:t18",
+            "demo:t29",
+            "demo:t1709",
+            "demo:t1808",
+            "demo:t90",
+            "demo:t102",
+            "demo:t113",
+            "demo:t124",
+        ]
+        .iter()
+        .map(|id| identifier_parse(id))
+        .collect();
+        assert_eq!(
+            key_set(&facts, "game/registry/minecraft:item", &key_set_call)
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        // `facts()` lists blocks with no registration order.
+        assert!(
+            key_set(&facts, "game/registry/minecraft:block", &key_set_call)
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn can_send_is_true_only_for_a_channel_the_players_client_takes() {
+        let facts = facts();
+        let r = call(
+            SERVER_PLAY_NETWORKING,
+            "canSend",
+            "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/network/protocol/common/custom/CustomPacketPayload$Type;)Z",
+        );
+        assert_eq!(
+            can_send(&facts, &r, Some(7), Some("demo:sync"))
+                .unwrap()
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            can_send(&facts, &r, Some(7), Some("demo:other"))
+                .unwrap()
+                .unwrap(),
+            Value::Int(0)
+        );
+        // A vanilla client (no entry) takes nothing.
+        assert_eq!(
+            can_send(&facts, &r, Some(8), Some("demo:sync"))
+                .unwrap()
+                .unwrap(),
+            Value::Int(0)
+        );
+        // A player or channel the caller could not name refuses.
+        assert!(
+            can_send(&facts, &r, None, Some("demo:sync"))
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(
+            channel_of(&crate::runtime::host_ids::identifier_of_text("demo:sync"), |_| None).as_deref(),
+            Some("demo:sync")
+        );
+    }
+}

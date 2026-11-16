@@ -1,0 +1,48 @@
+//! `Class.getDeclaredConstructors` / `getConstructors` over the class file.
+//!
+//! Config libraries find a type's one-argument and no-argument constructors by
+//! listing them and checking `getParameterCount()` (Armor Hider's
+//! `ConfigurationItemFactoryRegistry`), so the list must be the class's real
+//! `<init>` methods. Each entry is the `Constructor` handle
+//! `getDeclaredConstructor` already hands out (`host_reflect.rs`), so
+//! `getParameterCount` and `newInstance` answer it unchanged. A class the runtime does not hold
+//! keeps the host's answer.
+
+use super::*;
+
+impl<H: Host> Runtime<'_, H> {
+    pub(super) fn invoke_reflect_constructors(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/lang/Class"
+            || !matches!(
+                r.name.as_str(),
+                "getDeclaredConstructors" | "getConstructors"
+            )
+            || r.descriptor != "()[Ljava/lang/reflect/Constructor;"
+        {
+            return Ok(None);
+        }
+        let class = reflection_class_name(receiver, r)?.replace('.', "/");
+        let public_only = r.name == "getConstructors";
+        let Some(file) = self.class(&class) else {
+            return Ok(None);
+        };
+        let descriptors: Vec<String> = file
+            .methods
+            .iter()
+            .filter(|method| method.name == "<init>" && (!public_only || method.access & 1 != 0))
+            .map(|method| method.descriptor.clone())
+            .collect();
+        let constructors = descriptors
+            .iter()
+            .map(|descriptor| self.reflected_constructor(&class, Some(descriptor)))
+            .collect();
+        Ok(Some(self.new_array_value(
+            "[Ljava/lang/reflect/Constructor;",
+            constructors,
+        )))
+    }
+}

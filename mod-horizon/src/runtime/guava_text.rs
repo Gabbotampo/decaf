@@ -1,0 +1,246 @@
+//! Guava's `Splitter` and `Joiner` over a fixed separator, and
+//! `Lists.newArrayList(Iterable)`, as Guava 33.6 (the copy the 26.3 game
+//! ships) answers them.
+//!
+//! NeoForge's `ModConfigSpec` splits and joins config paths with
+//! `Splitter.on(".")`, `Joiner.on(".")` and `Lists.newArrayList`. A jar that
+//! runs its own copy of that class (Forge Config API Port on Fabric, under
+//! the 2026-11-13 precedence ruling) reaches these from its `<clinit>`.
+//! Unanswered, `Splitter.on` was null and every config path failed with an
+//! NPE. `Lists.newArrayList(Iterable)` alone is counted in 9 census jars.
+//!
+//! The behaviour, checked against Guava 33.6.0 on JDK 25 (the expected values
+//! of `tests/fixture_guava_text.rs`):
+//!
+//! * `Splitter.on(String)` / `on(char)`: an empty separator throws
+//!   `IllegalArgumentException("The separator may not be the empty
+//!   string.")`. `split(sequence)` keeps every part, empty ones included
+//!   (`"a.b..c."` gives `[a, b, , c, ]`); a null sequence throws an NPE with
+//!   no message. `splitToList` is the same parts as a list.
+//! * `Joiner.on(String)` / `on(char)`: `join(Iterable)` and `join(Iterator)`
+//!   write each part's `toString` with the separator between them; a null
+//!   part throws an NPE with no message. `join(Object[])` stays counted: an
+//!   array belongs to the interpreter, not this host.
+//! * `Lists.newArrayList(Iterable)`: a new mutable list of the elements, in
+//!   iteration order; null throws an NPE with no message.
+//!
+//! Departure: `split` answers a host list where Guava answers a lazy
+//! `Iterable` that is not a `Collection`. Its elements, iteration order and
+//! `toString` are Guava's; `instanceof Collection` on it is true here and
+//! false in Guava. A part that is a jar object (whose `toString` is the jar's
+//! bytecode) is counted rather than printed. Any other `Splitter` or `Joiner`
+//! configuration (`trimResults`, `omitEmptyStrings`, `limit`, `skipNulls`,
+//! `useForNull`, a pattern or a `CharMatcher` separator) is counted.
+
+use super::*;
+
+const SPLITTER: &str = "com/google/common/base/Splitter";
+const JOINER: &str = "com/google/common/base/Joiner";
+const LISTS: &str = "com/google/common/collect/Lists";
+
+fn npe() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NullPointerException".into(),
+        message: None,
+        frame: None,
+    }
+}
+
+/// The separator a `Splitter.on`/`Joiner.on` argument names: a string, or a
+/// `char` passed as its code.
+fn separator(r: &MethodRef, value: &Value) -> Result<String, NativeError> {
+    match value {
+        Value::Ref(None) => Err(npe()),
+        Value::Int(code) if r.descriptor.starts_with("(C)") => {
+            Ok(char::from_u32(*code as u32).map_or_else(String::new, String::from))
+        }
+        Value::Ref(Some(text)) => Ok(text.clone()),
+        _ => Err(NativeError::Metadata(format!(
+            "{}#{} separator is not text",
+            r.owner, r.name
+        ))),
+    }
+}
+
+impl StdHost {
+    /// Answer a Guava text call, or `None` for any other call.
+    pub(crate) fn guava_text(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                SPLITTER,
+                "on",
+                "(Ljava/lang/String;)Lcom/google/common/base/Splitter;"
+                | "(C)Lcom/google/common/base/Splitter;",
+            ) => Some(Self::argument(r, args, 0).and_then(|value| {
+                let separator = separator(r, value)?;
+                if separator.is_empty() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("The separator may not be the empty string.".into()),
+                        frame: None,
+                    });
+                }
+                // A fresh `Splitter` (`host_guava.rs`).
+                Ok(crate::runtime::host_guava::splitter(&separator))
+            })),
+            (
+                SPLITTER,
+                "split" | "splitToList",
+                "(Ljava/lang/CharSequence;)Ljava/lang/Iterable;"
+                | "(Ljava/lang/CharSequence;)Ljava/util/List;",
+            ) => {
+                let separator = crate::runtime::host_guava::separator(receiver?, false)?;
+                Some(Self::argument(r, args, 0).and_then(|value| {
+                    let Value::Ref(Some(text)) = value else {
+                        return Err(npe());
+                    };
+                    let parts = text
+                        .split(separator.as_str())
+                        .map(|part| Value::Ref(Some(part.to_owned())))
+                        .collect::<Vec<_>>();
+                    Ok(self.new_list(parts))
+                }))
+            }
+            (
+                JOINER,
+                "on",
+                "(Ljava/lang/String;)Lcom/google/common/base/Joiner;"
+                | "(C)Lcom/google/common/base/Joiner;",
+            ) => Some(
+                Self::argument(r, args, 0)
+                    .and_then(|value| Ok(crate::runtime::host_guava::joiner(&separator(r, value)?))),
+            ),
+            (
+                JOINER,
+                "join",
+                "(Ljava/lang/Iterable;)Ljava/lang/String;"
+                | "(Ljava/util/Iterator;)Ljava/lang/String;",
+            ) => {
+                let separator = crate::runtime::host_guava::separator(receiver?, true)?;
+                let parts = Self::argument(r, args, 0).and_then(|value| self.guava_parts(value));
+                Some(match parts {
+                    Err(error) => Err(error),
+                    Ok(None) => self.unknown_host_call(r),
+                    Ok(Some(parts)) => self.join_parts(r, &separator, &parts),
+                })
+            }
+            (LISTS, "newArrayList", "(Ljava/lang/Iterable;)Ljava/util/ArrayList;") => {
+                let parts = Self::argument(r, args, 0).and_then(|value| self.guava_parts(value));
+                Some(match parts {
+                    Err(error) => Err(error),
+                    Ok(None) => self.unknown_host_call(r),
+                    Ok(Some(parts)) => Ok(self.new_list(parts)),
+                })
+            }
+            (LISTS, "newLinkedList", "(Ljava/lang/Iterable;)Ljava/util/LinkedList;") => {
+                let parts = Self::argument(r, args, 0).and_then(|value| self.guava_parts(value));
+                Some(match parts {
+                    Err(error) => Err(error),
+                    Ok(None) => self.unknown_host_call(r),
+                    Ok(Some(parts)) => Ok(self.new_collection("java/util/LinkedList", parts)),
+                })
+            }
+            (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "(Ljava/lang/Iterable;)Ljava/util/HashSet;",
+            )
+            | (
+                "com/google/common/collect/Sets",
+                "newHashSet",
+                "(Ljava/util/Iterator;)Ljava/util/HashSet;",
+            )
+            | (
+                "com/google/common/collect/Sets",
+                "newLinkedHashSet",
+                "(Ljava/lang/Iterable;)Ljava/util/LinkedHashSet;",
+            )
+            | (
+                "com/google/common/collect/Sets",
+                "newConcurrentHashSet",
+                "(Ljava/lang/Iterable;)Ljava/util/Set;",
+            ) => {
+                let parts = Self::argument(r, args, 0).and_then(|value| self.guava_parts(value));
+                let class = match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("newHashSet", _) => "java/util/HashSet",
+                    ("newLinkedHashSet", _) => "java/util/LinkedHashSet",
+                    _ => "java/util/concurrent/ConcurrentHashMap$KeySetView",
+                };
+                Some(match parts {
+                    Err(error) => Err(error),
+                    Ok(None) => self.unknown_host_call(r),
+                    Ok(Some(parts)) => Ok(self.new_collection(class, parts)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The elements of an `Iterable` or `Iterator` argument the host holds, in iteration order; `Ok(None)` when it holds none (the
+    /// call is then counted), an NPE for null.
+    fn guava_parts(&mut self, value: &Value) -> Result<Option<Vec<Value>>, NativeError> {
+        let marker = match value {
+            Value::Ref(None) => return Err(npe()),
+            // A `String` is no `Iterable`, whatever it spells.
+            Value::Ref(Some(_)) if crate::runtime::jar_object::spells_key(value) => return Ok(None),
+            Value::Ref(Some(marker)) => marker,
+            // A collection a jar `new`ed, by its key (`jar_object.rs`).
+            Value::Host(_) if crate::runtime::jar_object::is_object(value) => {
+                crate::runtime::expect_ref(value).ok_or_else(npe)?
+            }
+            // A host iterator, by its table key (`host_iterator.rs`).
+            Value::Host(_) if crate::runtime::host_iterator::marker(value).is_some() => {
+                crate::runtime::host_iterator::marker(value).ok_or_else(npe)?
+            }
+            // A host handle (a `ServiceLoader`, ...) is an `Iterable` whose
+            // elements only the runtime knows: counted.
+            _ => return Ok(None),
+        };
+        if let Some((values, index)) = self.iterators.get(marker) {
+            return Ok(Some(values[(*index).min(values.len())..].to_vec()));
+        }
+        match runtime_collection_values(self, value) {
+            Ok(values) => Ok(Some(values)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// `Joiner.join` over parts the host holds.
+    fn join_parts(
+        &mut self,
+        r: &MethodRef,
+        separator: &str,
+        parts: &[Value],
+    ) -> Result<Value, NativeError> {
+        let mut text = Vec::with_capacity(parts.len());
+        for part in parts {
+            if matches!(part, Value::Ref(None)) {
+                return Err(npe());
+            }
+            // A jar object's `toString` is its own bytecode, which this host
+            // can't run.
+            if crate::runtime::jar_object::object_class(part).is_some() {
+                return self.unknown_host_call(r);
+            }
+            text.push(
+                self.modelled_to_string(part)
+                    .unwrap_or_else(|| value_text(part)),
+            );
+        }
+        Ok(Value::Ref(Some(text.join(separator))))
+    }
+
+    /// A new mutable host list holding `values`.
+    fn new_list(&mut self, values: Vec<Value>) -> Value {
+        let list = self.empty_collection("list");
+        if let Some(marker) = expect_ref(&list) {
+            self.mutable_collections.insert(marker.to_owned(), values);
+        }
+        list
+    }
+}

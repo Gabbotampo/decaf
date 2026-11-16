@@ -1,0 +1,1725 @@
+//! Bounded models of the JDK and logging-library values a mod's config
+//! bootstrap reaches before it ever touches the game.
+//!
+//! Each answer here replaces a `null` the unmodelled-call fallback used to
+//! return. A null charset or logger is not neutral: config libraries check
+//! their builder state with `Objects.requireNonNull(charset)` or
+//! `if (logger == null) throw new IllegalStateException()`, so the jar stopped
+//! on a value the JVM would never have produced.
+//!
+//! The values are plain markers in the runtime's string vocabulary:
+//!
+//! * `charset/<canonical name>`: a `java.nio.charset.Charset`. Only the six
+//!   charsets every JVM must ship (`StandardCharsets`) are known; any other
+//!   name raises `UnsupportedCharsetException`, as a JVM without that charset
+//!   would.
+//! * a logger (a `HostKind::Logger` handle, `host_jdk.rs`): log4j, slf4j,
+//!   `java.util.logging`, `System.Logger` or Mojang `LogUtils`. Nothing is
+//!   written anywhere: every level reports disabled and every logging call
+//!   returns without effect, which is what a logger configured to drop the
+//!   mod's output does.
+//!
+//! The module also answers `Path.resolveSibling`, which the host's path model
+//! lacked. Paths stay virtual (`host_path.rs`): no call in this file reads or
+//! writes the host filesystem.
+
+use crate::runtime::host_jdk::logger_value;
+use crate::runtime::{MethodRef, NativeError, Value, expect_ref, expect_string};
+
+/// The canonical names of the charsets `java.nio.charset.StandardCharsets`
+/// declares, keyed by the field name. Every JVM ships these six.
+const STANDARD_CHARSETS: &[(&str, &str)] = &[
+    ("UTF_8", "UTF-8"),
+    ("US_ASCII", "US-ASCII"),
+    ("ISO_8859_1", "ISO-8859-1"),
+    ("UTF_16", "UTF-16"),
+    ("UTF_16BE", "UTF-16BE"),
+    ("UTF_16LE", "UTF-16LE"),
+];
+
+/// Prefix of a modelled `Charset` marker.
+const CHARSET_PREFIX: &str = "charset/";
+
+fn charset_value(canonical: &str) -> Value {
+    Value::Ref(Some(format!("{CHARSET_PREFIX}{canonical}")))
+}
+
+/// The canonical name `Charset.forName` resolves `name` to, matching the
+/// JDK's case-insensitive lookup over the standard charsets and their common
+/// aliases.
+pub(crate) fn canonical_charset(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    // Generated from Charset.forName(...).aliases() plus canonical names on
+    // Temurin 25.0.5+8; matching is the JDK's case-insensitive lookup.
+    const UTF8: &[&str] = &["unicode-1-1-utf-8", "utf-8", "utf8"];
+    const ASCII: &[&str] = &[
+        "646",
+        "ansi_x3.4-1968",
+        "ansi_x3.4-1986",
+        "ascii",
+        "ascii7",
+        "cp367",
+        "csascii",
+        "ibm367",
+        "iso-ir-6",
+        "iso646-us",
+        "iso_646.irv:1983",
+        "iso_646.irv:1991",
+        "us",
+        "us-ascii",
+    ];
+    const UTF16: &[&str] = &["utf-16", "utf16", "utf_16"];
+    const UTF16BE: &[&str] = &["utf-16be", "utf_16be", "x-utf-16be"];
+    const UTF16LE: &[&str] = &["utf-16le", "utf_16le", "x-utf-16le"];
+    const LATIN1: &[&str] = &[
+        "819",
+        "8859_1",
+        "cp819",
+        "csisolatin1",
+        "ibm-819",
+        "ibm819",
+        "iso-8859-1",
+        "iso-ir-100",
+        "iso8859-1",
+        "iso8859_1",
+        "iso_8859-1",
+        "iso_8859-1:1987",
+        "iso_8859_1",
+        "l1",
+        "latin1",
+    ];
+    Some(if UTF8.contains(&lower.as_str()) {
+        "UTF-8"
+    } else if ASCII.contains(&lower.as_str()) {
+        "US-ASCII"
+    } else if LATIN1.contains(&lower.as_str()) {
+        "ISO-8859-1"
+    } else if UTF16.contains(&lower.as_str()) {
+        "UTF-16"
+    } else if UTF16BE.contains(&lower.as_str()) {
+        "UTF-16BE"
+    } else if UTF16LE.contains(&lower.as_str()) {
+        "UTF-16LE"
+    } else {
+        return None;
+    })
+}
+
+/// Whether `owner` is one of the logger interfaces this module answers for.
+fn is_logger_owner(owner: &str) -> bool {
+    matches!(
+        owner,
+        "org/apache/logging/log4j/Logger"
+            | "org/apache/logging/log4j/spi/ExtendedLogger"
+            | "org/apache/logging/log4j/spi/AbstractLogger"
+            | "org/slf4j/Logger"
+            | "java/util/logging/Logger"
+            | "java/lang/System$Logger"
+    )
+}
+
+/// The logger name a factory argument names: a `String` as it is, a `Class`
+/// (an internal name, by the factory's declared parameter) as its binary
+/// name, and anything else as the root logger's empty name.
+fn logger_name(r: &MethodRef, args: &[Value]) -> String {
+    match args.first() {
+        Some(class) if r.descriptor.starts_with("(Ljava/lang/Class;") => {
+            crate::runtime::host_class::class_name(class)
+                .unwrap_or_default()
+                .replace('/', ".")
+        }
+        Some(Value::Ref(Some(text))) => text.clone(),
+        _ => String::new(),
+    }
+}
+
+/// A `GETSTATIC` the model answers, or `None` to leave it to the host.
+pub(crate) fn static_field(owner: &str, name: &str) -> Option<Value> {
+    if let Some(value) = crate::runtime::host_log4j_level::static_field(owner, name) {
+        return Some(value);
+    }
+    match owner {
+        "java/nio/charset/StandardCharsets" => STANDARD_CHARSETS
+            .iter()
+            .find(|(field, _)| *field == name)
+            .map(|(_, canonical)| charset_value(canonical)),
+        // The host reports `os.name=Linux` and models a JVM on that platform,
+        // so `java.io.File`'s platform constants are that platform's: `/`, `:`
+        // and their chars. They are read as `File.separator`/`separatorChar`
+        // and, at high frequency, by path normalisers that translate a
+        // separator char.
+        "java/io/File" => match name {
+            "separator" => Some(Value::Ref(Some("/".into()))),
+            "pathSeparator" => Some(Value::Ref(Some(":".into()))),
+            "separatorChar" => Some(Value::Int('/' as i32)),
+            "pathSeparatorChar" => Some(Value::Int(':' as i32)),
+            _ => None,
+        },
+        // A `WatchEvent.Kind` is only ever a token handed back to `register`
+        // or compared with `==` against the event a key reports
+        // (`watch_service.rs`). The marker keeps its enum name so
+        // `name()`/`toString` agree.
+        "java/nio/file/StandardWatchEventKinds" => match name {
+            "ENTRY_CREATE" | "ENTRY_DELETE" | "ENTRY_MODIFY" | "OVERFLOW" => {
+                Some(crate::runtime::host_watch::watch_kind(name))
+            }
+            _ => None,
+        },
+        // `System.Logger.Level`'s constants: the disabled-logger model drops
+        // every message, so the level is only ever handed back to `log` or
+        // compared. The marker carries the enum's own name.
+        "java/lang/System$Logger$Level" => matches!(
+            name,
+            "ALL" | "TRACE" | "DEBUG" | "INFO" | "WARNING" | "ERROR" | "OFF"
+        )
+        .then(|| Value::Ref(Some(format!("enum/java/lang/System$Logger$Level/{name}")))),
+        // `StackWalker.Option.RETAIN_CLASS_REFERENCE` only. The walker model
+        // keeps each frame's class and method and has no hidden or
+        // reflection frames, which is what a walker with that option alone
+        // answers. The other three options change the answers (no
+        // `getCallerClass` without `RETAIN_CLASS_REFERENCE`, no method name
+        // with `DROP_METHOD_INFO`, extra frames with `SHOW_*_FRAMES`), so
+        // their reads stay unanswered and counted. The marker keeps the
+        // enum's own name for `name()`/`toString`.
+        "java/lang/StackWalker$Option" => (name == "RETAIN_CLASS_REFERENCE")
+            .then(|| crate::runtime::host_jdk_constant::stack_walker_option(name)),
+        _ => None,
+    }
+}
+
+fn int_arg(args: &[Value], index: usize) -> Option<i32> {
+    args.get(index).and_then(super::boxed_integer)
+}
+
+fn long_arg(args: &[Value], index: usize) -> Option<i64> {
+    args.get(index).and_then(super::boxed_long)
+}
+
+/// A static call the model answers, or `None` to leave it to the host.
+pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    if let Some(collector) = to_map_collector(r, args) {
+        return Some(Ok(collector));
+    }
+    if let Some(comparator) = crate::runtime::jdk_stream::comparator_static(r, args) {
+        return Some(comparator);
+    }
+    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        // `Modifier`'s predicates over the access flags reflection answers
+        // (`Field.getModifiers`): config frameworks check `isPublic`/`isStatic`
+        // before they read a field, and the neutral `false` made every field
+        // look private.
+        ("java/lang/reflect/Modifier", name, "(I)Z") => {
+            let bit = match name {
+                "isPublic" => 0x0001,
+                "isPrivate" => 0x0002,
+                "isProtected" => 0x0004,
+                "isStatic" => 0x0008,
+                "isFinal" => 0x0010,
+                "isSynchronized" => 0x0020,
+                "isVolatile" => 0x0040,
+                "isTransient" => 0x0080,
+                "isNative" => 0x0100,
+                "isInterface" => 0x0200,
+                "isAbstract" => 0x0400,
+                "isStrict" => 0x0800,
+                _ => return None,
+            };
+            let flags = int_arg(args, 0)?;
+            Some(Ok(Value::Int(i32::from(flags & bit != 0))))
+        }
+        // The wrappers' static reducers, which streams reach as method
+        // references (`Integer::sum` as a `toMap` merge or `reduce` operator).
+        ("java/lang/Integer", "sum" | "max" | "min", "(II)I") => {
+            let (a, b) = (int_arg(args, 0)?, int_arg(args, 1)?);
+            Some(Ok(Value::Int(match r.name.as_str() {
+                "sum" => a.wrapping_add(b),
+                "max" => a.max(b),
+                _ => a.min(b),
+            })))
+        }
+        ("java/lang/Long", "sum" | "max" | "min", "(JJ)J") => {
+            let (a, b) = (long_arg(args, 0)?, long_arg(args, 1)?);
+            Some(Ok(Value::Long(match r.name.as_str() {
+                "sum" => a.wrapping_add(b),
+                "max" => a.max(b),
+                _ => a.min(b),
+            })))
+        }
+        // Since JDK 18 the default charset is UTF-8 on every platform.
+        ("java/nio/charset/Charset", "defaultCharset", "()Ljava/nio/charset/Charset;") => {
+            Some(Ok(charset_value("UTF-8")))
+        }
+        (
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        ) => {
+            let name = args.first().map(expect_string).unwrap_or_default();
+            Some(match canonical_charset(name) {
+                Some(canonical) => Ok(charset_value(canonical)),
+                None => Err(NativeError::UncaughtException {
+                    class: "java/nio/charset/UnsupportedCharsetException".into(),
+                    message: Some(name.to_owned()),
+                    frame: None,
+                }),
+            })
+        }
+        ("java/nio/charset/Charset", "isSupported", "(Ljava/lang/String;)Z") => {
+            let name = args.first().map(expect_string).unwrap_or_default();
+            Some(Ok(Value::Int(i32::from(canonical_charset(name).is_some()))))
+        }
+        // Logger factories. log4j's `String` overload names the logger by
+        // its text; the no-argument, `Class` and `Object` overloads name it by
+        // a class, which only the runtime knows (`invoke_logger_factory`). A
+        // `null` name (the caller's class) and the `MessageFactory` overloads
+        // (one logger per name and factory) are left counted.
+        (
+            "org/apache/logging/log4j/LogManager",
+            "getLogger" | "getFormatterLogger",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        ) => {
+            let api = if r.name == "getLogger" {
+                "log4j"
+            } else {
+                "log4j-formatter"
+            };
+            match args.first() {
+                Some(Value::Ref(Some(name))) => Some(Ok(logger_value(api, name))),
+                _ => None,
+            }
+        }
+        ("org/apache/logging/log4j/LogManager", "getRootLogger", _) => {
+            Some(Ok(logger_value("log4j", "")))
+        }
+        ("org/slf4j/LoggerFactory", "getLogger", descriptor)
+            if descriptor.ends_with(")Lorg/slf4j/Logger;") =>
+        {
+            Some(Ok(logger_value("slf4j", &logger_name(r, args))))
+        }
+        // Mojang's `LogUtils.getLogger()` names the caller's class through a
+        // stack walk; the bounded runtime has no stack to walk, so the logger
+        // is anonymous. Its name is never observable through a disabled logger.
+        ("com/mojang/logging/LogUtils", "getLogger", "()Lorg/slf4j/Logger;") => {
+            Some(Ok(logger_value("mojang", "")))
+        }
+        ("java/util/logging/Logger", "getLogger", descriptor)
+            if descriptor.ends_with(")Ljava/util/logging/Logger;") =>
+        {
+            Some(Ok(logger_value("jul", &logger_name(r, args))))
+        }
+        // `System.getLogger(String[, ResourceBundle])`: the JDK's
+        // `System.Logger` is answered by the same disabled-logger model as
+        // `java.util.logging` (the host writes nothing and reports every level
+        // disabled, which is a logger configured to drop the mod's output).
+        ("java/lang/System", "getLogger", descriptor)
+            if descriptor.ends_with(")Ljava/lang/System$Logger;") =>
+        {
+            Some(Ok(logger_value("system", &logger_name(r, args))))
+        }
+        ("java/util/logging/Logger", "getGlobal", _) => Some(Ok(logger_value("jul", "global"))),
+        ("java/util/logging/Logger", "getAnonymousLogger", _) => {
+            Some(Ok(logger_value("jul-anonymous", "")))
+        }
+        // The single runtime object. `availableProcessors` and the memory
+        // reads already answer on it (a single-threaded bounded runtime is one
+        // processor); only the static factory was missing, so a mod sizing a
+        // pool from it read a null and stopped.
+        ("java/lang/Runtime", "getRuntime", "()Ljava/lang/Runtime;") => {
+            Some(Ok(Value::Ref(Some("runtime/bootstrap".into()))))
+        }
+        // `Pattern.compile(text)` keeps the text as an opaque pattern; the
+        // matching methods are not modelled here, so a matcher call stays a
+        // counted unknown. Departure from the JVM: the syntax is NOT checked
+        // (the runtime has no regex engine), so text Java would reject with
+        // `PatternSyntaxException` compiles here. For valid text this matches
+        // the JVM: the caller stores the pattern and only a matcher needs it.
+        ("java/util/regex/Pattern", "compile", "(Ljava/lang/String;)Ljava/util/regex/Pattern;") => {
+            let pattern = expect_string(args.first()?);
+            Some(Ok(crate::runtime::host_jdk_constant::pattern(pattern)))
+        }
+        // The default filesystem. Its watch services are `watch_service.rs`'s;
+        // no call here touches the host's disk.
+        ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
+            Some(Ok(Value::Ref(Some("file-system/default".into()))))
+        }
+        ("kotlin/jvm/internal/Intrinsics", name, descriptor)
+            if crate::runtime::return_desc(descriptor) == "V" =>
+        {
+            kotlin_null_check(name, args)
+        }
+        // Fabric's resource loader, one per pack type: the real
+        // `ResourceLoaderImpl.get` is `IMPL_MAP.computeIfAbsent(type, ...)`, so
+        // it always answers the same instance for a type. The listener a mod
+        // registers is accepted; the runtime has no resource reload, so it
+        // never runs (named in the PR).
+        (
+            "net/fabricmc/fabric/api/resource/v1/ResourceLoader",
+            "get",
+            "(Lnet/minecraft/server/packs/PackType;)Lnet/fabricmc/fabric/api/resource/v1/ResourceLoader;",
+        ) => args
+            .first()
+            .and_then(crate::runtime::host_fabric_runtime::resource_loader)
+            .map(Ok),
+        _ => None,
+    }
+}
+
+/// Kotlin's null-check intrinsics, which compiled Kotlin runs on every
+/// non-null parameter and platform-typed expression: a pure check that throws
+/// on null, with the exception class and message `kotlin.jvm.internal.Intrinsics`
+/// uses. The two pre-1.4 forms throw `IllegalArgumentException` and
+/// `IllegalStateException`; the current ones throw `NullPointerException`. A
+/// parameter check's JDK message also names the calling method, which a host
+/// call cannot see, so that part is left out.
+fn kotlin_null_check(name: &str, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    let detail = || args.get(1).map(|value| expect_string(value).to_owned());
+    let parameter = || {
+        detail().map(|name| format!("Parameter specified as non-null is null: parameter {name}"))
+    };
+    let (class, message) = match name {
+        "checkNotNull" => ("java/lang/NullPointerException", detail()),
+        "checkNotNullParameter" => ("java/lang/NullPointerException", parameter()),
+        "checkParameterIsNotNull" => ("java/lang/IllegalArgumentException", parameter()),
+        "checkNotNullExpressionValue" => (
+            "java/lang/NullPointerException",
+            detail().map(|expression| format!("{expression} must not be null")),
+        ),
+        "checkExpressionValueIsNotNull" => (
+            "java/lang/IllegalStateException",
+            detail().map(|expression| format!("{expression} must not be null")),
+        ),
+        _ => return None,
+    };
+    Some(match args.first() {
+        Some(Value::Ref(None)) | None => Err(NativeError::UncaughtException {
+            class: class.into(),
+            message,
+            frame: None,
+        }),
+        Some(_) => Ok(Value::Void),
+    })
+}
+
+/// An instance call on a modelled value, or `None` to leave it to the host.
+pub(crate) fn instance_call(
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if let Some(comparator) = crate::runtime::jdk_stream::comparator_instance(r, receiver, args) {
+        return Some(comparator);
+    }
+    if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
+        return resolve_sibling(r, receiver, args).map(Ok);
+    }
+    if let Some(kind) = crate::runtime::host_watch::watch_key(receiver, crate::runtime::HostKind::WatchKind) {
+        return matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("name", "()Ljava/lang/String;")
+        )
+        .then(|| Ok(Value::Ref(Some(kind.to_owned()))));
+    }
+    if let Some(name) = crate::runtime::host_jdk::logger_name(receiver)
+        && is_logger_owner(&r.owner)
+    {
+        return logger_call(r, &name);
+    }
+    if let Some(value) = crate::runtime::host_log4j_level::instance_call(r, receiver, args) {
+        return Some(value);
+    }
+    if crate::runtime::host_fabric_runtime::is_resource_loader(receiver) {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            // Registration is kept nowhere: with no resource reload modelled,
+            // there is no event to fire the listener from, and pretending one
+            // had run would be worse than accepting the registration.
+            (
+                "registerReloadListener",
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/server/packs/resources/PreparableReloadListener;)V",
+            )
+            | (
+                "addListenerOrdering",
+                "(Lnet/minecraft/resources/Identifier;Lnet/minecraft/resources/Identifier;)V",
+            ) => Some(Ok(Value::Void)),
+            _ => None,
+        };
+    }
+    // A compiled `Pattern` (`host_jdk_constant.rs`): its text.
+    if let Some(pattern) = crate::runtime::host_jdk_constant::pattern_text(receiver) {
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("pattern" | "toString", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some(pattern)))),
+            _ => None,
+        };
+    }
+    let marker = expect_ref(receiver)?;
+    if let Some(canonical) = marker.strip_prefix(CHARSET_PREFIX) {
+        return charset_call(r, canonical, args);
+    }
+    if marker == "file-system/default" {
+        // `newWatchService` is `watch_service.rs`'s.
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("getSeparator", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some("/".into())))),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn charset_call(
+    r: &MethodRef,
+    canonical: &str,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let text = || Value::Ref(Some(canonical.to_owned()));
+    Some(Ok(match (r.name.as_str(), r.descriptor.as_str()) {
+        ("name" | "displayName" | "toString", "()Ljava/lang/String;") => text(),
+        ("canEncode" | "isRegistered", "()Z") => Value::Int(1),
+        ("equals", "(Ljava/lang/Object;)Z") => Value::Int(i32::from(matches!(
+            args.first(),
+            Some(Value::Ref(Some(other)))
+                if other.strip_prefix(CHARSET_PREFIX) == Some(canonical)
+        ))),
+        ("hashCode", "()I") => Value::Int(java_string_hash(canonical)),
+        _ => return None,
+    }))
+}
+
+/// Logger output methods are safe no-ops. Enablement checks require a real
+/// logging configuration; the standalone host has none, so those calls stay
+/// counted instead of inventing a disabled/enabled answer.
+fn logger_call(r: &MethodRef, name: &str) -> Option<Result<Value, NativeError>> {
+    let returns = r.descriptor.rsplit_once(')').map_or("", |(_, ret)| ret);
+    Some(Ok(match (r.name.as_str(), returns) {
+        ("getName", "Ljava/lang/String;") => Value::Ref(Some(name.to_owned())),
+        (method, "Z") if method.starts_with("is") => return None,
+        (_, "V") => Value::Void,
+        _ => return None,
+    }))
+}
+
+/// `Path.resolveSibling(other)`: `other` against the receiver's parent, or
+/// `other` itself when the receiver has no parent or `other` is absolute.
+fn resolve_sibling(r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
+    if !matches!(
+        r.descriptor.as_str(),
+        "(Ljava/lang/String;)Ljava/nio/file/Path;" | "(Ljava/nio/file/Path;)Ljava/nio/file/Path;"
+    ) {
+        return None;
+    }
+    let path = crate::runtime::host_path::path_key(receiver)?;
+    let other = args.first().map(crate::runtime::path_text).unwrap_or_default();
+    // Text a path is made of must encode (`host_path::encodable`); left to
+    // the caller, which counts it.
+    if !crate::runtime::host_path::encodable(other) {
+        return None;
+    }
+    let parent = path
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent });
+    let resolved = match parent {
+        Some(parent) if !other.starts_with('/') => {
+            format!("{}/{other}", parent.trim_end_matches('/'))
+        }
+        _ => other.to_owned(),
+    };
+    Some(crate::runtime::path_value(&resolved))
+}
+
+/// Elements one `StreamSupport.stream` source may yield before the runtime
+/// stops it. Config and service code streams a handful of providers or
+/// entries; a spliterator that keeps advancing past this is a generator the
+/// bounded runtime refuses rather than spinning on.
+pub(crate) const MAX_SPLITERATOR_ELEMENTS: usize = 4096;
+
+/// A `Collectors.toMap` collection in progress: its functions and what it
+/// has collected so far. The stream push feeds it one element at a time
+/// (`stream_pipeline.rs`), so the key and value functions run interleaved
+/// with the stages, as JDK 25's `ReduceOps` runs a collector's accumulator.
+///
+/// `Collectors.toMap` collects into a host `HashMap` (`map`, made by
+/// [`crate::runtime::Runtime::begin_to_map`] as the sink's `begin` runs `HashMap::new`)
+/// through `hash_bulk.rs`'s `putIfAbsent`/`merge`, so the result iterates in
+/// JDK 25's table order. Guava's collectors keep `entries` in encounter
+/// order, as an `ImmutableMap` does.
+#[derive(Clone, Debug)]
+pub(crate) struct ToMap {
+    pub(crate) key_fn: Value,
+    pub(crate) value_fn: Value,
+    pub(crate) merge_fn: Option<Value>,
+    guava: bool,
+    entries: Vec<(Value, Value)>,
+    map: Option<Value>,
+    /// The 4-argument form's map supplier (`TreeMap::new`, ...).
+    supplier: Option<Value>,
+}
+
+impl ToMap {
+    /// The state for a built-in `toMap` collector (`host_collector.rs`), `None` for any other.
+    pub(crate) fn begin(collector: &Value) -> Result<Option<Self>, NativeError> {
+        let Some(crate::runtime::host_collector::Builtin::ToMap { guava, functions }) =
+            crate::runtime::host_collector::builtin(collector)
+        else {
+            return Ok(None);
+        };
+        let (key_fn, value_fn, merge_fn, supplier) = match functions.as_slice() {
+            [key, value] => (key.clone(), value.clone(), None, None),
+            [key, value, merge] => (key.clone(), value.clone(), Some(merge.clone()), None),
+            [key, value, merge, supplier] if !guava => (
+                key.clone(),
+                value.clone(),
+                Some(merge.clone()),
+                Some(supplier.clone()),
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(Self {
+            key_fn,
+            value_fn,
+            merge_fn,
+            guava,
+            entries: Vec::new(),
+            map: None,
+            supplier,
+        }))
+    }
+
+    /// The collected map: the JDK collector's own `HashMap` (or supplied
+    /// map), or for Guava's `toImmutableMap` its entries in encounter order.
+    pub(crate) fn finish(self) -> Result<Value, Vec<Value>> {
+        if let Some(map) = self.map {
+            return Ok(map);
+        }
+        Err(self
+            .entries
+            .into_iter()
+            .flat_map(|(key, value)| [key, value])
+            .collect())
+    }
+}
+
+/// The `Collectors.toMap` overloads the host answers with a collector handle.
+pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
+    // Guava's immutable-map collectors (`ImmutableMap.toImmutableMap`,
+    // `Maps.toImmutableEnumMap`, WorldEdit's platform table) collect the same
+    // way; only a repeated key raises Guava's `IllegalArgumentException`.
+    let guava = match (r.owner.as_str(), r.name.as_str()) {
+        ("java/util/stream/Collectors", "toMap") => false,
+        ("com/google/common/collect/ImmutableMap", "toImmutableMap")
+        | ("com/google/common/collect/Maps", "toImmutableEnumMap") => true,
+        _ => return None,
+    };
+    let functions = match r.descriptor.as_str() {
+        "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;" => {
+            2
+        }
+        // The merge overload (`HashMap::new`).
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;)Ljava/util/stream/Collector;" => {
+            3
+        }
+        // The one that also names the map supplier: the supplier makes the
+        // map and each element is `map.merge(k, v, merge)` on it
+        // (`ToMap::supplier`).
+        "(Ljava/util/function/Function;Ljava/util/function/Function;Ljava/util/function/BinaryOperator;Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"
+            if !guava =>
+        {
+            4
+        }
+        _ => return None,
+    };
+    // A new `CollectorImpl` per call, holding the functions (`host_collector.rs`).
+    Some(crate::runtime::host_collector::collector(
+        crate::runtime::host_collector::Builtin::ToMap {
+            guava,
+            functions: args.iter().take(functions).cloned().collect(),
+        },
+    ))
+}
+
+impl crate::runtime::StdHost {
+    /// `List.copyOf`, `Set.copyOf` and `Map.copyOf`: an immutable copy of a
+    /// collection the host can read, with the JDK's rules (a `null` element
+    /// throws `NullPointerException`, a set keeps the first of equal
+    /// elements). Without this the call answered an empty neutral list, and
+    /// icy-better-horses found every breed's coat list empty.
+    pub(crate) fn collection_copy_of(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let kind = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/util/List", "copyOf", "(Ljava/util/Collection;)Ljava/util/List;") => "list",
+            ("java/util/Set", "copyOf", "(Ljava/util/Collection;)Ljava/util/Set;") => "set",
+            ("java/util/Map", "copyOf", "(Ljava/util/Map;)Ljava/util/Map;") => "map",
+            _ => return None,
+        };
+        let source = args.first()?;
+        let null_pointer = || NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        };
+        if matches!(source, Value::Ref(None)) {
+            return Some(Err(null_pointer()));
+        }
+        let values = match super::host_collection_values(self, source) {
+            Ok(values) => values,
+            Err(error) => return Some(Err(error)),
+        };
+        if values.iter().any(|value| matches!(value, Value::Ref(None))) {
+            return Some(Err(null_pointer()));
+        }
+        let values = if kind == "set" {
+            let mut seen = std::collections::BTreeSet::new();
+            values
+                .into_iter()
+                .filter(|value| seen.insert(super::value_marker(value)))
+                .collect()
+        } else {
+            values
+        };
+        // The class `List.copyOf`/`Set.copyOf`/`Map.copyOf` makes, its shared
+        // empty one included (#156 P14d2).
+        Some(Ok(
+            self.factory_unmodifiable(&r.owner, &r.name, kind, values)
+        ))
+    }
+
+    /// `List.subList(from, to)` on a list the host holds.
+    ///
+    /// The JDK answers a view; the bounded host answers a copy of the range
+    /// as a new mutable list. Reads (what config path code does: NightConfig
+    /// walks `path.subList(0, n - 1)` to find a parent table) see the same
+    /// elements; a write through the sub-list does not reach the parent. The
+    /// range checks raise the JDK's `IndexOutOfBoundsException` /
+    /// `IllegalArgumentException` with its messages.
+    pub(crate) fn sub_list(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let from = super::expect_int(r, Self::argument(r, args, 0)?)?;
+        let to = super::expect_int(r, Self::argument(r, args, 1)?)?;
+        let values = self
+            .mutable_collections
+            .get(marker)
+            .cloned()
+            .unwrap_or_default();
+        let failure = if from < 0 {
+            Some((
+                "java/lang/IndexOutOfBoundsException",
+                format!("fromIndex = {from}"),
+            ))
+        } else if to as i64 > values.len() as i64 {
+            Some((
+                "java/lang/IndexOutOfBoundsException",
+                format!("toIndex = {to}"),
+            ))
+        } else if from > to {
+            Some((
+                "java/lang/IllegalArgumentException",
+                format!("fromIndex({from}) > toIndex({to})"),
+            ))
+        } else {
+            None
+        };
+        if let Some((class, message)) = failure {
+            return Err(NativeError::UncaughtException {
+                class: class.into(),
+                message: Some(message),
+                frame: None,
+            });
+        }
+        let range = values[from as usize..to as usize].to_vec();
+        Ok(self.new_collection(super::stand_in_class("list"), range))
+    }
+}
+
+/// The supertypes `instanceof` must see for a boxed value or a JDK
+/// collection object, beyond the class itself.
+///
+/// The interpreter knows the jar's hierarchy from its class files; the JDK's
+/// is not in any jar, so `new ArrayList<>() instanceof List` and
+/// `Integer.valueOf(3) instanceof Number` answered `false`, and library code
+/// that dispatches on value type (NightConfig's TOML writer: "Unsupported
+/// value type: java/lang/Integer") refused values the JVM accepts. Only the
+/// public types a library tests for are listed.
+fn platform_supertypes(class: &str) -> &'static [&'static str] {
+    // The classes the platform models answer for. Their supertypes are Java 25's, generated
+    // (`jdk_closure.rs`), not written by hand: the hand rows made `WeakHashMap` a `Cloneable`,
+    // `Hashtable` an `AbstractMap` and `CopyOnWriteArrayList` an `AbstractList` (#163).
+    const CLASSES: &[&str] = &[
+        "java/lang/Integer",
+        "java/lang/Long",
+        "java/lang/Short",
+        "java/lang/Byte",
+        "java/lang/Float",
+        "java/lang/Double",
+        "java/lang/Boolean",
+        "java/lang/Character",
+        "java/util/ArrayList",
+        "java/util/Vector",
+        "java/util/Stack",
+        "java/util/concurrent/CopyOnWriteArrayList",
+        "java/util/LinkedList",
+        "java/util/HashSet",
+        "java/util/concurrent/CopyOnWriteArraySet",
+        "java/util/LinkedHashSet",
+        "java/util/TreeSet",
+        "java/util/concurrent/ConcurrentSkipListSet",
+        "java/util/HashMap",
+        "java/util/IdentityHashMap",
+        "java/util/WeakHashMap",
+        "java/util/EnumMap",
+        "java/util/Hashtable",
+        "java/util/LinkedHashMap",
+        "java/util/TreeMap",
+        "java/util/concurrent/ConcurrentSkipListMap",
+        "java/util/concurrent/ConcurrentHashMap",
+        "java/util/ArrayDeque",
+        "java/util/concurrent/ConcurrentLinkedDeque",
+        "java/util/PriorityQueue",
+        "java/util/concurrent/ConcurrentLinkedQueue",
+        "java/io/File",
+    ];
+    if CLASSES.contains(&class) {
+        crate::runtime::jdk_closure::below_object(class)
+    } else {
+        &[]
+    }
+}
+
+/// `marker instanceof wanted` for a boxed value or a JDK collection object
+/// (`java/util/ArrayList#3`, `java/util/LinkedHashMap#neutral0`).
+pub(crate) fn platform_instance_of(marker: &str, wanted: &str) -> bool {
+    let Some((class, _)) = marker.split_once('#') else {
+        return false;
+    };
+    // `[I#0` is a string: arrays are handles (`host_array.rs`).
+    !crate::runtime::host_array::handle_only_class(class) && class_instance_of(class, wanted)
+}
+
+/// Whether an instance of the platform class `class` is a `wanted`.
+pub(crate) fn class_instance_of(class: &str, wanted: &str) -> bool {
+    if class == wanted {
+        return true;
+    }
+    let known = match platform_supertypes(class) {
+        [] => crate::runtime::java_immutable::supertypes(class),
+        known => known,
+    };
+    if known.is_empty() {
+        return crate::runtime::library_dispatch::fastutil_instance_of(class, wanted);
+    }
+    class == wanted || known.contains(&wanted)
+}
+
+/// Adapt the arguments a method reference's target receives, the way the
+/// lambda metafactory does (JLS 5.3 invocation contexts: unboxing, then
+/// widening primitive conversion): a box in a primitive parameter position
+/// becomes its primitive (`BinaryOperator<Integer>` → `Integer::sum`), and a
+/// primitive is widened to the parameter's type (`IntFunction` →
+/// `takesLong(long)`, `Function<Integer, ?>` → `takesLong(long)`). `args` are
+/// the target's declared parameters in order (no receiver); a reference
+/// parameter, or a value that is no box, is left as it is.
+pub(crate) fn unbox_for_descriptor(descriptor: &str, args: &mut [Value]) {
+    for (parameter, value) in super::descriptor_arguments(descriptor)
+        .iter()
+        .zip(args.iter_mut())
+    {
+        if let Some(adapted) = adapt_to_primitive(value, parameter) {
+            *value = adapted;
+        }
+    }
+}
+
+/// `value` unboxed (when it is a box) and widened to the primitive type
+/// `descriptor` (`I`, `J`, `F`, `D`...), or `None` when `descriptor` is not a
+/// primitive or `value` is neither a primitive nor a box.
+///
+/// Widening follows JLS 5.1.2: `int`/`long` to `float` round to the nearest
+/// `float`; to `double`, `int` is exact and `long` rounds. A narrowing is never
+/// applied (the metafactory has none), so such a value is unboxed only.
+pub(crate) fn adapt_to_primitive(value: &Value, descriptor: &str) -> Option<Value> {
+    if !matches!(descriptor, "I" | "S" | "B" | "C" | "Z" | "J" | "F" | "D") {
+        return None;
+    }
+    let primitive = match value {
+        Value::Boxed(boxed) => boxed.primitive(),
+        Value::Ref(Some(_)) => match descriptor {
+            "C" => super::boxed_character(value).map(Value::Int),
+            "Z" => super::boxed_boolean(value).map(|flag| Value::Int(i32::from(flag))),
+            _ => super::boxed_integer(value)
+                .or_else(|| super::boxed_short(value).map(i32::from))
+                .or_else(|| super::boxed_byte(value).map(i32::from))
+                .or_else(|| super::boxed_character(value))
+                .map(Value::Int)
+                .or_else(|| super::boxed_long(value).map(Value::Long))
+                .or_else(|| super::boxed_number(value).map(Value::Float)),
+        }?,
+        Value::Int(_) | Value::Long(_) | Value::Float(_) => value.clone(),
+        _ => return None,
+    };
+    Some(match (primitive, descriptor) {
+        (Value::Int(int), "J") => Value::Long(i64::from(int)),
+        (Value::Int(int), "F") => Value::Float(f64::from(int as f32)),
+        (Value::Int(int), "D") => Value::Float(f64::from(int)),
+        (Value::Long(long), "F") => Value::Float(f64::from(long as f32)),
+        (Value::Long(long), "D") => Value::Float(long as f64),
+        (other, _) => other,
+    })
+}
+
+/// A parsed class's `access_flags`, read back from its bytes (the parser
+/// keeps the raw class file and skips the field for every other use).
+pub(crate) fn class_access_flags(file: &crate::runtime::ClassFile) -> Option<u16> {
+    let mut reader = crate::runtime::Reader::new(&file.raw);
+    if reader.u4().ok()? != 0xCAFE_BABE {
+        return None;
+    }
+    reader.skip(4).ok()?;
+    crate::runtime::read_pool(&mut reader).ok()?;
+    reader.u2().ok()
+}
+
+impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
+    /// `String.join(separator, CharSequence...)` and `String.join(separator,
+    /// Iterable)`: command feedback builds its lines with them. The varargs
+    /// array lives in the interpreter, so this runs here rather than in the
+    /// host; a `StringBuilder` element reads its text, `null` reads `null`.
+    /// An `Iterable`'s elements come back from the host as stored item
+    /// markers, so each is parsed back to its value before it is joined.
+    pub(crate) fn invoke_string_join(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/lang/String" || r.name != "join" {
+            return Ok(None);
+        }
+        let Some(separator) = args.first() else {
+            return Ok(None);
+        };
+        let elements: Vec<Value> = match r.descriptor.as_str() {
+            "(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;" => {
+                let Some(values) = args.get(1).and_then(|array| self.owned_array(array)) else {
+                    return Ok(None);
+                };
+                values.into_owned()
+            }
+            "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;" => {
+                let Some(items) = args
+                    .get(1)
+                    .and_then(|items| self.host.mutable_collection_values(items))
+                else {
+                    return Ok(None);
+                };
+                items
+            }
+            _ => return Ok(None),
+        };
+        // `String.join` takes `String.valueOf(element)` of each element: a
+        // builder's text, a jar `CharSequence`'s own `toString()`
+        // (`jar_text.rs`, counted when it has none), else the value's text.
+        let mut parts = Vec::with_capacity(elements.len());
+        for value in std::iter::once(separator).chain(&elements) {
+            let text = match value {
+                value if self.builder_text(value).is_some() => {
+                    self.builder_text(value).cloned().unwrap_or_default()
+                }
+                value if crate::runtime::jar_object::packaged_object_class(value).is_some() => {
+                    match self.runtime_value_of(value, "java/lang/String", "join")? {
+                        Some(Value::Ref(Some(text))) => text,
+                        Some(_) => "null".to_owned(),
+                        None => crate::runtime::value_text(value),
+                    }
+                }
+                other => crate::runtime::value_text(other),
+            };
+            parts.push(text);
+        }
+        let separator = parts.remove(0);
+        Ok(Some(Value::Ref(Some(parts.join(&separator)))))
+    }
+
+    /// The JDK calls the interpreter answers itself, in one dispatch slot:
+    /// `CharSequence` on text, `Class` kind queries on jar classes, and list
+    /// sorts that need a comparator to run.
+    pub(crate) fn invoke_jdk_runtime(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_class_kind(r, receiver) {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_identifier_runtime(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_value_of_builder(r, args) {
+            return Ok(Some(value));
+        }
+        self.invoke_char_sequence(r, receiver, args)
+    }
+
+    /// `Class.isInterface`/`isEnum`/`isAnnotation`/`isRecord` for a class a
+    /// jar declares, from its class-file access flags and superclass.
+    ///
+    /// The host only knows class names, so it answered `false` for every
+    /// `isInterface()`, and a config library that proxies an interface
+    /// (servercore's DazzleConf: "OptimizationConfig is not an interface")
+    /// refused its own config type. A platform class keeps the host's answer.
+    fn invoke_class_kind(&self, r: &MethodRef, receiver: Option<&Value>) -> Option<Value> {
+        if r.owner != "java/lang/Class" || r.descriptor != "()Z" {
+            return None;
+        }
+        let name = crate::runtime::host_class::class_name(receiver?)?;
+        // A primitive, an array or a JDK class: `isInterface` from Java 25's
+        // table (`List.class.isInterface()`); the rest is the host's.
+        let Some(file) = self.class(name) else {
+            return (r.name == "isInterface")
+                .then(|| crate::runtime::host_class::table_is_interface(name))
+                .flatten()
+                .map(|interface| Value::Int(i32::from(interface)));
+        };
+        let flags = class_access_flags(file)?;
+        let answer = match r.name.as_str() {
+            "isInterface" => flags & 0x0200 != 0,
+            "isAnnotation" => flags & 0x2000 != 0,
+            "isEnum" => flags & 0x4000 != 0 && file.super_name == "java/lang/Enum",
+            "isRecord" => file.super_name == "java/lang/Record" && flags & 0x0010 != 0,
+            _ => return None,
+        };
+        Some(Value::Int(i32::from(answer)))
+    }
+
+    /// A `java.lang.CharSequence` call on a `String` or a modelled
+    /// `StringBuilder`/`StringBuffer`.
+    ///
+    /// Library code types text as `CharSequence` (NightConfig's TOML writer
+    /// measures every key with `CharSequence.length()`); the host's string
+    /// surface is keyed by `java/lang/String`, so the call is answered as the
+    /// `String` method on the receiver's text. A jar class implementing
+    /// `CharSequence`, or any other object, keeps the normal dispatch.
+    fn invoke_char_sequence(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/lang/CharSequence" {
+            return Ok(None);
+        }
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(marker) = expect_ref(receiver) else {
+            return Ok(None);
+        };
+        let text = match self.builder_text(receiver) {
+            Some(text) => text.clone(),
+            None if crate::runtime::jar_object::packaged_object_class(receiver).is_some() => {
+                return Ok(None);
+            }
+            None => marker.clone(),
+        };
+        let (name, descriptor) = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("subSequence", "(II)Ljava/lang/CharSequence;") => {
+                ("substring", "(II)Ljava/lang/String;")
+            }
+            (
+                name @ ("length" | "charAt" | "isEmpty" | "toString" | "chars" | "codePoints"),
+                descriptor,
+            ) => (name, descriptor),
+            _ => return Ok(None),
+        };
+        let as_string = MethodRef {
+            owner: "java/lang/String".into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        self.host
+            .invoke_instance(&as_string, &Value::Ref(Some(text)), args)
+            .map(Some)
+    }
+
+    /// The class whose body an instance method reference runs for
+    /// `receiver`: the receiver class's own override or inherited body when
+    /// the receiver is a jar object, else `None` to keep the symbolic owner.
+    ///
+    /// The JVM invokes a `REF_invokeVirtual`/`REF_invokeInterface` handle
+    /// virtually. The marker does not record the handle kind, so a concrete
+    /// symbolic body is only replaced by a jar override found on the
+    /// receiver's chain; an abstract one is always resolved there.
+    pub(crate) fn callback_dispatch_owner(
+        &self,
+        target: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Option<String> {
+        let class = self.receiver_class(receiver?)?.to_owned();
+        if class == target.owner {
+            return None;
+        }
+        let (owner, true) = self.member_owner(&class, &target.name, &target.descriptor)? else {
+            return None;
+        };
+        let method = self
+            .class(&owner)?
+            .method(&target.name, &target.descriptor)?;
+        (method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0)
+            .then_some(owner)
+    }
+
+    /// The jar class whose override a platform-typed virtual call selects.
+    ///
+    /// `invokevirtual java/io/Reader.read()` on a `FastStringReader#10` the
+    /// jar constructed must run `FastStringReader.read()`: the JVM dispatches
+    /// on the receiver, and the symbolic owner only fixes the signature. Only
+    /// call sites whose symbolic resolution finds no jar body are considered,
+    /// only objects this run built (`class#n`), and never a constructor, a
+    /// static or a private method, none of which overrides.
+    pub(crate) fn platform_override_owner(
+        &self,
+        r: &MethodRef,
+        opcode: u8,
+        receiver: Option<&Value>,
+    ) -> Option<String> {
+        if !matches!(opcode, 0xb6 | 0xb9) || r.name.starts_with('<') {
+            return None;
+        }
+        // A symbolic owner that resolves to a jar body keeps the
+        // interpreter's own dispatch rules. What is left is a site whose
+        // resolution finds no body in any jar: a platform owner, or a jar
+        // class that only inherits the method abstractly (`AbstractConfig`
+        // calling `createSubConfig()`, which only `Config` declares).
+        if let Some((owner, true)) = self.member_owner(&r.owner, &r.name, &r.descriptor)
+            && self
+                .class(&owner)
+                .and_then(|file| file.method(&r.name, &r.descriptor))
+                .is_some_and(|method| method.code.is_some())
+        {
+            return None;
+        }
+        let class = crate::runtime::jar_object::object_class(receiver?)?;
+        let Some((owner, true)) = self.member_owner(class, &r.name, &r.descriptor) else {
+            return None;
+        };
+        let method = self.class(&owner)?.method(&r.name, &r.descriptor)?;
+        (method.code.is_some() && !method.is_static() && method.access & 0x0002 == 0)
+            .then_some(owner)
+    }
+
+    /// `Files.walk(path)` / `Files.list(path)` over the invocation's virtual
+    /// file table.
+    ///
+    /// A path exists when the jar wrote it, created it as a directory, or
+    /// wrote something beneath it; anything else raises the JVM's
+    /// `NoSuchFileException`, which is what a fresh game directory answers for
+    /// a folder the mod never made (emotecraft walks `emotes/`). `walk` yields
+    /// the start path, then every descendant (intermediate directories
+    /// included) in sorted order; `list` yields the direct children. Both are
+    /// bounded by [`MAX_SPLITERATOR_ELEMENTS`]. The host filesystem is never
+    /// read.
+    pub(crate) fn files_tree(
+        &mut self,
+        r: &MethodRef,
+        path: &str,
+        class: &str,
+        method: &str,
+    ) -> Result<Value, NativeError> {
+        let root = path.trim_end_matches('/');
+        let prefix = format!("{root}/");
+        let mut found = std::collections::BTreeSet::new();
+        for key in self.io_files.keys() {
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            let parts = rest
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            let depth = if r.name == "list" { 1 } else { parts.len() };
+            for end in 1..=depth.min(parts.len()) {
+                found.insert(format!("{prefix}{}", parts[..end].join("/")));
+            }
+        }
+        if found.is_empty()
+            && !self.io_files.contains_key(root)
+            && !self.io_files.contains_key(path)
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/nio/file/NoSuchFileException".into(),
+                message: Some(path.to_owned()),
+                frame: None,
+            });
+        }
+        if found.len() >= MAX_SPLITERATOR_ELEMENTS {
+            return Err(NativeError::Metadata(format!(
+                "Files.{} under {path} holds more than {MAX_SPLITERATOR_ELEMENTS} entries",
+                r.name
+            )));
+        }
+        let mut values = Vec::with_capacity(found.len() + 1);
+        if r.name == "walk" {
+            values.push(crate::runtime::path_value(path));
+        }
+        values.extend(found.into_iter().map(|entry| crate::runtime::path_value(&entry)));
+        // `spliteratorUnknownSize` over the directory iterator: not `SIZED`.
+        let stream = self.new_stream(class, method, values);
+        Ok(stream)
+    }
+
+    /// `stream.collect(Collectors.toMap(key, value[, merge]))` over a value
+    /// list: [`Self::accept_to_map`] for each element in order, then
+    /// [`ToMap::finish`].
+    pub(crate) fn collect_to_map(
+        &mut self,
+        collector: &Value,
+        values: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(mut state) = self.begin_to_map(collector)? else {
+            return Ok(None);
+        };
+        for element in values {
+            self.accept_to_map(&mut state, element)?;
+        }
+        Ok(Some(self.finish_to_map(state)?))
+    }
+
+    /// [`ToMap::finish`]: Guava's entries become its `ImmutableMap`
+    /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
+    /// none.
+    pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        match state.finish() {
+            Ok(map) => Ok(map),
+            Err(entries) => self.factory_or_count(
+                &crate::runtime::stream_pipeline::wanted(
+                    "com/google/common/collect/ImmutableMap",
+                    "toImmutableMap",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+                ),
+                "map",
+                entries,
+            ),
+        }
+    }
+
+    /// [`ToMap::begin`], and for `Collectors.toMap` the `HashMap::new` its
+    /// supplier runs before the first element.
+    pub(crate) fn begin_to_map(&mut self, collector: &Value) -> Result<Option<ToMap>, NativeError> {
+        let Some(mut state) = ToMap::begin(collector)? else {
+            return Ok(None);
+        };
+        if let Some(supplier) = state.supplier.clone() {
+            // `mapFactory.get()` in the sink's `begin`.
+            let map = self.call_sam("java/util/function/Supplier", &supplier, &[])?;
+            if map == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            state.map = Some(map);
+        } else if !state.guava {
+            state.map = Some(self.new_collector_hash_map()?);
+        }
+        Ok(Some(state))
+    }
+
+    /// `toMap`'s accumulator for one element: the key function, then the
+    /// value function, then the insert. A repeated key without a merge
+    /// function raises the JVM's `IllegalStateException` ("Duplicate key
+    /// ..."); with one, the merged value replaces the earlier one in place.
+    /// A `null` value raises `NullPointerException`, as `HashMap.merge` does.
+    pub(crate) fn accept_to_map(
+        &mut self,
+        state: &mut ToMap,
+        element: &Value,
+    ) -> Result<(), NativeError> {
+        if let (Some(map), Some(merge)) = (
+            state.map.clone(),
+            state.supplier.as_ref().and(state.merge_fn.clone()),
+        ) {
+            // `toMap(k, v, merge, mapFactory)`'s accumulator:
+            // `map.merge(keyMapper.apply(t), valueMapper.apply(t), merge)`.
+            let key = self.apply_function(&state.key_fn, element)?;
+            let value = self.apply_function(&state.value_fn, element)?;
+            self.call_virtual(
+                crate::runtime::jdk_call::Site::Interface,
+                "java/util/Map",
+                "merge",
+                "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+                &map,
+                &[key, value, merge],
+            )?;
+            return Ok(());
+        }
+        if let Some(map) = state.map.clone() {
+            // `Collectors.toMap`: `putIfAbsent` or `merge` on the `HashMap`.
+            return self.hash_map_collect_one(&map, state, element);
+        }
+        let key = self.apply_function(&state.key_fn, element)?;
+        let value = self.apply_function(&state.value_fn, element)?;
+        if matches!(value, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        let existing = state
+            .entries
+            .iter()
+            .position(|(other, _)| super::value_marker(other) == super::value_marker(&key));
+        match (existing, state.merge_fn.clone()) {
+            (None, _) => state.entries.push((key, value)),
+            (Some(index), Some(merge)) => {
+                let earlier = state.entries[index].1.clone();
+                let merged = self.apply_callback(&merge, &[earlier, value])?;
+                state.entries[index].1 = merged;
+            }
+            (Some(index), None) if state.guava => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "Multiple entries with same key: {key}={} and {key}={}",
+                        super::value_text(&state.entries[index].1),
+                        super::value_text(&value),
+                        key = super::value_text(&key),
+                    )),
+                    frame: None,
+                });
+            }
+            (Some(index), None) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalStateException".into(),
+                    message: Some(format!(
+                        "Duplicate key {} (attempted merging values {} and {})",
+                        super::value_text(&key),
+                        super::value_text(&state.entries[index].1),
+                        super::value_text(&value)
+                    )),
+                    frame: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_function(&mut self, function: &Value, element: &Value) -> Result<Value, NativeError> {
+        self.apply_callback(function, std::slice::from_ref(element))
+    }
+
+    /// Run a functional-interface value the way a stream stage does: a jar
+    /// lambda or method reference through the callback path, anything else
+    /// through the host's `Function.apply`.
+    pub(crate) fn apply_callback(
+        &mut self,
+        function: &Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        if let Some(value) = self.invoke_callback(function, args)? {
+            return Ok(value);
+        }
+        let descriptor = if args.len() == 2 {
+            (
+                "java/util/function/BiFunction",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+        } else {
+            (
+                "java/util/function/Function",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+        };
+        self.host.invoke_instance(
+            &MethodRef {
+                owner: descriptor.0.into(),
+                name: "apply".into(),
+                descriptor: descriptor.1.into(),
+            },
+            function,
+            args,
+        )
+    }
+}
+
+/// `String#hashCode` over UTF-16 code units.
+pub(crate) fn java_string_hash(text: &str) -> i32 {
+    text.encode_utf16().fold(0i32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+    })
+}
+
+impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
+    /// The logger factories whose name may depend on a class, which only the
+    /// runtime knows: log4j's `LogManager.getLogger`/`getFormatterLogger`
+    /// with no argument (the caller's class, `StackLocatorUtil.getCallerClass`),
+    /// a `String` (`null`: the caller's), a `Class` (`null`: the caller's) or
+    /// an `Object` (its class; `null`: the caller's), a class named by
+    /// `Class.getCanonicalName()` (else `getName()`) as log4j-api 2.26's
+    /// `LoggerContext.getLogger(Class)` does, each with an optional
+    /// `MessageFactory` (counted, see below); and Mojang's
+    /// `LogUtils.getLogger()`, slf4j's logger of the caller's class, named by
+    /// `getName()`. A name the runtime cannot tell (a class it does not hold
+    /// with a `$`, a value of unknown class, no caller frame) is counted and
+    /// answered with the best name it has. `None` for any other call.
+    pub(crate) fn invoke_logger_factory(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let caller = || {
+            crate::runtime::stack_walk::snapshot()
+                .first()
+                .map(|(class, _)| class.clone())
+        };
+        if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
+            == (
+                "com/mojang/logging/LogUtils",
+                "getLogger",
+                "()Lorg/slf4j/Logger;",
+            )
+        {
+            return Ok(Some(match caller() {
+                Some(class) => logger_value("slf4j", &class.replace('/', ".")),
+                None => {
+                    self.host.unknown_operand_call(r)?;
+                    logger_value("mojang", "")
+                }
+            }));
+        }
+        let api = match (r.owner.as_str(), r.name.as_str()) {
+            ("org/apache/logging/log4j/LogManager", "getLogger") => "log4j",
+            ("org/apache/logging/log4j/LogManager", "getFormatterLogger") => "log4j-formatter",
+            _ => return Ok(None),
+        };
+        if !r.descriptor.ends_with(")Lorg/apache/logging/log4j/Logger;") {
+            return Ok(None);
+        }
+        // An overload taking a `MessageFactory` caches one logger per name
+        // and factory, which the runtime cannot compare: answered (a mod
+        // logs through it) but counted, under a key no other logger shares.
+        let parameters = crate::runtime::descriptor_arguments(&r.descriptor);
+        let (api, first) = match parameters.as_slice() {
+            [] => (api, None),
+            [first] => (api, Some(first.as_str())),
+            [first, factory] if factory == "Lorg/apache/logging/log4j/message/MessageFactory;" => {
+                self.host.unknown_operand_call(r)?;
+                ("log4j-factory", Some(first.as_str()))
+            }
+            _ => return Ok(None),
+        };
+        let class = match (first, args.first()) {
+            (None, _)
+            | (
+                Some("Ljava/lang/String;" | "Ljava/lang/Class;" | "Ljava/lang/Object;"),
+                Some(Value::Ref(None)),
+            ) => caller(),
+            // A name is the logger's name as it is.
+            (Some("Ljava/lang/String;"), Some(Value::Ref(Some(name)))) => {
+                return Ok(Some(logger_value(api, name)));
+            }
+            (Some("Ljava/lang/Class;"), Some(class))
+                if crate::runtime::host_class::class_name(class).is_some() =>
+            {
+                crate::runtime::host_class::class_name(class).map(|class| class.replace('.', "/"))
+            }
+            (Some("Ljava/lang/Object;"), Some(value)) => {
+                crate::runtime::class_of_value(value).or_else(|| {
+                    expect_ref(value)
+                        .filter(|text| crate::runtime::value_class::is_plain_string(text))
+                        .map(|_| "java/lang/String".to_owned())
+                })
+            }
+            _ => return Ok(None),
+        };
+        let name = match class
+            .as_deref()
+            .map(|class| (class, self.canonical_class_name(class)))
+        {
+            Some((_, Some(Some(name)))) => name,
+            Some((class, Some(None))) => class.replace('/', "."),
+            Some((class, None)) => {
+                self.host.unknown_operand_call(r)?;
+                class.replace('/', ".")
+            }
+            None => {
+                self.host.unknown_operand_call(r)?;
+                String::new()
+            }
+        };
+        Ok(Some(logger_value(api, &name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn method(owner: &str, name: &str, descriptor: &str) -> MethodRef {
+        MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        }
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Ref(Some(value.into()))
+    }
+
+    /// Only `RETAIN_CLASS_REFERENCE` matches what the walker model answers;
+    /// the options that change the JDK's answers stay unanswered.
+    #[test]
+    fn only_retain_class_reference_is_answered() {
+        assert_eq!(
+            static_field("java/lang/StackWalker$Option", "RETAIN_CLASS_REFERENCE"),
+            Some(crate::runtime::host_jdk_constant::stack_walker_option(
+                "RETAIN_CLASS_REFERENCE"
+            ))
+        );
+        for name in [
+            "DROP_METHOD_INFO",
+            "SHOW_REFLECT_FRAMES",
+            "SHOW_HIDDEN_FRAMES",
+        ] {
+            assert_eq!(
+                static_field("java/lang/StackWalker$Option", name),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn charset_for_name_resolves_aliases_and_rejects_unknown_names() {
+        let for_name = method(
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        );
+        let utf8 = static_call(&for_name, &[text("utf8")]).unwrap().unwrap();
+        let name = method("java/nio/charset/Charset", "name", "()Ljava/lang/String;");
+        assert_eq!(
+            instance_call(&name, &utf8, &[]).unwrap().unwrap(),
+            text("UTF-8")
+        );
+        let latin = static_call(&for_name, &[text("Latin1")]).unwrap().unwrap();
+        assert_eq!(
+            instance_call(&name, &latin, &[]).unwrap().unwrap(),
+            text("ISO-8859-1")
+        );
+        // `KOI8-R` is not modelled; `default` is not a name JDK 25 knows.
+        for unknown in ["KOI8-R", "default"] {
+            assert!(
+                matches!(
+                    static_call(&for_name, &[text(unknown)]),
+                    Some(Err(NativeError::UncaughtException { class, .. }))
+                        if class == "java/nio/charset/UnsupportedCharsetException"
+                ),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_java25_standard_charset_alias_resolves() {
+        let for_name = method(
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        );
+        for (canonical, aliases) in [
+            ("UTF-8", ["unicode-1-1-utf-8", "utf-8", "utf8"].as_slice()),
+            (
+                "US-ASCII",
+                [
+                    "646",
+                    "ansi_x3.4-1968",
+                    "ansi_x3.4-1986",
+                    "ascii",
+                    "ascii7",
+                    "cp367",
+                    "csascii",
+                    "ibm367",
+                    "iso-ir-6",
+                    "iso646-us",
+                    "iso_646.irv:1983",
+                    "iso_646.irv:1991",
+                    "us",
+                    "us-ascii",
+                ]
+                .as_slice(),
+            ),
+            (
+                "ISO-8859-1",
+                [
+                    "819",
+                    "8859_1",
+                    "cp819",
+                    "csisolatin1",
+                    "ibm-819",
+                    "ibm819",
+                    "iso-8859-1",
+                    "iso-ir-100",
+                    "iso8859-1",
+                    "iso8859_1",
+                    "iso_8859-1",
+                    "iso_8859-1:1987",
+                    "iso_8859_1",
+                    "l1",
+                    "latin1",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for alias in aliases {
+                let value = static_call(&for_name, &[text(alias)]).unwrap().unwrap();
+                let name = method("java/nio/charset/Charset", "name", "()Ljava/lang/String;");
+                assert_eq!(
+                    instance_call(&name, &value, &[]).unwrap().unwrap(),
+                    text(canonical),
+                    "{alias}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standard_charsets_equal_their_for_name_lookup() {
+        let field = static_field("java/nio/charset/StandardCharsets", "UTF_8").unwrap();
+        let for_name = method(
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        );
+        let looked_up = static_call(&for_name, &[text("UTF-8")]).unwrap().unwrap();
+        let equals = method("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+        assert_eq!(
+            instance_call(&equals, &field, &[looked_up])
+                .unwrap()
+                .unwrap(),
+            Value::Int(1)
+        );
+        let ascii = static_field("java/nio/charset/StandardCharsets", "US_ASCII").unwrap();
+        assert_eq!(
+            instance_call(&equals, &field, &[ascii]).unwrap().unwrap(),
+            Value::Int(0)
+        );
+        // "UTF-8".hashCode() on a JVM.
+        let hash = method("java/nio/charset/Charset", "hashCode", "()I");
+        assert_eq!(
+            instance_call(&hash, &field, &[]).unwrap().unwrap(),
+            Value::Int(81_070_450)
+        );
+    }
+
+    #[test]
+    fn logger_factories_answer_a_named_disabled_logger() {
+        // The `Class`/`Object`/no-argument overloads are named by a class
+        // the runtime knows (`invoke_logger_factory`; fixture_host_values_p2b
+        // checks them against Java 25); the host answers the `String` one.
+        let by_name = method(
+            "org/apache/logging/log4j/LogManager",
+            "getLogger",
+            "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
+        );
+        let logger = static_call(&by_name, &[text("xaero.lib.XaeroLib")])
+            .unwrap()
+            .unwrap();
+        assert_ne!(logger, Value::Ref(None));
+        let get_name = method(
+            "org/apache/logging/log4j/Logger",
+            "getName",
+            "()Ljava/lang/String;",
+        );
+        assert_eq!(
+            instance_call(&get_name, &logger, &[]).unwrap().unwrap(),
+            text("xaero.lib.XaeroLib")
+        );
+        let enabled = method("org/slf4j/Logger", "isDebugEnabled", "()Z");
+        let slf4j = static_call(
+            &method(
+                "org/slf4j/LoggerFactory",
+                "getLogger",
+                "(Ljava/lang/String;)Lorg/slf4j/Logger;",
+            ),
+            &[text("demo")],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            instance_call(&enabled, &slf4j, &[]).is_none(),
+            "enablement requires a host logging configuration"
+        );
+        let info = method(
+            "org/slf4j/Logger",
+            "info",
+            "(Ljava/lang/String;Ljava/lang/Object;)V",
+        );
+        assert_eq!(
+            instance_call(&info, &slf4j, &[text("{}"), text("x")])
+                .unwrap()
+                .unwrap(),
+            Value::Void
+        );
+    }
+
+    #[test]
+    fn modifier_predicates_read_their_flag_bits() {
+        // `public static final` is 0x19 on the JVM.
+        let flags = Value::Int(0x19);
+        for (name, expected) in [
+            ("isPublic", 1),
+            ("isStatic", 1),
+            ("isFinal", 1),
+            ("isPrivate", 0),
+            ("isAbstract", 0),
+        ] {
+            let predicate = method("java/lang/reflect/Modifier", name, "(I)Z");
+            assert_eq!(
+                static_call(&predicate, std::slice::from_ref(&flags))
+                    .unwrap()
+                    .unwrap(),
+                Value::Int(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_sibling_replaces_the_last_name() {
+        let sibling = method(
+            "java/nio/file/Path",
+            "resolveSibling",
+            "(Ljava/lang/String;)Ljava/nio/file/Path;",
+        );
+        let cases = [
+            (
+                "/horizon/config",
+                "defaultconfigs",
+                "/horizon/defaultconfigs",
+            ),
+            ("/horizon/config/a.json", "b.json", "/horizon/config/b.json"),
+            ("config", "other", "other"),
+            ("/top", "x", "/x"),
+            ("/horizon/config", "/abs", "/abs"),
+        ];
+        for (path, other, expected) in cases {
+            let path = crate::runtime::path_value(path);
+            assert_eq!(
+                instance_call(&sibling, &path, &[text(other)])
+                    .unwrap()
+                    .unwrap(),
+                crate::runtime::path_value(expected),
+                "{path:?} sibling {other}"
+            );
+        }
+    }
+}

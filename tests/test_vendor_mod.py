@@ -69,6 +69,27 @@ class VendorModTests(unittest.TestCase):
         self.assertEqual(same.returncode, 0, same.stderr)
         self.assertIn("vendored file(s) match", same.stdout)
 
+    def test_every_mod_folder_gets_the_copy_and_is_checked(self):
+        # `mod-horizon/` (the official-Horizon build) carries the same copy as `mod/`; a tree with
+        # only `mod/` is unchanged, and an edit in either copy fails the check.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            (tree / "mod-horizon").mkdir()
+            self.assertEqual(check(tree, "--check")[0], 1, "an empty mod-horizon/src/runtime drifts")
+            subprocess.run([sys.executable, str(VENDOR), "--repo", str(tree)], check=True,
+                           capture_output=True, timeout=120)
+            self.assertEqual(check(tree, "--check")[0], 0)
+            for mod in ("mod", "mod-horizon"):
+                self.assertEqual(
+                    (tree / mod / "src" / "runtime" / "mod.rs").read_bytes(),
+                    (tree / "mod" / "src" / "runtime" / "mod.rs").read_bytes(),
+                )
+            edited = tree / "mod-horizon" / "src" / "runtime" / "brigadier.rs"
+            edited.write_bytes(edited.read_bytes() + b"\n")
+            code, stderr = check(tree, "--check")
+            self.assertEqual(code, 1)
+            self.assertIn("mod-horizon/src/runtime/brigadier.rs", stderr)
+
     def test_one_edited_byte_fails_the_check(self):
         with tempfile.TemporaryDirectory() as scratch:
             tree = copy_tree(Path(scratch) / "tree")
