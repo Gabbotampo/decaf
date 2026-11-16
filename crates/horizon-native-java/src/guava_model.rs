@@ -249,16 +249,16 @@ impl<H: Host> Runtime<'_, H> {
             match (r.name.as_str(), r.descriptor.as_str(), receiver) {
                 ("natural", "()Lcom/google/common/collect/Ordering;", None) => {
                     return Ok(Some(crate::callback_marker::composite(
-                        "guava.ordering.natural",
+                        "cmp.guava-natural",
                         &[],
                     )));
                 }
                 ("reverse", "()Lcom/google/common/collect/Ordering;", Some(v)) => {
                     if let Some((op, _)) = crate::callback_marker::composite_of(v) {
-                        return Ok(Some(if op == "guava.ordering.natural" {
-                            crate::callback_marker::composite("guava.ordering.reverse", &[v])
+                        return Ok(Some(if op == "cmp.guava-natural" {
+                            crate::callback_marker::composite("cmp.guava-reverse", &[v])
                         } else {
-                            crate::callback_marker::composite("guava.ordering.natural", &[])
+                            crate::callback_marker::composite("cmp.guava-natural", &[])
                         }));
                     }
                 }
@@ -266,8 +266,8 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         if let Some((kind, _)) = receiver.and_then(crate::callback_marker::composite_of) {
-            let natural = kind == "guava.ordering.natural";
-            let reverse = kind == "guava.ordering.reverse";
+            let natural = kind == "cmp.guava-natural";
+            let reverse = kind == "cmp.guava-reverse";
             if natural || reverse {
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
                     return Ok(Some(Value::Ref(Some(
