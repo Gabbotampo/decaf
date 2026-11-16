@@ -2775,6 +2775,11 @@ pub trait Host {
         Vec::new()
     }
 
+    /// A Fabric origin's stored singleton root list, when this host models it.
+    fn origin_paths(&mut self, _receiver: &Value, _path: &str) -> Option<Value> {
+        None
+    }
+
     /// Text a jar wrote to `System.out`. The bounded host keeps it in memory for the length of
     /// one invocation; a host that shows the jar's output (the game's mod) keeps it across calls
     /// and reads it back through its own accessor. Hosts that do not model a console keep the
@@ -3987,6 +3992,32 @@ impl StdHost {
             return jar_object::collection(marker);
         }
         let made = self.new_collection(class, values);
+        if let Some(marker) = expect_ref(&made) {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        made
+    }
+
+    /// The loader wraps metadata collections in a fresh unmodifiable view,
+    /// cached per receiver and getter just like the mutable stand-ins.
+    pub(crate) fn cached_unmodifiable_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        values: Vec<Value>,
+    ) -> Value {
+        let Some(identity) = cache_identity(of) else {
+            return self.unmodifiable_as(class, values);
+        };
+        let cache = (identity, member.to_owned());
+        if let Some(marker) = self.cached_collections.get(&cache)
+            && (self.mutable_collections.contains_key(marker)
+                || self.unmodifiable_collections.contains_key(marker))
+        {
+            return jar_object::collection(marker.clone());
+        }
+        let made = self.unmodifiable_as(class, values);
         if let Some(marker) = expect_ref(&made) {
             self.cached_collections.insert(cache, marker.clone());
         }
@@ -5994,6 +6025,15 @@ impl Host for StdHost {
 
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.merged_service_providers(service)
+    }
+
+    fn origin_paths(&mut self, receiver: &Value, path: &str) -> Option<Value> {
+        Some(self.cached_unmodifiable_collection(
+            receiver,
+            "getPaths",
+            "java/util/Collections$SingletonList",
+            vec![path_value(path)],
+        ))
     }
 
     fn resource_stream_text(&mut self, marker: &str) -> Option<String> {
@@ -9694,6 +9734,19 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            if r.name == "remove"
+                && r.descriptor == "()V"
+                && self.iterator_sources.get(marker).is_some_and(|source| {
+                    source.starts_with("java/util/Collections$Unmodifiable")
+                        || source == "java/util/Collections$SingletonList"
+                })
+            {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/UnsupportedOperationException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
                 ("next", "()Ljava/lang/Object;") => {
@@ -11408,11 +11461,10 @@ impl Host for StdHost {
                 // The container keeps its root paths: one list per container.
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
                 let roots = vec![path_value(&format!("/horizon/mods/{id}"))];
-                Ok(self.cached_collection(
+                Ok(self.cached_unmodifiable_collection(
                     receiver,
                     "getRootPaths",
-                    stand_in_class("list"),
-                    false,
+                    "java/util/Collections$SingletonList",
                     roots,
                 ))
             }
@@ -11447,19 +11499,15 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
-            // The metadata keeps each of these: one empty collection per
-            // metadata object and member, the same on every call.
+            // Metadata handles without a recorded V1 document are the
+            // bounded opaque-loader fallback. Keep the old per-receiver
+            // collection identity for this unknown path; V0 and builtin
+            // documents are handled by fabric_mods.rs and remain counted.
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides" | "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
-            ) => Ok(self.cached_collection(
-                receiver,
-                &r.name,
-                stand_in_class("list"),
-                false,
-                Vec::new(),
-            )),
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
@@ -11468,14 +11516,8 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
-                "()Ljava/util/Map;",
-            ) => Ok(self.cached_collection(
-                receiver,
-                "getDependencies",
-                stand_in_class("map"),
-                false,
-                Vec::new(),
-            )),
+                "()Ljava/util/Collection;" | "()Ljava/util/Map;",
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/Version",
                 "getFriendlyString" | "getRaw" | "toString",
