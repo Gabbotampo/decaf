@@ -841,7 +841,10 @@ impl<H: Host> Runtime<'_, H> {
             // Arrays are reflected as JSON arrays, preserving primitive and
             // reference elements exactly as Gson's TypeAdapterRuntimeTypeWrapper.
             Value::Host(handle) if tree_mode && handle.kind() == crate::HostKind::Array => {
-                self.gson_array_text(&self.array(value)?.clone(), style, depth, tree_mode)?
+                // `array` borrows the runtime (a `Cow` over the backing since #338),
+                // so own the elements before the writer takes `&mut self`.
+                let values = self.array(value)?.into_owned();
+                self.gson_array_text(&values, style, depth, tree_mode)?
             }
             // A host model's object (`Optional`): Gson reflects its private
             // fields, which JDK 25's module system refuses; not answered.
