@@ -182,6 +182,7 @@ mod mod_config_register;
 mod mod_config_spec;
 mod mod_count;
 mod mod_origin;
+mod model_layers;
 mod modified_utf8;
 mod native_library;
 pub mod neoforge_attachments;
@@ -23439,6 +23440,9 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
+        if let Some(value) = model_layers::new_object(class, &key) {
+            return value;
+        }
         if modelled_writer_class(class) {
             jar_object::writer_handle(key)
         } else {
