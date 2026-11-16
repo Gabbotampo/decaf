@@ -154,6 +154,7 @@ mod jdk_closure;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
+mod jdk_new_set_from_map;
 mod jdk_object_methods;
 mod jdk_reflect_proxy;
 mod jdk_skeletons;
@@ -2479,6 +2480,16 @@ pub trait Host {
         None
     }
 
+    /// Whether a `Collections$SetFromMap` receiver must route through the
+    /// backing map instead of the standalone identity-set helper.
+    fn is_set_from_map(&self, _value: &Value) -> bool {
+        false
+    }
+
+    fn set_from_map_source(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
     /// Whether [`Self::mutable_collection_values`] would answer for `value`,
     /// without copying the values out (#203).
     fn holds_collection(&self, value: &Value) -> bool {
@@ -3330,6 +3341,9 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Live SetFromMap marker -> backing map marker.
+    set_from_map_views: BTreeMap<String, String>,
+    next_set_from_map: u64,
     /// Chat components changed in place, by marker (`host_component.rs`).
     pub(crate) component_states: host_component::States,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -3560,6 +3574,8 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            set_from_map_views: BTreeMap::new(),
+            next_set_from_map: 0,
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             random_sources: BTreeMap::new(),
@@ -4319,6 +4335,19 @@ impl StdHost {
     /// [`Self::mutable_values`] reads it (through a synchronized wrapper),
     /// or `None` for a view (whose values are another list's) and a marker
     /// with no list.
+    fn set_from_map_values(&self, marker: &str) -> Option<Vec<Value>> {
+        let map = self.set_from_map_views.get(marker)?;
+        let values = self.mutable_collections.get(map)?;
+        Some(
+            values
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| pair[0].clone())
+                .collect(),
+        )
+    }
+
     fn direct_collection<'a>(&'a self, marker: &'a str) -> Option<&'a str> {
         let marker = self.synchronized_target(marker);
         (self.view_values(marker).is_none()
@@ -4328,6 +4357,13 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<Value>> {
+        // A typed SetFromMap handle reads its backing map's keys.
+        if let Value::Host(handle) = receiver
+            && handle.kind() == HostKind::Collection
+            && let Some(values) = self.set_from_map_values(handle.key())
+        {
+            return Some(values);
+        }
         // A `String` is no collection, whatever it spells (`jar_object.rs`).
         if jar_object::spells_key(receiver) {
             return None;
@@ -4352,9 +4388,12 @@ impl StdHost {
                 reversed = !reversed;
                 base.clone()
             } else {
-                // A collection is a handle with a row (#156 P14d2): a view over
-                // anything else reads nothing.
-                let mut values = self.mutable_collections.get(&target)?.clone();
+                // A collection is a handle with a row (#156 P14d2). SetFromMap
+                // is a live view over its backing map row.
+                let mut values = match self.set_from_map_values(&target) {
+                    Some(values) => values,
+                    None => self.mutable_collections.get(&target)?.clone(),
+                };
                 if reversed {
                     values.reverse();
                 }
@@ -5419,6 +5458,24 @@ impl Host for StdHost {
         }
     }
 
+    fn is_set_from_map(&self, value: &Value) -> bool {
+        eprintln!(
+            "SETMAP? {value:?} keys={:?}",
+            self.set_from_map_views.keys().collect::<Vec<_>>()
+        );
+        let Value::Host(handle) = value else {
+            return false;
+        };
+        handle.kind() == HostKind::Collection && self.set_from_map_views.contains_key(handle.key())
+    }
+
+    fn set_from_map_source(&self, value: &Value) -> Option<Value> {
+        let marker = crate::runtime::jar_object::object_key(value)?;
+        self.set_from_map_views
+            .get(marker)
+            .map(|map| crate::runtime::jar_object::stored(map))
+    }
+
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
     }
@@ -5426,6 +5483,9 @@ impl Host for StdHost {
     fn collection_len(&self, value: &Value) -> Option<usize> {
         let marker = self.synchronized_target(expect_ref(value)?);
         if let Some(values) = self.view_values(marker) {
+            return Some(values.len());
+        }
+        if let Some(values) = self.set_from_map_values(marker) {
             return Some(values.len());
         }
         if let Some(values) = self.reversed_view_values(marker) {
@@ -5453,6 +5513,18 @@ impl Host for StdHost {
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        if let Value::Host(handle) = value
+            && handle.kind() == HostKind::Collection
+            && let Some(map) = self.set_from_map_views.get(handle.key()).cloned()
+        {
+            let mut entries = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                entries.push(value);
+                entries.push(Value::Boxed(Boxed::Boolean(true)));
+            }
+            self.mutable_collections.insert(map, entries);
+            return;
+        }
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
             self.mutable_collections.insert(marker, values);
@@ -6330,6 +6402,9 @@ impl Host for StdHost {
         }
         // The game-event façade's statics (`ServerPlayNetworking.canSend`).
         if let Some(value) = self.game_event_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = self.new_set_from_map(r, args) {
             return value;
         }
         if let Some(value) = self.unmodifiable_factory(r, args) {
@@ -7570,6 +7645,17 @@ impl Host for StdHost {
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
+        if self.is_set_from_map(receiver) {
+            if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                return answer;
+            }
+        }
         check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
@@ -8371,6 +8457,12 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // A jar String that spells a SetFromMap handle is still a String.
+            // It must never enter the live-view dispatch or mutate the backing map.
+            if matches!(receiver, Value::Ref(Some(text)) if self.set_from_map_views.contains_key(text))
+            {
+                return self.unknown_host_call(r);
+            }
             // The game's `NonNullList` (an inventory's list): its own rules
             // (no `null`, a fixed size for `withSize`) are not modelled, so a
             // mutator is counted (#255 review), and so is `subList`, whose
@@ -8425,6 +8517,17 @@ impl Host for StdHost {
             }
             if let Some(answer) = self.unmodifiable_member(r, marker, args) {
                 return answer;
+            }
+            if self.is_set_from_map(receiver) {
+                if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                    return answer;
+                }
+                if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                    return answer;
+                }
+                if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                    return answer;
+                }
             }
             if r.name == "removeIf"
                 && r.descriptor == "(Ljava/util/function/Predicate;)Z"
@@ -9752,6 +9855,32 @@ impl Host for StdHost {
                     .map(|pair| pair[1].clone())
                     .collect::<Vec<_>>();
                 Ok(self.map_view(receiver, "values", "list", values))
+            }
+            (owner, "hashCode", "()I") if is_set_owner(owner) => {
+                let values = host_collection_values(self, receiver)?;
+                let mut hash = 0_i32;
+                for value in values {
+                    let Some(element_hash) = jdk_new_set_from_map::known_set_hash(&value) else {
+                        return self.unknown_host_call(r);
+                    };
+                    hash = hash.wrapping_add(element_hash);
+                }
+                Ok(Value::Int(hash))
+            }
+            (owner, "equals", "(Ljava/lang/Object;)Z") if is_set_owner(owner) => {
+                let other = Self::argument(r, args, 0)?;
+                if !jdk_new_set_from_map::is_set_value(other) {
+                    return Ok(Value::Int(0));
+                }
+                let mine = host_collection_values(self, receiver)?;
+                let theirs = host_collection_values(self, other)?;
+                Ok(Value::Int(
+                    (mine.len() == theirs.len()
+                        && mine
+                            .iter()
+                            .all(|value| theirs.iter().any(|other| other == value)))
+                        as i32,
+                ))
             }
             (owner, "toString", "()Ljava/lang/String;") if is_collection_owner(owner) => {
                 // A jar subclass's marker names its own class; the JDK owner
@@ -22534,6 +22663,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
+        eprintln!(
+            "CALLBACK target={:?} captures={:?} args={:?}",
+            callback.target, callback.captures, args
+        );
         // The callback target may live in a linked library jar, so resolve it
         // the same way a frame resolves its own class: the host's modelled
         // surface wins over a lookalike class in the pack.
