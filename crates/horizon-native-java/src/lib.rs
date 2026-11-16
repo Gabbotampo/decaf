@@ -75,6 +75,7 @@ mod gson_tree;
 mod gson_type_token;
 mod gson_writer;
 mod guava_model;
+mod guava_multimap;
 mod guava_text;
 mod hash_bulk;
 mod hash_collections;
