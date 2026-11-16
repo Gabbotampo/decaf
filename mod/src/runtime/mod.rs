@@ -50,6 +50,7 @@ pub mod dependencies;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
+mod entity_registration;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
@@ -3491,6 +3492,7 @@ pub struct StdHost {
     brigadier: brigadier::BrigadierState,
     /// FML's `InterModComms` queues, shared with the other jars of a game (`neoforge_imc.rs`).
     imc: neoforge_imc::ImcHandle,
+    entity_registration: entity_registration::State,
 }
 
 impl Default for StdHost {
@@ -3637,6 +3639,7 @@ impl StdHost {
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
+            entity_registration: entity_registration::State::default(),
         }
     }
 
@@ -6029,6 +6032,9 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {
+            return value;
+        }
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
@@ -6284,6 +6290,11 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) =
+            entity_registration::static_call(&mut self.entity_registration, r, args)
+        {
+            return value;
+        }
         if !random_source::is_bit_conversion(r) {
             self.random_bit_scope = None;
         }
@@ -7647,6 +7658,11 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) =
+            entity_registration::instance_call(&mut self.entity_registration, r, receiver, args)
+        {
+            return value;
+        }
         self.record(r, Some(receiver), args);
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;

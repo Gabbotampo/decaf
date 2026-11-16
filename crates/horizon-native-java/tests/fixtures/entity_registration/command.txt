@@ -1,0 +1,4 @@
+Captured on cytonic from the real 26.3 server-game.jar with the installed OpenJDK 27 runtime (arcweld has no JDK; the JDK-25 oracle was unavailable on the build host):
+CP=.local/minecraft/26.3/jars/server-game.jar:$(find .local/minecraft/26.3/libraries -type f -name '*.jar' | paste -sd:)
+/usr/lib/jvm/java-27-openjdk/bin/javac -cp "$CP" Probe.java
+/usr/lib/jvm/java-27-openjdk/bin/java -cp ".:$CP" Probe > java27.txt
