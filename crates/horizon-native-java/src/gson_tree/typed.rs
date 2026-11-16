@@ -72,6 +72,12 @@ fn json_long(text: &str) -> Option<i64> {
 /// `Double.parseDouble` of a JSON number's text. Text of any other shape is
 /// refused: Java's parser and Rust's accept different spellings beyond it.
 fn json_double(text: &str) -> Option<f64> {
+    match text {
+        "NaN" => return Some(f64::NAN),
+        "Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
     json_number(text)?;
     text.parse::<f64>().ok()
 }
@@ -202,7 +208,10 @@ impl<H: Host> Runtime<'_, H> {
         target: &GenericType,
         style: &gson_model::GsonStyle,
     ) -> Result<Option<Value>, NativeError> {
-        match Parser::parse_noting_duplicates(text) {
+        match Parser::parse_noting_duplicates_with_special_floats(
+            text,
+            style.allows_special_floats(),
+        ) {
             // An empty document is `null`.
             (Parsed::Empty, _) => Ok(Some(Value::Ref(None))),
             (Parsed::Value(tree), false) => self.gson_read(&tree, target, style),
@@ -240,6 +249,19 @@ impl<H: Host> Runtime<'_, H> {
             _ => &[],
         };
         let class = class.to_owned();
+        // Gson's STRICT reader rejects non-finite values for every numeric
+        // adapter and ObjectTypeAdapter. StringAdapter still reads the token
+        // text, so retain that exact result.
+        if !style.allows_special_floats()
+            && class != "java/lang/String"
+            && matches!(
+                tree,
+                Tree::Num(text)
+                    if json_double(text).is_some_and(|value| !value.is_finite())
+            )
+        {
+            return Ok(None);
+        }
         if class == "java/lang/Object" {
             return self.gson_object_value(tree);
         }
@@ -286,6 +308,13 @@ impl<H: Host> Runtime<'_, H> {
             Tree::Null => Some(Value::Ref(None)),
             Tree::Str(text) => Some(Value::Ref(Some(text.clone()))),
             Tree::Bool(flag) => Some(Value::Boxed(Boxed::Boolean(*flag))),
+            // Gson's ObjectTypeAdapter reads lenient unquoted NaN/Infinity
+            // through JsonReader.nextString(), so these special tokens remain
+            // Strings for Object. Ordinary JSON numbers, including overflow,
+            // use the default Double policy.
+            Tree::Num(text) if matches!(text.as_str(), "NaN" | "Infinity" | "-Infinity") => {
+                Some(Value::Ref(Some(text.clone())))
+            }
             Tree::Num(text) => json_double(text).map(Value::Float),
             Tree::Array(elements) => {
                 let mut values = Vec::with_capacity(elements.len());
@@ -479,7 +508,14 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         let fields = self.gson_fields(class);
-        if fields.is_empty() {
+        // Gson's reflective adapter has no useful instance target when the
+        // class contains only static, synthetic, or otherwise excluded
+        // fields. Keep this counted rather than materializing an empty jar
+        // object (the mc-armor-hud config shape).
+        if !fields
+            .iter()
+            .any(|(_, _, _, access, _names)| access & 0x0008 == 0 && style.includes_field(*access))
+        {
             return Ok(None);
         }
         self.ensure_initialized(class)?;

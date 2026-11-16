@@ -545,7 +545,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         let kinds = match StdHost::argument(r, args, 1)? {
             Value::Ref(None) => return self.host.unknown_operand_call(r).map(Some),
-            value => self.array(value)?.clone(),
+            value => self.array(value)?.into_owned(),
         };
         let mut wanted = Vec::new();
         for kind in &kinds {
@@ -581,13 +581,20 @@ impl<H: Host> Runtime<'_, H> {
         {
             return self.host.unknown_operand_call(r).map(Some);
         }
-        let path = path_text(&directory).to_owned();
+        let display_path = path_text(&directory).to_owned();
+        let path = host_path::sandbox_absolute(&display_path);
         match self.file_kind(&path) {
             file_attributes::FileKind::Missing => {
-                return Err(thrown("java/nio/file/NoSuchFileException", Some(path)));
+                return Err(thrown(
+                    "java/nio/file/NoSuchFileException",
+                    Some(display_path.clone()),
+                ));
             }
             file_attributes::FileKind::RegularFile => {
-                return Err(thrown("java/nio/file/NotDirectoryException", Some(path)));
+                return Err(thrown(
+                    "java/nio/file/NotDirectoryException",
+                    Some(display_path.clone()),
+                ));
             }
             file_attributes::FileKind::Directory => {}
         }

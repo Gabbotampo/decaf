@@ -191,11 +191,14 @@ fn class_for_entries(_: &str) -> &'static str {
 }
 
 fn class_for_lazy(key: &str) -> &'static str {
-    let mode = HostRef::new(HostKind::KotlinLazy, key)
-        .values()
-        .and_then(|values| values.first().cloned())
-        .and_then(|value| match value {
-            Value::Ref(Some(mode)) => Some(mode),
+    // Only the mode, the key's first marker, is read: the initializer after
+    // it is a callback, which no text reads back (#261), so reading every
+    // value would fail and fall back to the synchronized class.
+    let mode = crate::runtime::split_capture_markers(key)
+        .ok()
+        .and_then(|markers| markers.into_iter().next())
+        .and_then(|marker| match crate::runtime::parse_value_marker(&marker) {
+            Ok(Value::Ref(Some(mode))) => Some(mode),
             _ => None,
         });
     match mode.as_deref().unwrap_or("SYNCHRONIZED") {
@@ -359,7 +362,7 @@ pub(crate) fn invoke<H: crate::runtime::Host>(
 ) -> Option<Result<Value, NativeError>> {
     if r.owner == "kotlin/enums/EnumEntriesKt" && r.name == "enumEntries" {
         if r.descriptor == "([Ljava/lang/Enum;)Lkotlin/enums/EnumEntries;" {
-            let values = runtime.owned_array(args.first()?)?.clone();
+            let values = runtime.owned_array(args.first()?)?.into_owned();
             let serial = NEXT_ENTRIES.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(Value::Host(HostRef::of_values(
                 HostKind::KotlinEnumEntries,
@@ -557,7 +560,7 @@ fn kotlin_collections<H: crate::runtime::Host>(
         ("mutableListOf", "([Ljava/lang/Object;)Ljava/util/List;")
             if runtime
                 .owned_array(args.first()?)
-                .is_some_and(Vec::is_empty) =>
+                .is_some_and(|values| values.is_empty()) =>
         {
             runtime.host.empty_mutable_collection("list").map(Ok)
         }
@@ -567,7 +570,7 @@ fn kotlin_collections<H: crate::runtime::Host>(
         ("listOf", "([Ljava/lang/Object;)Ljava/util/List;")
             if runtime
                 .owned_array(args.first()?)
-                .is_some_and(Vec::is_empty) =>
+                .is_some_and(|values| values.is_empty()) =>
         {
             Some(Ok(Value::Host(HostRef::new(
                 HostKind::KotlinEmptyCollection,
@@ -716,4 +719,27 @@ pub(crate) fn instance<H: crate::runtime::Host>(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lazy holder's class follows its mode when its initializer is a
+    /// callback handle, whose marker no text reader takes back (#261).
+    #[test]
+    fn a_lazy_holder_over_a_lambda_keeps_its_modes_class() {
+        let lambda = crate::runtime::callback_marker::test_token("demo/A#0");
+        for (mode, class) in [
+            ("NONE", "kotlin/UnsafeLazyImpl"),
+            ("PUBLICATION", "kotlin/SafePublicationLazyImpl"),
+            ("INITIALIZED", INITIALIZED_LAZY),
+            ("SYNCHRONIZED", "kotlin/SynchronizedLazyImpl"),
+        ] {
+            let Value::Host(handle) = lazy_key(mode, 7, &lambda) else {
+                unreachable!()
+            };
+            assert_eq!(lazy_class(handle.key()), class, "{mode}");
+        }
+    }
 }

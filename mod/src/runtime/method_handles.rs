@@ -771,7 +771,9 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let classes = match args.get(2) {
-                    Some(value) if self.owned_array(value).is_some() => self.array(value)?.clone(),
+                    Some(value) if self.owned_array(value).is_some() => {
+                        self.array(value)?.into_owned()
+                    }
                     Some(value @ Value::Ref(Some(_))) => {
                         runtime_collection_values(self.host, value)?
                     }
@@ -815,7 +817,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let values = match args.get(2) {
                     Some(value) if host_array::array_key(value).is_some() => {
-                        self.array(value)?.clone()
+                        self.array(value)?.into_owned()
                     }
                     _ => Vec::new(),
                 };
@@ -1025,7 +1027,7 @@ impl<H: Host> Runtime<'_, H> {
             ("invokeWithArguments", "([Ljava/lang/Object;)Ljava/lang/Object;") => {
                 let values = match args.first() {
                     Some(value) if host_array::array_key(value).is_some() => {
-                        self.array(value)?.clone()
+                        self.array(value)?.into_owned()
                     }
                     _ => Vec::new(),
                 };
@@ -1225,9 +1227,9 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             Handle::LambdaFactory {
-                descriptor: _,
+                descriptor,
                 implementation,
-            } => Ok(self.spin_lambda(implementation, args)?),
+            } => Ok(self.spin_lambda(descriptor, implementation, args)?),
         }
     }
 
@@ -1238,29 +1240,61 @@ impl<H: Host> Runtime<'_, H> {
     /// `MethodHandle.invokeExact` on the handle itself, captured first.
     fn spin_lambda(
         &mut self,
+        factory: &str,
         implementation: &Handle,
         captured: &[Value],
     ) -> Result<Value, NativeError> {
-        let (target, captures) = match implementation {
+        let (target, captures, ref_kind) = match implementation {
             Handle::Direct {
+                kind,
                 owner,
                 name,
                 descriptor,
-                ..
-            } => (format!("{owner}#{name}{descriptor}"), captured.to_vec()),
+            } => (
+                MethodRef {
+                    owner: owner.clone(),
+                    name: name.clone(),
+                    descriptor: descriptor.clone(),
+                },
+                captured.to_vec(),
+                // JVMS 5.4.3.5's reference kinds, as a class file's handle.
+                Some(match kind {
+                    Kind::Virtual => 5,
+                    Kind::Static => 6,
+                    Kind::Special => 7,
+                    Kind::Constructor => 8,
+                }),
+            ),
             other => {
                 let mut captures = vec![other.value()];
                 captures.extend_from_slice(captured);
                 (
-                    format!("{HANDLE_CLASS}#invokeExact{}", other.descriptor()?),
+                    MethodRef {
+                        owner: HANDLE_CLASS.to_owned(),
+                        name: "invokeExact".to_owned(),
+                        descriptor: other.descriptor()?,
+                    },
                     captures,
+                    Some(5),
                 )
             }
         };
-        Ok(Value::Ref(Some(format!(
-            "@indy:{METAFACTORY_SITE}:0:{target}:{}",
-            bounded_captured_markers(&captures)
-        ))))
+        // The factory type's result is the functional interface made.
+        let sam = crate::runtime::return_desc(factory)
+            .strip_prefix('L')
+            .and_then(|class| class.strip_suffix(';'))
+            .unwrap_or("");
+        // Each reflective `metafactory` call links a call site of its own, so
+        // its lambda is a new object (`fresh`).
+        Ok(crate::runtime::callback_marker::lambda(
+            METAFACTORY_SITE,
+            0,
+            sam,
+            Some(target),
+            ref_kind,
+            captures,
+            true,
+        ))
     }
 
     /// Run one member on arguments of the handle's type (the receiver first

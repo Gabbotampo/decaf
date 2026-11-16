@@ -87,9 +87,10 @@ fn fail_fast(class: &str) -> Option<FailFast> {
         | "java/util/TreeMap"
         | "java/util/IdentityHashMap"
         | "java/util/WeakHashMap" => FailFast::MapKeys,
-        "java/util/HashSet" | "java/util/LinkedHashSet" | "java/util/TreeSet" => {
-            FailFast::SetElements
-        }
+        "java/util/HashSet"
+        | "java/util/LinkedHashSet"
+        | "java/util/TreeSet"
+        | "java/util/Collections$SetFromMap" => FailFast::SetElements,
         "java/util/ArrayDeque" => FailFast::Deque,
         _ => return None,
     })
@@ -110,12 +111,14 @@ impl<H: Host> Runtime<'_, H> {
         let marker = expect_ref(value)?;
         let source = self
             .host
-            .view_copy_source(marker)
-            .or_else(|| self.host.unmodifiable_view_source(marker))
-            .map_or_else(
-                || value.clone(),
-                |source| crate::runtime::jar_object::stored_value(&source),
-            );
+            .set_from_map_source(value)
+            .or_else(|| {
+                self.host
+                    .view_copy_source(marker)
+                    .or_else(|| self.host.unmodifiable_view_source(marker))
+                    .map(|source| crate::runtime::jar_object::stored_value(&source))
+            })
+            .unwrap_or_else(|| value.clone());
         let class = self.host_collection_class(&source)?;
         Some((source, fail_fast(&class)?))
     }

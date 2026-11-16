@@ -21,8 +21,7 @@
 //!   escaped unless this was called.
 //! * `serializeNulls`: jar-object fields with a null value are written.
 //! * `setFieldNamingPolicy`: every `FieldNamingPolicy` constant's transform
-//!   (`separateCamelCase` + `upperCaseFirstLetter`) names the JSON keys, both
-//!   when writing and when reading a jar object.
+//!   names the JSON keys, both when writing and when reading a jar object.
 //! * `excludeFieldsWithModifiers`: `Excluder.withModifiers` **replaces** its
 //!   default `STATIC|TRANSIENT` mask with the arguments' OR, so
 //!   `excludeFieldsWithModifiers(0)` really does write static and transient
@@ -57,9 +56,8 @@
 //! (number parsing) and `disableInnerClassSerialization` (Gson refuses an inner
 //! class there; this writer would emit it).
 //!
-//! Accepted and named as inert for this runtime: `setLenient`/`setStrictness`
-//! (the parser is lenient, the existing departure for reading jar resources;
-//! writing does not depend on it), `disableJdkUnsafe` (nothing here instantiates
+//! Accepted and modeled for reading: `setLenient`/`setStrictness` record the
+//! reader's handling of non-finite numeric tokens. `disableJdkUnsafe` (nothing here instantiates
 //! through `Unsafe`; `fromJson` already builds an object without running a
 //! constructor) and `addReflectionAccessFilter` (filters Gson's reflection into
 //! JDK classes, which this model never reflects into).
@@ -292,6 +290,10 @@ pub(super) struct GsonStyle {
     non_executable: bool,
     special_floats: bool,
     long_strings: bool,
+    /// Gson's reader strictness. `false` is the default/LENIENT setting;
+    /// STRICT rejects non-finite numeric values while still accepting the
+    /// regular JSON number grammar.
+    strict: bool,
     /// An option that changes the output is set but cannot be applied here, so
     /// the writer must not produce text.
     counted: bool,
@@ -308,6 +310,7 @@ impl Default for GsonStyle {
             non_executable: false,
             special_floats: false,
             long_strings: false,
+            strict: false,
             counted: false,
         }
     }
@@ -319,7 +322,7 @@ impl GsonStyle {
     fn key(&self) -> String {
         format!(
             "newline={};indent={};space={};html={};nulls={};\
-             naming={};mods={};nonexec={};special={};longs={};counted={}",
+             naming={};mods={};nonexec={};special={};longs={};strict={};counted={}",
             hex(&self.formatting.newline),
             hex(&self.formatting.indent),
             u8::from(self.formatting.space_after_separators),
@@ -330,6 +333,7 @@ impl GsonStyle {
             u8::from(self.non_executable),
             u8::from(self.special_floats),
             u8::from(self.long_strings),
+            u8::from(self.strict),
             u8::from(self.counted),
         )
     }
@@ -354,6 +358,7 @@ impl GsonStyle {
                 "nonexec" => style.non_executable = flag(value)?,
                 "special" => style.special_floats = flag(value)?,
                 "longs" => style.long_strings = flag(value)?,
+                "strict" => style.strict = flag(value)?,
                 "counted" => style.counted = flag(value)?,
                 _ => return None,
             }
@@ -362,8 +367,7 @@ impl GsonStyle {
     }
 
     /// The writer options `Gson.toJson` applies to a `JsonElement`
-    /// (`gson_tree.rs`). The `Gson`'s strictness is not recorded, so the tree
-    /// writer is not told it is lenient.
+    /// (`gson_tree.rs`).
     pub(super) fn tree_style(&self) -> super::gson_tree::TreeStyle {
         super::gson_tree::TreeStyle {
             newline: self.formatting.newline.clone(),
@@ -376,7 +380,7 @@ impl GsonStyle {
     }
 
     /// Whether a `toJson`/`fromJson` on this `Gson` must be a counted unknown.
-    pub(super) fn is_counted(&self) -> bool {
+    pub(crate) fn is_counted(&self) -> bool {
         self.counted
     }
 
@@ -388,8 +392,12 @@ impl GsonStyle {
         self.long_strings
     }
 
-    fn special_floats(&self) -> bool {
+    pub(crate) fn special_floats(&self) -> bool {
         self.special_floats
+    }
+
+    pub(super) fn allows_special_floats(&self) -> bool {
+        !self.strict
     }
 
     fn serialize_nulls(&self) -> bool {
@@ -736,15 +744,34 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
-            // Inert for this runtime: the parser is lenient by its documented
-            // departure (writing does not depend on strictness), nothing here
-            // instantiates through `Unsafe`, and `fromJson` already builds an
-            // object without running a constructor.
-            ("setLenient" | "disableJdkUnsafe", _) => answer(),
-            ("setStrictness", _) => {
+            ("setLenient", "()Lcom/google/gson/GsonBuilder;") => {
+                let mut style = self.gson_style(&marker);
+                style.strict = false;
+                self.set_gson_style(&marker, style);
+                answer()
+            }
+            // Nothing here instantiates through `Unsafe`.
+            ("disableJdkUnsafe", _) => answer(),
+            ("setStrictness", "(Lcom/google/gson/Strictness;)Lcom/google/gson/GsonBuilder;") => {
                 if args.iter().any(|value| matches!(value, Value::Ref(None))) {
                     return Err(npe());
                 }
+                let mut style = self.gson_style(&marker);
+                // Enum constants are represented by a stable marker containing
+                // the declaring class and constant name. Unknown markers are
+                // conservatively treated as STRICT; Gson's default remains
+                // lenient until this method is called.
+                style.strict = args
+                    .first()
+                    .and_then(expect_ref)
+                    .and_then(|constant| {
+                        self.enum_constants
+                            .get(constant)
+                            .map(|(name, _)| name == "STRICT")
+                            .or_else(|| Some(!constant.contains("LENIENT")))
+                    })
+                    .unwrap_or(true);
+                self.set_gson_style(&marker, style);
                 answer()
             }
             _ => Ok(None),
@@ -770,9 +797,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(adapter) = args.get(1).filter(|adapter| **adapter != Value::Ref(None)) else {
             return Err(npe());
         };
-        if expect_ref(adapter)
-            .is_some_and(|text| text.starts_with("@indy:") || text.starts_with("@fn:"))
-        {
+        if crate::callback_marker::callback_text(adapter).is_some() {
             return Ok(());
         }
         let Some(class) = crate::jar_object::object_class(adapter) else {
@@ -804,7 +829,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(DEFAULT_FIELD_MODIFIERS);
         };
         let mut mask = 0u16;
-        for value in self.array(array)? {
+        for value in self.array(array)?.iter() {
             let Value::Int(bits) = value else {
                 return Err(NativeError::Metadata(
                     "excludeFieldsWithModifiers needs an int array".into(),
@@ -824,7 +849,7 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// The style a builder or `Gson` receiver carries, or Gson's default.
-    pub(super) fn gson_style_of(&self, receiver: Option<&Value>) -> GsonStyle {
+    pub(crate) fn gson_style_of(&self, receiver: Option<&Value>) -> GsonStyle {
         receiver
             .and_then(expect_ref)
             .map_or_else(GsonStyle::default, |marker| self.gson_style(marker))
@@ -840,11 +865,34 @@ impl<H: Host> Runtime<'_, H> {
     /// Gson's `toJson` text for a modelled value, or `None` when the value has
     /// no honest JSON shape (an object the runtime does not own and cannot
     /// reflect over). The caller counts the call instead of writing fake text.
-    pub(super) fn gson_to_json(
+    pub(crate) fn gson_to_json(
         &mut self,
         value: &Value,
         style: &GsonStyle,
         depth: usize,
+    ) -> Result<Option<String>, NativeError> {
+        self.gson_to_json_mode(value, style, depth, false)
+    }
+
+    /// The tree adapter uses the same bounded reflection model as the writer,
+    /// but its extra answers must not alter `Gson.toJson` itself.  In
+    /// particular, Gson's writer keeps source-number spelling and does not
+    /// know the native collection markers used by the interpreter.
+    pub(crate) fn gson_to_json_tree(
+        &mut self,
+        value: &Value,
+        style: &GsonStyle,
+        depth: usize,
+    ) -> Result<Option<String>, NativeError> {
+        self.gson_to_json_mode(value, style, depth, true)
+    }
+
+    fn gson_to_json_mode(
+        &mut self,
+        value: &Value,
+        style: &GsonStyle,
+        depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
         // One level of a nested value (#250): Gson recurses through a cycle until a
         // `StackOverflowError`, and so does this writer.
@@ -855,6 +903,14 @@ impl<H: Host> Runtime<'_, H> {
         }
         let text = match value {
             Value::Ref(None) | Value::Void => Some("null".to_owned()),
+            // Arrays are reflected as JSON arrays, preserving primitive and
+            // reference elements exactly as Gson's TypeAdapterRuntimeTypeWrapper.
+            Value::Host(handle) if tree_mode && handle.kind() == crate::HostKind::Array => {
+                // `array` borrows the runtime (a `Cow` over the backing since #338),
+                // so own the elements before the writer takes `&mut self`.
+                let values = self.array(value)?.into_owned();
+                self.gson_array_text(&values, style, depth, tree_mode)?
+            }
             // A host model's object (`Optional`): Gson reflects its private
             // fields, which JDK 25's module system refuses; not answered.
             Value::Host(handle) if !crate::jar_object::is_object_handle(handle) => None,
@@ -881,7 +937,11 @@ impl<H: Host> Runtime<'_, H> {
             }),
             Value::Float(value) => {
                 if value.is_finite() {
-                    Some(format!("{value}"))
+                    Some(if tree_mode {
+                        format_java_float(*value)
+                    } else {
+                        format!("{value}")
+                    })
                 } else {
                     Some(non_finite_text(*value, style)?)
                 }
@@ -889,20 +949,20 @@ impl<H: Host> Runtime<'_, H> {
             // A marker, or an object by its key (`jar_object.rs`).
             Value::Ref(Some(_)) | Value::Host(_) => {
                 let marker = expect_ref(value).map_or("", String::as_str);
-                // Gson's `EnumTypeAdapter`, never a reflective walk of the constant.
+                // One EnumTypeAdapter name path serves values and map keys.
                 if let Some(name) = self.gson_enum_text(value) {
                     Some(format!("\"{}\"", style.escape(&name)))
-                } else if let Some(kind) = gson_marker_kind(self.host, value) {
+                } else if let Some(kind) = gson_marker_kind(self.host, value, tree_mode) {
                     let values = runtime_collection_values(self.host, value)?;
                     if kind == "map" {
-                        self.gson_object_text(&values, style, depth)?
+                        self.gson_object_text(&values, style, depth, tree_mode)?
                     } else {
-                        self.gson_array_text(&values, style, depth)?
+                        self.gson_array_text(&values, style, depth, tree_mode)?
                     }
                 } else if let Some(class) = crate::jar_object::object_class(value)
                     && self.class(class).is_some()
                 {
-                    self.gson_fields_text(class, marker, style, depth)?
+                    self.gson_fields_text(class, marker, style, depth, tree_mode)?
                 } else {
                     // A plain `String` value (and a marker the runtime only
                     // models as text) is a JSON string.
@@ -918,6 +978,7 @@ impl<H: Host> Runtime<'_, H> {
         values: &[Value],
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
         if values.is_empty() {
             return Ok(Some("[]".into()));
@@ -928,7 +989,7 @@ impl<H: Host> Runtime<'_, H> {
                 out.push(',');
             }
             out.push_str(&style.line(depth + 1));
-            let Some(text) = self.gson_to_json(value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -943,6 +1004,7 @@ impl<H: Host> Runtime<'_, H> {
         values: &[Value],
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
         if !values.len().is_multiple_of(2) {
             return Err(NativeError::Metadata(
@@ -968,7 +1030,7 @@ impl<H: Host> Runtime<'_, H> {
             out.push_str(&style.escape(&key_text));
             out.push('"');
             out.push_str(style.colon());
-            let Some(text) = self.gson_to_json(&value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(&value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -988,7 +1050,11 @@ impl<H: Host> Runtime<'_, H> {
         marker: &str,
         style: &GsonStyle,
         depth: usize,
+        tree_mode: bool,
     ) -> Result<Option<String>, NativeError> {
+        if tree_mode && self.class(class).is_some_and(ClassFile::is_record) {
+            return Ok(None);
+        }
         let mut members: Vec<(String, Value)> = Vec::new();
         for (declaring, name, descriptor, access, names) in self.gson_fields(class) {
             if !style.includes_field(access) {
@@ -1024,7 +1090,15 @@ impl<H: Host> Runtime<'_, H> {
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            members.push((key, value));
+            let (name, value) = if tree_mode {
+                (
+                    self.gson_field_name(&declaring, &name, &descriptor, style),
+                    primitive_box(&descriptor, value),
+                )
+            } else {
+                (key, value)
+            };
+            members.push((name, value));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -1039,7 +1113,7 @@ impl<H: Host> Runtime<'_, H> {
             out.push_str(&style.escape(name));
             out.push('"');
             out.push_str(style.colon());
-            let Some(text) = self.gson_to_json(value, style, depth + 1)? else {
+            let Some(text) = self.gson_to_json_mode(value, style, depth + 1, tree_mode)? else {
                 return Ok(None);
             };
             out.push_str(&text);
@@ -1047,6 +1121,44 @@ impl<H: Host> Runtime<'_, H> {
         out.push_str(&style.line(depth));
         out.push('}');
         Ok(Some(out))
+    }
+
+    fn gson_enum_name(&self, class: &str, name: &str) -> Option<String> {
+        let file = self.class(class)?;
+        let field = file
+            .fields
+            .iter()
+            .find(|field| field.name == name && field.descriptor == format!("L{class};"))?;
+        file.field_annotations(&field.name, &field.descriptor)
+            .into_iter()
+            .find(|annotation| {
+                annotation.descriptor == "Lcom/google/gson/annotations/SerializedName;"
+            })
+            .and_then(|annotation| match annotation.values.get("value") {
+                Some(crate::AnnotationValue::String(value)) => Some(value.clone()),
+                _ => None,
+            })
+    }
+
+    fn gson_field_name(
+        &self,
+        declaring: &str,
+        name: &str,
+        descriptor: &str,
+        style: &GsonStyle,
+    ) -> String {
+        let serialized = self
+            .class(declaring)
+            .into_iter()
+            .flat_map(|file| file.field_annotations(name, descriptor))
+            .find(|annotation| {
+                annotation.descriptor == "Lcom/google/gson/annotations/SerializedName;"
+            })
+            .and_then(|annotation| match annotation.values.get("value") {
+                Some(crate::AnnotationValue::String(value)) => Some(value.clone()),
+                _ => None,
+            });
+        serialized.unwrap_or_else(|| style.field_name(name))
     }
 
     /// Every declared field of `class` and its superclasses with its access
@@ -1084,8 +1196,11 @@ impl<H: Host> Runtime<'_, H> {
     /// its constant field's `@SerializedName` value, else `name`. A constant with a body is
     /// an object of the enum's anonymous subclass, whose superclass declares the constant
     /// field. `None` (counted) where that field or its annotations cannot be read.
-    fn gson_enum_name(&self, value: &Value, name: &str) -> Option<String> {
+    fn gson_enum_name_for_value(&self, value: &Value, name: &str) -> Option<String> {
         let class = crate::jar_object::object_class(value)?;
+        if let Some(name) = self.gson_enum_name(class, name) {
+            return Some(name);
+        }
         let file = self.class(class)?;
         let declaring = if file.super_name == "java/lang/Enum" {
             file
@@ -1107,7 +1222,7 @@ impl<H: Host> Runtime<'_, H> {
     fn gson_enum_text(&self, value: &Value) -> Option<String> {
         let marker = expect_ref(value)?;
         if let Some((name, _)) = self.enum_constants.get(marker) {
-            return self.gson_enum_name(value, name);
+            return self.gson_enum_name_for_value(value, name);
         }
         marker
             .strip_prefix("enum/")
@@ -1173,12 +1288,14 @@ pub(super) fn non_executable_prefix(style: &GsonStyle) -> Option<&'static str> {
 ///
 /// A neutral marker names its kind directly; a `new`-backed marker is a class
 /// name whose list/set/map family decides how its pairs or elements serialize.
-fn gson_marker_kind<H: Host>(host: &H, value: &Value) -> Option<&'static str> {
-    let marker = expect_ref(value)?;
+fn gson_marker_kind<H: Host>(host: &H, value: &Value, tree_mode: bool) -> Option<&'static str> {
+    let marker = expect_ref(value).map(String::as_str).or_else(|| {
+        tree_mode
+            .then(|| crate::jar_object::object_key(value))
+            .flatten()
+    })?;
     if host.holds_collection(value) {
-        let class = marker
-            .split_once('#')
-            .map_or(marker.as_str(), |(class, _)| class);
+        let class = marker.split_once('#').map_or(marker, |(class, _)| class);
         // A map whichever class the host made it (Guava's
         // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
         // (#253 review).
