@@ -529,13 +529,22 @@ impl<H: Host> Runtime<'_, H> {
         }
         self.ensure_initialized(class)?;
         let object = self.new_object(class);
+        if self.class(class).is_some_and(|file| {
+            file.methods
+                .iter()
+                .any(|method| method.name == "<init>" && method.descriptor == "()V")
+        }) {
+            self.invoke(class, "<init>", "()V", Some(object.clone()), &[])?;
+        }
         for (declaring, name, descriptor, access) in fields {
             if !style.includes_field(access) {
                 continue;
             }
-            // The naming policy names the JSON key on the way in too.
-            let json_name = style.field_name(&name);
-            let Some((_, member)) = members.iter().find(|(key, _)| *key == json_name) else {
+            let names = self.gson_serialized_names(&declaring, &name, &descriptor, style);
+            let Some((_, member)) = names
+                .iter()
+                .find_map(|name| members.iter().find(|(key, _)| key == name))
+            else {
                 continue;
             };
             let field_type = self.gson_field_type(&declaring, &name, &descriptor);

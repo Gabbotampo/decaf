@@ -211,7 +211,7 @@ impl<H: Host> Runtime<'_, H> {
         parsed.or_else(|| descriptor_type(descriptor))
     }
 
-    fn gson_serialized_names(
+    pub(crate) fn gson_serialized_names(
         &self,
         declaring: &str,
         name: &str,
@@ -675,6 +675,26 @@ impl<H: Host> Runtime<'_, H> {
         let style = self.gson_style_of(receiver);
         if style.is_counted() {
             return self.count_gson_fromjson(r, receiver, args);
+        }
+        if !element_input {
+            let reflective_special = self.class(&class).is_some_and(|file| {
+                let flags = crate::runtime::jdk_model::class_access_flags(file).unwrap_or_default();
+                file.super_name == "java/lang/Record"
+                    || flags & (0x0200 | 0x0400) != 0
+                    || flags & 0x1000 != 0
+            });
+            if !reflective_special {
+                if !reader && matches!(args.first(), Some(Value::Ref(None))) {
+                    return Ok(Some(Value::Ref(None)));
+                }
+                let Some(text) = self.gson_source(args.first(), reader) else {
+                    return self.count_gson_fromjson(r, receiver, args);
+                };
+                return match self.gson_read_text(&text, &target, &style)? {
+                    Some(value) => Ok(Some(value)),
+                    None => self.count_gson_fromjson(r, receiver, args),
+                };
+            }
         }
         let parsed = if element_input {
             let Some(element) = args.first() else {
