@@ -2,9 +2,6 @@
 use crate::runtime::{MethodRef, Value};
 const ENCHANTMENTS: &str = "net/minecraft/world/item/enchantment/Enchantments";
 const KEY: &str = "Lnet/minecraft/resources/ResourceKey;";
-fn id(name: &str) -> String {
-    name.to_ascii_lowercase()
-}
 fn captured(name: &str) -> Option<&'static str> {
     include_str!("vanilla_enchantments_capture.txt")
         .lines()
@@ -38,7 +35,7 @@ mod tests {
         let created = crate::runtime::host_ids::resource_key_named("minecraft:enchantment", "knockback");
         assert_eq!(field, created);
         match (field, created) {
-            (Value::Host(a), Value::Host(b)) => assert!(a.same_object(&b)),
+            (Value::Host(a), Value::Host(b)) => assert_eq!(a.same_object(&b), Some(true)),
             _ => panic!("expected canonical host keys"),
         }
     }
