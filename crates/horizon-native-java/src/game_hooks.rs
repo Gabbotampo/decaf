@@ -1043,6 +1043,14 @@ impl<H: Host> GameHookHost<'_, H> {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         if facade_server::owns(text) {
+            // A registry's `keySet()`: a set of its own (#156 P14d2).
+            if let Some(ids) = facade_server::key_set(&self.context.server, text, r) {
+                return Some(ids.and_then(|ids| {
+                    self.inner
+                        .factory_collection("java/util/Collections", "unmodifiableSet", "set", ids)
+                        .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))
+                }));
+            }
             return Some(
                 // A Java exception vanilla throws there stays one.
                 facade_server::answer(&self.context.server, text, r, args).map_err(|error| {
@@ -1377,6 +1385,41 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.constructed_uuid(value)
     }
 
+    fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
+        self.inner.map_entry_parts(value)
+    }
+
+    fn mint_map_entry(
+        &mut self,
+        map: Option<&Value>,
+        key: &Value,
+        value: &Value,
+        made: crate::host_map_entry::EntryMade,
+    ) -> Value {
+        self.inner.mint_map_entry(map, key, value, made)
+    }
+
+    fn mint_map_entries(
+        &mut self,
+        map: &Value,
+        pairs: &[Value],
+        made: crate::host_map_entry::EntryMade,
+    ) -> Vec<Value> {
+        self.inner.mint_map_entries(map, pairs, made)
+    }
+
+    fn unwrapped_view_entry(&self, entry: &Value) -> Option<Value> {
+        self.inner.unwrapped_view_entry(entry)
+    }
+
+    fn entries_before_call(&mut self, marker: &str, name: &str, args: &[Value]) {
+        self.inner.entries_before_call(marker, name, args);
+    }
+
+    fn entries_after_call(&mut self, marker: &str) {
+        self.inner.entries_after_call(marker);
+    }
+
     fn component_states(&self) -> Option<&crate::host_component::States> {
         self.inner.component_states()
     }
@@ -1637,6 +1680,28 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.store_persistent_class_state(fields, initialized)
     }
 
+    fn persistent_io_state(
+        &self,
+    ) -> (
+        BTreeMap<String, String>,
+        BTreeMap<String, String>,
+        BTreeMap<String, Vec<u8>>,
+        BTreeSet<String>,
+    ) {
+        self.inner.persistent_io_state()
+    }
+
+    fn store_persistent_io_state(
+        &mut self,
+        paths: BTreeMap<String, String>,
+        files: BTreeMap<String, String>,
+        file_bytes: BTreeMap<String, Vec<u8>>,
+        dirs: BTreeSet<String>,
+    ) -> Result<(), NativeError> {
+        self.inner
+            .store_persistent_io_state(paths, files, file_bytes, dirs)
+    }
+
     fn take_persistent_heap(&mut self) -> Option<JavaHeap> {
         self.inner.take_persistent_heap()
     }
@@ -1655,6 +1720,22 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
+    }
+
+    fn make_collection(&mut self, class: &str, values: Vec<Value>) -> Option<Value> {
+        self.inner.make_collection(class, values)
+    }
+
+    fn owned_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        follow: bool,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner
+            .owned_collection(of, member, class, follow, values)
     }
 
     fn array_view(
@@ -1895,6 +1976,7 @@ impl NativeJar {
         );
         let (persistent_static_fields, persistent_initialized_classes) =
             host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut wrapped = GameHookHost {
             inner: host,
             context,
@@ -1922,11 +2004,16 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
-            io_paths: BTreeMap::new(),
-            io_files: BTreeMap::new(),
-            io_dirs: BTreeSet::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
             watch: Default::default(),
             annotations: BTreeMap::new(),
             next_annotation: 0,
@@ -2081,6 +2168,7 @@ impl NativeJar {
             // a failed firing keeps nothing, as before the heap.
             outcome?;
             runtime.persist_class_state()?;
+            runtime.persist_io_state()?;
             state.fields = std::mem::take(&mut runtime.fields);
             state.arrays = std::mem::take(&mut runtime.arrays);
         } else {
@@ -2112,12 +2200,15 @@ impl NativeJar {
                 .values()
                 .chain(&results)
                 .chain(returned_value.as_ref())
-                .filter_map(|value| crate::heap::value_text(value).map(str::to_owned))
+                .flat_map(crate::heap::value_texts)
+                .map(str::to_owned)
                 .collect();
             let persistence = runtime.persist_class_state();
+            let io_persistence = runtime.persist_io_state();
             let heap = runtime.persist_resident_heap_with(roots);
             outcome?;
             persistence?;
+            io_persistence?;
             heap?;
         }
         state.next_object = runtime.next_object;

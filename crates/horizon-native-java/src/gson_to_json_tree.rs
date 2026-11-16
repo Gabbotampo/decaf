@@ -33,6 +33,6 @@ pub(crate) fn instance_call<H: Host>(
     if style.special_floats() {
         crate::gson_tree::parse::parse_text_with_special(runtime, &text).map(Some)
     } else {
-        crate::gson_tree::parse_text(runtime, &text).map(Some)
+        crate::gson_tree::parse::parse_text(runtime, &text).map(Some)
     }
 }

@@ -66,13 +66,7 @@
 use super::*;
 
 pub(crate) mod parse;
-
-pub(crate) fn parse_text<H: Host>(
-    runtime: &mut Runtime<'_, H>,
-    text: &str,
-) -> Result<Value, NativeError> {
-    parse::parse_text(runtime, text)
-}
+mod typed;
 
 pub(crate) const JSON_ELEMENT: &str = "com/google/gson/JsonElement";
 pub(crate) const JSON_OBJECT: &str = "com/google/gson/JsonObject";
@@ -175,6 +169,12 @@ fn kind_of(marker: &str) -> Option<Kind> {
 
 /// The kind of a tree object, `None` for any other value (a `String`
 /// spelling one's key included).
+/// Whether `value` is a Gson tree element the host models (`JsonObject`, `JsonArray`,
+/// `JsonPrimitive`, `JsonNull`).
+pub(crate) fn is_tree_element(value: &Value) -> bool {
+    value_kind(value).is_some()
+}
+
 fn value_kind(value: &Value) -> Option<Kind> {
     crate::jar_object::object_key(value).and_then(kind_of)
 }
@@ -1620,7 +1620,11 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `JsonElement.equals(other)` for a tree element; `None` when a number
     /// the comparison needs cannot be typed.
-    fn element_equals(&mut self, a: &Value, b: &Value) -> Result<Option<bool>, NativeError> {
+    pub(crate) fn element_equals(
+        &mut self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<Option<bool>, NativeError> {
         // One level of a nested element (#250): a cycle ends in a `StackOverflowError`.
         let _level = crate::host_recursion::enter()?;
         if a == b && *a != Value::Ref(None) {
@@ -1720,7 +1724,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `JsonElement.hashCode()`; `None` for a `JsonNull` anywhere (an
     /// identity hash) or an untypeable number.
-    fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+    pub(crate) fn element_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
         // One level of a nested element (#250): a cycle ends in a `StackOverflowError`.
         let _level = crate::host_recursion::enter()?;
         let Some(kind) = value_kind(value) else {

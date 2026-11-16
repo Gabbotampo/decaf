@@ -148,7 +148,9 @@ fn record_components(file: &ClassFile, index: u16) -> Option<Vec<Component>> {
     let mut components = Vec::new();
     for (name, getter) in names.zip(getters) {
         let field = match file.pool.get(*getter as usize) {
-            Some(Cp::MethodHandle { reference_index }) => file.field_ref(*reference_index).ok()?,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => file.field_ref(*reference_index).ok()?,
             _ => return None,
         };
         components.push(Component {
@@ -221,10 +223,13 @@ impl<H: Host> Runtime<'_, H> {
                 // A game id compares and hashes by its key (`host_ids.rs`).
                 crate::runtime::host_ids::pure_equality(value)
                     || is_map_entry(value)
-                        && map_entry_parts(value).is_ok_and(|(key, entry)| {
-                            self.pure_equality_at(&key, depth + 1)
-                                && self.pure_equality_at(&entry, depth + 1)
-                        })
+                        && self
+                            .host
+                            .map_entry_parts(value)
+                            .is_some_and(|(key, entry)| {
+                                self.pure_equality_at(&key, depth + 1)
+                                    && self.pure_equality_at(&entry, depth + 1)
+                            })
             }
             Equality::Jar { equals, hash_code } => {
                 if depth >= MAX_PURITY_DEPTH {
@@ -308,6 +313,14 @@ impl<H: Host> Runtime<'_, H> {
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::runtime::host_recursion::enter()?;
+        // A Gson tree element hashes as `JsonElement.hashCode` (`gson_tree::element_hash`,
+        // Gson 2.14's bytecode: an integral `JsonPrimitive` by its `long`, any other number by
+        // `doubleToLongBits`), consistent with the `equals` `java_equals` answers for it: equal
+        // elements with different hashes (`1` and `1.0`) stay two keys, as in Java (#221 re-check
+        // 4, B9). An element it cannot hash (`JsonNull`'s identity hash) is unknown.
+        if crate::runtime::gson_tree::is_tree_element(value) {
+            return self.element_hash(value);
+        }
         match self.equality_of(value) {
             Equality::Null => Ok(Some(0)),
             Equality::Identity
@@ -359,19 +372,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             return handle.hash_code(&mut RuntimeNested::new(self));
         }
-        let Some(marker) = expect_ref(value) else {
+        if expect_ref(value).is_none() {
             return Ok(None);
-        };
+        }
         if let Some(path) = self.file_path(value) {
             return Ok(Some(file_hash(path)));
-        }
-        if marker.starts_with("map-entry/") {
-            // `Objects.hashCode(key) ^ Objects.hashCode(value)`.
-            let (key, entry) = map_entry_parts(value)?;
-            let (Some(key), Some(entry)) = (self.java_hash(&key)?, self.java_hash(&entry)?) else {
-                return Ok(None);
-            };
-            return Ok(Some(key ^ entry));
         }
         let Some(kind) = self.host_collection_kind(value) else {
             return Ok(None);
@@ -589,21 +594,63 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     };
                 }
-                if is_map_entry(a) {
-                    // `Map.Entry.equals`: an entry with `Objects.equals` keys
-                    // and values.
-                    if !is_map_entry(b) {
-                        return Ok(false);
+                let kotlin_collection = |value: &Value| {
+                    matches!(
+                        value,
+                        Value::Host(handle)
+                            if matches!(
+                                handle.kind(),
+                                crate::runtime::host_ref::HostKind::KotlinEnumEntries
+                                    | crate::runtime::host_ref::HostKind::KotlinEmptyCollection
+                            )
+                    )
+                };
+                if (kotlin_collection(a) || kotlin_collection(b))
+                    && let (Some(left_kind), Some(right_kind)) =
+                        (self.host_collection_kind(a), self.host_collection_kind(b))
+                    && left_kind == right_kind
+                {
+                    let left = self.collection_elements(a)?;
+                    let right = self.collection_elements(b)?;
+                    if left_kind == CollectionKind::List {
+                        if left.len() != right.len() {
+                            return Ok(false);
+                        }
+                        for (left, right) in left.iter().zip(&right) {
+                            if !self.objects_equals(left, right)? {
+                                return Ok(false);
+                            }
+                        }
+                        return Ok(true);
                     }
-                    let (left_key, left_value) = map_entry_parts(a)?;
-                    let (right_key, right_value) = map_entry_parts(b)?;
-                    return Ok(self.objects_equals(&left_key, &right_key)?
-                        && self.objects_equals(&left_value, &right_value)?);
+                    return Ok(left.is_empty() && right.is_empty());
                 }
                 if self.host_collection_kind(a) == Some(CollectionKind::List)
                     && self.host_collection_kind(b) == Some(CollectionKind::List)
                 {
                     return self.list_equals(a, b);
+                }
+                if self.host_collection_kind(a) == Some(CollectionKind::Set)
+                    && self.host_collection_kind(b) == Some(CollectionKind::Set)
+                {
+                    return self.abstract_set_equals(a, b);
+                }
+                // A Gson tree element (`JsonObject`, `JsonArray`, `JsonPrimitive`...):
+                // `JsonElement.equals` by contents (`gson_tree.rs`), wherever a collection
+                // compares its elements (a `LinkedHashMap` keyed by equal `JsonObject`s merges
+                // them, #221 review B7). One it cannot type is counted.
+                if crate::runtime::gson_tree::is_tree_element(a) {
+                    return match self.element_equals(a, b)? {
+                        Some(equal) => Ok(equal),
+                        None => {
+                            self.host.unknown_operand_call(&MethodRef {
+                                owner: "com/google/gson/JsonElement".into(),
+                                name: "equals".into(),
+                                descriptor: EQUALS.into(),
+                            })?;
+                            Ok(false)
+                        }
+                    };
                 }
                 // `File.equals`: the same path text (`UnixFileSystem.compare`).
                 if let Some(path) = self.file_path(a) {
@@ -641,6 +688,48 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// `AbstractSet.equals` between two sets the host holds, wherever a collection compares
+    /// its elements (`List.contains`, a `HashSet`'s or `HashMap`'s bins, `Set.of`'s duplicate
+    /// check): `o == this`, then the sizes, then `containsAll(o)`, `this.contains(e)` run
+    /// through the dispatch for each of `o`'s elements, a `ClassCastException` or
+    /// `NullPointerException` answering `false`. Two sets with their own handles (two maps'
+    /// `entrySet()` views, #221 review B5) compare by contents, as a direct `equals` does.
+    pub(crate) fn abstract_set_equals(
+        &mut self,
+        a: &Value,
+        b: &Value,
+    ) -> Result<bool, NativeError> {
+        if identical(a, b) {
+            return Ok(true);
+        }
+        let theirs = self.collection_elements(b)?;
+        if self.collection_elements(a)?.len() != theirs.len() {
+            return Ok(false);
+        }
+        for element in &theirs {
+            let found = self.call_virtual(
+                crate::runtime::jdk_call::Site::Interface,
+                "java/util/Set",
+                "contains",
+                "(Ljava/lang/Object;)Z",
+                a,
+                std::slice::from_ref(element),
+            );
+            match found {
+                Ok(Value::Int(0)) => return Ok(false),
+                Ok(_) => {}
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+
     /// `Objects.equals(a, b)`: `a == b || a != null && a.equals(b)`.
     pub(crate) fn objects_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
         if identical(a, b) {
@@ -648,6 +737,37 @@ impl<H: Host> Runtime<'_, H> {
         }
         if *a == Value::Ref(None) {
             return Ok(false);
+        }
+        let is_kotlin_collection = |value: &Value| {
+            matches!(
+                value,
+                Value::Host(handle)
+                    if matches!(
+                        handle.kind(),
+                        crate::runtime::host_ref::HostKind::KotlinEnumEntries
+                            | crate::runtime::host_ref::HostKind::KotlinEmptyCollection
+                    )
+            )
+        };
+        if (is_kotlin_collection(a) || is_kotlin_collection(b))
+            && let (Some(left_kind), Some(right_kind)) =
+                (self.host_collection_kind(a), self.host_collection_kind(b))
+            && left_kind == right_kind
+        {
+            let left = self.collection_elements(a)?;
+            let right = self.collection_elements(b)?;
+            if left_kind == CollectionKind::List {
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                for (left, right) in left.iter().zip(&right) {
+                    if !self.objects_equals(left, right)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            return Ok(left.is_empty() && right.is_empty());
         }
         self.java_equals(a, b)
     }
@@ -839,6 +959,21 @@ impl<H: Host> Runtime<'_, H> {
         if !matches!(opcode, 0xb6 | 0xb9) || crate::runtime::jar_object::is_object_handle(handle) {
             return Ok(None);
         }
+        if handle.kind() == crate::runtime::host_ref::HostKind::KotlinLazy
+            && let Some(value) =
+                crate::runtime::kotlin_stdlib::instance(self, r, receiver.unwrap_or(&Value::Ref(None)), args)
+        {
+            return value.map(Some);
+        }
+        // A callback's `toString`: counted, a text answered (`host_ref_text`).
+        if handle.kind() == crate::runtime::host_ref::HostKind::Callback
+            && r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && args.is_empty()
+        {
+            let text = self.host_ref_text(handle, class, method)?;
+            return Ok(text.map(|text| Value::Ref(Some(text))));
+        }
         let mut nested = RuntimeNested {
             runtime: self,
             class,
@@ -881,6 +1016,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<String>, NativeError> {
+        // A callback's text is its hidden class and identity hash: counted,
+        // and a text answered (`callback_marker::CALLBACK_TEXT`), never the
+        // `null` a jar would dereference where Java never fails.
+        if handle.kind() == crate::runtime::host_ref::HostKind::Callback {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "toString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            })?;
+            return Ok(Some(crate::runtime::callback_marker::CALLBACK_TEXT.into()));
+        }
         handle.to_string(&mut RuntimeNested {
             runtime: self,
             class,
@@ -978,7 +1124,7 @@ impl<H: Host> Runtime<'_, H> {
             }
             // `Map.Entry.hashCode()` is `host_value_hash`'s; an entry whose
             // key or value has no hash the runtime can compute is counted.
-            if expect_ref(receiver).is_some_and(|marker| marker.starts_with("map-entry/")) {
+            if is_map_entry(receiver) {
                 return match self.java_hash(receiver)? {
                     Some(hash) => Ok(Some(Value::Int(hash))),
                     None => self.host.unknown_operand_call(r).map(Some),
@@ -1095,9 +1241,9 @@ impl<H: Host> Runtime<'_, H> {
     }
 }
 
-/// Whether a value is the host's `Map.Entry` (`map-entry/k,v`).
+/// Whether a value is one of the host's `Map.Entry` handles (`host_map_entry.rs`).
 pub(crate) fn is_map_entry(value: &Value) -> bool {
-    expect_ref(value).is_some_and(|marker| marker.starts_with("map-entry/"))
+    crate::runtime::host_map_entry::is_entry(value)
 }
 
 /// `a.equals(b)` for a string or a box `a`: equal values of the same kind. A
@@ -1141,6 +1287,25 @@ impl<H: Host> Runtime<'_, H> {
         if crate::runtime::jar_object::spells_key(value) {
             return None;
         }
+        // Kotlin's collection handles carry their exact concrete classes.
+        if let Value::Host(handle) = value {
+            match handle.kind() {
+                crate::runtime::host_ref::HostKind::KotlinEnumEntries => {
+                    return Some("kotlin/enums/EnumEntriesList".into());
+                }
+                crate::runtime::host_ref::HostKind::KotlinEmptyCollection => {
+                    return Some(
+                        match handle.key() {
+                            "set" => "kotlin/collections/EmptySet",
+                            "map" => "kotlin/collections/EmptyMap",
+                            _ => "kotlin/collections/EmptyList",
+                        }
+                        .into(),
+                    );
+                }
+                _ => {}
+            }
+        }
         // A collection the host made is the class it was made as (Guava's
         // `RegularImmutableList` too, #156 P14c).
         if let Value::Host(handle) = value
@@ -1148,16 +1313,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(crate::runtime::jar_object::collection_class(handle.key()).to_owned());
         }
+        // No text is a collection (#156 P14d2): only an object `new` made of
+        // a JDK collection class, or of a jar subclass of one, has a row.
         let marker = expect_ref(value)?;
-        let (head, _) = marker
-            .split_once(['#', '/'])
-            .unwrap_or((marker.as_str(), ""));
-        match head {
-            "list" => return Some("java/util/ArrayList".into()),
-            "set" => return Some("java/util/LinkedHashSet".into()),
-            "map" => return Some("java/util/LinkedHashMap".into()),
-            _ => {}
-        }
         let mut class = crate::runtime::jar_object::key_class(marker)
             .or_else(|| marker.split_once('#').map(|(class, _)| class))?
             .to_owned();
@@ -1205,6 +1363,21 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Whether a host collection is a list, a set or a map.
     pub(crate) fn host_collection_kind(&self, value: &Value) -> Option<CollectionKind> {
+        if let Value::Host(handle) = value {
+            match handle.kind() {
+                crate::runtime::host_ref::HostKind::KotlinEnumEntries => {
+                    return Some(CollectionKind::List);
+                }
+                crate::runtime::host_ref::HostKind::KotlinEmptyCollection => {
+                    return Some(match handle.key() {
+                        "set" => CollectionKind::Set,
+                        "map" => CollectionKind::Map,
+                        _ => CollectionKind::List,
+                    });
+                }
+                _ => {}
+            }
+        }
         let class = self.host_collection_class(value)?;
         if is_map_owner(&class) || java_immutable::supertypes(&class).contains(&"java/util/Map") {
             Some(CollectionKind::Map)
@@ -1224,6 +1397,17 @@ impl<H: Host> Runtime<'_, H> {
     /// A host collection's elements (a map's keys and values interleaved),
     /// in the order the host keeps them.
     pub(crate) fn collection_elements(&self, value: &Value) -> Result<Vec<Value>, NativeError> {
+        if let Value::Host(handle) = value {
+            if handle.kind() == crate::runtime::host_ref::HostKind::KotlinEmptyCollection {
+                return Ok(Vec::new());
+            }
+            if handle.kind() == crate::runtime::host_ref::HostKind::KotlinEnumEntries {
+                return Ok(handle
+                    .values()
+                    .and_then(|values| values.get(1..).map(ToOwned::to_owned))
+                    .unwrap_or_default());
+            }
+        }
         runtime_collection_values(self.host, value)
     }
 }
@@ -1341,6 +1525,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
         self.runtime.objects_equals(a, b).map(Some)
     }
 
+    fn collection_entries(&mut self, value: &Value) -> Option<Vec<Value>> {
+        self.runtime.host.mutable_collection_entries(value)
+    }
+
     fn text(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         // One level of a nested `String.valueOf` (#250): a cycle ends in a `StackOverflowError`.
         let _level = crate::runtime::host_recursion::enter()?;
@@ -1373,6 +1561,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
+    }
+
+    fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        self.runtime.host.map_entry_parts(value)
     }
 
     fn server_value_key(&mut self, value: &Value) -> Option<Option<String>> {

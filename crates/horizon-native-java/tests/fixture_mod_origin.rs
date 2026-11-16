@@ -2,10 +2,15 @@
 //!
 //! The stub API classes declare the loader signatures a mod compiles against;
 //! the runtime answers them from its own model. The expected values below are
-//! Fabric Loader 0.19.5's own `ModOriginImpl` on a real JVM (javac 21,
+//! Fabric Loader 0.19.5's own `ModOriginImpl` on a real JVM (javac 25,
 //! `--release 17`, `fabric-loader-0.19.5.jar` on the class path):
+//! The real Java 25 oracle command was javac -cp fabric-loader-0.19.5.jar ModOriginOracle.java followed by java -cp .:fabric-loader-0.19.5.jar ModOriginOracle.
 //!
 //! ```text
+//! enum=[PATH|0|PATH, NESTED|1|NESTED, UNKNOWN|2|UNKNOWN]
+//! valueOf=[PATH=true, NESTED=true, UNKNOWN=true]
+//! valueOf-bad=[java.lang.IllegalArgumentException|No enum constant net.fabricmc.loader.api.metadata.ModOrigin.Kind.NOPE]
+//! valueOf-null=[java.lang.NullPointerException|Name is null]
 //! path=[PATH|/horizon/mods/origin-fixture|0]
 //! paths=[1|/horizon/mods/origin-fixture]
 //! path-parent=[uoe:kind PATH doesn't have a parent mod]
@@ -20,10 +25,13 @@
 //! `ModContainer.getRootPaths()` answers), not the jar's host path; the
 //! runtime never exposes host paths.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
     fs,
-    io::Write,
+    io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -112,6 +120,45 @@ public final class Probe {
         ModOrigin other = origin("minecraft");
         return first.equals(again) + "|" + first.equals(other) + "|" + other;
     }
+
+    public static String kindEnum() {
+        ModOrigin.Kind[] first = ModOrigin.Kind.values();
+        ModOrigin.Kind[] second = ModOrigin.Kind.values();
+        return first.length + "|" +
+            first[0].name() + ":" + first[0].ordinal() + ":" + first[0].toString() + "|" +
+            first[1].name() + ":" + first[1].ordinal() + ":" + first[1].toString() + "|" +
+            first[2].name() + ":" + first[2].ordinal() + ":" + first[2].toString() + "|" +
+            (first != second) + "|" +
+            (first[0] == ModOrigin.Kind.PATH) + "|" +
+            (first[0] == ModOrigin.Kind.valueOf("PATH")) + "|" +
+            (first[1] == ModOrigin.Kind.valueOf("NESTED")) + "|" +
+            (first[2] == ModOrigin.Kind.valueOf("UNKNOWN"));
+    }
+
+    public static String nested() {
+        ModOrigin origin = origin("nested-child");
+        return (origin.getKind() == ModOrigin.Kind.NESTED) + "|" +
+            origin.getKind().name() + "|" + origin.getParentModId() + "|" +
+            origin.getParentSubLocation() + "|" + origin;
+    }
+
+    public static String kindValueOfFailures() {
+        String bad;
+        try {
+            ModOrigin.Kind.valueOf("NOPE");
+            bad = "ok";
+        } catch (IllegalArgumentException error) {
+            bad = "iae:" + error.getMessage();
+        }
+        String nil;
+        try {
+            ModOrigin.Kind.valueOf(null);
+            nil = "ok";
+        } catch (NullPointerException error) {
+            nil = "npe:" + error.getMessage();
+        }
+        return bad + "|" + nil;
+    }
 }
 "#;
 
@@ -152,7 +199,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-mod-origin-{test}-{}-{unique}",
             std::process::id()
         ));
@@ -193,6 +240,23 @@ impl Fixture {
             br#"{"id":"origin-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
         )
         .unwrap();
+        let mut nested_bytes = Cursor::new(Vec::new());
+        {
+            let mut nested = zip::ZipWriter::new(&mut nested_bytes);
+            nested
+                .start_file("fabric.mod.json", SimpleFileOptions::default())
+                .unwrap();
+            nested
+                .write_all(br#"{"id":"nested-child","version":"1.0"}"#)
+                .unwrap();
+            nested.finish().unwrap();
+        }
+        zip.start_file(
+            "META-INF/jars/nested-child.jar",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(nested_bytes.get_ref()).unwrap();
         for class in files_under(&classes) {
             let entry = class
                 .strip_prefix(&classes)
@@ -215,9 +279,9 @@ impl Fixture {
     }
 
     fn call(&self, method: &str) -> Result<Value, NativeError> {
-        // The loader seeds the jar's own id (and the always-loaded game and
-        // loader) before the entrypoint runs; `NativeJar::host` does the same.
-        let mut host = StdHost::new().with_mod("origin-fixture", "1.0");
+        // Seed the jar and link its META-INF/jars child exactly as the loader
+        // does before invoking an entrypoint.
+        let mut host = self.jar.seed_host(StdHost::new());
         self.jar.invoke_method_with_args(
             "demo/Probe",
             method,
@@ -257,6 +321,28 @@ fn parent_accessors_throw_what_fabric_throws_for_a_path_origin() {
     assert_eq!(
         fixture.text("parentSub"),
         "uoe:kind PATH doesn't have a parent sub-location"
+    );
+}
+
+#[test]
+fn mod_origin_kind_is_the_loader_enum_with_fresh_values_arrays() {
+    let fixture = Fixture::build("kind-enum");
+    assert_eq!(
+        fixture.text("kindEnum"),
+        "3|PATH:0:PATH|NESTED:1:NESTED|UNKNOWN:2:UNKNOWN|true|true|true|true|true"
+    );
+    assert_eq!(
+        fixture.text("kindValueOfFailures"),
+        "iae:No enum constant net.fabricmc.loader.api.metadata.ModOrigin.Kind.NOPE|npe:Name is null"
+    );
+}
+
+#[test]
+fn nested_container_origin_is_a_nested_origin_over_its_entry() {
+    let fixture = Fixture::build("nested");
+    assert_eq!(
+        fixture.text("nested"),
+        "true|NESTED|origin-fixture|META-INF/jars/nested-child.jar|origin-fixture:META-INF/jars/nested-child.jar"
     );
 }
 

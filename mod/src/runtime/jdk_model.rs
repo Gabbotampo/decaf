@@ -47,18 +47,61 @@ fn charset_value(canonical: &str) -> Value {
 /// The canonical name `Charset.forName` resolves `name` to, matching the
 /// JDK's case-insensitive lookup over the standard charsets and their common
 /// aliases.
-fn canonical_charset(name: &str) -> Option<&'static str> {
+pub(crate) fn canonical_charset(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
-    Some(match lower.as_str() {
-        "utf-8" | "utf8" | "unicode-1-1-utf-8" => "UTF-8",
-        "us-ascii" | "ascii" | "iso646-us" | "us" | "default" | "ascii7" | "646" => "US-ASCII",
-        "iso-8859-1" | "iso8859_1" | "iso8859-1" | "latin1" | "l1" | "iso_8859-1" | "cp819" => {
-            "ISO-8859-1"
-        }
-        "utf-16" | "utf16" | "utf_16" => "UTF-16",
-        "utf-16be" | "utf_16be" | "x-utf-16be" => "UTF-16BE",
-        "utf-16le" | "utf_16le" | "x-utf-16le" => "UTF-16LE",
-        _ => return None,
+    // Generated from Charset.forName(...).aliases() plus canonical names on
+    // Temurin 25.0.5+8; matching is the JDK's case-insensitive lookup.
+    const UTF8: &[&str] = &["unicode-1-1-utf-8", "utf-8", "utf8"];
+    const ASCII: &[&str] = &[
+        "646",
+        "ansi_x3.4-1968",
+        "ansi_x3.4-1986",
+        "ascii",
+        "ascii7",
+        "cp367",
+        "csascii",
+        "ibm367",
+        "iso-ir-6",
+        "iso646-us",
+        "iso_646.irv:1983",
+        "iso_646.irv:1991",
+        "us",
+        "us-ascii",
+    ];
+    const UTF16: &[&str] = &["utf-16", "utf16", "utf_16"];
+    const UTF16BE: &[&str] = &["utf-16be", "utf_16be", "x-utf-16be"];
+    const UTF16LE: &[&str] = &["utf-16le", "utf_16le", "x-utf-16le"];
+    const LATIN1: &[&str] = &[
+        "819",
+        "8859_1",
+        "cp819",
+        "csisolatin1",
+        "ibm-819",
+        "ibm819",
+        "iso-8859-1",
+        "iso-ir-100",
+        "iso8859-1",
+        "iso8859_1",
+        "iso_8859-1",
+        "iso_8859-1:1987",
+        "iso_8859_1",
+        "l1",
+        "latin1",
+    ];
+    Some(if UTF8.contains(&lower.as_str()) {
+        "UTF-8"
+    } else if ASCII.contains(&lower.as_str()) {
+        "US-ASCII"
+    } else if LATIN1.contains(&lower.as_str()) {
+        "ISO-8859-1"
+    } else if UTF16.contains(&lower.as_str()) {
+        "UTF-16"
+    } else if UTF16BE.contains(&lower.as_str()) {
+        "UTF-16BE"
+    } else if UTF16LE.contains(&lower.as_str()) {
+        "UTF-16LE"
+    } else {
+        return None;
     })
 }
 
@@ -158,7 +201,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         return Some(Ok(collector));
     }
     if let Some(comparator) = crate::runtime::jdk_stream::comparator_static(r, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         // `Modifier`'s predicates over the access flags reflection answers
@@ -364,7 +407,7 @@ pub(crate) fn instance_call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     if let Some(comparator) = crate::runtime::jdk_stream::comparator_instance(r, receiver, args) {
-        return Some(Ok(comparator));
+        return Some(comparator);
     }
     if r.owner == "java/nio/file/Path" && r.name == "resolveSibling" {
         return resolve_sibling(r, receiver, args).map(Ok);
@@ -540,17 +583,17 @@ impl ToMap {
         }))
     }
 
-    /// The collected map.
-    pub(crate) fn finish(self) -> Value {
+    /// The collected map: the JDK collector's own `HashMap` (or supplied
+    /// map), or for Guava's `toImmutableMap` its entries in encounter order.
+    pub(crate) fn finish(self) -> Result<Value, Vec<Value>> {
         if let Some(map) = self.map {
-            return map;
+            return Ok(map);
         }
-        let flat = self
+        Err(self
             .entries
             .into_iter()
             .flat_map(|(key, value)| [key, value])
-            .collect::<Vec<_>>();
-        super::collection_value("map", &flat)
+            .collect())
     }
 }
 
@@ -634,62 +677,11 @@ impl crate::runtime::StdHost {
         } else {
             values
         };
-        Some(Ok(super::collection_value(kind, &values)))
-    }
-
-    /// `Map.Entry.setValue` on an entry `entrySet()` handed out.
-    ///
-    /// An entry marker is a value (`map-entry/k,v`), not a view, so the write
-    /// goes to the one host map that holds exactly this key and value: the
-    /// map the entry came from (`for (e : map.entrySet()) e.setValue(...)`,
-    /// icy-better-horses freezing its coat lists). The earlier value is the
-    /// answer, as on the JVM. An entry no mutable map holds is an immutable
-    /// `Map.entry`, which raises `UnsupportedOperationException`; one that
-    /// several maps hold is refused rather than written to a guess. The
-    /// entry marker itself keeps its old value: a later `getValue()` on the
-    /// same entry reads the value it was created with.
-    pub(crate) fn entry_set_value(
-        &mut self,
-        key: &Value,
-        old: &Value,
-        replacement: Value,
-    ) -> Result<Value, NativeError> {
-        let holders = self
-            .mutable_collections
-            .iter()
-            .filter(|(marker, _)| {
-                super::is_map_owner(
-                    marker
-                        .split_once('#')
-                        .map_or(marker.as_str(), |(class, _)| class),
-                )
-            })
-            .filter_map(|(marker, values)| {
-                values
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .position(|pair| &pair[0] == key && &pair[1] == old)
-                    .map(|pair| (marker.clone(), pair * 2 + 1))
-            })
-            .collect::<Vec<_>>();
-        match holders.as_slice() {
-            [] => Err(NativeError::UncaughtException {
-                class: "java/lang/UnsupportedOperationException".into(),
-                message: None,
-                frame: None,
-            }),
-            [(marker, index)] => {
-                let values = self
-                    .mutable_collections
-                    .get_mut(marker)
-                    .expect("the holder was just found");
-                Ok(std::mem::replace(&mut values[*index], replacement))
-            }
-            _ => Err(NativeError::Metadata(
-                "Map.Entry.setValue: several maps hold this entry".into(),
-            )),
-        }
+        // The class `List.copyOf`/`Set.copyOf`/`Map.copyOf` makes, its shared
+        // empty one included (#156 P14d2).
+        Some(Ok(
+            self.factory_unmodifiable(&r.owner, &r.name, kind, values)
+        ))
     }
 
     /// `List.subList(from, to)` on a list the host holds.
@@ -739,16 +731,7 @@ impl crate::runtime::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        let list = self.empty_collection("list");
-        match expect_ref(&list).and_then(|marker| self.mutable_collections.get_mut(marker)) {
-            Some(stored) => {
-                *stored = range;
-                Ok(list)
-            }
-            // Past the neutral-collection bound the host has no fresh mutable
-            // list to give; an immutable one still carries the elements.
-            None => Ok(super::collection_value("list", &range)),
-        }
+        Ok(self.new_collection(super::stand_in_class("list"), range))
     }
 }
 
@@ -1204,7 +1187,25 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         for element in values {
             self.accept_to_map(&mut state, element)?;
         }
-        Ok(Some(state.finish()))
+        Ok(Some(self.finish_to_map(state)?))
+    }
+
+    /// [`ToMap::finish`]: Guava's entries become its `ImmutableMap`
+    /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
+    /// none.
+    pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        match state.finish() {
+            Ok(map) => Ok(map),
+            Err(entries) => self.factory_or_count(
+                &crate::runtime::stream_pipeline::wanted(
+                    "com/google/common/collect/ImmutableMap",
+                    "toImmutableMap",
+                    "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
+                ),
+                "map",
+                entries,
+            ),
+        }
     }
 
     /// [`ToMap::begin`], and for `Collectors.toMap` the `HashMap::new` its
@@ -1514,11 +1515,80 @@ mod tests {
             instance_call(&name, &latin, &[]).unwrap().unwrap(),
             text("ISO-8859-1")
         );
-        assert!(matches!(
-            static_call(&for_name, &[text("KOI8-R")]),
-            Some(Err(NativeError::UncaughtException { class, .. }))
-                if class == "java/nio/charset/UnsupportedCharsetException"
-        ));
+        // `KOI8-R` is not modelled; `default` is not a name JDK 25 knows.
+        for unknown in ["KOI8-R", "default"] {
+            assert!(
+                matches!(
+                    static_call(&for_name, &[text(unknown)]),
+                    Some(Err(NativeError::UncaughtException { class, .. }))
+                        if class == "java/nio/charset/UnsupportedCharsetException"
+                ),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_java25_standard_charset_alias_resolves() {
+        let for_name = method(
+            "java/nio/charset/Charset",
+            "forName",
+            "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+        );
+        for (canonical, aliases) in [
+            ("UTF-8", ["unicode-1-1-utf-8", "utf-8", "utf8"].as_slice()),
+            (
+                "US-ASCII",
+                [
+                    "646",
+                    "ansi_x3.4-1968",
+                    "ansi_x3.4-1986",
+                    "ascii",
+                    "ascii7",
+                    "cp367",
+                    "csascii",
+                    "ibm367",
+                    "iso-ir-6",
+                    "iso646-us",
+                    "iso_646.irv:1983",
+                    "iso_646.irv:1991",
+                    "us",
+                    "us-ascii",
+                ]
+                .as_slice(),
+            ),
+            (
+                "ISO-8859-1",
+                [
+                    "819",
+                    "8859_1",
+                    "cp819",
+                    "csisolatin1",
+                    "ibm-819",
+                    "ibm819",
+                    "iso-8859-1",
+                    "iso-ir-100",
+                    "iso8859-1",
+                    "iso8859_1",
+                    "iso_8859-1",
+                    "iso_8859-1:1987",
+                    "iso_8859_1",
+                    "l1",
+                    "latin1",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for alias in aliases {
+                let value = static_call(&for_name, &[text(alias)]).unwrap().unwrap();
+                let name = method("java/nio/charset/Charset", "name", "()Ljava/lang/String;");
+                assert_eq!(
+                    instance_call(&name, &value, &[]).unwrap().unwrap(),
+                    text(canonical),
+                    "{alias}"
+                );
+            }
+        }
     }
 
     #[test]

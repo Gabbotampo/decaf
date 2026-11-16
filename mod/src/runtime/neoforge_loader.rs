@@ -161,18 +161,35 @@ impl StdHost {
             ) => Some(crate::runtime::host_service::loader_singleton(
                 "net/neoforged/fml/config/ConfigTracker",
             )),
+            // The tracker's fields: one object each for the run (#156 P14d2).
             (
                 "net/neoforged/fml/config/ConfigTracker",
-                "configsByMod" | "fileMap",
+                name @ ("configsByMod" | "fileMap"),
                 "Ljava/util/concurrent/ConcurrentHashMap;"
                 | "Ljava/util/Map;"
                 | "Ljava/util/concurrent/ConcurrentMap;",
-            ) => Some(Value::Ref(Some("map".into()))),
+            ) => Some(self.cached_collection(
+                &Value::Ref(Some("net/neoforged/fml/config/ConfigTracker".into())),
+                name,
+                "java/util/concurrent/ConcurrentHashMap",
+                false,
+                Vec::new(),
+            )),
             (
                 "net/neoforged/fml/config/ConfigTracker",
                 "configSets",
-                "Ljava/util/EnumMap;" | "Ljava/util/Map;" | "Ljava/util/Set;",
-            ) => Some(Value::Ref(Some("set".into()))),
+                descriptor @ ("Ljava/util/EnumMap;" | "Ljava/util/Map;" | "Ljava/util/Set;"),
+            ) => Some(self.cached_collection(
+                &Value::Ref(Some("net/neoforged/fml/config/ConfigTracker".into())),
+                "configSets",
+                crate::runtime::stand_in_class(if descriptor == "Ljava/util/Set;" {
+                    "set"
+                } else {
+                    "map"
+                }),
+                false,
+                Vec::new(),
+            )),
             // NeoForge's own registries. The attachment registry is a real
             // registry the loader creates, keyed `neoforge:attachment_types`
             // (`NeoForgeRegistries.Keys.ATTACHMENT_TYPES`, plural; this used
@@ -497,7 +514,15 @@ impl StdHost {
             .iter()
             .map(|id| loader::mod_info(id))
             .collect::<Vec<_>>();
-        crate::runtime::collection_value("list", &infos)
+        // `ModList.getMods()` returns its `sortedList` field: one list for
+        // the run, which a new list stands in for (#156 P14d2).
+        self.cached_collection(
+            &Value::Ref(Some("net/neoforged/fml/ModList".into())),
+            "getMods",
+            crate::runtime::stand_in_class("list"),
+            false,
+            infos,
+        )
     }
 
     /// Whether `id` is a mod container this host can answer, and its version.

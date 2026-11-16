@@ -581,13 +581,20 @@ impl<H: Host> Runtime<'_, H> {
         {
             return self.host.unknown_operand_call(r).map(Some);
         }
-        let path = path_text(&directory).to_owned();
+        let display_path = path_text(&directory).to_owned();
+        let path = host_path::sandbox_absolute(&display_path);
         match self.file_kind(&path) {
             file_attributes::FileKind::Missing => {
-                return Err(thrown("java/nio/file/NoSuchFileException", Some(path)));
+                return Err(thrown(
+                    "java/nio/file/NoSuchFileException",
+                    Some(display_path.clone()),
+                ));
             }
             file_attributes::FileKind::RegularFile => {
-                return Err(thrown("java/nio/file/NotDirectoryException", Some(path)));
+                return Err(thrown(
+                    "java/nio/file/NotDirectoryException",
+                    Some(display_path.clone()),
+                ));
             }
             file_attributes::FileKind::Directory => {}
         }
@@ -704,13 +711,12 @@ impl<H: Host> Runtime<'_, H> {
                 if unsettled {
                     self.host.unknown_operand_call(r)?;
                 }
-                match self.host.empty_mutable_collection("list") {
-                    Some(list) => {
-                        self.host.replace_mutable_collection(&list, values);
-                        list
-                    }
-                    None => collection_value("list", &values),
-                }
+                // `pollEvents()`: a new list of the events.
+                self.new_host_collection(
+                    "java/util/ArrayList",
+                    values,
+                    (&r.owner, &r.name, &r.descriptor),
+                )?
             }
             ("reset", "()Z") => {
                 let Some(key) = self.watch.keys.get_mut(marker) else {

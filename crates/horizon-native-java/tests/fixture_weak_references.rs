@@ -13,6 +13,9 @@
 //! observable answer as a JVM run with no collection, which is what the
 //! fixture measures.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -133,7 +136,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-references-{test}-{}-{unique}",
             std::process::id()
         ));

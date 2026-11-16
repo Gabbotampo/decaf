@@ -45,9 +45,8 @@
 //! (number parsing) and `disableInnerClassSerialization` (Gson refuses an inner
 //! class there; this writer would emit it).
 //!
-//! Accepted and named as inert for this runtime: `setLenient`/`setStrictness`
-//! (the parser is lenient, the existing departure for reading jar resources;
-//! writing does not depend on it), `disableJdkUnsafe` (nothing here instantiates
+//! Accepted and modeled for reading: `setLenient`/`setStrictness` record the
+//! reader's handling of non-finite numeric tokens. `disableJdkUnsafe` (nothing here instantiates
 //! through `Unsafe`; `fromJson` already builds an object without running a
 //! constructor) and `addReflectionAccessFilter` (filters Gson's reflection into
 //! JDK classes, which this model never reflects into).
@@ -236,6 +235,10 @@ pub(super) struct GsonStyle {
     non_executable: bool,
     special_floats: bool,
     long_strings: bool,
+    /// Gson's reader strictness. `false` is the default/LENIENT setting;
+    /// STRICT rejects non-finite numeric values while still accepting the
+    /// regular JSON number grammar.
+    strict: bool,
     /// An option that changes the output is set but cannot be applied here, so
     /// the writer must not produce text.
     counted: bool,
@@ -252,6 +255,7 @@ impl Default for GsonStyle {
             non_executable: false,
             special_floats: false,
             long_strings: false,
+            strict: false,
             counted: false,
         }
     }
@@ -263,7 +267,7 @@ impl GsonStyle {
     fn key(&self) -> String {
         format!(
             "newline={};indent={};space={};html={};nulls={};\
-             naming={};mods={};nonexec={};special={};longs={};counted={}",
+             naming={};mods={};nonexec={};special={};longs={};strict={};counted={}",
             hex(&self.formatting.newline),
             hex(&self.formatting.indent),
             u8::from(self.formatting.space_after_separators),
@@ -274,6 +278,7 @@ impl GsonStyle {
             u8::from(self.non_executable),
             u8::from(self.special_floats),
             u8::from(self.long_strings),
+            u8::from(self.strict),
             u8::from(self.counted),
         )
     }
@@ -298,6 +303,7 @@ impl GsonStyle {
                 "nonexec" => style.non_executable = flag(value)?,
                 "special" => style.special_floats = flag(value)?,
                 "longs" => style.long_strings = flag(value)?,
+                "strict" => style.strict = flag(value)?,
                 "counted" => style.counted = flag(value)?,
                 _ => return None,
             }
@@ -306,8 +312,7 @@ impl GsonStyle {
     }
 
     /// The writer options `Gson.toJson` applies to a `JsonElement`
-    /// (`gson_tree.rs`). The `Gson`'s strictness is not recorded, so the tree
-    /// writer is not told it is lenient.
+    /// (`gson_tree.rs`).
     pub(super) fn tree_style(&self) -> super::gson_tree::TreeStyle {
         super::gson_tree::TreeStyle {
             newline: self.formatting.newline.clone(),
@@ -334,6 +339,10 @@ impl GsonStyle {
 
     pub(crate) fn special_floats(&self) -> bool {
         self.special_floats
+    }
+
+    pub(super) fn allows_special_floats(&self) -> bool {
+        !self.strict
     }
 
     fn serialize_nulls(&self) -> bool {
@@ -670,15 +679,34 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
-            // Inert for this runtime: the parser is lenient by its documented
-            // departure (writing does not depend on strictness), nothing here
-            // instantiates through `Unsafe`, and `fromJson` already builds an
-            // object without running a constructor.
-            ("setLenient" | "disableJdkUnsafe", _) => answer(),
-            ("setStrictness", _) => {
+            ("setLenient", "()Lcom/google/gson/GsonBuilder;") => {
+                let mut style = self.gson_style(&marker);
+                style.strict = false;
+                self.set_gson_style(&marker, style);
+                answer()
+            }
+            // Nothing here instantiates through `Unsafe`.
+            ("disableJdkUnsafe", _) => answer(),
+            ("setStrictness", "(Lcom/google/gson/Strictness;)Lcom/google/gson/GsonBuilder;") => {
                 if args.iter().any(|value| matches!(value, Value::Ref(None))) {
                     return Err(npe());
                 }
+                let mut style = self.gson_style(&marker);
+                // Enum constants are represented by a stable marker containing
+                // the declaring class and constant name. Unknown markers are
+                // conservatively treated as STRICT; Gson's default remains
+                // lenient until this method is called.
+                style.strict = args
+                    .first()
+                    .and_then(expect_ref)
+                    .and_then(|constant| {
+                        self.enum_constants
+                            .get(constant)
+                            .map(|(name, _)| name == "STRICT")
+                            .or_else(|| Some(!constant.contains("LENIENT")))
+                    })
+                    .unwrap_or(true);
+                self.set_gson_style(&marker, style);
                 answer()
             }
             _ => Ok(None),
@@ -704,9 +732,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(adapter) = args.get(1).filter(|adapter| **adapter != Value::Ref(None)) else {
             return Err(npe());
         };
-        if expect_ref(adapter)
-            .is_some_and(|text| text.starts_with("@indy:") || text.starts_with("@fn:"))
-        {
+        if crate::runtime::callback_marker::callback_text(adapter).is_some() {
             return Ok(());
         }
         let Some(class) = crate::runtime::jar_object::object_class(adapter) else {
@@ -829,6 +855,11 @@ impl<H: Host> Runtime<'_, H> {
             Value::Boxed(boxed @ Boxed::Character(_)) => {
                 Some(format!("\"{}\"", style.escape(&boxed.text())))
             }
+            // A `Float` box (a `float` field too): `Gson`'s float adapter
+            // checks the value widened to a `double` before writing it.
+            Value::Boxed(Boxed::Float(bits)) if !f32::from_bits(*bits).is_finite() => {
+                Some(non_finite_text(f64::from(f32::from_bits(*bits)), style)?)
+            }
             Value::Boxed(boxed) => Some(boxed.text()),
             Value::Int(value) => Some(value.to_string()),
             Value::Long(value) => Some(if style.long_strings() {
@@ -843,26 +874,8 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         format!("{value}")
                     })
-                } else if style.special_floats() {
-                    Some(if value.is_nan() {
-                        "NaN".into()
-                    } else if *value > 0.0 {
-                        "Infinity".into()
-                    } else {
-                        "-Infinity".into()
-                    })
                 } else {
-                    // Gson's `JsonWriter.value(double)` refusal.
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some(
-                            "NaN is not a valid double value as per JSON specification. \
-                             To override this behavior, use \
-                             GsonBuilder.serializeSpecialFloatingPointValues() method."
-                                .into(),
-                        ),
-                        frame: None,
-                    });
+                    Some(non_finite_text(*value, style)?)
                 }
             }
             // A marker, or an object by its key (`jar_object.rs`).
@@ -1021,7 +1034,7 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 style.field_name(&name)
             };
-            members.push((name, value));
+            members.push((name, primitive_box(&descriptor, value)));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -1171,21 +1184,59 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value, tree_mode: bool) -> Option
     })?;
     if host.holds_collection(value) {
         let class = marker.split_once('#').map_or(marker, |(class, _)| class);
-        return if is_map_owner(class) || (tree_mode && class.contains("Map")) {
+        // A map whichever class the host made it (Guava's
+        // `RegularImmutableMap`, `Map.of`'s `MapN`): its supertypes say
+        // (#253 review).
+        return if is_map_owner(class)
+            || crate::runtime::java_immutable::supertypes(class).contains(&"java/util/Map")
+        {
             Some("map")
         } else {
             Some("list")
         };
     }
-    match gson_collection_kind(marker) {
-        Some("map") => Some("map"),
-        Some(_) => Some("list"),
-        None => None,
+    // A collection is a handle the host holds (#156 P14d2): no text is one.
+    None
+}
+
+/// A primitive field's value as Gson's adapter for its type writes it: the
+/// interpreter holds a `boolean` and a `char` as an `int`, so `true` would
+/// print `1` and `'a'` `97` (#253 re-check: a config written with booleans
+/// then failed to read back), the same two rows as #307's writer; and a
+/// `float` as a `double`, so `0.1f` would print `0.10000000149011612`: it is
+/// boxed, and the box goes through Gson's NaN/infinity check (#253 re-check
+/// B7). A `byte`/`short` prints the same either way.
+fn primitive_box(descriptor: &str, value: Value) -> Value {
+    match (descriptor, &value) {
+        ("Z", Value::Int(int)) => Value::Boxed(Boxed::Boolean(*int != 0)),
+        ("C", Value::Int(int)) => Value::Boxed(Boxed::Character(*int as u16)),
+        ("F", Value::Float(float)) => Value::Boxed(Boxed::float(*float)),
+        _ => value,
     }
 }
 
-fn gson_collection_kind(marker: &str) -> Option<&str> {
-    let kind = marker.split_once('/').map_or(marker, |(kind, _)| kind);
-    let kind = kind.split_once('#').map_or(kind, |(kind, _)| kind);
-    matches!(kind, "list" | "set" | "map").then_some(kind)
+/// A NaN or infinite `double` (or `float`, widened) as Gson writes it:
+/// `NaN`/`Infinity`/`-Infinity` under `serializeSpecialFloatingPointValues`,
+/// else `Gson.checkValidFloatingPoint`'s `IllegalArgumentException`, naming
+/// the value as `Double.toString` prints it (#253 re-check B7).
+fn non_finite_text(value: f64, style: &GsonStyle) -> Result<String, NativeError> {
+    let shown = if value.is_nan() {
+        "NaN"
+    } else if value > 0.0 {
+        "Infinity"
+    } else {
+        "-Infinity"
+    };
+    if style.special_floats() {
+        return Ok(shown.into());
+    }
+    Err(NativeError::UncaughtException {
+        class: "java/lang/IllegalArgumentException".into(),
+        message: Some(format!(
+            "{shown} is not a valid double value as per JSON specification. \
+             To override this behavior, use \
+             GsonBuilder.serializeSpecialFloatingPointValues() method."
+        )),
+        frame: None,
+    })
 }
