@@ -1,7 +1,7 @@
 //! Vanilla entity registration and synchronized-data handles.
 use crate::runtime::jar_object;
 use crate::runtime::{MethodRef, NativeError, Value, expect_float, expect_int, expect_ref};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 struct Builder {
@@ -42,6 +42,7 @@ pub(crate) struct State {
     entities: BTreeMap<String, Entity>,
     dimensions: BTreeMap<String, (f64, f64, f64)>,
     ids: BTreeMap<String, u16>,
+    registered: BTreeSet<String>,
 }
 
 impl State {
@@ -53,6 +54,19 @@ impl State {
         self.builders.retain(|key, _| keep(key));
         self.entities.retain(|key, _| keep(key));
         self.dimensions.retain(|key, _| keep(key));
+        self.registered.retain(|key| keep(key));
+    }
+
+    pub(crate) fn register_entity_type(&mut self, value: &Value) -> bool {
+        let Some(key) = jar_object::instance_key(value) else {
+            return false;
+        };
+        if self.entities.contains_key(key) {
+            self.registered.insert(key.to_owned());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -113,7 +127,7 @@ fn category_name(value: &Value) -> Option<&'static str> {
     .get(id)
     .copied()
 }
-fn serializer_handle(name: &str) -> Value {
+fn serializer_handle(name: &str) -> Option<Value> {
     let names = [
         "BYTE",
         "INT",
@@ -156,8 +170,8 @@ fn serializer_handle(name: &str) -> Value {
         "VILLAGER_DATA",
         "OPTIONAL_UNSIGNED_INT",
     ];
-    let id = names.iter().position(|n| *n == name).unwrap_or(0);
-    jar_object::handle(format!("{SERIALIZER}#{}", 720_000 + id))
+    let id = names.iter().position(|n| *n == name)?;
+    Some(jar_object::handle(format!("{SERIALIZER}#{}", 720_000 + id)))
 }
 
 fn category(v: &Value) -> Option<String> {
@@ -237,7 +251,7 @@ pub(crate) fn static_field(
             "OPTIONAL_UNSIGNED_INT",
         ];
         if names.iter().any(|n| *n == r.name) {
-            return Some(Ok(serializer_handle(&r.name)));
+            return serializer_handle(&r.name).map(Ok);
         }
     }
     None
@@ -250,7 +264,7 @@ pub(crate) fn static_call(
 ) -> Option<Result<Value, NativeError>> {
     if r.owner == "net/minecraft/network/syncher/SynchedEntityData" && r.name == "defineId" {
         let class_name = args.first().and_then(crate::runtime::host_class::class_name)?;
-        return Some(define_id(state, class_name));
+        return define_id(state, class_name);
     }
     if r.owner == BUILDER && (r.name == "of" || r.name == "createNothing") {
         let cat = args.get(1).or_else(|| args.first()).and_then(category)?;
@@ -390,6 +404,9 @@ pub(crate) fn instance_call(
         }));
     }
     if marker == ENTITY {
+        if !state.registered.contains(&k) {
+            return None;
+        }
         let e = state.entities.get(&k)?;
         let (entity_width, entity_height, entity_eye_height) = (e.width, e.height, e.eye_height);
         let out = match (r.name.as_str(), r.descriptor.as_str()) {
@@ -422,33 +439,40 @@ pub(crate) fn instance_call(
     None
 }
 
-pub(crate) fn define_id(state: &mut State, class_name: &str) -> Result<Value, NativeError> {
-    let next = state.ids.entry(class_name.to_owned()).or_insert_with(|| {
-        if class_name == "net/minecraft/world/entity/Entity" {
-            0
-        } else if class_name == "net/minecraft/world/entity/LivingEntity" {
-            7
-        } else if class_name == "net/minecraft/world/entity/Mob" {
-            16
-        } else if class_name.ends_with("Entity") {
-            7
-        } else {
-            0
-        }
-    });
+const VANILLA_POOL: &[(&str, u16)] = &[
+    ("net/minecraft/world/entity/Entity", 8),
+    ("net/minecraft/world/entity/LivingEntity", 15),
+    ("net/minecraft/world/entity/Mob", 16),
+    (
+        "net/minecraft/world/entity/projectile/arrow/AbstractArrow",
+        11,
+    ),
+    ("net/minecraft/world/entity/monster/zombie/Zombie", 19),
+    ("net/minecraft/world/entity/animal/wolf/Wolf", 25),
+    ("net/minecraft/world/entity/animal/golem/IronGolem", 17),
+    ("net/minecraft/world/entity/player/Player", 21),
+];
+
+pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Value, NativeError>> {
+    let next = if let Some(next) = state.ids.get_mut(class_name) {
+        next
+    } else {
+        let (_, count) = VANILLA_POOL.iter().find(|(name, _)| *name == class_name)?;
+        state.ids.entry(class_name.to_owned()).or_insert(*count)
+    };
     if *next > 254 {
-        return Err(NativeError::UncaughtException {
+        return Some(Err(NativeError::UncaughtException {
             class: "java/lang/IllegalArgumentException".into(),
             message: Some(format!(
                 "Data value id is too big with {}! (Max is 254)",
                 *next
             )),
             frame: None,
-        });
+        }));
     }
     let id = *next;
     *next += 1;
-    Ok(jar_object::handle(format!("{ACCESSOR}#{id}")))
+    Some(Ok(jar_object::handle(format!("{ACCESSOR}#{id}"))))
 }
 
 pub(crate) fn accessor_id(value: &Value) -> Option<i32> {
@@ -485,7 +509,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let id = define_id(&mut state, "demo/ProbeEntity");
-        assert_eq!(accessor_id(&id.unwrap()), Some(7));
+        let id = define_id(&mut state, "net/minecraft/world/entity/Entity")
+            .unwrap()
+            .unwrap();
+        assert_eq!(accessor_id(&id), Some(8));
     }
 }

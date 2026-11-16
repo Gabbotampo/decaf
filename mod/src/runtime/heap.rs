@@ -1513,8 +1513,9 @@ mod tests {
         .unwrap();
         let accessor = crate::runtime::entity_registration::define_id(
             &mut host.entity_registration,
-            "demo/ProbeEntity",
+            "net/minecraft/world/entity/Entity",
         )
+        .unwrap()
         .unwrap();
         let entity_key = crate::runtime::jar_object::instance_key(&entity).unwrap().to_owned();
         let accessor_key = crate::runtime::jar_object::instance_key(&accessor)
@@ -1538,7 +1539,7 @@ mod tests {
         collect(&mut heap, &mut host, &[]);
         assert_eq!(host.entity_registration.entry_count(), 0);
         assert!(heap.fields.is_empty());
-        assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(7));
+        assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(8));
     }
 
     #[test]

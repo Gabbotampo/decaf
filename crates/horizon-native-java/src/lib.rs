@@ -5090,10 +5090,13 @@ impl StdHost {
         }
         self.registrations.push(RegistryEntry {
             registry: registry.to_owned(),
-            id,
+            id: id.clone(),
             value: value.clone(),
             declaration,
         });
+        if registry == "minecraft:entity_type" {
+            let _ = self.entity_registration.register_entity_type(&value);
+        }
         Some(value)
     }
 
