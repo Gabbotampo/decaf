@@ -6359,6 +6359,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
