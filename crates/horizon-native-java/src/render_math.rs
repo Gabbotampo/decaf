@@ -606,12 +606,14 @@ mod tests {
         for _ in 0..10_000 {
             call(&mut host, &mut map, &push, &stack, &[]);
             call(
+                &mut host,
                 &mut map,
                 &t,
                 &stack,
                 &[Value::Float(1.25), Value::Float(-2.5), Value::Float(3.75)],
             );
             call(
+                &mut host,
                 &mut map,
                 &sc,
                 &stack,
