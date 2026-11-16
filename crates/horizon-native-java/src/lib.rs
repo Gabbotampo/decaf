@@ -3114,6 +3114,10 @@ pub trait Host {
         None
     }
 
+    fn array_values(&self, _value: &Value) -> Option<Vec<Value>> {
+        None
+    }
+
     /// The array `marker` views, where its part starts, how long it is, and
     /// whether it is a `subList`; `None` for anything but a view.
     fn array_view_of(&self, _marker: &str) -> Option<(String, usize, usize, bool)> {
@@ -6125,6 +6129,11 @@ impl Host for StdHost {
 
     fn array_view_of(&self, marker: &str) -> Option<(String, usize, usize, bool)> {
         StdHost::array_view_of(self, marker)
+    }
+
+    fn array_values(&self, value: &Value) -> Option<Vec<Value>> {
+        let _ = value;
+        None
     }
 
     fn has_array_views(&self, array: &str) -> bool {
