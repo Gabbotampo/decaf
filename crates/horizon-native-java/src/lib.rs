@@ -73,6 +73,7 @@ mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod gson_type_token;
+mod gson_writer;
 mod guava_model;
 mod guava_text;
 mod hash_bulk;
@@ -119,6 +120,7 @@ mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
 mod host_registry;
+mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
@@ -3241,6 +3243,9 @@ pub struct StdHost {
     own_loader_classes: BTreeSet<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
+    /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
+    fabric_origins: BTreeMap<String, (String, String)>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
@@ -3527,6 +3532,7 @@ impl StdHost {
             run_loader: class_precedence::RunLoader::default(),
             own_loader_classes: BTreeSet::new(),
             fabric_metadata: BTreeMap::new(),
+            fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
@@ -4097,6 +4103,18 @@ impl StdHost {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
             self.record_loaded_mod(&nested);
+            if let Some(nested_id) = nested.fabric_id.as_deref() {
+                let parent = jar
+                    .fabric_id
+                    .as_deref()
+                    .or(jar.neoforge_id.as_deref())
+                    .unwrap_or("jar");
+                let sublocation = entry.clone();
+                self.fabric_origins.insert(
+                    nested_id.to_owned(),
+                    ("nested".into(), format!("{parent}|{sublocation}")),
+                );
+            }
         }
         Ok(added)
     }
@@ -4120,6 +4138,9 @@ impl StdHost {
             }
         }
         if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
+            self.fabric_origins
+                .entry(id.to_owned())
+                .or_insert_with(|| ("path".into(), id.to_owned()));
             let version = jar
                 .fabric_version
                 .as_deref()
@@ -6006,6 +6027,10 @@ impl Host for StdHost {
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
+        // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = mod_origin::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = Self::fabric_mods_static(r) {
             return Ok(value);
         }
@@ -6067,7 +6092,10 @@ impl Host for StdHost {
             return Ok(value);
         }
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
-        if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
+        if let Some(value) = gson_model::static_field(r)
+            .or_else(|| gson_tree::static_field(r))
+            .or_else(|| gson_writer::static_field(r))
+        {
             return Ok(value);
         }
         // `Blocks.<FIELD>` is already a game registry handle in the current
@@ -6317,6 +6345,48 @@ impl Host for StdHost {
         if let Some(value) = jdk_character::static_call(r, args) {
             return value;
         }
+        // Gson's numeric edge cases are compared by raw IEEE bits in the
+        // fixture. Keep the signed zero and NaN payload exactly as Java does.
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/lang/Double", "doubleToRawLongBits", "(D)J") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                // Value::Float cannot preserve every Java NaN payload.  The
+                // raw bits are therefore untrustworthy; keep this call
+                // counted instead of answering a fabricated payload.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Long(value.to_bits() as i64));
+            }
+            ("java/lang/Double", "doubleToLongBits", "(D)J") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                let bits = if value.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Long(bits as i64));
+            }
+            ("java/lang/Float", "floatToRawIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                // See the double raw-bit case above: a NaN payload is not a
+                // trustworthy value in the bounded interpreter.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Int(value.to_bits() as i32));
+            }
+            ("java/lang/Float", "floatToIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                let bits = if value.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Int(bits as i32));
+            }
+            _ => {}
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -6356,6 +6426,9 @@ impl Host for StdHost {
         }
         if let Some(value) = self.networking_send(r, args) {
             return Ok(value);
+        }
+        if let Some(value) = host_registry_holder::static_call(self, r, args) {
+            return value;
         }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
@@ -7726,6 +7799,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_either::host_instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = host_registry_holder::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.holder_call(r, receiver) {
@@ -11144,7 +11220,7 @@ impl Host for StdHost {
                 // Fabric Loader's own origin for a jar container is a `PATH`
                 // origin over the container's root (`mod_origin.rs`).
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
-                Ok(mod_origin::origin_value(&id))
+                Ok(self.fabric_origin(&id))
             }
             (
                 "net/fabricmc/loader/api/ModContainer",
@@ -11579,6 +11655,17 @@ impl Host for StdHost {
     fn pause_collections(&mut self, paused: bool) {
         self.collections_paused = paused;
     }
+}
+
+fn modelled_writer_class(class: &str) -> bool {
+    matches!(
+        class,
+        "java/io/BufferedWriter"
+            | "java/io/FileWriter"
+            | "java/io/OutputStreamWriter"
+            | "java/io/PrintWriter"
+            | "java/io/StringWriter"
+    )
 }
 
 fn expect_int(r: &MethodRef, value: &Value) -> Result<i32, NativeError> {
@@ -12532,6 +12619,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         ],
         "net/minecraft/world/level/block/Mirror" => &["NONE", "LEFT_RIGHT", "FRONT_BACK"],
         // Mods iterate `PackType.values()` to register a pack for each side.
+        "net/minecraft/core/Holder$Kind" => &["REFERENCE", "DIRECT"],
         "net/minecraft/server/packs/PackType" => &["CLIENT_RESOURCES", "SERVER_DATA"],
         // SLF4J ships with the game; logging shims switch over its levels
         // (javac's `$SwitchMap` sizes its table from `values()`).
@@ -13121,7 +13209,7 @@ fn boxed_character(value: &Value) -> Option<i32> {
 /// Read any of the host's boxed numeric markers as a Java `double`-like value.
 /// The native probe does not model primitive wide values separately, so all
 /// conversions pass through this helper before applying Java's narrowing cast.
-fn boxed_number(value: &Value) -> Option<f64> {
+pub(crate) fn boxed_number(value: &Value) -> Option<f64> {
     match value {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
@@ -13305,12 +13393,12 @@ fn format_integer_us(value: i64) -> String {
 }
 
 /// `Double.toString(value)`, exactly as Java 25 prints it (`jdk_float_text.rs`).
-fn format_java_float(value: f64) -> String {
+pub(crate) fn format_java_float(value: f64) -> String {
     jdk_float_text::double_to_string(value)
 }
 
 /// `Float.toString` of a `float` the interpreter holds widened to `double`.
-fn format_java_float32(value: f64) -> String {
+pub(crate) fn format_java_float32(value: f64) -> String {
     jdk_float_text::float_to_string(value)
 }
 
@@ -18858,7 +18946,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -19070,7 +19160,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -19238,7 +19330,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -21416,10 +21510,13 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// JsonWriter states keyed by their jar object marker.
+    gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
     /// growth is `(old << 1) + 2`, so ensureCapacity can refuse the actual
     /// array length rather than only the requested minimum.
     string_builder_capacities: BTreeMap<String, usize>,
+
     /// Text each `java.io.StringReader` (and each modelled file or stream
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
@@ -23010,7 +23107,11 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
-        jar_object::handle(key)
+        if modelled_writer_class(class) {
+            jar_object::writer_handle(key)
+        } else {
+            jar_object::handle(key)
+        }
     }
 
     /// A fresh allocation key `class#n`, for a model whose object is a handle
@@ -24570,6 +24671,9 @@ impl<H: Host> Runtime<'_, H> {
     /// holds one `enum/<class>/<name>` marker per constant, so `length`,
     /// `clone`, element reads and ordinal lookups all work.
     fn invoke_game_enum_values(&mut self, r: &MethodRef) -> Option<Value> {
+        if let Some(values) = mod_origin::enum_values(r) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         if r.name != "values" {
             return None;
         }
@@ -25804,6 +25908,349 @@ impl<H: Host> Runtime<'_, H> {
         ))
     }
 
+    fn gson_writer_target_marker(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::Writer
+            || !modelled_writer_class(crate::jar_object::packaged_object_class(value)?)
+        {
+            return None;
+        }
+        let marker = handle.key_text();
+        self.io_sink_key(marker).map(|_| marker.to_owned())
+    }
+
+    fn gson_appendable_target_marker(&self, value: &Value) -> Option<String> {
+        if let Some(marker) = self.gson_writer_target_marker(value) {
+            return Some(marker);
+        }
+        let Value::Host(handle) = value else {
+            return host_service::stream_marker(value).cloned();
+        };
+        let marker = handle.key_text();
+        if handle.kind() == HostKind::JarObject
+            && matches!(
+                crate::jar_object::packaged_object_class(value),
+                Some("java/lang/StringBuilder" | "java/lang/StringBuffer")
+            )
+            && self.string_builders.contains_key(marker)
+        {
+            return Some(marker.to_owned());
+        }
+        None
+    }
+
+    fn gson_json_writer_marker(value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::JarObject
+            && crate::jar_object::packaged_object_class(value)
+                == Some("com/google/gson/stream/JsonWriter"))
+        .then(|| handle.key_text().to_owned())
+    }
+
+    fn gson_writer_fallback(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        self.host
+            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+            .map(Some)
+    }
+
+    /// Model Gson 2.14's JsonWriter over the same writer sinks as Gson's
+    /// Appendable overload. Unsupported writer objects remain counted.
+    fn invoke_gson_writer(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver else {
+            return self.gson_writer_fallback(r, receiver, args);
+        };
+        let Some(marker) = Self::gson_json_writer_marker(receiver) else {
+            return self.gson_writer_fallback(r, Some(receiver), args);
+        };
+        if r.name == "<init>" {
+            if r.descriptor != "(Ljava/io/Writer;)V" {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            }
+            let Some(argument) = args.first() else {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            };
+            if *argument == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("out == null".into()),
+                    frame: None,
+                });
+            }
+            let Some(target) = self.gson_writer_target_marker(argument) else {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            };
+            self.gson_writers
+                .insert(marker, gson_writer::State::new(target.to_owned()));
+            return Ok(Some(Value::Void));
+        }
+        if !self.gson_writers.contains_key(&marker) {
+            return self.gson_writer_fallback(r, Some(receiver), args);
+        }
+        let writer_value = || crate::jar_object::stored_value(&marker);
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("beginObject", "()Lcom/google/gson/stream/JsonWriter;")
+            | ("beginArray", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    if r.name == "beginObject" {
+                        state.begin_object()?
+                    } else {
+                        state.begin_array()?
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("endObject", "()Lcom/google/gson/stream/JsonWriter;")
+            | ("endArray", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    if r.name == "endObject" {
+                        state.end_object()?
+                    } else {
+                        state.end_array()?
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("name", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let Some(name) = args.first().and_then(expect_ref) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("name == null".into()),
+                        frame: None,
+                    });
+                };
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .name(name)?;
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(expect_ref).cloned();
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .string_value(value.as_deref())?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Z)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = matches!(args.first(), Some(Value::Int(flag)) if *flag != 0);
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .bool_value(value)?;
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Ljava/lang/Boolean;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(boxed_boolean);
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    match value {
+                        Some(value) => state.bool_value(value)?,
+                        None => state.null_value()?,
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("value", "(F)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(D)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(J)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(Ljava/lang/Number;)Lcom/google/gson/stream/JsonWriter;") => {
+                let Some(value) = args.first() else {
+                    return self.gson_writer_fallback(r, Some(receiver), args);
+                };
+                let value = if r.descriptor.starts_with("(F") {
+                    match boxed_float(value) {
+                        Some(number) => Value::Boxed(Boxed::Float((number as f32).to_bits())),
+                        None => return self.gson_writer_fallback(r, Some(receiver), args),
+                    }
+                } else {
+                    value.clone()
+                };
+                let Some(fragment) = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .number_value(&value)?
+                else {
+                    return self.gson_writer_fallback(r, Some(receiver), args);
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("nullValue", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .null_value()?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("jsonValue", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(expect_ref);
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .json_value(value.map(String::as_str))?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("setIndent", "(Ljava/lang/String;)V") => {
+                let Some(indent) = args.first().and_then(expect_ref) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"String.isEmpty()\" because \"indent\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                };
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_indent(indent)?;
+                Ok(Some(Value::Void))
+            }
+            ("setFormattingStyle", "(Lcom/google/gson/FormattingStyle;)V") => {
+                let Some(style) = args.first() else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("formattingStyle == null".into()),
+                        frame: None,
+                    });
+                };
+                if *style == Value::Ref(None) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_formatting_style(style)?;
+                Ok(Some(Value::Void))
+            }
+            ("setLenient", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_lenient(matches!(args.first(), Some(Value::Int(flag)) if *flag != 0));
+                Ok(Some(Value::Void))
+            }
+            ("setStrictness", "(Lcom/google/gson/Strictness;)V") => {
+                let Some(value) = args.first() else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("strictness == null".into()),
+                        frame: None,
+                    });
+                };
+                if *value == Value::Ref(None) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_strictness(value)?;
+                Ok(Some(Value::Void))
+            }
+            ("getStrictness", "()Lcom/google/gson/Strictness;") => {
+                Ok(Some(self.gson_writers[&marker].strictness_value()))
+            }
+            ("isLenient", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].is_lenient(),
+            )))),
+            ("setSerializeNulls", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_serialize_nulls(
+                        matches!(args.first(), Some(Value::Int(flag)) if *flag != 0),
+                    );
+                Ok(Some(Value::Void))
+            }
+            ("getSerializeNulls", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].serialize_nulls(),
+            )))),
+            ("setHtmlSafe", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_html_safe(matches!(args.first(), Some(Value::Int(flag)) if *flag != 0));
+                Ok(Some(Value::Void))
+            }
+            ("isHtmlSafe", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].is_html_safe(),
+            )))),
+            ("getFormattingStyle", "()Lcom/google/gson/FormattingStyle;") => {
+                Ok(Some(self.gson_writers[&marker].formatting_value()))
+            }
+            ("flush", "()V") => {
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_writers[&marker].flush()?;
+                self.io_commit(&target);
+                Ok(Some(Value::Void))
+            }
+            ("close", "()V") => {
+                let target = self.gson_writers[&marker].target.clone();
+                let result = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .close_document();
+                self.io_commit(&target);
+                result.map(|()| Some(Value::Void))
+            }
+            _ => self.gson_writer_fallback(r, Some(receiver), args),
+        }
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -25838,9 +26285,8 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
-        // JsonWriter state/options are not modeled; count every call.
         if r.owner == "com/google/gson/stream/JsonWriter" {
-            return self.host.unknown_operand_call(r).map(Some);
+            return self.invoke_gson_writer(r, receiver, args);
         }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
@@ -25893,9 +26339,23 @@ impl<H: Host> Runtime<'_, H> {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
                     ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
-                        self.host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some)
+                        let Some(target) = args
+                            .first()
+                            .and_then(|value| self.gson_writer_target_marker(value))
+                        else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let writer = self.new_object("com/google/gson/stream/JsonWriter");
+                        if let Some(marker) = expect_ref(&writer) {
+                            let mut state = gson_writer::State::new(target.to_owned());
+                            let gson_style = self.gson_style_of(receiver).tree_style();
+                            state.apply_tree_style(&gson_style);
+                            self.gson_writers.insert(marker.to_owned(), state);
+                        }
+                        Ok(Some(writer))
                     }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
@@ -25926,9 +26386,52 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("JsonWriter") =>
                     {
-                        self.host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some)
+                        let Some(writer) = args.last().and_then(Self::gson_json_writer_marker)
+                        else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let Some(state) = self.gson_writers.get(&writer).cloned() else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let Some(value) = args.first() else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let mut style = state.tree_style();
+                        let gson_style = self.gson_style_of(receiver);
+                        let gson_tree_style = gson_style.tree_style();
+                        style.html_safe = gson_tree_style.html_safe;
+                        style.serialize_nulls = gson_tree_style.serialize_nulls;
+                        let tree = self.gson_tree_json(value, &style, state.base_depth())?;
+                        let Some(tree) = tree else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let target = state.target;
+                        let fragment = {
+                            let writer = self.gson_writers.get_mut(&writer).expect("writer exists");
+                            match tree {
+                                Some(text) => writer.raw_tree(text)?,
+                                None => {
+                                    writer.skip_null_member();
+                                    String::new()
+                                }
+                            }
+                        };
+                        if !fragment.is_empty() {
+                            self.gson_write_target(&target, &fragment)?;
+                        }
+                        Ok(Some(Value::Void))
                     }
                     (name, descriptor)
                         if name == "toJson"
@@ -25952,27 +26455,20 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                        let target = args
+                        let Some(target) = args
                             .last()
-                            .and_then(|arg| {
-                                expect_ref(arg).or_else(|| host_service::stream_marker(arg))
-                            })
-                            .ok_or_else(|| {
-                                NativeError::Metadata(
-                                    "Gson.toJson needs an Appendable receiver".into(),
-                                )
-                            })?;
-                        if self.io_sink_key(target).is_some() {
-                            self.io_write(target, &text)?;
-                            return Ok(Some(Value::Void));
-                        }
-                        if !self.string_builders.contains_key(target) {
+                            .and_then(|arg| self.gson_appendable_target_marker(arg))
+                        else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
+                        };
+                        if self.io_sink_key(&target).is_some() {
+                            self.io_write(&target, &text)?;
+                        } else {
+                            self.gson_write_target(&target, &text)?;
                         }
-                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
@@ -27905,30 +28401,39 @@ impl<H: Host> Runtime<'_, H> {
                         self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
                     let value = match outcome {
                         AnchorOutcome::Normal => {
-                            match self.static_fields.get(&Self::static_field_key(&field)) {
-                                Some(value) => value.clone(),
-                                // A field a jar class declares and nothing
-                                // assigned yet holds the JVM default; only a
-                                // static of a class the jar does not declare
-                                // is the host's to answer (a strict host would
-                                // refuse the read otherwise).
-                                // A `ConstantValue` static is its constant
-                                // (never stored, `class_init.rs`).
-                                None if self.class(&field.owner).is_some_and(|file| {
-                                    file.fields.iter().any(|declared| {
-                                        declared.name == field.name
-                                            && declared.descriptor == field.descriptor
-                                    })
-                                }) =>
-                                {
-                                    self.static_constant(
-                                        &field.owner,
-                                        &field.name,
-                                        &field.descriptor,
-                                    )?
-                                    .unwrap_or_else(|| Value::default_for(&field.descriptor))
+                            if let Some(value) = gson_model::static_field(&field)
+                                .or_else(|| gson_tree::static_field(&field))
+                                .or_else(|| gson_writer::static_field(&field))
+                            {
+                                value
+                            } else {
+                                match self.static_fields.get(&Self::static_field_key(&field)) {
+                                    Some(value) => value.clone(),
+                                    // A field a jar class declares and nothing
+                                    // assigned yet holds the JVM default; only a
+                                    // static of a class the jar does not declare
+                                    // is the host's to answer (a strict host would
+                                    // refuse the read otherwise).
+                                    // A `ConstantValue` static is its constant
+                                    // (never stored, `class_init.rs`).
+                                    None if self.class(&field.owner).is_some_and(|file| {
+                                        file.fields.iter().any(|declared| {
+                                            declared.name == field.name
+                                                && declared.descriptor == field.descriptor
+                                        })
+                                    }) && gson_model::static_field(&field).is_none()
+                                        && gson_tree::static_field(&field).is_none()
+                                        && gson_writer::static_field(&field).is_none() =>
+                                    {
+                                        self.static_constant(
+                                            &field.owner,
+                                            &field.name,
+                                            &field.descriptor,
+                                        )?
+                                        .unwrap_or_else(|| Value::default_for(&field.descriptor))
+                                    }
+                                    None => self.host.get_static(&field)?,
                                 }
-                                None => self.host.get_static(&field)?,
                             }
                         }
                         AnchorOutcome::Suppress => Value::default_for(&field.descriptor),
@@ -33432,7 +33937,9 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -33500,7 +34007,9 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -40641,7 +41150,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -40804,7 +41315,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -40990,7 +41503,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41352,7 +41867,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41658,7 +42175,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -46914,7 +47433,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -46970,7 +47491,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),

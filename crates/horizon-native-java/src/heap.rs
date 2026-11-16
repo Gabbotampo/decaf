@@ -1554,6 +1554,7 @@ mod tests {
             "run_loader",
             "own_loader_classes",
             "fabric_metadata",
+            "fabric_origins",
             "environment_type",
             "game_version",
             "development_environment",
