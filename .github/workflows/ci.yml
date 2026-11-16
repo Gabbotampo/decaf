@@ -42,7 +42,7 @@ jobs:
         # The fixture tests look for the debug binaries the step above built.
         run: python3 -m unittest discover -s tests
 
-  # `mod/` is excluded from the workspace (the launcher builds it against Horizon's own lock), so
+  # `mod/` is excluded from the workspace (the launcher builds it against Sunrise's own lock), so
   # the workspace gates above never compile it. This job does, so a mod PR's green check means the
   # mod's code builds, lints clean and passes its unit tests.
   mod:

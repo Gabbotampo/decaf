@@ -36,17 +36,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # The folder the game reads content packages from, beside `options.txt`
-# (horizon-mod-package `mod_list::DIR`), and the file that turns one on (`FILE`).
+# (sunrise-mod-package `mod_list::DIR`), and the file that turns one on (`FILE`).
 MODS_DIR = "horizon-mods"
 MODS_FILE = "horizon-mods.txt"
 REPORT = Path("config") / "horizon_java" / "bake-report.json"
 
 # The content fence's path rule: `assets/` or `data/`, then `/`-separated parts of
-# `[a-z0-9_.-]`, none of them `.` or `..` (horizon-mod-package `content::check_path`).
+# `[a-z0-9_.-]`, none of them `.` or `..` (sunrise-mod-package `content::check_path`).
 PLAIN_PART = re.compile(r"^[a-z0-9_.-]+$")
 NAMESPACE = re.compile(r"^[a-z0-9_.-]{1,64}$")
 # A `.hmod` manifest id is narrower than a namespace: `[a-z0-9_]{1,64}` and not a Windows
-# device name (horizon-mod-package `manifest::valid_mod_id`).
+# device name (sunrise-mod-package `manifest::valid_mod_id`).
 PACKAGE_ID = re.compile(r"^[a-z0-9_]{1,64}$")
 RESERVED_IDS = {"con", "prn", "aux", "nul"} | {
     f"{prefix}{digit}" for prefix in ("com", "lpt") for digit in "123456789"
@@ -372,12 +372,12 @@ def probe_declarations(probe: Path, jar: Path) -> list[tuple[str, str, dict]]:
 
 
 def write_package(path: Path, namespace: str, jar: str, files: list[tuple[str, bytes]]) -> int:
-    """Writes a deterministic `.hmod` (a zip: `horizon-mod.toml` then the sorted files)."""
+    """Writes a deterministic `.hmod` (a zip: `sunrise-mod.toml` then the sorted files)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
         manifest = _manifest(namespace, jar)
-        info = zipfile.ZipInfo("horizon-mod.toml", ZIP_TIME)
+        info = zipfile.ZipInfo("sunrise-mod.toml", ZIP_TIME)
         info.external_attr = ZIP_MODE
         info.compress_type = zipfile.ZIP_DEFLATED
         archive.writestr(info, manifest.encode("utf-8"))

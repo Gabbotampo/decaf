@@ -279,17 +279,13 @@ fn get_entries_is_the_registers_unmodifiable_live_set() {
 }
 
 /// The view's iterator is `UnmodifiableCollection`'s, whose `remove` throws
-/// `UnsupportedOperationException`. A host iterator does not know the view
-/// it walks is unmodifiable, so `remove` on it is counted, not answered.
+/// `UnsupportedOperationException`, including after `next`.
 #[test]
-fn removing_through_the_views_iterator_is_counted() {
+fn removing_through_the_views_iterator_throws() {
     let fixture = fixture("registry-answers-iterator-remove");
-    let (_, unknown) = run(&fixture, "entriesIteratorRemove");
-    assert_eq!(
-        unknown,
-        vec![("java/util/Iterator#remove()V".to_owned(), 1)],
-        "{unknown:?}"
-    );
+    let (text, unknown) = run(&fixture, "entriesIteratorRemove");
+    assert_eq!(text, "UOE");
+    assert!(unknown.is_empty(), "{unknown:?}");
 }
 
 /// Walking a vanilla registry yields the game's entries, which the host does
