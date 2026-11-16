@@ -197,37 +197,108 @@ fn floating(value: &Value) -> Option<f64> {
 
 /// `Comparable.compareTo` for the values whose natural order the JDK defines
 /// and the runtime can read.
+pub(crate) fn null_compare_message(value: &Value) -> Option<&'static str> {
+    let class = match value {
+        Value::Ref(Some(_)) => "java/lang/String",
+        Value::Int(_) => "java/lang/Integer",
+        Value::Long(_) => "java/lang/Long",
+        Value::Float(_) => "java/lang/Double",
+        Value::Boxed(boxed) => boxed.class(),
+        _ => return None,
+    };
+    Some(match class {
+        "java/lang/Byte" => "Cannot read field \"value\" because \"anotherByte\" is null",
+        "java/lang/Short" => "Cannot read field \"value\" because \"anotherShort\" is null",
+        "java/lang/Integer" => "Cannot read field \"value\" because \"anotherInteger\" is null",
+        "java/lang/Long" => "Cannot read field \"value\" because \"anotherLong\" is null",
+        "java/lang/Float" => "Cannot read field \"value\" because \"anotherFloat\" is null",
+        "java/lang/Double" => "Cannot read field \"value\" because \"anotherDouble\" is null",
+        "java/lang/Character" => "Cannot read field \"value\" because \"anotherCharacter\" is null",
+        "java/lang/Boolean" => "Cannot read field \"value\" because \"b\" is null",
+        "java/lang/String" => "Cannot read field \"value\" because \"anotherString\" is null",
+        _ => return None,
+    })
+}
+
 pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> {
-    if matches!(a, Value::Ref(None)) || matches!(b, Value::Ref(None)) {
+    if matches!(a, Value::Ref(None)) {
         return Err(NativeError::UncaughtException {
             class: "java/lang/NullPointerException".into(),
             message: None,
             frame: None,
         });
     }
-    if let (Some(a), Some(b)) = (integral(a), integral(b)) {
-        return Ok(a.cmp(&b) as i32);
+    if matches!(b, Value::Ref(None))
+        && let Some(message) = null_compare_message(a)
+    {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(message.into()),
+            frame: None,
+        });
+    }
+    // Each boxed bridge casts its argument to the same final class. Keep the
+    // logical Integer representation (`Value::Int`) paired with Boxed::Integer,
+    // but reject cross-class comparisons with Java's ClassCastException.
+    let class = |value: &Value| match value {
+        // A String that spells a runtime marker remains a String. Runtime
+        // enum values are recognized by jar_compare from their owned handle
+        // or recorded marker, never by this text classifier.
+        Value::Ref(Some(_)) => Some("java/lang/String".into()),
+        _ => crate::class_of_value(value),
+    };
+    let own_class = class(a);
+    let other_class = class(b);
+    if let (Some(own), Some(other)) = (own_class.as_deref(), other_class.as_deref())
+        && own != other
+    {
+        return Err(crate::checkcast::class_cast_exception(other, own));
+    }
+    if matches!(
+        own_class.as_deref(),
+        Some("java/lang/Integer" | "java/lang/Long" | "java/lang/Byte" | "java/lang/Short")
+    ) {
+        let left = integral(a).unwrap();
+        let right = integral(b).unwrap();
+        return if matches!(
+            own_class.as_deref(),
+            Some("java/lang/Byte" | "java/lang/Short")
+        ) {
+            Ok((left - right) as i32)
+        } else {
+            Ok(left.cmp(&right) as i32)
+        };
     }
     // `Character.compareTo` is the code-unit difference, not a sign.
-    let character = |value: &Value| match value {
-        Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
-        _ => None,
-    };
-    if let (Some(a), Some(b)) = (character(a), character(b)) {
-        return Ok(a - b);
+    if own_class.as_deref() == Some("java/lang/Character") {
+        let unit = |value: &Value| match value {
+            Value::Boxed(Boxed::Character(unit)) => Some(i32::from(*unit)),
+            _ => None,
+        };
+        return Ok(unit(a).unwrap() - unit(b).unwrap());
     }
-    if let (Some(a), Some(b)) = (floating(a), floating(b)) {
+    if matches!(
+        own_class.as_deref(),
+        Some("java/lang/Double" | "java/lang/Float")
+    ) {
+        let left = floating(a).unwrap();
+        let right = floating(b).unwrap();
         // `Double.compare`: -0.0 < 0.0 and NaN above everything.
-        return Ok(a.total_cmp(&b) as i32);
+        return Ok(left.total_cmp(&right) as i32);
     }
-    let boolean = |value: &Value| match value {
-        Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
-        _ => None,
-    };
-    if let (Some(a), Some(b)) = (boolean(a), boolean(b)) {
-        return Ok(a.cmp(&b) as i32);
+    if own_class.as_deref() == Some("java/lang/Boolean") {
+        let boolean = |value: &Value| match value {
+            Value::Boxed(Boxed::Boolean(flag)) => Some(*flag),
+            _ => None,
+        };
+        return Ok(boolean(a).unwrap().cmp(&boolean(b).unwrap()) as i32);
     }
-    if let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (a, b) {
+    if own_class.as_deref() == Some("java/lang/String") {
+        let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (a, b) else {
+            return Err(NativeError::Metadata(
+                "String.compareTo lost its String operands".into(),
+            ));
+        };
         // `String.compareTo`: the first differing UTF-16 unit, else the
         // length difference.
         let (mut left, mut right) = (a.encode_utf16(), b.encode_utf16());

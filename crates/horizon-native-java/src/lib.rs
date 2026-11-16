@@ -7852,6 +7852,22 @@ impl Host for StdHost {
         {
             return Ok(Value::Int(1));
         }
+        // Host dispatch is also used for JDK calls reached from a jar lambda.
+        // Keep raw String/boxed receivers on the same Java natural-order path
+        // as the interpreter's direct dispatch.
+        if r.name == "compareTo"
+            && object_methods::is_compare_to(&r.descriptor)
+            && !matches!(receiver, Value::Host(handle) if jar_object::is_object_handle(handle))
+        {
+            let other = args.first().unwrap_or(&Value::Ref(None));
+            if matches!(other, Value::Ref(None))
+                && jdk_stream::null_compare_message(receiver).is_none()
+            {
+                return self.unknown_operand_call(r);
+            }
+            return jdk_stream::natural_compare(receiver, other).map(Value::Int);
+        }
+
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -23077,6 +23093,18 @@ impl<H: Host> Runtime<'_, H> {
                     )
                     .map(Some);
             }
+            if callback.target.name == "compareTo"
+                && object_methods::is_compare_to(&callback.target.descriptor)
+                && !matches!(
+                    &receiver,
+                    Value::Host(handle)
+                        if jar_object::is_object_handle(handle)
+                            && !self.is_enum_object(&receiver)
+                )
+            {
+                let other = rest.first().unwrap_or(&Value::Ref(None));
+                return Ok(Some(Value::Int(self.natural_order(&receiver, other)?)));
+            }
             if let Some(value) =
                 self.invoke_jdk_skeleton(&callback.target, 0xb9, Some(&receiver), &rest)?
             {
@@ -27125,16 +27153,23 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if r.name == "<init>" && r.descriptor == "(Ljava/lang/String;I)V" {
-            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
-                NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
-            })?;
+            let marker = crate::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
+                .or_else(|| {
+                    expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
+                })
+                .ok_or_else(|| {
+                    NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
+                })?;
             let name = expect_string(StdHost::argument(r, args, 0)?);
             let ordinal = expect_int(r, StdHost::argument(r, args, 1)?)?;
             self.enum_constants
                 .insert(marker.to_owned(), (name.to_owned(), ordinal));
             return Ok(Some(Value::Void));
         }
-        let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None)));
+        let marker =
+            crate::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None))).or_else(|| {
+                expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
+            });
         let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
@@ -29271,6 +29306,23 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
                     {
                         value
+                    } else if r.name == "compareTo"
+                        && object_methods::is_compare_to(&r.descriptor)
+                        && !matches!(
+                            receiver.as_ref(),
+                            Some(Value::Host(handle))
+                                if jar_object::is_object_handle(handle)
+                                    && !self.is_enum_object(receiver.as_ref().unwrap_or(&Value::Ref(None)))
+                        )
+                    {
+                        let other = args.first().unwrap_or(&Value::Ref(None));
+                        Value::Int(invoke_or_catch!(
+                            at,
+                            self.natural_order(
+                                receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                                other
+                            )
+                        ))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
