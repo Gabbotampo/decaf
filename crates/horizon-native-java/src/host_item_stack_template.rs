@@ -1,6 +1,6 @@
 use crate::{
     MethodRef, NativeError, Value,
-    host_ref::{HostRef, Methods, Nested},
+    host_ref::{HostKind, HostRef, Methods, Nested},
     jar_object,
 };
 fn ts(_: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
@@ -29,7 +29,10 @@ pub(crate) const METHODS: Methods = Methods {
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
     if r.owner == "net/minecraft/world/item/ItemStackTemplate" && r.name == "fromNonEmptyStack" {
         let key = jar_object::instance_key(args.first()?)?.to_owned();
-        return Some(Ok(jar_object::handle(format!("item-template/{key}"))));
+        return Some(Ok(Value::Host(HostRef::new(
+            HostKind::ItemStackTemplate,
+            key,
+        ))));
     }
     None
 }
