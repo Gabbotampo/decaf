@@ -443,6 +443,9 @@ pub enum HostKind {
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
+    /// A runtime-owned annotation proxy; its key carries the held annotation
+    /// interface descriptor but is never a String marker.
+    AnnotationProxy,
     /// A chat component (`MutableComponent`): key a serial per allocation, then its vanilla
     /// JSON, keys sorted
     /// (`host_component.rs`).
@@ -2034,6 +2037,13 @@ const KINDS: &[KindInfo] = &[
         // One `Class` per name in a run (`class_precedence`, #124).
         canonical: always_canonical,
         methods: &crate::host_class::CLASS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::AnnotationProxy,
+        tag: "anpr",
+        class: ClassRule::FromKey(crate::annotation_proxy::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::annotation_proxy::METHODS,
     },
     KindInfo {
         kind: HostKind::Component,
