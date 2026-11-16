@@ -5527,10 +5527,6 @@ impl Host for StdHost {
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {
-        eprintln!(
-            "SETMAP? {value:?} keys={:?}",
-            self.set_from_map_views.keys().collect::<Vec<_>>()
-        );
         let Value::Host(handle) = value else {
             return false;
         };
@@ -22760,10 +22756,6 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
-        eprintln!(
-            "CALLBACK target={:?} captures={:?} args={:?}",
-            callback.target, callback.captures, args
-        );
         // The callback target may live in a linked library jar, so resolve it
         // the same way a frame resolves its own class: the host's modelled
         // surface wins over a lookalike class in the pack.
