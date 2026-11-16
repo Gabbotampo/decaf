@@ -8,7 +8,6 @@ public class Probe {
  static class Sub extends Base { }
  public static String rows() {
   StringBuilder out=new StringBuilder();
-  SharedConstants.tryDetectVersion(); Bootstrap.bootStrap();
   for (MobCategory c : MobCategory.values()) out.append("cat="+c.name()+","+c.getName()+","+c.getDebugAbbreviation()+","+c.getMaxInstancesPerChunk()+","+c.isFriendly()+","+c.isPersistent()+","+c.getDespawnDistance()+","+c.getNoDespawnDistance()+","+c.toString()).append("\n");
   out.append("serial="+(EntityDataSerializers.BYTE==EntityDataSerializers.BYTE)+","+EntityDataSerializers.BYTE.equals(EntityDataSerializers.INT)).append("\n");
   out.append("base="+SynchedEntityData.defineId(Base.class,S).id()).append("\n");
