@@ -173,7 +173,8 @@ struct ActiveFrame {
     nested_entries: std::cell::Cell<u32>,
     refused_reentries: std::cell::Cell<u32>,
 }
-thread_local! { static ACTIVE_FRAMES: RefCell<Vec<Box<ActiveFrame>>> = const { RefCell::new(Vec::new()) }; }
+struct ActiveFrameSlot(Box<ActiveFrame>);
+thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrameSlot>> = const { RefCell::new(Vec::new()) }; }
 #[cfg(test)]
 thread_local! { static FORCE_CALLBACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
@@ -230,11 +231,12 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
     let owner_ptr = owner as *const HorizonJava;
     let active = ACTIVE_FRAMES.with(|frames| {
         let frames = frames.borrow();
-        let frame = frames.last().filter(|frame| frame.owner == owner_ptr)?;
+        let frame = frames.last().filter(|frame| frame.0.owner == owner_ptr)?;
         frame
+            .0
             .nested_entries
-            .set(frame.nested_entries.get().saturating_add(1));
-        Some(frame.state.get())
+            .set(frame.0.nested_entries.get().saturating_add(1));
+        Some(frame.0.state.get())
     });
     if let Some(state) = active {
         return StateGuard::Active {
@@ -253,7 +255,8 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
     StateGuard::Locked { _gate: gate, state }
 }
 
-fn finish_frame(frame: Box<ActiveFrame>) -> State {
+fn finish_frame(slot: ActiveFrameSlot) -> State {
+    let ActiveFrameSlot(frame) = slot;
     let ActiveFrame {
         state,
         nested_entries,
@@ -294,12 +297,13 @@ impl HorizonJava {
         let owner = self as *const HorizonJava;
         let refused = ACTIVE_FRAMES.with(|frames| {
             let frames = frames.borrow();
-            let Some(frame) = frames.last().filter(|frame| frame.owner == owner) else {
+            let Some(frame) = frames.last().filter(|frame| frame.0.owner == owner) else {
                 return false;
             };
             frame
+                .0
                 .refused_reentries
-                .set(frame.refused_reentries.get().saturating_add(1));
+                .set(frame.0.refused_reentries.get().saturating_add(1));
             true
         });
         if refused {
@@ -319,12 +323,14 @@ impl HorizonJava {
             std::mem::take(&mut *locked)
         };
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(Box::new(ActiveFrame {
-                owner,
-                state: std::cell::UnsafeCell::new(state),
-                nested_entries: std::cell::Cell::new(0),
-                refused_reentries: std::cell::Cell::new(0),
-            }))
+            frames
+                .borrow_mut()
+                .push(ActiveFrameSlot(Box::new(ActiveFrame {
+                    owner,
+                    state: std::cell::UnsafeCell::new(state),
+                    nested_entries: std::cell::Cell::new(0),
+                    refused_reentries: std::cell::Cell::new(0),
+                })))
         });
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let state = ACTIVE_FRAMES
@@ -958,12 +964,14 @@ mod tests {
         };
         let owner = &java as *const HorizonJava;
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(Box::new(ActiveFrame {
-                owner,
-                state: std::cell::UnsafeCell::new(state),
-                nested_entries: std::cell::Cell::new(0),
-                refused_reentries: std::cell::Cell::new(0),
-            }))
+            frames
+                .borrow_mut()
+                .push(ActiveFrameSlot(Box::new(ActiveFrame {
+                    owner,
+                    state: std::cell::UnsafeCell::new(state),
+                    nested_entries: std::cell::Cell::new(0),
+                    refused_reentries: std::cell::Cell::new(0),
+                })))
         });
         java.ensure_jars("26.3");
         java.refresh_game_hook_plan_bits();
@@ -1011,12 +1019,14 @@ mod tests {
         };
         let owner = &java as *const HorizonJava;
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(Box::new(ActiveFrame {
-                owner,
-                state: std::cell::UnsafeCell::new(state),
-                nested_entries: std::cell::Cell::new(0),
-                refused_reentries: std::cell::Cell::new(0),
-            }))
+            frames
+                .borrow_mut()
+                .push(ActiveFrameSlot(Box::new(ActiveFrame {
+                    owner,
+                    state: std::cell::UnsafeCell::new(state),
+                    nested_entries: std::cell::Cell::new(0),
+                    refused_reentries: std::cell::Cell::new(0),
+                })))
         });
         let refused = stop_dispatch(&java, Phase::Tail).unwrap_err();
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().unwrap());
