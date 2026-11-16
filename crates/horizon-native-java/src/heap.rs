@@ -1539,6 +1539,7 @@ mod tests {
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
+            "next_ranged_attribute",
             "properties",
             "environment",
             "resources",
