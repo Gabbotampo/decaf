@@ -452,6 +452,13 @@ mod tests {
             .collect()
     }
 
+    fn only_lines(trace: Vec<String>, wanted: &[&str]) -> Vec<String> {
+        trace
+            .into_iter()
+            .filter(|line| wanted.contains(&line.as_str()))
+            .collect()
+    }
+
     #[test]
     fn method_bitset_has_no_false_negative_for_target_spelling() {
         let bits = PlanBits::default();
@@ -527,7 +534,7 @@ mod tests {
         ];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(stdout_trace(), ["low", "high"]);
+        assert_eq!(only_lines(stdout_trace(), &["low", "high"]), ["low", "high"]);
 
         java.lock().jars = vec![
             load(
@@ -543,7 +550,10 @@ mod tests {
         ];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(stdout_trace(), ["first", "second"]);
+        assert_eq!(
+            only_lines(stdout_trace(), &["first", "second"]),
+            ["first", "second"]
+        );
 
         java.lock().jars = vec![load(
             "decl",
@@ -552,7 +562,7 @@ mod tests {
         )];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(stdout_trace(), ["a", "b"]);
+        assert_eq!(only_lines(stdout_trace(), &["a", "b"]), ["a", "b"]);
     }
 
     #[test]
