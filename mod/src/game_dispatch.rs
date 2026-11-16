@@ -170,20 +170,28 @@ pub(crate) fn matches_method(
 struct ActiveFrame {
     owner: *const HorizonJava,
     state: std::cell::UnsafeCell<State>,
+    nested_entries: std::cell::Cell<u32>,
+    refused_reentries: std::cell::Cell<u32>,
 }
-thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCell::new(Vec::new()) }; }
+thread_local! { static ACTIVE_FRAMES: RefCell<Vec<Box<ActiveFrame>>> = const { RefCell::new(Vec::new()) }; }
 #[cfg(test)]
 thread_local! { static FORCE_CALLBACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 static BLOCK_CALLBACK: std::sync::Mutex<
     Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 > = std::sync::Mutex::new(None);
+#[cfg(test)]
+static NESTED_DISPATCH_TARGET: std::sync::Mutex<Option<Arc<HorizonJava>>> =
+    std::sync::Mutex::new(None);
 
 pub(crate) enum StateGuard<'a> {
     Locked {
         _gate: MutexGuard<'a, ()>,
         state: MutexGuard<'a, State>,
     },
+    /// A raw view into the active frame's state. A nested Hooks call can alias the outer
+    /// dispatcher's live `&mut State` and re-enter a jar interpreter; PR2 replaces this with
+    /// Sunrise's explicit re-entry contract. `lock_state` counts every such view for the census.
     Active {
         state: *mut State,
         _marker: std::marker::PhantomData<&'a mut State>,
@@ -220,13 +228,15 @@ impl DerefMut for StateGuard<'_> {
 
 pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
     let owner_ptr = owner as *const HorizonJava;
-    if let Some(state) = ACTIVE_FRAMES.with(|frames| {
-        frames
-            .borrow()
-            .last()
-            .filter(|frame| frame.owner == owner_ptr)
-            .map(|frame| frame.state.get())
-    }) {
+    let active = ACTIVE_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        let frame = frames.last().filter(|frame| frame.owner == owner_ptr)?;
+        frame
+            .nested_entries
+            .set(frame.nested_entries.get().saturating_add(1));
+        Some(frame.state.get())
+    });
+    if let Some(state) = active {
         return StateGuard::Active {
             state,
             _marker: std::marker::PhantomData,
@@ -243,6 +253,35 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
     StateGuard::Locked { _gate: gate, state }
 }
 
+fn finish_frame(frame: Box<ActiveFrame>) -> State {
+    let ActiveFrame {
+        state,
+        nested_entries,
+        refused_reentries,
+        ..
+    } = *frame;
+    let nested_entries = nested_entries.get();
+    let refused_reentries = refused_reentries.get();
+    let mut state = state.into_inner();
+    if nested_entries > 0 || refused_reentries > 0 {
+        for loaded in &mut state.jars {
+            if nested_entries > 0 {
+                loaded
+                    .host
+                    .note_unknown_game_hook("nested-hooks-entry-during-dispatch");
+                loaded.row.game_hooks.failed += nested_entries as usize;
+            }
+            if refused_reentries > 0 {
+                loaded
+                    .host
+                    .note_unknown_game_hook("game-hook-reentry-during-dispatch");
+                loaded.row.game_hooks.failed += refused_reentries as usize;
+            }
+        }
+    }
+    state
+}
+
 impl HorizonJava {
     /// Dispatch one point. The relaxed/immutable snapshot check precedes every lock or allocation.
     pub fn dispatch_game_hook<'a>(
@@ -253,21 +292,17 @@ impl HorizonJava {
             return Ok(DispatchAnswer::default());
         }
         let owner = self as *const HorizonJava;
-        if let Some(state) = ACTIVE_FRAMES.with(|frames| {
-            frames
-                .borrow()
-                .last()
-                .filter(|frame| frame.owner == owner)
-                .map(|frame| frame.state.get())
-        }) {
-            // SAFETY: this is the active same-thread frame; refusal is counted on every live jar
-            // before returning so census/report counters observe the unsupported re-entry.
-            unsafe {
-                for loaded in &mut (*state).jars {
-                    loaded.host.note_unknown_game_hook(dispatch.method.0);
-                    loaded.row.game_hooks.failed += 1;
-                }
-            }
+        let refused = ACTIVE_FRAMES.with(|frames| {
+            let frames = frames.borrow();
+            let Some(frame) = frames.last().filter(|frame| frame.owner == owner) else {
+                return false;
+            };
+            frame
+                .refused_reentries
+                .set(frame.refused_reentries.get().saturating_add(1));
+            true
+        });
+        if refused {
             return Err(DispatchError::from_error(
                 "Java game-hook re-entry is unsupported in PR 1 (Sunrise dispatch token not available inside Java callbacks)",
             ));
@@ -284,10 +319,12 @@ impl HorizonJava {
             std::mem::take(&mut *locked)
         };
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(ActiveFrame {
+            frames.borrow_mut().push(Box::new(ActiveFrame {
                 owner,
                 state: std::cell::UnsafeCell::new(state),
-            })
+                nested_entries: std::cell::Cell::new(0),
+                refused_reentries: std::cell::Cell::new(0),
+            }))
         });
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let state = ACTIVE_FRAMES
@@ -296,10 +333,11 @@ impl HorizonJava {
             unsafe { dispatch_state(&mut *state, dispatch) }
         }));
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().expect("active frame"));
+        let state = finish_frame(frame);
         *self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = frame.state.into_inner();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
         match outcome {
             Ok(result) => result,
             Err(panic) => resume_unwind(panic),
@@ -409,6 +447,10 @@ fn dispatch_state(
                     entered.wait();
                     release.wait();
                 }
+                #[cfg(test)]
+                if let Some(target) = NESTED_DISPATCH_TARGET.lock().unwrap().take() {
+                    tests::dispatch_nested_for_test(&target);
+                }
                 callback.inspect(|_| {
                     #[cfg(test)]
                     if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
@@ -504,6 +546,10 @@ mod tests {
             None,
             &mut host,
         ))
+    }
+
+    pub(super) fn dispatch_nested_for_test(java: &HorizonJava) {
+        stop_dispatch(java, Phase::Tail).unwrap();
     }
 
     fn destroy_speed_dispatch(
@@ -910,20 +956,46 @@ mod tests {
         };
         let owner = &java as *const HorizonJava;
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(ActiveFrame {
+            frames.borrow_mut().push(Box::new(ActiveFrame {
                 owner,
                 state: std::cell::UnsafeCell::new(state),
-            })
+                nested_entries: std::cell::Cell::new(0),
+                refused_reentries: std::cell::Cell::new(0),
+            }))
         });
         java.ensure_jars("26.3");
         java.refresh_game_hook_plan_bits();
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().unwrap());
-        let mut state = frame.state.into_inner();
+        let mut state = finish_frame(frame);
         assert_eq!(state.jars.len(), 1);
+        assert_eq!(state.jars[0].host.unknown_host_call_count(), 2);
+        assert_eq!(state.jars[0].row.game_hooks.failed, 2);
         state.jars[0].row.game_hooks.unlisted += 1;
         *java.lock() = state;
         assert!(java.plan_bits.maybe_contains("java_server_stopped"));
         assert_eq!(stop_dispatch(&java, Phase::Tail).unwrap().callbacks, 1);
+    }
+
+    #[test]
+    fn different_instance_nested_dispatch_keeps_frame_pointer_stable() {
+        let first = Arc::new(HorizonJava::default());
+        first.lock().jars.push(load(
+            "outer_instance",
+            "OuterInstance",
+            "@Mixin(MinecraftServer.class) public class OuterInstance { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"outer\"); } }",
+        ));
+        first.refresh_game_hook_plan_bits();
+        let second = Arc::new(HorizonJava::default());
+        second.lock().jars.push(load(
+            "inner_instance",
+            "InnerInstance",
+            "@Mixin(MinecraftServer.class) public class InnerInstance { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"inner\"); } }",
+        ));
+        second.refresh_game_hook_plan_bits();
+        *NESTED_DISPATCH_TARGET.lock().unwrap() = Some(Arc::clone(&second));
+        assert_eq!(stop_dispatch(&first, Phase::Tail).unwrap().callbacks, 1);
+        assert_eq!(stdout(&mut first.lock(), 0), ["outer"]);
+        assert_eq!(stdout(&mut second.lock(), 0), ["inner"]);
     }
 
     #[test]
@@ -937,14 +1009,16 @@ mod tests {
         };
         let owner = &java as *const HorizonJava;
         ACTIVE_FRAMES.with(|frames| {
-            frames.borrow_mut().push(ActiveFrame {
+            frames.borrow_mut().push(Box::new(ActiveFrame {
                 owner,
                 state: std::cell::UnsafeCell::new(state),
-            })
+                nested_entries: std::cell::Cell::new(0),
+                refused_reentries: std::cell::Cell::new(0),
+            }))
         });
         let refused = stop_dispatch(&java, Phase::Tail).unwrap_err();
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().unwrap());
-        let state = frame.state.into_inner();
+        let state = finish_frame(frame);
         assert!(refused.is_reentry_refusal());
         assert_eq!(state.jars[0].host.unknown_host_call_count(), 1);
         assert_eq!(state.jars[0].row.game_hooks.failed, 1);
