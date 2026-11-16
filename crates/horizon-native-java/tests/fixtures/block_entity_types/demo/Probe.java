@@ -1,4 +1,4 @@
-package demo; public final class Probe { static void p(StringBuilder o,String n,Object v){o.append(n).append("=").append(v).append("\n");} public static String rows(){StringBuilder o=new StringBuilder();
+package demo; public final class Probe { static void p(StringBuilder o,String n,Object v){o.append(n).append("=").append(net.minecraft.core.registries.BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey((net.minecraft.world.level.block.entity.BlockEntityType)v)).append("\n");} public static String rows(){StringBuilder o=new StringBuilder();
  p(o,"FURNACE",net.minecraft.world.level.block.entity.BlockEntityTypes.FURNACE);
  p(o,"CHEST",net.minecraft.world.level.block.entity.BlockEntityTypes.CHEST);
  p(o,"TRAPPED_CHEST",net.minecraft.world.level.block.entity.BlockEntityTypes.TRAPPED_CHEST);
