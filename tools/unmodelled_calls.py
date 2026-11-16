@@ -297,6 +297,18 @@ def entrypoint_kind(path: Path, corpus: str, role: str = "server") -> str | None
     return None
 
 
+STANDARD_ENTRYPOINTS={"main","client","server"}
+
+def custom_entrypoint_keys(path, corpus):
+    e=ledger.read_jar_entrypoints(path) if corpus != "neoforge" else None
+    return tuple(sorted(set(e.kinds)-STANDARD_ENTRYPOINTS)) if e else ()
+
+def consumes_entrypoint(path,key):
+    try:
+        with zipfile.ZipFile(path) as a:
+            return any(n.endswith(".class") and key.encode() in a.read(n) for n in a.namelist())
+    except (OSError,zipfile.BadZipFile): return False
+
 def classify_client(path: Path, corpus: str) -> tuple[str, str | None, str]:
     entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
     if entrypoints is None:
@@ -577,31 +589,35 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 jar_role, reason = None, classify_server_skip(jar, name)
                 kind = entrypoint_kind(jar, name, args.role)
-            if kind is None:
-                for mode in (("alone", "closure") if args.dependency_mode == "both"
-                             else (args.dependency_mode,)):
-                    rows.append({"jar": jar.name, "mode": mode, "verdict": "skipped",
-                                 "reason": reason, **({"role": jar_role} if jar_role else {})})
-                continue
             closure_error = ""
             if name != "neoforge" and fabric_oracle_error:
                 closure = ledger.Closure()
                 closure_error = f"Fabric dependency predicate oracle unavailable: {fabric_oracle_error}"
             else:
-                matcher = (fabric_oracle.matches if name != "neoforge"
-                           else hybrid_pack.maven_version_satisfies)
+                matcher = (fabric_oracle.matches if name != "neoforge" else hybrid_pack.maven_version_satisfies)
                 closure = ledger.dependency_closure(jar, index, version_matcher=matcher)
             missing = list(closure.missing)
             requirements = closure.missing_requirements
             modes = ("alone", "closure") if args.dependency_mode == "both" else (args.dependency_mode,)
+            via = None
+            if kind is None and "closure" in modes:
+                for key in custom_entrypoint_keys(jar, name):
+                    consumer = next((dep for dep in closure.jars if consumes_entrypoint(dep, key)), None)
+                    if consumer is not None and entrypoint_kind(consumer, name, args.role):
+                        via, kind = consumer.name, entrypoint_kind(consumer, name, args.role)
+                        break
+            if kind is None:
+                for mode in modes:
+                    rows.append({"jar": jar.name, "mode": mode, "verdict": "skipped", "reason": reason, **({"role": jar_role} if jar_role else {})})
+                continue
             for mode in modes:
-                if mode == "alone":
-                    todo.append((jar, kind, jar_role, [], [], (), mode, ""))
-                else:
-                    todo.append((jar, kind, jar_role, list(closure.jars), missing, requirements, mode, closure_error))
+                if mode == "alone" and via is not None:
+                    rows.append({"jar": jar.name, "mode": "alone", "verdict": "skipped", "reason": reason})
+                    continue
+                todo.append((jar, kind, jar_role, list(closure.jars) if mode == "closure" else [], missing if mode == "closure" else [], requirements if mode == "closure" else (), mode, closure_error if mode == "closure" else "", via))
 
         def run(item):
-            jar, kind, jar_role, deps, missing, requirements, mode, closure_error = item
+            jar, kind, jar_role, deps, missing, requirements, mode, closure_error, via = item
             if closure_error:
                 result = {"status": "refused", "stage": "dependency", "error": closure_error}
             elif missing:
@@ -612,7 +628,10 @@ def main(argv: list[str] | None = None) -> int:
                     probe, jar, kind, deps, args.game_version,
                     game_block_classes,
                 )
-            return result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
+            row = result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
+            if via:
+                row["via"] = via
+            return row
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
             rows.extend(pool.map(run, todo))

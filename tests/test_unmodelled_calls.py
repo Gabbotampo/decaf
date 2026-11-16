@@ -444,6 +444,27 @@ class UnmodelledCallsTests(unittest.TestCase):
         totals, _ = TOOL.aggregate({"wide": [rows[0]]})
         self.assertEqual(totals["wide"]["ran-hollow"], 1)
 
+    def test_custom_key_consumer_detection(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); custom=root/"custom.jar"; consumer=root/"consumer.jar"
+            meta={"id":"custom","entrypoints":{"glitchcore":["x.Main"]}}
+            with zipfile.ZipFile(custom,"w") as z: z.writestr("fabric.mod.json",json.dumps(meta))
+            with zipfile.ZipFile(consumer,"w") as z: z.writestr("a/B.class",b"glitchcore")
+            self.assertEqual(TOOL.custom_entrypoint_keys(custom,"mega"),("glitchcore",))
+            self.assertTrue(TOOL.consumes_entrypoint(consumer,"glitchcore"))
+
+    def test_custom_key_without_consumer_is_skipped(self):
+        self.assertFalse(TOOL.consumes_entrypoint(Path("missing.jar"),"glitchcore"))
+
+    def test_plain_library_has_no_custom_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"plain.jar"
+            with zipfile.ZipFile(p,"w") as z: z.writestr("fabric.mod.json",json.dumps({"id":"plain","entrypoints":{}}))
+            self.assertEqual(TOOL.custom_entrypoint_keys(p,"mega"),())
+
+    def test_alone_mode_does_not_select_custom_key_consumer(self):
+        self.assertEqual(TOOL.STANDARD_ENTRYPOINTS,{"main","client","server"})
+
 
 if __name__ == "__main__":
     unittest.main()
