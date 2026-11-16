@@ -310,10 +310,17 @@ def custom_entrypoint_keys(path: Path, corpus: str) -> tuple[str, ...]:
     return tuple(sorted(set(entrypoints.kinds) - STANDARD_ENTRYPOINTS))
 
 
-def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
-    """Return whether a class constant pool has an exact UTF-8 key string."""
+#: The Fabric Loader calls a mod uses to ask for other mods' entrypoints under a key
+#: (`FabricLoader.getEntrypoints`, `getEntrypointContainers`, `invokeEntrypoints`).
+ENTRYPOINT_LOOKUPS = frozenset({"getEntrypoints", "getEntrypointContainers", "invokeEntrypoints"})
+
+
+def class_utf8_constants(data: bytes) -> set[str]:
+    """The UTF-8 entries of a class file's constant pool: every string literal, name and
+    descriptor the class refers to. Empty for anything that is not a well-formed class."""
+    found: set[str] = set()
     if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
-        return False
+        return found
     count = int.from_bytes(data[8:10], "big")
     offset = 10
     # Entries are numbered 1..count-1; a long or double takes two numbers (JVMS 4.4.5), so the
@@ -321,7 +328,7 @@ def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
     index = 1
     while index < count:
         if offset >= len(data):
-            return False
+            return set()
         tag = data[offset]
         offset += 1
         index += 1
@@ -329,11 +336,9 @@ def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
             size = int.from_bytes(data[offset:offset + 2], "big")
             offset += 2
             try:
-                value = data[offset:offset + size].decode("utf-8")
+                found.add(data[offset:offset + size].decode("utf-8"))
             except UnicodeDecodeError:
-                value = ""
-            if value == wanted:
-                return True
+                pass
             offset += size
         elif tag in (3, 4):
             offset += 4
@@ -347,21 +352,30 @@ def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
         elif tag == 15:
             offset += 3
         else:
-            return False
-    return False
+            return set()
+    return found
 
 
 def consumes_entrypoint(path: Path, key: str) -> bool:
-    """Return whether a jar contains an exact constant-pool key reference."""
+    """Whether a jar asks Fabric Loader for the entrypoints declared under `key`.
+
+    True when one class holds both the exact string `key` and the name of a loader lookup
+    method (`ENTRYPOINT_LOOKUPS`). The string alone is not enough: a mod that only checks
+    `isModLoaded("modmenu")`, or declares its own `modmenu` entrypoint, also carries that
+    literal, and running another mod "via" it would report a run that never touches that mod.
+    A package prefix such as `glitchcore/Foo` is a different constant and does not count."""
     try:
         with zipfile.ZipFile(path) as archive:
-            return any(
-                name.endswith(".class")
-                and class_has_utf8_constant(archive.read(name), key)
-                for name in archive.namelist()
-            )
+            for name in archive.namelist():
+                if not name.endswith(".class"):
+                    continue
+                constants = class_utf8_constants(archive.read(name))
+                if key in constants and constants & ENTRYPOINT_LOOKUPS:
+                    return True
     except (OSError, zipfile.BadZipFile):
         return False
+    return False
+
 
 def classify_client(path: Path, corpus: str) -> tuple[str, str | None, str]:
     entrypoints = ledger.read_jar_entrypoints(path, force_neoforge=corpus == "neoforge")
