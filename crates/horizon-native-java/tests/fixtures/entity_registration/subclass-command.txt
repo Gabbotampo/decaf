@@ -1,0 +1,4 @@
+Java 25.0.5+8, real 26.3 server-game.jar and libraries; compile/run:
+CP=~/ava/minecraft-26.3-server-game.jar:$(python3 -c "import pathlib; print(\":\".join(map(str,pathlib.Path(\"libraries\").rglob(\"*.jar\"))))")
+javac -cp "$CP" SubclassProbe.java
+java -cp ".:$CP" SubclassProbe 2>&1 | sed -n "s/^\\[[^]]*\\] \\[main/INFO\\]: \\[STDOUT\\]: //p" > ../../../src/vanilla_entity_data_subclass.txt

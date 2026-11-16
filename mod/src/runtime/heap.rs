@@ -383,6 +383,9 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        if self.render_objects.contains_key(marker) {
+            out.push(marker.to_owned());
+        }
         push(self.ranged_attributes.get(marker), out);
     }
 
@@ -413,6 +416,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
             .map(String::as_str)
     }
@@ -447,6 +451,7 @@ impl StdHost {
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
+        self.render_objects.retain(|key, _| keep(key));
     }
 }
 
@@ -527,6 +532,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.iterators.len()
         + host.component_states.len()
         + host.ranged_attributes.len()
+        + host.entity_registration.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -839,7 +845,14 @@ fn mark_kotlin_lazy_states(
 /// collection elements and iterator snapshot.
 pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String]) {
     let collectable = Collectable::new(heap, host);
+    let mut render_roots = Vec::new();
+    host.root_texts(&mut render_roots);
+    render_roots.extend(extra.iter().map(String::as_str));
+    let render_live = crate::runtime::render_math::reachable_keys(&host.render_objects, render_roots);
     if collectable.markers.is_empty() {
+        host.render_objects
+            .retain(|key, _| render_live.contains(key));
+        host.render_handles.retain(|key| render_live.contains(key));
         return;
     }
     let mut pending = Vec::new();
@@ -1045,7 +1058,11 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
+    host.entity_registration.retain_keys(keep);
     host.prune_keyed_tables(keep);
+    host.render_objects
+        .retain(|key, _| render_live.contains(key));
+    host.render_handles.retain(|key| render_live.contains(key));
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
 }
@@ -1481,6 +1498,127 @@ mod tests {
     /// classified: #233's `cached_collections` slipped past the audit, so
     /// `System.getProperties()` lost its contents and every map's views
     /// stayed cached (#226 re-check 4).
+
+    #[test]
+    fn render_objects_follow_the_collector() {
+        let (mut host, mut heap) = graph("demo/Render#1");
+        let mut diag = StdHost::new();
+        let stack = crate::runtime::render_math::new_value("", "com/mojang/blaze3d/vertex/PoseStack#10");
+        host.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10");
+        diag.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10");
+        diag.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10/pose/0");
+        crate::runtime::render_math::construct(
+            &mut host.render_objects,
+            &stack,
+            "com/mojang/blaze3d/vertex/PoseStack",
+            &[],
+        );
+        let last = crate::runtime::render_math::call(
+            &mut diag,
+            &mut host.render_objects,
+            &crate::runtime::MethodRef {
+                owner: "com/mojang/blaze3d/vertex/PoseStack".into(),
+                name: "last".into(),
+                descriptor: "()Lcom/mojang/blaze3d/vertex/PoseStack$Pose;".into(),
+            },
+            &stack,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let matrix = crate::runtime::render_math::call(
+            &mut diag,
+            &mut host.render_objects,
+            &crate::runtime::MethodRef {
+                owner: "com/mojang/blaze3d/vertex/PoseStack$Pose".into(),
+                name: "pose".into(),
+                descriptor: "()Lorg/joml/Matrix4f;".into(),
+            },
+            &last,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        host.render_handles.extend(diag.render_handles);
+        host.persistent_static_fields.insert(
+            "demo/Render#STACKLcom/mojang/blaze3d/vertex/PoseStack;".into(),
+            stack.clone(),
+        );
+        host.retain(&matrix);
+        collect(&mut heap, &mut host, &[]);
+        assert!(
+            host.render_objects
+                .contains_key("com/mojang/blaze3d/vertex/PoseStack#10")
+        );
+        assert!(
+            host.render_objects
+                .contains_key("com/mojang/blaze3d/vertex/PoseStack#10/pose/0/matrix4")
+        );
+        host.persistent_static_fields.clear();
+        host.release(&matrix);
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.render_objects.is_empty());
+    }
+
+    #[test]
+    fn entity_registration_handles_follow_callback_collection_roots() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        let category = crate::runtime::entity_registration::category_constant("CREATURE").unwrap();
+        let builder = crate::runtime::entity_registration::static_call(
+            &mut host.entity_registration,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "of".into(),
+                descriptor: "()".into(),
+            },
+            &[Value::Ref(Some("factory".into())), category],
+        )
+        .unwrap()
+        .unwrap();
+        let entity = crate::runtime::entity_registration::instance_call(
+            &mut host.entity_registration,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "build".into(),
+                descriptor: "()".into(),
+            },
+            &builder,
+            &[Value::Ref(Some("minecraft:probe".into()))],
+        )
+        .unwrap()
+        .unwrap();
+        let accessor = crate::runtime::entity_registration::define_id(
+            &mut host.entity_registration,
+            "net/minecraft/world/entity/Entity",
+        )
+        .unwrap()
+        .unwrap();
+        let entity_key = crate::runtime::jar_object::instance_key(&entity).unwrap().to_owned();
+        let accessor_key = crate::runtime::jar_object::instance_key(&accessor)
+            .unwrap()
+            .to_owned();
+        heap.fields
+            .insert(field(&entity_key, "state"), Value::Int(1));
+        heap.fields
+            .insert(field(&accessor_key, "state"), Value::Int(1));
+        host.mutable_collections.insert(
+            "java/util/ArrayList#neutral0".into(),
+            vec![entity.clone(), accessor.clone()],
+        );
+        host.persistent_static_fields.insert(
+            "demo/Mod#ROOTLjava/util/List;".into(),
+            text("java/util/ArrayList#neutral0"),
+        );
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(host.entity_registration.entry_count(), 1);
+        host.persistent_static_fields.clear();
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(host.entity_registration.entry_count(), 0);
+        assert!(heap.fields.is_empty());
+        assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(8));
+    }
+
     #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
@@ -1557,8 +1695,11 @@ mod tests {
             "threads",
             "game_event",
             "client",
+            "render_objects",
+            "render_handles",
             "brigadier",
             "imc",
+            "entity_registration",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
@@ -1601,6 +1742,7 @@ mod tests {
             "dfu_codec_callback_roots",
             "dfu_codec_refusals",
             "unknown_host_calls",
+            "nondeterministic",
             "strict_unknown_host_calls",
             "next_lazy_optional",
             "next_fabric_event",
