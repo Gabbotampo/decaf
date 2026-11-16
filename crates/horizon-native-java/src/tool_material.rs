@@ -98,12 +98,12 @@ mod tests {
     use super::*;
     #[test]
     fn captured_constants_match_java25_rows() {
-        assert_eq!(row(WOOD).unwrap().durability, 59);
-        assert_eq!(row(STONE).unwrap().durability, 131);
-        assert_eq!(row(COPPER).unwrap().durability, 190);
-        assert_eq!(row(IRON).unwrap().durability, 250);
-        assert_eq!(row(DIAMOND).unwrap().durability, 1561);
-        assert_eq!(row(GOLD).unwrap().durability, 32);
-        assert_eq!(row(NETHERITE).unwrap().durability, 2031);
+        assert_eq!(row("WOOD").unwrap().durability, 59);
+        assert_eq!(row("STONE").unwrap().durability, 131);
+        assert_eq!(row("COPPER").unwrap().durability, 190);
+        assert_eq!(row("IRON").unwrap().durability, 250);
+        assert_eq!(row("DIAMOND").unwrap().durability, 1561);
+        assert_eq!(row("GOLD").unwrap().durability, 32);
+        assert_eq!(row("NETHERITE").unwrap().durability, 2031);
     }
 }
