@@ -198,6 +198,17 @@ pub(crate) fn registry_id(value: &Value) -> Option<&str> {
     }
 }
 
+/// Record whether a registry registration contributed a stable lifecycle.
+pub(crate) fn note_registry_lifecycle(host: &mut crate::runtime::StdHost, id: &str, stable: Option<bool>) {
+    let state = host
+        .registry_lifecycles
+        .entry(id.to_owned())
+        .or_insert_with(|| crate::runtime::vanilla_registries::is_built_in(id));
+    if stable != Some(true) {
+        *state = false;
+    }
+}
+
 /// The declared types of a `Registry` with this key.
 pub(crate) fn registry_types(key: &str) -> &'static [&'static str] {
     match key.chars().next() {
@@ -285,31 +296,21 @@ fn identity_equals(
     })
 }
 
-/// A built-in `MappedRegistry`'s 26.3 `toString`: its root key and stable
-/// lifecycle are exact for the registry handles this host models. Unknown
-/// registry implementations remain counted.
-fn registry_to_string(
-    handle: &HostRef,
-    nested: &mut dyn Nested,
-) -> Result<Option<String>, NativeError> {
-    let Some(implementation) = handle.key().chars().next() else {
-        return Ok(None);
-    };
-    if !matches!(implementation, MAPPED | DEFAULTED_MAPPED) {
-        return Ok(None);
+/// A built-in `MappedRegistry`'s 26.3 `toString` is exact only while every
+/// observed registration kept a stable lifecycle. Unknown or experimental
+/// registration info leaves the call counted.
+pub(crate) fn registry_text(host: &crate::runtime::StdHost, value: &Value) -> Option<Value> {
+    let id = registry_id(value)?;
+    if !crate::runtime::vanilla_registries::is_built_in(id) || !host.registry_lifecycle_stable(id) {
+        return None;
     }
-    let Some(id) = handle.key().get(1..) else {
-        return Ok(None);
-    };
-    let key = crate::runtime::host_ids::registry_key_of(id);
-    let Some(key) = nested.text(&key)? else {
-        return Ok(None);
-    };
-    Ok(Some(format!("Registry[{key} (Stable)]")))
+    Some(Value::Ref(Some(format!(
+        "Registry[ResourceKey[minecraft:root / {id}] (Stable)]"
+    ))))
 }
 
 pub(crate) const REGISTRY_METHODS: Methods = Methods {
-    to_string: registry_to_string,
+    to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: identity_equals,
     instance_of: |handle, wanted, hierarchy| {
