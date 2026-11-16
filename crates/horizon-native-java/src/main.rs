@@ -533,9 +533,104 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
                 "at": plan.at,
                 "invoke_target": plan.invoke_target.as_ref().map(method_label),
                 "cancellable": plan.cancellable,
+                "method_descriptor": plan.target.descriptor,
+                "ordinal": plan.ordinal,
+                "opcode": serde_json::Value::Null,
+                "shift": plan.shift.map(|shift| match shift.direction {
+                    horizon_native_java::weaver::Shift::Before => "BEFORE",
+                    horizon_native_java::weaver::Shift::After => "AFTER",
+                }),
+                "by": plan.shift.map(|shift| i32::from(shift.by)),
+                "slice": plan.slice.as_ref().map(slice_json),
             })
         })
         .collect()
+}
+
+fn site_selector_text(selector: &horizon_native_java::weaver::SiteSelector) -> String {
+    match selector {
+        horizon_native_java::weaver::SiteSelector::Invoke {
+            owner,
+            name,
+            descriptor,
+        }
+        | horizon_native_java::weaver::SiteSelector::InvokeOrdinal {
+            owner,
+            name,
+            descriptor,
+            ..
+        } => format!("INVOKE:{owner}#{name}{descriptor}"),
+        horizon_native_java::weaver::SiteSelector::Head => "HEAD".into(),
+        horizon_native_java::weaver::SiteSelector::Return
+        | horizon_native_java::weaver::SiteSelector::ReturnOrdinal { .. } => "RETURN".into(),
+        horizon_native_java::weaver::SiteSelector::Tail
+        | horizon_native_java::weaver::SiteSelector::TailOrdinal { .. } => "TAIL".into(),
+    }
+}
+
+fn slice_json(slice: &horizon_native_java::weaver::SliceBounds) -> serde_json::Value {
+    serde_json::json!({"from": site_selector_text(&slice.from), "to": site_selector_text(&slice.to)})
+}
+
+fn anchor_shift_json(
+    shift: Option<horizon_native_java::weaver::ShiftBy>,
+) -> (serde_json::Value, serde_json::Value) {
+    let Some(shift) = shift else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    let direction = if shift.by < 0 { "BEFORE" } else { "AFTER" };
+    let by = if shift.by < 0 {
+        -shift.by
+    } else {
+        shift.by.saturating_sub(1)
+    };
+    (direction.into(), by.into())
+}
+
+fn anchor_plan_entries(plans: &[horizon_native_java::MixinAnchorPlan]) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let (shift, by) = anchor_shift_json(plan.shift);
+        let field_access = plan.site.as_deref().and_then(|site| site.rsplit_once(':')
+            .and_then(|(_, direction)| matches!(direction, "GET" | "PUT").then_some(direction)));
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": plan.at, "site": plan.site,
+            "opcode": plan.opcode, "field_access": field_access, "ordinal": plan.ordinal,
+            "shift": shift, "by": by,
+            "slice": match (&plan.slice_from, &plan.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            },
+            "cancellable": plan.cancellable, "redirect": plan.redirect,
+        })
+    }).collect()
+}
+
+fn modify_arg_entries(plans: &[horizon_native_java::MixinModifyArgPlan]) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| serde_json::json!({
+        "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+        "method_descriptor": plan.target.descriptor,
+        "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+        "callback_descriptor": plan.callback.descriptor, "at": "INVOKE",
+        "invoke_target": method_label(&plan.invoke_target), "ordinal": plan.ordinal.map(|n| n as i32),
+        "opcode": serde_json::Value::Null, "shift": serde_json::Value::Null, "by": serde_json::Value::Null,
+        "slice": plan.slice.as_ref().map(slice_json),
+    })).collect()
+}
+
+fn modify_variable_entries(
+    plans: &[horizon_native_java::MixinModifyVariablePlan],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| serde_json::json!({
+        "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+        "method_descriptor": plan.target.descriptor,
+        "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+        "callback_descriptor": plan.callback.descriptor, "at": plan.at,
+        "ordinal": plan.ordinal.map(|n| n as i32), "opcode": serde_json::Value::Null,
+        "shift": serde_json::Value::Null, "by": serde_json::Value::Null, "slice": serde_json::Value::Null,
+    })).collect()
 }
 
 /// The `--mixin-plans` report: planning only, no entrypoint is required.
@@ -564,6 +659,12 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
         "plans": mixin_plan_entries(&plans),
         "unresolved": mixin_plan_entries(&unresolved),
+        "anchor_plans": anchor_plan_entries(&jar.mixin_anchor_plans()),
+        "unresolved_anchor_plans": anchor_plan_entries(&jar.unresolved_anchor_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>()),
+        "modify_arg_plans": modify_arg_entries(&jar.mixin_modify_arg_plans()),
+        "unresolved_modify_arg_plans": modify_arg_entries(&jar.unresolved_modify_arg_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>()),
+        "modify_variable_plans": modify_variable_entries(&jar.mixin_modify_variable_plans()),
+        "unresolved_modify_variable_plans": modify_variable_entries(&jar.unresolved_modify_variable_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>()),
         "configs": configs,
         "config_errors": jar
             .mixin_config_errors()
