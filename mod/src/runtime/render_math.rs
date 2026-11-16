@@ -4,7 +4,7 @@ use crate::runtime::{HostKind, HostRef, MethodRef, NativeError, StdHost, Value};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug)]
 struct M4([f32; 16]);
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct M3([f32; 9]);
 #[derive(Clone, Copy, Debug)]
 struct Q([f32; 4]);
@@ -113,57 +113,14 @@ fn trans(x: f32, y: f32, z: f32) -> M4 {
 fn scale(x: f32, y: f32, z: f32) -> M4 {
     M4([x, 0., 0., 0., 0., y, 0., 0., 0., 0., z, 0., 0., 0., 0., 1.])
 }
-fn pure_translation(m: M4) -> bool {
-    let a = m.0;
-    a[0] == 1.
-        && a[1] == 0.
-        && a[2] == 0.
-        && a[3] == 0.
-        && a[4] == 0.
-        && a[5] == 1.
-        && a[6] == 0.
-        && a[7] == 0.
-        && a[8] == 0.
-        && a[9] == 0.
-        && a[10] == 1.
-        && a[11] == 0.
-        && a[15] == 1.
+const PROPERTY_BITS_REASON: &str =
+    "depends on JOML property bits; exact path via real JOML bytecode planned";
+
+fn counted(host: &mut StdHost, r: &MethodRef, reason: &str) -> Result<Value, NativeError> {
+    let _ = reason;
+    host.unknown_host_call(r)
 }
-fn rotation_property(m: M4) -> bool {
-    let a = m.0;
-    if a[3] != 0.0 || a[7] != 0.0 || a[11] != 0.0 || a[15] != 1.0 {
-        return false;
-    }
-    let c0 = [a[0], a[1], a[2]];
-    let c1 = [a[4], a[5], a[6]];
-    let c2 = [a[8], a[9], a[10]];
-    let dot = |x: [f32; 3], y: [f32; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
-    dot(c0, c0) == 1.0
-        && dot(c1, c1) == 1.0
-        && dot(c2, c2) == 1.0
-        && dot(c0, c1) == 0.0
-        && dot(c0, c2) == 0.0
-        && dot(c1, c2) == 0.0
-}
-fn normal(p: M4) -> M3 {
-    let a = p.0;
-    let d = a[0] * (a[5] * a[10] - a[6] * a[9]) - a[4] * (a[1] * a[10] - a[2] * a[9])
-        + a[8] * (a[1] * a[6] - a[2] * a[5]);
-    // JOML Matrix3f.invert() deliberately propagates IEEE Inf/NaN for a
-    // singular matrix; it does not substitute identity.
-    let z = 1. / d;
-    M3([
-        (a[5] * a[10] - a[6] * a[9]) * z,
-        (a[2] * a[9] - a[1] * a[10]) * z,
-        (a[1] * a[6] - a[2] * a[5]) * z,
-        (a[6] * a[8] - a[4] * a[10]) * z,
-        (a[0] * a[10] - a[2] * a[8]) * z,
-        (a[4] * a[2] - a[0] * a[6]) * z,
-        (a[4] * a[9] - a[5] * a[8]) * z,
-        (a[1] * a[8] - a[0] * a[9]) * z,
-        (a[0] * a[5] - a[1] * a[4]) * z,
-    ])
-}
+
 fn axis_vec(k: &str) -> Option<V3> {
     Some(if k.ends_with("#XP") {
         V3([1., 0., 0.])
@@ -279,7 +236,7 @@ pub(crate) fn call(
     } else if r.owner == "com/mojang/math/Axis" {
         axis_call(map, &k, r, args)
     } else if r.owner.starts_with("org/joml/") {
-        joml(map, &k, r, args)
+        joml(host, map, &k, r, args)
     } else {
         None
     }
@@ -398,41 +355,9 @@ fn stack(
             pose_translate(map, s.last()?, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
-        "scale" if r.descriptor == "(FFF)V" => {
-            pose_scale(map, s.last()?, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
-            Some(Ok(Value::Void))
-        }
+        "scale" if r.descriptor == "(FFF)V" => Some(counted(host, r, PROPERTY_BITS_REASON)),
         "rotateDegrees" | "rotate" | "rotateAround" => Some(host.unknown_host_call(r)),
-        "mulPose" if r.descriptor == "(Lorg/joml/Matrix4fc;)V" => {
-            let rhs = key(a.first()?)?.to_owned();
-            if !host.owns_render_handle(&rhs) {
-                return None;
-            }
-            let m = match map.get(&rhs) {
-                Some(Obj::M4(m)) => *m,
-                _ => return None,
-            };
-            let x = s.last()?;
-            let Some(Obj::Pose(p)) = map.get_mut(x) else {
-                return None;
-            };
-            p.p = mul4(p.p, m);
-            if !pure_translation(m) {
-                if rotation_property(m) {
-                    p.n = mul3(
-                        p.n,
-                        M3([
-                            m.0[0], m.0[1], m.0[2], m.0[4], m.0[5], m.0[6], m.0[8], m.0[9], m.0[10],
-                        ]),
-                    );
-                } else {
-                    p.n = normal(p.p);
-                    p.trusted = false;
-                }
-            }
-            sync_pose_aliases(map, x);
-            Some(Ok(Value::Void))
-        }
+        "mulPose" => Some(counted(host, r, PROPERTY_BITS_REASON)),
         _ => None,
     }
 }
@@ -463,6 +388,9 @@ fn pose(
         "transformNormal"
             if r.descriptor == "(Lorg/joml/Vector3fc;Lorg/joml/Vector3f;)Lorg/joml/Vector3f;" =>
         {
+            if p.n != I3 || !p.trusted {
+                return Some(counted(host, r, PROPERTY_BITS_REASON));
+            }
             let src = key(a.first()?)?.to_owned();
             let dst = key(a.get(1)?)?.to_owned();
             if !host.owns_render_handle(&src) || !host.owns_render_handle(&dst) {
@@ -475,35 +403,63 @@ fn pose(
             let Some(Obj::V3(out)) = map.get_mut(&dst) else {
                 return None;
             };
-            let n = p.n.0;
-            let x = n[0] * v.0[0] + n[3] * v.0[1] + n[6] * v.0[2];
-            let y = n[1] * v.0[0] + n[4] * v.0[1] + n[7] * v.0[2];
-            let z = n[2] * v.0[0] + n[5] * v.0[1] + n[8] * v.0[2];
-            out.0 = [x, y, z];
-            if !p.trusted {
-                let len = (x * x + y * y + z * z).sqrt();
-                out.0 = [x / len, y / len, z / len];
-            }
+            out.0 = v.0;
             Some(Ok(h(&dst)))
         }
         "transformNormal" if r.descriptor == "(FFFLorg/joml/Vector3f;)Lorg/joml/Vector3f;" => {
+            if p.n != I3 || !p.trusted {
+                return Some(counted(host, r, PROPERTY_BITS_REASON));
+            }
             let dst = key(a.get(3)?)?.to_owned();
             if !host.owns_render_handle(&dst) {
                 return None;
             }
-            let v = V3([arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?]);
             let Some(Obj::V3(out)) = map.get_mut(&dst) else {
                 return None;
             };
-            let n = p.n.0;
-            let x = n[0] * v.0[0] + n[3] * v.0[1] + n[6] * v.0[2];
-            let y = n[1] * v.0[0] + n[4] * v.0[1] + n[7] * v.0[2];
-            let z = n[2] * v.0[0] + n[5] * v.0[1] + n[8] * v.0[2];
-            out.0 = [x, y, z];
-            if !p.trusted {
-                let len = (x * x + y * y + z * z).sqrt();
-                out.0 = [x / len, y / len, z / len];
+            out.0 = [arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?];
+            Some(Ok(h(&dst)))
+        }
+        "transformPosition"
+            if r.descriptor == "(Lorg/joml/Vector3fc;Lorg/joml/Vector3f;)Lorg/joml/Vector3f;" =>
+        {
+            let src = key(a.first()?)?.to_owned();
+            let dst = key(a.get(1)?)?.to_owned();
+            if !host.owns_render_handle(&src) || !host.owns_render_handle(&dst) {
+                return None;
             }
+            let v = match map.get(&src) {
+                Some(Obj::V3(v)) => *v,
+                _ => return None,
+            };
+            let Some(Obj::V3(out)) = map.get_mut(&dst) else {
+                return None;
+            };
+            let m = p.p.0;
+            out.0 = [
+                m[0] * v.0[0] + m[4] * v.0[1] + m[8] * v.0[2] + m[12],
+                m[1] * v.0[0] + m[5] * v.0[1] + m[9] * v.0[2] + m[13],
+                m[2] * v.0[0] + m[6] * v.0[1] + m[10] * v.0[2] + m[14],
+            ];
+            Some(Ok(h(&dst)))
+        }
+        "transformPosition" if r.descriptor == "(FFFLorg/joml/Vector3f;)Lorg/joml/Vector3f;" => {
+            let dst = key(a.get(3)?)?.to_owned();
+            if !host.owns_render_handle(&dst) {
+                return None;
+            }
+            let Some(Obj::V3(out)) = map.get_mut(&dst) else {
+                return None;
+            };
+            let m = p.p.0;
+            let x = arg(r, a, 0)?;
+            let y = arg(r, a, 1)?;
+            let z = arg(r, a, 2)?;
+            out.0 = [
+                m[0] * x + m[4] * y + m[8] * z + m[12],
+                m[1] * x + m[5] * y + m[9] * z + m[13],
+                m[2] * x + m[6] * y + m[10] * z + m[14],
+            ];
             Some(Ok(h(&dst)))
         }
         "copy" if r.descriptor == "()Lcom/mojang/blaze3d/vertex/PoseStack$Pose;" => {
@@ -528,10 +484,7 @@ fn pose(
             pose_translate(map, k, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
-        "scale" if r.descriptor == "(FFF)V" => {
-            pose_scale(map, k, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
-            Some(Ok(Value::Void))
-        }
+        "scale" if r.descriptor == "(FFF)V" => Some(counted(host, r, PROPERTY_BITS_REASON)),
         "rotateDegrees" | "rotate" | "rotateAround" => Some(host.unknown_host_call(r)),
         _ => None,
     }
@@ -546,6 +499,7 @@ fn axis_call(
 }
 
 fn joml(
+    host: &mut StdHost,
     map: &mut BTreeMap<String, Obj>,
     k: &str,
     r: &MethodRef,
@@ -564,14 +518,7 @@ fn joml(
             sync_matrix_alias(map, k);
             Some(Ok(h(k)))
         }
-        ("org/joml/Matrix4f", "scale") if r.descriptor == "(FFF)Lorg/joml/Matrix4f;" => {
-            let (x, y, z) = (arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
-            if let Some(Obj::M4(m)) = map.get_mut(k) {
-                *m = mul4(*m, scale(x, y, z));
-            }
-            sync_matrix_alias(map, k);
-            Some(Ok(h(k)))
-        }
+        ("org/joml/Matrix4f", "scale") => Some(counted(host, r, PROPERTY_BITS_REASON)),
         ("org/joml/Quaternionf", "mul") => None,
         ("org/joml/Vector3f", "set") if r.descriptor == "(FFF)Lorg/joml/Vector3f;" => {
             let (x, y, z) = (arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
@@ -644,6 +591,40 @@ mod tests {
         assert_eq!(host.unknown_host_call_count(), 2);
         let marker = Value::Ref(Some("com/mojang/blaze3d/vertex/PoseStack#forged".into()));
         assert!(call(&mut host, &mut map, &init, &marker, &[]).is_none());
+    }
+
+    #[test]
+    fn property_sensitive_render_families_are_counted() {
+        let mut map = BTreeMap::new();
+        let mut host = StdHost::new();
+        let stack = new_value("", "com/mojang/blaze3d/vertex/PoseStack#counted");
+        host.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#counted");
+        let init = r("com/mojang/blaze3d/vertex/PoseStack", "<init>", "()V");
+        call(&mut host, &mut map, &init, &stack, &[])
+            .unwrap()
+            .unwrap();
+        let scale = r("com/mojang/blaze3d/vertex/PoseStack", "scale", "(FFF)V");
+        call(
+            &mut host,
+            &mut map,
+            &scale,
+            &stack,
+            &[Value::Float(2.), Value::Float(3.), Value::Float(4.)],
+        )
+        .unwrap()
+        .unwrap();
+        let mul = r(
+            "com/mojang/blaze3d/vertex/PoseStack",
+            "mulPose",
+            "(Lorg/joml/Matrix4fc;)V",
+        );
+        let matrix = new_value("", "org/joml/Matrix4f#counted");
+        host.register_render_handle("org/joml/Matrix4f#counted");
+        construct(&mut map, &matrix, "org/joml/Matrix4f", &[]);
+        call(&mut host, &mut map, &mul, &stack, &[matrix])
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.unknown_host_call_count(), 2);
     }
 
     #[test]
