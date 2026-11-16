@@ -2760,6 +2760,17 @@ pub trait Host {
     /// `forEachRemaining` leaves it after its action threw).
     fn set_host_iterator_cursor(&mut self, _marker: &str, _cursor: usize) {}
 
+    /// A runtime-owned iterator over a snapshot with a model-specific source tag.
+    fn new_host_iterator(&mut self, _values: Vec<Value>, _source: Option<String>) -> Option<Value> {
+        None
+    }
+
+    fn host_iterator_values(&self, _marker: &str) -> Option<Vec<Value>> {
+        None
+    }
+
+    fn set_host_iterator_source(&mut self, _marker: &str, _source: String) {}
+
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
@@ -3049,6 +3060,18 @@ pub trait Host {
 
     /// A fresh immutable JDK collection with the exact unmodifiable class.
     fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
+        None
+    }
+
+    /// A fresh immutable collection made by a library factory whose owner
+    /// selects a concrete class (Guava immutable map copy, for example).
+    fn immutable_collection_from(
+        &mut self,
+        _owner: &str,
+        _name: &str,
+        _kind: &str,
+        _values: Vec<Value>,
+    ) -> Option<Value> {
         None
     }
 
@@ -5860,6 +5883,24 @@ impl Host for StdHost {
         }
     }
 
+    fn new_host_iterator(&mut self, values: Vec<Value>, source: Option<String>) -> Option<Value> {
+        let marker = format!("iterator/{}", self.next_iterator);
+        self.next_iterator = self.next_iterator.saturating_add(1);
+        self.iterators.insert(marker.clone(), (values, 0));
+        if let Some(source) = source {
+            self.iterator_sources.insert(marker.clone(), source);
+        }
+        Some(crate::runtime::host_iterator::iterator(marker))
+    }
+
+    fn host_iterator_values(&self, marker: &str) -> Option<Vec<Value>> {
+        self.iterators.get(marker).map(|(values, _)| values.clone())
+    }
+
+    fn set_host_iterator_source(&mut self, marker: &str, source: String) {
+        self.iterator_sources.insert(marker.to_owned(), source);
+    }
+
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
         let owner = match kind {
             "list" => "java/util/List",
@@ -5868,6 +5909,16 @@ impl Host for StdHost {
             _ => return None,
         };
         Some(self.unmodifiable_from(owner, "of", kind, values))
+    }
+
+    fn immutable_collection_from(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        Some(self.unmodifiable_from(owner, name, kind, values))
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
@@ -13806,6 +13857,12 @@ fn is_map_owner(owner: &str) -> bool {
                 | "java/util/concurrent/ConcurrentSkipListMap"
                 | "com/google/common/collect/ImmutableMap"
                 | "com/google/common/collect/ImmutableBiMap"
+                | "com/google/common/collect/RegularImmutableMap"
+                | "com/google/common/collect/SingletonImmutableMap"
+                | "com/google/common/collect/RegularImmutableBiMap"
+                | "com/google/common/collect/SingletonImmutableBiMap"
+                | "com/google/common/collect/HashBiMap"
+                | "com/google/common/collect/HashBiMap$Inverse"
                 | gson_tree::TREE_MAP
         )
 }
@@ -29556,6 +29613,12 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         // A model handed a jar object it has no state for
                         // counts it instead of answering (`jar_operands.rs`).
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_guava(&r, receiver.as_ref(), &args))
+                    {
+                        // Guava bimap views must run before the generic map-view
+                        // copy path, which otherwise detaches key/value/entry sets.
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
