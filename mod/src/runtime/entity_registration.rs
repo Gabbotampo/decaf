@@ -461,13 +461,14 @@ pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Va
         if current == "net/minecraft/world/entity/Entity" {
             break 0;
         }
-        if current.starts_with("net/minecraft/")
-            && crate::runtime::vanilla_entity_data_pool::row(&current).is_none()
-        {
-            return None;
+        if let Some((table_parent, _)) = crate::runtime::vanilla_entity_data_pool::row(&current) {
+            current = table_parent?.to_owned();
+        } else {
+            if current.starts_with("net/minecraft/") {
+                return None;
+            }
+            current = state.supers.get(&current)?.clone();
         }
-        let parent = state.supers.get(&current)?.clone();
-        current = parent;
     };
     if id > 254 {
         return Some(Err(NativeError::UncaughtException {
@@ -495,6 +496,72 @@ pub(crate) fn accessor_id(value: &Value) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn captured_subclass_pool_rows_match_java25() {
+        let mut state = State::default();
+        note_hierarchy(
+            &mut state,
+            &[
+                (
+                    "demo/Child".into(),
+                    "net/minecraft/world/entity/Entity".into(),
+                ),
+                (
+                    "demo/Sibling".into(),
+                    "net/minecraft/world/entity/Entity".into(),
+                ),
+                ("demo/Grandchild".into(), "demo/Child".into()),
+                (
+                    "demo/ProjectileChild".into(),
+                    "net/minecraft/world/entity/projectile/Projectile".into(),
+                ),
+                (
+                    "demo/PathfinderChild".into(),
+                    "net/minecraft/world/entity/PathfinderMob".into(),
+                ),
+                (
+                    "demo/TamableChild".into(),
+                    "net/minecraft/world/entity/TamableAnimal".into(),
+                ),
+            ],
+        );
+        let rows = [
+            ("child", "demo/Child"),
+            ("sibling", "demo/Sibling"),
+            ("grandchild", "demo/Grandchild"),
+            ("child2", "demo/Child"),
+            ("projectile", "demo/ProjectileChild"),
+            ("pathfinder", "demo/PathfinderChild"),
+            ("tamable", "demo/TamableChild"),
+        ];
+        let captured = rows
+            .iter()
+            .map(|(label, class)| {
+                let id = define_id(&mut state, class).unwrap().unwrap();
+                format!("{label}={}", accessor_id(&id).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            captured,
+            include_str!("vanilla_entity_data_subclass.txt")
+        );
+    }
+
+    #[test]
+    fn unlisted_vanilla_ancestor_is_counted() {
+        let mut state = State::default();
+        note_hierarchy(
+            &mut state,
+            &[(
+                "demo/Unknown".into(),
+                "net/minecraft/world/entity/Unknown".into(),
+            )],
+        );
+        assert!(define_id(&mut state, "demo/Unknown").is_none());
+    }
+
     #[test]
     fn builder_and_accessor_surface_keeps_vanilla_defaults() {
         let mut state = State::default();

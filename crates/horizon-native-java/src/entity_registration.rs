@@ -543,10 +543,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n";
-        assert_eq!(
-            captured,
-            include_str!("../tests/fixtures/entity_registration/subclass-java25.txt")
-        );
+        assert_eq!(captured, include_str!("vanilla_entity_data_subclass.txt"));
     }
 
     #[test]
