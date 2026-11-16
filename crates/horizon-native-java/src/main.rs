@@ -710,6 +710,7 @@ fn execution_json(
         "unknown_host_calls": host.unknown_host_calls(),
         "client_registrations": host.client_registration_summary(),
         "parked_threads": parked_threads_json(host),
+        "nondeterministic": host.nondeterministic_markers(),
         "payload_directions": host
             .payload_registrations()
             .iter()
@@ -1089,8 +1090,10 @@ fn command_summary(
             }),
             EventContext::default(),
         );
-        let budget =
-            horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(5));
+        let budget = horizon_native_java::ExecutionBudget::deterministic(
+            2_000_000,
+            std::time::Duration::from_secs(300),
+        );
         if let Err(error) = jar.run_game_listener(listener, &mut firing, &mut host, &budget) {
             refused.get_or_insert_with(|| error.to_string());
         }
@@ -1150,8 +1153,10 @@ fn command_summary(
         if let Some(requirement @ horizon_native_java::brigadier::Requirement::Predicate(_)) =
             &node.requirement
         {
-            let budget =
-                horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(1));
+            let budget = horizon_native_java::ExecutionBudget::deterministic(
+                2_000_000,
+                std::time::Duration::from_secs(300),
+            );
             let level = match jar.requirement_level(requirement, true, &mut host, &budget) {
                 Ok(level) => serde_json::json!(level),
                 Err(error) => serde_json::json!(error.to_string()),
