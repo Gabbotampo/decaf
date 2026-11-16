@@ -893,7 +893,7 @@ registration can be probed.
 The native CLI's `--json` form returns
 `{status,kind,entrypoints,host_calls,payload_directions}` on success and a structured
 `{status,error,stage}` object on load, discovery, or execution failure. A launcher can use that verdict to
-select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo horizon-mod
+select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo sunrise-mod
 check` runs the same bounded probe as an optional `native` field in its JSON report, trying Fabric `main`,
 `client`, and `server` entrypoints before a NeoForge `@Mod` entrypoint. The launcher prints the selected kind,
 executes every declaration for that selected kind (retaining the first as the compatibility `entrypoint`),

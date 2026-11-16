@@ -419,7 +419,7 @@ fn hyphenated_uuid(uuid: u128) -> String {
     )
 }
 
-#[mod_api::horizon_mod]
+#[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
     /// The content root still accepts native block declarations here, at the Registration phase
     /// and before any resource loads (NeoForge's `RegisterEvent` drained from
@@ -1344,30 +1344,46 @@ impl Hooks for HorizonJava {
     /// `PlayerInteractEvent.EntityInteract`).
     fn entity_interact(
         &self,
-        host: &mut dyn ServerHost,
+        host: HostSide<'_>,
         event: &mut EntityInteractEvent<'_>,
-    ) -> Flow {
-        let player = host.players().acting_player();
-        let held = player
-            .and_then(|player| server_facts::held_items(host, player, event.hand, event.stack));
-        let level = player
-            .and_then(|player| player.entity().level(&*host))
-            .map(|level| level.dimension_id().to_owned());
-        let context =
-            entity_interact_context(player.map(|player| player.uuid()), level, held, event);
-        let fired = self.fire_bridged(
-            Some(&mut *host),
-            Lifecycle::None,
-            GameEvent::UseEntity,
-            self.dedicated(),
-            context,
-            |_| true,
-        );
-        if fired.cancelled {
-            Flow::Cancel
-        } else {
-            Flow::Continue
-        }
+    ) -> Option<InteractionResult> {
+        let fired = match host {
+            HostSide::Server(host) => {
+                let player = host.players().acting_player();
+                let held = player.and_then(|player| {
+                    server_facts::held_items(host, player, event.hand, event.stack)
+                });
+                let level = player
+                    .and_then(|player| player.entity().level(&*host))
+                    .map(|level| level.dimension_id().to_owned());
+                let context =
+                    entity_interact_context(player.map(|player| player.uuid()), level, held, event);
+                self.fire_bridged(
+                    Some(host),
+                    Lifecycle::None,
+                    GameEvent::UseEntity,
+                    self.dedicated(),
+                    context,
+                    |_| true,
+                )
+            }
+            HostSide::Client(_) => {
+                // The native runtime has a server façade only. Still dispatch the Sunrise
+                // both-side hook on the client, with the event-owned facts; unavailable server
+                // player/level/held-item reads remain the runtime's counted host calls.
+                let context = entity_interact_context(None, None, None, event);
+                self.fire_event(GameEvent::UseEntity, self.dedicated(), context, |_| true)
+            }
+        };
+        fired.cancelled.then(|| {
+            // A Forge cancellation has no Fabric InteractionResult.  Fail is the Sunrise
+            // replacement that stops this entity interaction while preserving the old Flow::Cancel.
+            fired
+                .interaction
+                .as_deref()
+                .map(|result| interaction_result(Some(result)))
+                .unwrap_or(InteractionResult::Fail)
+        })
     }
 
     /// A living entity's death has finished (Fabric's `ServerLivingEntityEvents.AFTER_DEATH`): the
@@ -1403,7 +1419,7 @@ impl Hooks for HorizonJava {
                 kind: event.kind.to_owned(),
                 level: None,
             }),
-            damage: Some(event.damage_type.to_owned()),
+            damage: Some(event.source.damage_type.to_owned()),
             ..EventContext::default()
         };
         let fired = self.fire_bridged(
@@ -1423,7 +1439,7 @@ impl Hooks for HorizonJava {
         // (Villager, Wolf, Raider...) do it after these callbacks here: a named departure.
         if event.kind != "minecraft:player" && !fired.cancelled {
             let (id, kind) = (event.entity as i32, event.kind.to_owned());
-            let damage = event.damage_type.to_owned();
+            let damage = event.source.damage_type.to_owned();
             self.game_hooks(Some(host), "living_death", |state| {
                 let source = game_hooks::damage_source(state, &damage);
                 Some((
@@ -3393,7 +3409,6 @@ mod tests {
                 entity: 3,
                 kind: "minecraft:cow",
                 stack: None,
-                cancelled: false,
             };
             let level = Some("minecraft:the_nether".to_owned());
             let context = entity_interact_context(Some(7), level.clone(), None, &event);
@@ -3443,7 +3458,7 @@ mod tests {
             player: 7,
             name: "Alex",
             was_death: true,
-            // The hook-scoped view of the old player (fork pin `1cc882b8e0`); the context
+            // The hook-scoped view of the old player (Sunrise pin `a87e07f5f8`); the context
             // takes the facts read from it, so any token does.
             original: mod_api::__private::game::original_player_ref(1),
         };

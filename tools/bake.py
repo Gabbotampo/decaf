@@ -372,12 +372,12 @@ def probe_declarations(probe: Path, jar: Path) -> list[tuple[str, str, dict]]:
 
 
 def write_package(path: Path, namespace: str, jar: str, files: list[tuple[str, bytes]]) -> int:
-    """Writes a deterministic `.hmod` (a zip: `horizon-mod.toml` then the sorted files)."""
+    """Writes a deterministic `.hmod` (a zip: `sunrise-mod.toml` then the sorted files)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
         manifest = _manifest(namespace, jar)
-        info = zipfile.ZipInfo("horizon-mod.toml", ZIP_TIME)
+        info = zipfile.ZipInfo("sunrise-mod.toml", ZIP_TIME)
         info.external_attr = ZIP_MODE
         info.compress_type = zipfile.ZIP_DEFLATED
         archive.writestr(info, manifest.encode("utf-8"))

@@ -126,7 +126,7 @@ class BakeTests(unittest.TestCase):
         self.assertTrue(package.is_file())
         with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
-            manifest = archive.read("horizon-mod.toml").decode()
+            manifest = archive.read("sunrise-mod.toml").decode()
             declaration = json.loads(
                 archive.read("data/ruby_mod/horizon/item/ruby.json")
             )
@@ -136,7 +136,7 @@ class BakeTests(unittest.TestCase):
             "data/ruby_mod/horizon/item/ruby.json",
             "data/ruby_mod/horizon/block/ruby_block.json",
         } | {name for name in ruby_jar() if name.startswith(("assets/", "data/"))}
-        self.assertEqual(names[0], "horizon-mod.toml")
+        self.assertEqual(names[0], "sunrise-mod.toml")
         self.assertEqual(names[1:], sorted(expected))
         self.assertEqual(declaration, ITEM)
         self.assertIn('id = "ruby_mod"', manifest)
