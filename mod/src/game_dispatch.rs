@@ -356,7 +356,14 @@ fn dispatch_state(
     }
     Ok(answer)
 }
+#[cfg(test)]
+static EFFECT_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
+    #[cfg(test)]
+    if let GameHookEffect::SystemMessage { text, .. } = &effect {
+        EFFECT_TRACE.lock().unwrap().push(text.clone());
+    }
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
             if let Some(target) = host.player(player) {
@@ -432,6 +439,23 @@ mod tests {
         ))
     }
 
+    fn player_tick_dispatch(java: &HorizonJava) -> Result<DispatchAnswer, DispatchError> {
+        let mut args = [];
+        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        java.dispatch_game_hook(GameDispatch::new(
+            MethodId("java_base_player_tick_head"),
+            Phase::Head,
+            Some(GameObject::player(1, "Alex")),
+            &mut args,
+            None,
+            &mut host,
+        ))
+    }
+
+    fn effect_trace() -> Vec<String> {
+        std::mem::take(&mut *EFFECT_TRACE.lock().unwrap())
+    }
+
     #[test]
     fn method_bitset_has_no_false_negative_for_target_spelling() {
         let bits = PlanBits::default();
@@ -496,39 +520,42 @@ mod tests {
             load(
                 "high",
                 "High",
-                "@Mixin(value=Player.class, priority=1500) public class High { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(1.0f); } }",
+                "@Mixin(value=Player.class, priority=1500) public class High { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"high\")); } }",
             ),
             load(
                 "low",
                 "Low",
-                "@Mixin(value=Player.class, priority=500) public class Low { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(2.0f); } }",
+                "@Mixin(value=Player.class, priority=500) public class Low { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"low\")); } }",
             ),
         ];
         java.refresh_game_hook_plan_bits();
-        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(1.0)));
+        player_tick_dispatch(&java).unwrap();
+        assert_eq!(effect_trace(), ["low", "high"]);
 
         java.lock().jars = vec![
             load(
                 "first",
                 "First",
-                "@Mixin(Player.class) public class First { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(3.0f); } }",
+                "@Mixin(Player.class) public class First { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"first\")); } }",
             ),
             load(
                 "second",
                 "Second",
-                "@Mixin(Player.class) public class Second { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void z(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(4.0f); } }",
+                "@Mixin(Player.class) public class Second { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void z(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"second\")); } }",
             ),
         ];
         java.refresh_game_hook_plan_bits();
-        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(4.0)));
+        player_tick_dispatch(&java).unwrap();
+        assert_eq!(effect_trace(), ["first", "second"]);
 
         java.lock().jars = vec![load(
             "decl",
             "Decl",
-            "@Mixin(Player.class) public class Decl { @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void a(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(5.0f); } @Inject(method=\"getDestroySpeed\", at=@At(\"RETURN\"), cancellable=true) private void b(BlockState s, CallbackInfoReturnable<Float> ci) { ci.setReturnValue(6.0f); } }",
+            "@Mixin(Player.class) public class Decl { @Inject(method=\"tick\", at=@At(\"HEAD\")) private void a(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"a\")); } @Inject(method=\"tick\", at=@At(\"HEAD\")) private void b(CallbackInfo ci) { ((Player)(Object)this).sendSystemMessage(Component.literal(\"b\")); } }",
         )];
         java.refresh_game_hook_plan_bits();
-        assert_eq!(destroy_speed_dispatch(&java, 0.0).unwrap().returned, Some(Value::Float(6.0)));
+        player_tick_dispatch(&java).unwrap();
+        assert_eq!(effect_trace(), ["a", "b"]);
     }
 
     #[test]

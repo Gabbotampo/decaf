@@ -540,6 +540,10 @@ pub(crate) mod tests {
             "package net.minecraft.world.damagesource; public class DamageSource {}",
         ),
         (
+            "net/minecraft/network/chat/Component.java",
+            "package net.minecraft.network.chat; public class Component { public static Component literal(String text) { return null; } }",
+        ),
+        (
             "net/minecraft/server/level/ServerPlayer.java",
             "package net.minecraft.server.level; public class ServerPlayer { \
              public java.util.UUID getUUID() { return null; } }",
@@ -756,7 +760,8 @@ pub(crate) mod tests {
              public class Player extends net.minecraft.world.entity.LivingEntity { \
              public void attack(net.minecraft.world.entity.Entity target) {} \
              public float getDestroySpeed(net.minecraft.world.level.block.state.BlockState state) { return 1.0f; } \
-             public void tick() {} public java.util.UUID getUUID() { return null; } }",
+             public void tick() {} public java.util.UUID getUUID() { return null; } \
+             public void sendSystemMessage(net.minecraft.network.chat.Component component) {} }",
         ),
         (
             "net/minecraft/server/MinecraftServer.java",
@@ -770,6 +775,7 @@ pub(crate) mod tests {
         import net.minecraft.world.entity.*; \
         import net.minecraft.world.entity.player.Player; \
         import net.minecraft.server.MinecraftServer; \
+        import net.minecraft.network.chat.Component; \
         import net.minecraft.world.level.block.state.BlockState; \
         import net.minecraft.world.item.BoneMealItem; \
         import net.minecraft.world.item.ItemStack; \
