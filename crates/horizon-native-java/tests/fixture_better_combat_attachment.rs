@@ -39,6 +39,10 @@ fn attachment_predicate_rows_match_java25() {
         horizon_native_java::Value::Ref(Some(v)) => v,
         other => panic!("{other:?}"),
     };
-    let expected = ORACLE.lines().filter(|line| !line.starts_with(#)).collect::<Vec<_>>().join("\n");
+    let expected = ORACLE
+        .lines()
+        .filter(|line| !line.starts_with("#"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(text, expected.trim());
 }
