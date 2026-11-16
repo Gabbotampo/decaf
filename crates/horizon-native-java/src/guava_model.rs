@@ -927,12 +927,15 @@ impl<H: Host> Runtime<'_, H> {
         wanted: &Value,
     ) -> Result<bool, NativeError> {
         let pairs = self.bimap_pairs(source)?;
+        let wanted_entry = (kind == BimapKind::Entries)
+            .then(|| self.host.map_entry_parts(wanted))
+            .flatten();
         let index = pairs.chunks(2).position(|pair| {
             if matches!(kind, BimapKind::Keys | BimapKind::Values) {
                 self.java_equals(&pair[0], wanted).unwrap_or(false)
-            } else if let Some((key, value)) = self.host.map_entry_parts(wanted) {
-                self.java_equals(&pair[0], &key).unwrap_or(false)
-                    && self.java_equals(&pair[1], &value).unwrap_or(false)
+            } else if let Some((key, value)) = &wanted_entry {
+                self.java_equals(&pair[0], key).unwrap_or(false)
+                    && self.java_equals(&pair[1], value).unwrap_or(false)
             } else {
                 false
             }
@@ -965,6 +968,77 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
+    fn bimap_view_item_equals(
+        &mut self,
+        kind: BimapKind,
+        left: &Value,
+        right: &Value,
+    ) -> Result<bool, NativeError> {
+        if matches!(kind, BimapKind::Keys | BimapKind::Values) {
+            return self.java_equals(left, right);
+        }
+        let Some((left_key, left_value)) = self.host.map_entry_parts(left) else {
+            return Ok(false);
+        };
+        let Some((right_key, right_value)) = self.host.map_entry_parts(right) else {
+            return Ok(false);
+        };
+        Ok(self.java_equals(&left_key, &right_key)?
+            && self.java_equals(&left_value, &right_value)?)
+    }
+
+    fn bimap_view_bulk(
+        &mut self,
+        source: &Value,
+        kind: BimapKind,
+        other: &Value,
+        retain: bool,
+    ) -> Result<bool, NativeError> {
+        let wanted = crate::runtime_collection_values(&*self.host, other)?;
+        let current = self.bimap_view_values(source, kind)?;
+        let mut removed = Vec::new();
+        let mut removed_entries = Vec::new();
+        for item in current.iter().cloned() {
+            let present = wanted.iter().any(|candidate| {
+                self.bimap_view_item_equals(kind, &item, candidate)
+                    .unwrap_or(false)
+            });
+            if present != retain {
+                if kind == BimapKind::Entries {
+                    if let Some((key, value)) = self.host.map_entry_parts(&item) {
+                        removed_entries.push((key, value));
+                    }
+                } else {
+                    removed.push(item);
+                }
+            }
+        }
+        let changed = !removed.is_empty() || !removed_entries.is_empty();
+        for item in removed {
+            self.bimap_view_remove(source, kind, &item)?;
+        }
+        for (key, value) in removed_entries {
+            let pairs = self.bimap_pairs(source)?;
+            let Some(index) = pairs.chunks(2).position(|pair| {
+                self.java_equals(&pair[0], &key).unwrap_or(false)
+                    && self.java_equals(&pair[1], &value).unwrap_or(false)
+            }) else {
+                continue;
+            };
+            let old_key = pairs[index * 2].clone();
+            let old_value = pairs[index * 2 + 1].clone();
+            let partner = self
+                .bimap_inverse(
+                    crate::expect_ref(source)
+                        .ok_or_else(|| NativeError::Metadata("HashBiMap source missing".into()))?,
+                )
+                .ok_or_else(|| NativeError::Metadata("HashBiMap inverse missing".into()))?;
+            self.bimap_host_remove(source, &old_key)?;
+            self.bimap_host_remove(&partner, &old_value)?;
+        }
+        Ok(changed)
+    }
+
     fn invoke_bimap_view(
         &mut self,
         r: &MethodRef,
@@ -994,6 +1068,18 @@ impl<H: Host> Runtime<'_, H> {
                     self.bimap_view_remove(source, kind, &wanted)? as i32,
                 )));
             }
+            ("removeAll", "(Ljava/util/Collection;)Z") => {
+                let other = args.first().cloned().unwrap_or(Value::Ref(None));
+                return Ok(Some(Value::Int(
+                    self.bimap_view_bulk(source, kind, &other, false)? as i32,
+                )));
+            }
+            ("retainAll", "(Ljava/util/Collection;)Z") => {
+                let other = args.first().cloned().unwrap_or(Value::Ref(None));
+                return Ok(Some(Value::Int(
+                    self.bimap_view_bulk(source, kind, &other, true)? as i32,
+                )));
+            }
             ("clear", "()V") => {
                 self.bimap_view_clear(source)?;
                 return Ok(Some(Value::Void));
@@ -1007,7 +1093,14 @@ impl<H: Host> Runtime<'_, H> {
                     .host
                     .new_host_iterator(
                         values,
-                        Some(format!("{BIMAP_ITERATOR_PREFIX}{view_marker}")),
+                        Some(format!(
+                            "{BIMAP_ITERATOR_PREFIX}{view_marker}|generation={}",
+                            self.host
+                                .collection_generation(
+                                    crate::expect_ref(source).map_or("", String::as_str)
+                                )
+                                .unwrap_or(0)
+                        )),
                     )
                     .ok_or_else(|| {
                         NativeError::Metadata("HashBiMap iterator host missing".into())
@@ -1026,12 +1119,14 @@ impl<H: Host> Runtime<'_, H> {
         Ok(None)
     }
 
-    fn bimap_iterator_source(&self, value: &Value) -> Option<String> {
+    fn bimap_iterator_source(&self, value: &Value) -> Option<(String, u64, bool)> {
         let marker = crate::host_iterator::marker(value)?;
         let source = self.host.host_iterator(marker)?.2?;
-        source
-            .strip_prefix(BIMAP_ITERATOR_PREFIX)
-            .map(|rest| rest.strip_suffix("|removed").unwrap_or(rest).to_owned())
+        let rest = source.strip_prefix(BIMAP_ITERATOR_PREFIX)?;
+        let removed = rest.ends_with("|removed");
+        let rest = rest.strip_suffix("|removed").unwrap_or(rest);
+        let (view, generation) = rest.rsplit_once("|generation=")?;
+        Some((view.to_owned(), generation.parse().ok()?, removed))
     }
 
     fn invoke_bimap_iterator(
@@ -1043,7 +1138,9 @@ impl<H: Host> Runtime<'_, H> {
         let Some(iterator) = crate::host_iterator::marker(receiver).cloned() else {
             return Ok(None);
         };
-        let Some(view_marker) = self.bimap_iterator_source(receiver) else {
+        let Some((view_marker, expected_generation, removed)) =
+            self.bimap_iterator_source(receiver)
+        else {
             return Ok(None);
         };
         if !matches!(
@@ -1052,22 +1149,38 @@ impl<H: Host> Runtime<'_, H> {
         ) {
             return Ok(None);
         }
-        let (cursor, length, source) = self
+        let (cursor, length, _source) = self
             .host
             .host_iterator(&iterator)
             .ok_or_else(|| NativeError::Metadata("unknown bimap iterator".into()))?;
+        let source_value = self
+            .bimap_view_source(&view_marker)
+            .ok_or_else(|| NativeError::Metadata("bimap iterator source missing".into()))?;
+        let current_generation = self
+            .host
+            .collection_generation(crate::expect_ref(&source_value).map_or("", String::as_str))
+            .unwrap_or(0);
+        if current_generation != expected_generation
+            && matches!(r.name.as_str(), "hasNext" | "next" | "remove")
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            });
+        }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("hasNext", "()Z") => Ok(Some(Value::Int((cursor < length) as i32))),
             ("next", "()Ljava/lang/Object;") => {
                 let value = self.host.host_iterator_next(&iterator)?;
                 self.host.set_host_iterator_source(
                     &iterator,
-                    format!("{BIMAP_ITERATOR_PREFIX}{view_marker}"),
+                    format!("{BIMAP_ITERATOR_PREFIX}{view_marker}|generation={current_generation}"),
                 );
                 Ok(Some(value))
             }
             ("remove", "()V") => {
-                if cursor == 0 || source.is_some_and(|s| s.ends_with("|removed")) {
+                if cursor == 0 || removed {
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/IllegalStateException".into(),
                         message: None,
@@ -1086,13 +1199,18 @@ impl<H: Host> Runtime<'_, H> {
                 let (_, kind) = self
                     .bimap_handle_info(&view)
                     .ok_or_else(|| NativeError::Metadata("bimap iterator view missing".into()))?;
-                let source = self
-                    .bimap_view_source(&view_marker)
-                    .ok_or_else(|| NativeError::Metadata("bimap iterator source missing".into()))?;
-                self.bimap_view_remove(&source, kind, &last)?;
+                self.bimap_view_remove(&source_value, kind, &last)?;
+                let new_generation = self
+                    .host
+                    .collection_generation(
+                        crate::expect_ref(&source_value).map_or("", String::as_str),
+                    )
+                    .unwrap_or(current_generation);
                 self.host.set_host_iterator_source(
                     &iterator,
-                    format!("{BIMAP_ITERATOR_PREFIX}{view_marker}|removed"),
+                    format!(
+                        "{BIMAP_ITERATOR_PREFIX}{view_marker}|generation={new_generation}|removed"
+                    ),
                 );
                 Ok(Some(Value::Void))
             }
@@ -1182,6 +1300,11 @@ impl<H: Host> Runtime<'_, H> {
             .chunks(2)
             .position(|pair| self.java_equals(&pair[0], &key).unwrap_or(false));
         let old = found.map(|index| pairs[index * 2 + 1].clone());
+        if let Some(index) = found
+            && self.java_equals(&pairs[index * 2 + 1], &value)?
+        {
+            return Ok(old.unwrap_or(Value::Ref(None)));
+        }
         if let Some(index) = found {
             pairs[index * 2 + 1] = value;
         } else {

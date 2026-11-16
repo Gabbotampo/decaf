@@ -17,6 +17,11 @@
 //! iterable-bimap=com.google.common.collect.RegularImmutableBiMap|{a=1, b=2}
 //! iterable-duplicate=java.lang.IllegalArgumentException:Multiple entries with same key: a=2 and a=1
 //! iterable-null-entry=java.lang.NullPointerException:null
+//! key-retain=true|{a=1, c=3}|{1=a, 3=c}
+//! value-retain=true|{a=1, c=3}|{1=a, 3=c}
+//! entry-removeall=true|{b=2}|{2=b}
+//! cme=java.util.ConcurrentModificationException:null
+//! inverse-cme=java.util.ConcurrentModificationException:null
 
 use horizon_native_java::{NativeJar, Value};
 use std::{
@@ -109,6 +114,27 @@ public final class Probe {
     Iterator<String> it=b.keySet().iterator(); String first=it.next(); it.remove();
     return first+"|"+b+"|"+b.inverse();
   }
+  public static String bulkViews() {
+    HashBiMap<String,Integer> b=HashBiMap.create(); b.put("a",1); b.put("b",2); b.put("c",3);
+    boolean kr=b.keySet().retainAll(Set.of("a","c"));
+    String key=kr+"|"+b+"|"+b.inverse();
+    b=HashBiMap.create(); b.put("a",1); b.put("b",2); b.put("c",3);
+    boolean vr=b.values().retainAll(Set.of(1,3));
+    String value=vr+"|"+b+"|"+b.inverse();
+    b=HashBiMap.create(); b.put("a",1); b.put("b",2); b.put("c",3);
+    boolean er=b.entrySet().removeAll(Set.of(Map.entry("a",1), Map.entry("c",3)));
+    return key+"|"+value+"|"+er+"|"+b+"|"+b.inverse();
+  }
+  public static String cmeViews() {
+    HashBiMap<String,Integer> b=HashBiMap.create(); b.put("a",1); b.put("b",2);
+    Iterator<String> i=b.keySet().iterator(); b.put("c",3);
+    String first; try { first=String.valueOf(i.next()); } catch(Throwable t){first=ex(t);}
+    b=HashBiMap.create(); b.put("a",1); b.put("b",2);
+    Iterator<Integer> j=b.inverse().keySet().iterator(); b.put("c",3);
+    String second; try { second=String.valueOf(j.next()); } catch(Throwable t){second=ex(t);}
+    return first+"|"+second;
+  }
+
   public static String iterableCopy() {
     Map<String,Integer> m=new LinkedHashMap<>(); m.put("a",1); m.put("b",2);
     return ImmutableMap.copyOf(m.entrySet()).getClass().getName()+"|"+ImmutableMap.copyOf(m.entrySet())
@@ -270,6 +296,19 @@ fn immutable_copy_iterable_matches_guava() {
     assert_eq!(
         f.text("iterableErrors"),
         "java.lang.IllegalArgumentException:Multiple entries with same key: a=2 and a=1|java.lang.NullPointerException:null"
+    );
+}
+
+#[test]
+fn hash_bimap_bulk_views_are_live_and_cme_is_exact() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.text("bulkViews"),
+        "true|{a=1, c=3}|{1=a, 3=c}|true|{a=1, c=3}|{1=a, 3=c}|true|{b=2}|{2=b}"
+    );
+    assert_eq!(
+        f.text("cmeViews"),
+        "java.util.ConcurrentModificationException:null|java.util.ConcurrentModificationException:null"
     );
 }
 
