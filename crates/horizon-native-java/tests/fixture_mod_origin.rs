@@ -142,6 +142,10 @@ public final class Probe {
             origin.getParentSubLocation() + "|" + origin;
     }
 
+    public static String kindDeclaringClass() {
+        return ModOrigin.Kind.PATH.getDeclaringClass().getName();
+    }
+
     public static String kindValueOfFailures() {
         String bad;
         try {
@@ -334,6 +338,15 @@ fn mod_origin_kind_is_the_loader_enum_with_fresh_values_arrays() {
     assert_eq!(
         fixture.text("kindValueOfFailures"),
         "iae:No enum constant net.fabricmc.loader.api.metadata.ModOrigin.Kind.NOPE|npe:Name is null"
+    );
+}
+
+#[test]
+fn mod_origin_kind_declaring_class_matches_java() {
+    let fixture = Fixture::build("kind-declaring-class");
+    assert_eq!(
+        fixture.text("kindDeclaringClass"),
+        "net.fabricmc.loader.api.metadata.ModOrigin$Kind"
     );
 }
 
