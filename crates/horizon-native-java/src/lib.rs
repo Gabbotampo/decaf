@@ -4690,6 +4690,30 @@ impl StdHost {
         &self.registrations
     }
 
+    /// Record a registry entry whose id and value were observed by a bounded
+    /// `Registry.registerForHolder` call.  The row is deliberately kept in
+    /// the same table as `Registry.register` so later holder lookups can only
+    /// answer for registrations this runtime actually saw.
+    pub(crate) fn record_observed_registry(&mut self, registry: &str, id: String, value: Value) {
+        self.registrations.push(RegistryEntry {
+            registry: registry.to_owned(),
+            id,
+            value,
+            declaration: None,
+        });
+    }
+
+    pub(crate) fn observed_registry_entry(
+        &self,
+        registry: &str,
+        id: &str,
+    ) -> Option<&RegistryEntry> {
+        self.registrations
+            .iter()
+            .rev()
+            .find(|entry| entry.registry == registry && entry.id == id)
+    }
+
     /// The property chain recorded for a constructed item marker, in the
     /// builder's own vocabulary (`stacksTo`, `durability`, `rarity`, ...).
     ///
@@ -5084,17 +5108,28 @@ impl StdHost {
             .find_map(host_registry::registry_id)?
             .to_owned();
         let registry = registry.as_str();
-        let id = args.iter().find_map(|value| {
-            if let Some(id) = host_ids::identifier_key(value) {
-                let (namespace, path) = id.split_once(':')?;
-                return Some(format!("{namespace}:{path}"));
-            }
-            // `Registry.register(registry, ResourceKey, value)` names the entry
-            // through the key rather than a bare identifier. Without reading
-            // the id out of the key the host answers null and the caller's
-            // static field ends up null. An unnamed key names no id.
-            resource_key_identifier(value).map(|(namespace, path)| format!("{namespace}:{path}"))
-        })?;
+        let id = args[..args.len().saturating_sub(1)]
+            .iter()
+            .find_map(|value| {
+                if let Some(id) = host_ids::identifier_key(value) {
+                    let (namespace, path) = id.split_once(':')?;
+                    return Some(format!("{namespace}:{path}"));
+                }
+                // `Registry.register(registry, ResourceKey, value)` names the entry
+                // through the key rather than a bare identifier. Without reading
+                // the id out of the key the host answers null and the caller's
+                // static field ends up null. An unnamed key names no id.
+                if let Some((namespace, path)) = resource_key_identifier(value) {
+                    return Some(format!("{namespace}:{path}"));
+                }
+                // The legacy overload accepts a String and parses it as an
+                // Identifier (`minecraft:` is the default namespace). Only the
+                // pre-value arguments are inspected, so a registered String value
+                // cannot be mistaken for its id.
+                let text = expect_ref(value)?;
+                let (namespace, path) = text.split_once(':').unwrap_or(("minecraft", text));
+                (!namespace.is_empty() && !path.is_empty()).then(|| format!("{namespace}:{path}"))
+            })?;
         let value = args.last().cloned().unwrap_or(Value::Void);
         let key = format!("{registry}/{id}");
         // An id the jar's metadata already describes stays opaque: the
