@@ -104,7 +104,7 @@ fn client_kind(rest: &str) -> HostKind {
         // `OptionInstance`s and vanilla `KeyMapping`s: one per name.
         "option" | "vanilla-key" => HostKind::GameSingleton,
         name if key.is_empty() && CLIENT_SINGLETONS.contains(&name) => HostKind::GameSingleton,
-        "item" | "block" | "mob-effect" | "effect-holder" | "particle-type" => {
+        "item" | "block" | "mob-effect" | "effect-holder" | "attribute" | "particle-type" => {
             HostKind::GameRegistryObject
         }
         "style" | "text-color" | "vec3" | "awt-color" => HostKind::GameValue,
@@ -403,6 +403,8 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (true, "player") => &["net/minecraft/client/player/LocalPlayer"],
         (true, "stack") => &["net/minecraft/world/item/ItemStack"],
         (true, "item") => &["net/minecraft/world/item/Item"],
+        (true, "mob-effect") => &["net/minecraft/world/effect/MobEffect"],
+        (true, "attribute") => &["net/minecraft/world/entity/ai/attributes/Attribute"],
         (true, "block") => &["net/minecraft/world/level/block/Block"],
         (true, "style") => &["net/minecraft/network/chat/Style"],
         (true, "text-color") => &["net/minecraft/network/chat/TextColor"],

@@ -242,6 +242,8 @@ mod type_switch;
 mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
+mod vanilla_holders;
+mod vanilla_holders_table;
 mod vanilla_registries;
 mod vanilla_values;
 pub mod verdict;
@@ -6266,6 +6268,9 @@ impl Host for StdHost {
         if r.owner == "java/awt/Color"
             && let Some(value) = client_surface::awt_constant(&r.name)
         {
+            return Ok(value);
+        }
+        if let Some(value) = vanilla_holders::static_field(r) {
             return Ok(value);
         }
         if let Some(value) = self.client_static(r) {

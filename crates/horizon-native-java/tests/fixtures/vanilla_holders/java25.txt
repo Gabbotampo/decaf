@@ -1,0 +1,4 @@
+# Command: . ~/ava/env.sh; CP=$HOME/ava/scratch/codex-vanilla-registry-holders-server-game.jar:$HOME/ava/scratch/codex-vanilla-registry-holders-server.jar:$(find $HOME/ava/scratch/vanilla-values/oracle/libraries -type f -name '*.jar' -print | paste -sd: -); javac --release 21 -cp "$CP" -d ~/ava/scratch/vanilla-holders-oracle/probe-classes tests/fixtures/vanilla_holders/Probe.java; java -cp "$CP:$HOME/ava/scratch/vanilla-holders-oracle/probe-classes" demo.Probe
+minecraft:speed|ResourceKey[minecraft:mob_effect / minecraft:speed]|ResourceKey[minecraft:mob_effect / minecraft:speed]|true|true|true|true
+minecraft:armor|ResourceKey[minecraft:attribute / minecraft:armor]|ResourceKey[minecraft:attribute / minecraft:armor]|true|true|false|true
+false|false|false
