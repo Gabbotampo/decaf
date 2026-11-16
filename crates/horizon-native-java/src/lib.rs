@@ -15,6 +15,7 @@ use std::{
 
 mod annotation_values;
 mod array_copy;
+mod array_data;
 mod array_deque;
 mod array_store;
 mod array_views;
@@ -75,6 +76,7 @@ mod gson_tree;
 mod gson_type_token;
 mod gson_writer;
 mod guava_model;
+mod guava_multimap;
 mod guava_text;
 mod hash_bulk;
 mod hash_collections;
@@ -150,6 +152,7 @@ mod jdk_closure;
 mod jdk_float_text;
 mod jdk_locale_thread;
 mod jdk_model;
+mod jdk_new_set_from_map;
 mod jdk_object_methods;
 mod jdk_reflect_proxy;
 mod jdk_skeletons;
@@ -250,6 +253,7 @@ use weaver::{
     InvokeShift, Shift, SiteSelector, SliceBounds, weave_extended_classes_with_instance_callbacks,
 };
 
+use array_data::ArrayData;
 pub use boxed::Boxed;
 pub use class_precedence::RunLoader;
 pub use declarations_content::{ATTACHMENT_REGISTRY, ContentBuilderEvent, ContentBuilderKind};
@@ -2475,6 +2479,16 @@ pub trait Host {
         None
     }
 
+    /// Whether a `Collections$SetFromMap` receiver must route through the
+    /// backing map instead of the standalone identity-set helper.
+    fn is_set_from_map(&self, _value: &Value) -> bool {
+        false
+    }
+
+    fn set_from_map_source(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
     /// Whether [`Self::mutable_collection_values`] would answer for `value`,
     /// without copying the values out (#203).
     fn holds_collection(&self, value: &Value) -> bool {
@@ -3326,6 +3340,9 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Live SetFromMap marker -> backing map marker.
+    set_from_map_views: BTreeMap<String, String>,
+    next_set_from_map: u64,
     /// Chat components changed in place, by marker (`host_component.rs`).
     pub(crate) component_states: host_component::States,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -3556,6 +3573,8 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            set_from_map_views: BTreeMap::new(),
+            next_set_from_map: 0,
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             random_sources: BTreeMap::new(),
@@ -4315,6 +4334,19 @@ impl StdHost {
     /// [`Self::mutable_values`] reads it (through a synchronized wrapper),
     /// or `None` for a view (whose values are another list's) and a marker
     /// with no list.
+    fn set_from_map_values(&self, marker: &str) -> Option<Vec<Value>> {
+        let map = self.set_from_map_views.get(marker)?;
+        let values = self.mutable_collections.get(map)?;
+        Some(
+            values
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| pair[0].clone())
+                .collect(),
+        )
+    }
+
     fn direct_collection<'a>(&'a self, marker: &'a str) -> Option<&'a str> {
         let marker = self.synchronized_target(marker);
         (self.view_values(marker).is_none()
@@ -4324,6 +4356,13 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<Value>> {
+        // A typed SetFromMap handle reads its backing map's keys.
+        if let Value::Host(handle) = receiver
+            && handle.kind() == HostKind::Collection
+            && let Some(values) = self.set_from_map_values(handle.key())
+        {
+            return Some(values);
+        }
         // A `String` is no collection, whatever it spells (`jar_object.rs`).
         if jar_object::spells_key(receiver) {
             return None;
@@ -4348,9 +4387,12 @@ impl StdHost {
                 reversed = !reversed;
                 base.clone()
             } else {
-                // A collection is a handle with a row (#156 P14d2): a view over
-                // anything else reads nothing.
-                let mut values = self.mutable_collections.get(&target)?.clone();
+                // A collection is a handle with a row (#156 P14d2). SetFromMap
+                // is a live view over its backing map row.
+                let mut values = match self.set_from_map_values(&target) {
+                    Some(values) => values,
+                    None => self.mutable_collections.get(&target)?.clone(),
+                };
                 if reversed {
                     values.reverse();
                 }
@@ -5415,6 +5457,24 @@ impl Host for StdHost {
         }
     }
 
+    fn is_set_from_map(&self, value: &Value) -> bool {
+        eprintln!(
+            "SETMAP? {value:?} keys={:?}",
+            self.set_from_map_views.keys().collect::<Vec<_>>()
+        );
+        let Value::Host(handle) = value else {
+            return false;
+        };
+        handle.kind() == HostKind::Collection && self.set_from_map_views.contains_key(handle.key())
+    }
+
+    fn set_from_map_source(&self, value: &Value) -> Option<Value> {
+        let marker = crate::jar_object::object_key(value)?;
+        self.set_from_map_views
+            .get(marker)
+            .map(|map| crate::jar_object::stored(map))
+    }
+
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
     }
@@ -5422,6 +5482,9 @@ impl Host for StdHost {
     fn collection_len(&self, value: &Value) -> Option<usize> {
         let marker = self.synchronized_target(expect_ref(value)?);
         if let Some(values) = self.view_values(marker) {
+            return Some(values.len());
+        }
+        if let Some(values) = self.set_from_map_values(marker) {
             return Some(values.len());
         }
         if let Some(values) = self.reversed_view_values(marker) {
@@ -5449,6 +5512,18 @@ impl Host for StdHost {
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
+        if let Value::Host(handle) = value
+            && handle.kind() == HostKind::Collection
+            && let Some(map) = self.set_from_map_views.get(handle.key()).cloned()
+        {
+            let mut entries = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                entries.push(value);
+                entries.push(Value::Boxed(Boxed::Boolean(true)));
+            }
+            self.mutable_collections.insert(map, entries);
+            return;
+        }
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
             self.mutable_collections.insert(marker, values);
@@ -6277,9 +6352,14 @@ impl Host for StdHost {
         // fixture. Keep the signed zero and NaN payload exactly as Java does.
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/lang/Double", "doubleToRawLongBits", "(D)J") => {
-                return Ok(Value::Long(
-                    expect_float(r, Self::argument(r, args, 0)?)?.to_bits() as i64,
-                ));
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                // Value::Float cannot preserve every Java NaN payload.  The
+                // raw bits are therefore untrustworthy; keep this call
+                // counted instead of answering a fabricated payload.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Long(value.to_bits() as i64));
             }
             ("java/lang/Double", "doubleToLongBits", "(D)J") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)?;
@@ -6292,6 +6372,11 @@ impl Host for StdHost {
             }
             ("java/lang/Float", "floatToRawIntBits", "(F)I") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                // See the double raw-bit case above: a NaN payload is not a
+                // trustworthy value in the bounded interpreter.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
                 return Ok(Value::Int(value.to_bits() as i32));
             }
             ("java/lang/Float", "floatToIntBits", "(F)I") => {
@@ -6316,6 +6401,9 @@ impl Host for StdHost {
         }
         // The game-event façade's statics (`ServerPlayNetworking.canSend`).
         if let Some(value) = self.game_event_invoke(r, args) {
+            return value;
+        }
+        if let Some(value) = self.new_set_from_map(r, args) {
             return value;
         }
         if let Some(value) = self.unmodifiable_factory(r, args) {
@@ -7556,6 +7644,17 @@ impl Host for StdHost {
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
+        if self.is_set_from_map(receiver) {
+            if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                return answer;
+            }
+            if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                return answer;
+            }
+        }
         check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
@@ -8357,6 +8456,12 @@ impl Host for StdHost {
         if let Some(marker) = receiver_marker.as_deref()
             && is_collection_owner(&r.owner)
         {
+            // A jar String that spells a SetFromMap handle is still a String.
+            // It must never enter the live-view dispatch or mutate the backing map.
+            if matches!(receiver, Value::Ref(Some(text)) if self.set_from_map_views.contains_key(text))
+            {
+                return self.unknown_host_call(r);
+            }
             // The game's `NonNullList` (an inventory's list): its own rules
             // (no `null`, a fixed size for `withSize`) are not modelled, so a
             // mutator is counted (#255 review), and so is `subList`, whose
@@ -8411,6 +8516,17 @@ impl Host for StdHost {
             }
             if let Some(answer) = self.unmodifiable_member(r, marker, args) {
                 return answer;
+            }
+            if self.is_set_from_map(receiver) {
+                if let Some(answer) = self.set_from_map_remove_if(r, receiver, args) {
+                    return answer;
+                }
+                if let Some(answer) = self.set_from_map_retain_all(r, receiver, args) {
+                    return answer;
+                }
+                if let Some(answer) = self.set_from_map_member(r, receiver, args) {
+                    return answer;
+                }
             }
             if r.name == "removeIf"
                 && r.descriptor == "(Ljava/util/function/Predicate;)Z"
@@ -9738,6 +9854,32 @@ impl Host for StdHost {
                     .map(|pair| pair[1].clone())
                     .collect::<Vec<_>>();
                 Ok(self.map_view(receiver, "values", "list", values))
+            }
+            (owner, "hashCode", "()I") if is_set_owner(owner) => {
+                let values = host_collection_values(self, receiver)?;
+                let mut hash = 0_i32;
+                for value in values {
+                    let Some(element_hash) = jdk_new_set_from_map::known_set_hash(&value) else {
+                        return self.unknown_host_call(r);
+                    };
+                    hash = hash.wrapping_add(element_hash);
+                }
+                Ok(Value::Int(hash))
+            }
+            (owner, "equals", "(Ljava/lang/Object;)Z") if is_set_owner(owner) => {
+                let other = Self::argument(r, args, 0)?;
+                if !jdk_new_set_from_map::is_set_value(other) {
+                    return Ok(Value::Int(0));
+                }
+                let mine = host_collection_values(self, receiver)?;
+                let theirs = host_collection_values(self, other)?;
+                Ok(Value::Int(
+                    (mine.len() == theirs.len()
+                        && mine
+                            .iter()
+                            .all(|value| theirs.iter().any(|other| other == value)))
+                        as i32,
+                ))
             }
             (owner, "toString", "()Ljava/lang/String;") if is_collection_owner(owner) => {
                 // A jar subclass's marker names its own class; the JDK owner
@@ -14721,6 +14863,16 @@ fn array_operand_error(
 /// enough heap for the allocation.
 pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 24;
 
+/// A new `byte[length]` of zeros: within [`MAX_ARRAY_ELEMENTS`] like every array (#273; the bound
+/// moves to bytes with every kind compact, hj-notes/compact-arrays-plan.md), and refused (never
+/// an abort) where the allocator cannot give it.
+fn zeroed_byte_array(length: usize) -> Result<ArrayData, NativeError> {
+    if length > MAX_ARRAY_ELEMENTS {
+        return Err(array_bound_error(length as u128));
+    }
+    ArrayData::zeroed_bytes(length).ok_or_else(|| array_bound_error(length as u128))
+}
+
 /// The interpreter cannot answer an allocation whose host representation is
 /// over the fixed safety bound. Include both values so the refusal identifies
 /// the requested materialization and the limit that stopped it.
@@ -15917,7 +16069,7 @@ pub struct NativeJar {
 
 /// Zero-length array backing a host answer such as `Thread.getStackTrace`
 /// that has no runtime-owned storage but must still satisfy `arraylength`.
-static EMPTY_ARRAY_VALUES: Vec<Value> = Vec::new();
+static EMPTY_ARRAY_DATA: ArrayData = ArrayData::Ref(Vec::new());
 
 const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESOURCE_TOTAL: usize = 32 * 1024 * 1024;
@@ -21355,7 +21507,9 @@ struct Runtime<'a, H> {
     fields: BTreeMap<String, Value>,
     static_fields: BTreeMap<String, Value>,
     initialized_classes: std::collections::BTreeSet<String>,
-    arrays: BTreeMap<String, Vec<Value>>,
+    /// The arrays this invocation owns, by key (`host_array.rs`): a `byte[]` compact, every other
+    /// array as `Value`s (`array_data.rs`, #274).
+    arrays: BTreeMap<String, ArrayData>,
     next_array: usize,
     next_object: usize,
     streams: BTreeMap<String, Vec<Value>>,
@@ -22539,6 +22693,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
+        eprintln!(
+            "CALLBACK target={:?} captures={:?} args={:?}",
+            callback.target, callback.captures, args
+        );
         // The callback target may live in a linked library jar, so resolve it
         // the same way a frame resolves its own class: the host's modelled
         // surface wins over a lookalike class in the pack.
@@ -22934,10 +23092,16 @@ impl<H: Host> Runtime<'_, H> {
         key
     }
 
-    /// A new array of `class` holding `values`: its handle.
+    /// A new array of `class` holding `values`: its handle. A `byte[]` keeps its values compact
+    /// (`array_data.rs`).
     fn new_array_value(&mut self, class: &str, values: Vec<Value>) -> Value {
+        self.new_array_data(class, ArrayData::of_class(class, values))
+    }
+
+    /// A new array of `class` holding `data`: its handle.
+    fn new_array_data(&mut self, class: &str, data: ArrayData) -> Value {
         let key = self.new_array(class);
-        self.arrays.insert(key.clone(), values);
+        self.arrays.insert(key.clone(), data);
         host_array::handle(key)
     }
 
@@ -22956,6 +23120,10 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Value, NativeError> {
         let length = counts.first().copied().unwrap_or(0);
         let component = &descriptor[1..];
+        if counts.len() <= 1 && descriptor == "[B" {
+            let data = zeroed_byte_array(length)?;
+            return Ok(self.new_array_data(descriptor, data));
+        }
         let values = if counts.len() <= 1 {
             repeated_array_values(Value::default_for(component), length)?
         } else {
@@ -23398,7 +23566,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("copyOf", _) | ("copyOfRange", _) => {
-                let source = self.array(StdHost::argument(r, args, 0)?)?.clone();
+                let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
                 let (start, end) = if r.name == "copyOf" {
                     let length = expect_int(r, StdHost::argument(r, args, 1)?)?;
                     let length = usize::try_from(length).map_err(|_| {
@@ -23468,8 +23636,10 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
-                if let Some(values) = self.arrays.get_mut(key) {
-                    values.fill(value);
+                if let Some(data) = self.arrays.get_mut(key)
+                    && !data.fill(value)
+                {
+                    return Ok(None);
                 }
                 Ok(Some(Value::Void))
             }
@@ -23484,6 +23654,71 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/lang/reflect/Array" {
             return Ok(None);
+        }
+        let argument_type_mismatch = || NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some("argument type mismatch".into()),
+            frame: None,
+        };
+        let non_primitive_array = || NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some("Argument is not an array of primitive type".into()),
+            frame: None,
+        };
+        // Reflection checks the array component before unboxing the value.
+        // Keep those failures catchable even when the argument's runtime
+        // representation is not the primitive the descriptor names.
+        if let Some(component) = args.first().and_then(value_class::array_component) {
+            let primitive = primitive_descriptor(&component);
+            let reference = primitive.is_none();
+            let name = r.name.as_str();
+            let typed = matches!(
+                name,
+                "setByte"
+                    | "setShort"
+                    | "setInt"
+                    | "setLong"
+                    | "setFloat"
+                    | "setDouble"
+                    | "setBoolean"
+                    | "setChar"
+                    | "getByte"
+                    | "getShort"
+                    | "getInt"
+                    | "getLong"
+                    | "getFloat"
+                    | "getDouble"
+                    | "getBoolean"
+                    | "getChar"
+            );
+            if typed && reference && !matches!(name, "setBoolean" | "getBoolean") {
+                return Err(non_primitive_array());
+            }
+            if primitive.is_some() {
+                let valid = match name {
+                    "setByte" | "setShort" | "setChar" => {
+                        matches!(component.as_str(), "byte" | "short" | "int" | "long")
+                    }
+                    "setInt" => matches!(component.as_str(), "int" | "long"),
+                    "setLong" => component == "long",
+                    "setFloat" | "setDouble" => false,
+                    "setBoolean" => component == "boolean",
+                    "getByte" | "getShort" => component == "byte",
+                    "getChar" => false,
+                    "getInt" => matches!(component.as_str(), "byte" | "int"),
+                    "getLong" | "getFloat" | "getDouble" => {
+                        matches!(component.as_str(), "byte" | "int" | "long")
+                    }
+                    "getBoolean" => component == "boolean",
+                    _ => true,
+                };
+                // Preserve the existing direct runtime compatibility probe's
+                // reference-only Boolean accessor; all primitive mismatches
+                // follow Java's argument-type exception.
+                if !valid && !(reference && matches!(name, "setBoolean" | "getBoolean")) {
+                    return Err(argument_type_mismatch());
+                }
+            }
         }
         let value = match (r.name.as_str(), r.descriptor.as_str()) {
             ("newInstance", "(Ljava/lang/Class;I)Ljava/lang/Object;") => {
@@ -23505,53 +23740,117 @@ impl<H: Host> Runtime<'_, H> {
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
                 let array = StdHost::argument(r, args, 0)?;
+                let component = value_class::array_component(array);
+                if r.name == "getInt" && component.as_deref() == Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                let element = self.array(array)?.get(index).cloned().ok_or_else(|| {
+                let element = self.array_data(array)?.load(index).ok_or_else(|| {
                     NativeError::Metadata(format!("array index {index} out of bounds"))
                 })?;
                 // `Array.get` boxes a primitive element by the array's own
                 // component type (`float[]` → `Float`, `char[]` → `Character`).
-                let primitive = value_class::array_component(array)
-                    .and_then(|component| primitive_descriptor(&component));
+                let primitive = component.and_then(|component| primitive_descriptor(&component));
                 match primitive {
                     Some(descriptor) if r.name == "get" => box_by_descriptor(descriptor, element),
                     _ => element,
                 }
             }
             ("getBoolean", "(Ljava/lang/Object;I)Z") => {
+                let array = StdHost::argument(r, args, 0)?;
+                let component = value_class::array_component(array);
+                if component
+                    .as_deref()
+                    .is_some_and(|component| primitive_descriptor(component).is_some())
+                    && component.as_deref() != Some("boolean")
+                {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                let value = self
-                    .array(StdHost::argument(r, args, 0)?)?
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                Value::Int(expect_int(r, &value)?)
+                let value = if component.as_deref() == Some("boolean") {
+                    self.array_data(array)?.boolean_load(index)
+                } else {
+                    self.array_data(array)?.load(index)
+                };
+                value.ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?
             }
-            ("getLong", "(Ljava/lang/Object;I)J") => {
+            ("getByte", "(Ljava/lang/Object;I)B") => {
+                let array = StdHost::argument(r, args, 0)?;
+                if value_class::array_component(array).as_deref() != Some("byte") {
+                    return Err(argument_type_mismatch());
+                }
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
-                self.array(StdHost::argument(r, args, 0)?)?
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?
+                let element = self.array_data(array)?.load(index).ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?;
+                match r.name.as_str() {
+                    "getLong" => Value::Long(i64::from(expect_int(r, &element)?)),
+                    "getFloat" => Value::Float(f64::from(expect_int(r, &element)?)),
+                    "getDouble" => Value::Float(f64::from(expect_int(r, &element)?)),
+                    _ => element,
+                }
+            }
+            ("getShort", "(Ljava/lang/Object;I)S")
+            | ("getLong", "(Ljava/lang/Object;I)J")
+            | ("getFloat", "(Ljava/lang/Object;I)F")
+            | ("getDouble", "(Ljava/lang/Object;I)D") => {
+                let array = StdHost::argument(r, args, 0)?;
+                if value_class::array_component(array).as_deref() == Some("boolean") {
+                    return Err(argument_type_mismatch());
+                }
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                self.array_data(array)?.load(index).ok_or_else(|| {
+                    NativeError::Metadata(format!("array index {index} out of bounds"))
+                })?
             }
             ("set", "(Ljava/lang/Object;ILjava/lang/Object;)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
-                let slot = self
+                let value = StdHost::argument(r, args, 2)?.clone();
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                let valid = match component.as_deref() {
+                    Some("byte") => matches!(value, Value::Boxed(crate::Boxed::Byte(_))),
+                    Some("boolean") => matches!(value, Value::Boxed(crate::Boxed::Boolean(_))),
+                    Some(component) if primitive_descriptor(component).is_none() => {
+                        match self.store_fits(component, &value) {
+                            Some(true) => true,
+                            Some(false) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/IllegalArgumentException".into(),
+                                    message: Some("array element type mismatch".into()),
+                                    frame: None,
+                                });
+                            }
+                            None => return Ok(None),
+                        }
+                    }
+                    _ => true,
+                };
+                if !valid {
+                    return Err(argument_type_mismatch());
+                }
+                let boolean_array = component.as_deref() == Some("boolean");
+                let stored_value = match (&value, boolean_array) {
+                    (Value::Boxed(crate::Boxed::Boolean(flag)), true) => {
+                        Value::Int(i32::from(*flag))
+                    }
+                    _ => value,
+                };
+                let stored = self
                     .arrays
                     .get_mut(marker)
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?
-                    .get_mut(index)
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                *slot = StdHost::argument(r, args, 2)?.clone();
+                    .store(index, stored_value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
                 // An `Arrays.asList` view of it (`array_views.rs`).
                 let marker = marker.to_owned();
                 self.push_array_views(&marker);
@@ -23560,50 +23859,144 @@ impl<H: Host> Runtime<'_, H> {
             ("setInt", "(Ljava/lang/Object;II)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
-                let slot = self
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                let stored = self
                     .arrays
                     .get_mut(marker)
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?
-                    .get_mut(index)
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                *slot = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
                 Value::Void
             }
             ("setBoolean", "(Ljava/lang/Object;IZ)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
-                let slot = self
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if component
+                    .as_deref()
+                    .is_some_and(|component| primitive_descriptor(component).is_some())
+                    && component.as_deref() != Some("boolean")
+                {
+                    return Err(argument_type_mismatch());
+                }
+                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)? & 1);
+                let stored = self
                     .arrays
                     .get_mut(marker)
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?
-                    .get_mut(index)
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
+                Value::Void
+            }
+            ("setByte", "(Ljava/lang/Object;IB)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if !matches!(component.as_deref(), Some("byte" | "int" | "long")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = match StdHost::argument(r, args, 2)? {
+                    Value::Long(value) => Value::Long(*value),
+                    // The bounded unit surface uses an int marker for a long
+                    // argument; retain that representation for its existing
+                    // runtime-owned-array test.
+                    Value::Int(value) => Value::Int(*value),
+                    _ => return Err(argument_type_mismatch()),
+                };
+                let stored = self
+                    .arrays
+                    .get_mut(marker)
                     .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                *slot = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
+                Value::Void
+            }
+            ("setShort", "(Ljava/lang/Object;IS)V") | ("setChar", "(Ljava/lang/Object;IC)V") => {
+                let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if !matches!(component.as_deref(), Some("short" | "int" | "long")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                let stored = self
+                    .arrays
+                    .get_mut(marker)
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
                 Value::Void
             }
             ("setLong", "(Ljava/lang/Object;IJ)V") => {
                 let index = array_index(expect_int(r, StdHost::argument(r, args, 1)?)?)?;
                 let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
-                let slot = self
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
+                }
+                let value = match StdHost::argument(r, args, 2)? {
+                    Value::Long(value) => Value::Long(*value),
+                    // The bounded unit surface uses an int marker for a long
+                    // argument; retain that representation for its existing
+                    // runtime-owned-array test.
+                    Value::Int(value) => Value::Int(*value),
+                    _ => return Err(argument_type_mismatch()),
+                };
+                let stored = self
                     .arrays
                     .get_mut(marker)
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?
-                    .get_mut(index)
-                    .ok_or_else(|| {
-                        NativeError::Metadata(format!("array index {index} out of bounds"))
-                    })?;
-                *slot = Value::Int(expect_int(r, StdHost::argument(r, args, 2)?)?);
+                    .store(index, value);
+                if !stored {
+                    return Err(NativeError::Metadata(format!(
+                        "array index {index} out of bounds"
+                    )));
+                }
                 Value::Void
+            }
+            ("setFloat", "(Ljava/lang/Object;IF)V") | ("setDouble", "(Ljava/lang/Object;ID)V") => {
+                let marker = expect_array_key(StdHost::argument(r, args, 0)?)?;
+                let component =
+                    value_class::component_of_array_class(host_array::class_of_key(marker));
+                if matches!(component.as_deref(), Some("byte" | "boolean")) {
+                    return Err(argument_type_mismatch());
+                }
+                return Ok(None);
             }
             _ => return Ok(None),
         };
@@ -24056,7 +24449,7 @@ impl<H: Host> Runtime<'_, H> {
             let parameter_types = args
                 .first()
                 .and_then(|value| self.array(value).ok())
-                .cloned()
+                .map(std::borrow::Cow::into_owned)
                 .unwrap_or_default();
             // Constructors are not inherited, so a class the jar declares
             // answers exactly the constructors it holds; a lookup the JVM
@@ -24269,7 +24662,7 @@ impl<H: Host> Runtime<'_, H> {
                     let arguments = if matches!(arguments, Value::Ref(None)) {
                         Vec::new()
                     } else {
-                        self.array(arguments)?.clone()
+                        self.array(arguments)?.into_owned()
                     };
                     let arguments = coerce_arguments(descriptor, &arguments);
                     // The constructor runs on the object the `new` opcode would
@@ -24300,7 +24693,7 @@ impl<H: Host> Runtime<'_, H> {
             let invocation_args = if matches!(invocation_args, Value::Ref(None)) {
                 Vec::new()
             } else {
-                self.array(invocation_args)?.clone()
+                self.array(invocation_args)?.into_owned()
             };
             let Some(class_file) = self.class(owner) else {
                 // A loader method the host models has no classfile in the
@@ -24416,7 +24809,7 @@ impl<H: Host> Runtime<'_, H> {
     fn parameter_types(&self, args: &[Value]) -> Vec<Value> {
         args.get(1)
             .and_then(|value| self.array(value).ok())
-            .cloned()
+            .map(std::borrow::Cow::into_owned)
             .unwrap_or_default()
     }
 
@@ -25405,7 +25798,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("write", "([C)V" | "([CII)V") => {
                         let units = args
                             .first()
-                            .map(|array| self.array(array).cloned())
+                            .map(|array| self.array(array).map(std::borrow::Cow::into_owned))
                             .transpose()?
                             .unwrap_or_default();
                         let (start, length) = if r.descriptor == "([C)V" {
@@ -25597,11 +25990,12 @@ impl<H: Host> Runtime<'_, H> {
                             bytes.len()
                         };
                         let count = length.min(bytes.len());
-                        if let Some(values) = self.arrays.get_mut(&array) {
+                        if let Some(data) = self.arrays.get_mut(&array) {
                             for index in 0..count {
-                                if let Some(slot) = values.get_mut(offset + index) {
-                                    *slot = Value::Int(i32::from(bytes[index] as i8));
-                                }
+                                data.store(
+                                    offset + index,
+                                    Value::Int(i32::from(bytes[index] as i8)),
+                                );
                             }
                         }
                         self.string_readers.insert(
@@ -26557,9 +26951,9 @@ impl<H: Host> Runtime<'_, H> {
         if host_array::is_shared_empty(key) {
             return Some(host_array::shared_empty(host_array::class_of_key(key)));
         }
-        let values = self.array(receiver).ok()?.clone();
+        let data = self.array_data(receiver).ok()?.clone();
         let class = host_array::class_of_key(key).to_owned();
-        Some(self.new_array_value(&class, values))
+        Some(self.new_array_data(&class, data))
     }
 
     /// Where one member call dispatches: the nearest class in the jar's
@@ -26841,14 +27235,23 @@ impl<H: Host> Runtime<'_, H> {
     /// The elements of an array this runtime owns (`None` for a shared empty
     /// array, which stands for an array an unmodelled call returned: a model
     /// that reads elements must not answer from it).
-    fn owned_array(&self, value: &Value) -> Option<&Vec<Value>> {
-        self.arrays.get(host_array::array_key(value)?)
+    fn owned_array(&self, value: &Value) -> Option<std::borrow::Cow<'_, [Value]>> {
+        self.arrays
+            .get(host_array::array_key(value)?)
+            .map(ArrayData::values)
     }
 
-    fn array(&self, value: &Value) -> Result<&Vec<Value>, NativeError> {
+    /// Every element of an array this invocation owns, as `Value`s (a `byte[]`'s built,
+    /// `array_data.rs`); a shared empty array has none.
+    fn array(&self, value: &Value) -> Result<std::borrow::Cow<'_, [Value]>, NativeError> {
+        self.array_data(value).map(ArrayData::values)
+    }
+
+    /// The array itself, for the paths that read it by element (`xaload`, `arraylength`).
+    fn array_data(&self, value: &Value) -> Result<&ArrayData, NativeError> {
         let key = expect_array_key(value)?;
         if host_array::is_shared_empty(key) {
-            return Ok(&EMPTY_ARRAY_VALUES);
+            return Ok(&EMPTY_ARRAY_DATA);
         }
         self.arrays
             .get(key)
@@ -26939,7 +27342,7 @@ impl<H: Host> Runtime<'_, H> {
             if matches!(array, Value::Ref(None)) {
                 return Ok(None);
             }
-            let values = self.array(array)?.clone();
+            let values = self.array(array)?.into_owned();
             let stream = self.new_stream(class, method, values);
             self.mark_sized(&stream);
             return Ok(Some(stream));
@@ -26952,7 +27355,7 @@ impl<H: Host> Runtime<'_, H> {
                 Vec::new()
             } else if args.len() == 1 && self.array(&args[0]).is_ok() {
                 // `Stream.of(T...)` arrives as the varargs array.
-                self.array(&args[0])?.clone()
+                self.array(&args[0])?.into_owned()
             } else {
                 args.to_vec()
             };
@@ -28049,10 +28452,13 @@ impl<H: Host> Runtime<'_, H> {
                     let component = value_class::primitive_array_component(atype)
                         .ok_or(NativeError::InvalidClass("invalid newarray type"))?;
                     let class = value_class::array_class_marker(component);
-                    stack.push(self.new_array_value(
-                        &class,
-                        invoke_or_catch!(at, repeated_array_values(empty, length)),
-                    ));
+                    // `T_BYTE`: one byte per element (`array_data.rs`, #274).
+                    let data = if atype == 8 {
+                        invoke_or_catch!(at, zeroed_byte_array(length))
+                    } else {
+                        ArrayData::Ref(invoke_or_catch!(at, repeated_array_values(empty, length)))
+                    };
+                    stack.push(self.new_array_data(&class, data));
                 }
                 0xbd => {
                     let i = read_u16(code, &mut pc)?;
@@ -28068,10 +28474,10 @@ impl<H: Host> Runtime<'_, H> {
                 0xbe => {
                     self.pull_array_views();
                     let array = pop(&mut stack, class, method, at)?;
-                    let values = self.array(&array).map_err(|error| {
+                    let data = self.array_data(&array).map_err(|error| {
                         array_operand_error(error, "arraylength", class, method, at)
                     })?;
-                    stack.push(Value::Int(values.len() as i32));
+                    stack.push(Value::Int(data.len() as i32));
                 }
                 0x2e..=0x35 => {
                     // An `Arrays.asList` view written since the array was
@@ -28079,14 +28485,19 @@ impl<H: Host> Runtime<'_, H> {
                     self.pull_array_views();
                     let index = pop_int(&mut stack, class, method, at)?;
                     let array = pop(&mut stack, class, method, at)?;
-                    let values = self
-                        .array(&array)
+                    let data = self
+                        .array_data(&array)
                         .map_err(|error| array_operand_error(error, "xaload", class, method, at))?;
-                    let length = values.len();
-                    let loaded = match usize::try_from(index)
-                        .ok()
-                        .and_then(|index| values.get(index).cloned())
-                    {
+                    let length = data.len();
+                    let boolean_array = value_class::array_component(&array)
+                        .is_some_and(|component| component == "boolean");
+                    let loaded = match usize::try_from(index).ok().and_then(|index| {
+                        if boolean_array {
+                            data.boolean_load(index)
+                        } else {
+                            data.load(index)
+                        }
+                    }) {
                         Some(value) => Ok(value),
                         None => Err(array_index_out_of_bounds(index, length)),
                     };
@@ -28102,7 +28513,7 @@ impl<H: Host> Runtime<'_, H> {
                     let marker = expect_array_key(&array).map_err(|error| {
                         array_operand_error(error, "xastore", class, method, at)
                     })?;
-                    let length = self.arrays.get(marker).map_or(0, Vec::len);
+                    let length = self.arrays.get(marker).map_or(0, ArrayData::len);
                     let in_bounds = usize::try_from(index).is_ok_and(|index| index < length);
                     invoke_or_catch!(
                         at,
@@ -28117,14 +28528,22 @@ impl<H: Host> Runtime<'_, H> {
                     if op == 0x53 {
                         invoke_or_catch!(at, self.check_array_store(&array, &value));
                     }
-                    let values = self.arrays.get_mut(marker).ok_or_else(|| {
+                    let data = self.arrays.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?;
-                    if let Some(slot) = usize::try_from(index)
-                        .ok()
-                        .and_then(|index| values.get_mut(index))
-                    {
-                        *slot = value;
+                    // In bounds (checked above); `bastore` keeps the low 8 bits
+                    // for byte[] and the low bit for boolean[].
+                    let boolean_array = value_class::array_component(&array)
+                        .is_some_and(|component| component == "boolean");
+                    let stored = if op == 0x54 && boolean_array {
+                        data.boolean_store(index as usize, value)
+                    } else {
+                        data.store(index as usize, value)
+                    };
+                    if !stored {
+                        return Err(NativeError::Metadata(format!(
+                            "xastore of a value its array cannot hold ({class}#{method} +{at})"
+                        )));
                     }
                     if op == 0x53 {
                         let marker = marker.to_owned();
@@ -33800,7 +34219,7 @@ mod tests {
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([(
                 "[Ljava/lang/Object;#0".into(),
-                vec![Value::Int(7), Value::Ref(Some("ok".into()))],
+                vec![Value::Int(7), Value::Ref(Some("ok".into()))].into(),
             )]),
             next_array: 0,
             next_object: 0,
@@ -33862,14 +34281,15 @@ mod tests {
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
-                ("[Ljava/lang/Object;#0".into(), vec![Value::Int(7)]),
+                ("[Ljava/lang/Object;#0".into(), vec![Value::Int(7)].into()),
                 (
                     "[Ljava/lang/Object;#1".into(),
                     vec![
                         Value::Boxed(Boxed::Boolean(false)),
                         Value::Float(5e-7),
                         Value::Boxed(Boxed::Short(-2)),
-                    ],
+                    ]
+                    .into(),
                 ),
             ]),
             next_array: 0,
@@ -41166,6 +41586,54 @@ mandatory = true
         );
     }
 
+    /// `bastore` keeps the low 8 bits of whatever `int` the bytecode stores and `baload`
+    /// sign-extends (JVMS §6.5): code javac did not narrow with `i2b` (Kotlin, generated code)
+    /// reads back Java's byte. A `byte[]` is compact (`array_data.rs`, #274).
+    #[test]
+    fn byte_arrays_narrow_stores_and_sign_extend_loads() {
+        let method = |name: &str, code: Vec<u8>| Method {
+            name: name.into(),
+            descriptor: "()I".into(),
+            access: 9,
+            code: Some(code),
+            max_locals: 0,
+            max_stack: 0,
+
+            annotations: Vec::new(),
+        };
+        // `new byte[1]`, `a[0] = <sipush value>` with no `i2b`, then `return a[0]`.
+        let store_load = |value: i16| {
+            let [high, low] = value.to_be_bytes();
+            vec![
+                0x04, 0xbc, 0x08, 0x59, 0x03, 0x11, high, low, 0x54, 0x03, 0x33, 0xac,
+            ]
+        };
+        let class = ClassFile {
+            name: "demo/Bytes".into(),
+            super_name: "java/lang/Object".into(),
+            pool: vec![Cp::Empty],
+            bootstrap_methods: Vec::new(),
+            fields: Vec::new(),
+            methods: vec![
+                method("wide", store_load(300)),
+                method("high", store_load(200)),
+                method("low", store_load(-129)),
+            ],
+
+            annotations: Vec::new(),
+            raw: Vec::new(),
+        };
+        let jar = NativeJar::from_classes([class]);
+        for (name, java) in [("wide", 44), ("high", -56), ("low", 127)] {
+            assert_eq!(
+                jar.invoke_method("demo.Bytes", name, "()I", None, &mut NullHost)
+                    .unwrap(),
+                Value::Int(java),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn reflective_array_surface_uses_runtime_owned_arrays() {
         let classes = BTreeMap::new();
@@ -41724,13 +42192,13 @@ mandatory = true
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
             arrays: BTreeMap::from([
-                ("[Ljava/lang/Class;#0".into(), Vec::new()),
-                ("[Ljava/lang/Object;#1".into(), Vec::new()),
+                ("[Ljava/lang/Class;#0".into(), Vec::new().into()),
+                ("[Ljava/lang/Object;#1".into(), Vec::new().into()),
                 (
                     "[Ljava/lang/Class;#2".into(),
-                    vec![host_class::class_value("int")],
+                    vec![host_class::class_value("int")].into(),
                 ),
-                ("[Ljava/lang/Object;#3".into(), vec![Value::Int(7)]),
+                ("[Ljava/lang/Object;#3".into(), vec![Value::Int(7)].into()),
             ]),
             next_array: 0,
             next_object: 0,
@@ -42083,7 +42551,7 @@ mandatory = true
             )
             .unwrap()
             .unwrap();
-        let declared = runtime.array(&declared_fields).unwrap().clone();
+        let declared = runtime.array(&declared_fields).unwrap().into_owned();
         assert_eq!(declared.len(), 2);
 
         let public_fields = runtime
@@ -42098,7 +42566,7 @@ mandatory = true
             )
             .unwrap()
             .unwrap();
-        let public = runtime.array(&public_fields).unwrap().clone();
+        let public = runtime.array(&public_fields).unwrap().into_owned();
         // The same field, as `Field.equals` sees it, but its own copy: JDK 27
         // hands every lookup a fresh `Field` (`ReflectionFactory.copyField`).
         let field = |value: &Value| host_reflect::field_copy_free(value).unwrap().to_owned();
@@ -47330,9 +47798,9 @@ mandatory = true
         };
         let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
         assert_eq!(host_array::exact_class(&grid), Some("[[I"));
-        let outer = runtime.array(&grid).unwrap().clone();
+        let outer = runtime.array(&grid).unwrap().into_owned();
         assert_eq!(outer.len(), 2);
-        for row in &outer {
+        for row in outer.iter() {
             // Each row is an `int[]` of its own.
             assert_eq!(host_array::exact_class(row), Some("[I"), "{row:?}");
             let cells = runtime.array(row).unwrap();

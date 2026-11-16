@@ -205,6 +205,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(class) = empty_factory_class(r) {
             return Ok(self.host.empty_mutable_collection(class));
         }
+        if let Some(value) = crate::runtime::guava_multimap::invoke(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some((class, values, map)) = self.collection_factory_values(r, args)? {
             let collection = self.host.empty_mutable_collection(class).ok_or_else(|| {
                 NativeError::Metadata("Guava collection factory has no host collection".into())
@@ -281,7 +284,7 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     match value {
                         array if self.owned_array(array).is_some() => {
-                            values.extend(self.array(value)?.clone());
+                            values.extend(self.array(value)?.into_owned());
                         }
                         other => {
                             let items = runtime_collection_values(&*self.host, other)?;
@@ -608,7 +611,7 @@ impl<H: Host> Runtime<'_, H> {
             });
         }
         if array {
-            return Ok(Some((class, self.array(source)?.clone(), map)));
+            return Ok(Some((class, self.array(source)?.into_owned(), map)));
         }
         let values = runtime_collection_values(&*self.host, source)?;
         Ok(Some((class, values, map)))
@@ -634,7 +637,7 @@ impl<H: Host> Runtime<'_, H> {
             if matches!(rest, Value::Ref(None)) {
                 return Err(thrown("java/lang/NullPointerException", None));
             }
-            values.extend(self.array(&rest)?.clone());
+            values.extend(self.array(&rest)?.into_owned());
         }
         if values.iter().any(|value| matches!(value, Value::Ref(None))) {
             return Err(thrown("java/lang/NullPointerException", None));
