@@ -7,6 +7,8 @@
 //! Fabric metadata, and executes a small no-argument bytecode subset. Calls
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -15,8 +17,6 @@ use std::{
     path::Path,
     sync::Arc,
 };
-#[cfg(test)]
-use std::sync::Mutex;
 
 #[cfg(test)]
 static TEST_STDOUT_TRACE: Mutex<String> = Mutex::new(String::new());
