@@ -378,15 +378,21 @@ mod tests {
     use crate::runtime::GameObject;
     use crate::runtime::Value;
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::thread;
 
     struct CountingAllocator;
     static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    thread_local! { static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) }; }
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            COUNT_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+                }
+            });
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -673,6 +679,7 @@ mod tests {
         let mut args = [Value::Int(1)];
         let mut host = NoopHost;
         ALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
         let answer = java
             .dispatch_game_hook(GameDispatch::new(
                 MethodId("missing"),
@@ -683,6 +690,7 @@ mod tests {
                 &mut host,
             ))
             .unwrap();
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
         assert_eq!(answer, DispatchAnswer::default());
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
     }
