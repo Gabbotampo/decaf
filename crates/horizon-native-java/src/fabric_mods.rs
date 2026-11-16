@@ -257,6 +257,16 @@ impl StdHost {
         loader::container(id, self.fabric_version(id).as_deref())
     }
 
+    /// The origin that Fabric Loader would attach to this run's container.
+    pub(crate) fn fabric_origin(&self, id: &str) -> Value {
+        let (kind, argument) = self
+            .fabric_origins
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| ("path".into(), id.to_owned()));
+        loader::origin(&kind, &argument)
+    }
+
     /// Answer the loader's container list and metadata surface, or `None`
     /// for a call this module does not own.
     pub(crate) fn fabric_mods_instance(

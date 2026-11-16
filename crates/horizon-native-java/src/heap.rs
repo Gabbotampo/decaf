@@ -146,8 +146,13 @@ impl StdHost {
     /// hand); one the embedder keeps across later calls must be retained.
     /// Holds are counted: two `retain`s need two `release`s.
     pub fn retain(&mut self, value: &Value) {
-        if let Some(text) = pin_text(value) {
-            *self.retained.entry(text.to_owned()).or_default() += 1;
+        let mut texts = pin_texts(value).into_iter();
+        if let Some(own) = texts.next() {
+            let entry = self
+                .retained
+                .entry(own.to_owned())
+                .or_insert_with(|| (0, texts.map(str::to_owned).collect()));
+            entry.0 += 1;
         }
     }
 
@@ -155,12 +160,12 @@ impl StdHost {
     /// collections may free it (and what only it reached) when the jar no
     /// longer reaches it either.
     pub fn release(&mut self, value: &Value) {
-        if let Some(text) = pin_text(value)
-            && let Some(holds) = self.retained.get_mut(text)
+        if let Some(own) = pin_texts(value).first()
+            && let Some((holds, _)) = self.retained.get_mut(*own)
         {
             *holds -= 1;
             if *holds == 0 {
-                self.retained.remove(text);
+                self.retained.remove(*own);
             }
         }
     }
@@ -245,15 +250,16 @@ impl StdHost {
     /// is listed, including bootstrap-only ones.
     fn root_texts<'a>(&'a self, out: &mut Vec<&'a str>) {
         fn value<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
-            if let Some(text) = value_text(value) {
-                out.push(text);
-            }
+            out.extend(value_texts(value));
         }
         for field in self.persistent_static_fields.values() {
             value(field, out);
         }
         // What the embedder holds between invocations (`StdHost::retain`).
-        out.extend(self.retained.keys().map(String::as_str));
+        for (own, (_, held)) in &self.retained {
+            out.push(own);
+            out.extend(held.iter().map(String::as_str));
+        }
         // Only the logged calls the log is read back for (event
         // registrations, `events::read_back_call`). Every other call is
         // history: a constructor's receiver is the new object itself, and
@@ -352,6 +358,7 @@ impl StdHost {
                 out.push(format!("{entry:?}"));
             }
         }
+        push(self.io_paths.get(marker), out);
         push(self.unmodifiable_collections.get(marker), out);
         push(self.reversed_views.get(marker), out);
         push(self.synchronized_views.get(marker), out);
@@ -362,6 +369,9 @@ impl StdHost {
         push(self.iterator_guards.get(marker), out);
         push(self.collection_comparators.get(marker), out);
         push(self.references.get(marker), out);
+        if self.random_sources.contains_key(marker) {
+            out.push(format!("{:?}", self.random_sources.get(marker)));
+        }
         push(self.throwable_causes.get(marker), out);
         push(self.throwable_suppressed.get(marker), out);
         push(self.hash_tables.get(marker), out);
@@ -377,8 +387,9 @@ impl StdHost {
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
     /// tables kept per object.
     fn keyed_table_keys(&self) -> impl Iterator<Item = &str> {
-        self.unmodifiable_collections
+        self.io_paths
             .keys()
+            .chain(self.unmodifiable_collections.keys())
             .chain(self.reversed_views.keys())
             .chain(self.synchronized_views.keys())
             .chain(self.view_copies.keys())
@@ -388,6 +399,7 @@ impl StdHost {
             .chain(self.iterator_guards.keys())
             .chain(self.collection_comparators.keys())
             .chain(self.references.keys())
+            .chain(self.random_sources.keys())
             .chain(self.throwable_causes.keys())
             .chain(self.throwable_suppressed.keys())
             .chain(self.throwable_messages.keys())
@@ -403,6 +415,7 @@ impl StdHost {
 
     /// Drop every per-object row of a collected object (`keep` false).
     fn prune_keyed_tables(&mut self, keep: impl Fn(&str) -> bool) {
+        self.io_paths.retain(|key, _| keep(key));
         self.unmodifiable_collections.retain(|key, _| keep(key));
         self.reversed_views.retain(|key, _| keep(key));
         self.synchronized_views.retain(|key, _| keep(key));
@@ -414,6 +427,7 @@ impl StdHost {
         self.iterator_guards.retain(|key, _| keep(key));
         self.collection_comparators.retain(|key, _| keep(key));
         self.references.retain(|key, _| keep(key));
+        self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
@@ -467,14 +481,14 @@ fn collectable(marker: &str) -> bool {
     crate::jar_object::collection_key(marker).is_some()
 }
 
-/// The text a hold keeps: a handle's key, or a reference's text that may name
+/// The texts a hold keeps: a handle's key (and a callback's held values), or a reference's text that may name
 /// an object (a marker, a callback's captures). A plain `String` holds no
 /// object, and pinning each would grow the set by every string an
 /// invocation answered.
-fn pin_text(value: &Value) -> Option<&str> {
+fn pin_texts(value: &Value) -> Vec<&str> {
     match value {
-        Value::Ref(Some(text)) if crate::value_class::is_plain_string(text) => None,
-        other => value_text(other),
+        Value::Ref(Some(text)) if crate::value_class::is_plain_string(text) => Vec::new(),
+        other => value_texts(other),
     }
 }
 
@@ -498,6 +512,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
 }
@@ -587,6 +602,40 @@ impl FreedObjects {
 
 fn value_bytes(value: &Value) -> usize {
     value_text(value).map_or(8, str::len)
+}
+
+/// Every text a value names other objects through: [`value_text`], and the
+/// texts of every value a handle holds exactly (a callback's row, the values
+/// an optional or a map entry was made of), which its key names only in
+/// bounded text (#156 P15b). Every root and heap walker uses this.
+///
+/// The walk has no depth bound (#261 round-3 S2): a capture held 70 links
+/// down a chain a jar built in a loop is as reachable as one held at the
+/// top. It is a loop over a worklist, so a chain 200,000 deep takes no native
+/// stack, and it visits each shared row or held list once, so a chain that
+/// holds one operand twice per link (`p = p.or(p)`) is not walked 2^n times.
+pub(crate) fn value_texts(value: &Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        if let Some(text) = value_text(value) {
+            out.push(text);
+        }
+        let Value::Host(handle) = value else {
+            continue;
+        };
+        if let Some(row) = handle.row()
+            && seen.insert(std::ptr::from_ref(row).cast::<u8>())
+        {
+            pending.extend(row.values());
+        }
+        let held = handle.held();
+        if !held.is_empty() && seen.insert(held.as_ptr().cast::<u8>()) {
+            pending.extend(held);
+        }
+    }
+    out
 }
 
 /// The text a value names other objects through: a reference's, or a host
@@ -691,6 +740,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
             .chain(host.enumerations.keys().map(String::as_str))
             .chain(host.component_states.keys().map(String::as_str))
@@ -807,9 +857,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                     .flat_map(|(_, (elements, _))| elements),
             );
         for value in kept_values {
-            if let Some(text) = value_text(value) {
-                roots.push(text);
-            }
+            roots.extend(value_texts(value));
         }
         for text in roots {
             mark_kotlin_lazy_states(
@@ -880,7 +928,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .chain(components)
             .chain(entries)
         {
-            if let Some(text) = value_text(value) {
+            for text in value_texts(value) {
                 mark_kotlin_lazy_states(
                     heap,
                     text,
@@ -1013,7 +1061,8 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<(), NativeError> {
         let roots = crossing
             .iter()
-            .filter_map(|value| value_text(value).map(str::to_owned))
+            .flat_map(value_texts)
+            .map(str::to_owned)
             .collect();
         self.persist_resident_heap_with(roots)
     }
@@ -1095,8 +1144,17 @@ mod tests {
     fn markers_embedded_in_a_lambda_or_an_entry_keep_their_objects() {
         // A static lambda capturing node 3, and node 1 only as a map entry's
         // value inside a list the host keeps for a static.
-        let (mut host, mut heap) =
-            graph("@indy:demo/Mod#init:4:demo/Mod#lambda$0(Ldemo/Node;)V:rdemo/Node#3");
+        let (mut host, mut heap) = graph("demo/Mod#unused");
+        host.persistent_static_fields.insert(
+            "demo/Mod#ROOTLjava/lang/Object;".into(),
+            crate::callback_marker::lambda_from_text(
+                "demo/Mod#init",
+                4,
+                "",
+                "demo/Mod#lambda$0(Ldemo/Node;)V",
+                "rdemo/Node#3",
+            ),
+        );
         host.persistent_static_fields.insert(
             "demo/Mod#MAPLjava/util/List;".into(),
             text("java/util/ArrayList#7"),
@@ -1343,7 +1401,11 @@ mod tests {
     fn numbers_are_read_from_every_key_a_text_names() {
         let mut out = Vec::new();
         note_numbers("demo/Lock#5", &mut out);
-        note_numbers("@indy:demo/Main#lambda|demo/Cell#12|x#|#", &mut out);
+        let callback = crate::callback_marker::test_token("demo/Main#lambda|demo/Cell#12|x#|#");
+        note_numbers(
+            crate::callback_marker::callback_text(&callback).unwrap(),
+            &mut out,
+        );
         note_numbers("HostRef { key: \"demo/A#7\" } #neutral3", &mut out);
         assert_eq!(out, [5, 12, 7]);
     }
@@ -1417,6 +1479,7 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "random_sources",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",
@@ -1451,6 +1514,7 @@ mod tests {
             "throwable_causes",
             "throwable_suppressed",
             "persistent_static_fields",
+            "io_paths",
             "heap",
             "retained",
             "freed_objects",
@@ -1479,10 +1543,15 @@ mod tests {
             "run_loader",
             "own_loader_classes",
             "fabric_metadata",
+            "fabric_origins",
             "environment_type",
             "game_version",
             "development_environment",
+            "random_bit_scope",
             "console_out",
+            "io_files",
+            "io_file_bytes",
+            "io_dirs",
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",
