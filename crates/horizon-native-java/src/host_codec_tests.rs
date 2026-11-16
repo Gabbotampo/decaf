@@ -4,14 +4,37 @@
 //! `demo/HostCodecs.java` makes its pairs through the real API in both runs: compiled against
 //! the fixture's compile-only stubs here (only `demo/*` ships, so every call reaches the
 //! runtime's model), and against DataFixerUpper 10.0.21 (the 26.3 server's library, with guava
-//! and fastutil) by `oracle/HostCodecsOracle.java` on OpenJDK 25.0.5+8 (two runs alike but for
-//! an identity hash), whose output is every expected string below.
+//! and fastutil) by `oracle/HostCodecsOracle.java` on OpenJDK 25.0.5+8; the committed
+//! `oracle/java25.txt` is the direct stdout of that run.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 use crate::{NativeJar, StdHost, Value};
+
+fn oracle_row(name: &str) -> &'static str {
+    static JAVA25_ORACLE: OnceLock<String> = OnceLock::new();
+    let oracle = JAVA25_ORACLE.get_or_init(|| {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = [
+            manifest.join("tests/fixtures/host_codecs/oracle/java25.txt"),
+            manifest
+                .join("../crates/horizon-native-java/tests/fixtures/host_codecs/oracle/java25.txt"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("the committed Java 25 oracle is present");
+        std::fs::read_to_string(path).expect("the committed Java 25 oracle is readable")
+    });
+    oracle
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix('='))
+        })
+        .unwrap_or_else(|| panic!("missing Java 25 oracle row {name}"))
+}
 
 enum Outcome {
     Exact(&'static str),
@@ -107,20 +130,53 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
                 "1aa1|falsetruefalsetruefalsefalse2|(1, a)|(null, null)|1089,961|truetruefalsecom.mojang.datafixers.util.Pairjava.lang.Object|true71",
             ),
         ),
+        ("pairMaps", Exact("(2, b)|(3, B)|3B|true")),
+        (
+            "pairSubclass",
+            Exact("demo.HostCodecs$SubPair|1|sub|7|own7|true"),
+        ),
+        (
+            "eithers",
+            Exact("Left[a]|Right[2]|A|2|a|2|false|false|a3|Right[a]"),
+        ),
+        ("eitherIdentity", Exact("false|false")),
+        ("eitherOrThrow", Counted),
         ("nested", Exact("((2, b), [3, 4])|36770|true")),
         // An identity hash held: counted.
         ("identityHeld", Counted),
         // An unmodelled codec constant (Java `truetrue`): counted.
-        ("opaqueCodec", Counted),
+        ("opaqueCodec", Exact("truetrue")),
         // A library's codec constants are one object each: identity, `equals`, hash
         // collections exact, the constants' reads counted (#199 F2).
         (
             "codecConstants",
-            CountedAs("truefalsetruefalsetruefalse2true1truefalse1true"),
+            Exact("truefalsetruefalsetruefalse2true1truefalse1true"),
         ),
         // `Set.of` refuses one constant twice and prints it (DFU's `toString`).
-        ("codecDuplicate", CountedAs("duplicate element: String")),
-        ("codecText", CountedAs("String|Int|Bool")),
+        (
+            "codecSingletons",
+            Exact("truetruetruetruetruetruetruetruetruetruetruetruetruefalse"),
+        ),
+        ("codecDuplicate", Exact("duplicate element: String")),
+        ("codecText", Exact("String|Int|Bool")),
+        (
+            "dfuConstruction",
+            CountedAs("true|false|true|false|true|true|false|true"),
+        ),
+        (
+            "countedOperations",
+            CountedAs(oracle_row("countedOperations")),
+        ),
+        ("dfuText", Exact(oracle_row("dfuText"))),
+        (
+            "forgedDfuReceiver",
+            CountedAs(oracle_row("forgedDfuReceiver")),
+        ),
+        ("callbackXmapUse", CountedAs(oracle_row("callbackXmapUse"))),
+        (
+            "forgedDfuReceivers",
+            CountedAs(oracle_row("forgedDfuReceivers")),
+        ),
         // A pair is never equal to a JDK object (#199 F4).
         ("pairVsJdk", Exact("falsefalsefalsefalsefalse")),
     ];
@@ -154,6 +210,50 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn each_dfu_operation_is_counted_individually() {
+    let mut host = StdHost::new();
+    let answer = jar()
+        .invoke_method_with_args(
+            "demo/HostCodecs",
+            "countedOperations",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(answer, Value::Ref(Some("8".into())));
+    let names: std::collections::BTreeSet<_> = host
+        .unknown_host_calls()
+        .into_iter()
+        .map(|(call, _)| {
+            call.split('#')
+                .nth(1)
+                .unwrap()
+                .split('(')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    for name in [
+        "listOf",
+        "dispatch",
+        "orElse",
+        "validate",
+        "codec",
+        "encodeStart",
+        "decode",
+        "parse",
+    ] {
+        assert!(
+            names.contains(name),
+            "missing counted DFU operation {name}: {names:?}"
+        );
+    }
 }
 
 /// A String is no codec: a payload registered with one names no codec, and the attachment

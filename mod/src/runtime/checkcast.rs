@@ -25,10 +25,9 @@
 //! - the exception message names a jar's or the game's class as in the
 //!   unnamed module of loader `app` (a plain `java -cp` run): in the game its
 //!   loader is Knot's, whose name carries an identity hash no run can know;
-//! - a lambda (an `@indy:` marker) cast to a jar *interface* passes uncounted:
-//!   the marker does not record which functional interface the lambda
-//!   implements, and javac only emits such a cast after an erased generic read.
-//!   A lambda cast to a jar *class* still throws.
+//! - a lambda cast to a type its class does not implement throws a counted
+//!   `ClassCastException`: Java's message names the lambda's hidden class
+//!   (`Demo$$Lambda/0x…`), which no run reproduces (`callback_marker.rs`).
 
 use super::*;
 
@@ -415,6 +414,11 @@ impl<H: Host> Runtime<'_, H> {
                     Some(class) => HostCast::Throws(class.to_owned()),
                     None => HostCast::FailsCounted,
                 },
+                // A callback no answer covers (its functional interface is
+                // not held) fails counted, never passes: Java's verdict is
+                // unknown, and a passed cast would hand the jar an object it
+                // may not hold (#261 review B2).
+                None if handle.kind() == HostKind::Callback => HostCast::FailsCounted,
                 None => HostCast::Unknown,
             });
         }
@@ -498,6 +502,11 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
         }
+        if let Value::Host(handle) = value
+            && handle.kind() == HostKind::Callback
+        {
+            return handle.instance_of(target, self);
+        }
         let target_is_interface = self
             .class(target)
             .and_then(class_access)
@@ -512,6 +521,13 @@ impl<H: Host> Runtime<'_, H> {
     /// [`Self::known_instance_of`] for an object of the class `class`, before
     /// one exists (a `ServiceLoader` provider the loader is about to build).
     pub(crate) fn class_known_instance_of(&self, class: &str, target: &str) -> Option<bool> {
+        if self.class(class).is_some_and(|file| {
+            file.interface_names()
+                .iter()
+                .any(|interface| interface == target)
+        }) {
+            return Some(true);
+        }
         let target_is_interface = self
             .class(target)
             .and_then(class_access)
@@ -677,13 +693,6 @@ impl<H: Host> Runtime<'_, H> {
             };
             return (verdict, Some("java/lang/String".into()));
         }
-        if marker.starts_with("@indy:") {
-            // A lambda is an instance of its functional interface only.
-            return match target_is_interface {
-                Some(false) => (Verdict::No, Some("java/lang/Object".into())),
-                _ => (Verdict::Yes, None),
-            };
-        }
         // An annotation object reflection handed out implements exactly its
         // annotation interface.
         if let Some(annotation) = self.annotations.get(marker) {
@@ -715,19 +724,10 @@ impl<H: Host> Runtime<'_, H> {
         }
         // A JDK value the runtime builds itself (a collection, a stream, a
         // builder): JDK classes never extend or implement a jar type.
-        let jdk_kind = [
-            "string-builder/",
-            "stream/",
-            "list/",
-            "set/",
-            "map/",
-        ]
-        .iter()
-        .any(|prefix| marker.starts_with(prefix))
-            || matches!(
-                marker,
-                                "list" | "set" | "map" | "true" | "false"
-            )
+        let jdk_kind = ["string-builder/", "stream/"]
+            .iter()
+            .any(|prefix| marker.starts_with(prefix))
+            || matches!(marker, "true" | "false")
             // An object `new` made of a JDK class (`java/util/ArrayList#3`).
             || crate::runtime::jar_object::value_marker_class(value).is_some_and(|class| class.starts_with("java/"));
         if jdk_kind {
@@ -957,7 +957,13 @@ impl<H: Host> Runtime<'_, H> {
 /// Mixins') for a jar class, `None` where the chain leaves them.
 impl<H: Host> host_ref::ClassHierarchy for Runtime<'_, H> {
     fn described_instance_of(&self, key: &str, wanted: &str) -> Option<bool> {
-        self.host.described_instance_of(key, wanted)
+        self.host
+            .described_instance_of(key, wanted)
+            .or_else(|| self.host.game_instance_of(key, wanted))
+    }
+
+    fn declared_interfaces(&self, class: &str) -> Option<Vec<String>> {
+        self.class(class).map(|file| file.interface_names())
     }
 
     fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {

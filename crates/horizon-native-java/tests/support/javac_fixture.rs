@@ -63,6 +63,51 @@ impl Fixture {
         Self::build_jars(test, sources, &[], false)
     }
 
+    pub fn build_with_real_classpath(
+        test: &str,
+        sources: &[(&str, &str)],
+        classpath: &Path,
+        mod_json: &str,
+    ) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            false,
+            "demo",
+            Some(mod_json),
+            Some(classpath),
+        )
+    }
+
+    /// Compile a probe against a string classpath for lightweight fixtures.
+    pub fn build_with_classpath<P: AsRef<Path>>(
+        test: &str,
+        sources: &[(&str, &str)],
+        classpath: P,
+    ) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            false,
+            "demo",
+            None,
+            Some(classpath.as_ref()),
+        )
+    }
+
+    /// [`Self::build`] with byte-level patches applied to named compiled
+    /// classes before they are packed. This keeps small JVM opcode probes
+    /// hand-written without checking generated class files into the tree.
+    pub fn build_with_patches(
+        test: &str,
+        sources: &[(&str, &str)],
+        patches: &[(&str, fn(&mut [u8]))],
+    ) -> Self {
+        Self::build_packed_with_patches(test, sources, &[], false, "demo", None, None, patches)
+    }
+
     /// [`Self::build`], with the `lib/` classes packed as a second jar
     /// (`lib`, a library the probe jar bundles or depends on) and `extra`
     /// `(entry, bytes)` files written into the probe jar.
@@ -73,13 +118,13 @@ impl Fixture {
     /// [`Self::build`], packing every compiled class into the probe jar, not
     /// only `demo/`'s (a probe whose jar classes sit in other packages).
     pub fn build_every_package(test: &str, sources: &[(&str, &str)]) -> Self {
-        Self::build_packed(test, sources, &[], false, "", None)
+        Self::build_packed(test, sources, &[], false, "", None, None)
     }
 
     /// [`Self::build`] with `mod_json` as the jar's `fabric.mod.json` (its own
     /// entrypoints).
     pub fn build_with_mod_json(test: &str, sources: &[(&str, &str)], mod_json: &str) -> Self {
-        Self::build_packed(test, sources, &[], false, "demo", Some(mod_json))
+        Self::build_packed(test, sources, &[], false, "demo", Some(mod_json), None)
     }
 
     fn build_jars(
@@ -88,7 +133,7 @@ impl Fixture {
         extra: &[(&str, &[u8])],
         with_lib: bool,
     ) -> Self {
-        Self::build_packed(test, sources, extra, with_lib, "demo", None)
+        Self::build_packed(test, sources, extra, with_lib, "demo", None, None)
     }
 
     /// Compile `sources` and pack the classes under `packed` (every class
@@ -100,6 +145,29 @@ impl Fixture {
         with_lib: bool,
         packed: &str,
         mod_json: Option<&str>,
+        classpath: Option<&Path>,
+    ) -> Self {
+        Self::build_packed_with_patches(
+            test,
+            sources,
+            extra,
+            with_lib,
+            packed,
+            mod_json,
+            classpath,
+            &[],
+        )
+    }
+
+    fn build_packed_with_patches(
+        test: &str,
+        sources: &[(&str, &str)],
+        extra: &[(&str, &[u8])],
+        with_lib: bool,
+        packed: &str,
+        mod_json: Option<&str>,
+        classpath: Option<&Path>,
+        patches: &[(&str, fn(&mut [u8]))],
     ) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -115,7 +183,11 @@ impl Fixture {
             .map(|home| PathBuf::from(home).join("bin/javac"))
             .unwrap_or_else(|| "javac".into());
         let mut javac = Command::new(javac);
-        javac.args(["--release", "21", "-d"]).arg(&classes);
+        javac.args(["--release", "21"]);
+        if let Some(classpath) = classpath {
+            javac.arg("-cp").arg(classpath);
+        }
+        javac.args(["-d"]).arg(&classes);
         for (path, source) in sources {
             let file = root.join("src").join(path);
             fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -137,10 +209,18 @@ impl Fixture {
         )
         .unwrap();
         for class in files_under(&classes.join(packed)) {
-            let entry = class.strip_prefix(&classes).unwrap().to_string_lossy();
+            let entry = class
+                .strip_prefix(&classes)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
             zip.start_file(entry.replace('\\', "/"), SimpleFileOptions::default())
                 .unwrap();
-            zip.write_all(&fs::read(class).unwrap()).unwrap();
+            let mut bytes = fs::read(class).unwrap();
+            if let Some((_, patch)) = patches.iter().find(|(name, _)| *name == entry) {
+                patch(&mut bytes);
+            }
+            zip.write_all(&bytes).unwrap();
         }
         for (entry, bytes) in extra {
             zip.start_file(*entry, SimpleFileOptions::default())

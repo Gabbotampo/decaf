@@ -1,7 +1,7 @@
 //! The JDK's own class hierarchy, as Java 25 reports it: the data a "this object is not a
 //! `wanted`" answer may rest on (#156, `host_ref.rs`).
 //!
-//! `jdk_supertypes_25.txt` is generated, never edited: `tests/fixtures/jdk_supertypes/
+//! `jdk_supertypes_25.toml` is generated, never edited: `tests/fixtures/jdk_supertypes/
 //! JdkSupertypes.java` run on OpenJDK 25 prints, for each class the runtime's JDK answers read,
 //! whether it is final or an interface and its whole supertype set (`getSuperclass()` and
 //! `getInterfaces()`, transitively) and which of `equals`/`hashCode`/`toString`/`compareTo` its
@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-const DATA: &str = include_str!("jdk_supertypes_25.txt");
+const DATA: &str = include_str!("jdk_supertypes_25.toml");
 
 /// One generated row.
 pub(crate) struct JdkClass {
@@ -98,7 +98,7 @@ fn table() -> &'static Table {
                 (Some("object"), Some(package), Some(entries), None) => {
                     for entry in entries.split(' ') {
                         let Some((simple, flags)) = entry.split_once('=') else {
-                            panic!("malformed jdk_supertypes_25.txt object entry: {entry:?}");
+                            panic!("malformed jdk_supertypes_25.toml object entry: {entry:?}");
                         };
                         objects.insert(format!("{package}/{simple}"), flags);
                     }
@@ -107,7 +107,7 @@ fn table() -> &'static Table {
                     packages.insert(name);
                     modules.insert(name, module);
                 }
-                _ => panic!("malformed jdk_supertypes_25.txt line: {line:?}"),
+                _ => panic!("malformed jdk_supertypes_25.toml line: {line:?}"),
             }
         }
         Table {
@@ -124,6 +124,16 @@ fn table() -> &'static Table {
 /// exported package of the system modules holds publicly.
 pub(crate) fn object_members(name: &str) -> Option<&'static str> {
     table().objects.get(name).copied()
+}
+
+/// Whether Java 25 identifies a public JDK class as an enum. Explicit
+/// hierarchy rows carry their direct superclass; exported-package rows carry
+/// the generated uppercase E marker for enum classes.
+pub(crate) fn class_is_enum(name: &str) -> Option<bool> {
+    if let Some(row) = class(name) {
+        return Some(row.superclass == Some("java/lang/Enum"));
+    }
+    object_members(name).map(|members| members.contains('E'))
 }
 
 /// The generated row of JDK class `name`.

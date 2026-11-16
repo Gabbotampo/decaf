@@ -19,6 +19,19 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(receiver) = receiver
+            && let Some(value) = crate::runtime::kotlin_stdlib::instance(self, r, receiver, args)
+        {
+            return value.map(Some);
+        }
+        if receiver.is_none()
+            && let Some(value) = crate::runtime::kotlin_stdlib::invoke(self, r, args)
+        {
+            return value.map(Some);
+        }
+        if let Some(value) = string_constructors::value_of(self, r, args)? {
+            return Ok(Some(value));
+        }
         // Loggers named after a class (`jdk_model.rs`).
         if let Some(value) = self.invoke_logger_factory(r, args)? {
             return Ok(Some(value));
@@ -166,7 +179,7 @@ impl<H: Host> Runtime<'_, H> {
     /// value live in the object's own `key`/`value` fields; `getKey`,
     /// `getValue`, `setValue` (the immutable one throws) and `toString`
     /// answer from them. A call typed as `Map.Entry` on one reaches here too,
-    /// before the host's `map-entry/` marker model refuses the object.
+    /// before the host's entry model (`host_map_entry.rs`) counts the object.
     fn invoke_simple_entry(
         &mut self,
         r: &MethodRef,
@@ -957,7 +970,7 @@ impl<H: Host> Runtime<'_, H> {
             let Some(array) = args.first().cloned() else {
                 return Ok(None);
             };
-            let Some(length) = self.owned_array(&array).map(Vec::len) else {
+            let Some(length) = self.owned_array(&array).map(|values| values.len()) else {
                 return Ok(None);
             };
             let (offset, count) = match r.descriptor.as_str() {
@@ -1060,7 +1073,11 @@ impl<H: Host> Runtime<'_, H> {
                         None => return Ok(None),
                     },
                 };
-                let Some(capacity) = self.arrays.get(&target).map(Vec::len) else {
+                let Some(capacity) = self
+                    .arrays
+                    .get(&target)
+                    .map(crate::runtime::array_data::ArrayData::len)
+                else {
                     return Ok(None);
                 };
                 let (offset, length) = if r.descriptor == "([B)I" {
@@ -1087,9 +1104,9 @@ impl<H: Host> Runtime<'_, H> {
                         Value::Int(-1)
                     } else {
                         let read = bytes.len();
-                        if let Some(slots) = self.arrays.get_mut(&target) {
-                            for (slot, byte) in slots[offset..offset + read].iter_mut().zip(bytes) {
-                                *slot = Value::Int(i32::from(byte as i8));
+                        if let Some(array) = self.arrays.get_mut(&target) {
+                            for (index, byte) in bytes.into_iter().enumerate() {
+                                array.store(offset + index, Value::Int(i32::from(byte as i8)));
                             }
                         }
                         Value::Int(read as i32)
@@ -1145,7 +1162,23 @@ impl<H: Host> Runtime<'_, H> {
         let Ok(items) = runtime_collection_values(&*self.host, receiver) else {
             return Ok(None);
         };
-        let values = items;
+        // `toArray(IntFunction)` on an entry set of `Collections.unmodifiableMap` is JDK 25's
+        // `UnmodifiableCollection.toArray(f)`, `c.toArray(f)`: the source map's own entries.
+        // `UnmodifiableEntrySet` wraps each entry only in `toArray()` and `toArray(T[])`, so the
+        // other two forms keep the wrappers (#221 review 7, B11). Only a view's entry set holds
+        // wrappers (a list copied from it keeps them, as Java's copy does).
+        let unwrap = r.descriptor == "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"
+            && expect_ref(receiver).is_some_and(|marker| {
+                self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
+            });
+        let values = if unwrap {
+            items
+                .into_iter()
+                .map(|entry| self.host.unwrapped_view_entry(&entry).unwrap_or(entry))
+                .collect()
+        } else {
+            items
+        };
         // `toArray(IntFunction)` is `toArray(generator.apply(0))`
         // (`Collection`'s default): the generated array names the class.
         let target = match r.descriptor.as_str() {
@@ -1182,8 +1215,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.host.unknown_operand_call(r).map(Some);
             };
             if let Some(target) = &target
-                && let Some(slots) =
-                    host_array::array_key(target).and_then(|key| self.arrays.get_mut(key))
+                && let Some(slots) = host_array::array_key(target)
+                    .and_then(|key| self.arrays.get_mut(key))
+                    .and_then(crate::runtime::array_data::ArrayData::refs_mut)
                 && slots.len() >= values.len()
             {
                 for (slot, value) in slots.iter_mut().zip(&values[..misfit]) {
@@ -1200,8 +1234,9 @@ impl<H: Host> Runtime<'_, H> {
         // slot after the last element, as the JDK's `AbstractCollection` does;
         // otherwise it answers a new array of `a`'s class.
         if let Some(target) = target
-            && let Some(slots) =
-                host_array::array_key(&target).and_then(|key| self.arrays.get_mut(key))
+            && let Some(slots) = host_array::array_key(&target)
+                .and_then(|key| self.arrays.get_mut(key))
+                .and_then(crate::runtime::array_data::ArrayData::refs_mut)
             && slots.len() >= values.len()
         {
             let length = values.len();
@@ -1303,7 +1338,7 @@ impl<H: Host> Runtime<'_, H> {
             }
         };
         let more = match args.get(1) {
-            Some(value @ Value::Host(_)) => self.array(value)?.clone(),
+            Some(value @ Value::Host(_)) => self.array(value)?.into_owned(),
             _ => Vec::new(),
         };
         let mut parts = vec![first];

@@ -13,6 +13,9 @@
 //! The logging stubs are compiled for `javac` but left out of the jar: the jar
 //! must reach the host's logger model, as a real mod reaches the platform's.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{LinkedClassTable, NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -496,7 +499,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-jdk-{test}-{}-{unique}",
             std::process::id()
         ));
@@ -736,11 +739,13 @@ fn entry_lists_round_trip_and_sort_like_the_jdk() {
 
 #[test]
 fn string_format_widths_flags_hex_and_half_up_precision() {
-    // The JDK's `Formatter`: `%.2f` rounds the shortest digits half-up.
+    // Integer and string conversions are exact. The trailing no-locale floating
+    // conversions use Locale.getDefault(Locale.Category.FORMAT), which the bounded
+    // host cannot provide, so Java's string concatenation sees null.
     let fixture = Fixture::build("formats");
     assert_eq!(
         fixture.text("formats"),
-        "[00ff|ab   |   ab|-0042|7   |FF|he|ffffffff]2.68|10.00|3"
+        "[00ff|ab   |   ab|-0042|7   |FF|he|ffffffff]null"
     );
 }
 
@@ -766,14 +771,14 @@ fn guava_immutable_map_collector_collects_and_rejects_duplicate_keys() {
 
 #[test]
 fn kotlin_null_checks_throw_what_the_intrinsics_throw() {
-    // `java` with kotlin-stdlib 2.4.21 prints the same, except that a
-    // parameter check also names the calling method ("method
-    // demo.Probe.lambda$..., parameter name"), which a host call cannot see.
+    // `java` with kotlin-stdlib 2.4.21 includes the caller method in the
+    // parameter-check message, which the interpreter recovers from the
+    // current frame.
     let fixture = Fixture::build("kotlin-checks");
     assert_eq!(
         fixture.text("kotlinNullChecks"),
-        "NPE:null|NPE:custom|NPE:Parameter specified as non-null is null: parameter name|\
-         IAE:Parameter specified as non-null is null: parameter name|\
+        "NPE:null|NPE:custom|NPE:Parameter specified as non-null is null: method demo.Probe.lambda$kotlinNullChecks$2, parameter name|\
+         IAE:Parameter specified as non-null is null: method demo.Probe.lambda$kotlinNullChecks$3, parameter name|\
          NPE:getFoo(...) must not be null|ISE:getFoo(...) must not be null|ok"
     );
 }

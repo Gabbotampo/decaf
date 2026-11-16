@@ -161,6 +161,9 @@ public @interface At {
     String target() default "";
     int opcode() default 0;
     int ordinal() default -1;
+    Shift shift() default Shift.NONE;
+    int by() default 0;
+    public enum Shift { NONE, BEFORE, AFTER, BY }
 }
 "#;
 
@@ -171,6 +174,7 @@ import java.lang.annotation.*;
 public @interface Inject {
     String[] method();
     At[] at();
+    Slice slice() default @Slice;
     boolean cancellable() default false;
 }
 "#;
@@ -182,6 +186,64 @@ import java.lang.annotation.*;
 public @interface Redirect {
     String[] method();
     At[] at();
+}
+"#;
+
+const SLICE: &str = r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target({})
+public @interface Slice {
+    At from() default @At("HEAD");
+    At to() default @At("TAIL");
+}
+"#;
+
+const MODIFY_ARG: &str = r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface ModifyArg {
+    String[] method();
+    At at();
+    int index() default -1;
+    boolean remap() default true;
+}
+"#;
+
+const MODIFY_VARIABLE: &str = r#"package org.spongepowered.asm.mixin.injection;
+import java.lang.annotation.*;
+@Retention(RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+public @interface ModifyVariable {
+    String[] method();
+    At at();
+    int ordinal() default -1;
+    int index() default -1;
+}
+"#;
+
+const REPORT_SELECTORS: &str = r#"package demo;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.*;
+@Mixin(targets = {"Ldemo/Target;"})
+public abstract class ReportSelectorsMixin {
+    @Inject(method = "call()I", at = @At(value = "INVOKE", target = "Ldemo/Probe;value()I", ordinal = 1, shift = At.Shift.AFTER))
+    private static void invokeAfter() {}
+    @Inject(method = "call()I", at = @At(value = "INVOKE", target = "Ldemo/Probe;value()I", shift = At.Shift.BEFORE))
+    private static void invokeBefore() {}
+    @Inject(method = "call()I", at = @At(value = "INVOKE", target = "Ldemo/Probe;value()I", shift = At.Shift.BY, by = 2), slice = @Slice(from = @At("HEAD"), to = @At("RETURN")))
+    private static void invokeBy() {}
+    @Inject(method = "call()I", at = @At(value = "INVOKE", target = "Ldemo/Probe;value()I"))
+    private static void invokeOmitted() {}
+    @Inject(method = "read()I", at = @At(value = "FIELD", target = "Ldemo/Target;count:I", opcode = 180))
+    private static void fieldGet() {}
+    @Inject(method = "writeThenRead(I)I", at = @At(value = "FIELD", target = "Ldemo/Target;sink:I", opcode = 181))
+    private static void fieldPut() {}
+    @ModifyArg(method = "call()I", at = @At(value = "INVOKE", target = "Ldemo/Probe;value()I", ordinal = 1), index = 0)
+    private static int modifyArg(int value) { return value; }
+    @ModifyVariable(method = "choose(I)I", at = @At(value = "STORE", ordinal = 2), ordinal = 2)
+    private static int modifyVariable(int value) { return value; }
 }
 "#;
 
@@ -235,6 +297,15 @@ fn sources(mixin_name: &'static str, mixin: &'static str) -> BTreeMap<&'static s
     let mut sources = BTreeMap::new();
     sources.insert("org/spongepowered/asm/mixin/Mixin.java", MIXIN);
     sources.insert("org/spongepowered/asm/mixin/injection/At.java", AT);
+    sources.insert("org/spongepowered/asm/mixin/injection/Slice.java", SLICE);
+    sources.insert(
+        "org/spongepowered/asm/mixin/injection/ModifyArg.java",
+        MODIFY_ARG,
+    );
+    sources.insert(
+        "org/spongepowered/asm/mixin/injection/ModifyVariable.java",
+        MODIFY_VARIABLE,
+    );
     sources.insert("org/spongepowered/asm/mixin/injection/Inject.java", INJECT);
     sources.insert(
         "org/spongepowered/asm/mixin/injection/Redirect.java",
@@ -316,6 +387,101 @@ public abstract class FieldWriteCancelMixin {
     }
 }
 "#;
+
+#[test]
+fn plan_report_preserves_declared_selector_values() {
+    if !has_jdk() {
+        eprintln!("skipping: no JDK");
+        return;
+    }
+    let (root, jar_path) = build_jar(
+        "report-selectors",
+        sources("ReportSelectorsMixin.java", REPORT_SELECTORS),
+    );
+    let probe = env!("CARGO_BIN_EXE_horizon-native-java");
+    let output = Command::new(probe)
+        .args(["--json", "--mixin-plans", jar_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plans = report["plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(report["unresolved"].as_array().unwrap().iter())
+        .collect::<Vec<_>>();
+    let find = |callback: &str| {
+        plans
+            .iter()
+            .find(|row| row["callback"] == callback)
+            .unwrap()
+    };
+    assert_eq!(find("demo/ReportSelectorsMixin#invokeAfter")["ordinal"], 1);
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeAfter")["shift"],
+        "AFTER"
+    );
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeAfter")["by"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeBefore")["shift"],
+        "BEFORE"
+    );
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeBefore")["by"],
+        serde_json::Value::Null
+    );
+    assert_eq!(find("demo/ReportSelectorsMixin#invokeBy")["shift"], "BY");
+    assert_eq!(find("demo/ReportSelectorsMixin#invokeBy")["by"], 2);
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeBy")["slice"],
+        serde_json::json!({"from":"HEAD","to":"RETURN"})
+    );
+    assert_eq!(
+        find("demo/ReportSelectorsMixin#invokeOmitted")["ordinal"],
+        serde_json::Value::Null
+    );
+    let anchors = report["anchor_plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(report["unresolved_anchor_plans"].as_array().unwrap().iter())
+        .collect::<Vec<_>>();
+    assert!(anchors.iter().any(|row| row["opcode"] == 180));
+    assert!(anchors.iter().any(|row| row["opcode"] == 181));
+    let modify_args = report["modify_arg_plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(
+            report["unresolved_modify_arg_plans"]
+                .as_array()
+                .unwrap()
+                .iter(),
+        )
+        .collect::<Vec<_>>();
+    assert!(modify_args.iter().any(|row| row["ordinal"] == 1));
+    let modify_vars = report["modify_variable_plans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(
+            report["unresolved_modify_variable_plans"]
+                .as_array()
+                .unwrap()
+                .iter(),
+        )
+        .collect::<Vec<_>>();
+    assert!(modify_vars.iter().any(|row| row["ordinal"] == 2));
+    let _ = root;
+}
 
 #[test]
 fn field_read_runs_the_callback_before_the_field_access() {

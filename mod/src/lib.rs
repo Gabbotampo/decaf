@@ -80,15 +80,16 @@ use std::time::Duration;
 use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
-    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow,
-    GameRuleChangedEvent, Hand, Hooks, Host, HostSide, InteractionResult, ItemsEvent,
-    LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
-    LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
-    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
+    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
+    CommandSource, ConfigFileError, ConfigPath, DimensionKey, EntityInteractEvent,
+    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
+    Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
+    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
+    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
+    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
     RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
     RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
     ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
@@ -107,6 +108,7 @@ use runtime::{ExecutionBudget, GameHookEffect, GameObject, NativeJar, StdHost};
 use serde_json::json;
 
 mod attachments;
+mod client;
 mod content;
 mod game_hooks;
 mod runtime;
@@ -129,6 +131,7 @@ const LOG: &str = "Horizon Java";
 #[derive(Default)]
 pub struct HorizonJava {
     state: Mutex<State>,
+    client: Mutex<client::State>,
 }
 
 #[derive(Default)]
@@ -419,7 +422,7 @@ fn hyphenated_uuid(uuid: u128) -> String {
     )
 }
 
-#[mod_api::horizon_mod]
+#[mod_api::sunrise_mod]
 impl Hooks for HorizonJava {
     /// The content root still accepts native block declarations here, at the Registration phase
     /// and before any resource loads (NeoForge's `RegisterEvent` drained from
@@ -468,7 +471,7 @@ impl Hooks for HorizonJava {
                 .count()
         };
         let total = state.jars.len() + state.refused.len();
-        match write_report(host, &state) {
+        match write_report(host, &state, &self.lock_client()) {
             Ok(path) => log::info!(
                 "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
@@ -544,7 +547,7 @@ impl Hooks for HorizonJava {
         for row in state.rows() {
             log::info!("{LOG}: {row}");
         }
-        if let Err(error) = write_report(host, &state) {
+        if let Err(error) = write_report(host, &state, &self.lock_client()) {
             log::warn!("{LOG}: {REPORT} could not be updated at server stopping: {error}");
         }
     }
@@ -1344,30 +1347,50 @@ impl Hooks for HorizonJava {
     /// `PlayerInteractEvent.EntityInteract`).
     fn entity_interact(
         &self,
-        host: &mut dyn ServerHost,
+        host: HostSide<'_>,
         event: &mut EntityInteractEvent<'_>,
-    ) -> Flow {
-        let player = host.players().acting_player();
-        let held = player
-            .and_then(|player| server_facts::held_items(host, player, event.hand, event.stack));
-        let level = player
-            .and_then(|player| player.entity().level(&*host))
-            .map(|level| level.dimension_id().to_owned());
-        let context =
-            entity_interact_context(player.map(|player| player.uuid()), level, held, event);
-        let fired = self.fire_bridged(
-            Some(&mut *host),
-            Lifecycle::None,
-            GameEvent::UseEntity,
-            self.dedicated(),
-            context,
-            |_| true,
-        );
-        if fired.cancelled {
-            Flow::Cancel
-        } else {
-            Flow::Continue
+    ) -> Option<InteractionResult> {
+        let fired = match host {
+            HostSide::Server(host) => {
+                let player = host.players().acting_player();
+                let held = player.and_then(|player| {
+                    server_facts::held_items(host, player, event.hand, event.stack)
+                });
+                let level = player
+                    .and_then(|player| player.entity().level(&*host))
+                    .map(|level| level.dimension_id().to_owned());
+                let context =
+                    entity_interact_context(player.map(|player| player.uuid()), level, held, event);
+                self.fire_bridged(
+                    Some(host),
+                    Lifecycle::None,
+                    GameEvent::UseEntity,
+                    self.dedicated(),
+                    context,
+                    |_| true,
+                )
+            }
+            HostSide::Client(_) => {
+                // The Java bridge has only the server-side player/level/held-item facade. Do not
+                // fire a client callback with fabricated empty context; count the unsupported
+                // side in the jar report and let Sunrise continue its client interaction.
+                self.skip_client_entity_interact();
+                return None;
+            }
+        };
+        let result = fired.cancelled.then(|| {
+            // A Forge cancellation has no Fabric InteractionResult. Fail is the Sunrise
+            // replacement that stops this entity interaction while preserving the old Flow::Cancel.
+            fired
+                .interaction
+                .as_deref()
+                .map(|result| interaction_result(Some(result)))
+                .unwrap_or(InteractionResult::Fail)
+        });
+        if fired.interaction.as_deref() == Some("TRY_WITH_EMPTY_HAND") {
+            self.note_entity_interact_try_empty_hand();
         }
+        result
     }
 
     /// A living entity's death has finished (Fabric's `ServerLivingEntityEvents.AFTER_DEATH`): the
@@ -1403,7 +1426,7 @@ impl Hooks for HorizonJava {
                 kind: event.kind.to_owned(),
                 level: None,
             }),
-            damage: Some(event.damage_type.to_owned()),
+            damage: Some(event.source.damage_type.to_owned()),
             ..EventContext::default()
         };
         let fired = self.fire_bridged(
@@ -1423,7 +1446,7 @@ impl Hooks for HorizonJava {
         // (Villager, Wolf, Raider...) do it after these callbacks here: a named departure.
         if event.kind != "minecraft:player" && !fired.cancelled {
             let (id, kind) = (event.entity as i32, event.kind.to_owned());
-            let damage = event.damage_type.to_owned();
+            let damage = event.source.damage_type.to_owned();
             self.game_hooks(Some(host), "living_death", |state| {
                 let source = game_hooks::damage_source(state, &damage);
                 Some((
@@ -1502,17 +1525,61 @@ impl Hooks for HorizonJava {
         }
     }
 
-    /// The client finished its first load (NeoForge's `FMLClientSetupEvent`), once per process.
-    /// A dedicated server never fires it. No client jar runs yet, so the hook logs the moment and
-    /// nothing else.
+    /// Sunrise FMLClientSetupEvent: once per client process on the render thread, after the
+    /// initial client load and before the title screen's first frame. A dedicated server never
+    /// fires it. The client owner runs its resident jars here before the native setup notification
+    /// returns; this owner hook does not claim to dispatch a second Java setup event.
     fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        log::info!("{LOG} {}: client setup", env!("CARGO_PKG_VERSION"));
+        let mut client = self.lock_client();
+        client.ensure_loaded();
+        let rows = client.report_rows().count();
+        log::info!("{LOG}: stored {rows} client report row(s)");
+        log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
+    /// on the client window. The owner currently records only the presence bit; no Java callback
+    /// is emitted because the resident-jars bridge has no client event facade yet.
+    fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
+        self.lock_client().level_loaded();
+    }
+
+    /// Sunrise's client level unload follows the matching load (including disconnects). As with
+    /// load, the borrowed dimension is deliberately not fabricated into a Java callback.
+    fn client_level_unload(
+        &self,
+        _host: &mut dyn ClientHost,
+        _event: &mut ClientLevelUnloadEvent<'_>,
+    ) {
+        self.lock_client().level_unloaded();
+    }
+
+    /// Sunrise ClientStoppingEvent: once per orderly client process shutdown, after the current
+    /// world is left and saved while client settings and resources remain available. Flush the
+    /// report before dropping the resident per-jar hosts.
+    fn client_stopping(&self, host: &mut dyn ClientHost, _event: &mut ClientStoppingEvent) {
+        let state = self.lock();
+        let mut client = self.lock_client();
+        let rows = client.report_rows().count();
+        if let Err(error) = write_report(host, &state, &client) {
+            log::warn!("{LOG}: {REPORT} could not be flushed at client stopping: {error}");
+        }
+        let dropped = client.teardown();
+        log::info!(
+            "{LOG}: client stopping flushed {rows} row(s), dropped {dropped} resident jar(s)"
+        );
     }
 }
 
 impl HorizonJava {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_client(&self) -> std::sync::MutexGuard<'_, client::State> {
+        self.client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -1627,6 +1694,35 @@ impl HorizonJava {
         Fired {
             cancelled: firing.cancelled,
             interaction: firing.interaction.clone(),
+        }
+    }
+
+    /// Sunrise fires entity interaction on both sides, but the Java bridge currently has only
+    /// server-side player/level/held-item handles. Count unsupported client callbacks instead of
+    /// invoking Java with empty context.
+    fn skip_client_entity_interact(&self) {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            loaded.row.entity_interact_client_skipped += loaded
+                .listeners
+                .iter()
+                .filter(|listener| listener.event == GameEvent::UseEntity)
+                .count();
+        }
+    }
+
+    /// Count the intentional Sunrise TRY_WITH_EMPTY_HAND fall-through, which differs from the
+    /// old Flow cancellation used by this bridge.
+    fn note_entity_interact_try_empty_hand(&self) {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            if loaded
+                .listeners
+                .iter()
+                .any(|listener| listener.event == GameEvent::UseEntity)
+            {
+                loaded.row.entity_interact_try_empty_hand += 1;
+            }
         }
     }
 
@@ -1903,6 +1999,7 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
         Some("SUCCESS_SERVER") => InteractionResult::SuccessServer,
         Some("CONSUME") => InteractionResult::Consume,
         Some("FAIL") => InteractionResult::Fail,
+        Some("TRY_WITH_EMPTY_HAND") => InteractionResult::TryWithEmptyHand,
         _ => InteractionResult::Pass,
     }
 }
@@ -2448,6 +2545,11 @@ struct JarRow {
     commands_ran: usize,
     commands_refused: usize,
     command_unknown_host_calls: usize,
+    /// Sunrise both-side entity callbacks skipped on the client because the Java facade lacks
+    /// player, level and held-item context.
+    entity_interact_client_skipped: usize,
+    /// Sunrise TRY_WITH_EMPTY_HAND fall-throughs, an intentional migration departure.
+    entity_interact_try_empty_hand: usize,
     /// Usages the registration callback built and this bridge translated, and usages it left out
     /// (an argument kind or predicate it cannot carry). Registration failures are callbacks:
     /// they are counted in `callbacks_failed` too.
@@ -2480,6 +2582,8 @@ impl JarRow {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -2528,6 +2632,8 @@ impl JarRow {
                 "translated": self.commands_translated,
                 "refused_at_registration": self.commands_refused_at_registration,
             },
+            "entity_interact_client_skipped": self.entity_interact_client_skipped,
+            "entity_interact_try_empty_hand": self.entity_interact_try_empty_hand,
             "game_hooks": self.game_hooks.json(),
             "content": {
                 "blocks": self.content_blocks,
@@ -2685,6 +2791,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -2713,6 +2821,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -2740,8 +2850,7 @@ fn load_jar(
 
 /// Writes the report, replacing the previous one, and answers the path it was written to (as a
 /// reader finds it under the game's `config/`).
-fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileError> {
-    let path = ConfigPath::new(REPORT)?;
+fn report_json(state: &State, client: &client::State) -> serde_json::Value {
     let rows: Vec<_> = state
         .jars
         .iter()
@@ -2755,8 +2864,22 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
         })
         .chain(state.refused.iter().map(JarRow::json))
         .collect();
-    let report =
-        json!({ "schema": SCHEMA, "jars": rows, "game_hook_sites": game_hooks::sites_json() });
+    let client_rows: Vec<_> = client.report_rows().collect();
+    json!({
+        "schema": SCHEMA,
+        "jars": rows,
+        "client_jars": client_rows,
+        "game_hook_sites": game_hooks::sites_json(),
+    })
+}
+
+fn write_report(
+    host: &dyn Host,
+    state: &State,
+    client: &client::State,
+) -> Result<String, ConfigFileError> {
+    let path = ConfigPath::new(REPORT)?;
+    let report = report_json(state, client);
     let mut bytes = serde_json::to_vec_pretty(&report).unwrap_or_default();
     bytes.push(b'\n');
     host.config_files().write(&path, &bytes)?;
@@ -2766,12 +2889,172 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mod_api::{DamageContainer, EntityRef, Identifier, PermissionLevel, WorldEpoch};
+    use mod_api::{
+        ConfigEntry, ConfigFileError, ConfigFiles, ConfigPath, DamageContainer, Dist, EntityRef,
+        Identifier, PermissionLevel, WorldEpoch,
+    };
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static REPORT_BYTES: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+
+    fn report_bytes() -> &'static Mutex<Option<Vec<u8>>> {
+        REPORT_BYTES.get_or_init(|| Mutex::new(None))
+    }
+
+    struct ReportFiles;
+    impl ConfigFiles for ReportFiles {
+        fn read(&self, _file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
+            report_bytes()
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(ConfigFileError::NotFound)
+        }
+        fn write(&self, _file: &ConfigPath, bytes: &[u8]) -> Result<(), ConfigFileError> {
+            *report_bytes().lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn list(
+            &self,
+            _folder: &ConfigPath,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<ConfigEntry>, ConfigFileError> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
+            Ok(None)
+        }
+    }
+
+    static REPORT_FILES: ReportFiles = ReportFiles;
+
+    struct ReportHost;
+    impl Host for ReportHost {}
+    mod_api::impl_host_areas!(ReportHost, except(config));
+    impl ClientHost for ReportHost {}
+    mod_api::impl_client_host_areas!(ReportHost, except(config));
+    impl mod_api::prelude::ConfigHost for ReportHost {
+        fn dist(&self) -> Dist {
+            Dist::Client
+        }
+        fn game_version(&self) -> &'static str {
+            "26.3"
+        }
+        fn on(&self, _mod_id: &str) -> bool {
+            true
+        }
+        fn setting(&self, _mod_id: &str, _key: &str) -> Option<String> {
+            None
+        }
+        fn set_setting(&self, _mod_id: &str, _key: &str, _value: &str) {}
+        fn config_files(&self) -> &'static dyn ConfigFiles {
+            &REPORT_FILES
+        }
+        fn dimension(&self) -> &'static str {
+            "minecraft:overworld"
+        }
+        fn server_has_time(&self) -> bool {
+            true
+        }
+        fn instance_dir(&self) -> PathBuf {
+            PathBuf::from("/tmp/horizon-java-test")
+        }
+    }
+    impl mod_api::prelude::ConfigClientHost for ReportHost {
+        fn translate(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn setting_bool(&self, _key: &str) -> Option<bool> {
+            None
+        }
+        fn setting_choice(&self, _key: &str) -> Option<u32> {
+            None
+        }
+        fn setting_f64(&self, _key: &str) -> Option<f64> {
+            None
+        }
+        fn setting_color(&self, _key: &str) -> Option<u32> {
+            None
+        }
+    }
+
+    fn lifecycle_fixture() -> Vec<u8> {
+        runtime::neoforge_lifecycle::tests::fixture_jar_bytes().to_vec()
+    }
+
+    fn install_client_fixture(java: &HorizonJava) {
+        java.lock_client()
+            .set_fixture_files(vec![("lifecycle.jar".into(), lifecycle_fixture())]);
+    }
+
+    #[test]
+    fn client_setup_leave_rejoin_stop_and_second_setup_keep_one_listener() {
+        *report_bytes().lock().unwrap() = None;
+        let java = HorizonJava::default();
+        install_client_fixture(&java);
+        let mut host = ReportHost;
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        let first = java.lock_client().report_rows().collect::<Vec<_>>();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["client"]["client_listeners"], 1);
+        let mut load = ClientLevelLoadEvent {
+            dimension: "minecraft:overworld",
+        };
+        Hooks::client_level_load(&java, &mut host, &mut load);
+        assert!(java.lock_client().world_loaded());
+        let mut unload = ClientLevelUnloadEvent {
+            dimension: "minecraft:overworld",
+        };
+        Hooks::client_level_unload(&java, &mut host, &mut unload);
+        assert!(!java.lock_client().world_loaded());
+        Hooks::client_level_load(&java, &mut host, &mut load);
+        assert!(java.lock_client().world_loaded());
+        assert_eq!(java.lock_client().resident_count(), 1);
+        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        assert_eq!(java.lock_client().resident_count(), 0);
+        assert!(!java.lock_client().world_loaded());
+        let report: serde_json::Value =
+            serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
+        assert_eq!(report["client_jars"].as_array().unwrap().len(), 1);
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        let client = java.lock_client();
+        assert_eq!(client.resident_count(), 1);
+        assert_eq!(client.report_rows().count(), 1);
+    }
+
+    #[test]
+    fn client_stages_run_and_persist_success_failure_counters() {
+        *report_bytes().lock().unwrap() = None;
+        let java = HorizonJava::default();
+        install_client_fixture(&java);
+        let mut host = ReportHost;
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        let report: serde_json::Value =
+            serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
+        let row = &report["client_jars"][0];
+        assert_eq!(row["verdict"], "ran-partial");
+        assert_eq!(row["client"]["entrypoints_ran"], 2);
+        assert_eq!(row["client"]["stages"]["Common setup"]["attempted"], 1);
+        assert_eq!(row["client"]["stages"]["Common setup"]["failed"], 0);
+        assert!(
+            row["client"]["stages"]["Common setup"]["calls"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["attempted"], 1);
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["failed"], 1);
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["disabled"], 1);
+        assert!(row["host_calls"].as_u64().unwrap() > 0);
+    }
 
     /// Two players leave in one poll: Horizon drops both before the first logout hook, so the
     /// first logout's refresh drops the second too. Each logout firing still gets its own
-    /// player's last entry (the same `ServerPlayer` earlier firings handed out), once, and a
-    /// player never listed gets none (#228's re-check B2).
+    /// player's last entry (the same ServerPlayer earlier firings handed out), once, and a
+    /// player never listed gets none (re-check B2).
     #[test]
     fn players_leaving_in_one_poll_each_keep_their_last_entry() {
         let player = |uuid: u128, entity_id: i32| FacadePlayer {
@@ -3382,7 +3665,40 @@ mod tests {
         assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
 
-    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess
+    #[test]
+    fn entity_interaction_results_match_sunrise_contract() {
+        assert_eq!(
+            interaction_result(Some("SUCCESS")),
+            InteractionResult::Success
+        );
+        assert_eq!(
+            interaction_result(Some("SUCCESS_SERVER")),
+            InteractionResult::SuccessServer
+        );
+        assert_eq!(
+            interaction_result(Some("CONSUME")),
+            InteractionResult::Consume
+        );
+        assert_eq!(interaction_result(Some("FAIL")), InteractionResult::Fail);
+        assert_eq!(
+            interaction_result(Some("TRY_WITH_EMPTY_HAND")),
+            InteractionResult::TryWithEmptyHand
+        );
+        assert_eq!(interaction_result(Some("PASS")), InteractionResult::Pass);
+        assert_eq!(interaction_result(None), InteractionResult::Pass);
+    }
+
+    #[test]
+    fn entity_interaction_client_departures_are_reported() {
+        let mut row = JarRow::refused("demo.jar", "demo".to_owned(), String::new());
+        row.entity_interact_client_skipped = 2;
+        row.entity_interact_try_empty_hand = 1;
+        let json = row.json();
+        assert_eq!(json["entity_interact_client_skipped"], 2);
+        assert_eq!(json["entity_interact_try_empty_hand"], 1);
+    }
+
+    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess
     /// from the stacks: two empty hands (where the old stack-matching left it unknown) still name
     /// the off hand when the game asks about the off hand.
     #[test]
@@ -3393,7 +3709,6 @@ mod tests {
                 entity: 3,
                 kind: "minecraft:cow",
                 stack: None,
-                cancelled: false,
             };
             let level = Some("minecraft:the_nether".to_owned());
             let context = entity_interact_context(Some(7), level.clone(), None, &event);
@@ -3443,7 +3758,7 @@ mod tests {
             player: 7,
             name: "Alex",
             was_death: true,
-            // The hook-scoped view of the old player (fork pin `1cc882b8e0`); the context
+            // The hook-scoped view of the old player (Sunrise pin `a87e07f5f8`); the context
             // takes the facts read from it, so any token does.
             original: mod_api::__private::game::original_player_ref(1),
         };
