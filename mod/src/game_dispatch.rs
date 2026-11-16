@@ -3,7 +3,9 @@
 //! Generated listeners translate a typed record into [`GameDispatch`] and apply the returned
 //! answer. This module owns one global Mixin order and keeps Java callback semantics in the
 //! existing resident runtime. Java-to-engine re-entry is deliberately refused in PR 1: no
-//! Sunrise dispatch token is available inside a Java callback yet.
+//! Sunrise dispatch token is available inside a Java callback yet. Argument-mutating Mixin plans
+//! are filtered into the load-time body-weave tables (`@ModifyArg`/`@ModifyVariable`) and never
+//! enter these point registrations; generated record copy-back is deferred to PR 2.
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -70,8 +72,6 @@ impl<'a> GameDispatch<'a> {
 pub struct DispatchAnswer {
     pub cancelled: bool,
     pub returned: Option<Value>,
-    /// Copy-out record values. A generated listener writes these back to its Sunrise record.
-    pub updated_args: Vec<Value>,
     pub callbacks: usize,
 }
 
@@ -318,23 +318,25 @@ fn dispatch_state(
         let result = crate::caught(
             &format!("{} game hook {}", loaded.row.id, target.hook),
             || {
-                loaded.jar.run_game_hook_returning(
-                    &registrations,
-                    &mut loaded.hook_state,
-                    &mut context,
-                    &target.hook,
-                    receiver,
-                    dispatch.args,
-                    dispatch.actual.clone(),
-                    &mut loaded.host,
-                    &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
-                )
-                .inspect(|_| {
-                    #[cfg(test)]
-                    if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
-                        panic!("dispatcher callback panic fixture");
-                    }
-                })
+                loaded
+                    .jar
+                    .run_game_hook_returning(
+                        &registrations,
+                        &mut loaded.hook_state,
+                        &mut context,
+                        &target.hook,
+                        receiver,
+                        dispatch.args,
+                        dispatch.actual.clone(),
+                        &mut loaded.host,
+                        &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
+                    )
+                    .inspect(|_| {
+                        #[cfg(test)]
+                        if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
+                            panic!("dispatcher callback panic fixture");
+                        }
+                    })
             },
         );
         let run = match result {
@@ -354,7 +356,6 @@ fn dispatch_state(
         if run.returned.is_some() {
             answer.returned = run.returned;
         }
-        answer.updated_args = dispatch.args.to_vec();
         for effect in context.take_effects() {
             apply_effect(dispatch.host, effect);
         }
@@ -404,7 +405,9 @@ mod tests {
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            unsafe { System.dealloc(ptr, layout); }
+            unsafe {
+                System.dealloc(ptr, layout);
+            }
         }
     }
     #[global_allocator]
@@ -429,7 +432,9 @@ mod tests {
         actual: f64,
     ) -> Result<DispatchAnswer, DispatchError> {
         let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
-        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
         java.dispatch_game_hook(GameDispatch::new(
             MethodId("java_destroy_speed"),
             Phase::Return,
@@ -442,7 +447,9 @@ mod tests {
 
     fn player_tick_dispatch(java: &HorizonJava) -> Result<DispatchAnswer, DispatchError> {
         let mut args = [];
-        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
         java.dispatch_game_hook(GameDispatch::new(
             MethodId("java_base_player_tick_head"),
             Phase::Head,
@@ -542,7 +549,10 @@ mod tests {
         ];
         java.refresh_game_hook_plan_bits();
         player_tick_dispatch(&java).unwrap();
-        assert_eq!(only_lines(stdout_trace(), &["low", "high"]), ["low", "high"]);
+        assert_eq!(
+            only_lines(stdout_trace(), &["low", "high"]),
+            ["low", "high"]
+        );
 
         java.lock().jars = vec![
             load(
@@ -589,15 +599,39 @@ mod tests {
         let java = HorizonJava::default();
         java.lock().jars.push(load("cancel", "Cancel", "@Mixin(BoneMealItem.class) public class Cancel { @Inject(method=\"growCrop\", at=@At(\"HEAD\"), cancellable=true) private void c(ItemStack s, Level l, BlockPos p, CallbackInfoReturnable<Boolean> ci) { ci.cancel(); } }"));
         java.refresh_game_hook_plan_bits();
-        let mut args = [Value::Ref(Some("game/itemstack/x".into())), Value::Ref(Some("game/level/x".into())), Value::Ref(Some("game/blockpos/x".into()))];
-        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
-        let answer = java.dispatch_game_hook(GameDispatch::new(MethodId("java_grow_crop"), Phase::Head, None, &mut args, None, &mut host)).unwrap();
+        let mut args = [
+            Value::Ref(Some("game/itemstack/x".into())),
+            Value::Ref(Some("game/level/x".into())),
+            Value::Ref(Some("game/blockpos/x".into())),
+        ];
+        let mut host = PlayerTickHost {
+            spectator: BTreeMap::new(),
+        };
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_grow_crop"),
+                Phase::Head,
+                None,
+                &mut args,
+                None,
+                &mut host,
+            ))
+            .unwrap();
         assert!(answer.cancelled);
         assert_eq!(answer.returned, Some(Value::Int(0)));
         java.lock().jars.clear();
         java.lock().jars.push(load("set", "Set", "@Mixin(BoneMealItem.class) public class Set { @Inject(method=\"growCrop\", at=@At(\"HEAD\"), cancellable=true) private void c(ItemStack s, Level l, BlockPos p, CallbackInfoReturnable<Boolean> ci) { ci.setReturnValue(true); } }"));
         java.refresh_game_hook_plan_bits();
-        let answer = java.dispatch_game_hook(GameDispatch::new(MethodId("java_grow_crop"), Phase::Head, None, &mut args, None, &mut host)).unwrap();
+        let answer = java
+            .dispatch_game_hook(GameDispatch::new(
+                MethodId("java_grow_crop"),
+                Phase::Head,
+                None,
+                &mut args,
+                None,
+                &mut host,
+            ))
+            .unwrap();
         assert!(answer.cancelled);
         assert_eq!(answer.returned, Some(Value::Int(1)));
     }
@@ -638,7 +672,11 @@ mod tests {
         FORCE_CALLBACK_PANIC.with(|panic| panic.set(true));
         let error = stop_dispatch(&java, Phase::Tail).unwrap_err();
         FORCE_CALLBACK_PANIC.with(|panic| panic.set(false));
-        assert!(error.to_string().contains("dispatcher callback panic fixture"));
+        assert!(
+            error
+                .to_string()
+                .contains("dispatcher callback panic fixture")
+        );
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.failed, 1);
         assert!(stdout(&mut state, 0).contains(&"before-panic".to_owned()));
@@ -772,32 +810,6 @@ mod tests {
         for worker in workers {
             assert!(worker.join().unwrap().iter().all(|count| *count == 1));
         }
-    }
-
-    #[test]
-    fn updated_args_copy_back_is_exposed_for_pr2_records() {
-        let java = HorizonJava::default();
-        let mut args = [Value::Int(9)];
-        let mut host = PlayerTickHost {
-            spectator: BTreeMap::new(),
-        };
-        let mut words = [0; 4];
-        set_bit(&mut words, "unplanned");
-        java.plan_bits.publish(words);
-        // The record adapter owns applying this payload; PR1 proves the ABI shape without a Sunrise record.
-        let answer = DispatchAnswer {
-            updated_args: args.to_vec(),
-            ..DispatchAnswer::default()
-        };
-        assert_eq!(answer.updated_args, args);
-        let _ = java.dispatch_game_hook(GameDispatch::new(
-            MethodId("unplanned"),
-            Phase::Head,
-            None,
-            &mut args,
-            None,
-            &mut host,
-        ));
     }
 
     #[test]
