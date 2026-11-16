@@ -594,6 +594,13 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
+    /// Pure client model-layer builder values and trees.
+    CubeDeformation,
+    PartPose,
+    CubeListBuilder,
+    MeshDefinition,
+    PartDefinition,
+    LayerDefinition,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2538,6 +2545,48 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::client_reload::converter_class),
         canonical: never_canonical,
         methods: &crate::client_reload::CONVERTER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CubeDeformation,
+        tag: "cdef",
+        class: ClassRule::Fixed(crate::model_layers::CUBE_DEFORMATION),
+        canonical: never_canonical,
+        methods: &crate::model_layers::CUBE_DEFORMATION_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PartPose,
+        tag: "ppose",
+        class: ClassRule::Fixed(crate::model_layers::PART_POSE),
+        canonical: never_canonical,
+        methods: &crate::model_layers::PART_POSE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CubeListBuilder,
+        tag: "mlbld",
+        class: ClassRule::Fixed(crate::model_layers::CUBE_LIST_BUILDER),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MeshDefinition,
+        tag: "mesh",
+        class: ClassRule::Fixed(crate::model_layers::MESH_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::PartDefinition,
+        tag: "part",
+        class: ClassRule::Fixed(crate::model_layers::PART_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::LayerDefinition,
+        tag: "layer",
+        class: ClassRule::Fixed(crate::model_layers::LAYER_DEFINITION),
+        canonical: always_canonical,
+        methods: &crate::model_layers::IDENTITY_METHODS,
     },
 ];
 

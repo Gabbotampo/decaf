@@ -1,0 +1,1 @@
+true,true,true,true,head,1.25,0.2,PartPose[x=1.25, y=-2.5, z=3.75, xRot=0.1, yRot=0.2, zRot=0.3, xScale=1.0, yScale=1.0, zScale=1.0],true,true,true,PartPose[x=0.3, y=0.5, z=0.70000005, xRot=0.0, yRot=0.0, zRot=0.0, xScale=1.0, yScale=1.0, zScale=1.0],true
