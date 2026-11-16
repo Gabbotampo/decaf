@@ -6,8 +6,10 @@ import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.Lifecycle;
 import com.mojang.serialization.MapCodec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.resources.Identifier;
 import java.util.*;
 
 /** DataFixerUpper's Pair and the game's codecs as host objects (#156 P5c). */
@@ -158,6 +160,54 @@ public final class HostCodecs {
 
   public static String codecText() {
     return Codec.STRING + "|" + Codec.INT + "|" + Codec.BOOL;
+  }
+
+  record One(int a) {}
+  record Three(int a, String b, boolean c) {}
+  record Eight(int a, int b, int c, int d, int e, int f, int g, int h) {}
+  static int throwingGetter(One value) {
+    throw new IllegalStateException("getter");
+  }
+
+  /** Record builders execute their jar callback and retain fields/getters/constructors. */
+  public static String recordConstruction() {
+    Codec<One> one = com.mojang.serialization.codecs.RecordCodecBuilder.create(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(One::a)).apply(i, One::new));
+    MapCodec<Three> three = com.mojang.serialization.codecs.RecordCodecBuilder.mapCodec(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(Three::a),
+            Codec.STRING.optionalFieldOf("b", "").forGetter(Three::b),
+            Codec.BOOL.optionalFieldOf("c", true).forGetter(Three::c))
+            .apply(i, Three::new));
+    Codec<Eight> eight = com.mojang.serialization.codecs.RecordCodecBuilder.create(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(Eight::a),
+            Codec.INT.fieldOf("b").forGetter(Eight::b),
+            Codec.INT.fieldOf("c").forGetter(Eight::c),
+            Codec.INT.fieldOf("d").forGetter(Eight::d),
+            Codec.INT.fieldOf("e").forGetter(Eight::e),
+            Codec.INT.fieldOf("f").forGetter(Eight::f),
+            Codec.INT.fieldOf("g").forGetter(Eight::g),
+            Codec.INT.fieldOf("h").forGetter(Eight::h))
+            .apply(i, Eight::new));
+    MapCodec<Integer> required = Codec.INT.fieldOf("required");
+    MapCodec<?> optional = Codec.INT.optionalFieldOf("optional");
+    MapCodec<Integer> defaulted = Codec.INT.optionalFieldOf("defaulted", 7);
+    Codec<?> list = Codec.INT.listOf();
+    Codec<Integer> mapped = Codec.INT.xmap(x -> x + 1, x -> x - 1);
+    Codec<One> nested = RecordCodecBuilder.create(i ->
+        i.group(one.fieldOf("one").forGetter((One x) -> x)).apply(i, x -> x));
+    Codec<One> throwing = RecordCodecBuilder.create(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(HostCodecs::throwingGetter)).apply(i, One::new));
+    return (one instanceof Codec) + "|" + (three instanceof MapCodec) + "|" + (eight instanceof Codec)
+        + "|" + (nested instanceof Codec) + "|" + (throwing instanceof Codec)
+        + "|" + required + "|" + optional + "|" + defaulted + "|" + list + "|" + mapped
+        + "|" + (Lifecycle.stable() == Lifecycle.stable()) + "|" + (Lifecycle.experimental() == Lifecycle.experimental())
+        + "|" + Lifecycle.stable() + "|" + Lifecycle.experimental();
+  }
+
+  public static String identifierCodec() {
+    Object first = Identifier.CODEC;
+    Object second = Identifier.CODEC;
+    return (first instanceof Codec) + "|" + (first == second);
   }
 
   /** A pair is never equal to an object that is not a pair (#199 F4). */
