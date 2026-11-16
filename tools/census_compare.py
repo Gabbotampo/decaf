@@ -62,7 +62,7 @@ def call_counts(row: dict | None) -> dict[str, int]:
 # refused row that now stops somewhere else (new `error`/`stage`) or a run whose `failed`, `frame`
 # or listener evidence changed is never reported as unchanged (rc261d: the tool missed two such rows).
 CALL_FIELDS = {"calls", "counted_before_error"}
-SHOWN_FIELDS = {"jar", "mode", "role", "verdict", "unknown"} | CALL_FIELDS
+SHOWN_FIELDS = {"jar", "mode", "role", "verdict", "unknown", "nondeterministic"} | CALL_FIELDS
 
 
 def other_changes(left: dict | None, right: dict | None) -> list[dict]:
@@ -155,14 +155,47 @@ def flaky_rows(flaky: dict[tuple[str, str, str, str], list[dict]]) -> list[dict]
             for key, runs in sorted(flaky.items())]
 
 
+def nondeterministic_rows(payload: dict) -> list[dict]:
+    rows = []
+    for corpus, data in (payload.get("corpora") or {}).items():
+        for row in data.get("rows", []):
+            if row.get("nondeterministic"):
+                rows.append({"corpus": str(corpus), "mode": row.get("mode"),
+                             "role": row.get("role"), "jar": row.get("jar"),
+                             "marker": row.get("nondeterministic"),
+                             "error": row.get("error")})
+    return rows
+
+
 def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]], role: str) -> dict:
+    # Keep baseline and head repetition failures separate. A known flaky main row
+    # must not make a deterministic head look flaky, and the census needs to say
+    # which binary still has the instability. The union remains the exclusion set
+    # for the base-to-head movement table, preserving the old report contract.
+    flaky_by_binary: dict[str, dict[tuple[str, str, str, str], list[dict]]] = {}
+    inherent_by_binary: dict[str, dict[tuple[str, str, str, str], list[dict]]] = {}
     all_flaky: dict[tuple[str, str, str, str], list[dict]] = {}
-    for payloads in repetitions.values():
-        all_flaky.update(differing_rows(payloads, role))
+    for label, payloads in repetitions.items():
+        found = differing_rows(payloads, role)
+        inherent = {
+            key: runs for key, runs in found.items()
+            if any(isinstance(row, dict) and row.get("nondeterministic") for row in runs)
+        }
+        found = {key: runs for key, runs in found.items() if key not in inherent}
+        flaky_by_binary[label] = found
+        inherent_by_binary[label] = inherent
+        all_flaky.update(found)
     excluded = set(all_flaky)
     return {"base": {"sha": base.get("sha"), "totals": totals(base, role, excluded)},
             "merged": {"sha": merged.get("sha"), "totals": totals(merged, role, excluded)},
-            "moved": moved_jars(base, merged, role, excluded), "flaky": flaky_rows(all_flaky)}
+            "moved": moved_jars(base, merged, role, excluded),
+            "nondeterministic": {"base": nondeterministic_rows(base),
+                                 "merged": nondeterministic_rows(merged)},
+            "flaky": flaky_rows(all_flaky),
+            "base_flaky": flaky_rows(flaky_by_binary.get("base", {})),
+            "merged_flaky": flaky_rows(flaky_by_binary.get("merged", {})),
+            "base_inherent": flaky_rows(inherent_by_binary.get("base", {})),
+            "merged_inherent": flaky_rows(inherent_by_binary.get("merged", {}))}
 
 
 def markdown(report: dict) -> str:
@@ -185,13 +218,30 @@ def markdown(report: dict) -> str:
         lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {others(item.get('other_changes', []))} | {item['attribution']} |")
     if not report["moved"]:
         lines.append("| — | — | — | — | — | — | — | — | — | — |")
-    lines += ["", "## Flaky rows", ""]
-    if report["flaky"]:
-        lines += ["| Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|"]
-        for item in report["flaky"]:
-            lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {len(item['runs'])} |")
+    lines += ["", "## Non-deterministic rows", "",
+              "A row here has an inherent nondeterminism marker (for example Java's random immutable-collection iteration). It is never treated as an ordinary flaky row or refusal.", "",
+              "| Binary | Corpus | Mode | Role | Jar | Marker | Error |", "|---|---|---|---|---|---|---|"]
+    guards = report.get("nondeterministic", {})
+    for binary in ("base", "merged"):
+        for item in guards.get(binary, []):
+            error = str(item.get("error") or "").replace("|", "\\|")
+            lines.append(f"| {binary} | {item['corpus']} | {item['mode']} | {item.get('role', '—')} | `{item['jar']}` | `{item['marker']}` | {error} |")
+    if not guards.get("base") and not guards.get("merged"):
+        lines.append("| — | — | — | — | — | — | — |")
+    lines += ["", "## Repetition stability", "",
+              "The merged/head rows must be byte-identical across repetitions; baseline flakes are listed separately.", "",
+              "| Binary | Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|---|"]
+    stability_rows = [("base", item) for item in report.get("base_flaky", [])]
+    stability_rows += [("merged/head", item) for item in report.get("merged_flaky", [])]
+    stability_rows += [("base/inherent", item) for item in report.get("base_inherent", [])]
+    stability_rows += [("merged/inherent", item) for item in report.get("merged_inherent", [])]
+    if stability_rows:
+        for binary, item in stability_rows:
+            lines.append(f"| {binary} | {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {len(item['runs'])} |")
     else:
-        lines.append("None.")
+        lines.append("| — | — | — | — | — | — |")
+    lines += ["", "## Flaky rows (union used for movement exclusion)", ""]
+    lines.append(f"Base flaky rows: {len(report.get('base_flaky', []))}; merged/head flaky rows: {len(report.get('merged_flaky', []))}.")
     return "\n".join(lines) + "\n"
 
 
