@@ -231,10 +231,7 @@ fn neoforge_loader_oracle_rows_and_counted_unknowns_are_exact() {
     assert_eq!(text(&jar, &mut host, "answered"), oracle_rows());
     let before_unknown = host.unknown_host_calls().to_vec();
     let before_payloads = host.payload_registrations().len();
-    assert_eq!(
-        text(&jar, &mut host, "counted"),
-        "done",
-    );
+    assert_eq!(text(&jar, &mut host, "counted"), "done",);
     for needle in [
         "net/neoforged/fml/ModContainer#registerExtensionPoint(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
         "net/neoforged/neoforge/network/registration/PayloadRegistrar#versioned(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
@@ -250,7 +247,11 @@ fn neoforge_loader_oracle_rows_and_counted_unknowns_are_exact() {
             .iter()
             .find(|(call, _)| call == needle)
             .map_or(0, |(_, count)| *count);
-        assert!(after > before, "{needle} was not counted; unknown={:?}", host.unknown_host_calls());
+        assert!(
+            after > before,
+            "{needle} was not counted; unknown={:?}",
+            host.unknown_host_calls()
+        );
     }
     assert_eq!(
         host.payload_registrations().len(),
