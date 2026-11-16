@@ -61,7 +61,7 @@ pub(crate) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn parse(text: &'a str) -> Parsed {
+    pub(crate) fn parse(text: &'a str) -> Parsed {
         Self::parse_noting_duplicates(text).0
     }
 

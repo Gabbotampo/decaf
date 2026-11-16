@@ -10,6 +10,12 @@ use crate::runtime::gson_tree::parse::{Parsed, Parser, Tree};
 
 const GSON: &str = "com/google/gson/Gson";
 const SERIALIZED_NAME: &str = "Lcom/google/gson/annotations/SerializedName;";
+const MAX_GSON_DEPTH: usize = 255;
+const FROM_JSON_COLLECTION: (&str, &str, &str) = (
+    "com/google/gson/Gson",
+    "fromJson",
+    "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
+);
 
 fn tree_target(class: &str) -> bool {
     matches!(
@@ -147,6 +153,23 @@ fn tree_depth(tree: &Tree, depth: usize) -> usize {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    fn gson_tree_to_parse(&mut self, value: &Value) -> Option<Tree> {
+        self.gson_tree_to_parsed(value)
+    }
+
+    fn gson_collection_value(
+        &mut self,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Result<Value, NativeError> {
+        let class = match kind {
+            "map" => crate::runtime::gson_tree::TREE_MAP,
+            "set" => "java/util/LinkedHashSet",
+            _ => "java/util/ArrayList",
+        };
+        self.new_host_collection(class, values, FROM_JSON_COLLECTION)
+    }
+
     fn count_gson_fromjson(
         &mut self,
         r: &MethodRef,
@@ -214,38 +237,6 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         names
-    }
-
-    fn gson_enum_value(&mut self, class: &str, tree: &Tree) -> Option<Value> {
-        let Tree::Str(name) = tree else {
-            return None;
-        };
-        let file = self.class(class)?;
-        for field in &file.fields {
-            if field.access & 0x0008 == 0 {
-                continue;
-            }
-            let mut names = vec![field.name.clone()];
-            for annotation in file.field_annotations(&field.name, &field.descriptor) {
-                if annotation.descriptor == SERIALIZED_NAME {
-                    if let Some(AnnotationValue::String(primary)) = annotation.values.get("value") {
-                        names.push(primary.clone());
-                    }
-                    if let Some(AnnotationValue::Array(alternates)) =
-                        annotation.values.get("alternate")
-                    {
-                        names.extend(alternates.iter().filter_map(|value| match value {
-                            AnnotationValue::String(value) => Some(value.clone()),
-                            _ => None,
-                        }));
-                    }
-                }
-            }
-            if names.iter().any(|candidate| candidate == name) {
-                return Some(Value::Ref(Some(format!("enum/{class}/{}", field.name))));
-            }
-        }
-        None
     }
 
     fn gson_json_io(message: String) -> NativeError {
@@ -360,7 +351,10 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         let declared = self.gson_fields(class);
-        if declared.is_empty() {
+        if !declared
+            .iter()
+            .any(|(_, _, _, access)| access & 0x0008 == 0 && style.includes_field(*access))
+        {
             return Ok(None);
         }
         if declared.iter().any(|(owner, name, descriptor, _)| {
@@ -440,7 +434,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(Value::Ref(None)));
         }
         match class.as_str() {
-            "java/lang/Object" => return self.gson_object_value(tree),
+            "java/lang/Object" => return self.gson_object_value_reflective(tree),
             "java/lang/String" => {
                 return Ok(numeric_text(tree)
                     .map(|text| Value::Ref(Some(text.to_owned())))
@@ -529,10 +523,10 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 materialized.push(value);
             }
-            return Ok(Some(collection_value(
+            return Ok(Some(self.gson_collection_value(
                 if is_set_owner(&class) { "set" } else { "list" },
-                &materialized,
-            )));
+                materialized,
+            )?));
         }
         if is_map_owner(&class) {
             let Some(values) = json_object(tree) else {
@@ -542,19 +536,31 @@ impl<H: Host> Runtime<'_, H> {
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| GenericType::Class("java/lang/Object".into()));
+            let key_type = args
+                .first()
+                .cloned()
+                .unwrap_or_else(|| GenericType::Class("java/lang/String".into()));
+            let key_class = raw_type(&key_type).unwrap_or_default();
             let mut materialized = Vec::with_capacity(values.len() * 2);
             for (key, value) in values {
-                materialized.push(Value::Ref(Some(key.clone())));
+                let key_value = if let Some(read) =
+                    self.gson_read_jar_enum(&Tree::Str(key.clone()), &key_class)?
+                {
+                    read.unwrap_or(Value::Ref(None))
+                } else {
+                    Value::Ref(Some(key.clone()))
+                };
+                materialized.push(key_value);
                 let Some(value) = self.gson_materialize_type(value, &element, style)? else {
                     return Ok(None);
                 };
                 materialized.push(value);
             }
-            return Ok(Some(collection_value("map", &materialized)));
+            return Ok(Some(self.gson_collection_value("map", materialized)?));
         }
         if self.has_class(&class) {
-            if let Some(value) = self.gson_enum_value(&class, tree) {
-                return Ok(Some(value));
+            if let Some(value) = self.gson_read_jar_enum(tree, &class)? {
+                return Ok(value);
             }
             let Some(values) = json_object(tree) else {
                 return Ok(None);
@@ -564,7 +570,7 @@ impl<H: Host> Runtime<'_, H> {
         Ok(gson_scalar_value(tree))
     }
 
-    fn gson_object_value(&mut self, tree: &Tree) -> Result<Option<Value>, NativeError> {
+    fn gson_object_value_reflective(&mut self, tree: &Tree) -> Result<Option<Value>, NativeError> {
         Ok(match tree {
             Tree::Null => Some(Value::Ref(None)),
             Tree::Bool(value) => Some(boolean_value(*value)),
@@ -581,23 +587,23 @@ impl<H: Host> Runtime<'_, H> {
             Tree::Array(values) => {
                 let mut materialized = Vec::with_capacity(values.len());
                 for value in values {
-                    let Some(value) = self.gson_object_value(value)? else {
+                    let Some(value) = self.gson_object_value_reflective(value)? else {
                         return Ok(None);
                     };
                     materialized.push(value);
                 }
-                Some(collection_value("list", &materialized))
+                Some(self.gson_collection_value("list", materialized)?)
             }
             Tree::Object(values) => {
                 let mut materialized = Vec::with_capacity(values.len() * 2);
                 for (key, value) in values {
                     materialized.push(Value::Ref(Some(key.clone())));
-                    let Some(value) = self.gson_object_value(value)? else {
+                    let Some(value) = self.gson_object_value_reflective(value)? else {
                         return Ok(None);
                     };
                     materialized.push(value);
                 }
-                Some(collection_value("map", &materialized))
+                Some(self.gson_collection_value("map", materialized)?)
             }
         })
     }
@@ -656,6 +662,12 @@ impl<H: Host> Runtime<'_, H> {
         let Some(class) = raw_type(&target) else {
             return self.count_gson_fromjson(r, receiver, args);
         };
+        // The #253 typed reader owns JDK scalars, Object, collections, arrays,
+        // and tree classes. Leave those targets to it so Gson's Double policy,
+        // nesting bound, and duplicate-name boundary remain single-source.
+        if class.starts_with("java/") || class.starts_with('[') {
+            return Ok(None);
+        }
         let element_input = r.descriptor.starts_with("(Lcom/google/gson/JsonElement;");
         if tree_target(&class) && !element_input {
             return Ok(None);
@@ -682,7 +694,14 @@ impl<H: Host> Runtime<'_, H> {
             let Some(text) = self.gson_source(args.first(), reader) else {
                 return self.count_gson_fromjson(r, receiver, args);
             };
-            match Parser::parse(&text) {
+            let (parsed, duplicate) = Parser::parse_noting_duplicates(&text);
+            if duplicate {
+                // Gson's map adapter throws its duplicate-key JsonSyntaxException;
+                // this bounded adapter counts the same unsupported shape rather
+                // than silently collapsing the repeated member.
+                return Ok(None);
+            }
+            match parsed {
                 Parsed::Empty => return Ok(Some(Value::Ref(None))),
                 Parsed::Value(tree) => tree,
                 // Keep the established bounded parser's diagnostic for malformed,

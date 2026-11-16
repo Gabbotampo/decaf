@@ -708,6 +708,46 @@ fn check_number(number: &Num, lenient: bool) -> NumberCheck {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// Convert a runtime-owned Gson tree back to the bounded parser shape for
+    /// the reflective fromJson adapter (`fromJson(JsonElement, Class)`).
+    pub(crate) fn gson_tree_to_parsed(
+        &mut self,
+        value: &Value,
+    ) -> Option<crate::runtime::gson_tree::parse::Tree> {
+        let marker = crate::runtime::jar_object::object_key(value)?.to_owned();
+        match kind_of(&marker)? {
+            Kind::Null => Some(crate::runtime::gson_tree::parse::Tree::Null),
+            Kind::Lazy => self
+                .lazy_text(&marker)
+                .map(crate::runtime::gson_tree::parse::Tree::Num),
+            Kind::Primitive => match self.primitive_of(&marker)? {
+                Prim::Str(text) => Some(crate::runtime::gson_tree::parse::Tree::Str(text)),
+                Prim::Bool(value) => Some(crate::runtime::gson_tree::parse::Tree::Bool(value)),
+                Prim::Num(value) => self.gson_tree_to_parsed(&value),
+            },
+            Kind::Array => {
+                let elements = self.elements_of(&marker)?;
+                let values = crate::runtime::runtime_collection_values(self.host, &elements).ok()?;
+                values
+                    .iter()
+                    .map(|value| self.gson_tree_to_parsed(value))
+                    .collect::<Option<Vec<_>>>()
+                    .map(crate::runtime::gson_tree::parse::Tree::Array)
+            }
+            Kind::Object => {
+                let members = self.members_of(&marker)?;
+                let values = crate::runtime::runtime_collection_values(self.host, &members).ok()?;
+                let mut fields = Vec::with_capacity(values.len() / 2);
+                for pair in values.chunks_exact(2) {
+                    let key = crate::runtime::expect_ref(&pair[0])?.clone();
+                    fields.push((key, self.gson_tree_to_parsed(&pair[1])?));
+                }
+                Some(crate::runtime::gson_tree::parse::Tree::Object(fields))
+            }
+            Kind::Map => None,
+        }
+    }
+
     /// The Gson tree surface: `JsonElement`'s four kinds,
     /// `LazilyParsedNumber` and `JsonObject.asMap()`'s map. `Ok(None)` leaves
     /// the call to the rest of the dispatch chain.

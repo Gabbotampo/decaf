@@ -458,17 +458,26 @@ impl<H: Host> Runtime<'_, H> {
         let mut values = Vec::with_capacity(members.len());
         for (name, member) in members {
             // The key reader reads the name as a string token.
-            let key = match key_class.as_str() {
-                "java/lang/String" | "java/lang/Object" => Value::Ref(Some(name.clone())),
-                "java/lang/Integer" => match json_int(name) {
-                    Some(int) => Value::Int(int),
-                    None => return Ok(None),
-                },
-                "java/lang/Long" => match json_long(name) {
-                    Some(long) => Value::Long(long),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
+            let key = if let Some(read) =
+                self.gson_read_jar_enum(&Tree::Str(name.clone()), &key_class)?
+            {
+                // EnumTypeAdapter returns null for an unknown name. Gson's
+                // ordinary map adapter accepts that null key; a custom
+                // toString path remains counted by the enum reader.
+                read.unwrap_or(Value::Ref(None))
+            } else {
+                match key_class.as_str() {
+                    "java/lang/String" | "java/lang/Object" => Value::Ref(Some(name.clone())),
+                    "java/lang/Integer" => match json_int(name) {
+                        Some(int) => Value::Int(int),
+                        None => return Ok(None),
+                    },
+                    "java/lang/Long" => match json_long(name) {
+                        Some(long) => Value::Long(long),
+                        None => return Ok(None),
+                    },
+                    _ => return Ok(None),
+                }
             };
             // Two names reading as one key: Gson's "duplicate key".
             if keys.contains(&key) {
@@ -562,7 +571,7 @@ impl<H: Host> Runtime<'_, H> {
     /// initializer built, never a marker of a name. A constant whose
     /// `toString` the jar overrides is counted when the first map misses: its
     /// text is not computed here.
-    fn gson_read_jar_enum(
+    pub(crate) fn gson_read_jar_enum(
         &mut self,
         tree: &Tree,
         class: &str,
