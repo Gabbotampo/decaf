@@ -4,6 +4,7 @@
     unmodelled_calls.py [--corpus name=DIR]... [--probe PATH] [--json OUT]
                         [--game-version 26.3] [--limit N] [--jobs N]
                         [--dependency-mode both|alone|closure]
+                        [--game-block-classes PATH]
 
 Runs the probe once per jar alone and once with the jar's declared dependency
 closure (unless `--dependency-mode` selects one), resolved against the other
@@ -42,6 +43,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -61,6 +63,8 @@ DEFAULT_CORPORA = (
 PROBE_TIMEOUT = 180.0
 MAX_REPORTED = 400
 FABRIC_LOADER_NAME = "fabric-loader-0.19.5.jar"
+GAME_BLOCK_TABLE_NAMES = ("vanilla-block-classes.json", "block-behaviours-classes.json",
+                          "block-behaviours.json")
 
 
 class FabricOracleUnavailable(RuntimeError):
@@ -152,11 +156,92 @@ def fabric_pairs(index: dict[str, list]) -> set[tuple[str, str]]:
     return pairs
 
 
+def provider_dir_jars(directory: Path, corpus_name: str) -> list[hybrid_pack.PackJar]:
+    """Read explicit providers, keeping each loader's metadata family separate."""
+    marker = "META-INF/neoforge.mods.toml" if corpus_name == "neoforge" else "fabric.mod.json"
+    jars = []
+    for jar in ledger.corpus_jars([directory]):
+        try:
+            with zipfile.ZipFile(jar.path) as archive:
+                if marker in archive.namelist():
+                    jars.append(jar)
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return jars
+
+
 def parse_corpus(value: str) -> tuple[str, Path]:
     name, _, directory = value.partition("=")
     if not name or not directory:
         raise argparse.ArgumentTypeError("a corpus is NAME=DIR")
     return name, Path(directory).expanduser()
+
+
+def _has_exact_behaviour_closure(path: Path) -> bool:
+    """Whether the prepared behaviour export carries internal-name closures.
+
+    Older Horizon resources have class/interfaces simple names only. They
+    must not be passed as the exact table: a jar class with the same simple name
+    would then forge a vanilla match.
+    """
+    try:
+        root = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    blocks = root.get("blocks") if isinstance(root, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return False
+    return all(
+        isinstance(block, dict)
+        and isinstance(block.get("class_closure", block.get("classClosure")), list)
+        for block in blocks
+    )
+
+
+def default_game_block_classes(game_version: str) -> Path | None:
+    """Find the exact table in Horizon's standard prepared-resource locations.
+
+    HORIZON_RESOURCES is the game's documented override. The other roots
+    are the normal checkout and installer locations; the last one is the shared
+    prepared root used by the corpus machines. Absence is deliberately loud:
+    the probe must keep vanilla-block instanceof calls counted.
+    """
+    configured = os.environ.get("HORIZON_RESOURCES")
+    if configured:
+        # An explicit game root is authoritative. Falling through to another
+        # machine's prepared root would make a missing table look present.
+        roots = [Path(configured).expanduser()]
+    else:
+        roots = [
+            Path.cwd() / ".local" / "horizon-client" / game_version,
+            ROOT / ".local" / "horizon-client" / game_version,
+            Path.home() / ".local" / "share" / "horizon" / "game-files"
+            / "horizon-client" / game_version,
+            Path.home() / "ava" / "resources" / game_version,
+        ]
+    seen: set[Path] = set()
+    searched: list[str] = []
+    for root in roots:
+        root = root.absolute()
+        if root in seen:
+            continue
+        seen.add(root)
+        searched.append(str(root))
+        for name in GAME_BLOCK_TABLE_NAMES:
+            path = root / name
+            if not path.is_file():
+                continue
+            if name == "block-behaviours.json" and not _has_exact_behaviour_closure(path):
+                continue
+            path = path.resolve()
+            print(f"using prepared vanilla block class table: {path}", file=sys.stderr)
+            return path
+    print(
+        "warning: prepared vanilla block class table absent; vanilla block "
+        "instanceof calls remain counted (searched: " + ", ".join(searched) + ")",
+        file=sys.stderr,
+    )
+    return None
 
 
 def locked_neoforge() -> set[str]:
@@ -265,8 +350,10 @@ def row_verdict(result: dict) -> str:
 
 
 def probe_one(probe: Path, jar: Path, kind: str, deps: list[Path],
-              game_version: str) -> dict:
+              game_version: str, game_block_classes: Path | None) -> dict:
     command = [str(probe), "--json", "--game-version", game_version]
+    if game_block_classes is not None:
+        command += ["--game-block-classes", str(game_block_classes)]
     for dep in deps:
         command += ["--link", str(dep)]
     command += [str(jar), kind]
@@ -389,6 +476,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="path to the real Fabric Loader 0.19.5 jar")
     parser.add_argument("--dependency-mode", choices=("both", "alone", "closure"),
                         default="both", help="run alone, closure, or both (default: both)")
+    parser.add_argument("--provider-dir", type=Path, action="append", default=[],
+                        help="providers-only directory for closure dependencies; rows are never scanned")
+    parser.add_argument("--game-block-classes", type=Path,
+                        help="exact vanilla block closure JSON generated from the player's 26.3 install "
+                             "(default: discover it in prepared resources)")
     parser.add_argument("--allow-missing-fabric-oracle", action="store_true",
                         help="run closure mode even without the Fabric Loader oracle; every Fabric "
                              "closure row is then refused (only for tests and partial machines)")
@@ -402,12 +494,22 @@ def main(argv: list[str] | None = None) -> int:
     if not probe.is_file():
         print(f"missing probe binary {probe}", file=sys.stderr)
         return 1
+    if args.game_block_classes:
+        game_block_classes = args.game_block_classes.expanduser().resolve()
+        if not game_block_classes.is_file():
+            print(f"error: game block class table is not a file: {game_block_classes}",
+                  file=sys.stderr)
+            return 1
+    else:
+        game_block_classes = default_game_block_classes(args.game_version)
 
-    # Providers live in the corpora under test and in the pools the mega corpus
-    # was fetched with, exactly as `java_mod_server_ledger.DEFAULT_DEP_DIRS`.
+    # Providers live in the corpora under test, the pools the mega corpus was
+    # fetched with, and explicit providers-only directories. Explicit provider
+    # directories are indexed but never scanned as census rows.
     # A NeoForge jar resolves inside the NeoForge corpus only: the Fabric corpora
     # carry Fabric builds of the same libraries (TerraBlender, GlitchCore), and
     # linking those beside a NeoForge mod measures the wrong class path.
+    provider_dirs_arg = [path.resolve() for path in args.provider_dir]
     indexes: dict[str, dict] = {}
     for name, directory in corpora:
         if name in indexes:
@@ -418,7 +520,14 @@ def main(argv: list[str] | None = None) -> int:
             provider_dirs = [path for other, path in corpora if other != "neoforge"]
             provider_dirs += [path for path in ledger.DEFAULT_DEP_DIRS
                               if str(path) not in {str(d) for d in provider_dirs}]
-        indexes[name] = ledger.provider_index(ledger.corpus_jars(provider_dirs))
+        index_jars = ledger.corpus_jars(provider_dirs)
+        seen = {jar.path.resolve() for jar in index_jars}
+        for provider_dir in provider_dirs_arg:
+            for jar in provider_dir_jars(provider_dir, name):
+                if jar.path.resolve() not in seen:
+                    index_jars.append(jar)
+                    seen.add(jar.path.resolve())
+        indexes[name] = ledger.provider_index(index_jars)
 
     fabric_oracle: FabricPredicateOracle | None = None
     fabric_oracle_error = ""
@@ -492,7 +601,10 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"status": "refused", "stage": "dependency",
                           "error": missing_reason(missing, requirements)}
             else:
-                result = probe_one(probe, jar, kind, deps, args.game_version)
+                result = probe_one(
+                    probe, jar, kind, deps, args.game_version,
+                    game_block_classes,
+                )
             return result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:

@@ -27,7 +27,7 @@ const JSON_PARSER: &str = "com/google/gson/JsonParser";
 const MAX_TREE_DEPTH: usize = 255;
 
 /// One parsed JSON value, before it becomes runtime objects.
-#[derive(Debug)]
+#[derive(Clone)]
 pub(crate) enum Tree {
     Object(Vec<(String, Tree)>),
     Array(Vec<Tree>),
@@ -54,17 +54,38 @@ pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     pos: usize,
+    /// A name repeated in one object: `JsonObject.add` keeps it (first
+    /// position, last value), Gson's map adapter throws "duplicate key".
+    duplicate: bool,
+    allow_special_floats: bool,
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn parse(text: &'a str) -> Parsed {
+    fn parse(text: &'a str) -> Parsed {
+        Self::parse_noting_duplicates(text).0
+    }
+
+    /// [`Self::parse`], and whether any object repeated a name.
+    pub(crate) fn parse_noting_duplicates(text: &'a str) -> (Parsed, bool) {
+        Self::parse_noting_duplicates_with_special_floats(text, false)
+    }
+
+    /// Parse the lenient numeric spellings Gson's `JsonReader` accepts when
+    /// its strictness is not `STRICT`.
+    pub(crate) fn parse_noting_duplicates_with_special_floats(
+        text: &'a str,
+        allow_special_floats: bool,
+    ) -> (Parsed, bool) {
         if text.len() > MAX_GSON_JSON_BYTES {
-            return Parsed::Unsupported;
+            return (Parsed::Unsupported, false);
         }
         let mut parser = Parser {
             bytes: text.as_bytes(),
             text,
-            pos: 0,
+            // `JsonReader`'s first fill skips one byte order mark.
+            pos: if text.starts_with('\u{feff}') { 3 } else { 0 },
+            duplicate: false,
+            allow_special_floats,
         };
         let parsed = (|| {
             parser.skip_space()?;
@@ -75,7 +96,7 @@ impl<'a> Parser<'a> {
             parser.skip_space()?;
             (parser.pos == parser.bytes.len()).then_some(Parsed::Value(value))
         })();
-        parsed.unwrap_or(Parsed::Unsupported)
+        (parsed.unwrap_or(Parsed::Unsupported), parser.duplicate)
     }
 
     fn peek(&self) -> Option<u8> {
@@ -122,6 +143,17 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self, depth: usize) -> Option<Tree> {
+        if self.allow_special_floats {
+            for token in ["-Infinity", "Infinity", "NaN"] {
+                if self.text[self.pos..].starts_with(token) {
+                    self.pos += token.len();
+                    if self.at_delimiter() {
+                        return Some(Tree::Num(token.to_owned()));
+                    }
+                    return None;
+                }
+            }
+        }
         match self.peek()? {
             b'{' => {
                 if depth >= MAX_TREE_DEPTH {
@@ -149,7 +181,10 @@ impl<'a> Parser<'a> {
                     // `JsonObject.add` keeps a repeated name at its first
                     // position with the last value.
                     match members.iter_mut().find(|(existing, _)| *existing == name) {
-                        Some(member) => member.1 = value,
+                        Some(member) => {
+                            member.1 = value;
+                            self.duplicate = true;
+                        }
                         None => members.push((name, value)),
                     }
                     self.skip_space()?;
@@ -424,6 +459,38 @@ impl<H: Host> Runtime<'_, H> {
     }
 }
 
+pub(crate) fn parse_text<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+) -> Result<Value, NativeError> {
+    parse_text_with_options(runtime, text, false)
+}
+
+pub(crate) fn parse_text_with_special<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+) -> Result<Value, NativeError> {
+    parse_text_with_options(runtime, text, true)
+}
+
+fn parse_text_with_options<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    text: &str,
+    allow_special_floats: bool,
+) -> Result<Value, NativeError> {
+    let (parsed, _) =
+        Parser::parse_noting_duplicates_with_special_floats(text, allow_special_floats);
+    match parsed {
+        Parsed::Empty => Ok(super::null_instance()),
+        Parsed::Value(tree) => runtime.materialize(tree),
+        Parsed::Unsupported => Err(NativeError::UnknownHostCall(MethodRef {
+            owner: JSON_PARSER.into(),
+            name: "parseString".into(),
+            descriptor: "(Ljava/lang/String;)Lcom/google/gson/JsonElement;".into(),
+        })),
+    }
+}
+
 /// Whether `r` is a `JsonParser` call.
 pub(super) fn is_parser(r: &MethodRef) -> bool {
     r.owner == JSON_PARSER
@@ -447,7 +514,9 @@ mod tests {
             "01",
             "1.",
             "NaN",
-            "\u{feff}{}",
+            // A byte order mark anywhere but first (gson-2.14.0: a
+            // `JsonSyntaxException`).
+            "{}\u{feff}",
             ")]}'\n{}",
             "{} {}",
             "/ {}",
@@ -460,6 +529,12 @@ mod tests {
                 "{text:?} was answered"
             );
         }
+        // `JsonReader`'s first fill skips one leading byte order mark
+        // (gson-2.14.0 reads `\u{feff}{}` as `{}`).
+        assert!(matches!(
+            Parser::parse("\u{feff}{}"),
+            Parsed::Value(Tree::Object(_))
+        ));
         // gson-2.14.0 parses this to `JsonNull`.
         assert!(matches!(
             Parser::parse(" // only\n#also\n/* c */ "),

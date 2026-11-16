@@ -6,6 +6,20 @@
 //! modelled primitives, strings, lists and maps, and those values serialize
 //! back. Malformed and over-deep documents are refused with a bounded reason
 //! instead of answering an empty value.
+//!
+//! Java 25 oracle rows for the bit-conversion fixture (OpenJDK 25.0.5+8):
+//! double non-NaN (raw/normal):
+//! 0/0;8000000000000000/8000000000000000;7ff0000000000000/7ff0000000000000;fff0000000000000/fff0000000000000;3ff4000000000000/3ff4000000000000;1/1;8000000000000001/8000000000000001;
+//! float non-NaN (raw/normal):
+//! 0/0;80000000/80000000;7f800000/7f800000;ff800000/ff800000;3fa00000/3fa00000;1/1;80000001/80000001;
+//! canonical NaN: double raw/normal=7ff8000000000000/7ff8000000000000;
+//! float raw/normal=7fc00000/7fc00000.
+//! The recorded oracle command was `javac --release 25 BitOracle.java && java BitOracle`;
+//! raw NaN calls are deliberately COUNTED by the native model because its f64 Value
+//! cannot preserve every Java NaN payload.
+
+#[path = "support/scratch.rs"]
+mod scratch;
 
 use horizon_native_java::{NativeError, NativeJar, StdHost, Value};
 use std::{
@@ -28,11 +42,18 @@ public class Gson {
 }
 "#;
 
+const STRICTNESS: &str = r#"package com.google.gson;
+
+public enum Strictness { LENIENT, LEGACY_STRICT, STRICT }
+"#;
+
 const GSON_BUILDER: &str = r#"package com.google.gson;
 
 public class GsonBuilder {
     public GsonBuilder() {}
     public GsonBuilder setPrettyPrinting() { return this; }
+    public GsonBuilder setLenient() { return this; }
+    public GsonBuilder setStrictness(Strictness strictness) { return this; }
     public Gson create() { return new Gson(); }
 }
 "#;
@@ -41,6 +62,7 @@ const PROBE: &str = r#"package demo;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.Strictness;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
@@ -55,6 +77,85 @@ import java.util.List;
 import java.util.Map;
 
 public final class Probe {
+    private static String scalar(Object value) {
+        if (value == null) return "null";
+        if (value instanceof Double number) return "D:" + scalarDouble(number);
+        if (value instanceof Float number) return "F:" + scalarFloat(number);
+        return value.toString();
+    }
+
+    private static String scalarDouble(double value) {
+        return value + ":" + Long.toHexString(Double.doubleToRawLongBits(value));
+    }
+
+    private static String scalarFloat(float value) {
+        return value + ":" + Integer.toHexString(Float.floatToRawIntBits(value));
+    }
+
+    public static String bitConversions() {
+        double[] doubles = { 0.0, -0.0, Double.POSITIVE_INFINITY,
+            Double.NEGATIVE_INFINITY, 1.25, Double.MIN_VALUE, -Double.MIN_VALUE };
+        float[] floats = { 0.0f, -0.0f, Float.POSITIVE_INFINITY,
+            Float.NEGATIVE_INFINITY, 1.25f, Float.MIN_VALUE, -Float.MIN_VALUE };
+        StringBuilder out = new StringBuilder();
+        for (double value : doubles) {
+            out.append(Long.toHexString(Double.doubleToRawLongBits(value)))
+                .append('/').append(Long.toHexString(Double.doubleToLongBits(value))).append(';');
+        }
+        for (float value : floats) {
+            out.append(Integer.toHexString(Float.floatToRawIntBits(value)))
+                .append('/').append(Integer.toHexString(Float.floatToIntBits(value))).append(';');
+        }
+        return out.toString();
+    }
+
+    public static String canonicalNaN() {
+        return Long.toHexString(Double.doubleToLongBits(Double.NaN)) + "/"
+            + Integer.toHexString(Float.floatToIntBits(Float.NaN));
+    }
+
+    public static String rawNaN() {
+        return Long.toHexString(Double.doubleToRawLongBits(Double.NaN)) + "|"
+            + Integer.toHexString(Float.floatToRawIntBits(Float.NaN));
+    }
+
+    public static String numeric(String mode, String json) {
+        GsonBuilder builder = new GsonBuilder();
+        if (mode.equals("lenient")) {
+            builder.setLenient();
+        } else if (mode.equals("strict")) {
+            builder.setStrictness(Strictness.STRICT);
+        }
+        Gson gson = builder.create();
+        Object object = null;
+        String string = null;
+        Double boxedDouble = null;
+        Float boxedFloat = null;
+        try { object = gson.fromJson(json, Object.class); } catch (RuntimeException ignored) {}
+        try { string = gson.fromJson(json, String.class); } catch (RuntimeException ignored) {}
+        try { boxedDouble = gson.fromJson(json, Double.class); } catch (RuntimeException ignored) {}
+        try { boxedFloat = gson.fromJson(json, Float.class); } catch (RuntimeException ignored) {}
+        return scalar(object) + "|" + scalar(string) + "|"
+            + (boxedDouble == null ? "null" : scalarDouble(boxedDouble)) + "|"
+            + (boxedFloat == null ? "null" : scalarFloat(boxedFloat));
+    }
+
+    public static final class ArmorConfig {}
+
+    public static final class StaticOnlyConfig {
+        public static int value = 7;
+    }
+
+    public static String armorConfig() {
+        Gson gson = new GsonBuilder().create();
+        return scalar(gson.fromJson(new StringReader("{}"), ArmorConfig.class));
+    }
+
+    public static String staticOnlyConfig() {
+        Gson gson = new GsonBuilder().create();
+        return scalar(gson.fromJson(new StringReader("{}"), StaticOnlyConfig.class));
+    }
+
     public static String roundTrip() {
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         int number = gson.fromJson("42", Integer.class);
@@ -184,7 +285,7 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
+        let root = scratch::unique_path(&format!(
             "horizon-native-java-gson-{test}-{}-{unique}",
             std::process::id()
         ));
@@ -197,6 +298,7 @@ impl Fixture {
         let sources = [
             ("com/google/gson/Gson.java", GSON),
             ("com/google/gson/GsonBuilder.java", GSON_BUILDER),
+            ("com/google/gson/Strictness.java", STRICTNESS),
             ("demo/Probe.java", PROBE),
         ];
         let mut javac = Command::new(javac());
@@ -234,14 +336,19 @@ impl Fixture {
     }
 
     fn call(&self, method: &str, descriptor: &str, args: &[Value]) -> Result<Value, NativeError> {
-        self.jar.invoke_method_with_args(
-            "demo/Probe",
-            method,
-            descriptor,
-            None,
-            args,
-            &mut StdHost::new(),
-        )
+        let mut host = StdHost::new();
+        self.call_with_host(method, descriptor, args, &mut host)
+    }
+
+    fn call_with_host(
+        &self,
+        method: &str,
+        descriptor: &str,
+        args: &[Value],
+        host: &mut StdHost,
+    ) -> Result<Value, NativeError> {
+        self.jar
+            .invoke_method_with_args("demo/Probe", method, descriptor, None, args, host)
     }
 
     fn text_with(&self, method: &str, argument: &str) -> String {
@@ -267,6 +374,38 @@ impl Fixture {
 }
 
 #[test]
+fn bit_conversions_match_java25_for_non_nan_values() {
+    let fixture = Fixture::build("bit-conversions");
+    assert_eq!(
+        fixture.text("bitConversions"),
+        "0/0;8000000000000000/8000000000000000;7ff0000000000000/7ff0000000000000;fff0000000000000/fff0000000000000;3ff4000000000000/3ff4000000000000;1/1;8000000000000001/8000000000000001;0/0;80000000/80000000;7f800000/7f800000;ff800000/ff800000;3fa00000/3fa00000;1/1;80000001/80000001;"
+    );
+}
+
+#[test]
+fn canonical_nan_bit_conversions_match_java25() {
+    let fixture = Fixture::build("canonical-nan");
+    assert_eq!(fixture.text("canonicalNaN"), "7ff8000000000000/7fc00000");
+}
+
+#[test]
+fn raw_nan_bit_conversions_are_counted() {
+    let fixture = Fixture::build("raw-nan");
+    let mut host = StdHost::new();
+    let value = fixture
+        .call_with_host("rawNaN", "()Ljava/lang/String;", &[], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("0|0".to_owned())));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![
+            ("java/lang/Double#doubleToRawLongBits(D)J".into(), 1),
+            ("java/lang/Float#floatToRawIntBits(F)I".into(), 1),
+        ]
+    );
+}
+
+#[test]
 fn gson_round_trips_primitives_strings_lists_and_maps() {
     let fixture = Fixture::build("round-trip");
     // `roundTrip` builds a pretty-printing `Gson`; gson-2.14.0 on a real JVM
@@ -277,21 +416,34 @@ fn gson_round_trips_primitives_strings_lists_and_maps() {
     );
 }
 
+/// `Gson.fromJson` that Gson would refuse: a malformed document (Gson's
+/// `JsonSyntaxException`, whose message carries the reader's position) and
+/// one nested past `JsonReader`'s 255 levels. Neither is reproduced: the
+/// call is counted.
 #[test]
-fn malformed_json_is_refused_with_a_bounded_reason() {
+fn malformed_and_too_deep_json_are_counted() {
     let fixture = Fixture::build("malformed");
-    let error = fixture
-        .call(
+    for json in [
+        "[".to_owned(),
+        format!("{}{}", "[".repeat(256), "]".repeat(256)),
+    ] {
+        let mut host = StdHost::new();
+        let _ = fixture.jar.invoke_method_with_args(
+            "demo/Probe",
             "parse",
             "(Ljava/lang/String;)Ljava/lang/String;",
-            &[Value::Ref(Some("[".into()))],
-        )
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("Gson.fromJson rejected the document"),
-        "unexpected error: {message}"
-    );
+            None,
+            &[Value::Ref(Some(json))],
+            &mut host,
+        );
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson")),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
 }
 
 #[test]
@@ -301,34 +453,28 @@ fn lenient_json_accepts_comments_and_a_byte_order_mark() {
     assert_eq!(fixture.text_with("lenient", document), "2");
 }
 
+/// 40 nested arrays are well within `JsonReader`'s 255 levels: a raw `List`
+/// holding one list, as Gson 2.14.0 reads it.
 #[test]
-fn deeply_nested_json_is_refused_by_the_depth_bound() {
+fn nested_json_within_gsons_limit_is_read() {
     let fixture = Fixture::build("depth");
     let json = format!("{}{}", "[".repeat(40), "]".repeat(40));
-    let error = fixture
-        .call(
-            "parse",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            &[Value::Ref(Some(json))],
-        )
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("nests") && message.contains("at most 32"),
-        "unexpected error: {message}"
-    );
+    assert_eq!(fixture.text_with("parse", &json), "1");
 }
 
+/// A raw `Map`'s numbers are `ObjectTypeAdapter`'s `Double`s, so the value
+/// read back prints `7.0` (Gson 2.14.0 writes `{"a":7.0}` and reads it back
+/// as `7.0`).
 #[test]
 fn file_writer_and_file_reader_round_trip_through_the_virtual_file() {
     let fixture = Fixture::build("file-round-trip");
-    assert_eq!(fixture.text("fileRoundTrip"), "false|true|7");
+    assert_eq!(fixture.text("fileRoundTrip"), "false|true|7.0");
 }
 
 #[test]
 fn output_stream_writer_and_files_reader_share_the_same_file() {
     let fixture = Fixture::build("stream-round-trip");
-    assert_eq!(fixture.text("streamRoundTrip"), "2");
+    assert_eq!(fixture.text("streamRoundTrip"), "2.0");
 }
 
 #[test]
@@ -341,4 +487,83 @@ fn string_writer_is_an_appendable_gson_can_write_to() {
 fn a_missing_file_raises_an_ioexception_a_java_catch_sees() {
     let fixture = Fixture::build("missing-file");
     assert_eq!(fixture.text("missingFile"), "caught");
+}
+
+#[test]
+fn gson_numeric_edge_cases_match_java25() {
+    let fixture = Fixture::build("numeric-edge-cases");
+    // Invoke the descriptor directly so Java's two String arguments remain
+    // unambiguous.
+    let call = |mode: &str, json: &str| match fixture.call(
+        "numeric",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+        &[
+            Value::Ref(Some(mode.to_owned())),
+            Value::Ref(Some(json.to_owned())),
+        ],
+    ) {
+        Ok(Value::Ref(Some(text))) => text,
+        other => panic!("numeric returned {other:?}"),
+    };
+    for mode in ["default", "lenient"] {
+        assert_eq!(
+            call(mode, "-0"),
+            "D:-0.0:8000000000000000|-0|-0.0:8000000000000000|-0.0:80000000"
+        );
+        assert_eq!(
+            call(mode, "1e400"),
+            "D:Infinity:7ff0000000000000|1e400|Infinity:7ff0000000000000|Infinity:7f800000"
+        );
+        assert_eq!(
+            call(mode, "NaN"),
+            // Raw NaN payloads are deliberately counted by the bounded host.
+            "NaN|NaN|NaN:0|NaN:0"
+        );
+        assert_eq!(
+            call(mode, "Infinity"),
+            "Infinity|Infinity|Infinity:7ff0000000000000|Infinity:7f800000"
+        );
+        assert_eq!(
+            call(mode, "-Infinity"),
+            "-Infinity|-Infinity|-Infinity:fff0000000000000|-Infinity:ff800000"
+        );
+    }
+    assert_eq!(
+        call("strict", "-0"),
+        "D:-0.0:8000000000000000|-0|-0.0:8000000000000000|-0.0:80000000"
+    );
+    assert_eq!(call("strict", "1e400"), "null|1e400|null|null");
+    assert_eq!(call("strict", "NaN"), "null|null|null|null");
+    assert_eq!(call("strict", "Infinity"), "null|null|null|null");
+    assert_eq!(call("strict", "-Infinity"), "null|null|null|null");
+}
+
+#[test]
+fn unsupported_jar_class_from_reader_is_counted() {
+    let fixture = Fixture::build("unsupported-jar-class");
+    let mut host = StdHost::new();
+    let value = fixture
+        .call_with_host("armorConfig", "()Ljava/lang/String;", &[], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("null".into())));
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson"))
+    );
+}
+
+#[test]
+fn static_only_jar_class_from_reader_is_counted() {
+    let fixture = Fixture::build("static-only-jar-class");
+    let mut host = StdHost::new();
+    let value = fixture
+        .call_with_host("staticOnlyConfig", "()Ljava/lang/String;", &[], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("null".into())));
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.starts_with("com/google/gson/Gson#fromJson"))
+    );
 }

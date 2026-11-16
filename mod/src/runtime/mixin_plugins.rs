@@ -414,21 +414,20 @@ impl NativeJar {
             .flat_map(|mixin| self.mixin_class_targets(&mixin.replace('.', "/")))
             .map(|target| binary_name(&target))
             .collect::<BTreeSet<_>>();
-        let set = |names: &BTreeSet<String>| {
-            collection_value(
-                "set",
-                &names
-                    .iter()
-                    .map(|name| java_text(Some(name)))
-                    .collect::<Vec<_>>(),
-            )
+        // Two sets of their own (#156 P14d2); a host that makes none cannot
+        // run the session.
+        let mut set = |names: &BTreeSet<String>| {
+            let names = names.iter().map(|name| java_text(Some(name))).collect();
+            host.make_collection(crate::runtime::stand_in_class("set"), names)
+                .ok_or_else(|| "acceptTargets: the host makes no collections".to_owned())
         };
+        let targets = [set(&kept_targets)?, set(&other_targets)?];
         required(
             call(
                 host,
                 "acceptTargets",
                 "(Ljava/util/Set;Ljava/util/Set;)V",
-                &[set(&kept_targets), set(&other_targets)],
+                &targets,
             )?,
             "acceptTargets",
         )?;

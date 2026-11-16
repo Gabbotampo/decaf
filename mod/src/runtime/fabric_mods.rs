@@ -255,6 +255,16 @@ impl StdHost {
         loader::container(id, self.fabric_version(id).as_deref())
     }
 
+    /// The origin that Fabric Loader would attach to this run's container.
+    pub(crate) fn fabric_origin(&self, id: &str) -> Value {
+        let (kind, argument) = self
+            .fabric_origins
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| ("path".into(), id.to_owned()));
+        loader::origin(&kind, &argument)
+    }
+
     /// Answer the loader's container list and metadata surface, or `None`
     /// for a call this module does not own.
     pub(crate) fn fabric_mods_instance(
@@ -265,6 +275,8 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/Collection;") => {
+                // `FabricLoaderImpl.getAllMods()`: a new
+                // `Collections.unmodifiableList(mods)` on every call.
                 let containers = self.fabric_containers();
                 // Fabric calls Collections.unmodifiableList(mods) inside
                 // getAllMods, so each query makes a fresh wrapper over the
@@ -445,7 +457,7 @@ impl StdHost {
                 let people = (0..count)
                     .map(|index| loader::pointed(Pointed::Person, id, &format!("/{key}/{index}")))
                     .collect::<Vec<_>>();
-                Ok(collection_value("list", &people))
+                Ok(self.metadata_collection(id, &r.name, people))
             }
             // `V1ModMetadata` holds `ContactInformation.EMPTY` without one.
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
@@ -456,10 +468,12 @@ impl StdHost {
                 })
             }
             ("getLicense", "()Ljava/util/Collection;") => {
-                Ok(collection_value("list", &strings("license")))
+                let license = strings("license");
+                Ok(self.metadata_collection(id, &r.name, license))
             }
             ("getProvides", "()Ljava/util/Collection;") => {
-                Ok(collection_value("list", &strings("provides")))
+                let provides = strings("provides");
+                Ok(self.metadata_collection(id, &r.name, provides))
             }
             ("containsCustomValue", "(Ljava/lang/String;)Z") => {
                 let key = expect_string(Self::argument(r, args, 0)?);
@@ -482,6 +496,13 @@ impl StdHost {
             }
             _ => self.unknown_host_call(r),
         }
+    }
+
+    /// A mod's metadata collection (`V1ModMetadata`'s `authors`, `license`...
+    /// fields): the same list on every call, for the run (#156 P14d2).
+    fn metadata_collection(&mut self, id: &str, member: &str, values: Vec<Value>) -> Value {
+        let of = Value::Ref(Some(format!("fabric-mod-metadata/{id}")));
+        self.cached_collection(&of, member, crate::runtime::stand_in_class("list"), false, values)
     }
 
     /// `java` and `minecraft` are `BuiltinModMetadata` built by the loader
@@ -517,7 +538,7 @@ impl StdHost {
             (
                 "getAuthors" | "getContributors" | "getLicense" | "getProvides",
                 "()Ljava/util/Collection;",
-            ) => Some(collection_value("list", &[])),
+            ) => Some(self.metadata_collection(id, &r.name, Vec::new())),
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
                 Some(loader::empty_contact())
             }

@@ -124,21 +124,25 @@ fn calls_to<'a>(host: &'a StdHost, owner: &str, name: &str) -> Vec<&'a HostInvoc
 }
 
 /// The callback target a registration recorded in its `@indy:` marker
-/// (`@indy:<class>#<method>:<index>:<target>:<captures>`).
+/// (`@indy:<class>#<method>:<site>:<interfaces>:<target>:<captures>`).
 fn indy_target(invocation: &HostInvocation) -> String {
     let marker = invocation
         .args
         .iter()
         .filter_map(|value| match value {
-            Value::Ref(Some(marker)) => Some(marker.as_str()),
+            // A lambda is a callback handle keyed by its marker (#156 P15a).
+            Value::Host(handle) if handle.kind() == horizon_native_java::HostKind::Callback => {
+                Some(handle.key())
+            }
             _ => None,
         })
         .find(|marker| marker.starts_with("@indy:"))
         .unwrap_or_else(|| panic!("no invokedynamic marker in {invocation:?}"));
-    // The target never contains `:`, so the captures after it cannot shift it.
+    // `@indy:<source>:<site>:<interfaces>:<target>:<captures>`: the target
+    // never contains `:`, so the captures after it cannot shift it.
     marker
         .split(':')
-        .nth(3)
+        .nth(4)
         .unwrap_or_else(|| panic!("malformed @indy marker {marker}"))
         .to_owned()
 }

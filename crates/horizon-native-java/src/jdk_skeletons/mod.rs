@@ -527,7 +527,7 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         if !matches!(opcode, 0xb6 | 0xb9)
             || (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z")
-            || !expect_ref(this).is_some_and(|marker| marker.starts_with("map-entry/"))
+            || !crate::host_map_entry::is_entry(this)
         {
             return Ok(None);
         }
@@ -558,8 +558,21 @@ impl<H: Host> Runtime<'_, H> {
                 &other,
                 &[],
             )?;
-            let equal = mine == theirs
-                || (mine != Value::Ref(None) && self.virtual_equals(&mine, &theirs)?);
+            // `IdentityHashMap.EntryIterator.Entry.equals` compares `e.getKey() == key` and
+            // `e.getValue() == value` (#221 review B1): by reference, counted where this model
+            // keeps no identity (two texts or boxes).
+            let equal = if crate::host_map_entry::is_identity_entry(this) {
+                match crate::host_map_entry::same_reference(&mine, &theirs) {
+                    Some(equal) => equal,
+                    None => {
+                        self.host.unknown_operand_call(r)?;
+                        return Ok(Some(boolean(false)));
+                    }
+                }
+            } else {
+                mine == theirs
+                    || (mine != Value::Ref(None) && self.virtual_equals(&mine, &theirs)?)
+            };
             if !equal {
                 return Ok(Some(boolean(false)));
             }
@@ -680,15 +693,19 @@ impl<H: Host> Runtime<'_, H> {
         value: Value,
     ) -> Result<(), NativeError> {
         let marker = expect_array_key(array)?;
-        let values = self
+        let array = self
             .arrays
             .get_mut(marker)
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))?;
-        let length = values.len();
-        let slot = values
-            .get_mut(index)
-            .ok_or_else(|| array_index_out_of_bounds(index as i32, length))?;
-        *slot = value;
+        let length = array.len();
+        if index >= length {
+            return Err(array_index_out_of_bounds(index as i32, length));
+        }
+        if !array.store(index, value) {
+            return Err(NativeError::Metadata(
+                "a value its array cannot hold".into(),
+            ));
+        }
         Ok(())
     }
 }

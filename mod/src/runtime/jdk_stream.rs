@@ -12,31 +12,32 @@
 //! * The comparators `sorted`, `max` and `min` take (rrls picks its
 //!   highest-priority service with `stream.max(COMPARATOR)`).
 //!
-//! A comparator is a marker in the runtime's string vocabulary, built by the
-//! host from `Comparator`'s factories and combinators and evaluated here,
-//! where jar callbacks can run:
+//! A comparator the runtime makes is a callback handle
+//! (`callback_marker::composite`, `HostKind::Callback`), never text, so no
+//! `String` is one and none can be read out of one (#261 re-review). Its
+//! operation and operands are the row's:
 //!
-//! * `@cmp:natural`: `Comparator.naturalOrder()`.
-//! * `@cmp:reverse:<c>`: `c.reversed()`, `Comparator.reverseOrder()`.
-//! * `@cmp:key:<f>`: `Comparator.comparing(f)` and the `comparingInt`,
-//!   `comparingLong`, `comparingDouble` forms.
-//! * `@cmp:keycmp:<f>,<c>`: `Comparator.comparing(f, c)`.
-//! * `@cmp:then:<a>,<b>`: `a.thenComparing(b)`.
-//! * `@cmp:entry-key` / `@cmp:entry-value`: `Map.Entry.comparingByKey()` /
-//!   `comparingByValue()`.
+//! * `cmp.natural`: `Comparator.naturalOrder()`, one object;
+//! * `cmp.reverse-natural`: `reverseOrder()` (both classes), one object;
+//! * `cmp.reverse` over `c`: `c.reversed()`, `Collections.reverseOrder(c)`,
+//!   with the JDK's unwrapping (`c.reversed().reversed() == c`, natural and
+//!   reverse order each other's `reversed()`); equal by its operand, as
+//!   `ReverseComparator2` is;
+//! * `cmp.key` over `f`: `Comparator.comparing(f)` and the `comparingInt`,
+//!   `comparingLong`, `comparingDouble` forms;
+//! * `cmp.keycmp` over `f`, `c`: `Comparator.comparing(f, c)`;
+//! * `cmp.then` over `a`, `b`: `a.thenComparing(b)`;
+//! * `cmp.entry-key` / `cmp.entry-value`: `Map.Entry.comparingByKey()` /
+//!   `comparingByValue()`, one object each.
 //!
-//! Operands are escaped capture markers (`value_marker`), so a jar lambda's
-//! `@indy:...` marker nests unchanged. Any other comparator value (a jar
-//! lambda, method reference or `Comparator` object) is called through the
-//! callback path. Natural order covers the boxed numbers, characters,
-//! booleans and strings (`String.compareTo` over UTF-16 units); anything else
-//! is refused with a named reason rather than ordered arbitrarily.
+//! Any other comparator value (a jar lambda, method reference or
+//! `Comparator` object) is called through the callback path. Natural order
+//! covers the boxed numbers, characters, booleans and strings
+//! (`String.compareTo` over UTF-16 units); anything else is refused with a
+//! named reason rather than ordered arbitrarily.
 
 use crate::runtime::jdk_model::MAX_SPLITERATOR_ELEMENTS;
 use crate::runtime::{Boxed, MethodRef, NativeError, Value, expect_ref};
-
-/// Prefix of a modelled `Comparator` marker.
-const COMPARATOR_PREFIX: &str = "@cmp:";
 
 /// The streams whose JDK spliterator reports SIZED (#166 F3): the lazy
 /// pipeline (`stream_pipeline.rs`) reads it, so `count()` of a SIZED
@@ -49,102 +50,129 @@ pub(crate) struct StreamPlan {
     sized: std::collections::BTreeSet<String>,
 }
 
-fn comparator(body: &str) -> Value {
-    Value::Ref(Some(format!("{COMPARATOR_PREFIX}{body}")))
+/// A comparator the runtime makes: a callback composite (`callback_marker`)
+/// whose operation is `cmp.<op>` over `operands`. An operand-free one is a
+/// singleton (one key), as the JDK's are.
+fn comparator(op: &str, operands: &[&Value]) -> Value {
+    crate::runtime::callback_marker::composite(&format!("cmp.{op}"), operands)
 }
 
-fn escaped(values: &[&Value]) -> String {
-    values
-        .iter()
-        .map(|value| super::value_marker(value))
-        .collect::<Vec<_>>()
-        .join(",")
+/// The comparator `value` is when the runtime made it: its `cmp.` operation
+/// (without the prefix) and operands.
+fn made_comparator(value: &Value) -> Option<(String, Vec<Value>)> {
+    let (op, operands) = crate::runtime::callback_marker::composite_of(value)?;
+    Some((op.strip_prefix("cmp.")?.to_owned(), operands))
 }
 
-/// `Comparator`'s static factories and `Map.Entry`'s comparators, answered by
-/// the host as comparator markers.
-pub(crate) fn comparator_static(r: &MethodRef, args: &[Value]) -> Option<Value> {
-    let first = || args.first().unwrap_or(&Value::Ref(None));
-    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+/// `Objects.requireNonNull(value)`: a `NullPointerException` with no
+/// message, as every `Comparator` factory throws for a `null` argument.
+fn require_non_null(values: &[Value]) -> Result<(), NativeError> {
+    if values.contains(&Value::Ref(None)) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    Ok(())
+}
+
+/// `Collections.reverseOrder(c)`, which `Comparator.reversed()` calls: the
+/// reverse-order singleton for `null`, natural order for it, the operand
+/// of a reversed comparator (`c.reversed().reversed() == c`), otherwise a
+/// new `ReverseComparator2` over `c`.
+fn reverse_of(c: &Value) -> Value {
+    if *c == Value::Ref(None) {
+        return comparator("reverse-natural", &[]);
+    }
+    match made_comparator(c) {
+        Some((op, _)) if op == "reverse-natural" => comparator("natural", &[]),
+        Some((op, _)) if op == "natural" => comparator("reverse-natural", &[]),
+        Some((op, operands)) if op == "reverse" && operands.len() == 1 => operands[0].clone(),
+        _ => comparator("reverse", &[c]),
+    }
+}
+
+/// `Comparator`'s static factories and `Map.Entry`'s comparators.
+pub(crate) fn comparator_static(
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let value = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         ("java/util/Comparator", "naturalOrder", "()Ljava/util/Comparator;") => {
-            Some(comparator("natural"))
+            comparator("natural", &[])
         }
         (
             "java/util/Comparator" | "java/util/Collections",
             "reverseOrder",
             "()Ljava/util/Comparator;",
-        ) => Some(comparator(&format!(
-            "reverse:{}",
-            escaped(&[&comparator("natural")])
-        ))),
+        ) => comparator("reverse-natural", &[]),
         (
             "java/util/Collections",
             "reverseOrder",
             "(Ljava/util/Comparator;)Ljava/util/Comparator;",
-        ) => Some(comparator(&format!("reverse:{}", escaped(&[first()])))),
+        ) => reverse_of(args.first().unwrap_or(&Value::Ref(None))),
         (
             "java/util/Comparator",
             "comparing" | "comparingInt" | "comparingLong" | "comparingDouble",
             descriptor,
-        ) if descriptor.ends_with(")Ljava/util/Comparator;") => match args {
-            [key] => Some(comparator(&format!("key:{}", escaped(&[key])))),
-            [key, order] => Some(comparator(&format!("keycmp:{}", escaped(&[key, order])))),
-            _ => None,
-        },
+        ) if descriptor.ends_with(")Ljava/util/Comparator;") => {
+            if let Err(error) = require_non_null(args) {
+                return Some(Err(error));
+            }
+            match args {
+                [key] => comparator("key", &[key]),
+                [key, order] => comparator("keycmp", &[key, order]),
+                _ => return None,
+            }
+        }
         ("java/util/Map$Entry", "comparingByKey", "()Ljava/util/Comparator;") => {
-            Some(comparator("entry-key"))
+            comparator("entry-key", &[])
         }
         ("java/util/Map$Entry", "comparingByValue", "()Ljava/util/Comparator;") => {
-            Some(comparator("entry-value"))
+            comparator("entry-value", &[])
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(Ok(value))
 }
 
-/// `reversed()` and `thenComparing*` on any comparator value: a modelled
-/// marker or a jar lambda. Answered by the host, since combining needs no
-/// callback to run.
+/// `reversed()` and `thenComparing*` on any comparator value: one the
+/// runtime made or a jar lambda. Combining needs no callback to run.
 pub(crate) fn comparator_instance(
     r: &MethodRef,
     receiver: &Value,
     args: &[Value],
-) -> Option<Value> {
+) -> Option<Result<Value, NativeError>> {
     if r.owner != "java/util/Comparator" || matches!(receiver, Value::Ref(None)) {
         return None;
     }
-    match (r.name.as_str(), r.descriptor.as_str()) {
-        // `ReverseComparator2.reversed()` answers the comparator it reverses, and
-        // `Collections.reverseOrder().reversed()` is `naturalOrder()`: reversing a reversal is
-        // the original, never one more level to recurse through (#250).
-        ("reversed", "()Ljava/util/Comparator;") => Some(
-            reversed_inner(receiver)
-                .unwrap_or_else(|| comparator(&format!("reverse:{}", escaped(&[receiver])))),
-        ),
+    let value = match (r.name.as_str(), r.descriptor.as_str()) {
+        ("reversed", "()Ljava/util/Comparator;") => reverse_of(receiver),
         ("thenComparing", "(Ljava/util/Comparator;)Ljava/util/Comparator;") => {
             let other = args.first()?;
-            Some(comparator(&format!("then:{}", escaped(&[receiver, other]))))
+            if let Err(error) = require_non_null(args) {
+                return Some(Err(error));
+            }
+            comparator("then", &[receiver, other])
         }
         (
             "thenComparing" | "thenComparingInt" | "thenComparingLong" | "thenComparingDouble",
             descriptor,
         ) if descriptor.ends_with(")Ljava/util/Comparator;") => {
+            if let Err(error) = require_non_null(args) {
+                return Some(Err(error));
+            }
             let key = match args {
-                [key] => comparator(&format!("key:{}", escaped(&[key]))),
-                [key, order] => comparator(&format!("keycmp:{}", escaped(&[key, order]))),
+                [key] => comparator("key", &[key]),
+                [key, order] => comparator("keycmp", &[key, order]),
                 _ => return None,
             };
-            Some(comparator(&format!("then:{}", escaped(&[receiver, &key]))))
+            comparator("then", &[receiver, &key])
         }
-        _ => None,
-    }
-}
-
-/// The comparator a `reverse:` marker reverses.
-fn reversed_inner(comparator: &Value) -> Option<Value> {
-    let body = expect_ref(comparator)?
-        .strip_prefix(COMPARATOR_PREFIX)?
-        .strip_prefix("reverse:")?;
-    operands(body).ok()?.into_iter().next()
+        _ => return None,
+    };
+    Some(Ok(value))
 }
 
 /// An integral boxed or primitive value, widened to `long`.
@@ -247,13 +275,6 @@ pub(crate) fn natural_compare(a: &Value, b: &Value) -> Result<i32, NativeError> 
     )))
 }
 
-fn operands(body: &str) -> Result<Vec<Value>, NativeError> {
-    super::split_capture_markers(body)?
-        .into_iter()
-        .map(|marker| super::parse_collection_value(&marker))
-        .collect()
-}
-
 impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     /// `comparator.compare(a, b)`, for a modelled comparator marker or any
     /// comparator value the callback path can run.
@@ -267,10 +288,12 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         // in a `StackOverflowError`, as Java's lambda chain does.
         let _level = crate::runtime::host_recursion::enter()?;
         // `sorted(null)` and `List.sort(null)` mean natural order.
-        let Some(marker) = expect_ref(comparator).cloned() else {
+        if *comparator == Value::Ref(None) {
             return self.natural_order(a, b);
-        };
-        let Some(body) = marker.strip_prefix(COMPARATOR_PREFIX) else {
+        }
+        // Any comparator the runtime did not make (a jar lambda, method
+        // reference or `Comparator` object) runs its own `compare`.
+        let Some((op, operands)) = made_comparator(comparator) else {
             let result = self.apply_callback(comparator, &[a.clone(), b.clone()])?;
             return super::boxed_integer(&result).ok_or_else(|| {
                 NativeError::Metadata(format!(
@@ -279,55 +302,50 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                 ))
             });
         };
-        let (kind, rest) = body.split_once(':').unwrap_or((body, ""));
-        match kind {
+        let operand = |at: usize| operands.get(at).cloned().unwrap_or(Value::Ref(None));
+        match op.as_str() {
             "natural" => self.natural_order(a, b),
-            "reverse" => {
-                let inner = operands(rest)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or(Value::Ref(None));
-                self.compare_with(&inner, b, a)
-            }
+            "reverse-natural" => self.natural_order(b, a),
+            "reverse" => self.compare_with(&operand(0), b, a),
             "key" => {
-                let key = operands(rest)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or(Value::Ref(None));
+                let key = operand(0);
                 let left = self.apply_callback(&key, std::slice::from_ref(a))?;
                 let right = self.apply_callback(&key, std::slice::from_ref(b))?;
                 self.natural_order(&left, &right)
             }
             "keycmp" => {
-                let parts = operands(rest)?;
-                let [key, order] = parts.as_slice() else {
-                    return Err(NativeError::Metadata("malformed comparator marker".into()));
-                };
-                let left = self.apply_callback(key, std::slice::from_ref(a))?;
-                let right = self.apply_callback(key, std::slice::from_ref(b))?;
-                self.compare_with(order, &left, &right)
+                let (key, order) = (operand(0), operand(1));
+                let left = self.apply_callback(&key, std::slice::from_ref(a))?;
+                let right = self.apply_callback(&key, std::slice::from_ref(b))?;
+                self.compare_with(&order, &left, &right)
             }
-            "then" => {
-                let parts = operands(rest)?;
-                let [first, second] = parts.as_slice() else {
-                    return Err(NativeError::Metadata("malformed comparator marker".into()));
-                };
-                match self.compare_with(first, a, b)? {
-                    0 => self.compare_with(second, a, b),
-                    order => Ok(order),
-                }
-            }
+            "then" => match self.compare_with(&operand(0), a, b)? {
+                0 => self.compare_with(&operand(1), a, b),
+                order => Ok(order),
+            },
             "entry-key" | "entry-value" => {
-                let (ka, va) = super::map_entry_parts(a)?;
-                let (kb, vb) = super::map_entry_parts(b)?;
-                if kind == "entry-key" {
-                    self.natural_order(&ka, &kb)
-                } else {
-                    self.natural_order(&va, &vb)
-                }
+                // `Map.Entry.comparingByKey/Value`: `c1.getKey().compareTo(c2.getKey())`, each
+                // read as the entry's own accessor reads it (`host_map_entry.rs`). An entry whose
+                // contents are unknown (a Gson reading after a write, B8) is that accessor's
+                // counted call, answering its neutral value, never an internal error (#221
+                // review 7, B12).
+                let key = op == "entry-key";
+                let mut part = |entry: &Value| -> Result<Value, NativeError> {
+                    match self.host.map_entry_parts(entry) {
+                        Some((k, v)) => Ok(if key { k } else { v }),
+                        None => self.host.unknown_operand_call(&MethodRef {
+                            owner: "java/util/Map$Entry".into(),
+                            name: if key { "getKey" } else { "getValue" }.into(),
+                            descriptor: "()Ljava/lang/Object;".into(),
+                        }),
+                    }
+                };
+                let left = part(a)?;
+                let right = part(b)?;
+                self.natural_order(&left, &right)
             }
             _ => Err(NativeError::Metadata(format!(
-                "unsupported comparator marker {marker}"
+                "unsupported comparator cmp.{op}"
             ))),
         }
     }
@@ -345,9 +363,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         {
             return Ok(None);
         }
-        let Some(receiver) = receiver.filter(|value| {
-            expect_ref(value).is_some_and(|marker| marker.starts_with(COMPARATOR_PREFIX))
-        }) else {
+        let Some(receiver) = receiver.filter(|value| made_comparator(value).is_some()) else {
             return Ok(None);
         };
         let (Some(a), Some(b)) = (args.first(), args.get(1)) else {
@@ -518,7 +534,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             }
             ("of", "([I)Ljava/util/stream/IntStream;" | "([J)Ljava/util/stream/LongStream;") => {
                 match args.first() {
-                    Some(array) => self.array(array)?.clone(),
+                    Some(array) => self.array(array)?.into_owned(),
                     None => return Ok(None),
                 }
             }
@@ -542,15 +558,22 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // The stream's elements through the host's iterator table, the
             // same iterator a `List.iterator()` over them answers.
-            ("iterator", "()Ljava/util/Iterator;") => self.host.invoke_instance(
-                &MethodRef {
-                    owner: "java/util/List".into(),
-                    name: "iterator".into(),
-                    descriptor: "()Ljava/util/Iterator;".into(),
-                },
-                &super::collection_value("list", values),
-                &[],
-            )?,
+            ("iterator", "()Ljava/util/Iterator;") => {
+                let list = self.new_host_collection(
+                    "java/util/ArrayList",
+                    values.to_vec(),
+                    (&r.owner, &r.name, &r.descriptor),
+                )?;
+                self.host.invoke_instance(
+                    &MethodRef {
+                        owner: "java/util/List".into(),
+                        name: "iterator".into(),
+                        descriptor: "()Ljava/util/Iterator;".into(),
+                    },
+                    &list,
+                    &[],
+                )?
+            }
             ("sum", "()I") => Value::Int(
                 values
                     .iter()
@@ -626,19 +649,51 @@ mod tests {
     }
 
     #[test]
-    fn comparator_combinators_nest_their_operands() {
-        let reversed = comparator_instance(
-            &MethodRef {
-                owner: "java/util/Comparator".into(),
-                name: "reversed".into(),
-                descriptor: "()Ljava/util/Comparator;".into(),
-            },
-            &text("@indy:demo/A#x:1:demo/A#cmp(II)I:"),
-            &[],
-        )
-        .unwrap();
-        let marker = expect_ref(&reversed).unwrap();
-        let inner = operands(marker.strip_prefix("@cmp:reverse:").unwrap()).unwrap();
-        assert_eq!(inner, [text("@indy:demo/A#x:1:demo/A#cmp(II)I:")]);
+    fn comparators_are_callback_handles_with_the_jdks_identities() {
+        let call = |name: &str| MethodRef {
+            owner: "java/util/Comparator".into(),
+            name: name.into(),
+            descriptor: "()Ljava/util/Comparator;".into(),
+        };
+        let lambda = crate::runtime::callback_marker::lambda_from_text(
+            "demo/A#x",
+            1,
+            "java/util/Comparator",
+            "demo/A#cmp(II)I",
+            "",
+        );
+        let reversed = comparator_instance(&call("reversed"), &lambda, &[])
+            .unwrap()
+            .unwrap();
+        assert!(crate::runtime::callback_marker::callback_text(&reversed).is_some());
+        assert_eq!(
+            made_comparator(&reversed),
+            Some(("reverse".into(), vec![lambda.clone()]))
+        );
+        // `c.reversed().reversed() == c`; the singletons are one object each.
+        let back = comparator_instance(&call("reversed"), &reversed, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(back, lambda);
+        let natural = comparator_static(&call("naturalOrder"), &[])
+            .unwrap()
+            .unwrap();
+        let reverse = comparator_static(&call("reverseOrder"), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            comparator_instance(&call("reversed"), &natural, &[])
+                .unwrap()
+                .unwrap(),
+            reverse
+        );
+        assert_eq!(
+            comparator_instance(&call("reversed"), &reverse, &[])
+                .unwrap()
+                .unwrap(),
+            natural
+        );
+        // A `String` spelled like the old text form is no comparator.
+        assert_eq!(made_comparator(&text("@cmp:natural")), None);
     }
 }

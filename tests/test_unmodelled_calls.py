@@ -126,6 +126,32 @@ class UnmodelledCallsTests(unittest.TestCase):
         self.assertEqual(TOOL.parse_corpus("neoforge=/tmp/x"),
                          ("neoforge", Path("/tmp/x")))
 
+    def test_default_game_block_table_discovers_exact_prepared_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            table = root / "vanilla-block-classes.json"
+            table.write_text('{"blocks":{"minecraft:fire":["net/minecraft/world/level/block/FireBlock"]}}')
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"HORIZON_RESOURCES": str(root)}, clear=False):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    found = TOOL.default_game_block_classes("26.3")
+            self.assertEqual(found, table.resolve())
+            self.assertIn("using prepared vanilla block class table", stderr.getvalue())
+
+    def test_default_game_block_table_rejects_simple_name_behaviour_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "block-behaviours.json").write_text(
+                '{"blocks":[{"name":"minecraft:fire","class":["FireBlock"],'
+                '"interfaces":["FeatureElement"]}]}'
+            )
+            from unittest import mock
+            with mock.patch.dict(os.environ, {"HORIZON_RESOURCES": str(root)}, clear=False):
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    found = TOOL.default_game_block_classes("26.3")
+            self.assertIsNone(found)
+            self.assertIn("prepared vanilla block class table absent", stderr.getvalue())
+
     def test_locked_neoforge_reads_the_committed_file_names(self):
         locked = TOOL.locked_neoforge()
         self.assertTrue(locked)
@@ -331,6 +357,78 @@ class UnmodelledCallsTests(unittest.TestCase):
                                   "--dependency-mode", "closure", "--jobs", "1"])
         self.assertEqual(code, 2)
         self.assertIn("--fabric-loader", errors.getvalue())
+
+    def test_provider_dir_filters_same_id_by_loader_for_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "deps-pool"
+            pool.mkdir()
+            with zipfile.ZipFile(pool / "shared-fabric.jar", "w") as archive:
+                archive.writestr("fabric.mod.json", json.dumps({
+                    "id": "shared", "version": "9",
+                }))
+            with zipfile.ZipFile(pool / "shared-neoforge.jar", "w") as archive:
+                archive.writestr("META-INF/neoforge.mods.toml", (
+                    '[[mods]]\nmodId="shared"\nversion="2"\n'))
+            with zipfile.ZipFile(root / "fabric-app.jar", "w") as archive:
+                archive.writestr("fabric.mod.json", json.dumps({
+                    "id": "fabric_app", "version": "1", "depends": {"shared": "*"},
+                }))
+            with zipfile.ZipFile(root / "neoforge-app.jar", "w") as archive:
+                archive.writestr("META-INF/neoforge.mods.toml", (
+                    '[[mods]]\nmodId="neoforge_app"\nversion="1"\n'
+                    '[[dependencies.neoforge_app]]\nmodId="shared"\n'
+                    'type="required"\n'))
+            fabric_index = TOOL.ledger.provider_index(
+                TOOL.provider_dir_jars(pool, "corpus-xl"))
+            neo_index = TOOL.ledger.provider_index(
+                TOOL.provider_dir_jars(pool, "neoforge"))
+            matcher = TOOL.hybrid_pack.maven_version_satisfies
+            fabric_closure = TOOL.ledger.dependency_closure(
+                root / "fabric-app.jar", fabric_index, version_matcher=matcher)
+            neo_closure = TOOL.ledger.dependency_closure(
+                root / "neoforge-app.jar", neo_index, version_matcher=matcher)
+        self.assertEqual([jar.name for jar in fabric_closure.jars],
+                         ["shared-fabric.jar"])
+        self.assertEqual([jar.name for jar in neo_closure.jars],
+                         ["shared-neoforge.jar"])
+
+    def test_provider_dir_supplies_closure_only_and_is_not_a_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "deps-pool"
+            pool.mkdir()
+            self._jar(root, "app.jar", "app", {"absent": ">=2"})
+            with zipfile.ZipFile(pool / "dep.jar", "w") as archive:
+                archive.writestr("fabric.mod.json", json.dumps({
+                    "id": "absent", "version": "2.1",
+                }))
+            probe = root / "probe"
+            probe.write_text(
+                "#!/bin/sh\n"
+                "printf '{\"status\":\"ok\",\"unknown_host_call_count\":0,\"unknown_host_calls\":[]}\n'\n",
+                encoding="utf-8")
+            probe.chmod(0o755)
+            from unittest import mock
+            fake_oracle = type("Oracle", (), {
+                "evaluate": lambda self, pairs: None,
+                "matches": lambda self, version, predicates: True,
+            })()
+            with mock.patch.object(TOOL, "find_fabric_loader", return_value=root / "loader.jar"), \
+                 mock.patch.object(TOOL, "FabricPredicateOracle", return_value=fake_oracle):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(TOOL.main([
+                        "--corpus", f"wide={root}", "--probe", str(probe),
+                        "--dependency-mode", "closure", "--jobs", "1",
+                        "--provider-dir", str(pool),
+                    ]), 0)
+            report = json.loads(output.getvalue())
+        rows = report["corpora"]["wide"]["rows"]
+        app = next(row for row in rows if row["jar"] == "app.jar")
+        self.assertEqual(app["verdict"], "ran-clean")
+        self.assertEqual(app["deps"], ["dep.jar"])
+        self.assertNotIn("dep.jar", {row["jar"] for row in rows})
 
     def test_dependency_failure_is_a_regression_outside_closure_totals(self):
         rows = [
