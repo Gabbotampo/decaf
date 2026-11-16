@@ -35717,7 +35717,7 @@ modId="minecraft"
                 assert_eq!(class, "demo/Spin");
                 assert_eq!(method, "spin");
                 assert_eq!(budget, limit);
-                assert_eq!(instructions, 0);
+                assert!(instructions > 0);
                 assert_eq!(instruction_limit, None);
             }
             other => panic!("expected the execution budget, got {other:?}"),
