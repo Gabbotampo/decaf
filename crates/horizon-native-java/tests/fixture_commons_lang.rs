@@ -63,7 +63,21 @@ fn commons_lang_slice_two_matches_java25() {
         ],
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
-    let _surrogate = fixture.text_on(&mut host, "surrogate");
+    let before = host.unknown_host_call_count();
+    let surrogate = fixture.jar.invoke_method_with_args(
+        "demo/Probe",
+        "surrogate",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
+    );
+    assert!(
+        surrogate.is_err(),
+        "surrogate unexpectedly answered: {surrogate:?}"
+    );
+    assert_eq!(host.unknown_host_call_count(), before + 1);
+    assert!(host.unknown_host_calls().iter().any(|(call, _)| call == "org/apache/commons/lang3/StringUtils#rightPad(Ljava/lang/String;IC)Ljava/lang/String;"));
     let expected = include_str!("fixtures/commons_lang/oracle/java25.txt")
         .lines()
         .filter(|line| !line.starts_with("surrogate="))
