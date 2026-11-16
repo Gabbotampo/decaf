@@ -23,7 +23,7 @@ use horizon_native_java::{StdHost, Value};
 fn probe_rows_match_java25_capture() {
  let probe: &'static str = Box::leak(format!("package demo;\n{}", include_str!("fixtures/entity_registration/Probe.java")).into_boxed_str());
  let sources = [
-  ("demo/Probe.java", &probe),
+  ("demo/Probe.java", probe),
   ("net/minecraft/SharedConstants.java", include_str!("fixtures/entity_registration/stubs/net/minecraft/SharedConstants.java")),
   ("net/minecraft/server/Bootstrap.java", include_str!("fixtures/entity_registration/stubs/net/minecraft/server/Bootstrap.java")),
   ("net/minecraft/network/RegistryFriendlyByteBuf.java", include_str!("fixtures/entity_registration/stubs/net/minecraft/network/RegistryFriendlyByteBuf.java")),
