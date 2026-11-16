@@ -2817,13 +2817,162 @@ fn write_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mod_api::{DamageContainer, EntityRef, Identifier, PermissionLevel, WorldEpoch};
+    use mod_api::{
+        ConfigEntry, ConfigFileError, ConfigFiles, ConfigPath, DamageContainer, Dist, EntityRef,
+        Identifier, PermissionLevel, WorldEpoch,
+    };
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static REPORT_BYTES: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+
+    fn report_bytes() -> &'static Mutex<Option<Vec<u8>>> {
+        REPORT_BYTES.get_or_init(|| Mutex::new(None))
+    }
+
+    struct ReportFiles;
+    impl ConfigFiles for ReportFiles {
+        fn read(&self, _file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
+            report_bytes()
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(ConfigFileError::NotFound)
+        }
+        fn write(&self, _file: &ConfigPath, bytes: &[u8]) -> Result<(), ConfigFileError> {
+            *report_bytes().lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn list(&self, _folder: &ConfigPath) -> Result<Vec<ConfigEntry>, ConfigFileError> {
+            Ok(Vec::new())
+        }
+        fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
+            Ok(None)
+        }
+    }
+
+    static REPORT_FILES: ReportFiles = ReportFiles;
+
+    struct ReportHost;
+    impl Host for ReportHost {}
+    mod_api::impl_host_areas!(ReportHost, except(config));
+    impl ClientHost for ReportHost {}
+    mod_api::impl_client_host_areas!(ReportHost, except(config));
+    impl mod_api::prelude::ConfigHost for ReportHost {
+        fn dist(&self) -> Dist {
+            Dist::Client
+        }
+        fn game_version(&self) -> &'static str {
+            "26.3"
+        }
+        fn horizon_version(&self) -> &'static str {
+            "test"
+        }
+        fn on(&self, _mod_id: &str) -> bool {
+            true
+        }
+        fn setting(&self, _mod_id: &str, _key: &str) -> Option<String> {
+            None
+        }
+        fn set_setting(&self, _mod_id: &str, _key: &str, _value: &str) {}
+        fn config_files(&self) -> &'static dyn ConfigFiles {
+            &REPORT_FILES
+        }
+        fn dimension(&self) -> &'static str {
+            "minecraft:overworld"
+        }
+        fn server_has_time(&self) -> bool {
+            true
+        }
+        fn instance_dir(&self) -> PathBuf {
+            PathBuf::from("/tmp/horizon-java-test")
+        }
+    }
+    impl mod_api::prelude::ConfigClientHost for ReportHost {
+        fn translate(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn setting_bool(&self, _key: &str) -> Option<bool> {
+            None
+        }
+        fn setting_choice(&self, _key: &str) -> Option<u32> {
+            None
+        }
+        fn setting_f64(&self, _key: &str) -> Option<f64> {
+            None
+        }
+        fn setting_color(&self, _key: &str) -> Option<u32> {
+            None
+        }
+    }
+
+    fn lifecycle_fixture() -> Vec<u8> {
+        runtime::neoforge_lifecycle::tests::fixture_jar_bytes().to_vec()
+    }
+
+    fn install_client_fixture(java: &HorizonJava) {
+        java.lock_client()
+            .set_fixture_files(vec![("lifecycle.jar".into(), lifecycle_fixture())]);
+    }
 
     #[test]
-    fn report_json_persists_a_client_rows_section() {
-        let report = report_json(&State::default(), &client::State::default());
-        assert_eq!(report["schema"], SCHEMA);
-        assert!(report["client_jars"].is_array());
+    fn client_setup_leave_rejoin_stop_and_second_setup_keep_one_listener() {
+        *report_bytes().lock().unwrap() = None;
+        let java = HorizonJava::default();
+        install_client_fixture(&java);
+        let mut host = ReportHost;
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        let first = java.lock_client().report_rows().collect::<Vec<_>>();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["client"]["client_listeners"], 1);
+        let mut load = ClientLevelLoadEvent {
+            dimension: "minecraft:overworld",
+        };
+        Hooks::client_level_load(&java, &mut host, &mut load);
+        let mut unload = ClientLevelUnloadEvent {
+            dimension: "minecraft:overworld",
+        };
+        Hooks::client_level_unload(&java, &mut host, &mut unload);
+        Hooks::client_level_load(&java, &mut host, &mut load);
+        assert_eq!(java.lock_client().resident_count(), 1);
+        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        assert_eq!(java.lock_client().resident_count(), 0);
+        let report: serde_json::Value = serde_json::from_slice(
+            report_bytes().lock().unwrap().as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["client_jars"].as_array().unwrap().len(), 1);
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        let client = java.lock_client();
+        assert_eq!(client.resident_count(), 1);
+        assert_eq!(client.report_rows().count(), 1);
+    }
+
+    #[test]
+    fn client_stages_run_and_persist_success_failure_counters() {
+        *report_bytes().lock().unwrap() = None;
+        let java = HorizonJava::default();
+        install_client_fixture(&java);
+        let mut host = ReportHost;
+        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        let report: serde_json::Value = serde_json::from_slice(
+            report_bytes().lock().unwrap().as_ref().unwrap(),
+        )
+        .unwrap();
+        let row = &report["client_jars"][0];
+        assert_eq!(row["verdict"], "ran-partial");
+        assert_eq!(row["client"]["entrypoints_ran"], 2);
+        assert_eq!(row["client"]["stages"]["Common setup"]["attempted"], 1);
+        assert_eq!(row["client"]["stages"]["Common setup"]["failed"], 0);
+        assert!(row["client"]["stages"]["Common setup"]["calls"]
+            .as_u64()
+            .unwrap()
+            > 0);
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["attempted"], 1);
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["failed"], 1);
+        assert_eq!(row["client"]["stages"]["Enqueue IMC"]["disabled"], 1);
+        assert!(row["host_calls"].as_u64().unwrap() > 0);
     }
 
     /// Two players leave in one poll: Horizon drops both before the first logout hook, so the

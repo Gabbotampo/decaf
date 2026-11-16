@@ -20,6 +20,8 @@ pub(crate) struct State {
     jars: Vec<LoadedJar>,
     refused: Vec<Row>,
     retired: Vec<Row>,
+    #[cfg(test)]
+    fixture_files: Option<Vec<(String, Vec<u8>)>>,
 }
 
 struct LoadedJar {
@@ -95,6 +97,11 @@ impl Row {
 }
 
 impl State {
+    #[cfg(test)]
+    pub(crate) fn set_fixture_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        self.fixture_files = Some(files);
+    }
+
     /// Load the client role once, on the client setup thread, and retain every host for later G1 dispatch.
     pub(crate) fn ensure_loaded(&mut self) {
         if self.loaded {
@@ -104,7 +111,19 @@ impl State {
         self.world_loaded = false;
         self.loaded = true;
         let mut parsed = Vec::new();
-        for (file, bytes) in crate::content::read_jar_files() {
+        let files = {
+            #[cfg(test)]
+            if let Some(files) = &self.fixture_files {
+                files.clone()
+            } else {
+                crate::content::read_jar_files()
+            }
+            #[cfg(not(test))]
+            {
+                crate::content::read_jar_files()
+            }
+        };
+        for (file, bytes) in files {
             match NativeJar::from_bytes(&bytes) {
                 Ok(jar) => parsed.push((file, Arc::new(jar))),
                 Err(error) => self.refused.push(Row::refused(
@@ -168,6 +187,11 @@ impl State {
             self.jars.len(),
             self.refused.len()
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_count(&self) -> usize {
+        self.jars.len()
     }
 
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
@@ -396,73 +420,6 @@ mod tests {
         }
         zip.finish().unwrap();
         NativeJar::from_bytes(&bytes.into_inner()).unwrap()
-    }
-
-    #[test]
-    fn client_state_reuses_resident_listeners_across_world_rejoin() {
-        let mut state = State {
-            loaded: true,
-            world_loaded: true,
-            ..State::default()
-        };
-        state.jars.push(LoadedJar {
-            row: Row {
-                listeners: 1,
-                ..Row::default()
-            },
-            jar: Arc::new(jar(&[])),
-            host: StdHost::new(),
-            listeners: vec![],
-            orderings: vec![],
-        });
-        state.level_unloaded();
-        state.level_loaded();
-        assert_eq!(state.jars.len(), 1);
-        assert_eq!(state.jars[0].row.listeners, 1);
-        assert_eq!(state.report_rows().count(), 1);
-    }
-
-    #[test]
-    fn client_teardown_drops_hosts_and_preserves_one_report_row_for_flush() {
-        let mut state = State {
-            loaded: true,
-            ..State::default()
-        };
-        state.jars.push(LoadedJar {
-            row: Row {
-                id: "fixture".into(),
-                ..Row::default()
-            },
-            jar: Arc::new(jar(&[])),
-            host: StdHost::new(),
-            listeners: vec![],
-            orderings: vec![],
-        });
-        assert_eq!(state.teardown(), 1);
-        assert!(!state.loaded);
-        assert!(state.jars.is_empty());
-        assert_eq!(state.report_rows().count(), 1);
-        state.ensure_loaded();
-        assert!(state.loaded);
-        assert!(state.retired.is_empty());
-    }
-
-    #[test]
-    fn stage_counts_are_serialized_with_calls_and_failure_counters() {
-        let mut row = Row::default();
-        row.stages.insert(
-            "client".into(),
-            StageCounts {
-                attempted: 1,
-                calls: 3,
-                ..StageCounts::default()
-            },
-        );
-        let stages = row.json()["client"]["stages"].clone();
-        assert_eq!(stages["client"]["attempted"], 1);
-        assert_eq!(stages["client"]["calls"], 3);
-        assert_eq!(stages["client"]["failed"], 0);
-        assert_eq!(stages["client"]["disabled"], 0);
     }
 
     #[test]
