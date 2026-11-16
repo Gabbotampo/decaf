@@ -387,10 +387,10 @@ mod tests {
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            System.alloc(layout)
+            unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            System.dealloc(ptr, layout);
+            unsafe { System.dealloc(ptr, layout); }
         }
     }
     #[global_allocator]
@@ -515,24 +515,19 @@ mod tests {
     #[test]
     fn head_cancel_default_and_set_return_value() {
         let java = HorizonJava::default();
-        java.lock().jars.push(load("cancel", "Cancel", "@Mixin(Player.class) public class Cancel { @Inject(method=\"getDestroySpeed\", at=@At(\"HEAD\"), cancellable=true) private void c(BlockState s, CallbackInfoReturnable<Float> ci) { ci.cancel(); } }"));
+        java.lock().jars.push(load("cancel", "Cancel", "@Mixin(BoneMealItem.class) public class Cancel { @Inject(method=\"growCrop\", at=@At(\"HEAD\"), cancellable=true) private void c(ItemStack s, Level l, BlockPos p, CallbackInfoReturnable<Boolean> ci) { ci.cancel(); } }"));
         java.refresh_game_hook_plan_bits();
-        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
-        let mut host = PlayerTickHost {
-            spectator: BTreeMap::new(),
-        };
-        let answer = java
-            .dispatch_game_hook(GameDispatch::new(
-                MethodId("java_destroy_speed"),
-                Phase::Head,
-                Some(GameObject::player(1, "Alex")),
-                &mut args,
-                None,
-                &mut host,
-            ))
-            .unwrap();
+        let mut args = [Value::Ref(Some("game/itemstack/x".into())), Value::Ref(Some("game/level/x".into())), Value::Ref(Some("game/blockpos/x".into()))];
+        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
+        let answer = java.dispatch_game_hook(GameDispatch::new(MethodId("java_grow_crop"), Phase::Head, None, &mut args, None, &mut host)).unwrap();
         assert!(answer.cancelled);
-        assert_eq!(answer.returned, Some(Value::Float(0.0)));
+        assert_eq!(answer.returned, Some(Value::Int(0)));
+        java.lock().jars.clear();
+        java.lock().jars.push(load("set", "Set", "@Mixin(BoneMealItem.class) public class Set { @Inject(method=\"growCrop\", at=@At(\"HEAD\"), cancellable=true) private void c(ItemStack s, Level l, BlockPos p, CallbackInfoReturnable<Boolean> ci) { ci.setReturnValue(true); } }"));
+        java.refresh_game_hook_plan_bits();
+        let answer = java.dispatch_game_hook(GameDispatch::new(MethodId("java_grow_crop"), Phase::Head, None, &mut args, None, &mut host)).unwrap();
+        assert!(answer.cancelled);
+        assert_eq!(answer.returned, Some(Value::Int(1)));
     }
 
     #[test]

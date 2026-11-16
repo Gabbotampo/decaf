@@ -735,6 +735,22 @@ pub(crate) mod tests {
             "package net.minecraft.world.level.block.state; public class BlockState {}",
         ),
         (
+            "net/minecraft/world/item/ItemStack.java",
+            "package net.minecraft.world.item; public class ItemStack {}",
+        ),
+        (
+            "net/minecraft/world/level/Level.java",
+            "package net.minecraft.world.level; public class Level {}",
+        ),
+        (
+            "net/minecraft/core/BlockPos.java",
+            "package net.minecraft.core; public class BlockPos {}",
+        ),
+        (
+            "net/minecraft/world/item/BoneMealItem.java",
+            "package net.minecraft.world.item; public class BoneMealItem { public boolean growCrop(ItemStack s, net.minecraft.world.level.Level l, net.minecraft.core.BlockPos p) { return true; } }",
+        ),
+        (
             "net/minecraft/world/entity/player/Player.java",
             "package net.minecraft.world.entity.player; \
              public class Player extends net.minecraft.world.entity.LivingEntity { \
@@ -755,6 +771,10 @@ pub(crate) mod tests {
         import net.minecraft.world.entity.player.Player; \
         import net.minecraft.server.MinecraftServer; \
         import net.minecraft.world.level.block.state.BlockState; \
+        import net.minecraft.world.item.BoneMealItem; \
+        import net.minecraft.world.item.ItemStack; \
+        import net.minecraft.world.level.Level; \
+        import net.minecraft.core.BlockPos; \
         import org.spongepowered.asm.mixin.Mixin; \
         import org.spongepowered.asm.mixin.injection.*; \
         import org.spongepowered.asm.mixin.injection.callback.CallbackInfo; \
