@@ -166,7 +166,7 @@ impl Fixture {
         with_lib: bool,
         packed: &str,
         mod_json: Option<&str>,
-        classpath: Option<&str>,
+        classpath: Option<&Path>,
         patches: &[(&str, fn(&mut [u8]))],
     ) -> Self {
         let unique = SystemTime::now()
