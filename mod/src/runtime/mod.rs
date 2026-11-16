@@ -76,6 +76,7 @@ mod game_hooks;
 mod game_object;
 mod game_rules;
 mod gson_model;
+mod gson_to_json_tree;
 mod gson_tree;
 mod gson_type_token;
 mod gson_writer;
@@ -207,6 +208,7 @@ mod sound_event;
 mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
+mod pure_helpers;
 mod random_source;
 #[cfg(test)]
 #[path = "random_source_tests.rs"]
@@ -6379,6 +6381,9 @@ impl Host for StdHost {
         if let Some(value) = commons_lang::static_call(self, r, args) {
             return value;
         }
+        if let Some(value) = pure_helpers::static_call(self, r, args) {
+            return value;
+        }
         if let Some(value) = self.neoforge_loader_call(r, args) {
             return Ok(value);
         }
@@ -6407,6 +6412,9 @@ impl Host for StdHost {
             return result.map(|class| self.empty_collection_class(class));
         }
         if let Some(class) = guava_model::empty_factory_class(r) {
+            return Ok(self.empty_collection_class(class));
+        }
+        if let Some(class) = pure_helpers::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
         }
         if let Some(value) = crate::runtime::host_log4j_level::static_call(r, args, &mut self.log4j_levels) {
@@ -15132,6 +15140,10 @@ struct BootstrapMethod {
 }
 
 impl ClassFile {
+    pub(crate) fn is_record(&self) -> bool {
+        self.super_name == "java/lang/Record"
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, NativeError> {
         Self::parse_with_warnings(bytes).map(|(class, _)| class)
     }
@@ -15365,7 +15377,11 @@ impl ClassFile {
     /// the way [`Self::field_signature`] does. Only `RuntimeVisibleAnnotations`
     /// is read: a `CLASS`-retention annotation is invisible to reflection on
     /// the JVM too. A malformed table answers no annotations.
-    fn field_annotations(&self, field_name: &str, field_descriptor: &str) -> Vec<Annotation> {
+    pub(crate) fn field_annotations(
+        &self,
+        field_name: &str,
+        field_descriptor: &str,
+    ) -> Vec<Annotation> {
         self.read_field_annotations(field_name, field_descriptor)
             .unwrap_or_default()
     }
@@ -29341,6 +29357,16 @@ impl<H: Host> Runtime<'_, H> {
                     } else if let Some(value) =
                         invoke_or_catch!(at, executors::invoke(self, &r, receiver.as_ref(), &args))
                     {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        gson_to_json_tree::instance_call(
+                            self,
+                            &r,
+                            receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                            &args,
+                        )
+                    ) {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))
