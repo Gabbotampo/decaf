@@ -359,6 +359,7 @@ impl StdHost {
             }
         }
         push(self.io_paths.get(marker), out);
+        push(self.set_from_map_views.get(marker), out);
         push(self.unmodifiable_collections.get(marker), out);
         push(self.reversed_views.get(marker), out);
         push(self.synchronized_views.get(marker), out);
@@ -389,6 +390,7 @@ impl StdHost {
     fn keyed_table_keys(&self) -> impl Iterator<Item = &str> {
         self.io_paths
             .keys()
+            .chain(self.set_from_map_views.keys())
             .chain(self.unmodifiable_collections.keys())
             .chain(self.reversed_views.keys())
             .chain(self.synchronized_views.keys())
@@ -416,6 +418,7 @@ impl StdHost {
     /// Drop every per-object row of a collected object (`keep` false).
     fn prune_keyed_tables(&mut self, keep: impl Fn(&str) -> bool) {
         self.io_paths.retain(|key, _| keep(key));
+        self.set_from_map_views.retain(|key, _| keep(key));
         self.unmodifiable_collections.retain(|key, _| keep(key));
         self.reversed_views.retain(|key, _| keep(key));
         self.synchronized_views.retain(|key, _| keep(key));
@@ -512,6 +515,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.set_from_map_views.len()
         + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
@@ -671,6 +675,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .map(|(key, elements)| key.len() + values(elements)),
         )
         .chain(
+            host.set_from_map_views
+                .iter()
+                .map(|(key, source)| key.len() + source.len()),
+        )
+        .chain(
             host.iterators
                 .iter()
                 .map(|(key, (elements, _))| key.len() + values(elements)),
@@ -740,6 +749,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.set_from_map_views.keys().map(String::as_str))
             .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
             .chain(host.enumerations.keys().map(String::as_str))
@@ -1479,6 +1489,7 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "set_from_map_views",
             "random_sources",
             "component_states",
             "unmodifiable_collections",
@@ -1567,6 +1578,7 @@ mod tests {
             "next_fabric_event",
             "next_iterator",
             "next_neutral_collection",
+            "next_set_from_map",
             "log4j_levels",
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.
             "jar_registries",
