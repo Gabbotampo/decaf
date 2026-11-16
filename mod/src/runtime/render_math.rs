@@ -394,6 +394,7 @@ fn stack(
                         trusted: true,
                     }),
                 );
+                sync_pose_aliases(map, x);
             }
             Some(Ok(Value::Void))
         }
@@ -465,6 +466,7 @@ fn pose(
                     trusted: true,
                 }),
             );
+            sync_pose_aliases(map, k);
             Some(Ok(Value::Void))
         }
         "translate" if r.descriptor == "(FFF)V" => {
