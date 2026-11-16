@@ -5490,10 +5490,6 @@ impl Host for StdHost {
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {
-        eprintln!(
-            "SETMAP? {value:?} keys={:?}",
-            self.set_from_map_views.keys().collect::<Vec<_>>()
-        );
         let Value::Host(handle) = value else {
             return false;
         };
