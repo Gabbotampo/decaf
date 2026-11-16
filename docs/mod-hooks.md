@@ -3,7 +3,7 @@
 The runtime records listeners for 41 game events (`GameEvent` in
 `crates/horizon-native-java/src/events.rs`): Fabric API event fields plus the NeoForge/Forge
 event classes, each mapped to one runtime event. This page says, for every one of them, which
-mod API hook (`arismoko/horizon`, crate `horizon-mod-api`, library `mod_api`) the mod fires it
+mod API hook (`sunrise-org/sunrise`, crate `sunrise-mod-api`, library `mod_api`) the mod fires it
 from at the matching moment, what the hook's contract lets a Java listener do, and whether it is
 wired. Moments are matched from the hook docs, not the names.
 
@@ -92,7 +92,7 @@ but no level, so a listener that ignores its `Level` still cancels the break.
   experience model; the hook's `exp_to_drop` is left `None`, so vanilla samples experience.
 - **`entity_interact`'s hand is unknown when the two hands agree.** The hook fires once per hand
   and its contract says `self.hand`, but the pin's event carries the stack and not the hand
-  (`arismoko/horizon#2797`). The mod compares the stack with the acting player's two hands
+  (`sunrise-org/sunrise#2797`). The mod compares the stack with the acting player's two hands
   (`LivingRef::hand_item`): a stack exactly one hand holds names that hand. When both hands hold
   the same stack — two empty hands included — the hand is not inferred and not guessed: the Java
   callback's `InteractionHand` argument is an unknown marker whose reads are counted in that jar's
