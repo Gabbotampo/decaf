@@ -34,6 +34,13 @@ fn pure_helpers_match_java25_edge_values() {
         fixture.text_on(&mut host, "strings"),
         "true|true|false|false|true|true|true|false"
     );
+    assert_eq!(
+        fixture.text_on(&mut host, "whitespace"),
+        "false|false|false|false|true|true|true|true|true|false"
+    );
+    let before = host.unknown_host_call_count();
+    assert_eq!(fixture.text_on(&mut host, "nonString"), "false|false|0");
+    assert_eq!(host.unknown_host_call_count() - before, 2);
     assert_eq!(fixture.text_on(&mut host, "list"), "true|1");
-    assert_eq!(host.unknown_host_call_count(), 0);
+    assert_eq!(host.unknown_host_call_count(), 2);
 }

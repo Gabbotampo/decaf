@@ -1,6 +1,6 @@
 //! Small side-effect-free library helpers whose contracts are independent of host state.
 
-use crate::runtime::{MethodRef, NativeError, StdHost, Value, expect_ref};
+use crate::runtime::{MethodRef, NativeError, StdHost, Value};
 
 const LOG4J_STRINGS: &str = "org/apache/logging/log4j/util/Strings";
 const LWJGL_MATH: &str = "org/lwjgl/system/MathUtil";
@@ -31,10 +31,22 @@ pub(crate) fn static_call(
         return Some(host.unknown_host_call(r));
     };
     Some(match (r.name.as_str(), r.descriptor.as_str()) {
-        ("isEmpty", "(Ljava/lang/CharSequence;)Z") => Ok(Value::Int(is_empty(value) as i32)),
-        ("isNotEmpty", "(Ljava/lang/CharSequence;)Z") => Ok(Value::Int((!is_empty(value)) as i32)),
-        ("isBlank", "(Ljava/lang/String;)Z") => Ok(Value::Int(is_blank(value) as i32)),
-        ("isNotBlank", "(Ljava/lang/String;)Z") => Ok(Value::Int((!is_blank(value)) as i32)),
+        ("isEmpty", "(Ljava/lang/CharSequence;)Z") => match string_text(value) {
+            Some(text) => Ok(Value::Int(text.is_none_or(String::is_empty) as i32)),
+            None => host.unknown_host_call(r),
+        },
+        ("isNotEmpty", "(Ljava/lang/CharSequence;)Z") => match string_text(value) {
+            Some(text) => Ok(Value::Int((!text.is_none_or(String::is_empty)) as i32)),
+            None => host.unknown_host_call(r),
+        },
+        ("isBlank", "(Ljava/lang/String;)Z") => match string_text(value) {
+            Some(text) => Ok(Value::Int(is_blank(text) as i32)),
+            None => host.unknown_host_call(r),
+        },
+        ("isNotBlank", "(Ljava/lang/String;)Z") => match string_text(value) {
+            Some(text) => Ok(Value::Int((!is_blank(text)) as i32)),
+            None => host.unknown_host_call(r),
+        },
         _ => host.unknown_host_call(r),
     })
 }
@@ -51,13 +63,19 @@ pub(crate) fn empty_factory_class(r: &MethodRef) -> Option<&'static str> {
     .then_some("java/util/ArrayList")
 }
 
-fn is_empty(value: &Value) -> bool {
-    matches!(value, Value::Ref(None)) || expect_ref(value).is_some_and(String::is_empty)
+fn string_text(value: &Value) -> Option<Option<&String>> {
+    match value {
+        Value::Ref(None) => Some(None),
+        Value::Ref(Some(text)) if crate::runtime::value_class::is_plain_string(text) => Some(Some(text)),
+        _ => None,
+    }
 }
 
-fn is_blank(value: &Value) -> bool {
-    match expect_ref(value) {
-        None => true,
-        Some(text) => text.is_empty() || text.chars().all(char::is_whitespace),
-    }
+fn is_blank(text: Option<&String>) -> bool {
+    text.is_none_or(|text| {
+        text.is_empty()
+            || text
+                .encode_utf16()
+                .all(|unit| crate::runtime::jdk_character::is_whitespace(i32::from(unit)))
+    })
 }
