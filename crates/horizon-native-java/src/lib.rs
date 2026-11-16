@@ -2365,6 +2365,11 @@ pub trait Host {
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
+    fn register_render_handle(&mut self, _key: &str) {}
+
+    fn owns_render_handle(&self, _key: &str) -> bool {
+        false
+    }
 
     /// Reserve one DFU construction node and any callback roots it introduces
     /// against this jar's lifetime budget.
@@ -3524,6 +3529,8 @@ pub struct StdHost {
     /// (`client_surface`): key mappings, HUD elements, the frame's snapshot.
     client: client_surface::ClientState,
     render_objects: BTreeMap<String, render_math::Obj>,
+    /// Render handles allocated by this host, including objects before their constructor runs.
+    render_handles: BTreeSet<String>,
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
@@ -3679,9 +3686,18 @@ impl StdHost {
             game_event: None,
             client: client_surface::ClientState::default(),
             render_objects: BTreeMap::new(),
+            render_handles: BTreeSet::new(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
         }
+    }
+
+    pub(crate) fn register_render_handle(&mut self, key: &str) {
+        self.render_handles.insert(key.to_owned());
+    }
+
+    pub(crate) fn owns_render_handle(&self, key: &str) -> bool {
+        self.render_handles.contains(key)
     }
 
     /// Make an unmodeled host call fail instead of returning its neutral Java
@@ -5389,6 +5405,14 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn register_render_handle(&mut self, key: &str) {
+        self.register_render_handle(key);
+    }
+
+    fn owns_render_handle(&self, key: &str) -> bool {
+        self.owns_render_handle(key)
+    }
+
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.unknown_host_call(r)
     }
@@ -23365,6 +23389,7 @@ impl<H: Host> Runtime<'_, H> {
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
         if render_math::is_class(class) {
+            self.host.register_render_handle(&key);
             return render_math::new_value(class, &key);
         }
         if modelled_writer_class(class) {

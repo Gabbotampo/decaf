@@ -3,6 +3,7 @@ mod javac_fixture;
 const ORACLE: &str = include_str!("fixtures/render_r0/java25.txt");
 const TRIG_AARCH64: &str = include_str!("fixtures/render_r0/trig_aarch64.txt");
 const TRIG_X86_64: &str = include_str!("fixtures/render_r0/trig_x86_64.txt");
+const NORMAL_ORACLE: &str = include_str!("fixtures/render_r0/normal_java25.txt");
 const PROBE: &str = include_str!("fixtures/render_r0/demo/Probe.java");
 const STUBS: &[(&str, &str)] = &[
     (
@@ -59,4 +60,5 @@ fn pose_stack_matches_java25_oracle() {
 fn captured_architecture_trig_oracles_are_kept_as_counted_rows() {
     assert_eq!(TRIG_AARCH64.lines().count(), 5);
     assert_eq!(TRIG_X86_64.lines().count(), 5);
+    assert_eq!(NORMAL_ORACLE.lines().count(), 5);
 }

@@ -851,6 +851,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     if collectable.markers.is_empty() {
         host.render_objects
             .retain(|key, _| render_live.contains(key));
+        host.render_handles.retain(|key| render_live.contains(key));
         return;
     }
     let mut pending = Vec::new();
@@ -1059,6 +1060,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.prune_keyed_tables(keep);
     host.render_objects
         .retain(|key, _| render_live.contains(key));
+    host.render_handles.retain(|key| render_live.contains(key));
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
 }
@@ -1500,6 +1502,9 @@ mod tests {
         let (mut host, mut heap) = graph("demo/Render#1");
         let mut diag = StdHost::new();
         let stack = crate::runtime::render_math::new_value("", "com/mojang/blaze3d/vertex/PoseStack#10");
+        host.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10");
+        diag.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10");
+        diag.register_render_handle("com/mojang/blaze3d/vertex/PoseStack#10/pose/0");
         crate::runtime::render_math::construct(
             &mut host.render_objects,
             &stack,
@@ -1532,6 +1537,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        host.render_handles.extend(diag.render_handles);
         host.persistent_static_fields.insert(
             "demo/Render#STACKLcom/mojang/blaze3d/vertex/PoseStack;".into(),
             stack.clone(),
@@ -1629,6 +1635,7 @@ mod tests {
             "game_event",
             "client",
             "render_objects",
+            "render_handles",
             "brigadier",
             "imc",
         ];
