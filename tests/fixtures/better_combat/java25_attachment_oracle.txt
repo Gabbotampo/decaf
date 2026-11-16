@@ -1,0 +1,7 @@
+# Captured on Java 25.0.5+8 with fabric-data-attachment-api-v1-2.2.35+af2d4d095d.jar
+# command: javac --release 21 ... && java -cp classes:fabric-data.jar net.fabricmc.fabric.api.attachment.v1.Oracle
+# jar sha256: 915db07c0c471858e7347b76ecc8c6bbbf914d89efcdbcf837721df0cf55d9e7
+all.same=true
+target.same=true
+allbut.same=true
+tests=true,true,false,true,false
