@@ -385,6 +385,7 @@ pub(crate) fn instance_call(
             _ => return None,
         };
         return Some(Ok(match r.name.as_str() {
+            "name" => Value::Ref(Some(name.to_owned())),
             "getName" | "getSerializedName" => Value::Ref(Some(name.to_ascii_lowercase())),
             "toString" => Value::Ref(Some(name.to_owned())),
             "getDebugAbbreviation" => Value::Ref(Some(
