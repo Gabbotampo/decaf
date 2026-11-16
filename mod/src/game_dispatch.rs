@@ -251,7 +251,7 @@ static REENTRY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 fn dispatch_state(
     state: &mut State,
-    mut dispatch: GameDispatch<'_>,
+    dispatch: GameDispatch<'_>,
 ) -> Result<DispatchAnswer, DispatchError> {
     #[cfg(test)]
     STATE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
