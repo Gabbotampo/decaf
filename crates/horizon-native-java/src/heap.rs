@@ -1601,6 +1601,7 @@ mod tests {
             "dfu_codec_callback_roots",
             "dfu_codec_refusals",
             "unknown_host_calls",
+            "nondeterministic",
             "strict_unknown_host_calls",
             "next_lazy_optional",
             "next_fabric_event",
