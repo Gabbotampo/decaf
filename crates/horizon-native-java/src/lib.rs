@@ -222,6 +222,7 @@ mod reflect_override;
 mod regex_calls;
 mod registry_contents;
 mod registry_lookup;
+mod render_math;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
@@ -2368,6 +2369,11 @@ pub trait Host {
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
+    fn register_render_handle(&mut self, _key: &str) {}
+
+    fn owns_render_handle(&self, _key: &str) -> bool {
+        false
+    }
 
     /// Reserve one DFU construction node and any callback roots it introduces
     /// against this jar's lifetime budget.
@@ -3554,6 +3560,9 @@ pub struct StdHost {
     /// The client surface's registrations and current firing
     /// (`client_surface`): key mappings, HUD elements, the frame's snapshot.
     client: client_surface::ClientState,
+    render_objects: BTreeMap<String, render_math::Obj>,
+    /// Render handles allocated by this host, including objects before their constructor runs.
+    render_handles: BTreeSet<String>,
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
@@ -3708,9 +3717,19 @@ impl StdHost {
             next_ranged_attribute: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
+            render_objects: BTreeMap::new(),
+            render_handles: BTreeSet::new(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
         }
+    }
+
+    pub(crate) fn register_render_handle(&mut self, key: &str) {
+        self.render_handles.insert(key.to_owned());
+    }
+
+    pub(crate) fn owns_render_handle(&self, key: &str) -> bool {
+        self.render_handles.contains(key)
     }
 
     /// Make an unmodeled host call fail instead of returning its neutral Java
@@ -5444,6 +5463,14 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn register_render_handle(&mut self, key: &str) {
+        self.register_render_handle(key);
+    }
+
+    fn owns_render_handle(&self, key: &str) -> bool {
+        self.owns_render_handle(key)
+    }
+
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.unknown_host_call(r)
     }
@@ -6314,6 +6341,9 @@ impl Host for StdHost {
             } else {
                 host_registry::registry(id)
             });
+        }
+        if let Some(value) = render_math::static_field(r) {
+            return Ok(value);
         }
         // A modelled game enum's constant is its `enum/<class>/<NAME>` marker,
         // the same value `values()` lists.
@@ -7841,6 +7871,12 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        let mut render_objects = std::mem::take(&mut self.render_objects);
+        let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
+        self.render_objects = render_objects;
+        if let Some(result) = render_result {
+            return result;
+        }
         if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
             return result;
         }
@@ -16054,6 +16090,8 @@ fn host_models_class(name: &str) -> bool {
         "net/neoforged/",
         "net/minecraftforge/",
         "com/google/gson/",
+        "com/mojang/",
+        "org/joml/",
         "org/spongepowered/asm/mixin/injection/callback/",
     ];
     is_platform_class(name) || ROOTS.iter().any(|root| name.starts_with(root))
@@ -23484,6 +23522,10 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
+        if render_math::is_class(class) {
+            self.host.register_render_handle(&key);
+            return render_math::new_value(class, &key);
+        }
         if let Some(value) = model_layers::new_object(class, &key) {
             return value;
         }
