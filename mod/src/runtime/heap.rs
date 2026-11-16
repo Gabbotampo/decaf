@@ -60,7 +60,7 @@ const COLLECT_SLACK: usize = 1024;
 pub struct JavaHeap {
     /// `receiver|owner#name descriptor` → value, the interpreter's own keys.
     pub(crate) fields: BTreeMap<String, Value>,
-    pub(crate) arrays: BTreeMap<String, Vec<Value>>,
+    pub(crate) arrays: BTreeMap<String, crate::runtime::array_data::ArrayData>,
     pub(crate) string_builders: BTreeMap<String, String>,
     /// Enum constants by object marker: declared name and ordinal. A later
     /// call never reruns `<clinit>`, so without these `name()` on a constant a
@@ -383,6 +383,7 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        push(self.ranged_attributes.get(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -412,6 +413,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.ranged_attributes.keys())
             .map(String::as_str)
     }
 
@@ -443,6 +445,7 @@ impl StdHost {
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
+        self.ranged_attributes.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
     }
 }
@@ -462,6 +465,10 @@ fn collectable(marker: &str) -> bool {
         !class.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
     }) {
         return true;
+    }
+    // A host-created ranged attribute is a per-allocation handle and follows the heap.
+    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
     // (`iterator/empty`) are never collected.
@@ -519,6 +526,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
+        + host.ranged_attributes.len()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -660,9 +668,14 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
         .iter()
         .map(|(key, value)| key.len() + value_bytes(value))
         .chain(
-            heap.arrays
-                .iter()
-                .map(|(key, elements)| key.len() + values(elements)),
+            // A `byte[]` takes a byte per element (`array_data.rs`); a reference array its values.
+            heap.arrays.iter().map(|(key, array)| {
+                key.len()
+                    + match array.bytes() {
+                        Some(bytes) => bytes.len(),
+                        None => values(array.references()),
+                    }
+            }),
         )
         .chain(
             heap.string_builders
@@ -691,6 +704,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                     .len()
                 + values(&state.siblings)
                 + state.args.as_deref().map_or(0, values)
+        }))
+        .chain(host.ranged_attributes.iter().map(|(key, state)| {
+            key.len()
+                + state.description_id.as_ref().map_or(0, String::len)
+                + 4 * std::mem::size_of::<f64>()
         }))
         .sum()
 }
@@ -906,7 +924,12 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .range(prefix.clone()..)
             .take_while(|(key, _)| key.starts_with(&prefix))
             .map(|(_, value)| value);
-        let arrays = heap.arrays.get(&marker).into_iter().flatten();
+        // A typed array holds no references (`array_data.rs`): nothing to trace.
+        let arrays = heap
+            .arrays
+            .get(&marker)
+            .into_iter()
+            .flat_map(crate::runtime::array_data::ArrayData::references);
         let collections = host.mutable_collections.get(&marker).into_iter().flatten();
         let iterators = host
             .iterators
@@ -1127,9 +1150,9 @@ mod tests {
         heap.fields
             .insert(field("demo/Node#4", "next"), Value::Int(4));
         heap.arrays
-            .insert("[Ldemo/Node;#0".into(), vec![Value::Int(1)]);
+            .insert("[Ldemo/Node;#0".into(), vec![Value::Int(1)].into());
         heap.arrays
-            .insert("[Ldemo/Node;#1".into(), vec![Value::Int(2)]);
+            .insert("[Ldemo/Node;#1".into(), vec![Value::Int(2)].into());
         (host, heap)
     }
 
@@ -1496,6 +1519,7 @@ mod tests {
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "ranged_attributes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1539,6 +1563,7 @@ mod tests {
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
+            "next_ranged_attribute",
             "properties",
             "environment",
             "resources",
@@ -1572,6 +1597,9 @@ mod tests {
             "holder_binding",
             "charset_decoders",
             "persistent_initialized_classes",
+            "dfu_codec_nodes",
+            "dfu_codec_callback_roots",
+            "dfu_codec_refusals",
             "unknown_host_calls",
             "strict_unknown_host_calls",
             "next_lazy_optional",
