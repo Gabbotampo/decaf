@@ -738,7 +738,7 @@ impl<H: Host> Runtime<'_, H> {
                 let members = self.members_of(&marker)?;
                 let values = crate::runtime::runtime_collection_values(self.host, &members).ok()?;
                 let mut fields = Vec::with_capacity(values.len() / 2);
-                for pair in values.chunks_exact(2) {
+                for pair in values.as_chunks::<2>().0 {
                     let key = crate::runtime::expect_ref(&pair[0])?.clone();
                     fields.push((key, self.gson_tree_to_parsed(&pair[1])?));
                 }
