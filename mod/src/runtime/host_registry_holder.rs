@@ -24,10 +24,16 @@ const HOLDER_TYPES: &[&str] = &[OWNER, HOLDER, "java/lang/Object"];
 /// identity hash and therefore remains counted; the identity itself is exact
 /// because each registration key is one host-created allocation.
 /// The bound flag starts false at registration; only a future real registry-freeze hook may set it true.
-fn holder(registry_key: Value, id: Value, value: Value, bound: bool) -> Value {
+fn holder(registry_key: Value, id: Value, value: Value, bound: bool, game_owned: bool) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::RegistryHolder,
-        &[registry_key, id, value, Value::Int(i32::from(bound))],
+        &[
+            registry_key,
+            id,
+            value,
+            Value::Int(i32::from(bound)),
+            Value::Int(i32::from(game_owned)),
+        ],
     ))
 }
 
@@ -36,6 +42,7 @@ struct Parts {
     id: String,
     value: Value,
     bound: bool,
+    game_owned: bool,
 }
 
 fn parts(value: &Value) -> Option<Parts> {
@@ -45,10 +52,16 @@ fn parts(value: &Value) -> Option<Parts> {
     if handle.kind() != HostKind::RegistryHolder {
         return None;
     }
-    let [registry_key, id, value, bound] = <[Value; 4]>::try_from(handle.values()?).ok()?;
+    let [registry_key, id, value, bound, game_owned] =
+        <[Value; 5]>::try_from(handle.values()?).ok()?;
     let id = host_ids::identifier_key(&id)?.to_owned();
     host_ids::resource_key_parts(&registry_key)?;
     let bound = match bound {
+        Value::Int(0) => false,
+        Value::Int(1) => true,
+        _ => return None,
+    };
+    let game_owned = match game_owned {
         Value::Int(0) => false,
         Value::Int(1) => true,
         _ => return None,
@@ -58,6 +71,7 @@ fn parts(value: &Value) -> Option<Parts> {
         id,
         value,
         bound,
+        game_owned,
     })
 }
 
@@ -96,6 +110,7 @@ fn make_for_identifier(registry: &Value, id: &Value, value: &Value, bound: bool)
         host_ids::identifier_of_text(&id_text),
         value.clone(),
         bound,
+        false,
     ))
 }
 
@@ -104,7 +119,28 @@ fn make_for_key(registry: &Value, key: &Value, value: &Value, bound: bool) -> Op
     if !same_registry(registry, &registry_key) {
         return None;
     }
-    Some(holder(registry_key, id, value.clone(), bound))
+    Some(holder(registry_key, id, value.clone(), bound, false))
+}
+
+/// A holder for an entry the 26.3 game registered before the mod runs.
+///
+/// The registry id and entry id are exact facts from the game's static
+/// initialisers. `value` remains a game object handle; this module does not
+/// invent any of that object's methods.
+pub(crate) fn vanilla(registry: &str, id: &str, value: Value) -> Value {
+    holder(
+        host_ids::registry_key_of(registry),
+        host_ids::identifier_of_text(id),
+        value,
+        true,
+        true,
+    )
+}
+
+/// The registered id of a vanilla holder, for game surfaces that accept a
+/// holder as an argument while retaining the holder's typed identity.
+pub(crate) fn registered_id(value: &Value) -> Option<String> {
+    parts(value).map(|parts| parts.id)
 }
 
 /// `Registry.registerForHolder`'s two 26.3 overloads. An unmodelled registry,
@@ -217,7 +253,10 @@ pub(crate) fn instance_call(
     let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (HOLDER | OWNER, "key", "()Lnet/minecraft/resources/ResourceKey;") => Ok(entry_key(&parts)),
         (HOLDER | OWNER, "value", "()Ljava/lang/Object;") => {
-            if parts.bound {
+            // Vanilla constants are game-owned and already bound during
+            // bootstrap; jar registrations use the same bound-state rule
+            // after their registry lifecycle binds them.
+            if parts.game_owned || parts.bound {
                 Ok(parts.value.clone())
             } else {
                 Err(unbound_value(&parts))
@@ -437,6 +476,7 @@ mod tests {
             crate::runtime::host_ids::identifier("demo", "item"),
             Value::Ref(Some("value".into())),
             true,
+            false,
         );
         assert_eq!(
             host.invoke_instance(

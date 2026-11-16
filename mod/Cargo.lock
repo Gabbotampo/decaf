@@ -132,6 +132,17 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
@@ -165,115 +176,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "horizon-core"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "libm",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "horizon-game-discovery"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "syn 2.0.119",
-]
-
-[[package]]
 name = "horizon-java-mod"
 version = "0.1.0"
 dependencies = [
- "horizon-mod-api",
  "libc",
  "log",
  "serde_json",
+ "sunrise-mod-api",
  "zip",
-]
-
-[[package]]
-name = "horizon-mod-api"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "bytemuck",
- "glam",
- "horizon-core",
- "horizon-mod-api-gen",
- "horizon-mod-api-macros",
- "horizon-mod-runtime",
- "horizon-mod-vocab",
- "log",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "horizon-mod-api-gen"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "heck",
- "horizon-game-discovery",
- "horizon-mod-point-shape",
- "prettyplease",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "sha2",
- "syn 2.0.119",
- "toml",
- "wit-parser",
-]
-
-[[package]]
-name = "horizon-mod-api-macros"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "horizon-mod-point-shape",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "horizon-mod-point-shape"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "horizon-mod-runtime"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "horizon-core",
-]
-
-[[package]]
-name = "horizon-mod-vocab"
-version = "0.1.0"
-source = "git+https://github.com/arismoko/horizon?rev=1cc882b8e089a240354d142e3fd115938ce140d7#1cc882b8e089a240354d142e3fd115938ce140d7"
-dependencies = [
- "bytemuck",
- "glam",
- "horizon-core",
- "horizon-mod-api-gen",
- "horizon-mod-api-macros",
- "horizon-mod-runtime",
- "log",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -347,6 +257,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "phf"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6780a80ae0c52cc120a26a1a42c1ae51b247a253e4e06113d23d2c2edd078"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_codegen"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8048c789fa5e851558d709946d6d79a8ff88c0440c587967f8e94bfb1216a"
+dependencies = [
+ "phf_generator",
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_generator"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c80231409c20246a13fddb31776fb942c38553c51e871f8cbd687a4cfb5843d"
+dependencies = [
+ "phf_shared",
+ "rand",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
+name = "ppv-lite86"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
+dependencies = [
+ "zerocopy",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -379,6 +336,36 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rand"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
+dependencies = [
+ "libc",
+ "rand_chacha",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rustversion"
@@ -462,6 +449,145 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
+name = "sunrise-core"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "libm",
+ "serde",
+ "serde_json",
+ "unicode_names2",
+]
+
+[[package]]
+name = "sunrise-game-discovery"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_json",
+ "sunrise-mod-source",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sunrise-mod-api"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "serde",
+ "serde_json",
+ "sunrise-core",
+ "sunrise-mod-api-gen",
+ "sunrise-mod-api-macros",
+ "sunrise-mod-runtime",
+ "sunrise-mod-vocab",
+]
+
+[[package]]
+name = "sunrise-mod-api-gen"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "heck",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sunrise-game-discovery",
+ "sunrise-mod-point-shape",
+ "sunrise-mod-source",
+ "sunrise-mod-surface",
+ "syn 2.0.119",
+ "toml",
+ "wit-parser",
+]
+
+[[package]]
+name = "sunrise-mod-api-macros"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sunrise-mod-point-shape",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sunrise-mod-point-shape"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sunrise-mod-runtime"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "sunrise-core",
+]
+
+[[package]]
+name = "sunrise-mod-source"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "sunrise-mod-surface",
+ "syn 2.0.119",
+ "toml",
+]
+
+[[package]]
+name = "sunrise-mod-surface"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "libc",
+ "proc-macro2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sunrise-mod-vocab"
+version = "0.1.0"
+source = "git+https://github.com/sunrise-org/sunrise?rev=a87e07f5f8bb584315a3915ae45503d94c713904#a87e07f5f8bb584315a3915ae45503d94c713904"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "serde",
+ "serde_json",
+ "sunrise-core",
+ "sunrise-mod-api-gen",
+ "sunrise-mod-api-macros",
+ "sunrise-mod-runtime",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -541,10 +667,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unicode_names2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d189085656ca1203291e965444e7f6a2723fbdd1dd9f34f8482e79bafd8338a0"
+dependencies = [
+ "phf",
+ "unicode_names2_generator",
+]
+
+[[package]]
+name = "unicode_names2_generator"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1262662dc96937c71115228ce2e1d30f41db71a7a45d3459e98783ef94052214"
+dependencies = [
+ "phf_codegen",
+ "rand",
+]
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "wasi"
+version = "0.11.1+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasm-bindgen"
@@ -642,6 +794,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerocopy"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "zip"
 version = "9.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,7 +821,7 @@ checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
 dependencies = [
  "crc32fast",
  "flate2",
- "getrandom",
+ "getrandom 0.4.3",
  "indexmap",
  "memchr",
  "nix",

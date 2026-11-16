@@ -361,7 +361,12 @@ impl<H: Host> Runtime<'_, H> {
         let size = self
             .collection_elements(value)
             .map_or(0, |entries| entries.len());
-        size / if map { 2 } else { 1 } >= 2
+        let random = size / if map { 2 } else { 1 } >= 2;
+        if random {
+            self.host
+                .mark_nondeterministic("java-random-immutable-iteration");
+        }
+        random
     }
 
     /// The class of a `Set.of`/`Map.of` this module laid out.

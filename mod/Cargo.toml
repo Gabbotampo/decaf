@@ -12,10 +12,10 @@ description = "Horizon Java: runs Java mod jars on the native bytecode runtime"
 path = "src/lib.rs"
 
 [dependencies]
-# The launcher rewrites this to the staged Horizon source it builds the game from, so the mod
-# always calls the mod API of the exact game revision in `horizon-mod.toml`.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon", rev = "1cc882b8e089a240354d142e3fd115938ce140d7" }
-# The runtime's dependencies, pinned to the exact versions in Horizon's `Cargo.lock`
+# The launcher rewrites this to the staged Sunrise source it builds the game from, so the mod
+# always calls the mod API of the exact game revision in `sunrise-mod.toml`.
+sunrise-mod-api = { git = "https://github.com/sunrise-org/sunrise", rev = "a87e07f5f8bb584315a3915ae45503d94c713904" }
+# The runtime's dependencies, pinned to the exact versions in Sunrise's `Cargo.lock`
 # (docs/modding/src/how-to/native-mods/016-the-mods-crate.md): a native mod may only use crates
 # the locked game already resolves, at the same version.
 serde_json = "=1.0.151"
@@ -24,10 +24,10 @@ log = "0.4"
 
 [dev-dependencies]
 # The dispatch-level game-hook tests use the API's in-process fake server host.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon", rev = "1cc882b8e089a240354d142e3fd115938ce140d7", features = ["testing"] }
+sunrise-mod-api = { git = "https://github.com/sunrise-org/sunrise", rev = "a87e07f5f8bb584315a3915ae45503d94c713904", features = ["testing"] }
 
 # The runtime's stack-bounds lookup (`java_regex/stack.rs`), at the version
-# Horizon's `Cargo.lock` resolves.
+# Sunrise's `Cargo.lock` resolves.
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"
 
