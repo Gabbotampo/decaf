@@ -27738,7 +27738,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         if game_constant && r.owner == "net/minecraft/sounds/SoundSource" && r.name == "getName" && r.descriptor == "()Ljava/lang/String;" {
-            let name = receiver.and_then(expect_ref).and_then(|m| m.rsplit('/').next()).map(|n| n.to_ascii_lowercase());
+            let name = receiver.and_then(expect_ref).and_then(|m| m.rsplit('/').next()).map(|n| match n { \MASTER\ => \master\, \MUSIC\ => \music\, \RECORDS\ => ecord\, \BLOCKS\ => lock\, \PLAYERS\ => \player\, _ => n.to_ascii_lowercase().as_str() }.to_owned());
             return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if game_constant && matches!(r.name.as_str(), "name" | "toString") {
