@@ -537,6 +537,30 @@ mod tests {
     }
 
     #[test]
+    fn callback_exception_is_counted_and_stops_the_chain() {
+        let java = HorizonJava::default();
+        java.lock().jars = vec![
+            load(
+                "throws",
+                "Throws",
+                "@Mixin(MinecraftServer.class) public class Throws { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { Integer.parseInt(\"1\", 40); } }",
+            ),
+            load(
+                "after",
+                "After",
+                "@Mixin(MinecraftServer.class) public class After { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"after\"); } }",
+            ),
+        ];
+        java.refresh_game_hook_plan_bits();
+        let error = stop_dispatch(&java, Phase::Tail).unwrap_err();
+        assert!(error.to_string().contains("NumberFormatException"));
+        let mut state = java.lock();
+        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
+        assert_eq!(state.jars[1].row.game_hooks.ran, 0);
+        assert!(stdout(&mut state, 1).is_empty());
+    }
+
+    #[test]
     fn return_tail_real_result_and_last_override_win() {
         let java = HorizonJava::default();
         java.lock().jars = vec![
