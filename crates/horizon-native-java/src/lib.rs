@@ -50,7 +50,6 @@ mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
 mod entity_registration;
-mod tool_material;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
@@ -202,6 +201,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod tool_material;
 mod vanilla_entity_data_pool;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
@@ -6355,7 +6355,9 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
-        if let Some(value) = tool_material::static_field(&mut self.tool_material, r) { return value; }
+        if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
+            return value;
+        }
         if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {
             return value;
         }
@@ -8018,7 +8020,11 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        if let Some(value) = tool_material::instance_call(&mut self.tool_material, r, receiver, args) { return value; }
+        if let Some(value) =
+            tool_material::instance_call(&mut self.tool_material, r, receiver, args)
+        {
+            return value;
+        }
         if let Some(value) =
             entity_registration::instance_call(&mut self.entity_registration, r, receiver, args)
         {
