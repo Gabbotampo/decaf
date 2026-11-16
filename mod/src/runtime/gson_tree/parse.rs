@@ -28,7 +28,7 @@ const MAX_TREE_DEPTH: usize = 255;
 
 /// One parsed JSON value, before it becomes runtime objects.
 #[derive(Clone)]
-pub(super) enum Tree {
+pub(crate) enum Tree {
     Object(Vec<(String, Tree)>),
     Array(Vec<Tree>),
     Str(String),
@@ -38,7 +38,7 @@ pub(super) enum Tree {
 }
 
 /// The outcome of reading a document with `JsonReader` in `LENIENT` mode.
-pub(super) enum Parsed {
+pub(crate) enum Parsed {
     /// Only whitespace and comments: `Streams.parse` answers `JsonNull` and
     /// `Gson.fromJson` answers `null`.
     Empty,
@@ -50,7 +50,7 @@ pub(super) enum Parsed {
 /// A strict-JSON reader plus the lenient forms whose result is unambiguous:
 /// `//`, `#` and `/* */` comments, unescaped control characters in strings,
 /// and the `\'` escape. Anything else gives up rather than guess.
-pub(super) struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     pos: usize,
@@ -61,18 +61,18 @@ pub(super) struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn parse(text: &'a str) -> Parsed {
+    pub(crate) fn parse(text: &'a str) -> Parsed {
         Self::parse_noting_duplicates(text).0
     }
 
     /// [`Self::parse`], and whether any object repeated a name.
-    pub(super) fn parse_noting_duplicates(text: &'a str) -> (Parsed, bool) {
+    pub(crate) fn parse_noting_duplicates(text: &'a str) -> (Parsed, bool) {
         Self::parse_noting_duplicates_with_special_floats(text, false)
     }
 
     /// Parse the lenient numeric spellings Gson's `JsonReader` accepts when
     /// its strictness is not `STRICT`.
-    pub(super) fn parse_noting_duplicates_with_special_floats(
+    pub(crate) fn parse_noting_duplicates_with_special_floats(
         text: &'a str,
         allow_special_floats: bool,
     ) -> (Parsed, bool) {
@@ -309,7 +309,7 @@ enum Source {
 impl<H: Host> Runtime<'_, H> {
     /// Runtime objects for one parsed value, as `JsonElementTypeAdapter.read`
     /// builds them.
-    pub(super) fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
+    pub(crate) fn materialize(&mut self, tree: Tree) -> Result<Value, NativeError> {
         Ok(match tree {
             Tree::Null => null_instance(),
             Tree::Bool(value) => self.new_primitive(Prim::Bool(value)),
