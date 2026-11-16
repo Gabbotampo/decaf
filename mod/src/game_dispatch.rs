@@ -175,8 +175,9 @@ thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCel
 #[cfg(test)]
 thread_local! { static FORCE_CALLBACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
-static BLOCK_CALLBACK: std::sync::Mutex<Option<Arc<std::sync::Barrier>>> =
-    std::sync::Mutex::new(None);
+static BLOCK_CALLBACK: std::sync::Mutex<
+    Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+> = std::sync::Mutex::new(None);
 
 pub(crate) enum StateGuard<'a> {
     Locked {
@@ -410,8 +411,9 @@ fn dispatch_state(
                     &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
                 );
                 #[cfg(test)]
-                if let Some(barrier) = BLOCK_CALLBACK.lock().unwrap().take() {
-                    barrier.wait();
+                if let Some((entered, release)) = BLOCK_CALLBACK.lock().unwrap().take() {
+                    entered.wait();
+                    release.wait();
                 }
                 callback.inspect(|_| {
                     #[cfg(test)]
@@ -866,11 +868,12 @@ mod tests {
             "@Mixin(MinecraftServer.class) public class Blocked { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"ran\"); } }",
         ));
         java.refresh_game_hook_plan_bits();
-        let callback_latch = Arc::new(Barrier::new(2));
-        *BLOCK_CALLBACK.lock().unwrap() = Some(Arc::clone(&callback_latch));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *BLOCK_CALLBACK.lock().unwrap() = Some((Arc::clone(&entered), Arc::clone(&release)));
         let java_a = Arc::clone(&java);
         let dispatch = thread::spawn(move || stop_dispatch(&java_a, Phase::Tail).unwrap());
-        callback_latch.wait();
+        entered.wait();
 
         let started = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
@@ -889,7 +892,7 @@ mod tests {
             thread::yield_now();
         }
         assert!(!finished.load(Ordering::Acquire));
-        callback_latch.wait();
+        release.wait();
         assert_eq!(dispatch.join().unwrap().callbacks, 1);
         entry.join().unwrap();
         assert!(finished.load(Ordering::Acquire));
