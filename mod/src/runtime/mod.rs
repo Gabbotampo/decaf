@@ -241,6 +241,7 @@ mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_registries;
+mod vanilla_values;
 pub mod verdict;
 mod watch_service;
 pub mod weaver;
@@ -3398,6 +3399,8 @@ pub struct StdHost {
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
     cached_collections: BTreeMap<(String, String), String>,
+    /// Primitive state for vanilla RangedAttribute handles.
+    ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -3514,6 +3517,7 @@ pub struct StdHost {
     /// view's contents (#243's review).
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
+    next_ranged_attribute: usize,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -3621,6 +3625,7 @@ impl StdHost {
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
+            ranged_attributes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -3671,6 +3676,7 @@ impl StdHost {
             next_neutral_collection: 0,
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
+            next_ranged_attribute: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
             brigadier: Default::default(),
@@ -6115,6 +6121,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = mod_origin::static_field(r) {
             return Ok(value);
         }
@@ -6366,7 +6375,7 @@ impl Host for StdHost {
     }
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
-        StdHost::random_new(self, class)
+        vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
@@ -6374,6 +6383,9 @@ impl Host for StdHost {
             self.random_bit_scope = None;
         }
         self.record(r, None, args);
+        if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
         if let Some(result) = self.random_static(r, args) {
             return result;
         }
@@ -7734,6 +7746,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
+            return result;
+        }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
@@ -7789,6 +7804,22 @@ impl Host for StdHost {
         {
             return Ok(Value::Int(1));
         }
+        // Host dispatch is also used for JDK calls reached from a jar lambda.
+        // Keep raw String/boxed receivers on the same Java natural-order path
+        // as the interpreter's direct dispatch.
+        if r.name == "compareTo"
+            && object_methods::is_compare_to(&r.descriptor)
+            && !matches!(receiver, Value::Host(handle) if jar_object::is_object_handle(handle))
+        {
+            let other = args.first().unwrap_or(&Value::Ref(None));
+            if matches!(other, Value::Ref(None))
+                && jdk_stream::null_compare_message(receiver).is_none()
+            {
+                return self.unknown_operand_call(r);
+            }
+            return jdk_stream::natural_compare(receiver, other).map(Value::Int);
+        }
+
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
@@ -23008,6 +23039,18 @@ impl<H: Host> Runtime<'_, H> {
                     )
                     .map(Some);
             }
+            if callback.target.name == "compareTo"
+                && object_methods::is_compare_to(&callback.target.descriptor)
+                && !matches!(
+                    &receiver,
+                    Value::Host(handle)
+                        if jar_object::is_object_handle(handle)
+                            && !self.is_enum_object(&receiver)
+                )
+            {
+                let other = rest.first().unwrap_or(&Value::Ref(None));
+                return Ok(Some(Value::Int(self.natural_order(&receiver, other)?)));
+            }
             if let Some(value) =
                 self.invoke_jdk_skeleton(&callback.target, 0xb9, Some(&receiver), &rest)?
             {
@@ -25140,6 +25183,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(self.new_array_value(&format!("[L{};", r.owner), values));
         }
+        if let Some(values) = crate::runtime::vanilla_values::enum_values(r) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         let constants = game_enum_constants(&r.owner)?;
         if r.descriptor != format!("()[L{};", r.owner) {
             return None;
@@ -27053,16 +27099,23 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if r.name == "<init>" && r.descriptor == "(Ljava/lang/String;I)V" {
-            let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None))).ok_or_else(|| {
-                NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
-            })?;
+            let marker = crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
+                .or_else(|| {
+                    expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
+                })
+                .ok_or_else(|| {
+                    NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
+                })?;
             let name = expect_string(StdHost::argument(r, args, 0)?);
             let ordinal = expect_int(r, StdHost::argument(r, args, 1)?)?;
             self.enum_constants
                 .insert(marker.to_owned(), (name.to_owned(), ordinal));
             return Ok(Some(Value::Void));
         }
-        let marker = expect_ref(receiver.unwrap_or(&Value::Ref(None)));
+        let marker =
+            crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None))).or_else(|| {
+                expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
+            });
         let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
@@ -29199,6 +29252,23 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
                     {
                         value
+                    } else if r.name == "compareTo"
+                        && object_methods::is_compare_to(&r.descriptor)
+                        && !matches!(
+                            receiver.as_ref(),
+                            Some(Value::Host(handle))
+                                if jar_object::is_object_handle(handle)
+                                    && !self.is_enum_object(receiver.as_ref().unwrap_or(&Value::Ref(None)))
+                        )
+                    {
+                        let other = args.first().unwrap_or(&Value::Ref(None));
+                        Value::Int(invoke_or_catch!(
+                            at,
+                            self.natural_order(
+                                receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                                other
+                            )
+                        ))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)

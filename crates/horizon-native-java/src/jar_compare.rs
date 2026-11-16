@@ -17,6 +17,17 @@ use super::*;
 const COMPARE_TO: &str = "(Ljava/lang/Object;)I";
 
 impl<H: Host> Runtime<'_, H> {
+    pub(crate) fn is_enum_object(&self, value: &Value) -> bool {
+        let Some(marker) = crate::jar_object::object_key(value) else {
+            return matches!(value, Value::Ref(Some(text)) if text.starts_with("enum/"));
+        };
+        self.enum_constants.contains_key(marker)
+            || crate::jar_object::object_class(value)
+                .and_then(|class| self.class(class))
+                .map(|file| file.super_name.as_str())
+                == Some("java/lang/Enum")
+    }
+
     /// `((Comparable) a).compareTo(b)`.
     pub(crate) fn natural_order(&mut self, a: &Value, b: &Value) -> Result<i32, NativeError> {
         // A host handle's natural order is its kind's row (`host_ref.rs`);
@@ -74,10 +85,65 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.count_compare_to();
         }
+        // Enum.compareTo casts the argument to the receiver's exact enum class,
+        // then subtracts ordinals. The marker is runtime-owned; a jar String
+        // with the same text is classified as String by natural_compare below.
+        let enum_info = |value: &Value| {
+            let marker = crate::jar_object::object_key(value)
+                .or_else(|| crate::expect_ref(value).map(|text| text.as_str()))?;
+            let class = match value {
+                Value::Host(_) => crate::jar_object::object_class(value)?.to_owned(),
+                // A String is never an enum merely because its text has the
+                // old marker spelling. Only a marker recorded by the runtime
+                // or a known game enum can enter this path.
+                Value::Ref(_) => {
+                    let class = marker.strip_prefix("enum/")?.rsplit_once('/')?.0;
+                    if !self.enum_constants.contains_key(marker)
+                        && crate::game_enum_constants(class).is_none()
+                    {
+                        return None;
+                    }
+                    class.to_owned()
+                }
+                _ => return None,
+            };
+            let class = self.enum_declaring_class(&class);
+            let ordinal = self
+                .enum_constants
+                .get(marker)
+                .map(|(_, ordinal)| *ordinal)
+                .or_else(|| {
+                    crate::game_enum_constants(&class)
+                        .and_then(|constants| {
+                            constants
+                                .iter()
+                                .position(|name| marker.ends_with(&format!("/{name}")))
+                        })
+                        .map(|ordinal| ordinal as i32)
+                })?;
+            Some((class, ordinal))
+        };
+        if let Some((own_class, own_ordinal)) = enum_info(a) {
+            let Some((other_class, other_ordinal)) = enum_info(b) else {
+                return self.count_compare_to();
+            };
+            if own_class != other_class {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            return Ok(own_ordinal - other_ordinal);
+        }
+
         let Some(class) = self.interpreted_object_class(a) else {
             if self.interpreted_object_class(b).is_some() {
                 // A platform value's `compareTo` of a jar object: a JVM throws
                 // `ClassCastException` or runs code the host does not hold.
+                return self.count_compare_to();
+            }
+            if matches!(b, Value::Ref(None)) && jdk_stream::null_compare_message(a).is_none() {
                 return self.count_compare_to();
             }
             return jdk_stream::natural_compare(a, b);
@@ -112,6 +178,25 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(left - right);
         }
         self.count_compare_to()
+    }
+
+    /// `Enum.compareTo` uses `getDeclaringClass`, so a constant-specific
+    /// class body (`E$1`) still compares with ordinary constants of `E`.
+    fn enum_declaring_class(&self, class: &str) -> String {
+        let mut current = class.to_owned();
+        for _ in 0..8 {
+            let Some(file) = self.class(&current) else {
+                break;
+            };
+            if file.super_name == "java/lang/Enum" {
+                break;
+            }
+            if file.super_name.is_empty() || file.super_name == current {
+                break;
+            }
+            current = file.super_name.clone();
+        }
+        current
     }
 
     /// Count `Comparable.compareTo` as unknown and answer "equal".
