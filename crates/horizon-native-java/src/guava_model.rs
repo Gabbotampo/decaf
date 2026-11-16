@@ -284,7 +284,7 @@ impl<H: Host> Runtime<'_, H> {
                         return Err(thrown("java/lang/NullPointerException", None));
                     }
                     if let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (&args[0], &args[1]) {
-                        let ord = crate::jdk_stream::natural_compare(a, b)?;
+                        let ord = crate::jdk_stream::natural_compare(&args[0], &args[1])?;
                         return Ok(Some(Value::Int(if reverse { -ord } else { ord })));
                     }
                 }
