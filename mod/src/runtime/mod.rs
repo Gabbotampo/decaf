@@ -11332,13 +11332,7 @@ impl Host for StdHost {
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides" | "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
-            ) => Ok(self.cached_collection(
-                receiver,
-                &r.name,
-                stand_in_class("list"),
-                false,
-                Vec::new(),
-            )),
+            ) => self.counted_metadata_collection(r),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
@@ -11347,13 +11341,8 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
-                "()Ljava/util/Map;",
-            ) => Ok(self.cached_unmodifiable_collection(
-                receiver,
-                "getDependencies",
-                "java/util/Collections$UnmodifiableMap",
-                Vec::new(),
-            )),
+                "()Ljava/util/Collection;" | "()Ljava/util/Map;",
+            ) => self.counted_metadata_collection(r),
             (
                 "net/fabricmc/loader/api/Version",
                 "getFriendlyString" | "getRaw" | "toString",

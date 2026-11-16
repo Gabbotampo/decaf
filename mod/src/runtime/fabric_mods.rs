@@ -428,6 +428,20 @@ impl StdHost {
             .then(|| enum_marker(&r.owner, &r.name))
     }
 
+    pub(crate) fn counted_metadata_collection(
+        &mut self,
+        r: &MethodRef,
+    ) -> Result<Value, NativeError> {
+        self.unknown_host_call(r)?;
+        Ok(
+            self.empty_collection(if r.descriptor.contains("Ljava/util/Map;") {
+                "map"
+            } else {
+                "list"
+            }),
+        )
+    }
+
     fn jar_metadata(
         &mut self,
         r: &MethodRef,
@@ -464,7 +478,7 @@ impl StdHost {
                 )
             )
         {
-            return self.unknown_host_call(r);
+            return self.counted_metadata_collection(r);
         }
         let dependencies = || -> Vec<Value> {
             [
@@ -614,6 +628,10 @@ impl StdHost {
             ("getEnvironment", "()Lnet/fabricmc/loader/api/metadata/ModEnvironment;") => {
                 Some(enum_marker(MOD_ENVIRONMENT, "UNIVERSAL"))
             }
+            (
+                "getAuthors" | "getContributors" | "getLicense" | "getProvides" | "getDependencies",
+                "()Ljava/util/Collection;",
+            ) => return self.counted_metadata_collection(r),
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
                 Some(loader::empty_contact())
             }
