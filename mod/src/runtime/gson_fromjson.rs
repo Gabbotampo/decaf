@@ -10,6 +10,8 @@ use crate::runtime::gson_tree::parse::{Parsed, Parser, Tree};
 
 const GSON: &str = "com/google/gson/Gson";
 const SERIALIZED_NAME: &str = "Lcom/google/gson/annotations/SerializedName;";
+const GSON_R8_TROUBLESHOOTING: &str =
+    "\nSee https://github.com/google/gson/blob/main/Troubleshooting.md#r8-abstract-class";
 const MAX_GSON_DEPTH: usize = 255;
 const FROM_JSON_COLLECTION: (&str, &str, &str) = (
     "com/google/gson/Gson",
@@ -339,7 +341,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         if flags & 0x0400 != 0 {
             return Err(Self::gson_json_io(format!(
-                "Abstract classes can't be instantiated! Adjust the R8 configuration or register an InstanceCreator or a TypeAdapter for this type. Class name: {}",
+                "Abstract classes can't be instantiated! Adjust the R8 configuration or register an InstanceCreator or a TypeAdapter for this type. Class name: {}{GSON_R8_TROUBLESHOOTING}",
                 class.replace('/', ".")
             )));
         }

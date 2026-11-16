@@ -120,6 +120,19 @@ public final class Probe {
 }
 "#;
 
+const ORACLE: &str = include_str!("fixtures/gson_fromjson/oracle/java25.txt");
+const ORACLE_METHODS: &[&str] = &[
+    "config",
+    "defaults",
+    "booleanFieldBoxing",
+    "unsafe",
+    "token",
+    "element",
+    "abstractCase",
+    "interfaceCase",
+    "recordCase",
+];
+
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|home| PathBuf::from(home).join("bin/javac"))
@@ -222,55 +235,11 @@ impl Fixture {
     }
 }
 #[test]
-fn reflective_config_fields_are_typed_and_named() {
-    assert_eq!(
-        Fixture::build("config").text("config"),
-        "123|7|true|inner|2|4|SECOND|alias|constructor"
-    );
-}
-#[test]
-fn missing_fields_keep_constructor_defaults_and_unknown_are_ignored() {
-    assert_eq!(
-        Fixture::build("defaults").text("defaults"),
-        "null|0|false|constructor"
-    );
-}
-#[test]
-fn primitive_boolean_fields_stay_ints_when_boxed() {
-    assert_eq!(
-        Fixture::build("boolean-field").text("booleanFieldBoxing"),
-        "true"
-    );
-}
-#[test]
-fn classes_without_noarg_use_unsafe_defaults_before_injection() {
-    assert_eq!(Fixture::build("unsafe").text("unsafe"), "json");
-}
-#[test]
-fn captured_type_tokens_keep_their_parameterized_element_type() {
-    assert_eq!(Fixture::build("token").text("token"), "token");
-}
-#[test]
-fn a_json_element_can_feed_the_reflective_adapter() {
-    assert_eq!(Fixture::build("element").text("element"), "element");
-}
-#[test]
-fn abstract_and_interface_targets_throw_gsons_json_io_exception() {
-    let fixture = Fixture::build("abstract");
-    let abstract_error = fixture.text("abstractCase");
-    assert!(
-        abstract_error
-            .starts_with("com.google.gson.JsonIOException|Abstract classes can't be instantiated!"),
-        "{abstract_error}"
-    );
-    let interface_error = fixture.text("interfaceCase");
-    assert!(
-        interface_error
-            .starts_with("com.google.gson.JsonIOException|Interfaces can't be instantiated!"),
-        "{interface_error}"
-    );
-}
-#[test]
-fn records_run_the_canonical_constructor() {
-    assert_eq!(Fixture::build("record").text("recordCase"), "4|ok|ctor");
+fn all_rows_match_the_captured_java25_oracle_byte_for_byte() {
+    let fixture = Fixture::build("oracle");
+    let actual = ORACLE_METHODS
+        .iter()
+        .map(|method| format!("{method}={}\n", fixture.text(method)))
+        .collect::<String>();
+    assert_eq!(actual.as_bytes(), ORACLE.as_bytes());
 }
