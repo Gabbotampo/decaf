@@ -468,7 +468,6 @@ pub enum HostKind {
     ThreadLocal,
     /// An explicitly seeded Minecraft RandomSource or positional factory.
     RandomSource,
-    ItemStackTemplate,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -610,6 +609,8 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
+    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    ItemStackTemplate,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2137,13 +2138,6 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::random_source::METHODS,
     },
     KindInfo {
-        kind: HostKind::ItemStackTemplate,
-        tag: "ist",
-        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
-        canonical: always_canonical,
-        methods: &crate::runtime::host_item_stack_template::METHODS,
-    },
-    KindInfo {
         kind: HostKind::ModelledCodec,
         tag: "mcdc",
         class: ClassRule::Unknown {
@@ -2634,6 +2628,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::runtime::model_layers::LAYER_DEFINITION),
         canonical: always_canonical,
         methods: &crate::runtime::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ItemStackTemplate,
+        tag: "ist",
+        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_item_stack_template::METHODS,
     },
 ];
 
