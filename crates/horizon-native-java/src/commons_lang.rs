@@ -164,7 +164,7 @@ pub(crate) fn runtime_call<H: Host>(
         };
         if matches!(format, Value::Ref(None)) {
             return Err(NativeError::UncaughtException {
-                class: "java/lang/inullPointerException".into(),
+                class: "java/lang/NullPointerException".into(),
                 message: Some(r#"Cannot invoke "java.util.function.Supplier.get()" because "messageSupplier" is null"#.into()),
                 frame: None,
             });
