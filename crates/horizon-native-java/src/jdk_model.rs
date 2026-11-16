@@ -422,6 +422,20 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if r.owner == "java/util/regex/Pattern"
+        && r.name == "matcher"
+        && r.descriptor == "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
+    {
+        let pattern = crate::host_jdk_constant::pattern_text(receiver)?;
+        let input = expect_string(args.first()?);
+        return Some(Ok(Value::Host(crate::host_ref::HostRef::of_values(
+            crate::host_ref::HostKind::Matcher,
+            &[
+                Value::Ref(Some(pattern)),
+                Value::Ref(Some(input.to_owned())),
+            ],
+        ))));
+    }
     if let Some(comparator) = crate::jdk_stream::comparator_instance(r, receiver, args) {
         return Some(comparator);
     }
