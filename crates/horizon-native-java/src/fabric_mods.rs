@@ -54,6 +54,8 @@
 use super::*;
 
 const MOD_METADATA: &str = "net/fabricmc/loader/api/metadata/ModMetadata";
+const MOD_DEPENDENCY: &str = "net/fabricmc/loader/api/metadata/ModDependency";
+const MOD_DEPENDENCY_KIND: &str = "net/fabricmc/loader/api/metadata/ModDependency$Kind";
 const PERSON: &str = "net/fabricmc/loader/api/metadata/Person";
 const CONTACT: &str = "net/fabricmc/loader/api/metadata/ContactInformation";
 const CUSTOM_VALUE: &str = "net/fabricmc/loader/api/metadata/CustomValue";
@@ -275,8 +277,6 @@ impl StdHost {
     ) -> Option<Result<Value, NativeError>> {
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("net/fabricmc/loader/api/FabricLoader", "getAllMods", "()Ljava/util/Collection;") => {
-                // `FabricLoaderImpl.getAllMods()`: a new
-                // `Collections.unmodifiableList(mods)` on every call.
                 let containers = self.fabric_containers();
                 // Fabric calls Collections.unmodifiableList(mods) inside
                 // getAllMods, so each query makes a fresh wrapper over the
@@ -288,13 +288,40 @@ impl StdHost {
                     .unmodifiable_view("list", &source)
                     .expect("fresh list is a host collection")))
             }
+            (MOD_DEPENDENCY, ..) => {
+                let (mod_id, kind) = loader::dependency_parts(receiver)?;
+                Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("getModId", "()Ljava/lang/String;") => Ok(text(mod_id)),
+                    ("getKind", "()Lnet/fabricmc/loader/api/metadata/ModDependency$Kind;") => Ok(
+                        Value::Ref(Some(format!("enum/{MOD_DEPENDENCY_KIND}/{kind}"))),
+                    ),
+                    _ => self.unknown_host_call(r),
+                })
+            }
+            (MOD_DEPENDENCY_KIND, ..) => {
+                let name = expect_ref(receiver)?.rsplit('/').next()?.to_owned();
+                Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
+                        Ok(text(name))
+                    }
+                    ("ordinal", "()I") => Ok(Value::Int(match name.as_str() {
+                        "DEPENDS" => 0,
+                        "RECOMMENDS" => 1,
+                        "SUGGESTS" => 2,
+                        "CONFLICTS" => 3,
+                        "BREAKS" => 4,
+                        _ => 5,
+                    })),
+                    _ => self.unknown_host_call(r),
+                })
+            }
             (MOD_METADATA, ..) => {
                 let id = loader::metadata_id(receiver)?;
                 if let Some(document) = self.fabric_document(&id).map(std::borrow::Cow::into_owned)
                 {
-                    Some(self.jar_metadata(r, &id, &document, args))
+                    Some(self.jar_metadata(r, receiver, &id, &document, args))
                 } else if Self::builtin_fabric_mod(&id) {
-                    Some(self.builtin_metadata(r, &id))
+                    Some(self.builtin_metadata(r, receiver, &id))
                 } else {
                     None
                 }
@@ -401,9 +428,46 @@ impl StdHost {
             .then(|| enum_marker(&r.owner, &r.name))
     }
 
+    pub(crate) fn counted_metadata_collection(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+    ) -> Result<Value, NativeError> {
+        let class = if r.descriptor.contains("Ljava/util/Map;") {
+            "map"
+        } else {
+            "list"
+        };
+        let cache = cache_identity(receiver).map(|identity| (identity, r.name.clone()));
+        if let Some(cache) = cache.as_ref()
+            && let Some(marker) = self.cached_collections.get(cache).cloned()
+            && self.mutable_collections.contains_key(&marker)
+            && self
+                .persistent_static_fields
+                .values()
+                .any(|value| expect_ref(value) == Some(&marker))
+        {
+            // The neutral value remains fabricated, so every observation stays
+            // counted in both normal and strict modes. The cache only preserves
+            // the identity a jar already retained; it never suppresses the
+            // unknown-host accounting.
+            self.unknown_host_call(r)?;
+            return Ok(crate::jar_object::collection(marker));
+        }
+        self.unknown_host_call(r)?;
+        let made = self.empty_collection(class);
+        if let Some(cache) = cache
+            && let Some(marker) = expect_ref(&made)
+        {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        Ok(made)
+    }
+
     fn jar_metadata(
         &mut self,
         r: &MethodRef,
+        receiver: &Value,
         id: &str,
         document: &serde_json::Value,
         args: &[Value],
@@ -419,6 +483,43 @@ impl StdHost {
                     .collect(),
                 _ => Vec::new(),
             }
+        };
+        let schema = field("schemaVersion")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if schema != 1
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                (
+                    "getAuthors"
+                        | "getContributors"
+                        | "getLicense"
+                        | "getProvides"
+                        | "getDependencies",
+                    "()Ljava/util/Collection;"
+                )
+            )
+        {
+            return self.counted_metadata_collection(r, receiver);
+        }
+        let dependencies = || -> Vec<Value> {
+            [
+                ("depends", "DEPENDS"),
+                ("recommends", "RECOMMENDS"),
+                ("suggests", "SUGGESTS"),
+                ("conflicts", "CONFLICTS"),
+                ("breaks", "BREAKS"),
+            ]
+            .into_iter()
+            .flat_map(|(field_name, kind)| {
+                field(field_name)
+                    .and_then(serde_json::Value::as_object)
+                    .into_iter()
+                    .flat_map(move |entries| {
+                        entries.keys().map(move |id| loader::dependency(id, kind))
+                    })
+            })
+            .collect()
         };
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("getId", "()Ljava/lang/String;") => Ok(text(id)),
@@ -457,7 +558,12 @@ impl StdHost {
                 let people = (0..count)
                     .map(|index| loader::pointed(Pointed::Person, id, &format!("/{key}/{index}")))
                     .collect::<Vec<_>>();
-                Ok(self.metadata_collection(id, &r.name, people))
+                Ok(self.cached_unmodifiable_collection(
+                    receiver,
+                    &r.name,
+                    "java/util/Collections$UnmodifiableCollection",
+                    people,
+                ))
             }
             // `V1ModMetadata` holds `ContactInformation.EMPTY` without one.
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
@@ -468,13 +574,29 @@ impl StdHost {
                 })
             }
             ("getLicense", "()Ljava/util/Collection;") => {
-                let license = strings("license");
-                Ok(self.metadata_collection(id, &r.name, license))
+                let values = strings("license");
+                {
+                    Ok(self.cached_unmodifiable_collection(
+                        receiver,
+                        "getLicense",
+                        "java/util/Collections$UnmodifiableCollection",
+                        values,
+                    ))
+                }
             }
-            ("getProvides", "()Ljava/util/Collection;") => {
-                let provides = strings("provides");
-                Ok(self.metadata_collection(id, &r.name, provides))
-            }
+            ("getProvides", "()Ljava/util/Collection;") => Ok(self.cached_unmodifiable_collection(
+                receiver,
+                "getProvides",
+                "java/util/Collections$UnmodifiableCollection",
+                strings("provides"),
+            )),
+            ("getDependencies", "()Ljava/util/Collection;") => Ok(self
+                .cached_unmodifiable_collection(
+                    receiver,
+                    "getDependencies",
+                    "java/util/Collections$UnmodifiableCollection",
+                    dependencies(),
+                )),
             ("containsCustomValue", "(Ljava/lang/String;)Z") => {
                 let key = expect_string(Self::argument(r, args, 0)?);
                 let present = field("custom").is_some_and(|custom| custom.get(key).is_some());
@@ -498,13 +620,6 @@ impl StdHost {
         }
     }
 
-    /// A mod's metadata collection (`V1ModMetadata`'s `authors`, `license`...
-    /// fields): the same list on every call, for the run (#156 P14d2).
-    fn metadata_collection(&mut self, id: &str, member: &str, values: Vec<Value>) -> Value {
-        let of = Value::Ref(Some(format!("fabric-mod-metadata/{id}")));
-        self.cached_collection(&of, member, crate::stand_in_class("list"), false, values)
-    }
-
     /// `java` and `minecraft` are `BuiltinModMetadata` built by the loader
     /// itself (`ModDiscoverer.createJavaMod`, `MinecraftGameProvider
     /// .getBuiltinMods`): the builder's defaults (`description` `""`,
@@ -514,7 +629,12 @@ impl StdHost {
     /// depends on the JDK's vendor, so it is counted. `minecraft`'s name is
     /// `Minecraft` and its version the game version a caller seeded (counted
     /// without one).
-    fn builtin_metadata(&mut self, r: &MethodRef, id: &str) -> Result<Value, NativeError> {
+    fn builtin_metadata(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        id: &str,
+    ) -> Result<Value, NativeError> {
         if r.name == "getId" && r.descriptor == "()Ljava/lang/String;" {
             return Ok(text(id));
         }
@@ -536,9 +656,9 @@ impl StdHost {
                 Some(enum_marker(MOD_ENVIRONMENT, "UNIVERSAL"))
             }
             (
-                "getAuthors" | "getContributors" | "getLicense" | "getProvides",
+                "getAuthors" | "getContributors" | "getLicense" | "getProvides" | "getDependencies",
                 "()Ljava/util/Collection;",
-            ) => Some(self.metadata_collection(id, &r.name, Vec::new())),
+            ) => return self.counted_metadata_collection(r, receiver),
             ("getContact", "()Lnet/fabricmc/loader/api/metadata/ContactInformation;") => {
                 Some(loader::empty_contact())
             }

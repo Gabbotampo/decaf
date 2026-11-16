@@ -357,6 +357,8 @@ pub enum HostKind {
     FabricModContainer,
     /// A Fabric `ModMetadata`: key its mod id.
     FabricModMetadata,
+    /// A Fabric metadata dependency: key its mod id and dependency kind.
+    FabricModDependency,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
     FabricModOriginKind,
@@ -1711,6 +1713,15 @@ const KINDS: &[KindInfo] = &[
             declared: crate::host_fabric_loader::metadata_types,
         },
         // The container's own metadata.
+        canonical: always_canonical,
+        methods: &crate::host_fabric_loader::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricModDependency,
+        tag: "fdep",
+        class: ClassRule::Unknown {
+            declared: crate::host_fabric_loader::dependency_types,
+        },
         canonical: always_canonical,
         methods: &crate::host_fabric_loader::OBJECT_METHODS,
     },
