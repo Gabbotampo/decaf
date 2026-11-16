@@ -1,18 +1,19 @@
-//! `Holder.Reference` handles produced by a jar's own
-//! `Registry.registerForHolder` calls.
+//! `Holder.Reference` and `Holder.Direct` handles produced by a jar's own
+//! registry calls.
 //!
 //! A registration carries the registry key, entry id, registered value and
-//! binding state. MappedRegistry.register creates an unbound reference. Fabric
-//! API's fabric-registry-sync-v0 mixin binds it immediately at register return;
-//! NeoForge and vanilla leave it unbound until their real registry lifecycle.
-//! A jar can only
-//! obtain one of these handles from the host call; spelling the
-//! old marker text in a `String` never aliases it. Vanilla holders whose
-//! registry contents or tags belong to the game stay outside this model.
+//! binding state. A reference returned for an observed registration is bound
+//! when the registry lifecycle has supplied its value; a direct holder keeps
+//! only the value and therefore has no invented registry id. A jar can obtain
+//! these handles only from modeled host calls; spelling an old marker in a
+//! `String` never aliases one. Vanilla holders whose registry contents or tags
+//! belong to the game stay outside this model.
 
 use crate::runtime::dfu_either;
 use crate::runtime::host_ids;
-use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out};
+use crate::runtime::host_ref::{
+    ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out,
+};
 use crate::runtime::{MethodRef, NativeError, StdHost, Value};
 
 const OWNER: &str = "net/minecraft/core/Holder$Reference";
@@ -22,8 +23,7 @@ const HOLDER_TYPES: &[&str] = &[OWNER, HOLDER, "java/lang/Object"];
 
 /// A holder reference is a concrete game object. Its object hash is the
 /// identity hash and therefore remains counted; the identity itself is exact
-/// because each registration key is one host-created allocation.
-/// The bound flag starts false at registration; only a future real registry-freeze hook may set it true.
+/// because each observed registration carries one registry key and value.
 fn holder(registry_key: Value, id: Value, value: Value, bound: bool, game_owned: bool) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::RegistryHolder,
@@ -150,28 +150,173 @@ pub(crate) fn static_call(
     r: &MethodRef,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if r.owner == HOLDER && r.name == "direct" {
+        let valid = matches!(
+            r.descriptor.as_str(),
+            "(Ljava/lang/Object;)Lnet/minecraft/core/Holder;"
+                | "(Ljava/lang/Object;Lnet/minecraft/core/component/DataComponentMap;)Lnet/minecraft/core/Holder;"
+        );
+        if !valid {
+            return Some(host.unknown_host_call(r));
+        }
+        let value = args.first().cloned().unwrap_or(Value::Void);
+        let components = args.get(1).cloned().unwrap_or(Value::Ref(None));
+        return Some(Ok(direct_holder(value, components)));
+    }
     if r.owner != "net/minecraft/core/Registry" || r.name != "registerForHolder" {
         return None;
     }
     let [registry, id_or_key, value] = args else {
         return Some(host.unknown_host_call(r));
     };
-    // Fabric API's fabric-registry-sync-v0 MappedRegistryMixin injects at
-    // register RETURN and calls Holder.Reference.bindValue(entry). This state
-    // is exact only when that module is present in the explicitly linked run
-    // metadata; vanilla, Fabric without it, and NeoForge stay unbound here.
-    let fabric_registry_sync = host.run_loader == crate::runtime::class_precedence::RunLoader::Fabric
-        && host.fabric_mod_present("fabric-registry-sync-v0");
+    // MappedRegistry.register binds both the key and value before returning;
+    // the returned reference is therefore bound in every loader.
     let answer = match r.descriptor.as_str() {
-        "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" => {
-            make_for_identifier(registry, id_or_key, value, fabric_registry_sync)
+        "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" =>
+        {
+            let holder = make_for_identifier(registry, id_or_key, value, true);
+            if holder.is_some() {
+                if let (Some(registry), Some(id)) = (
+                    crate::runtime::host_registry::registry_id(registry),
+                    host_ids::identifier_key(id_or_key),
+                ) {
+                    host.record_observed_registry(registry, id.to_owned(), value.clone());
+                }
+            }
+            holder
         }
-        "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" => {
-            make_for_key(registry, id_or_key, value, fabric_registry_sync)
+        "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" =>
+        {
+            let holder = make_for_key(registry, id_or_key, value, true);
+            if holder.is_some() {
+                if let (Some(registry), Some((_, id))) = (
+                    crate::runtime::host_registry::registry_id(registry),
+                    host_ids::resource_key_parts(id_or_key),
+                ) {
+                    host.record_observed_registry(registry, id, value.clone());
+                }
+            }
+            holder
         }
         _ => None,
     };
     Some(answer.map_or_else(|| host.unknown_host_call(r), Ok))
+}
+
+fn observed_holder(host: &StdHost, registry: &Value, id: &str) -> Option<Value> {
+    let registry_id = crate::runtime::host_registry::registry_id(registry)?;
+    let entry = host.observed_registry_entry(registry_id, id)?;
+    Some(holder(
+        host_ids::registry_key_of(registry_id),
+        host_ids::identifier_of_text(id),
+        entry.value.clone(),
+        true,
+        false,
+    ))
+}
+
+fn id_argument(registry: &str, value: &Value) -> Option<String> {
+    if let Some(id) = host_ids::identifier_key(value) {
+        return Some(id.to_owned());
+    }
+    let (key_registry, id) = host_ids::resource_key_parts(value)?;
+    (key_registry == registry).then_some(id)
+}
+
+fn registry_call(
+    host: &mut StdHost,
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let registry = crate::runtime::host_registry::registry_id(receiver)?.to_owned();
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("get", "(Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;")
+        | ("get", "(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;") => {
+            let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
+                return Some(host.unknown_host_call(r));
+            };
+            let Some(holder) = observed_holder(host, receiver, &id) else {
+                return Some(host.unknown_host_call(r));
+            };
+            Some(Ok(crate::runtime::host_optional::optional_wrap(holder)))
+        }
+        ("wrapAsHolder", "(Ljava/lang/Object;)Lnet/minecraft/core/Holder;") => {
+            let Some(value) = args.first() else {
+                return Some(host.unknown_host_call(r));
+            };
+            if let Some(entry) = host
+                .registrations()
+                .iter()
+                .rev()
+                .find(|entry| entry.registry == registry && entry.value == *value)
+            {
+                return Some(Ok(holder(
+                    host_ids::registry_key_of(&registry),
+                    host_ids::identifier_of_text(&entry.id),
+                    entry.value.clone(),
+                    true,
+                    false,
+                )));
+            }
+            Some(Ok(direct_holder(value.clone(), Value::Ref(None))))
+        }
+        ("getValue", "(Lnet/minecraft/resources/Identifier;)Ljava/lang/Object;")
+        | ("getValue", "(Lnet/minecraft/resources/ResourceKey;)Ljava/lang/Object;")
+        | ("getValueOrThrow", "(Lnet/minecraft/resources/ResourceKey;)Ljava/lang/Object;") => {
+            let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
+                return Some(host.unknown_host_call(r));
+            };
+            let Some(entry) = host.observed_registry_entry(&registry, &id) else {
+                return Some(host.unknown_host_call(r));
+            };
+            Some(Ok(entry.value.clone()))
+        }
+        ("getResourceKey", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
+            let Some(value) = args.first() else {
+                return Some(host.unknown_host_call(r));
+            };
+            let Some(entry) = host
+                .registrations()
+                .iter()
+                .rev()
+                .find(|entry| entry.registry == registry && entry.value == *value)
+            else {
+                return Some(host.unknown_host_call(r));
+            };
+            Some(Ok(crate::runtime::host_optional::optional_wrap(
+                host_ids::resource_key(
+                    &host_ids::registry_key_of(&registry),
+                    &host_ids::identifier_of_text(&entry.id),
+                    Some(entry.id.clone()),
+                ),
+            )))
+        }
+        ("getKey", "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;") => {
+            let Some(value) = args.first() else {
+                return Some(host.unknown_host_call(r));
+            };
+            let Some(entry) = host
+                .registrations()
+                .iter()
+                .rev()
+                .find(|entry| entry.registry == registry && entry.value == *value)
+            else {
+                return Some(host.unknown_host_call(r));
+            };
+            Some(Ok(host_ids::identifier_of_text(&entry.id)))
+        }
+        ("containsKey", "(Lnet/minecraft/resources/Identifier;)Z")
+        | ("containsKey", "(Lnet/minecraft/resources/ResourceKey;)Z") => {
+            let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
+                return Some(host.unknown_host_call(r));
+            };
+            Some(Ok(Value::Int(i32::from(
+                host.observed_registry_entry(&registry, &id).is_some(),
+            ))))
+        }
+        _ => None,
+    }
 }
 
 fn is_id(parts: &Parts, id: &Value) -> Option<bool> {
@@ -214,6 +359,111 @@ fn unbound_value(parts: &Parts) -> NativeError {
     }
 }
 
+const DIRECT_OWNER: &str = "net/minecraft/core/Holder$Direct";
+
+fn direct_holder(value: Value, components: Value) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::DirectHolder,
+        &[value, components],
+    ))
+}
+
+fn direct_parts(value: &Value) -> Option<(Value, Value)> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::DirectHolder {
+        return None;
+    }
+    <[Value; 2]>::try_from(handle.values()?)
+        .ok()
+        .map(|[value, components]| (value, components))
+}
+
+fn direct_identity_equals(
+    handle: &HostRef,
+    other: &Value,
+    _: &mut dyn Nested,
+) -> Result<Option<bool>, NativeError> {
+    Ok(match other {
+        Value::Host(other) if other.kind() == HostKind::DirectHolder => handle.same_object(other),
+        _ => Some(false),
+    })
+}
+
+fn direct_instance_of(
+    _handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if wanted == "java/lang/Object"
+        || wanted == HOLDER
+        || hierarchy.is_instance(DIRECT_OWNER, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    if wanted == OWNER || wanted == DIRECT_OWNER {
+        return Some(wanted == DIRECT_OWNER);
+    }
+    (hierarchy.is_interface(wanted) == Some(false) || exact_class_rules_out(DIRECT_OWNER, wanted))
+        .then_some(false)
+}
+
+pub(crate) const DIRECT_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: direct_identity_equals,
+    instance_of: direct_instance_of,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+fn direct_holder_call(
+    host: &mut StdHost,
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    let Some((value, _components)) = direct_parts(receiver) else {
+        return None;
+    };
+    let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        (HOLDER | DIRECT_OWNER, "value", "()Ljava/lang/Object;") => Ok(value),
+        (HOLDER | DIRECT_OWNER, "isBound", "()Z")
+        | (HOLDER | DIRECT_OWNER, "areComponentsBound", "()Z") => Ok(Value::Int(1)),
+        (HOLDER | DIRECT_OWNER, "is", "(Lnet/minecraft/resources/Identifier;)Z")
+        | (HOLDER | DIRECT_OWNER, "is", "(Lnet/minecraft/resources/ResourceKey;)Z")
+        | (HOLDER | DIRECT_OWNER, "is", "(Lnet/minecraft/tags/TagKey;)Z") => Ok(Value::Int(0)),
+        (HOLDER | DIRECT_OWNER, "is", "(Lnet/minecraft/core/Holder;)Z") => {
+            let Some(Value::Host(other)) = args.first() else {
+                return Some(host.unknown_host_call(r));
+            };
+            if other.kind() == HostKind::DirectHolder
+                && matches!(receiver, Value::Host(handle) if handle.same_object(other).is_some_and(|same| same))
+            {
+                Ok(Value::Int(1))
+            } else {
+                return Some(host.unknown_host_call(r));
+            }
+        }
+        (HOLDER | DIRECT_OWNER, "unwrapKey", "()Ljava/util/Optional;")
+        | (HOLDER | DIRECT_OWNER, "getRegisteredNameIfPresent", "()Ljava/util/Optional;") => {
+            Ok(crate::runtime::host_optional::empty_optional())
+        }
+        (HOLDER | DIRECT_OWNER, "getRegisteredName", "()Ljava/lang/String;") => {
+            Ok(Value::Ref(Some("[unregistered]".into())))
+        }
+        (HOLDER | DIRECT_OWNER, "unwrap", "()Lcom/mojang/datafixers/util/Either;") => {
+            Ok(dfu_either::right(&value))
+        }
+        (HOLDER | DIRECT_OWNER, "kind", "()Lnet/minecraft/core/Holder$Kind;") => {
+            Ok(Value::Ref(Some(format!("enum/{KIND}/DIRECT"))))
+        }
+        _ => return Some(host.unknown_host_call(r)),
+    };
+    Some(answer)
+}
+
 fn identity_equals(
     handle: &HostRef,
     other: &Value,
@@ -249,6 +499,12 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if direct_parts(receiver).is_some() {
+        return direct_holder_call(host, r, receiver, args);
+    }
+    if crate::runtime::host_registry::registry_id(receiver).is_some() {
+        return registry_call(host, r, receiver, args);
+    }
     let parts = parts(receiver)?;
     let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (HOLDER | OWNER, "key", "()Lnet/minecraft/resources/ResourceKey;") => Ok(entry_key(&parts)),
@@ -268,9 +524,9 @@ pub(crate) fn instance_call(
         (HOLDER | OWNER, "getRegisteredNameIfPresent", "()Ljava/util/Optional;") => Ok(
             crate::runtime::host_optional::optional_wrap(Value::Ref(Some(parts.id.clone()))),
         ),
-        (HOLDER | OWNER, "unwrapKey", "()Ljava/util/Optional;") => {
-            Ok(crate::runtime::host_optional::optional_wrap(entry_key(&parts)))
-        }
+        (HOLDER | OWNER, "unwrapKey", "()Ljava/util/Optional;") => Ok(
+            crate::runtime::host_optional::optional_wrap(entry_key(&parts)),
+        ),
         (HOLDER | OWNER, "unwrap", "()Lcom/mojang/datafixers/util/Either;") => {
             Ok(dfu_either::left(&entry_key(&parts)))
         }
@@ -341,8 +597,8 @@ mod tests {
             .unwrap(),
             Value::Ref(Some("demo:item".into()))
         );
-        let error = host
-            .invoke_instance(
+        assert_eq!(
+            host.invoke_instance(
                 &MethodRef {
                     owner: HOLDER.into(),
                     name: "value".into(),
@@ -351,18 +607,9 @@ mod tests {
                 &holder,
                 &[],
             )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            NativeError::UncaughtException {
-                ref class,
-                ref message,
-                ..
-            } if class == "java/lang/IllegalStateException"
-                && message.as_deref().is_some_and(|text| text.contains(
-                    "Trying to access unbound value 'ResourceKey[minecraft:item / demo:item]'"
-                ))
-        ));
+            .unwrap(),
+            Value::Ref(Some("value".into()))
+        );
         assert_eq!(
             host.invoke_instance(
                 &MethodRef {
@@ -374,7 +621,7 @@ mod tests {
                 &[],
             )
             .unwrap(),
-            Value::Int(0)
+            Value::Int(1)
         );
         assert!(matches!(
             host.invoke_instance(
@@ -392,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn fabric_registry_sync_binds_at_register_return() {
+    fn every_registry_register_for_holder_is_bound_at_return() {
         let mut host = StdHost::new()
             .with_run_loader(crate::runtime::class_precedence::RunLoader::Fabric)
             .with_mod("fabric-registry-sync-v0", "8.0.4");
@@ -438,8 +685,9 @@ mod tests {
     }
 
     #[test]
-    fn fabric_without_registry_sync_stays_unbound() {
-        let mut host = StdHost::new().with_run_loader(crate::runtime::class_precedence::RunLoader::Fabric);
+    fn registry_register_for_holder_is_bound_without_fabric_sync() {
+        let mut host =
+            StdHost::new().with_run_loader(crate::runtime::class_precedence::RunLoader::Fabric);
         let holder = host
             .invoke(
                 &method(
@@ -464,8 +712,68 @@ mod tests {
                 &[],
             )
             .unwrap(),
-            Value::Int(0)
+            Value::Int(1)
         );
+    }
+
+    #[test]
+    fn direct_holder_answers_unregistered_facts_without_an_invented_id() {
+        let mut host = StdHost::new();
+        let value = Value::Ref(Some("effect".into()));
+        let direct = host
+            .invoke(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "direct".into(),
+                    descriptor: "(Ljava/lang/Object;)Lnet/minecraft/core/Holder;".into(),
+                },
+                std::slice::from_ref(&value),
+            )
+            .unwrap();
+        assert!(matches!(
+            &direct,
+            Value::Host(handle) if handle.kind() == HostKind::DirectHolder
+        ));
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "getRegisteredName".into(),
+                    descriptor: "()Ljava/lang/String;".into(),
+                },
+                &direct,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("[unregistered]".into()))
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "value".into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                &direct,
+                &[],
+            )
+            .unwrap(),
+            value
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &MethodRef {
+                    owner: HOLDER.into(),
+                    name: "kind".into(),
+                    descriptor: "()Lnet/minecraft/core/Holder$Kind;".into(),
+                },
+                &direct,
+                &[],
+            )
+            .unwrap(),
+            Value::Ref(Some("enum/net/minecraft/core/Holder$Kind/DIRECT".into()))
+        );
+        assert!(host.unknown_host_calls().is_empty());
     }
 
     #[test]

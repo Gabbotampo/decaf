@@ -1,7 +1,9 @@
 //! DataFixerUpper Either values as typed host handles.
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out};
+use crate::runtime::host_ref::{
+    ClassHierarchy, HostKind, HostRef, Methods, Nested, exact_class_rules_out,
+};
 use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value};
 
 const OWNER: &str = "com/mojang/datafixers/util/Either";
@@ -11,6 +13,10 @@ static NEXT_EITHER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn left(value: &Value) -> Value {
     either(true, value)
+}
+
+pub(crate) fn right(value: &Value) -> Value {
+    either(false, value)
 }
 
 fn either(left: bool, value: &Value) -> Value {

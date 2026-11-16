@@ -279,6 +279,8 @@ pub enum HostKind {
     Holder,
     /// A `Holder.Reference` returned by a jar-owned `Registry.registerForHolder`: key the registry key, id and value.
     RegistryHolder,
+    /// A `Holder.Direct` returned by `Holder.direct`: key the held value and component map.
+    DirectHolder,
     /// The value a holder's registration registered: key the serial.
     Registered,
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
@@ -839,7 +841,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::GsonTypeToken,
         &crate::runtime::host_gson_type::TOKEN_CLASS_SIDE,
     ),
-    (HostKind::DfuPair, &crate::runtime::host_codec::PAIR_CLASS_SIDE),
+    (
+        HostKind::DfuPair,
+        &crate::runtime::host_codec::PAIR_CLASS_SIDE,
+    ),
     (
         HostKind::GameEvent,
         &crate::runtime::host_game_event::EVENT_CLASS_SIDE,
@@ -877,7 +882,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::StreamCodec,
         &crate::runtime::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
-    (HostKind::RandomSource, &crate::runtime::random_source::CLASS_SIDE),
+    (
+        HostKind::RandomSource,
+        &crate::runtime::random_source::CLASS_SIDE,
+    ),
 ];
 
 /// One row of the kind table.
@@ -1377,6 +1385,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("net/minecraft/core/Holder$Reference"),
         canonical: always_canonical,
         methods: &crate::runtime::host_registry_holder::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DirectHolder,
+        tag: "dhold",
+        class: ClassRule::Fixed("net/minecraft/core/Holder$Direct"),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_registry_holder::DIRECT_METHODS,
     },
     KindInfo {
         kind: HostKind::Registered,
@@ -2696,7 +2711,11 @@ impl HostRef {
     }
 
     /// A callback handle keyed `key` that carries `row` (`callback_marker.rs`).
-    pub(crate) fn with_row(kind: HostKind, key: String, row: crate::runtime::callback_marker::Row) -> Self {
+    pub(crate) fn with_row(
+        kind: HostKind,
+        key: String,
+        row: crate::runtime::callback_marker::Row,
+    ) -> Self {
         let mut handle = Self::new(kind, key);
         handle.row = Some(Arc::new(row));
         handle
@@ -3135,7 +3154,10 @@ mod tests {
             );
             // A collection element.
             assert_eq!(
-                crate::runtime::parse_value_marker(&crate::runtime::collection_item_marker(&handle)).ok(),
+                crate::runtime::parse_value_marker(&crate::runtime::collection_item_marker(
+                    &handle
+                ))
+                .ok(),
                 Some(handle.clone()),
                 "{held:?}"
             );

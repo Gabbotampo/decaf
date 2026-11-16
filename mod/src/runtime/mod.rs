@@ -4693,6 +4693,30 @@ impl StdHost {
         &self.registrations
     }
 
+    /// Record a registry entry whose id and value were observed by a bounded
+    /// `Registry.registerForHolder` call. The row is deliberately kept in
+    /// the same table as `Registry.register` so later holder lookups can only
+    /// answer for registrations this runtime actually saw.
+    pub(crate) fn record_observed_registry(&mut self, registry: &str, id: String, value: Value) {
+        self.registrations.push(RegistryEntry {
+            registry: registry.to_owned(),
+            id,
+            value,
+            declaration: None,
+        });
+    }
+
+    pub(crate) fn observed_registry_entry(
+        &self,
+        registry: &str,
+        id: &str,
+    ) -> Option<&RegistryEntry> {
+        self.registrations
+            .iter()
+            .rev()
+            .find(|entry| entry.registry == registry && entry.id == id)
+    }
+
     /// The property chain recorded for a constructed item marker, in the
     /// builder's own vocabulary (`stacksTo`, `durability`, `rarity`, ...).
     ///
@@ -5087,17 +5111,28 @@ impl StdHost {
             .find_map(host_registry::registry_id)?
             .to_owned();
         let registry = registry.as_str();
-        let id = args.iter().find_map(|value| {
-            if let Some(id) = host_ids::identifier_key(value) {
-                let (namespace, path) = id.split_once(':')?;
-                return Some(format!("{namespace}:{path}"));
-            }
-            // `Registry.register(registry, ResourceKey, value)` names the entry
-            // through the key rather than a bare identifier. Without reading
-            // the id out of the key the host answers null and the caller's
-            // static field ends up null. An unnamed key names no id.
-            resource_key_identifier(value).map(|(namespace, path)| format!("{namespace}:{path}"))
-        })?;
+        let id = args[..args.len().saturating_sub(1)]
+            .iter()
+            .find_map(|value| {
+                if let Some(id) = host_ids::identifier_key(value) {
+                    let (namespace, path) = id.split_once(':')?;
+                    return Some(format!("{namespace}:{path}"));
+                }
+                // `Registry.register(registry, ResourceKey, value)` names the entry
+                // through the key rather than a bare identifier. Without reading
+                // the id out of the key the host answers null and the caller's
+                // static field ends up null. An unnamed key names no id.
+                if let Some((namespace, path)) = resource_key_identifier(value) {
+                    return Some(format!("{namespace}:{path}"));
+                }
+                // The legacy overload accepts a String and parses it as an
+                // Identifier (`minecraft:` is the default namespace). Only the
+                // pre-value arguments are inspected, so a registered String value
+                // cannot be mistaken for its id.
+                let text = expect_ref(value)?;
+                let (namespace, path) = text.split_once(':').unwrap_or(("minecraft", text));
+                (!namespace.is_empty() && !path.is_empty()).then(|| format!("{namespace}:{path}"))
+            })?;
         let value = args.last().cloned().unwrap_or(Value::Void);
         let key = format!("{registry}/{id}");
         // An id the jar's metadata already describes stays opaque: the
@@ -6302,7 +6337,9 @@ impl Host for StdHost {
             && r.descriptor == "Lnet/minecraft/world/level/block/Block;"
         {
             return match crate::runtime::vanilla_blocks::field_id(&r.name) {
-                Some(id) => Ok(crate::runtime::game_object::server_value(format!("game/block/{id}"))),
+                Some(id) => Ok(crate::runtime::game_object::server_value(format!(
+                    "game/block/{id}"
+                ))),
                 None => self.unknown_host_call(r),
             };
         }
@@ -6539,7 +6576,9 @@ impl Host for StdHost {
         if let Some(class) = pure_helpers::empty_factory_class(r) {
             return Ok(self.empty_collection_class(class));
         }
-        if let Some(value) = crate::runtime::host_log4j_level::static_call(r, args, &mut self.log4j_levels) {
+        if let Some(value) =
+            crate::runtime::host_log4j_level::static_call(r, args, &mut self.log4j_levels)
+        {
             return value;
         }
         if let Some(value) = client_reload::static_call(self, r, args) {
@@ -12109,13 +12148,11 @@ fn builder_append_text<H: Host>(
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
             // `append(Object)` is `String.valueOf`: an object a model owns
             // prints its `toString`, and a box prints its value.
-            Value::Ref(Some(text)) => {
-                crate::runtime::java_tostring::modelled_marker(host, value).unwrap_or_else(|| text.clone())
-            }
+            Value::Ref(Some(text)) => crate::runtime::java_tostring::modelled_marker(host, value)
+                .unwrap_or_else(|| text.clone()),
             Value::Boxed(boxed) => boxed.text(),
-            Value::Host(_) => {
-                crate::runtime::java_tostring::modelled(host, value).unwrap_or_else(|| value_text(value))
-            }
+            Value::Host(_) => crate::runtime::java_tostring::modelled(host, value)
+                .unwrap_or_else(|| value_text(value)),
             Value::Ref(None) => "null".into(),
             Value::Int(value) => value.to_string(),
             Value::Long(value) => value.to_string(),
@@ -24152,7 +24189,9 @@ impl<H: Host> Runtime<'_, H> {
                     value_class::component_of_array_class(host_array::class_of_key(marker));
                 let valid = match component.as_deref() {
                     Some("byte") => matches!(value, Value::Boxed(crate::runtime::Boxed::Byte(_))),
-                    Some("boolean") => matches!(value, Value::Boxed(crate::runtime::Boxed::Boolean(_))),
+                    Some("boolean") => {
+                        matches!(value, Value::Boxed(crate::runtime::Boxed::Boolean(_)))
+                    }
                     Some(component) if primitive_descriptor(component).is_none() => {
                         match self.store_fits(component, &value) {
                             Some(true) => true,
@@ -27407,21 +27446,24 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if r.name == "<init>" && r.descriptor == "(Ljava/lang/String;I)V" {
-            let marker = crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
-                .or_else(|| {
-                    expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
-                })
-                .ok_or_else(|| {
-                    NativeError::Metadata("java/lang/Enum.<init> needs the constant object".into())
-                })?;
+            let marker =
+                crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
+                    .or_else(|| {
+                        expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
+                    })
+                    .ok_or_else(|| {
+                        NativeError::Metadata(
+                            "java/lang/Enum.<init> needs the constant object".into(),
+                        )
+                    })?;
             let name = expect_string(StdHost::argument(r, args, 0)?);
             let ordinal = expect_int(r, StdHost::argument(r, args, 1)?)?;
             self.enum_constants
                 .insert(marker.to_owned(), (name.to_owned(), ordinal));
             return Ok(Some(Value::Void));
         }
-        let marker =
-            crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None))).or_else(|| {
+        let marker = crate::runtime::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
+            .or_else(|| {
                 expect_ref(receiver.unwrap_or(&Value::Ref(None))).map(|text| text.as_str())
             });
         let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
@@ -35107,8 +35149,15 @@ mod tests {
         // doubling: transcription used to grow without limit here.
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
-            value =
-                crate::runtime::callback_marker::lambda("demo/C#m", 0, "", None, None, vec![value], false);
+            value = crate::runtime::callback_marker::lambda(
+                "demo/C#m",
+                0,
+                "",
+                None,
+                None,
+                vec![value],
+                false,
+            );
         }
         let Some(marker) = crate::runtime::callback_marker::callback_text(&value) else {
             panic!("expected a callback");
@@ -39026,7 +39075,9 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[crate::runtime::callback_marker::test_token("unused-supplier")],
+                &[crate::runtime::callback_marker::test_token(
+                    "unused-supplier"
+                )],
             )
             .unwrap(),
             optional_wrap(Value::Ref(Some("demo".into())))
@@ -39035,7 +39086,9 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &Value::Ref(None),
-                &[crate::runtime::callback_marker::test_token("empty-supplier")],
+                &[crate::runtime::callback_marker::test_token(
+                    "empty-supplier"
+                )],
             )
             .unwrap(),
             empty_optional()
@@ -39089,7 +39142,9 @@ mandatory = true
             .invoke_instance(
                 &or_else_throw_supplier,
                 &Value::Ref(None),
-                &[crate::runtime::callback_marker::test_token("optional-error")],
+                &[crate::runtime::callback_marker::test_token(
+                    "optional-error",
+                )],
             )
             .unwrap_err();
         assert!(
@@ -39482,7 +39537,9 @@ mandatory = true
             host.invoke_instance(
                 &for_each_remaining,
                 &remaining_iterator,
-                &[crate::runtime::callback_marker::test_token("remaining-consumer")],
+                &[crate::runtime::callback_marker::test_token(
+                    "remaining-consumer"
+                )],
             )
             .unwrap(),
             Value::Void
@@ -39592,7 +39649,9 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list_copy,
-                &[crate::runtime::callback_marker::test_token("list-predicate")],
+                &[crate::runtime::callback_marker::test_token(
+                    "list-predicate"
+                )],
             )
             .unwrap(),
             Value::Int(0)
@@ -41371,7 +41430,9 @@ mandatory = true
             .invoke_instance(
                 &with_path,
                 &id,
-                &[crate::runtime::callback_marker::test_token("path-transform")],
+                &[crate::runtime::callback_marker::test_token(
+                    "path-transform",
+                )],
             )
             .unwrap();
         // The operator is a jar lambda the host boundary cannot run; the call
@@ -42530,7 +42591,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[crate::runtime::callback_marker::test_token("stream-predicate")],
+                    &[crate::runtime::callback_marker::test_token(
+                        "stream-predicate"
+                    )],
                     "demo/Stream",
                     "probe",
                 )
@@ -42607,7 +42670,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[crate::runtime::callback_marker::test_token("stream-predicate")],
+                    &[crate::runtime::callback_marker::test_token(
+                        "stream-predicate"
+                    )],
                     "demo/Stream",
                     "probe",
                 )
@@ -42624,7 +42689,9 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[crate::runtime::callback_marker::test_token("stream-predicate")],
+                    &[crate::runtime::callback_marker::test_token(
+                        "stream-predicate"
+                    )],
                     "demo/Stream",
                     "probe",
                 )
@@ -43763,7 +43830,9 @@ mandatory = true
                 descriptor: "(Ljava/util/function/Consumer;)V".into(),
             },
             &mapped,
-            &[crate::runtime::callback_marker::test_token("capability-consumer")],
+            &[crate::runtime::callback_marker::test_token(
+                "capability-consumer",
+            )],
         )
         .unwrap();
         // `mapped` holds nothing (its function was counted): no consumer runs.
@@ -43905,8 +43974,12 @@ mandatory = true
             Value::Int(0)
         );
         assert_eq!(
-            host.invoke_instance(&is_canceled, &crate::runtime::posted_event("demo", true), &[])
-                .unwrap(),
+            host.invoke_instance(
+                &is_canceled,
+                &crate::runtime::posted_event("demo", true),
+                &[]
+            )
+            .unwrap(),
             Value::Int(1)
         );
         // A string spelled like the old cancelled marker is no event.
@@ -43933,7 +44006,9 @@ mandatory = true
         host.invoke_instance(
             &register,
             &bus,
-            &[crate::runtime::callback_marker::test_token("forge-static-handler")],
+            &[crate::runtime::callback_marker::test_token(
+                "forge-static-handler",
+            )],
         )
         .unwrap();
         let dispatches = host.dispatch_event(Value::Ref(Some("forge-event".into())));
@@ -43956,7 +44031,9 @@ mandatory = true
         host.invoke_instance(
             &add_listener,
             &bus,
-            &[crate::runtime::callback_marker::test_token("default-listener")],
+            &[crate::runtime::callback_marker::test_token(
+                "default-listener",
+            )],
         )
         .unwrap();
         host.invoke_instance(
@@ -44002,7 +44079,9 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&crate::runtime::callback_marker::test_token("typed-listener"))
+            Some(&crate::runtime::callback_marker::test_token(
+                "typed-listener"
+            ))
         );
     }
 
@@ -44132,7 +44211,10 @@ mandatory = true
                 .unwrap(),
             Value::Int(1)
         );
-        assert_eq!(host.posted_events(), &[crate::runtime::posted_event("forge", true)]);
+        assert_eq!(
+            host.posted_events(),
+            &[crate::runtime::posted_event("forge", true)]
+        );
     }
 
     #[test]
