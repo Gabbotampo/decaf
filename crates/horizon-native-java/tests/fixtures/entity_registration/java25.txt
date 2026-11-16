@@ -1,0 +1,14 @@
+cat=MONSTER,monster,MO,70,false,false,128,32,MONSTER
+cat=CREATURE,creature,C,10,true,true,128,32,CREATURE
+cat=AMBIENT,ambient,AM,15,true,false,128,32,AMBIENT
+cat=AXOLOTLS,axolotls,AX,5,true,false,128,32,AXOLOTLS
+cat=UNDERGROUND_WATER_CREATURE,underground_water_creature,UWC,5,true,false,128,32,UNDERGROUND_WATER_CREATURE
+cat=WATER_CREATURE,water_creature,WC,5,true,false,128,32,WATER_CREATURE
+cat=WATER_AMBIENT,water_ambient,WA,20,true,false,64,32,WATER_AMBIENT
+cat=MISC,misc,MI,-1,true,true,128,32,MISC
+serial=true,false
+base=0
+sub=1
+base2=1
+sibling=0
+overflow=Data value id is too big with 255! (Max is 254)

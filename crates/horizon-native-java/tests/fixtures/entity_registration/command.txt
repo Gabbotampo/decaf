@@ -1,0 +1,4 @@
+Captured with Java 25.0.5+8 and the real 26.3 server-game.jar. `java -version` output: openjdk version "25.0.5" 2026-10-20 LTS.
+CP=~/ava/minecraft-26.3-server-game.jar:$(python3 -c "import pathlib; print(":".join(map(str,pathlib.Path("libraries").rglob("*.jar"))))")
+javac -cp "$CP" Probe.java
+java -cp ".:$CP" Probe 2>&1 | sed -n "s/^\[[^]]*\] \[main/INFO\]: \[STDOUT\]: //p" > java25.txt
