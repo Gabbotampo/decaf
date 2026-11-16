@@ -174,7 +174,6 @@ mod library_dispatch;
 mod linked_resources;
 mod list_equality;
 mod map_compute;
-mod matcher_state;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -8021,9 +8020,6 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
-        if let Some(v) = matcher_state::call(r, receiver) {
-            return v;
-        }
         if matches!(receiver, Value::Host(h) if h.kind() == host_ref::HostKind::Matcher)
             && r.owner == "java/util/regex/Matcher"
         {
