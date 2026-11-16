@@ -64,12 +64,7 @@ fn is_view<H: Host>(this: &Runtime<'_, H>, key: &str) -> bool {
     field(this, key, "view").is_some()
 }
 
-fn cached_view<H: Host>(
-    this: &mut Runtime<'_, H>,
-    source: &str,
-    name: &str,
-    class: &str,
-) -> Value {
+fn cached_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &str, class: &str) -> Value {
     if let Some(view) = field(this, source, name) {
         return view;
     }
