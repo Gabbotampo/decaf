@@ -23,22 +23,7 @@ pub(crate) fn call(r: &crate::MethodRef, receiver: &Value) -> Option<Result<Valu
                 .map(|b| Value::Int(b as i32))
                 .map_err(|_| NativeError::Truncated),
         ),
-        ("find", "()Z") => {
-            let mut g = state().lock().ok()?;
-            let pos = g.get(&key).map(|x| x.1).unwrap_or(0);
-            let chars: Vec<char> = input.chars().collect();
-            let all = crate::java_regex::Regex::compile(p, 0)
-                .ok()?
-                .find_all(&chars, Some(usize::MAX))
-                .ok()?;
-            let m = all.into_iter().find(|m| m.start() >= pos);
-            if let Some(m) = m {
-                g.insert(key, (m.start(), m.end()));
-                Some(Ok(Value::Int(1)))
-            } else {
-                Some(Ok(Value::Int(0)))
-            }
-        }
+        ("find", "()Z") => None,
         ("start", "()I") | ("end", "()I") => {
             let g = state().lock().ok()?;
             let (a, b) = g.get(&key).copied()?;
