@@ -41,7 +41,7 @@ pub(crate) fn call(r: &crate::MethodRef, receiver: &Value) -> Option<Result<Valu
         }
         ("start", "()I") | ("end", "()I") => {
             let g = state().lock().ok()?;
-            let (a, b) = *g.get(&key)?;
+            let (a, b) = g.get(&key).copied()?;
             Some(Ok(Value::Int(if r.name == "start" { a } else { b } as i32)))
         }
         _ => None,

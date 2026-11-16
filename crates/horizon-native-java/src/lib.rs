@@ -8032,8 +8032,8 @@ impl Host for StdHost {
                     h.values().and_then(|v| <[Value; 2]>::try_from(v).ok())
                 {
                     if r.name == "matches" && r.descriptor == "()Z" {
-                        let matched = java_regex::matches(pattern, input)
-                            .map_err(|_| self.unknown_host_call(r).err().unwrap())?;
+                        let matched = java_regex::matches(&pattern, &input)
+                            .map_err(|_| NativeError::Truncated)?;
                         return Ok(Value::Int(matched as i32));
                     }
                 }
