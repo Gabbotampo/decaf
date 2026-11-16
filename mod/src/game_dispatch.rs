@@ -171,6 +171,8 @@ struct ActiveFrame {
     state: std::cell::UnsafeCell<State>,
 }
 thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCell::new(Vec::new()) }; }
+#[cfg(test)]
+thread_local! { static FORCE_CALLBACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 impl HorizonJava {
     /// Dispatch one point. The relaxed/immutable snapshot check precedes every lock or allocation.
@@ -327,6 +329,12 @@ fn dispatch_state(
                     &mut loaded.host,
                     &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
                 )
+                .inspect(|_| {
+                    #[cfg(test)]
+                    if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
+                        panic!("dispatcher callback panic fixture");
+                    }
+                })
             },
         );
         let run = match result {
@@ -616,6 +624,24 @@ mod tests {
         assert_eq!(state.jars[0].row.game_hooks.failed, 1);
         assert_eq!(state.jars[1].row.game_hooks.ran, 0);
         assert!(stdout(&mut state, 1).is_empty());
+    }
+
+    #[test]
+    fn callback_panic_is_counted_after_the_real_jar_callback() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load(
+            "panic",
+            "Panic",
+            "@Mixin(MinecraftServer.class) public class Panic { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"before-panic\"); } }",
+        ));
+        java.refresh_game_hook_plan_bits();
+        FORCE_CALLBACK_PANIC.with(|panic| panic.set(true));
+        let error = stop_dispatch(&java, Phase::Tail).unwrap_err();
+        FORCE_CALLBACK_PANIC.with(|panic| panic.set(false));
+        assert!(error.to_string().contains("dispatcher callback panic fixture"));
+        let mut state = java.lock();
+        assert_eq!(state.jars[0].row.game_hooks.failed, 1);
+        assert!(stdout(&mut state, 0).contains(&"before-panic".to_owned()));
     }
 
     #[test]
