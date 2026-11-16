@@ -26321,9 +26321,6 @@ impl<H: Host> Runtime<'_, H> {
                     ("notExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if !self.io_files.contains_key(&path) {
-                            return Ok(None);
-                        }
                         Value::Int(i32::from(!self.io_files.contains_key(&path)))
                     }
                     ("isReadable", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => Value::Int(i32::from(self.io_files.contains_key(&path))),
