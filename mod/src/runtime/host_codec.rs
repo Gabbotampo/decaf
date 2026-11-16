@@ -240,6 +240,9 @@ pub(crate) fn codec_label(value: &Value) -> Option<String> {
     if let Some(declared) = crate::runtime::stream_codec::codec_type(value) {
         return Some(declared.to_owned());
     }
+    if let Some(declared) = crate::runtime::dfu_codec::codec_type(value) {
+        return Some(declared.to_owned());
+    }
     if let Some(declared) = opaque_codec_type(value) {
         return Some(declared);
     }

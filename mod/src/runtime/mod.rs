@@ -47,6 +47,7 @@ mod concurrent_sync;
 pub mod content;
 mod declarations_content;
 pub mod dependencies;
+mod dfu_codec;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -2366,6 +2367,20 @@ pub trait Host {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
 
+    /// Reserve one DFU construction node and any callback roots it introduces
+    /// against this jar's lifetime budget.
+    fn reserve_dfu_codec(
+        &mut self,
+        _nodes: usize,
+        _callback_roots: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record a named DFU refusal; hosts that do not keep diagnostics may
+    /// leave it as a no-op while the call remains counted by the runtime.
+    fn dfu_codec_refused(&mut self, _reason: String) {}
+
     fn random_new(&mut self, _class: &str) -> Option<Value> {
         None
     }
@@ -3460,6 +3475,10 @@ pub struct StdHost {
     /// Jar-owned static fields retained across entrypoint/event invocations.
     /// The runtime still owns the map; the host only provides the lifetime.
     persistent_static_fields: BTreeMap<String, Value>,
+    /// Per-jar DFU construction budget, retained across callbacks.
+    dfu_codec_nodes: usize,
+    dfu_codec_callback_roots: BTreeSet<String>,
+    dfu_codec_refusals: Vec<String>,
     persistent_initialized_classes: std::collections::BTreeSet<String>,
     /// The jar's objects retained across invocations (`heap.rs`): instance
     /// fields, arrays, builders and enum identity of what its statics and
@@ -3634,6 +3653,9 @@ impl StdHost {
             throwable_causes: BTreeMap::new(),
             throwable_suppressed: BTreeMap::new(),
             persistent_static_fields: BTreeMap::new(),
+            dfu_codec_nodes: 0,
+            dfu_codec_callback_roots: BTreeSet::new(),
+            dfu_codec_refusals: Vec::new(),
             persistent_initialized_classes: std::collections::BTreeSet::new(),
             heap: heap::JavaHeap::default(),
             log4j_levels: crate::runtime::host_log4j_level::CustomLevels::new(),
@@ -3677,6 +3699,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Named DFU construction refusals for the current jar.
+    pub fn dfu_codec_refusals(&self) -> &[String] {
+        &self.dfu_codec_refusals
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -5415,6 +5442,46 @@ impl Host for StdHost {
         self.console_out.push_str(text);
     }
 
+    fn reserve_dfu_codec(
+        &mut self,
+        nodes: usize,
+        callback_roots: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        const MAX_NODES: usize = 256;
+        const MAX_CALLBACK_ROOTS: usize = 64;
+        let next_nodes = self.dfu_codec_nodes.saturating_add(nodes);
+        if next_nodes > MAX_NODES {
+            return Err(format!(
+                "DFU codec node budget exceeded: current {}, requested {}, maximum {}",
+                self.dfu_codec_nodes, nodes, MAX_NODES
+            ));
+        }
+        let additional_roots = callback_roots
+            .iter()
+            .filter(|root| !self.dfu_codec_callback_roots.contains(*root))
+            .count();
+        let next_roots = self
+            .dfu_codec_callback_roots
+            .len()
+            .saturating_add(additional_roots);
+        if next_roots > MAX_CALLBACK_ROOTS {
+            return Err(format!(
+                "DFU codec callback-root budget exceeded: current {}, requested {}, maximum {}",
+                self.dfu_codec_callback_roots.len(),
+                additional_roots,
+                MAX_CALLBACK_ROOTS
+            ));
+        }
+        self.dfu_codec_nodes = next_nodes;
+        self.dfu_codec_callback_roots
+            .extend(callback_roots.iter().cloned());
+        Ok(())
+    }
+
+    fn dfu_codec_refused(&mut self, reason: String) {
+        self.dfu_codec_refusals.push(reason);
+    }
+
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
@@ -6067,6 +6134,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = dfu_codec::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
@@ -29289,6 +29359,10 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
+                    {
+                        value
+                    } else if let Some(value) =
+                        dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
                     {
                         value
                     } else if let Some(value) = invoke_or_catch!(
