@@ -205,6 +205,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(class) = empty_factory_class(r) {
             return Ok(self.host.empty_mutable_collection(class));
         }
+        if let Some(value) = crate::guava_multimap::invoke(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some((class, values, map)) = self.collection_factory_values(r, args)? {
             let collection = self.host.empty_mutable_collection(class).ok_or_else(|| {
                 NativeError::Metadata("Guava collection factory has no host collection".into())
