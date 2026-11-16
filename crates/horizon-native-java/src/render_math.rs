@@ -359,7 +359,7 @@ fn stack(
         _ => return None,
     };
     match r.name.as_str() {
-        "pushPose" => {
+        "pushPose" if r.descriptor == "()V" => {
             let nk = format!("{k}/pose/{}", s.len());
             copy_pose(map, s.last()?, &nk);
             if let Some(Obj::Stack(v)) = map.get_mut(k) {
@@ -367,7 +367,7 @@ fn stack(
             }
             Some(Ok(Value::Void))
         }
-        "popPose" => {
+        "popPose" if r.descriptor == "()V" => {
             if s.len() <= 1 {
                 return Some(Err(NativeError::UncaughtException {
                     class: "java/util/NoSuchElementException".into(),
@@ -380,9 +380,11 @@ fn stack(
             }
             Some(Ok(Value::Void))
         }
-        "last" => Some(Ok(h(s.last()?))),
-        "isEmpty" => Some(Ok(Value::Int(i32::from(s.len() == 1)))),
-        "setIdentity" => {
+        "last" if r.descriptor == "()Lcom/mojang/blaze3d/vertex/PoseStack$Pose;" => {
+            Some(Ok(h(s.last()?)))
+        }
+        "isEmpty" if r.descriptor == "()Z" => Some(Ok(Value::Int(i32::from(s.len() == 1)))),
+        "setIdentity" if r.descriptor == "()V" => {
             if let Some(x) = s.last() {
                 map.insert(
                     x.clone(),
@@ -395,31 +397,33 @@ fn stack(
             }
             Some(Ok(Value::Void))
         }
-        "translate" => {
+        "translate" if r.descriptor == "(FFF)V" => {
             pose_translate(map, s.last()?, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
-        "scale" => {
+        "scale" if r.descriptor == "(FFF)V" => {
             pose_scale(map, s.last()?, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
         "rotateDegrees" | "rotate" | "rotateAround" => Some(host.unknown_host_call(r)),
-        "mulPose" => {
+        "mulPose" if r.descriptor == "(Lorg/joml/Matrix4fc;)V" => {
             let rhs = key(a.first()?)?.to_owned();
             let rhs_matrix = match map.get(&rhs) {
                 Some(Obj::M4(m)) => Some(*m),
                 _ => None,
             };
-            if let (Some(x), Some(m)) = (s.last(), rhs_matrix)
-                && let Some(Obj::Pose(p)) = map.get_mut(x)
-            {
-                p.p = mul4(p.p, m);
-                if !pure_translation(m) {
-                    p.n = normal(p.p);
-                    p.trusted = false;
-                }
-                sync_pose_aliases(map, x);
+            let (Some(x), Some(m)) = (s.last(), rhs_matrix) else {
+                return None;
+            };
+            let Some(Obj::Pose(p)) = map.get_mut(x) else {
+                return None;
+            };
+            p.p = mul4(p.p, m);
+            if !pure_translation(m) {
+                p.n = normal(p.p);
+                p.trusted = false;
             }
+            sync_pose_aliases(map, x);
             Some(Ok(Value::Void))
         }
         _ => None,
@@ -437,22 +441,22 @@ fn pose(
         _ => return None,
     };
     match r.name.as_str() {
-        "pose" => {
+        "pose" if r.descriptor == "()Lorg/joml/Matrix4f;" => {
             let nk = format!("{k}/matrix4");
             map.entry(nk.clone()).or_insert(Obj::M4(p.p));
             Some(Ok(h(&nk)))
         }
-        "normal" => {
+        "normal" if r.descriptor == "()Lorg/joml/Matrix3f;" => {
             let nk = format!("{k}/matrix3");
             map.entry(nk.clone()).or_insert(Obj::M3(p.n));
             Some(Ok(h(&nk)))
         }
-        "copy" => {
+        "copy" if r.descriptor == "()Lcom/mojang/blaze3d/vertex/PoseStack$Pose;" => {
             let nk = format!("{k}/copy");
             map.insert(nk.clone(), Obj::Pose(p));
             Some(Ok(h(&nk)))
         }
-        "setIdentity" => {
+        "setIdentity" if r.descriptor == "()V" => {
             map.insert(
                 k.into(),
                 Obj::Pose(Pose {
@@ -463,11 +467,11 @@ fn pose(
             );
             Some(Ok(Value::Void))
         }
-        "translate" => {
+        "translate" if r.descriptor == "(FFF)V" => {
             pose_translate(map, k, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
-        "scale" => {
+        "scale" if r.descriptor == "(FFF)V" => {
             pose_scale(map, k, arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             Some(Ok(Value::Void))
         }
@@ -491,11 +495,11 @@ fn joml(
     a: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     match (r.owner.as_str(), r.name.as_str()) {
-        ("org/joml/Matrix4f", "identity") => {
+        ("org/joml/Matrix4f", "identity") if r.descriptor == "()Lorg/joml/Matrix4f;" => {
             map.insert(k.into(), Obj::M4(I4));
             Some(Ok(h(k)))
         }
-        ("org/joml/Matrix4f", "translate") => {
+        ("org/joml/Matrix4f", "translate") if r.descriptor == "(FFF)Lorg/joml/Matrix4f;" => {
             let (x, y, z) = (arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             if let Some(Obj::M4(m)) = map.get_mut(k) {
                 *m = mul4(*m, trans(x, y, z));
@@ -503,7 +507,7 @@ fn joml(
             sync_matrix_alias(map, k);
             Some(Ok(h(k)))
         }
-        ("org/joml/Matrix4f", "scale") => {
+        ("org/joml/Matrix4f", "scale") if r.descriptor == "(FFF)Lorg/joml/Matrix4f;" => {
             let (x, y, z) = (arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             if let Some(Obj::M4(m)) = map.get_mut(k) {
                 *m = mul4(*m, scale(x, y, z));
@@ -511,7 +515,9 @@ fn joml(
             sync_matrix_alias(map, k);
             Some(Ok(h(k)))
         }
-        ("org/joml/Matrix4f", "rotate") => {
+        ("org/joml/Matrix4f", "rotate")
+            if r.descriptor == "(Lorg/joml/Quaternionfc;)Lorg/joml/Matrix4f;" =>
+        {
             let qk = key(a.first()?)?;
             let q = match map.get(qk)? {
                 Obj::Q(q) => *q,
@@ -524,7 +530,7 @@ fn joml(
             Some(Ok(h(k)))
         }
         ("org/joml/Quaternionf", "mul") => None,
-        ("org/joml/Vector3f", "set") => {
+        ("org/joml/Vector3f", "set") if r.descriptor == "(FFF)Lorg/joml/Vector3f;" => {
             let (x, y, z) = (arg(r, a, 0)?, arg(r, a, 1)?, arg(r, a, 2)?);
             if let Some(Obj::V3(v)) = map.get_mut(k) {
                 v.0 = [x, y, z];
