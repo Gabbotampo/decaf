@@ -4,6 +4,7 @@ import com.mojang.datafixers.kinds.App;
 import com.mojang.datafixers.util.Pair;
 import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.Lifecycle;
 import net.minecraft.network.codec.ByteBufCodecs;
 import java.util.*;
 
@@ -45,6 +46,19 @@ public final class HostCodecs {
       out.append(t instanceof String).append(t instanceof Pair).append(t instanceof Codec).append(',');
     }
     return out.toString();
+  }
+
+  /** PR1 DFU construction: static singleton, fresh field/xmap nodes, and callback retention. */
+  public static String dfuConstruction() {
+    Codec<Integer> codec = Codec.INT;
+    Object field = codec.fieldOf("n");
+    Object getter = ((com.mojang.serialization.MapCodec<Integer>) field).forGetter((Integer x) -> x);
+    Object mapped = codec.xmap(x -> x + 1, x -> x - 1);
+    Object record = com.mojang.serialization.codecs.RecordCodecBuilder.create(i -> (App) null);
+    return (codec == Codec.INT) + "|" + ((Object) codec == (Object) Codec.STRING) + "|" + (field instanceof com.mojang.serialization.MapCodec)
+        + "|" + (field == codec.fieldOf("n")) + "|" + (getter instanceof com.mojang.serialization.codecs.RecordCodecBuilder)
+        + "|" + (mapped instanceof Codec) + "|" + (mapped == codec.xmap(x -> x + 1, x -> x - 1))
+        + "|" + (record instanceof Codec);
   }
 
   /** A pair hands back its values; equal by them, a new object each time; text and hash. */
@@ -122,6 +136,16 @@ public final class HostCodecs {
   }
 
   /** `Set.of` refuses one constant twice, printing it (DataFixerUpper's `toString`). */
+  /** Every DataFixerUpper Codec constant is one canonical object. */
+  public static String codecSingletons() {
+    return "" + (Codec.BOOL == Codec.BOOL) + (Codec.BYTE == Codec.BYTE) + (Codec.SHORT == Codec.SHORT)
+        + (Codec.INT == Codec.INT) + (Codec.LONG == Codec.LONG) + (Codec.FLOAT == Codec.FLOAT)
+        + (Codec.DOUBLE == Codec.DOUBLE) + (Codec.STRING == Codec.STRING) + (Codec.BYTE_BUFFER == Codec.BYTE_BUFFER)
+        + (Codec.INT_STREAM == Codec.INT_STREAM) + (Codec.LONG_STREAM == Codec.LONG_STREAM)
+        + (Codec.PASSTHROUGH == Codec.PASSTHROUGH) + (Codec.EMPTY == Codec.EMPTY)
+        + ((Object) Codec.INT == (Object) Codec.LONG);
+  }
+
   public static String codecDuplicate() {
     try {
       return "" + Set.of(Codec.STRING, Codec.STRING).size();
@@ -145,5 +169,80 @@ public final class HostCodecs {
   public static String opaqueCodec() {
     Object c = Codec.STRING;
     return "" + (c == Codec.STRING) + (c instanceof Codec);
+  }
+  /** Broad DFU operations are deliberately counted until the execution phase is modelled. */
+  public static String countedOperations() {
+    int calls = 0;
+    try { Codec.INT.listOf(); } catch (Throwable ignored) {} finally { calls++; }
+    try { ((Codec) Codec.INT).dispatch(null, null); } catch (Throwable ignored) {} finally { calls++; }
+    try { ((Codec) Codec.INT).orElse((Codec) Codec.INT); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.validate(x -> null); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.EMPTY.codec(); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.encodeStart(null, 1); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.decode(null, null); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.parse(null, null); } catch (Throwable ignored) {} finally { calls++; }
+    return Integer.toString(calls);
+  }
+
+  /** A network StreamCodec is not a DFU Codec and must be refused before dispatch. */
+  public static String forgedDfuReceiver() {
+    Object forged = ByteBufCodecs.INT;
+    if (!(forged instanceof Codec)) return "true";
+    try {
+      ((Codec<Object>) forged).xmap(x -> x, x -> x);
+      return "false";
+    } catch (Throwable expected) {
+      return "true";
+    }
+  }
+  /** Deterministic structural text for the phase-1 nodes. */
+  public static String dfuText() {
+    return Codec.INT.fieldOf("x") + "|" + Codec.INT.optionalFieldOf("x") + "|"
+        + Codec.INT.optionalFieldOf("x", 7) + "|"
+        + Codec.INT.optionalFieldOf("x", 7, (Lifecycle) null) + "|"
+        + Codec.INT.xmap(x -> x + 1, x -> x - 1);
+  }
+  /** A real game StreamCodec constant is rejected by every DFU receiver family. */
+  public static String forgedDfuReceivers() {
+    Object stream = ByteBufCodecs.INT;
+    Object game = ByteBufCodecs.VAR_INT;
+    return "" + rejectedCodec(stream) + rejectedCodec(game) + rejectedOptional(stream) + rejectedOptional(game)
+        + rejectedXmap(stream) + rejectedXmap(game) + rejectedGetter(stream) + rejectedGetter(game);
+  }
+
+  static boolean rejectedCodec(Object value) {
+    if (!(value instanceof Codec)) return true;
+    try { ((Codec<Object>) value).fieldOf("x"); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedOptional(Object value) {
+    if (!(value instanceof Codec)) return true;
+    try { ((Codec<Object>) value).optionalFieldOf("x", 1); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedXmap(Object value) {
+    if (!(value instanceof Codec)) return true;
+    try { ((Codec<Object>) value).xmap(x -> x, x -> x); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedGetter(Object value) {
+    if (!(value instanceof com.mojang.serialization.MapCodec)) return true;
+    try { ((com.mojang.serialization.MapCodec<Object>) value).forGetter(x -> x); return false; } catch (Throwable expected) { return true; }
+  }
+
+  /** Builds xmap inside a callback, drops the callback/source references, forces GC, then uses the handle. */
+  public static String callbackXmapUse() {
+    final Codec<?>[] box = new Codec<?>[1];
+    java.util.function.Supplier<Codec<?>> maker = () -> {
+      Codec<?> value = Codec.INT.xmap(x -> x, x -> x);
+      box[0] = value;
+      return value;
+    };
+    Codec<?> kept = maker.get();
+    maker = null;
+    box[0] = null;
+    for (int i = 0; i < 300; i++) {
+      Object[] waste = new Object[1024];
+      waste[0] = i;
+    }
+    System.gc();
+    return kept.toString();
   }
 }
