@@ -11,7 +11,9 @@ on:
 jobs:
   gates:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The full test suite now takes 12-28 minutes on hosted runners; 30 cancelled #320's merge and #338
+    # twice mid-test. 45 leaves headroom without hiding a real hang.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
