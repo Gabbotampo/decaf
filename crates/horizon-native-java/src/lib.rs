@@ -24,6 +24,7 @@ mod bigdecimal_slice;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
+mod callback_marker;
 mod charset_decoder;
 mod checkcast;
 mod class_init;
@@ -65,6 +66,7 @@ mod files_copy;
 mod files_move;
 mod frame_bound;
 mod game_block_classes;
+mod game_codec_fields;
 mod game_codecs;
 mod game_hooks;
 mod game_object;
@@ -72,6 +74,7 @@ mod game_rules;
 mod gson_model;
 mod gson_tree;
 mod gson_type_token;
+mod gson_writer;
 mod guava_model;
 mod guava_text;
 mod hash_bulk;
@@ -118,6 +121,7 @@ mod host_ref;
 mod host_reflect;
 mod host_reflect_type;
 mod host_registry;
+mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
@@ -189,9 +193,18 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+/// A live callback token for tests that hand a host a listener without a jar
+/// (`callback_marker.rs`).
+#[doc(hidden)]
+pub use callback_marker::test_token as callback_test_token;
+mod sound_event;
 mod unmodifiable_sublist;
 pub use parked_threads::ParkedThread;
 mod priority_queue;
+mod random_source;
+#[cfg(test)]
+#[path = "random_source_tests.rs"]
+mod random_source_tests;
 mod reference_identity;
 mod references;
 mod reflect_constructors;
@@ -1548,7 +1561,7 @@ impl CallbackInfos {
     /// rest of the execution ([`Self::held`]).
     fn hold<'v>(&mut self, values: impl IntoIterator<Item = &'v Value>) {
         for value in values {
-            if let Some(text) = heap::value_text(value) {
+            for text in heap::value_texts(value) {
                 self.held.insert(text.to_owned());
             }
         }
@@ -2328,6 +2341,10 @@ pub trait Host {
     }
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
+    }
+
+    fn random_new(&mut self, _class: &str) -> Option<Value> {
+        None
     }
 
     /// Count `r` as an unknown host call and answer its neutral default:
@@ -3217,12 +3234,18 @@ pub struct StdHost {
     own_loader_classes: BTreeSet<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
+    /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
+    fabric_origins: BTreeMap<String, (String, String)>,
     environment_type: String,
     /// The game version a caller seeded for `ModList` and `DetectedVersion`.
     /// `None` keeps both questions unanswered instead of inventing a release.
     game_version: Option<String>,
     development_environment: bool,
     calls: Vec<MethodRef>,
+    /// A one-shot raw-bit conversion may consume only the immediately
+    /// preceding seeded RandomSource draw; it is cleared by every other call.
+    random_bit_scope: Option<MethodRef>,
     invocations: Vec<HostInvocation>,
     posted_events: Vec<Value>,
     /// Text the jar wrote to `System.out`, kept for callers that show it (the game's mod). The
@@ -3318,6 +3341,8 @@ pub struct StdHost {
     /// EMPTY_LIST` for `Collections.emptyList()`): its key, made on first use
     /// (`java_immutable.rs`).
     shared_empties: BTreeMap<&'static str, String>,
+    /// Explicitly seeded Minecraft RandomSource state, keyed by its host handle.
+    random_sources: BTreeMap<String, random_source::State>,
     /// The collections Java hands out as the same object on every call (a
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
@@ -3407,8 +3432,9 @@ pub struct StdHost {
     /// Log4j custom levels registered by `Level.forName`, keyed by normalized name.
     log4j_levels: crate::host_log4j_level::CustomLevels,
     /// Values the embedder holds between invocations (`StdHost::retain`),
-    /// with their hold counts: roots of the heap's collections.
-    retained: BTreeMap<String, usize>,
+    /// by their own text, with their hold counts and the texts of what a
+    /// callback's row holds: roots of the heap's collections.
+    retained: BTreeMap<String, (usize, Vec<String>)>,
     /// The jar objects collections freed (`heap::FreedObjects`).
     freed_objects: heap::FreedObjects,
     /// No collection runs (`Host::pause_collections`): a run that may be
@@ -3494,10 +3520,12 @@ impl StdHost {
             run_loader: class_precedence::RunLoader::default(),
             own_loader_classes: BTreeSet::new(),
             fabric_metadata: BTreeMap::new(),
+            fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
             development_environment: false,
             calls: Vec::new(),
+            random_bit_scope: None,
             invocations: Vec::new(),
             posted_events: Vec::new(),
             console_out: String::new(),
@@ -3532,6 +3560,7 @@ impl StdHost {
             mutable_collections: collection_store::CollectionStore::default(),
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
+            random_sources: BTreeMap::new(),
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
@@ -4060,6 +4089,18 @@ impl StdHost {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
             self.record_loaded_mod(&nested);
+            if let Some(nested_id) = nested.fabric_id.as_deref() {
+                let parent = jar
+                    .fabric_id
+                    .as_deref()
+                    .or(jar.neoforge_id.as_deref())
+                    .unwrap_or("jar");
+                let sublocation = entry.clone();
+                self.fabric_origins.insert(
+                    nested_id.to_owned(),
+                    ("nested".into(), format!("{parent}|{sublocation}")),
+                );
+            }
         }
         Ok(added)
     }
@@ -4083,6 +4124,9 @@ impl StdHost {
             }
         }
         if let Some(id) = jar.fabric_id.as_deref().or(jar.neoforge_id.as_deref()) {
+            self.fabric_origins
+                .entry(id.to_owned())
+                .or_insert_with(|| ("path".into(), id.to_owned()));
             let version = jar
                 .fabric_version
                 .as_deref()
@@ -4705,7 +4749,8 @@ impl StdHost {
                 || (invocation.method.owner == "net/fabricmc/fabric/api/event/Event"
                     && invocation.method.name == "register"))
                 && invocation.args.iter().any(|value| {
-                    matches!(value, Value::Ref(Some(marker)) if marker.starts_with("@indy:"))
+                    crate::callback_marker::callback_text(value)
+                        .is_some_and(callback_marker::is_callback)
                 })
         })
     }
@@ -5912,6 +5957,10 @@ impl Host for StdHost {
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
+        // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = mod_origin::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = Self::fabric_mods_static(r) {
             return Ok(value);
         }
@@ -5929,6 +5978,9 @@ impl Host for StdHost {
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
         if let Some(value) = attachment_codec::codec_static(r) {
+            return Ok(value);
+        }
+        if let Some(value) = game_codecs::static_field(r) {
             return Ok(value);
         }
         // `MixinEnvironment.Side` constants (`mixin_plugins.rs`).
@@ -5970,7 +6022,10 @@ impl Host for StdHost {
             return Ok(value);
         }
         // Gson's `FormattingStyle` constants (`gson_model.rs`).
-        if let Some(value) = gson_model::static_field(r).or_else(|| gson_tree::static_field(r)) {
+        if let Some(value) = gson_model::static_field(r)
+            .or_else(|| gson_tree::static_field(r))
+            .or_else(|| gson_writer::static_field(r))
+        {
             return Ok(value);
         }
         // `Blocks.<FIELD>` is already a game registry handle in the current
@@ -6150,13 +6205,29 @@ impl Host for StdHost {
         }
     }
 
+    fn random_new(&mut self, class: &str) -> Option<Value> {
+        StdHost::random_new(self, class)
+    }
+
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if !random_source::is_bit_conversion(r) {
+            self.random_bit_scope = None;
+        }
         self.record(r, None, args);
+        if let Some(result) = self.random_static(r, args) {
+            return result;
+        }
+        if let Some(result) = random_source::bit_conversion(self, r, args) {
+            return result;
+        }
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
         // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
         if let Some(value) = self.guava_text(r, None, args) {
+            return value;
+        }
+        if let Some(value) = sound_event::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = commons_lang::static_call(self, r, args) {
@@ -6204,6 +6275,48 @@ impl Host for StdHost {
         if let Some(value) = jdk_character::static_call(r, args) {
             return value;
         }
+        // Gson's numeric edge cases are compared by raw IEEE bits in the
+        // fixture. Keep the signed zero and NaN payload exactly as Java does.
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            ("java/lang/Double", "doubleToRawLongBits", "(D)J") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                // Value::Float cannot preserve every Java NaN payload.  The
+                // raw bits are therefore untrustworthy; keep this call
+                // counted instead of answering a fabricated payload.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Long(value.to_bits() as i64));
+            }
+            ("java/lang/Double", "doubleToLongBits", "(D)J") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                let bits = if value.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Long(bits as i64));
+            }
+            ("java/lang/Float", "floatToRawIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                // See the double raw-bit case above: a NaN payload is not a
+                // trustworthy value in the bounded interpreter.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Int(value.to_bits() as i32));
+            }
+            ("java/lang/Float", "floatToIntBits", "(F)I") => {
+                let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                let bits = if value.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                return Ok(Value::Int(bits as i32));
+            }
+            _ => {}
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -6240,6 +6353,9 @@ impl Host for StdHost {
         }
         if let Some(value) = self.networking_send(r, args) {
             return Ok(value);
+        }
+        if let Some(value) = host_registry_holder::static_call(self, r, args) {
+            return value;
         }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
@@ -7449,6 +7565,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = self.random_instance(r, receiver, args) {
+            return result;
+        }
         check_jdk_capacity(r, args)?;
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
@@ -7580,6 +7699,9 @@ impl Host for StdHost {
         if let Some(value) = java_identifier::invoke_instance(self, r, receiver, args) {
             return value;
         }
+        if let Some(value) = sound_event::instance_call(self, r, receiver, args) {
+            return value;
+        }
         if let Some(value) = self.reference_member(r, Some(receiver), args) {
             return value;
         }
@@ -7593,6 +7715,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = dfu_either::host_instance_call(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = host_registry_holder::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.holder_call(r, receiver) {
@@ -8009,10 +8134,8 @@ impl Host for StdHost {
             .or_else(|| host_iterator::marker(receiver))
             .or_else(|| host_service::stream_marker(receiver))
             .cloned();
-        if let Some(marker) = callback_text(receiver)
-            && let Some(value) = functional_composition_marker(r, &marker, args)
-        {
-            return Ok(value);
+        if let Some(value) = functional_composition_marker(r, receiver, args) {
+            return value;
         }
         // A `Field`/`Method` handle's own facts (`host_reflect.rs`); its
         // `toString` is the kind's row. A field the runtime did not read (a
@@ -8732,10 +8855,16 @@ impl Host for StdHost {
                     {
                         return Ok(values[index * 2 + 1].clone());
                     }
+                    // A callback the host cannot run: counted, never a value
+                    // made up for it (the runtime runs it first, `map_compute.rs`).
+                    if crate::callback_marker::callback_text(function).is_some() {
+                        return self.unknown_host_call(r);
+                    }
+                    let values = self
+                        .mutable_collections
+                        .entry(marker.to_owned())
+                        .or_default();
                     let computed = match function {
-                        Value::Ref(Some(callback)) if callback.starts_with("@indy:") => {
-                            Value::Ref(Some(format!("computed/{}", value_marker(&key))))
-                        }
                         Value::Ref(None) => Value::Ref(None),
                         other => Value::Ref(Some(format!(
                             "computed/{}/{}",
@@ -10428,15 +10557,22 @@ impl Host for StdHost {
                 "filter",
                 "(Ljava/util/function/Predicate;)Ljava/util/Optional;",
             ) => {
-                let Some(_value) = optional_present(receiver) else {
+                let Some(value) = optional_present(receiver) else {
                     return Ok(empty_optional());
                 };
-                let predicate = Self::argument(r, args, 0)?;
-                let accepted = matches!(
-                    predicate,
-                    Value::Ref(Some(marker)) if marker.starts_with("@indy:")
-                );
-                Ok(if accepted {
+                // `predicate.test(value)`: the host runs no callback, so the
+                // test is counted (above), never answered for the lambda.
+                let predicate = Self::argument(r, args, 0)?.clone();
+                let tested = self.invoke_instance(
+                    &MethodRef {
+                        owner: "java/util/function/Predicate".into(),
+                        name: "test".into(),
+                        descriptor: "(Ljava/lang/Object;)Z".into(),
+                    },
+                    &predicate,
+                    std::slice::from_ref(&value),
+                )?;
+                Ok(if matches!(tested, Value::Int(flag) if flag != 0) {
                     receiver.clone()
                 } else {
                     empty_optional()
@@ -10575,45 +10711,43 @@ impl Host for StdHost {
                     Err(thrown_from_supplied(supplied))
                 }
             }
-            (
-                "java/util/function/UnaryOperator",
-                "apply",
-                "(Ljava/lang/Object;)Ljava/lang/Object;",
-            )
-            | ("java/util/function/Function", "apply", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
-                Ok(Self::argument(r, args, 0)?.clone())
-            }
-            (
-                "java/util/function/BiFunction",
-                "apply",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-            ) => Ok(Self::argument(r, args, 1)?.clone()),
-            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V") => {
-                if let Some(marker) = receiver_marker.as_deref()
-                    && let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
-                    && let Some((left, right)) = rest.split_once('|')
-                {
-                    // One level of a composed consumer (#250): a chain as long as a jar
-                    // builds it ends in a `StackOverflowError`, as Java's lambda chain does.
-                    let _level = host_recursion::enter()?;
-                    self.invoke_instance(r, &composed_callback(left), args)?;
-                    self.invoke_instance(r, &composed_callback(right), args)?;
+            // A functional interface's method on a value the host holds: the
+            // host runs no jar code (the runtime runs callbacks before a call
+            // gets here), so it counts the call, never answers for the
+            // callback (#156 P15a: `apply` used to answer its argument,
+            // `test` true for any lambda, `get` null, uncounted).
+            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
+                if let Some(sides) =
+                    callback_marker::composite_operands(receiver, "consumer.then") =>
+            {
+                // One level of a composed consumer (#250): a chain as long as a jar
+                // builds it ends in a `StackOverflowError`, as Java's lambda chain does.
+                let _level = host_recursion::enter()?;
+                for side in &sides {
+                    self.invoke_instance(r, side, args)?;
                 }
                 Ok(Value::Void)
             }
             (
+                "java/util/function/UnaryOperator" | "java/util/function/Function",
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            | (
+                "java/util/function/BiFunction",
+                "apply",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            )
+            | ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
+            | (
                 "java/util/function/BiConsumer",
                 "accept",
                 "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            ) => Ok(Value::Void),
-            ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z") => {
-                let truth = match expect_ref(receiver) {
-                    Some(marker) => predicate_marker_value(marker)?,
-                    None => false,
-                };
-                Ok(Value::Int(i32::from(truth)))
+            )
+            | ("java/util/function/Predicate", "test", "(Ljava/lang/Object;)Z")
+            | ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => {
+                self.unknown_host_call(r)
             }
-            ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => Ok(Value::Ref(None)),
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
             // their registry wrappers by `registry.key().identifier()`.
@@ -10959,7 +11093,7 @@ impl Host for StdHost {
                 // Fabric Loader's own origin for a jar container is a `PATH`
                 // origin over the container's root (`mod_origin.rs`).
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
-                Ok(mod_origin::origin_value(&id))
+                Ok(self.fabric_origin(&id))
             }
             (
                 "net/fabricmc/loader/api/ModContainer",
@@ -11396,6 +11530,17 @@ impl Host for StdHost {
     }
 }
 
+fn modelled_writer_class(class: &str) -> bool {
+    matches!(
+        class,
+        "java/io/BufferedWriter"
+            | "java/io/FileWriter"
+            | "java/io/OutputStreamWriter"
+            | "java/io/PrintWriter"
+            | "java/io/StringWriter"
+    )
+}
+
 fn expect_int(r: &MethodRef, value: &Value) -> Result<i32, NativeError> {
     match value {
         Value::Int(value) => Ok(*value),
@@ -11783,6 +11928,11 @@ fn java_value_text(value: &Value, desc: &str) -> String {
         Value::Ref(Some(value)) if stream_pipeline::is_stream_marker(value) => {
             stream_pipeline::STREAM_TEXT.into()
         }
+        // Nor does a callback, or a composition holding one: its text names
+        // a live callback (`callback_marker.rs`).
+        Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
+            callback_marker::CALLBACK_TEXT.into()
+        }
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
@@ -12047,17 +12197,31 @@ fn enum_ordinal(value: &Value) -> i32 {
 /// hundred keys reached a gigabyte before the bound. Transcribing the head is
 /// enough to name the site, and the bound keeps the chain flat.
 fn bounded_captured_markers(values: &[Value]) -> String {
-    const MAX_MARKER_CHARS: usize = 4096;
+    bounded_markers(values, 4096)
+}
+
+/// [`bounded_captured_markers`] with a bound of `max_chars`.
+fn bounded_markers(values: &[Value], max_chars: usize) -> String {
     let mut text = String::new();
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             text.push(',');
         }
         let marker = value_marker(value);
-        let room = MAX_MARKER_CHARS.saturating_sub(text.chars().count());
+        let room = max_chars.saturating_sub(text.chars().count());
         if marker.chars().count() > room {
-            text.extend(marker.chars().take(room));
-            text.push('\u{2026}');
+            // The cut value is no value any more: an element no capture
+            // parser accepts follows it, so running the callback is counted
+            // rather than handing it the cut text (#261 review).
+            let mut cut: String = marker.chars().take(room).collect();
+            // A cut right after an escaping `\` would escape the sentinel's
+            // `,` and read back as one longer, wrong value (#261 round-3
+            // S1): drop that `\`.
+            if cut.chars().rev().take_while(|ch| *ch == '\\').count() % 2 == 1 {
+                cut.pop();
+            }
+            text.push_str(&cut);
+            text.push_str(",\u{2026}");
             break;
         }
         text.push_str(&marker);
@@ -12328,6 +12492,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         ],
         "net/minecraft/world/level/block/Mirror" => &["NONE", "LEFT_RIGHT", "FRONT_BACK"],
         // Mods iterate `PackType.values()` to register a pack for each side.
+        "net/minecraft/core/Holder$Kind" => &["REFERENCE", "DIRECT"],
         "net/minecraft/server/packs/PackType" => &["CLIENT_RESOURCES", "SERVER_DATA"],
         // SLF4J ships with the game; logging shims switch over its levels
         // (javac's `$SwitchMap` sizes its table from `values()`).
@@ -12572,6 +12737,10 @@ fn is_lazy_optional_owner(owner: &str) -> bool {
 /// object by its marker, as before.
 fn host_text(value: &Value) -> String {
     match value {
+        // A callback never prints its key (`callback_marker::CALLBACK_TEXT`).
+        Value::Host(handle) if handle.kind() == HostKind::Callback => {
+            callback_marker::CALLBACK_TEXT.to_owned()
+        }
         Value::Host(handle) => handle
             .to_string(&mut MarkerText)
             .ok()
@@ -12708,6 +12877,11 @@ impl StdHost {
             _ => return self.unknown_host_call(r),
         };
         let answer = match r.name.as_str() {
+            // A callback's text: counted, a text answered, never its key.
+            "toString" if handle.kind() == HostKind::Callback => {
+                self.unknown_host_call(r)?;
+                Some(Value::Ref(Some(callback_marker::CALLBACK_TEXT.into())))
+            }
             "toString" => handle
                 .to_string(&mut HostNested(Some(self)))?
                 .map(|text| Value::Ref(Some(text))),
@@ -12787,6 +12961,10 @@ fn value_text(value: &Value) -> String {
             // A stream never prints its marker (`stream_pipeline.rs`).
             if stream_pipeline::is_stream_marker(value) {
                 return stream_pipeline::STREAM_TEXT.into();
+            }
+            // Nor does a callback (`callback_marker.rs`).
+            if callback_marker::holds_callback(value) {
+                return callback_marker::CALLBACK_TEXT.into();
             }
             value.clone()
         }
@@ -12904,7 +13082,7 @@ fn boxed_character(value: &Value) -> Option<i32> {
 /// Read any of the host's boxed numeric markers as a Java `double`-like value.
 /// The native probe does not model primitive wide values separately, so all
 /// conversions pass through this helper before applying Java's narrowing cast.
-fn boxed_number(value: &Value) -> Option<f64> {
+pub(crate) fn boxed_number(value: &Value) -> Option<f64> {
     match value {
         Value::Int(value) => Some(f64::from(*value)),
         Value::Long(value) => Some(*value as f64),
@@ -13088,12 +13266,12 @@ fn format_integer_us(value: i64) -> String {
 }
 
 /// `Double.toString(value)`, exactly as Java 25 prints it (`jdk_float_text.rs`).
-fn format_java_float(value: f64) -> String {
+pub(crate) fn format_java_float(value: f64) -> String {
     jdk_float_text::double_to_string(value)
 }
 
 /// `Float.toString` of a `float` the interpreter holds widened to `double`.
-fn format_java_float32(value: f64) -> String {
+pub(crate) fn format_java_float32(value: f64) -> String {
     jdk_float_text::float_to_string(value)
 }
 
@@ -13402,10 +13580,7 @@ fn box_callback_result<H: Host>(
         // A primitive return unboxes a boxed result (`lambda_boxing.rs`).
         return Ok(lambda_boxing::unbox_result(call_descriptor, value));
     }
-    let Some(marker) = expect_ref(receiver) else {
-        return Ok(value);
-    };
-    let Ok(callback) = parse_callback_marker(marker) else {
+    let Some(callback) = callback_marker::lambda_of(receiver) else {
         return Ok(value);
     };
     let target_return = return_desc(&callback.target.descriptor).to_owned();
@@ -13708,6 +13883,12 @@ fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError>
                 if stream_pipeline::is_stream_marker(marker) {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
                     return stream_pipeline::STREAM_TEXT.into();
+                }
+                // A callback's text is the hidden class and an identity hash:
+                // counted, its key never printed (`callback_marker.rs`).
+                if callback_marker::holds_callback(marker) {
+                    let _ = host.unknown_host_call(&jar_text::object_to_string());
+                    return callback_marker::CALLBACK_TEXT.into();
                 }
                 if crate::jar_object::packaged_object_class(value).is_some() {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
@@ -15084,7 +15265,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
@@ -15117,7 +15300,9 @@ impl ClassFile {
         });
         let handle_index = implementation.unwrap_or(bootstrap.method_ref);
         let handle = match self.pool.get(handle_index as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             other => {
                 return Err(NativeError::InvalidConstant(
                     handle_index,
@@ -15126,6 +15311,75 @@ impl ClassFile {
             }
         };
         Ok(Some(self.method_ref(handle)?))
+    }
+
+    /// The reference kind of a lambda call site's implementation handle (its
+    /// bootstrap's second static argument; JVMS 5.4.3.5), `None` when the
+    /// bootstrap has none.
+    fn invoke_dynamic_reference_kind(&self, index: u16) -> Option<u8> {
+        let Some(Cp::InvokeDynamic { bootstrap, .. }) = self.pool.get(index as usize) else {
+            return None;
+        };
+        let argument = self
+            .bootstrap_methods
+            .get(*bootstrap as usize)?
+            .arguments
+            .get(1)?;
+        match self.pool.get(*argument as usize) {
+            Some(Cp::MethodHandle { reference_kind, .. }) => Some(*reference_kind),
+            _ => None,
+        }
+    }
+
+    /// The interfaces `LambdaMetafactory.altMetafactory` adds to a lambda's
+    /// class beyond its call site's own (an intersection cast,
+    /// `(Runnable & Serializable) () -> {}`): `Serializable` for
+    /// `FLAG_SERIALIZABLE`, then the `FLAG_MARKERS` classes, in the order the
+    /// static arguments list them. Empty for `metafactory` and any other
+    /// bootstrap.
+    fn lambda_marker_interfaces(&self, index: u16) -> Vec<String> {
+        const FLAG_SERIALIZABLE: i32 = 1;
+        const FLAG_MARKERS: i32 = 2;
+        let Some(Cp::InvokeDynamic { bootstrap, .. }) = self.pool.get(index as usize) else {
+            return Vec::new();
+        };
+        let Some(bootstrap) = self.bootstrap_methods.get(*bootstrap as usize) else {
+            return Vec::new();
+        };
+        let is_alt = match self.pool.get(bootstrap.method_ref as usize) {
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => self.method_ref(*reference_index).is_ok_and(|r| {
+                r.owner == "java/lang/invoke/LambdaMetafactory" && r.name == "altMetafactory"
+            }),
+            _ => false,
+        };
+        let int = |at: usize| match bootstrap
+            .arguments
+            .get(at)
+            .and_then(|index| self.pool.get(*index as usize))
+        {
+            Some(Cp::Integer(value)) => Some(*value),
+            _ => None,
+        };
+        let Some(flags) = int(3).filter(|_| is_alt) else {
+            return Vec::new();
+        };
+        let mut interfaces = Vec::new();
+        if flags & FLAG_SERIALIZABLE != 0 {
+            interfaces.push("java/io/Serializable".to_owned());
+        }
+        if flags & FLAG_MARKERS != 0 {
+            let count = int(4).unwrap_or(0).max(0) as usize;
+            for at in 5..5 + count {
+                if let Some(index) = bootstrap.arguments.get(at)
+                    && let Ok(name) = class_name(&self.pool, *index)
+                {
+                    interfaces.push(name);
+                }
+            }
+        }
+        interfaces
     }
 
     /// The recipe a `StringConcatFactory` call site joined its arguments with.
@@ -15143,7 +15397,9 @@ impl ClassFile {
             _ => return None,
         };
         let handle = match self.pool.get(bootstrap.method_ref as usize) {
-            Some(Cp::MethodHandle { reference_index }) => *reference_index,
+            Some(Cp::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
             _ => return None,
         };
         let target = self.method_ref(handle).ok()?;
@@ -15198,6 +15454,8 @@ enum Cp {
         nt: u16,
     },
     MethodHandle {
+        /// JVMS 4.4.8: 5 `invokeVirtual` ... 9 `invokeInterface`.
+        reference_kind: u8,
         reference_index: u16,
     },
     MethodType,
@@ -18571,7 +18829,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -18783,7 +19043,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -18951,7 +19213,9 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -20899,19 +21163,9 @@ impl NativeJar {
         dispatch: &EventDispatch,
         host: &mut H,
     ) -> Result<Value, NativeError> {
-        let marker = dispatch
-            .listener
-            .args
-            .iter()
-            .rev()
-            .find_map(|value| match value {
-                Value::Ref(Some(value)) if value.starts_with("@indy:") => Some(value.as_str()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                NativeError::Metadata("event listener has no invokedynamic marker".into())
-            })?;
-        let callback = parse_callback_marker(marker)?;
+        let callback = events::indy_argument(&dispatch.listener.args).ok_or_else(|| {
+            NativeError::Metadata("event listener has no invokedynamic marker".into())
+        })??;
         let class = self.classes.get(&callback.target.owner).ok_or_else(|| {
             NativeError::MissingMethod(format!(
                 "{}#{}{}",
@@ -20959,179 +21213,81 @@ impl NativeJar {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct CallbackMarker {
-    target: MethodRef,
-    captures: Vec<Value>,
-}
-
-fn parse_callback_marker(marker: &str) -> Result<CallbackMarker, NativeError> {
-    let mut parts = marker.splitn(5, ':');
-    if parts.next() != Some("@indy") {
-        return Err(NativeError::Metadata(
-            "invalid callback marker prefix".into(),
-        ));
-    }
-    let _source = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no source".into()))?;
-    let _index = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no call-site index".into()))?;
-    let target = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no target".into()))?;
-    let captures = parts
-        .next()
-        .ok_or_else(|| NativeError::Metadata("callback marker has no captures".into()))?;
-    let (owner, method_and_descriptor) = target
-        .split_once('#')
-        .ok_or_else(|| NativeError::Metadata("callback target has no owner separator".into()))?;
-    let descriptor_at = method_and_descriptor
-        .find('(')
-        .ok_or_else(|| NativeError::Metadata("callback target has no descriptor".into()))?;
-    let target = MethodRef {
-        owner: owner.to_owned(),
-        name: method_and_descriptor[..descriptor_at].to_owned(),
-        descriptor: method_and_descriptor[descriptor_at..].to_owned(),
-    };
-    let captures = if captures.is_empty() {
-        Vec::new()
-    } else {
-        split_capture_markers(captures)?
-            .into_iter()
-            .map(|capture| parse_value_marker(&capture))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    Ok(CallbackMarker { target, captures })
-}
-
-/// Evaluate the bounded truth surface of a predicate marker.  Java's default
-/// `Predicate` combinators are represented as markers, so they remain usable
-/// even though the interpreter does not materialize interface instances.
-///
-/// One level per combinator (#250): a chain as deep as a jar builds it ends in a
-/// `StackOverflowError`, as Java's default-method chain does.
-fn predicate_marker_value(marker: &str) -> Result<bool, NativeError> {
-    let _level = host_recursion::enter()?;
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.not:") {
-        return Ok(!predicate_marker_value(rest)?);
-    }
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.and:")
-        && let Some((left, right)) = rest.split_once('|')
-    {
-        return Ok(predicate_marker_value(left)? && predicate_marker_value(right)?);
-    }
-    if let Some(rest) = marker.strip_prefix("@fn:predicate.or:")
-        && let Some((left, right)) = rest.split_once('|')
-    {
-        return Ok(predicate_marker_value(left)? || predicate_marker_value(right)?);
-    }
-    Ok(marker.starts_with("@indy:"))
-}
-
-/// The marker a `Predicate`/`Consumer`/`Function` combinator answers.
+/// The callback a `Predicate`/`Consumer`/`Function` combinator answers
+/// (`p.and(q)`, `c.andThen(d)`, `p.negate()`), `None` for any other method.
 ///
 /// Java's default combinators close over both sides instead of producing an
-/// object. The interpreter represents that closure as an `@fn:` marker, and
-/// both the host surface and a jar callback's own combinator call read it the
+/// object. The interpreter holds that closure as a combinator callback over
+/// the receiver and the argument (`callback_marker::composite`), and both
+/// the host surface and a jar callback's own combinator call build it the
 /// same way: composing two callbacks must not execute the receiver as if it
-/// were the argument (which is what a callback marker otherwise means).
-/// A callback's text inside a composition marker: its marker, or a host
-/// handle's encoded form (a `Stream.Builder` is a `Consumer`), which
-/// [`composed_callback`] reads back.
-fn callback_text(value: &Value) -> Option<String> {
-    match value {
-        // A jar `String` spelled like a handle's encoding is no callback, and
-        // never becomes the handle (`composed_callback`).
-        Value::Ref(Some(marker)) if HostRef::decode(marker).is_some() => None,
-        Value::Ref(Some(marker)) => Some(marker.clone()),
-        Value::Host(handle) => Some(handle.encode()),
-        _ => None,
-    }
-}
-
-/// One side of a composition marker as the callback it was.
-fn composed_callback(text: &str) -> Value {
-    match HostRef::decode(text) {
-        Some(handle) => Value::Host(handle),
-        None => Value::Ref(Some(text.to_owned())),
-    }
-}
-
+/// were the argument (which is what calling a callback otherwise means).
 fn functional_composition_marker(
     r: &MethodRef,
-    receiver_marker: &str,
+    receiver: &Value,
     args: &[Value],
-) -> Option<Value> {
-    let other_text = args.first().and_then(callback_text);
-    let other = || other_text.as_deref();
-    match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+) -> Option<Result<Value, NativeError>> {
+    let op = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (
             "java/util/function/Predicate",
             "and",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:predicate.and:{receiver_marker}|{}",
-            other().unwrap_or("@fn:predicate.false")
-        )))),
+        ) => "predicate.and",
         (
             "java/util/function/Predicate",
             "or",
             "(Ljava/util/function/Predicate;)Ljava/util/function/Predicate;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:predicate.or:{receiver_marker}|{}",
-            other().unwrap_or("@fn:predicate.false")
-        )))),
-        ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => Some(
-            Value::Ref(Some(format!("@fn:predicate.not:{receiver_marker}"))),
-        ),
+        ) => "predicate.or",
+        ("java/util/function/Predicate", "negate", "()Ljava/util/function/Predicate;") => {
+            "predicate.not"
+        }
         (
             "java/util/function/Consumer",
             "andThen",
             "(Ljava/util/function/Consumer;)Ljava/util/function/Consumer;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:consumer.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:consumer.empty")
-        )))),
+        ) => "consumer.then",
         (
             "java/util/function/Function",
             "compose",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.compose:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
-        )))),
+        ) => "function.compose",
         (
             "java/util/function/Function",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/Function;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
-        )))),
+        ) => "function.then",
         // The two-argument forms compose the same way: running the composite
         // hands both arguments to each consumer, and a `BiFunction`'s result to
-        // the `Function` after it. Without these the combinator ran the
-        // receiver with the second callback as its only argument.
+        // the `Function` after it.
         (
             "java/util/function/BiConsumer",
             "andThen",
             "(Ljava/util/function/BiConsumer;)Ljava/util/function/BiConsumer;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:consumer.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:consumer.empty")
-        )))),
+        ) => "biconsumer.then",
         (
             "java/util/function/BiFunction",
             "andThen",
             "(Ljava/util/function/Function;)Ljava/util/function/BiFunction;",
-        ) => Some(Value::Ref(Some(format!(
-            "@fn:function.then:{receiver_marker}|{}",
-            other().unwrap_or("@fn:function.empty")
-        )))),
-        _ => None,
+        ) => "bifunction.then",
+        _ => return None,
+    };
+    let mut operands = vec![receiver];
+    if op != "predicate.not" {
+        // `Objects.requireNonNull(other)`: every combinator taking another
+        // callback refuses `null` before it builds anything (Java 25: a
+        // `NullPointerException` with no message).
+        match args.first() {
+            Some(Value::Ref(None)) | None => {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                }));
+            }
+            Some(other) => operands.push(other),
+        }
     }
+    Some(Ok(callback_marker::composite(op, &operands)))
 }
 
 fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
@@ -21159,6 +21315,8 @@ fn split_capture_markers(value: &str) -> Result<Vec<String>, NativeError> {
     Ok(captures)
 }
 
+/// A value marker read back from text: no callback comes out of it, nor out
+/// of a handle it yields, at any depth (`HostRef::decode`).
 fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
     if marker == "null" {
         return Ok(Value::Ref(None));
@@ -21237,10 +21395,13 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// JsonWriter states keyed by their jar object marker.
+    gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
     /// growth is `(old << 1) + 2`, so ensureCapacity can refuse the actual
     /// array length rather than only the requested minimum.
     string_builder_capacities: BTreeMap<String, usize>,
+
     /// Text each `java.io.StringReader` (and each modelled file or stream
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
@@ -22246,6 +22407,119 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Run a combinator's result (`callback_marker::composite`) the way its
+    /// JDK default method does: the sides in the combinator's order,
+    /// `and`/`or` short-circuiting, `negate` flipping, `identity()` answering
+    /// its argument (#258: predicates were never run here). `None` when
+    /// `callback` is no combinator result.
+    fn run_composite(
+        &mut self,
+        callback: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        use callback_marker::composite_operands as operands;
+        const PREDICATE: (&str, &str, &str) = (
+            "java/util/function/Predicate",
+            "test",
+            "(Ljava/lang/Object;)Z",
+        );
+        const FUNCTION: (&str, &str, &str) = (
+            "java/util/function/Function",
+            "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        const CONSUMER: (&str, &str, &str) = (
+            "java/util/function/Consumer",
+            "accept",
+            "(Ljava/lang/Object;)V",
+        );
+        const BICONSUMER: (&str, &str, &str) = (
+            "java/util/function/BiConsumer",
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        );
+        const BIFUNCTION: (&str, &str, &str) = (
+            "java/util/function/BiFunction",
+            "apply",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        // A comparator the runtime made (`jdk_stream.rs`): `compare(a, b)`.
+        if let Some((op, _)) = callback_marker::composite_of(callback)
+            && op.starts_with("cmp.")
+        {
+            let [a, b] = args else {
+                return Ok(None);
+            };
+            return Ok(Some(Value::Int(self.compare_with(callback, a, b)?)));
+        }
+        let first = |value: &[Value]| value.first().cloned().unwrap_or(Value::Ref(None));
+        for op in [
+            callback_marker::IDENTITY_FUNCTION,
+            callback_marker::IDENTITY_UNARY,
+        ] {
+            if operands(callback, op).is_some() {
+                return Ok(Some(first(args)));
+            }
+        }
+        for (op, sam) in [("consumer.then", CONSUMER), ("biconsumer.then", BICONSUMER)] {
+            if let Some(sides) = operands(callback, op) {
+                for side in &sides {
+                    self.run_composite_side(side, sam, args)?;
+                }
+                return Ok(Some(Value::Void));
+            }
+        }
+        for (op, sam) in [("function.then", FUNCTION), ("bifunction.then", BIFUNCTION)] {
+            if let Some([left, right]) = operands(callback, op).as_deref() {
+                let value = self.run_composite_side(left, sam, args)?;
+                return self.run_composite_side(right, FUNCTION, &[value]).map(Some);
+            }
+        }
+        if let Some([left, right]) = operands(callback, "function.compose").as_deref() {
+            // `f.compose(g)` applies `g` first, then `f`.
+            let value = self.run_composite_side(right, FUNCTION, args)?;
+            return self.run_composite_side(left, FUNCTION, &[value]).map(Some);
+        }
+        let truth = |value: &Value| matches!(value, Value::Int(flag) if *flag != 0);
+        for (op, short_circuit) in [("predicate.and", false), ("predicate.or", true)] {
+            if let Some([left, right]) = operands(callback, op).as_deref() {
+                let left = truth(&self.run_composite_side(left, PREDICATE, args)?);
+                let answer = if left == short_circuit {
+                    left
+                } else {
+                    truth(&self.run_composite_side(right, PREDICATE, args)?)
+                };
+                return Ok(Some(Value::Int(i32::from(answer))));
+            }
+        }
+        if let Some([inner]) = operands(callback, "predicate.not").as_deref() {
+            let inner = truth(&self.run_composite_side(inner, PREDICATE, args)?);
+            return Ok(Some(Value::Int(i32::from(!inner))));
+        }
+        Ok(None)
+    }
+
+    /// One side of a combinator result run as its interface's method
+    /// (`Predicate.test`...), the way the JDK's default method calls it: a
+    /// callback's body, a jar object's own method, or the host's call, which
+    /// counts what it cannot run. A side is never skipped or answered `null`
+    /// silently.
+    fn run_composite_side(
+        &mut self,
+        side: &Value,
+        (owner, name, descriptor): (&str, &str, &str),
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        self.call_virtual(
+            crate::jdk_call::Site::Interface,
+            owner,
+            name,
+            descriptor,
+            side,
+            args,
+        )
+    }
+
     fn invoke_callback(
         &mut self,
         marker: &Value,
@@ -22259,44 +22533,15 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.stream_callback(marker, args)? {
             return Ok(Some(value));
         }
-        let Some(marker) = expect_ref(marker) else {
-            return Ok(None);
-        };
-        // A composition marker closes over the two callbacks it joined. Running
-        // it means running both, in the order the combinator defines — not
-        // answering the marker itself.
-        // `Function.identity()` / `UnaryOperator.identity()` (`string_code_points.rs`).
-        if marker == string_code_points::FUNCTION_IDENTITY
-            || marker == string_code_points::UNARY_IDENTITY
-        {
-            return Ok(Some(args.first().cloned().unwrap_or(Value::Ref(None))));
+        // A combinator's result closes over the callbacks it joined. Running
+        // it means running them, in the order the combinator defines — not
+        // answering the callback itself.
+        if let Some(value) = self.run_composite(marker, args)? {
+            return Ok(Some(value));
         }
-        if let Some(rest) = marker.strip_prefix("@fn:consumer.then:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            // A side may be a host handle's encoded form (`callback_text`).
-            self.invoke_callback(&composed_callback(left), args)?;
-            self.invoke_callback(&composed_callback(right), args)?;
-            return Ok(Some(Value::Void));
-        }
-        if let Some(rest) = marker.strip_prefix("@fn:function.then:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            let value = self
-                .invoke_callback(&Value::Ref(Some(left.to_owned())), args)?
-                .unwrap_or(Value::Ref(None));
-            return self.invoke_callback(&Value::Ref(Some(right.to_owned())), &[value]);
-        }
-        if let Some(rest) = marker.strip_prefix("@fn:function.compose:")
-            && let Some((left, right)) = rest.split_once('|')
-        {
-            // `f.compose(g)` applies `g` first, then `f`.
-            let value = self
-                .invoke_callback(&Value::Ref(Some(right.to_owned())), args)?
-                .unwrap_or(Value::Ref(None));
-            return self.invoke_callback(&Value::Ref(Some(left.to_owned())), &[value]);
-        }
-        let Ok(callback) = parse_callback_marker(marker) else {
+        // Only a callback handle is a callback: a `String` spelled like one
+        // is the `String` it is.
+        let Some(callback) = callback_marker::lambda_of(marker) else {
             return Ok(None);
         };
         // The callback target may live in a linked library jar, so resolve it
@@ -22316,17 +22561,22 @@ impl<H: Host> Runtime<'_, H> {
             // is the interpreter's, and the host's identity `Function.apply`
             // would otherwise hand the receiver back unchanged.
             //
-            // The marker does not record the handle kind, so the arity tells
-            // the shapes apart: the callback's values are the captures followed
-            // by the call's own arguments, exactly the JVM's argument order. One
-            // more value than the target declares is a receiver
-            // (`Enum.class::isAssignableFrom` bound, `String::length`
-            // unbound); exactly as many is a static reference
-            // (`Integer::parseInt`).
+            // The callback's values are the captures followed by the call's own
+            // arguments, exactly the JVM's argument order. The implementation
+            // handle's kind says whether the first is a receiver (#156 P15b):
+            // `invokestatic` (6) takes none (`Integer::parseInt`); a virtual,
+            // special or interface handle takes one (`String::length`
+            // unbound, `Enum.class::isAssignableFrom` bound). A handle read
+            // back from text has no kind, and the arity tells them apart: one
+            // more value than the target declares is a receiver.
             let mut values = callback.captures.clone();
             values.extend_from_slice(args);
             let expected = arg_count(&callback.target.descriptor);
-            if values.len() == expected && callback.target.name != "<init>" {
+            let is_static = match callback.ref_kind {
+                Some(kind) => kind == 6,
+                None => values.len() == expected && callback.target.name != "<init>",
+            };
+            if is_static {
                 method_ref_null_check(&callback.target.descriptor, None, &values)?;
                 jdk_model::unbox_for_descriptor(&callback.target.descriptor, &mut values);
                 // A jar object argument no model can read is counted
@@ -22372,7 +22622,13 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(Some(Value::Ref(Some(text))));
                 }
                 let object = self.new_object(&callback.target.owner);
-                if string_constructors::count(self, &callback.target)?.is_none() {
+                // `StringBuilder::new`: the interpreter's own builder, as `new`
+                // and `<init>` make it (`jdk_string_builder.rs`).
+                if self
+                    .invoke_string_builder(&callback.target, Some(&object), &values)?
+                    .is_none()
+                    && string_constructors::count(self, &callback.target)?.is_none()
+                {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
                 }
@@ -22742,7 +22998,11 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
-        jar_object::handle(key)
+        if modelled_writer_class(class) {
+            jar_object::writer_handle(key)
+        } else {
+            jar_object::handle(key)
+        }
     }
 
     /// A fresh allocation key `class#n`, for a model whose object is a handle
@@ -24527,6 +24787,9 @@ impl<H: Host> Runtime<'_, H> {
     /// holds one `enum/<class>/<name>` marker per constant, so `length`,
     /// `clone`, element reads and ordinal lookups all work.
     fn invoke_game_enum_values(&mut self, r: &MethodRef) -> Option<Value> {
+        if let Some(values) = mod_origin::enum_values(r) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         if r.name != "values" {
             return None;
         }
@@ -25762,6 +26025,349 @@ impl<H: Host> Runtime<'_, H> {
         ))
     }
 
+    fn gson_writer_target_marker(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::Writer
+            || !modelled_writer_class(crate::jar_object::packaged_object_class(value)?)
+        {
+            return None;
+        }
+        let marker = handle.key_text();
+        self.io_sink_key(marker).map(|_| marker.to_owned())
+    }
+
+    fn gson_appendable_target_marker(&self, value: &Value) -> Option<String> {
+        if let Some(marker) = self.gson_writer_target_marker(value) {
+            return Some(marker);
+        }
+        let Value::Host(handle) = value else {
+            return host_service::stream_marker(value).cloned();
+        };
+        let marker = handle.key_text();
+        if handle.kind() == HostKind::JarObject
+            && matches!(
+                crate::jar_object::packaged_object_class(value),
+                Some("java/lang/StringBuilder" | "java/lang/StringBuffer")
+            )
+            && self.string_builders.contains_key(marker)
+        {
+            return Some(marker.to_owned());
+        }
+        None
+    }
+
+    fn gson_json_writer_marker(value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        (handle.kind() == HostKind::JarObject
+            && crate::jar_object::packaged_object_class(value)
+                == Some("com/google/gson/stream/JsonWriter"))
+        .then(|| handle.key_text().to_owned())
+    }
+
+    fn gson_writer_fallback(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        self.host
+            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+            .map(Some)
+    }
+
+    /// Model Gson 2.14's JsonWriter over the same writer sinks as Gson's
+    /// Appendable overload. Unsupported writer objects remain counted.
+    fn invoke_gson_writer(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(receiver) = receiver else {
+            return self.gson_writer_fallback(r, receiver, args);
+        };
+        let Some(marker) = Self::gson_json_writer_marker(receiver) else {
+            return self.gson_writer_fallback(r, Some(receiver), args);
+        };
+        if r.name == "<init>" {
+            if r.descriptor != "(Ljava/io/Writer;)V" {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            }
+            let Some(argument) = args.first() else {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            };
+            if *argument == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("out == null".into()),
+                    frame: None,
+                });
+            }
+            let Some(target) = self.gson_writer_target_marker(argument) else {
+                return self.gson_writer_fallback(r, Some(receiver), args);
+            };
+            self.gson_writers
+                .insert(marker, gson_writer::State::new(target.to_owned()));
+            return Ok(Some(Value::Void));
+        }
+        if !self.gson_writers.contains_key(&marker) {
+            return self.gson_writer_fallback(r, Some(receiver), args);
+        }
+        let writer_value = || crate::jar_object::stored_value(&marker);
+        match (r.name.as_str(), r.descriptor.as_str()) {
+            ("beginObject", "()Lcom/google/gson/stream/JsonWriter;")
+            | ("beginArray", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    if r.name == "beginObject" {
+                        state.begin_object()?
+                    } else {
+                        state.begin_array()?
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("endObject", "()Lcom/google/gson/stream/JsonWriter;")
+            | ("endArray", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    if r.name == "endObject" {
+                        state.end_object()?
+                    } else {
+                        state.end_array()?
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("name", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let Some(name) = args.first().and_then(expect_ref) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("name == null".into()),
+                        frame: None,
+                    });
+                };
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .name(name)?;
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(expect_ref).cloned();
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .string_value(value.as_deref())?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Z)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = matches!(args.first(), Some(Value::Int(flag)) if *flag != 0);
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .bool_value(value)?;
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("value", "(Ljava/lang/Boolean;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(boxed_boolean);
+                let fragment = {
+                    let state = self.gson_writers.get_mut(&marker).expect("writer exists");
+                    match value {
+                        Some(value) => state.bool_value(value)?,
+                        None => state.null_value()?,
+                    }
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("value", "(F)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(D)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(J)Lcom/google/gson/stream/JsonWriter;")
+            | ("value", "(Ljava/lang/Number;)Lcom/google/gson/stream/JsonWriter;") => {
+                let Some(value) = args.first() else {
+                    return self.gson_writer_fallback(r, Some(receiver), args);
+                };
+                let value = if r.descriptor.starts_with("(F") {
+                    match boxed_float(value) {
+                        Some(number) => Value::Boxed(Boxed::Float((number as f32).to_bits())),
+                        None => return self.gson_writer_fallback(r, Some(receiver), args),
+                    }
+                } else {
+                    value.clone()
+                };
+                let Some(fragment) = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .number_value(&value)?
+                else {
+                    return self.gson_writer_fallback(r, Some(receiver), args);
+                };
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_write_target(&target, &fragment)?;
+                Ok(Some(writer_value()))
+            }
+            ("nullValue", "()Lcom/google/gson/stream/JsonWriter;") => {
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .null_value()?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("jsonValue", "(Ljava/lang/String;)Lcom/google/gson/stream/JsonWriter;") => {
+                let value = args.first().and_then(expect_ref);
+                let fragment = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .json_value(value.map(String::as_str))?;
+                let target = self.gson_writers[&marker].target.clone();
+                if !fragment.is_empty() {
+                    self.gson_write_target(&target, &fragment)?;
+                }
+                Ok(Some(writer_value()))
+            }
+            ("setIndent", "(Ljava/lang/String;)V") => {
+                let Some(indent) = args.first().and_then(expect_ref) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"String.isEmpty()\" because \"indent\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                };
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_indent(indent)?;
+                Ok(Some(Value::Void))
+            }
+            ("setFormattingStyle", "(Lcom/google/gson/FormattingStyle;)V") => {
+                let Some(style) = args.first() else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("formattingStyle == null".into()),
+                        frame: None,
+                    });
+                };
+                if *style == Value::Ref(None) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_formatting_style(style)?;
+                Ok(Some(Value::Void))
+            }
+            ("setLenient", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_lenient(matches!(args.first(), Some(Value::Int(flag)) if *flag != 0));
+                Ok(Some(Value::Void))
+            }
+            ("setStrictness", "(Lcom/google/gson/Strictness;)V") => {
+                let Some(value) = args.first() else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("strictness == null".into()),
+                        frame: None,
+                    });
+                };
+                if *value == Value::Ref(None) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_strictness(value)?;
+                Ok(Some(Value::Void))
+            }
+            ("getStrictness", "()Lcom/google/gson/Strictness;") => {
+                Ok(Some(self.gson_writers[&marker].strictness_value()))
+            }
+            ("isLenient", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].is_lenient(),
+            )))),
+            ("setSerializeNulls", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_serialize_nulls(
+                        matches!(args.first(), Some(Value::Int(flag)) if *flag != 0),
+                    );
+                Ok(Some(Value::Void))
+            }
+            ("getSerializeNulls", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].serialize_nulls(),
+            )))),
+            ("setHtmlSafe", "(Z)V") => {
+                self.gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .set_html_safe(matches!(args.first(), Some(Value::Int(flag)) if *flag != 0));
+                Ok(Some(Value::Void))
+            }
+            ("isHtmlSafe", "()Z") => Ok(Some(Value::Int(i32::from(
+                self.gson_writers[&marker].is_html_safe(),
+            )))),
+            ("getFormattingStyle", "()Lcom/google/gson/FormattingStyle;") => {
+                Ok(Some(self.gson_writers[&marker].formatting_value()))
+            }
+            ("flush", "()V") => {
+                let target = self.gson_writers[&marker].target.clone();
+                self.gson_writers[&marker].flush()?;
+                self.io_commit(&target);
+                Ok(Some(Value::Void))
+            }
+            ("close", "()V") => {
+                let target = self.gson_writers[&marker].target.clone();
+                let result = self
+                    .gson_writers
+                    .get_mut(&marker)
+                    .expect("writer exists")
+                    .close_document();
+                self.io_commit(&target);
+                result.map(|()| Some(Value::Void))
+            }
+            _ => self.gson_writer_fallback(r, Some(receiver), args),
+        }
+    }
+
     /// Answer the bounded `com.google.gson` surface config code reaches.
     ///
     /// The adapter models the two calls that make a config bootstrap work:
@@ -25796,9 +26402,8 @@ impl<H: Host> Runtime<'_, H> {
                 _ => Ok(None),
             };
         }
-        // JsonWriter state/options are not modeled; count every call.
         if r.owner == "com/google/gson/stream/JsonWriter" {
-            return self.host.unknown_operand_call(r).map(Some);
+            return self.invoke_gson_writer(r, receiver, args);
         }
         match r.owner.as_str() {
             "com/google/gson/GsonBuilder" | "com/google/gson/FormattingStyle" => {
@@ -25851,9 +26456,23 @@ impl<H: Host> Runtime<'_, H> {
                         Ok(Some(self.new_object("com/google/gson/TypeAdapter")))
                     }
                     ("newJsonWriter", "(Ljava/io/Writer;)Lcom/google/gson/stream/JsonWriter;") => {
-                        self.host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some)
+                        let Some(target) = args
+                            .first()
+                            .and_then(|value| self.gson_writer_target_marker(value))
+                        else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let writer = self.new_object("com/google/gson/stream/JsonWriter");
+                        if let Some(marker) = expect_ref(&writer) {
+                            let mut state = gson_writer::State::new(target.to_owned());
+                            let gson_style = self.gson_style_of(receiver).tree_style();
+                            state.apply_tree_style(&gson_style);
+                            self.gson_writers.insert(marker.to_owned(), state);
+                        }
+                        Ok(Some(writer))
                     }
                     // Gson declares one `toJson` overload per element type
                     // (`JsonElement`, `Object`, and the `Type` variants). They
@@ -25884,9 +26503,52 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("JsonWriter") =>
                     {
-                        self.host
-                            .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
-                            .map(Some)
+                        let Some(writer) = args.last().and_then(Self::gson_json_writer_marker)
+                        else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let Some(state) = self.gson_writers.get(&writer).cloned() else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let Some(value) = args.first() else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let mut style = state.tree_style();
+                        let gson_style = self.gson_style_of(receiver);
+                        let gson_tree_style = gson_style.tree_style();
+                        style.html_safe = gson_tree_style.html_safe;
+                        style.serialize_nulls = gson_tree_style.serialize_nulls;
+                        let tree = self.gson_tree_json(value, &style, state.base_depth())?;
+                        let Some(tree) = tree else {
+                            return self
+                                .host
+                                .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
+                                .map(Some);
+                        };
+                        let target = state.target;
+                        let fragment = {
+                            let writer = self.gson_writers.get_mut(&writer).expect("writer exists");
+                            match tree {
+                                Some(text) => writer.raw_tree(text)?,
+                                None => {
+                                    writer.skip_null_member();
+                                    String::new()
+                                }
+                            }
+                        };
+                        if !fragment.is_empty() {
+                            self.gson_write_target(&target, &fragment)?;
+                        }
+                        Ok(Some(Value::Void))
                     }
                     (name, descriptor)
                         if name == "toJson"
@@ -25910,27 +26572,20 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
-                        let target = args
+                        let Some(target) = args
                             .last()
-                            .and_then(|arg| {
-                                expect_ref(arg).or_else(|| host_service::stream_marker(arg))
-                            })
-                            .ok_or_else(|| {
-                                NativeError::Metadata(
-                                    "Gson.toJson needs an Appendable receiver".into(),
-                                )
-                            })?;
-                        if self.io_sink_key(target).is_some() {
-                            self.io_write(target, &text)?;
-                            return Ok(Some(Value::Void));
-                        }
-                        if !self.string_builders.contains_key(target) {
+                            .and_then(|arg| self.gson_appendable_target_marker(arg))
+                        else {
                             return self
                                 .host
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
+                        };
+                        if self.io_sink_key(&target).is_some() {
+                            self.io_write(&target, &text)?;
+                        } else {
+                            self.gson_write_target(&target, &text)?;
                         }
-                        self.gson_write_target(target, &text)?;
                         Ok(Some(Value::Void))
                     }
                     ("fromJson", "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;") => {
@@ -27614,7 +28269,11 @@ impl<H: Host> Runtime<'_, H> {
                             // and in this frame, so its failure is catchable
                             // at this instruction.
                             invoke_or_catch!(at, self.ensure_initialized(&created));
-                            stack.push(self.new_object(&created));
+                            let object = self
+                                .host
+                                .random_new(&created)
+                                .unwrap_or_else(|| self.new_object(&created));
+                            stack.push(object);
                         }
                         // A cancelled NEW leaves the reference descriptor's
                         // default (null) and makes the matching `<init>` skip.
@@ -27796,6 +28455,17 @@ impl<H: Host> Runtime<'_, H> {
                     let index = read_u16(code, &mut pc)?;
                     let wanted = class_name(&file.pool, index)?;
                     let value = pop(&mut stack, class, method, at)?;
+                    // A callback is an instance of its interfaces and their
+                    // supertypes only (`callback_marker.rs`); one the run
+                    // cannot decide is counted, never answered from the
+                    // generic paths below.
+                    if let Value::Host(handle) = &value
+                        && handle.kind() == HostKind::Callback
+                    {
+                        let answer = invoke_or_catch!(at, self.handle_instance_of(handle, &wanted));
+                        stack.push(Value::Int(i32::from(answer)));
+                        continue;
+                    }
                     // The `java.lang.reflect.Type` nodes the generic
                     // reflection surface builds answer their own runtime type,
                     // and a class marker answers `Class`. Every other marker
@@ -27873,30 +28543,39 @@ impl<H: Host> Runtime<'_, H> {
                         self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
                     let value = match outcome {
                         AnchorOutcome::Normal => {
-                            match self.static_fields.get(&Self::static_field_key(&field)) {
-                                Some(value) => value.clone(),
-                                // A field a jar class declares and nothing
-                                // assigned yet holds the JVM default; only a
-                                // static of a class the jar does not declare
-                                // is the host's to answer (a strict host would
-                                // refuse the read otherwise).
-                                // A `ConstantValue` static is its constant
-                                // (never stored, `class_init.rs`).
-                                None if self.class(&field.owner).is_some_and(|file| {
-                                    file.fields.iter().any(|declared| {
-                                        declared.name == field.name
-                                            && declared.descriptor == field.descriptor
-                                    })
-                                }) =>
-                                {
-                                    self.static_constant(
-                                        &field.owner,
-                                        &field.name,
-                                        &field.descriptor,
-                                    )?
-                                    .unwrap_or_else(|| Value::default_for(&field.descriptor))
+                            if let Some(value) = gson_model::static_field(&field)
+                                .or_else(|| gson_tree::static_field(&field))
+                                .or_else(|| gson_writer::static_field(&field))
+                            {
+                                value
+                            } else {
+                                match self.static_fields.get(&Self::static_field_key(&field)) {
+                                    Some(value) => value.clone(),
+                                    // A field a jar class declares and nothing
+                                    // assigned yet holds the JVM default; only a
+                                    // static of a class the jar does not declare
+                                    // is the host's to answer (a strict host would
+                                    // refuse the read otherwise).
+                                    // A `ConstantValue` static is its constant
+                                    // (never stored, `class_init.rs`).
+                                    None if self.class(&field.owner).is_some_and(|file| {
+                                        file.fields.iter().any(|declared| {
+                                            declared.name == field.name
+                                                && declared.descriptor == field.descriptor
+                                        })
+                                    }) && gson_model::static_field(&field).is_none()
+                                        && gson_tree::static_field(&field).is_none()
+                                        && gson_writer::static_field(&field).is_none() =>
+                                    {
+                                        self.static_constant(
+                                            &field.owner,
+                                            &field.name,
+                                            &field.descriptor,
+                                        )?
+                                        .unwrap_or_else(|| Value::default_for(&field.descriptor))
+                                    }
+                                    None => self.host.get_static(&field)?,
                                 }
-                                None => self.host.get_static(&field)?,
                             }
                         }
                         AnchorOutcome::Suppress => Value::default_for(&field.descriptor),
@@ -28622,12 +29301,10 @@ impl<H: Host> Runtime<'_, H> {
                                     // callback as its argument and answer the
                                     // callback's void, which loses the value the
                                     // combinator returns.
-                                    if let Some(value) = functional_composition_marker(
-                                        &resolved,
-                                        callback_text(receiver).as_deref().unwrap_or(""),
-                                        &args,
-                                    ) {
-                                        value
+                                    if let Some(value) =
+                                        functional_composition_marker(&resolved, receiver, &args)
+                                    {
+                                        invoke_or_catch!(at, value)
                                     } else if let Some(value) =
                                         invoke_or_catch!(at, self.invoke_callback(receiver, &args))
                                     {
@@ -28897,16 +29574,33 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         continue;
                     }
-                    let target = file.invoke_dynamic_target(index)?.map(|target| {
-                        format!("{}#{}{}", target.owner, target.name, target.descriptor)
-                    });
-                    let marker = format!(
-                        "@indy:{class}#{method}:{index}:{}:{}",
-                        target.as_deref().unwrap_or("?"),
-                        bounded_captured_markers(&captured)
+                    let target = file.invoke_dynamic_target(index)?;
+                    // The call site's own type is the functional interface the
+                    // lambda's class implements, with `altMetafactory`'s
+                    // markers after it (`callback_marker.rs`).
+                    let mut interfaces = return_desc(&descriptor)
+                        .strip_prefix('L')
+                        .and_then(|class| class.strip_suffix(';'))
+                        .unwrap_or("")
+                        .to_owned();
+                    for marker in file.lambda_marker_interfaces(index) {
+                        interfaces.push(',');
+                        interfaces.push_str(&marker);
+                    }
+                    // HotSpot links each `invokedynamic` instruction once: the
+                    // site is the instruction (`at`), not its constant, which
+                    // javac shares across a `finally` body's copies.
+                    let callback = callback_marker::lambda(
+                        &format!("{class}#{method}"),
+                        at,
+                        &interfaces,
+                        target,
+                        file.invoke_dynamic_reference_kind(index),
+                        captured,
+                        false,
                     );
                     if return_desc(&descriptor) != "V" {
-                        stack.push(Value::Ref(Some(marker)));
+                        stack.push(callback);
                     }
                 }
                 0xbf => {
@@ -30599,8 +31293,9 @@ fn read_pool(r: &mut Reader<'_>) -> Result<Vec<Cp>, NativeError> {
                 Cp::Double(f64::from_bits((high << 32) | low))
             }
             15 => {
-                let _ = r.u1()?;
+                let reference_kind = r.u1()?;
                 Cp::MethodHandle {
+                    reference_kind,
                     reference_index: r.u2()?,
                 }
             }
@@ -32524,19 +33219,17 @@ pub fn dispatch_payload_frame_with(
     // A type can have a row per direction, and only the receiving side's row
     // has a handler (the payload type registry records the others).
     let Some(registration) = registrations.iter().find(|registration| {
-        matches!(registration.handler, Value::Ref(Some(_)))
+        callback_marker::callback_text(&registration.handler).is_some()
             // The `CustomPacketPayload.Type` object the jar built.
             && jar_object::object_key(&registration.payload_type)
                 .is_some_and(|marker| host.packet_types.get(marker).is_some_and(|known| known == id))
     }) else {
         return Ok(false);
     };
-    let Value::Ref(Some(marker)) = &registration.handler else {
+    let Some(callback) = callback_marker::lambda_of(&registration.handler) else {
         return Ok(false);
     };
-    let Some((target, captures)) = parse_dynamic_handler(marker) else {
-        return Ok(false);
-    };
+    let (target, captures) = (callback.target, callback.captures);
     let class = jar.classes.get(&target.owner).ok_or_else(|| {
         NativeError::MissingMethod(format!(
             "{}#{}{}",
@@ -32565,55 +33258,6 @@ pub fn dispatch_payload_frame_with(
     // entrypoint built (a handler map, a config) and what earlier frames left.
     jar.invoke_persistent(&target, receiver, &args, host, &ExecutionBudget::UNBOUNDED)?;
     Ok(true)
-}
-
-/// Parse an `@indy:` handler marker into its implementation method and bound
-/// captures. Runtime arguments (the payload and context) are not included.
-fn parse_dynamic_handler(marker: &str) -> Option<(MethodRef, Vec<Value>)> {
-    // `@indy:<class>#<method>:<index>:<target>:<captures>`. The first three
-    // hold no `:` (a descriptor has none); the captures may (a handle's
-    // `h<tag>:<key>`, the entrypoint object `this::handle` captures).
-    let rest = marker.strip_prefix("@indy:")?;
-    let mut parts = rest.splitn(4, ':');
-    let (_class_method, _index, target, captures) =
-        (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    let (owner, name_desc) = target.split_once('#')?;
-    let (name, descriptor) = name_desc.split_once('(')?;
-    let target = MethodRef {
-        owner: owner.to_owned(),
-        name: name.to_owned(),
-        descriptor: format!("({descriptor}"),
-    };
-    let mut values = Vec::new();
-    for capture in split_dynamic_captures(captures) {
-        values.push(parse_value_marker(&capture).ok()?);
-    }
-    Some((target, values))
-}
-
-/// Split a marker's captures on unescaped commas.
-fn split_dynamic_captures(captures: &str) -> Vec<String> {
-    if captures.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut escaped = false;
-    for ch in captures.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            current.push(ch);
-            escaped = true;
-        } else if ch == ',' {
-            out.push(std::mem::take(&mut current));
-        } else {
-            current.push(ch);
-        }
-    }
-    out.push(current);
-    out
 }
 
 #[cfg(test)]
@@ -33435,7 +34079,9 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -33504,7 +34150,9 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -33704,21 +34352,28 @@ mod tests {
         let captured = bounded_captured_markers(&[Value::Ref(Some("x".repeat(1 << 20)))]);
         assert_eq!(
             captured.chars().count(),
-            4097,
-            "4096 transcribed + ellipsis"
+            4098,
+            "4096 transcribed + an unparsable `…` element"
         );
-        assert!(captured.ends_with('\u{2026}'), "{captured}");
+        assert!(captured.ends_with(",\u{2026}"), "{captured}");
+        assert!(
+            crate::split_capture_markers(&captured).is_ok_and(|markers| {
+                markers
+                    .iter()
+                    .any(|marker| crate::parse_value_marker(marker).is_err())
+            })
+        );
 
-        // A concat site captures the previous concat's marker text, so a real
-        // chain nests. Each link adds one bounded prefix instead of doubling:
-        // transcription used to grow without limit here.
+        // A concat site captures the previous concat's callback, so a real
+        // chain nests. Each link's key adds one bounded prefix instead of
+        // doubling: transcription used to grow without limit here.
         let mut value = Value::Ref(Some("x".repeat(64)));
         for _ in 0..64 {
-            let captured = bounded_captured_markers(std::slice::from_ref(&value));
-            value = Value::Ref(Some(format!("@indy:demo/C#m:0:?:{captured}")));
+            value =
+                crate::callback_marker::lambda("demo/C#m", 0, "", None, None, vec![value], false);
         }
-        let Value::Ref(Some(marker)) = &value else {
-            panic!("expected a marker");
+        let Some(marker) = crate::callback_marker::callback_text(&value) else {
+            panic!("expected a callback");
         };
         assert!(
             marker.chars().count() < 64 * (4096 + 128),
@@ -37568,10 +38223,12 @@ mandatory = true
             .invoke_instance(
                 &map,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:identity".into()))],
+                &[crate::callback_marker::test_token("identity")],
             )
             .unwrap();
-        assert_eq!(mapped, optional_wrap(Value::Ref(Some("demo".into()))));
+        // The host runs no callback: `apply` is counted (#156 P15a), never the
+        // identity.
+        assert_eq!(mapped, optional_wrap(Value::Ref(None)));
         // Mapping an empty optional answers the empty optional, whether the
         // receiver is the empty marker or a host `null` read as empty.
         assert_eq!(
@@ -37607,10 +38264,11 @@ mandatory = true
             host.invoke_instance(
                 &filter,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:predicate".into()))],
+                &[crate::callback_marker::test_token("predicate")],
             )
             .unwrap(),
-            optional_wrap(Value::Ref(Some("demo".into())))
+            // The host runs no predicate: `test` is counted (#156 P15a).
+            empty_optional()
         );
         assert_eq!(
             host.invoke_instance(
@@ -37630,7 +38288,7 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:unused-supplier".into()))],
+                &[crate::callback_marker::test_token("unused-supplier")],
             )
             .unwrap(),
             optional_wrap(Value::Ref(Some("demo".into())))
@@ -37639,7 +38297,7 @@ mandatory = true
             host.invoke_instance(
                 &or,
                 &Value::Ref(None),
-                &[Value::Ref(Some("@indy:empty-supplier".into()))],
+                &[crate::callback_marker::test_token("empty-supplier")],
             )
             .unwrap(),
             empty_optional()
@@ -37653,7 +38311,7 @@ mandatory = true
             host.invoke_instance(
                 &if_present,
                 &optional_wrap(Value::Ref(Some("demo".into()))),
-                &[Value::Ref(Some("@indy:consumer".into()))],
+                &[crate::callback_marker::test_token("consumer")],
             )
             .unwrap(),
             Value::Void
@@ -37693,7 +38351,7 @@ mandatory = true
             .invoke_instance(
                 &or_else_throw_supplier,
                 &Value::Ref(None),
-                &[Value::Ref(Some("@indy:optional-error".into()))],
+                &[crate::callback_marker::test_token("optional-error")],
             )
             .unwrap_err();
         assert!(
@@ -37908,7 +38566,7 @@ mandatory = true
             host.invoke_instance(
                 &collection_for_each,
                 &list,
-                &[Value::Ref(Some("@indy:list-consumer".into()))],
+                &[crate::callback_marker::test_token("list-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -38086,7 +38744,7 @@ mandatory = true
             host.invoke_instance(
                 &for_each_remaining,
                 &remaining_iterator,
-                &[Value::Ref(Some("@indy:remaining-consumer".into()))],
+                &[crate::callback_marker::test_token("remaining-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -38172,7 +38830,7 @@ mandatory = true
             host.invoke_instance(
                 &remove_if,
                 &list,
-                &[Value::Ref(Some("@indy:list-predicate".into()))],
+                &[crate::callback_marker::test_token("list-predicate")],
             ),
             Err(NativeError::UncaughtException { class, .. })
                 if class == "java/lang/UnsupportedOperationException"
@@ -38189,18 +38847,22 @@ mandatory = true
             std::slice::from_ref(&list),
         )
         .unwrap();
+        // The host runs no callback: its `test` is counted (#156 P15a), so
+        // nothing is removed.
+        let before = host.unknown_host_call_count();
         assert_eq!(
             host.invoke_instance(
                 &remove_if,
                 &list_copy,
-                &[Value::Ref(Some("@indy:list-predicate".into()))],
+                &[crate::callback_marker::test_token("list-predicate")],
             )
             .unwrap(),
-            Value::Int(1)
+            Value::Int(0)
         );
+        assert!(host.unknown_host_call_count() > before);
         assert_eq!(
             host.invoke_instance(&size, &list_copy, &[]).unwrap(),
-            Value::Int(0)
+            host.invoke_instance(&size, &list, &[]).unwrap()
         );
     }
 
@@ -38215,8 +38877,8 @@ mandatory = true
         let combined = host
             .invoke_instance(
                 &predicate,
-                &Value::Ref(Some("@indy:left".into())),
-                &[Value::Ref(Some("@indy:right".into()))],
+                &crate::callback_marker::test_token("left"),
+                &[crate::callback_marker::test_token("right")],
             )
             .unwrap();
         let test = MethodRef {
@@ -38224,11 +38886,15 @@ mandatory = true
             name: "test".into(),
             descriptor: "(Ljava/lang/Object;)Z".into(),
         };
+        // The host runs neither side: `test` is counted (#156 P15a), never
+        // `true` for any lambda.
+        let before = host.unknown_host_call_count();
         assert_eq!(
             host.invoke_instance(&test, &combined, &[Value::Ref(Some("x".into()))])
                 .unwrap(),
-            Value::Int(1)
+            Value::Int(0)
         );
+        assert!(host.unknown_host_call_count() > before);
         let negate = MethodRef {
             owner: "java/util/function/Predicate".into(),
             name: "negate".into(),
@@ -38249,8 +38915,8 @@ mandatory = true
         let chained = host
             .invoke_instance(
                 &consumer,
-                &Value::Ref(Some("@indy:first".into())),
-                &[Value::Ref(Some("@indy:second".into()))],
+                &crate::callback_marker::test_token("first"),
+                &[crate::callback_marker::test_token("second")],
             )
             .unwrap();
         let accept = MethodRef {
@@ -38370,18 +39036,24 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some(
-                        "@indy:demo#0:0:demo/Factory#make()Ljava/lang/Object;:".into()
-                    )),
+                    crate::callback_marker::lambda_from_text(
+                        "demo#0",
+                        0,
+                        "",
+                        "demo/Factory#make()Ljava/lang/Object;",
+                        ""
+                    ),
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            // The host runs no callback: counted, nothing made up and stored
+            // (#156 P15a).
+            Value::Ref(None)
         );
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("computed-key".into()))])
                 .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            Value::Ref(None)
         );
         let compute_present = MethodRef {
             owner: "java/util/Map".into(),
@@ -38395,11 +39067,12 @@ mandatory = true
                 &map,
                 &[
                     Value::Ref(Some("computed-key".into())),
-                    Value::Ref(Some("@indy:compute-present".into())),
+                    crate::callback_marker::test_token("compute-present"),
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("computed/rcomputed-key".into()))
+            // The key is absent (the counted `computeIfAbsent` stored nothing).
+            Value::Ref(None)
         );
         let merge = MethodRef {
             owner: "java/util/Map".into(),
@@ -38415,7 +39088,7 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("merged-value".into())),
-                    Value::Ref(Some("@indy:merge".into())),
+                    crate::callback_marker::test_token("merge"),
                 ],
             )
             .unwrap(),
@@ -38433,16 +39106,18 @@ mandatory = true
                 &[
                     Value::Ref(Some("merged-key".into())),
                     Value::Ref(Some("updated-value".into())),
-                    Value::Ref(Some("@indy:merge-existing".into())),
+                    crate::callback_marker::test_token("merge-existing"),
                 ],
             )
             .unwrap(),
-            Value::Ref(Some("updated-value".into()))
+            // The remapping function the host cannot run is counted (#156
+            // P15a); its neutral `null` removes the entry, as Java's would.
+            Value::Ref(None)
         );
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("merged-key".into()))],)
                 .unwrap(),
-            Value::Ref(Some("updated-value".into()))
+            Value::Ref(None)
         );
         let put_if_absent = MethodRef {
             owner: "java/util/Map".into(),
@@ -38499,15 +39174,17 @@ mandatory = true
             host.invoke_instance(
                 &replace_all,
                 &map,
-                &[Value::Ref(Some("@indy:map-replace".into()))],
+                &[crate::callback_marker::test_token("map-replace")],
             )
             .unwrap(),
             Value::Void
         );
+        // Each value is the function's, which the host cannot run: `apply` is
+        // counted and its neutral `null` stored (#156 P15a).
         assert_eq!(
             host.invoke_instance(&map_get, &map, &[Value::Ref(Some("key".into()))])
                 .unwrap(),
-            Value::Ref(Some("updated".into()))
+            Value::Ref(None)
         );
         assert!(
             host.calls().iter().any(|call| {
@@ -38529,7 +39206,8 @@ mandatory = true
                 ],
             )
             .unwrap(),
-            Value::Int(1)
+            // `replaceAll`'s counted function left `null` there.
+            Value::Int(0)
         );
     }
 
@@ -38569,7 +39247,7 @@ mandatory = true
             host.invoke_instance(
                 &for_each,
                 &map,
-                &[Value::Ref(Some("@indy:map-consumer".into()))],
+                &[crate::callback_marker::test_token("map-consumer")],
             )
             .unwrap(),
             Value::Void
@@ -39955,7 +40633,7 @@ mandatory = true
             .invoke_instance(
                 &with_path,
                 &id,
-                &[Value::Ref(Some("@indy:path-transform".into()))],
+                &[crate::callback_marker::test_token("path-transform")],
             )
             .unwrap();
         // The operator is a jar lambda the host boundary cannot run; the call
@@ -40056,7 +40734,7 @@ mandatory = true
             host.invoke_instance(
                 &add_listener,
                 &bus,
-                &[Value::Ref(Some("@indy:listener".into()))],
+                &[crate::callback_marker::test_token("listener")],
             )
             .unwrap(),
             bus
@@ -40087,7 +40765,7 @@ mandatory = true
                 &register,
                 &[
                     Value::Ref(Some("entry".into())),
-                    Value::Ref(Some("@indy:supplier".into())),
+                    crate::callback_marker::test_token("supplier"),
                 ],
             )
             .unwrap();
@@ -40236,13 +40914,13 @@ mandatory = true
         assert_eq!(host.invocations().len(), 18);
         assert_eq!(
             host.invocations()[2].args[0],
-            Value::Ref(Some("@indy:listener".into()))
+            crate::callback_marker::test_token("listener")
         );
         let dispatches = host.dispatch_event(Value::Ref(Some("RegisterEvent".into())));
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some("@indy:listener".into())))
+            Some(&crate::callback_marker::test_token("listener"))
         );
         assert_eq!(
             dispatches[0].event,
@@ -40318,7 +40996,7 @@ mandatory = true
                     descriptor: "(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/minecraftforge/registries/RegistryObject;".into(),
                 },
                 &register,
-                &[Value::Ref(Some("entry".into())), Value::Ref(Some("@indy:supplier".into()))],
+                &[Value::Ref(Some("entry".into())), crate::callback_marker::test_token("supplier")],
             )
             .unwrap();
         // A Forge `RegistryObject` handle (`host_registry.rs`).
@@ -40399,7 +41077,7 @@ mandatory = true
             &[
                 host_ids::resource_key_named("minecraft:root", "minecraft:item"),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some("@indy:ruby-wand-supplier".into())),
+                crate::callback_marker::test_token("ruby-wand-supplier"),
             ],
         )
         .unwrap();
@@ -40408,7 +41086,7 @@ mandatory = true
         assert_eq!(entry.key(), "minecraft:item/ruby:wand");
         assert_eq!(
             entry.value,
-            Value::Ref(Some("@indy:ruby-wand-supplier".into()))
+            crate::callback_marker::test_token("ruby-wand-supplier")
         );
     }
 
@@ -40429,7 +41107,10 @@ mandatory = true
                 },
                 Cp::Utf8("accept".into()),
                 Cp::Utf8("(Ljava/lang/Object;)Ljava/lang/Object;".into()),
-                Cp::MethodHandle { reference_index: 6 },
+                Cp::MethodHandle {
+                    reference_kind: 6,
+                    reference_index: 6,
+                },
                 Cp::MethodRef { class: 7, nt: 8 },
                 Cp::Class(9),
                 Cp::NameType {
@@ -40470,13 +41151,19 @@ mandatory = true
                 &mut NullHost,
             )
             .unwrap();
+        // A capturing lambda is a new object per evaluation (its own key);
+        // its target and captures are what the site bound.
+        let callback = crate::callback_marker::lambda_of(&value).expect("a lambda");
         assert_eq!(
-            value,
-            Value::Ref(Some(
-                "@indy:demo/Lambda#make:1:demo/Target#callback(Ljava/lang/Object;)V:rcapture"
-                    .into(),
-            ))
+            callback.target,
+            MethodRef {
+                owner: "demo/Target".into(),
+                name: "callback".into(),
+                descriptor: "(Ljava/lang/Object;)V".into(),
+            }
         );
+        assert_eq!(callback.captures, [Value::Ref(Some("capture".into()))]);
+        assert_eq!(callback.sam, "java/lang/Object");
     }
 
     #[test]
@@ -40496,7 +41183,7 @@ mandatory = true
                 },
                 Cp::Utf8("apply".into()),
                 Cp::Utf8("(Ljava/lang/Object;)Ljava/lang/Object;".into()),
-                Cp::MethodHandle { reference_index: 6 },
+                Cp::MethodHandle { reference_kind: 6, reference_index: 6 },
                 Cp::MethodRef { class: 7, nt: 8 },
                 Cp::Class(9),
                 Cp::NameType {
@@ -40506,7 +41193,7 @@ mandatory = true
                 Cp::Utf8("java/lang/invoke/LambdaMetafactory".into()),
                 Cp::Utf8("metafactory".into()),
                 Cp::Utf8("(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;".into()),
-                Cp::MethodHandle { reference_index: 13 },
+                Cp::MethodHandle { reference_kind: 6, reference_index: 13 },
                 Cp::MethodRef { class: 14, nt: 15 },
                 Cp::Class(16),
                 Cp::NameType {
@@ -40606,7 +41293,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -40817,7 +41506,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41003,7 +41694,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41099,12 +41792,12 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(1))
+            Some(Value::Int(0))
         );
         let optional_stream = runtime
             .invoke_stream(
@@ -41176,12 +41869,12 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(0))
+            Some(Value::Int(1))
         );
         let stream = list_stream(&mut runtime);
         assert_eq!(
@@ -41193,12 +41886,12 @@ mandatory = true
                         descriptor: "(Ljava/util/function/Predicate;)Z".into(),
                     },
                     Some(&stream),
-                    &[Value::Ref(Some("@indy:stream-predicate".into()))],
+                    &[crate::callback_marker::test_token("stream-predicate")],
                     "demo/Stream",
                     "probe",
                 )
                 .unwrap(),
-            Some(Value::Int(1))
+            Some(Value::Int(0))
         );
         let stream = list_stream(&mut runtime);
         assert_eq!(
@@ -41365,7 +42058,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41671,7 +42366,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -41841,10 +42538,13 @@ mandatory = true
             raw: Vec::new(),
         };
         let jar = NativeJar::from_classes([caller, target]);
-        let marker = Value::Ref(Some(
-            "@indy:demo/Caller#make:0:demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;:"
-                .into(),
-        ));
+        let marker = crate::callback_marker::lambda_from_text(
+            "demo/Caller#make",
+            0,
+            "",
+            "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+            "",
+        );
         assert_eq!(
             jar.invoke_method_with_args(
                 "demo/Caller",
@@ -41865,10 +42565,13 @@ mandatory = true
                 None,
                 &[
                     optional_wrap(Value::Ref(Some("input".into()))),
-                    Value::Ref(Some(
-                        "@indy:demo/Caller#make:0:demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;:"
-                            .into(),
-                    )),
+                    crate::callback_marker::lambda_from_text(
+                        "demo/Caller#make",
+                        0,
+                        "",
+                        "demo/Target#callback(Ljava/lang/Object;)Ljava/lang/Object;",
+                        ""
+                    ),
                 ],
                 &mut NullHost,
             )
@@ -41879,11 +42582,14 @@ mandatory = true
 
     #[test]
     fn callback_marker_round_trips_delimited_capture_values() {
-        let marker = format!(
-            "@indy:demo/Mod#make:1:demo/Target#callback(Ljava/lang/Object;)V:{}",
-            value_marker(&Value::Ref(Some("a,b\\c".into())))
+        let marker = crate::callback_marker::make(
+            "demo/Mod#make",
+            1,
+            "java/util/function/Consumer",
+            "demo/Target#callback(Ljava/lang/Object;)V",
+            &value_marker(&Value::Ref(Some("a,b\\c".into()))),
         );
-        let parsed = parse_callback_marker(&marker).unwrap();
+        let parsed = callback_marker::parse(&marker).unwrap();
         assert_eq!(parsed.captures, vec![Value::Ref(Some("a,b\\c".into()))]);
     }
 
@@ -41919,10 +42625,13 @@ mandatory = true
                         .into(),
                 },
                 receiver: Some(Value::Ref(Some("event-bus".into()))),
-                args: vec![Value::Ref(Some(
-                    "@indy:demo/Mod#wire:1:demo/Target#callback(Ljava/lang/Object;)V:rTarget"
-                        .into(),
-                ))],
+                args: vec![crate::callback_marker::lambda_from_text(
+                    "demo/Mod#wire",
+                    1,
+                    "",
+                    "demo/Target#callback(Ljava/lang/Object;)V",
+                    "rTarget",
+                )],
             },
             event: Value::Ref(Some("register-event".into())),
         };
@@ -42292,7 +43001,7 @@ mandatory = true
                     descriptor: "(Ljava/util/function/Function;)Lnet/neoforged/neoforge/common/util/LazyOptional;".into(),
                 },
                 &optional,
-                &[Value::Ref(Some("@indy:identity-map".into()))],
+                &[crate::callback_marker::test_token("identity-map")],
             )
             .unwrap();
         assert_eq!(
@@ -42306,7 +43015,8 @@ mandatory = true
                 &[],
             )
             .unwrap(),
-            Value::Ref(Some("handler/items".into()))
+            // `map` runs the function, which the host cannot: counted (#156 P15a).
+            Value::Ref(None)
         );
         host.invoke_instance(
             &MethodRef {
@@ -42315,10 +43025,11 @@ mandatory = true
                 descriptor: "(Ljava/util/function/Consumer;)V".into(),
             },
             &mapped,
-            &[Value::Ref(Some("@indy:capability-consumer".into()))],
+            &[crate::callback_marker::test_token("capability-consumer")],
         )
         .unwrap();
-        assert!(host.invocations().iter().any(|invocation| {
+        // `mapped` holds nothing (its function was counted): no consumer runs.
+        assert!(!host.invocations().iter().any(|invocation| {
             invocation.method.owner == "java/util/function/Consumer"
                 && invocation.method.name == "accept"
                 && invocation.args == [Value::Ref(Some("handler/items".into()))]
@@ -42397,9 +43108,13 @@ mandatory = true
                 &create,
                 &[
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some(
-                        "@indy:demo/Mod#event:0:demo/Mod#combine()Ljava/lang/Object;:".into(),
-                    )),
+                    crate::callback_marker::lambda_from_text(
+                        "demo/Mod#event",
+                        0,
+                        "",
+                        "demo/Mod#combine()Ljava/lang/Object;",
+                        "",
+                    ),
                 ],
             )
             .unwrap();
@@ -42409,9 +43124,13 @@ mandatory = true
             name: "register".into(),
             descriptor: "(Ljava/lang/Object;)V".into(),
         };
-        let listener = Value::Ref(Some(
-            "@indy:demo/Mod#wire:1:demo/Mod#onEvent(Ljava/lang/Object;)V:".into(),
-        ));
+        let listener = crate::callback_marker::lambda_from_text(
+            "demo/Mod#wire",
+            1,
+            "",
+            "demo/Mod#onEvent(Ljava/lang/Object;)V",
+            "",
+        );
         assert!(matches!(
             host.invoke_instance(&register, &event, &[listener]),
             Ok(Value::Void)
@@ -42476,7 +43195,7 @@ mandatory = true
         host.invoke_instance(
             &register,
             &bus,
-            &[Value::Ref(Some("@indy:forge-static-handler".into()))],
+            &[crate::callback_marker::test_token("forge-static-handler")],
         )
         .unwrap();
         let dispatches = host.dispatch_event(Value::Ref(Some("forge-event".into())));
@@ -42499,14 +43218,14 @@ mandatory = true
         host.invoke_instance(
             &add_listener,
             &bus,
-            &[Value::Ref(Some("@indy:default-listener".into()))],
+            &[crate::callback_marker::test_token("default-listener")],
         )
         .unwrap();
         host.invoke_instance(
             &add_listener,
             &bus,
             &[
-                Value::Ref(Some("@indy:cancelled-listener".into())),
+                crate::callback_marker::test_token("cancelled-listener"),
                 Value::Int(1),
             ],
         )
@@ -42515,7 +43234,7 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args[0],
-            Value::Ref(Some("@indy:cancelled-listener".into()))
+            crate::callback_marker::test_token("cancelled-listener")
         );
     }
 
@@ -42536,7 +43255,7 @@ mandatory = true
                     Value::Ref(Some("NORMAL".into())),
                     Value::Int(1),
                     Value::Ref(Some("demo/Event".into())),
-                    Value::Ref(Some("@indy:typed-listener".into())),
+                    crate::callback_marker::test_token("typed-listener"),
                 ],
             )
             .unwrap();
@@ -42545,7 +43264,7 @@ mandatory = true
         assert_eq!(dispatches.len(), 1);
         assert_eq!(
             dispatches[0].listener.args.last(),
-            Some(&Value::Ref(Some("@indy:typed-listener".into())))
+            Some(&crate::callback_marker::test_token("typed-listener"))
         );
     }
 
@@ -42558,7 +43277,7 @@ mandatory = true
             name: "addListener".into(),
             descriptor: "(Ljava/util/function/Consumer;)Lnet/neoforged/bus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some("@indy:remove-me".into()));
+        let listener = crate::callback_marker::test_token("remove-me");
         host.invoke_instance(&add_listener, &bus, std::slice::from_ref(&listener))
             .unwrap();
         let unregister = MethodRef {
@@ -42636,7 +43355,7 @@ mandatory = true
             descriptor:
                 "(Ljava/util/function/Consumer;)Lnet/minecraftforge/eventbus/api/IEventBus;".into(),
         };
-        let listener = Value::Ref(Some("@indy:forge-listener".into()));
+        let listener = crate::callback_marker::test_token("forge-listener");
         assert_eq!(
             host.invoke_instance(&add, &bus, std::slice::from_ref(&listener))
                 .unwrap(),
@@ -46557,7 +47276,7 @@ mandatory = true
             },
         )
         .unwrap();
-        let value = Value::Ref(Some("@indy:ruby-wand".into()));
+        let value = crate::callback_marker::test_token("ruby-wand");
         assert_eq!(
             Host::invoke(
                 &mut host,
@@ -46582,7 +47301,7 @@ mandatory = true
             &[
                 Value::Ref(None),
                 identifier_value("ruby", "wand"),
-                Value::Ref(Some("@indy:ruby-wand".into())),
+                crate::callback_marker::test_token("ruby-wand"),
             ],
         )
         .unwrap();
@@ -46905,7 +47624,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -46961,7 +47682,9 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
+
             string_readers: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),

@@ -46,9 +46,8 @@
 //! (number parsing) and `disableInnerClassSerialization` (Gson refuses an inner
 //! class there; this writer would emit it).
 //!
-//! Accepted and named as inert for this runtime: `setLenient`/`setStrictness`
-//! (the parser is lenient, the existing departure for reading jar resources;
-//! writing does not depend on it), `disableJdkUnsafe` (nothing here instantiates
+//! Accepted and modeled for reading: `setLenient`/`setStrictness` record the
+//! reader's handling of non-finite numeric tokens. `disableJdkUnsafe` (nothing here instantiates
 //! through `Unsafe`; `fromJson` already builds an object without running a
 //! constructor) and `addReflectionAccessFilter` (filters Gson's reflection into
 //! JDK classes, which this model never reflects into).
@@ -237,6 +236,10 @@ pub(super) struct GsonStyle {
     non_executable: bool,
     special_floats: bool,
     long_strings: bool,
+    /// Gson's reader strictness. `false` is the default/LENIENT setting;
+    /// STRICT rejects non-finite numeric values while still accepting the
+    /// regular JSON number grammar.
+    strict: bool,
     /// An option that changes the output is set but cannot be applied here, so
     /// the writer must not produce text.
     counted: bool,
@@ -253,6 +256,7 @@ impl Default for GsonStyle {
             non_executable: false,
             special_floats: false,
             long_strings: false,
+            strict: false,
             counted: false,
         }
     }
@@ -264,7 +268,7 @@ impl GsonStyle {
     fn key(&self) -> String {
         format!(
             "newline={};indent={};space={};html={};nulls={};\
-             naming={};mods={};nonexec={};special={};longs={};counted={}",
+             naming={};mods={};nonexec={};special={};longs={};strict={};counted={}",
             hex(&self.formatting.newline),
             hex(&self.formatting.indent),
             u8::from(self.formatting.space_after_separators),
@@ -275,6 +279,7 @@ impl GsonStyle {
             u8::from(self.non_executable),
             u8::from(self.special_floats),
             u8::from(self.long_strings),
+            u8::from(self.strict),
             u8::from(self.counted),
         )
     }
@@ -299,6 +304,7 @@ impl GsonStyle {
                 "nonexec" => style.non_executable = flag(value)?,
                 "special" => style.special_floats = flag(value)?,
                 "longs" => style.long_strings = flag(value)?,
+                "strict" => style.strict = flag(value)?,
                 "counted" => style.counted = flag(value)?,
                 _ => return None,
             }
@@ -307,8 +313,7 @@ impl GsonStyle {
     }
 
     /// The writer options `Gson.toJson` applies to a `JsonElement`
-    /// (`gson_tree.rs`). The `Gson`'s strictness is not recorded, so the tree
-    /// writer is not told it is lenient.
+    /// (`gson_tree.rs`).
     pub(super) fn tree_style(&self) -> super::gson_tree::TreeStyle {
         super::gson_tree::TreeStyle {
             newline: self.formatting.newline.clone(),
@@ -335,6 +340,10 @@ impl GsonStyle {
 
     fn special_floats(&self) -> bool {
         self.special_floats
+    }
+
+    pub(super) fn allows_special_floats(&self) -> bool {
+        !self.strict
     }
 
     fn serialize_nulls(&self) -> bool {
@@ -671,15 +680,34 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
-            // Inert for this runtime: the parser is lenient by its documented
-            // departure (writing does not depend on strictness), nothing here
-            // instantiates through `Unsafe`, and `fromJson` already builds an
-            // object without running a constructor.
-            ("setLenient" | "disableJdkUnsafe", _) => answer(),
-            ("setStrictness", _) => {
+            ("setLenient", "()Lcom/google/gson/GsonBuilder;") => {
+                let mut style = self.gson_style(&marker);
+                style.strict = false;
+                self.set_gson_style(&marker, style);
+                answer()
+            }
+            // Nothing here instantiates through `Unsafe`.
+            ("disableJdkUnsafe", _) => answer(),
+            ("setStrictness", "(Lcom/google/gson/Strictness;)Lcom/google/gson/GsonBuilder;") => {
                 if args.iter().any(|value| matches!(value, Value::Ref(None))) {
                     return Err(npe());
                 }
+                let mut style = self.gson_style(&marker);
+                // Enum constants are represented by a stable marker containing
+                // the declaring class and constant name. Unknown markers are
+                // conservatively treated as STRICT; Gson's default remains
+                // lenient until this method is called.
+                style.strict = args
+                    .first()
+                    .and_then(expect_ref)
+                    .and_then(|constant| {
+                        self.enum_constants
+                            .get(constant)
+                            .map(|(name, _)| name == "STRICT")
+                            .or_else(|| Some(!constant.contains("LENIENT")))
+                    })
+                    .unwrap_or(true);
+                self.set_gson_style(&marker, style);
                 answer()
             }
             _ => Ok(None),
@@ -705,9 +733,7 @@ impl<H: Host> Runtime<'_, H> {
         let Some(adapter) = args.get(1).filter(|adapter| **adapter != Value::Ref(None)) else {
             return Err(npe());
         };
-        if expect_ref(adapter)
-            .is_some_and(|text| text.starts_with("@indy:") || text.starts_with("@fn:"))
-        {
+        if crate::callback_marker::callback_text(adapter).is_some() {
             return Ok(());
         }
         let Some(class) = crate::jar_object::object_class(adapter) else {

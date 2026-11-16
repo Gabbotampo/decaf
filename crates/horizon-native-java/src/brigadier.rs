@@ -61,7 +61,7 @@ use crate::{
     expect_ref, expect_string,
     host_brigadier::{self as handles, PERMISSION_SET, REQUIRES},
     host_ref::HostKind,
-    identifier_value, parse_callback_marker, return_desc, stable_hash, uuid_value,
+    identifier_value, return_desc, stable_hash, uuid_value,
 };
 
 const COMMAND_SELECTION: &str = "net/minecraft/commands/Commands$CommandSelection";
@@ -2052,10 +2052,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
             return false;
         }
-        let Some(text) = expect_ref(receiver).filter(|t| t.starts_with("@indy:")) else {
-            return false;
-        };
-        let Ok(callback) = parse_callback_marker(text) else {
+        let Some(callback) = crate::callback_marker::lambda_of(receiver) else {
             return false;
         };
         let Some(method) = self
@@ -2089,10 +2086,7 @@ impl NativeJar {
             if self.classes.contains_key(&target.owner) {
                 break;
             }
-            let Some(Value::Ref(Some(inner))) = captures.first() else {
-                break;
-            };
-            let Ok(inner) = parse_callback_marker(inner) else {
+            let Some(inner) = captures.first().and_then(crate::callback_marker::lambda_of) else {
                 break;
             };
             let mut next = inner.captures;
@@ -2119,10 +2113,7 @@ impl NativeJar {
                 "a null {method} callback was called"
             )));
         }
-        if let Some(text) = expect_ref(callback)
-            && text.starts_with("@indy:")
-        {
-            let parsed = parse_callback_marker(text)?;
+        if let Some(parsed) = crate::callback_marker::lambda_of(callback) {
             let (target, mut captures) =
                 self.command_callback_target(parsed.target, parsed.captures);
             let found = self
@@ -2541,7 +2532,7 @@ mod tests {
             "executes",
             EXECUTES,
             &child,
-            &[marker("@indy:late".into())],
+            &[crate::callback_marker::test_token("late")],
         );
         register(&mut h, &root);
         let tree = h.command_tree();
@@ -2556,25 +2547,24 @@ mod tests {
         // `/home a` then `/home b` with a new command on `home`: one root
         // with both children, and the newer command.
         let mut h = host();
-        for (child, command) in [("a", "@indy:first"), ("b", "@indy:second")] {
+        for (child, command) in [
+            ("a", crate::callback_marker::test_token("first")),
+            ("b", crate::callback_marker::test_token("second")),
+        ] {
             let root = literal(&mut h, "home");
             let leaf = literal(&mut h, child);
             call(&mut h, BUILDER, "then", THEN, &root, &[leaf]);
-            call(
-                &mut h,
-                BUILDER,
-                "executes",
-                EXECUTES,
-                &root,
-                &[marker(command.into())],
-            );
+            call(&mut h, BUILDER, "executes", EXECUTES, &root, &[command]);
             register(&mut h, &root);
         }
         let tree = h.command_tree();
         let roots: Vec<_> = tree.roots().collect();
         assert_eq!(roots.len(), 1);
         let home = roots[0].1;
-        assert_eq!(home.command, Some(marker("@indy:second".into())));
+        assert_eq!(
+            home.command,
+            Some(crate::callback_marker::test_token("second"))
+        );
         let names: Vec<_> = home
             .children
             .iter()

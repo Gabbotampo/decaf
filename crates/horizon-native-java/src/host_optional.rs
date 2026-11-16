@@ -21,7 +21,17 @@
 //!   the canonical `NaN` (`Double.doubleToRawLongBits` alone can tell).
 
 use crate::host_ref::{HostKind, HostRef, Methods, Nested, instance_of_class};
-use crate::{NativeError, Value, format_java_float, java_double_bits, object_methods, return_desc};
+use crate::{
+    NativeError, Value, format_java_float, host_recursion, java_double_bits, object_methods,
+    return_desc,
+};
+
+/// A normal nested key is ideal for ordinary values, but a 100,000-deep
+/// `Optional` would otherwise copy its whole prefix at every wrapper. Once a
+/// chain is this deep, keep the empty-chain depth in one host-created key and
+/// refuse walks past the host bound instead of shortening Java text.
+const MAX_OPTIONAL_WALK_DEPTH: usize = 4096;
+const DEEP_EMPTY_PREFIX: &str = "deep-empty:";
 
 /// `Optional.empty()`.
 pub(crate) fn empty_optional() -> Value {
@@ -63,10 +73,36 @@ fn present_key(value: &Value, kind: HostKind) -> Option<&str> {
 
 /// The value an `Optional` handle holds.
 fn held(handle: &HostRef) -> Option<Value> {
+    if let Some(depth) = empty_chain_depth(handle)
+        && depth >= MAX_OPTIONAL_WALK_DEPTH
+    {
+        return Some(Value::Host(HostRef::new(
+            HostKind::Optional,
+            format!("{DEEP_EMPTY_PREFIX}{}", depth - 1),
+        )));
+    }
     match handle.values()?.as_slice() {
         [held] => Some(held.clone()),
         _ => None,
     }
+}
+
+/// The depth of an all-empty Optional chain, if this handle is one. This only
+/// recognizes runtime-produced handles; a jar String is never parsed here.
+fn empty_chain_depth(handle: &HostRef) -> Option<usize> {
+    if handle.kind() != HostKind::Optional {
+        return None;
+    }
+    if let Some(depth) = handle.key().strip_prefix(DEEP_EMPTY_PREFIX) {
+        return depth.parse().ok();
+    }
+    let mut key = handle.key();
+    let mut depth = 0;
+    while let Some(rest) = key.strip_prefix("hopt:") {
+        depth += 1;
+        key = rest;
+    }
+    key.is_empty().then_some(depth)
 }
 
 /// The value a present optional holds, `None` when it is empty or no
@@ -89,6 +125,21 @@ pub(crate) fn optional_payload(value: &Value) -> Option<Value> {
 pub(crate) fn optional_wrap(value: Value) -> Value {
     match value {
         Value::Ref(None) | Value::Void => empty_optional(),
+        Value::Host(inner) if inner.kind() == HostKind::Optional => {
+            if let Some(depth) = empty_chain_depth(&inner)
+                && depth + 1 >= MAX_OPTIONAL_WALK_DEPTH
+            {
+                let depth = depth + 1;
+                return Value::Host(HostRef::new(
+                    HostKind::Optional,
+                    format!("{DEEP_EMPTY_PREFIX}{depth}"),
+                ));
+            }
+            Value::Host(HostRef::of_values(
+                HostKind::Optional,
+                &[Value::Host(inner)],
+            ))
+        }
         value => Value::Host(HostRef::of_values(HostKind::Optional, &[value])),
     }
 }
@@ -136,6 +187,20 @@ fn optional_to_string(
     handle: &HostRef,
     nested: &mut dyn Nested,
 ) -> Result<Option<String>, NativeError> {
+    if let Some(depth) = empty_chain_depth(handle) {
+        if depth > MAX_OPTIONAL_WALK_DEPTH {
+            return Err(host_recursion::refuse_at(MAX_OPTIONAL_WALK_DEPTH));
+        }
+        let mut text = String::with_capacity(14 + depth * 10);
+        for _ in 0..depth {
+            text.push_str("Optional[");
+        }
+        text.push_str("Optional.empty");
+        for _ in 0..depth {
+            text.push(']');
+        }
+        return Ok(Some(text));
+    }
     Ok(match held(handle) {
         Some(value) => nested.text(&value)?.map(|text| format!("Optional[{text}]")),
         None => Some("Optional.empty".into()),
@@ -147,6 +212,12 @@ fn optional_hash_code(
     handle: &HostRef,
     nested: &mut dyn Nested,
 ) -> Result<Option<i32>, NativeError> {
+    if let Some(depth) = empty_chain_depth(handle) {
+        if depth > MAX_OPTIONAL_WALK_DEPTH {
+            return Err(host_recursion::refuse_at(MAX_OPTIONAL_WALK_DEPTH));
+        }
+        return Ok(Some(0));
+    }
     match held(handle) {
         Some(value) => nested.hash(&value),
         None => Ok(Some(0)),
@@ -165,6 +236,15 @@ fn optional_equals(
     };
     if other.kind() != HostKind::Optional {
         return Ok(Some(false));
+    }
+    if handle == other {
+        if let Some(depth) = empty_chain_depth(handle)
+            && depth > MAX_OPTIONAL_WALK_DEPTH
+            && handle.same_object(other) != Some(true)
+        {
+            return Err(host_recursion::refuse_at(MAX_OPTIONAL_WALK_DEPTH));
+        }
+        return Ok(Some(true));
     }
     match (held(handle), held(other)) {
         (Some(left), Some(right)) => nested.equals(&left, &right),
