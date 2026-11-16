@@ -19509,18 +19509,6 @@ impl NativeJar {
         }
         persistence?;
         io_persistence?;
-        if std::env::var_os("HORIZON_TRACE_BUDGET").is_some()
-            && budget.instruction_limit().is_some()
-        {
-            eprintln!(
-                "native-budget {}#{} instructions={} limit={:?} wall={:?}",
-                target.owner,
-                target.name,
-                runtime.instructions,
-                budget.instruction_limit(),
-                budget.limit(),
-            );
-        }
         result
     }
 
