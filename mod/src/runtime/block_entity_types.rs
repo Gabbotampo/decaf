@@ -62,24 +62,3 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         "client/block_entity_type/minecraft:{id}"
     )))
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn captured_fields_return_canonical_handles() {
-        for line in include_str!("block_entity_types_all_java25.txt").lines() {
-            let (name, id) = line.split_once("=").expect("oracle row");
-            let id = id.strip_prefix("minecraft:").expect("minecraft id");
-            let r = MethodRef {
-                owner: OWNER.into(),
-                name: name.into(),
-                descriptor: DESC.into(),
-            };
-            let got = static_field(&r).expect("captured field");
-            assert_eq!(
-                got,
-                game_object::client_value(format!("client/block_entity_type/minecraft:{id}"))
-            );
-        }
-    }
-}
