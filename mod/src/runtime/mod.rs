@@ -52,6 +52,7 @@ mod dfu_codec;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
+mod entity_registration;
 mod entrypoint_role;
 mod enum_value_of;
 pub mod events;
@@ -76,6 +77,7 @@ mod game_codecs;
 mod game_hooks;
 mod game_object;
 mod game_rules;
+mod gson_fromjson;
 mod gson_model;
 mod gson_to_json_tree;
 mod gson_tree;
@@ -204,6 +206,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod vanilla_entity_data_pool;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
 #[doc(hidden)]
@@ -2371,6 +2374,8 @@ pub trait Host {
     fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
         None
     }
+    fn note_entity_data_hierarchy(&mut self, _entries: &[(String, String)]) {}
+
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -3573,6 +3578,7 @@ pub struct StdHost {
     brigadier: brigadier::BrigadierState,
     /// FML's `InterModComms` queues, shared with the other jars of a game (`neoforge_imc.rs`).
     imc: neoforge_imc::ImcHandle,
+    entity_registration: entity_registration::State,
 }
 
 impl Default for StdHost {
@@ -3726,6 +3732,7 @@ impl StdHost {
             render_handles: BTreeSet::new(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
+            entity_registration: entity_registration::State::default(),
         }
     }
 
@@ -5144,10 +5151,13 @@ impl StdHost {
         }
         self.registrations.push(RegistryEntry {
             registry: registry.to_owned(),
-            id,
+            id: id.clone(),
             value: value.clone(),
             declaration,
         });
+        if registry == "minecraft:entity_type" {
+            let _ = self.entity_registration.register_entity_type(&value);
+        }
         Some(value)
     }
 
@@ -6242,6 +6252,9 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {
+            return value;
+        }
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
@@ -6508,7 +6521,16 @@ impl Host for StdHost {
         vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
     }
 
+    fn note_entity_data_hierarchy(&mut self, entries: &[(String, String)]) {
+        entity_registration::note_hierarchy(&mut self.entity_registration, entries);
+    }
+
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) =
+            entity_registration::static_call(&mut self.entity_registration, r, args)
+        {
+            return value;
+        }
         if !random_source::is_bit_conversion(r) {
             self.random_bit_scope = None;
         }
@@ -7878,6 +7900,11 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) =
+            entity_registration::instance_call(&mut self.entity_registration, r, receiver, args)
+        {
+            return value;
+        }
         self.record(r, Some(receiver), args);
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
@@ -14574,7 +14601,7 @@ const MAX_GENERIC_SIGNATURE_BYTES: usize = 64 * 1024;
 /// wildcard and generic-array shapes are `java.lang.reflect.Type` handles
 /// (`host_reflect_type.rs`) whose key is the node itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum GenericType {
+pub(crate) enum GenericType {
     /// A class or array type: the internal name (`java/util/List`) or the
     /// array descriptor (`[Ljava/lang/String;`), exactly the marker
     /// `Field.getType` answers.
@@ -14602,7 +14629,7 @@ enum GenericType {
 
 /// What declares a type variable (`TypeVariable.getGenericDeclaration`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TypeDeclaration {
+pub(crate) enum TypeDeclaration {
     /// A class: its internal name.
     Class(String),
     /// A method or constructor: its class, name and descriptor.
@@ -28180,6 +28207,32 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
     }
 
+    fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
+        let Some(mut class_name) = args
+            .first()
+            .and_then(host_class::class_name)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let mut entries = Vec::new();
+        for _ in 0..256 {
+            let Some(file) = self.class(&class_name) else {
+                break;
+            };
+            let parent = file.super_name.clone();
+            if parent.is_empty() {
+                break;
+            }
+            entries.push((class_name.clone(), parent.clone()));
+            if parent == "java/lang/Object" {
+                break;
+            }
+            class_name = parent;
+        }
+        self.host.note_entity_data_hierarchy(&entries);
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -28237,7 +28290,14 @@ impl<H: Host> Runtime<'_, H> {
             return match redirect {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
                     Some(receiver) => self.host.invoke_instance(&r, receiver, args),
-                    None => self.host.invoke(&r, args),
+                    None => {
+                        if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
+                            && r.name == "defineId"
+                        {
+                            self.prepare_entity_data_hierarchy(args);
+                        }
+                        self.host.invoke(&r, args)
+                    }
                 },
                 JarCallRedirect::Jar(r) => {
                     self.invoke(&r.owner, &r.name, &r.descriptor, receiver, args)
@@ -28314,7 +28374,14 @@ impl<H: Host> Runtime<'_, H> {
             }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
-                None => self.host.invoke(&r, args),
+                None => {
+                    if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
+                        && r.name == "defineId"
+                    {
+                        self.prepare_entity_data_hierarchy(args);
+                    }
+                    self.host.invoke(&r, args)
+                }
             };
         };
         // `if_acmp`'s producer analysis, looked up once per frame
@@ -29914,6 +29981,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_gson_fromjson(&r, receiver.as_ref(), &args)
+                    ) {
+                        // Gson's bounded reflective fromJson adapter (`gson_fromjson.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         gson_to_json_tree::instance_call(
                             self,
                             &r,
@@ -29921,6 +29994,7 @@ impl<H: Host> Runtime<'_, H> {
                             &args,
                         )
                     ) {
+                        // Gson's `toJsonTree` instance surface (`gson_to_json_tree.rs`).
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))
@@ -30128,7 +30202,15 @@ impl<H: Host> Runtime<'_, H> {
                                         )
                                     }
                                 } else {
-                                    invoke_or_catch!(at, self.host.invoke(&resolved, &args))
+                                    invoke_or_catch!(at, {
+                                        if resolved.owner
+                                            == "net/minecraft/network/syncher/SynchedEntityData"
+                                            && resolved.name == "defineId"
+                                        {
+                                            self.prepare_entity_data_hierarchy(&args);
+                                        }
+                                        self.host.invoke(&resolved, &args)
+                                    })
                                 }
                             } else if let Some(receiver) = receiver.as_ref() {
                                 // A library's own functional interface (log4j's
@@ -30181,7 +30263,15 @@ impl<H: Host> Runtime<'_, H> {
                                     )
                                 }
                             } else {
-                                invoke_or_catch!(at, self.host.invoke(&resolved, &args))
+                                invoke_or_catch!(at, {
+                                    if resolved.owner
+                                        == "net/minecraft/network/syncher/SynchedEntityData"
+                                        && resolved.name == "defineId"
+                                    {
+                                        self.prepare_entity_data_hierarchy(&args);
+                                    }
+                                    self.host.invoke(&resolved, &args)
+                                })
                             }
                         }
                     } else {

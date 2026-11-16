@@ -532,6 +532,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.iterators.len()
         + host.component_states.len()
         + host.ranged_attributes.len()
+        + host.entity_registration.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -1057,6 +1058,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
+    host.entity_registration.retain_keys(keep);
     host.prune_keyed_tables(keep);
     host.render_objects
         .retain(|key, _| render_live.contains(key));
@@ -1559,6 +1561,65 @@ mod tests {
     }
 
     #[test]
+    fn entity_registration_handles_follow_callback_collection_roots() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        let category = crate::runtime::entity_registration::category_constant("CREATURE").unwrap();
+        let builder = crate::runtime::entity_registration::static_call(
+            &mut host.entity_registration,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "of".into(),
+                descriptor: "()".into(),
+            },
+            &[Value::Ref(Some("factory".into())), category],
+        )
+        .unwrap()
+        .unwrap();
+        let entity = crate::runtime::entity_registration::instance_call(
+            &mut host.entity_registration,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/entity/EntityType$Builder".into(),
+                name: "build".into(),
+                descriptor: "()".into(),
+            },
+            &builder,
+            &[Value::Ref(Some("minecraft:probe".into()))],
+        )
+        .unwrap()
+        .unwrap();
+        let accessor = crate::runtime::entity_registration::define_id(
+            &mut host.entity_registration,
+            "net/minecraft/world/entity/Entity",
+        )
+        .unwrap()
+        .unwrap();
+        let entity_key = crate::runtime::jar_object::instance_key(&entity).unwrap().to_owned();
+        let accessor_key = crate::runtime::jar_object::instance_key(&accessor)
+            .unwrap()
+            .to_owned();
+        heap.fields
+            .insert(field(&entity_key, "state"), Value::Int(1));
+        heap.fields
+            .insert(field(&accessor_key, "state"), Value::Int(1));
+        host.mutable_collections.insert(
+            "java/util/ArrayList#neutral0".into(),
+            vec![entity.clone(), accessor.clone()],
+        );
+        host.persistent_static_fields.insert(
+            "demo/Mod#ROOTLjava/util/List;".into(),
+            text("java/util/ArrayList#neutral0"),
+        );
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(host.entity_registration.entry_count(), 1);
+        host.persistent_static_fields.clear();
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(host.entity_registration.entry_count(), 0);
+        assert!(heap.fields.is_empty());
+        assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(8));
+    }
+
+    #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
             "array_views",
@@ -1638,6 +1699,7 @@ mod tests {
             "render_handles",
             "brigadier",
             "imc",
+            "entity_registration",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
