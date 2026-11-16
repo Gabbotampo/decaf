@@ -13039,6 +13039,10 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        "net/minecraft/sounds/SoundSource" => &["MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS", "AMBIENT", "VOICE", "UI"],
+        "net/minecraft/sounds/SoundSource" => &["MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS", "AMBIENT", "VOICE", "UI"],
+        "net/minecraft/world/entity/ai/attributes/AttributeModifier$Operation" => &["ADD_VALUE", "ADD_MULTIPLIED_BASE", "ADD_MULTIPLIED_TOTAL"],
+        "net/minecraft/world/entity/HumanoidArm" => &["LEFT", "RIGHT"],
         "net/minecraft/world/entity/EquipmentSlot" => {
             &["MAINHAND", "OFFHAND", "FEET", "LEGS", "CHEST", "HEAD"]
         }
@@ -27729,6 +27733,10 @@ impl<H: Host> Runtime<'_, H> {
                 .is_some_and(|marker| marker.starts_with(&format!("enum/{}/", r.owner)));
         if r.owner != "java/lang/Enum" && !game_constant {
             return Ok(None);
+        }
+        if game_constant && r.owner == "net/minecraft/sounds/SoundSource" && r.name == "getName" && r.descriptor == "()Ljava/lang/String;" {
+            let name = receiver.and_then(expect_ref).and_then(|m| m.rsplit('/').next()).map(|n| n.to_ascii_lowercase());
+            return Ok(name.map(|name| Value::Ref(Some(name))));
         }
         if game_constant && matches!(r.name.as_str(), "name" | "toString") {
             let name = receiver
