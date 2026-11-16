@@ -1368,22 +1368,26 @@ impl Hooks for HorizonJava {
                 )
             }
             HostSide::Client(_) => {
-                // The native runtime has a server façade only. Still dispatch the Sunrise
-                // both-side hook on the client, with the event-owned facts; unavailable server
-                // player/level/held-item reads remain the runtime's counted host calls.
-                let context = entity_interact_context(None, None, None, event);
-                self.fire_event(GameEvent::UseEntity, self.dedicated(), context, |_| true)
+                // The Java bridge has only the server-side player/level/held-item facade. Do not
+                // fire a client callback with fabricated empty context; count the unsupported
+                // side in the jar report and let Sunrise continue its client interaction.
+                self.skip_client_entity_interact();
+                return None;
             }
         };
-        fired.cancelled.then(|| {
-            // A Forge cancellation has no Fabric InteractionResult.  Fail is the Sunrise
+        let result = fired.cancelled.then(|| {
+            // A Forge cancellation has no Fabric InteractionResult. Fail is the Sunrise
             // replacement that stops this entity interaction while preserving the old Flow::Cancel.
             fired
                 .interaction
                 .as_deref()
                 .map(|result| interaction_result(Some(result)))
                 .unwrap_or(InteractionResult::Fail)
-        })
+        });
+        if fired.interaction.as_deref() == Some("TRY_WITH_EMPTY_HAND") {
+            self.note_entity_interact_try_empty_hand();
+        }
+        result
     }
 
     /// A living entity's death has finished (Fabric's `ServerLivingEntityEvents.AFTER_DEATH`): the
@@ -1643,6 +1647,35 @@ impl HorizonJava {
         Fired {
             cancelled: firing.cancelled,
             interaction: firing.interaction.clone(),
+        }
+    }
+
+    /// Sunrise fires entity interaction on both sides, but the Java bridge currently has only
+    /// server-side player/level/held-item handles. Count unsupported client callbacks instead of
+    /// invoking Java with empty context.
+    fn skip_client_entity_interact(&self) {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            loaded.row.entity_interact_client_skipped += loaded
+                .listeners
+                .iter()
+                .filter(|listener| listener.event == GameEvent::UseEntity)
+                .count();
+        }
+    }
+
+    /// Count the intentional Sunrise TRY_WITH_EMPTY_HAND fall-through, which differs from the
+    /// old Flow cancellation used by this bridge.
+    fn note_entity_interact_try_empty_hand(&self) {
+        let mut state = self.lock();
+        for loaded in &mut state.jars {
+            if loaded
+                .listeners
+                .iter()
+                .any(|listener| listener.event == GameEvent::UseEntity)
+            {
+                loaded.row.entity_interact_try_empty_hand += 1;
+            }
         }
     }
 
@@ -1919,6 +1952,7 @@ fn interaction_result(result: Option<&str>) -> InteractionResult {
         Some("SUCCESS_SERVER") => InteractionResult::SuccessServer,
         Some("CONSUME") => InteractionResult::Consume,
         Some("FAIL") => InteractionResult::Fail,
+        Some("TRY_WITH_EMPTY_HAND") => InteractionResult::TryWithEmptyHand,
         _ => InteractionResult::Pass,
     }
 }
@@ -2464,6 +2498,11 @@ struct JarRow {
     commands_ran: usize,
     commands_refused: usize,
     command_unknown_host_calls: usize,
+    /// Sunrise both-side entity callbacks skipped on the client because the Java facade lacks
+    /// player, level and held-item context.
+    entity_interact_client_skipped: usize,
+    /// Sunrise TRY_WITH_EMPTY_HAND fall-throughs, an intentional migration departure.
+    entity_interact_try_empty_hand: usize,
     /// Usages the registration callback built and this bridge translated, and usages it left out
     /// (an argument kind or predicate it cannot carry). Registration failures are callbacks:
     /// they are counted in `callbacks_failed` too.
@@ -2496,6 +2535,8 @@ impl JarRow {
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -2544,6 +2585,8 @@ impl JarRow {
                 "translated": self.commands_translated,
                 "refused_at_registration": self.commands_refused_at_registration,
             },
+            "entity_interact_client_skipped": self.entity_interact_client_skipped,
+            "entity_interact_try_empty_hand": self.entity_interact_try_empty_hand,
             "game_hooks": self.game_hooks.json(),
             "content": {
                 "blocks": self.content_blocks,
@@ -2701,6 +2744,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -2729,6 +2774,8 @@ fn load_jar(
             commands_ran: 0,
             commands_refused: 0,
             command_unknown_host_calls: 0,
+            entity_interact_client_skipped: 0,
+            entity_interact_try_empty_hand: 0,
             commands_translated: 0,
             commands_refused_at_registration: 0,
             content_blocks: 0,
@@ -3398,7 +3445,40 @@ mod tests {
         assert_eq!(caught("runs", || 7).unwrap(), 7);
     }
 
-    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess
+    #[test]
+    fn entity_interaction_results_match_sunrise_contract() {
+        assert_eq!(
+            interaction_result(Some("SUCCESS")),
+            InteractionResult::Success
+        );
+        assert_eq!(
+            interaction_result(Some("SUCCESS_SERVER")),
+            InteractionResult::SuccessServer
+        );
+        assert_eq!(
+            interaction_result(Some("CONSUME")),
+            InteractionResult::Consume
+        );
+        assert_eq!(interaction_result(Some("FAIL")), InteractionResult::Fail);
+        assert_eq!(
+            interaction_result(Some("TRY_WITH_EMPTY_HAND")),
+            InteractionResult::TryWithEmptyHand
+        );
+        assert_eq!(interaction_result(Some("PASS")), InteractionResult::Pass);
+        assert_eq!(interaction_result(None), InteractionResult::Pass);
+    }
+
+    #[test]
+    fn entity_interaction_client_departures_are_reported() {
+        let mut row = JarRow::refused("demo.jar", "demo".to_owned(), String::new());
+        row.entity_interact_client_skipped = 2;
+        row.entity_interact_try_empty_hand = 1;
+        let json = row.json();
+        assert_eq!(json["entity_interact_client_skipped"], 2);
+        assert_eq!(json["entity_interact_try_empty_hand"], 1);
+    }
+
+    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess    /// `EntityInteract#getHand`/`UseEntityCallback`'s hand is the hook's own `hand`, never a guess
     /// from the stacks: two empty hands (where the old stack-matching left it unknown) still name
     /// the off hand when the game asks about the off hand.
     #[test]

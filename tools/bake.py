@@ -36,17 +36,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # The folder the game reads content packages from, beside `options.txt`
-# (horizon-mod-package `mod_list::DIR`), and the file that turns one on (`FILE`).
+# (sunrise-mod-package `mod_list::DIR`), and the file that turns one on (`FILE`).
 MODS_DIR = "horizon-mods"
 MODS_FILE = "horizon-mods.txt"
 REPORT = Path("config") / "horizon_java" / "bake-report.json"
 
 # The content fence's path rule: `assets/` or `data/`, then `/`-separated parts of
-# `[a-z0-9_.-]`, none of them `.` or `..` (horizon-mod-package `content::check_path`).
+# `[a-z0-9_.-]`, none of them `.` or `..` (sunrise-mod-package `content::check_path`).
 PLAIN_PART = re.compile(r"^[a-z0-9_.-]+$")
 NAMESPACE = re.compile(r"^[a-z0-9_.-]{1,64}$")
 # A `.hmod` manifest id is narrower than a namespace: `[a-z0-9_]{1,64}` and not a Windows
-# device name (horizon-mod-package `manifest::valid_mod_id`).
+# device name (sunrise-mod-package `manifest::valid_mod_id`).
 PACKAGE_ID = re.compile(r"^[a-z0-9_]{1,64}$")
 RESERVED_IDS = {"con", "prn", "aux", "nul"} | {
     f"{prefix}{digit}" for prefix in ("com", "lpt") for digit in "123456789"
