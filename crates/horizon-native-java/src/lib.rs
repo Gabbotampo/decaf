@@ -26207,7 +26207,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let path = host_path::sandbox_canonical(&display_path);
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-                    ("exists", "()Z") => Value::Int(i32::from(self.io_files.contains_key(&path))),
+                    ("exists", "()Z") => Value::Int(i32::from(present)),
                     // `file_attributes.rs`: what the model knows the path to be.
                     ("isFile", "()Z") => Value::Int(i32::from(
                         self.file_kind(&path) == file_attributes::FileKind::RegularFile,
@@ -26306,22 +26306,19 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = host_path::sandbox_canonical(&display_path);
+                let seeded = self.resource(path.trim_start_matches('/')).is_some();
+                let present = self.io_files.contains_key(&path) || seeded;
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("exists", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        if !self.io_files.contains_key(&path) {
-                            // A resource the jar ships still answers through the
-                            // host's table.
-                            return Ok(None);
-                        }
-                        Value::Int(1)
+                        Value::Int(i32::from(present))
                     }
                     ("notExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        Value::Int(i32::from(!self.io_files.contains_key(&path)))
+                        Value::Int(i32::from(!present))
                     }
                     ("isReadable", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
@@ -26336,9 +26333,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("isRegularFile", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        Value::Int(i32::from(
-                            self.io_files.contains_key(&path) && !self.io_dirs.contains(&path),
-                        ))
+                        Value::Int(i32::from(present && !self.io_dirs.contains(&path)))
                     }
                     ("isSymbolicLink", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
@@ -26355,7 +26350,10 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
-                            None => return Ok(None),
+                            None => match self.resource(path.trim_start_matches('/')) {
+                                Some(text) => Value::Ref(Some(text.to_owned())),
+                                None => return Ok(None),
+                            },
                         }
                     }
                     ("writeString", descriptor)
