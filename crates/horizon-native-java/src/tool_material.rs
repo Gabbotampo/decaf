@@ -12,6 +12,14 @@ struct Row {
 pub(crate) struct State {
     handles: BTreeMap<String, Value>,
 }
+impl State {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.handles.len()
+    }
+    pub(crate) fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
+        self.handles.retain(|k, _| keep(k));
+    }
+}
 fn row(name: &str) -> Option<Row> {
     match name {
         "WOOD" => Some(Row {
