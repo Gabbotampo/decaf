@@ -18,11 +18,10 @@ pub(crate) fn call(r: &crate::MethodRef, receiver: &Value) -> Option<Result<Valu
     };
     let key = h.key().to_owned();
     match (r.name.as_str(), r.descriptor.as_str()) {
-        ("matches", "()Z") => Some(
-            crate::java_regex::matches(p, input)
-                .map(|b| Value::Int(b as i32))
-                .map_err(|_| NativeError::Truncated),
-        ),
+        ("matches", "()Z") => match crate::java_regex::matches(p, input) {
+            Ok(b) => Some(Ok(Value::Int(b as i32))),
+            Err(_) => None,
+        },
         ("find", "()Z") => None,
         ("start", "()I") | ("end", "()I") => {
             let g = state().lock().ok()?;
