@@ -884,32 +884,8 @@ impl<H: Host> Runtime<'_, H> {
             // A marker, or an object by its key (`jar_object.rs`).
             Value::Ref(Some(_)) | Value::Host(_) => {
                 let marker = expect_ref(value).map_or("", String::as_str);
-                // A jar enum constant serializes as its name. The runtime's
-                // enum constructor table preserves the name for object handles.
-                let enum_name = if tree_mode {
-                    self.enum_constants
-                        .get(crate::jar_object::object_key(value).unwrap_or_default())
-                        .map(|(name, _)| name.as_str())
-                        .or_else(|| {
-                            marker
-                                .strip_prefix("enum/")
-                                .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
-                        })
-                } else {
-                    marker
-                        .strip_prefix("enum/")
-                        .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name))
-                };
-                let enum_name = if tree_mode {
-                    enum_name.and_then(|name| {
-                        crate::jar_object::object_class(value)
-                            .and_then(|class| self.gson_enum_name(class, name))
-                            .or_else(|| Some(name.to_owned()))
-                    })
-                } else {
-                    enum_name.map(str::to_owned)
-                };
-                if let Some(name) = enum_name {
+                // One EnumTypeAdapter name path serves values and map keys.
+                if let Some(name) = self.gson_enum_text(value) {
                     Some(format!("\"{}\"", style.escape(&name)))
                 } else if let Some(kind) = gson_marker_kind(self.host, value, tree_mode) {
                     let values = runtime_collection_values(self.host, value)?;
@@ -982,8 +958,11 @@ impl<H: Host> Runtime<'_, H> {
             }
             first = false;
             out.push_str(&style.line(depth + 1));
+            let Some(key_text) = self.gson_map_key_text(&key) else {
+                return Ok(None);
+            };
             out.push('"');
-            out.push_str(&style.escape(&value_text(&key)));
+            out.push_str(&style.escape(&key_text));
             out.push('"');
             out.push_str(style.colon());
             let Some(text) = self.gson_to_json_mode(&value, style, depth + 1, tree_mode)? else {
@@ -1077,6 +1056,51 @@ impl<H: Host> Runtime<'_, H> {
                 Some(crate::AnnotationValue::String(value)) => Some(value.clone()),
                 _ => None,
             })
+    }
+
+    /// The enum class whose constant field carries Gson's @SerializedName.
+    ///
+    /// A constant-specific enum body is an anonymous subclass (for example
+    /// Probe$Split$1), but EnumTypeAdapter uses the declaring enum class
+    /// (Probe$Split) when it reads the constant field annotation.
+    fn gson_enum_declaring_class(&self, class: &str) -> Option<String> {
+        let mut current = class.to_owned();
+        loop {
+            let file = self.class(&current)?;
+            if file.super_name == "java/lang/Enum" {
+                return Some(current);
+            }
+            if file.super_name.is_empty() || file.super_name == current {
+                return None;
+            }
+            current = file.super_name.clone();
+        }
+    }
+
+    fn gson_enum_text(&self, value: &Value) -> Option<String> {
+        let marker = expect_ref(value)?;
+        let (name, class) = if let Some((name, _)) = self.enum_constants.get(marker) {
+            let class = crate::jar_object::object_class(value)
+                .and_then(|class| self.gson_enum_declaring_class(class));
+            (name.clone(), class)
+        } else {
+            let rest = marker.strip_prefix("enum/")?;
+            let (class, name) = rest.rsplit_once('/')?;
+            (name.to_owned(), Some(class.to_owned()))
+        };
+        class
+            .as_deref()
+            .and_then(|class| self.gson_enum_name(class, &name))
+            .or(Some(name))
+    }
+
+    fn gson_map_key_text(&self, key: &Value) -> Option<String> {
+        if let Some(marker) = expect_ref(key)
+            && (marker.starts_with("enum/") || self.enum_constants.contains_key(marker))
+        {
+            return self.gson_enum_text(key);
+        }
+        Some(value_text(key))
     }
 
     fn gson_field_name(

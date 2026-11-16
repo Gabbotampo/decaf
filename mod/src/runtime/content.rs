@@ -104,7 +104,7 @@ impl ContentDeclaration {
     }
 
     /// The `data/<namespace>/horizon/{block,item}/<path>.json` value the content loader reads
-    /// (`horizon-mod-package/src/content.rs`, `BlockFile`/`ItemFile`).
+    /// (`sunrise-mod-package/src/content.rs`, `BlockFile`/`ItemFile`).
     pub fn file_json(&self) -> Value {
         match self {
             Self::Block(block) => {
