@@ -81,6 +81,43 @@ public class Probe {
     return out.toString();
   }
 
+  /** TextColor.parseColor's DataResult success/error shape. */
+  public static String parseColors() {
+    var good = TextColor.parseColor("#000a");
+    var named = TextColor.parseColor("gold");
+    var bad = TextColor.parseColor("missing");
+    return good.isError() + "," + good.result().get().getValue() + ","
+        + named.result().get().toString() + "," + bad.isError() + "," + bad.result().isEmpty();
+  }
+
+  /** 50,000 deterministic builder chains against the real 26.3 Style. */
+  public static String randomChains() {
+    long hashes = 0;
+    long texts = 0;
+    int empties = 0;
+    for (int i = 0; i < 50000; i++) {
+      int x = i * 1103515245 + 12345;
+      Style style = Style.EMPTY;
+      for (int step = 0; step < 6; step++) {
+        x = x * 1664525 + 1013904223;
+        switch ((x >>> 28) & 7) {
+          case 0 -> style = style.withColor(x);
+          case 1 -> style = style.withColor((x & 1) == 0 ? ChatFormatting.RED : ChatFormatting.GOLD);
+          case 2 -> style = style.withBold((x & 1) == 0 ? Boolean.TRUE : Boolean.FALSE);
+          case 3 -> style = style.withItalic((x & 1) == 0 ? Boolean.TRUE : null);
+          case 4 -> style = style.applyFormat((x & 1) == 0 ? ChatFormatting.BOLD : ChatFormatting.RESET);
+          case 5 -> style = style.applyLegacyFormat((x & 1) == 0 ? ChatFormatting.RED : ChatFormatting.ITALIC);
+          case 6 -> style = style.applyFormats((x & 1) == 0 ? new ChatFormatting[] { ChatFormatting.BOLD, ChatFormatting.RED } : new ChatFormatting[] { ChatFormatting.RESET });
+          default -> style = style.applyTo(Style.EMPTY);
+        }
+      }
+      hashes += style.hashCode();
+      texts += style.toString().hashCode();
+      if (style.isEmpty()) empties++;
+    }
+    return hashes + "," + texts + "," + empties;
+  }
+
   /** Two styles built alike: equal, two objects (Java `two_bold_eq=false`). */
   public static String twoBold() {
     return String.valueOf(Style.EMPTY.withBold(true) == Style.EMPTY.withBold(true));

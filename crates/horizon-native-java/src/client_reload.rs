@@ -219,19 +219,19 @@ fn id_argument(value: Option<&Value>, message: &str) -> Result<Option<String>, N
     Ok(registration_id(value))
 }
 
+/// A collection handle's elements; nothing for any other value (a
+/// collection is a handle, #156 P14d2).
 fn collection_items<H: Host>(runtime: &Runtime<'_, H>, value: &Value) -> Option<Vec<Value>> {
-    runtime.host.mutable_collection_values(value).or_else(|| {
-        matches!(value, Value::Ref(Some(_)))
-            .then(|| crate::collection_values(value).ok())
-            .flatten()
-    })
+    runtime.host.mutable_collection_values(value)
 }
 
+/// The listener's `getFabricDependencies()`, or `None` where the class keeps
+/// the interface's default (`Collections.emptyList()`: no dependencies).
 fn invoke_dependency_method<H: Host>(
     runtime: &mut Runtime<'_, H>,
     class: &str,
     listener: Value,
-) -> Result<Value, NativeError> {
+) -> Result<Option<Value>, NativeError> {
     match runtime.invoke(
         class,
         "getFabricDependencies",
@@ -239,8 +239,8 @@ fn invoke_dependency_method<H: Host>(
         Some(listener.clone()),
         &[],
     ) {
-        Err(NativeError::MissingMethod(_)) => Ok(Value::Ref(Some("list/".into()))),
-        result => result,
+        Err(NativeError::MissingMethod(_)) => Ok(None),
+        result => result.map(Some),
     }
 }
 
@@ -631,13 +631,15 @@ pub(crate) fn runtime_instance_call<H: Host>(
                     Ok(value) => value,
                     Err(error) => return Some(Err(error)),
                 };
-                if matches!(deps, Value::Ref(None)) {
+                if matches!(deps, Some(Value::Ref(None))) {
                     return Some(Err(null_pointer(
                         "Cannot invoke \"java.util.Collection.forEach(java.util.function.Consumer)\" because the return value of \"net.fabricmc.fabric.api.resource.IdentifiableResourceReloadListener.getFabricDependencies()\" is null",
                     )));
                 }
-                let Some(items) = collection_items(runtime, &deps) else {
-                    return None;
+                let items = match deps {
+                    // The interface's default: no dependencies.
+                    None => Vec::new(),
+                    Some(deps) => collection_items(runtime, &deps)?,
                 };
                 for dependency in items {
                     let Some(dependency) = (match id_argument(

@@ -211,10 +211,7 @@ fn crosses_jars(value: &Value) -> bool {
 /// How the sender's runtime reaches `Supplier#get` on `supplier`: a lambda or method reference, or
 /// a jar object's own `get`.
 fn supplier_callback(jar: &NativeJar, supplier: &Value) -> Option<ListenerCallback> {
-    if let Some(text) = expect_ref(supplier)
-        && text.starts_with("@indy:")
-    {
-        let marker = crate::runtime::parse_callback_marker(text).ok()?;
+    if let Some(marker) = crate::runtime::callback_marker::lambda_of(supplier) {
         return Some(ListenerCallback::Indy {
             target: marker.target,
             captures: marker.captures,

@@ -40,6 +40,19 @@ so closure mode over a Fabric corpus needs that jar: pass `--fabric-loader PATH`
 corpus or a default dependency directory. Without it the census stops with an error instead of
 refusing every Fabric closure row; `--allow-missing-fabric-oracle` keeps the old behaviour for tests.
 
+The driver also discovers the exact vanilla block-class closure table in the prepared 26.3
+resources (HORIZON_RESOURCES, the checkout's .local/horizon-client/26.3, or the installer
+game-files location). It prints the selected path, or a warning that vanilla-block instanceof
+calls remain counted. --game-block-classes PATH overrides discovery. The table is generated on
+the player's machine by compiling and running tools/VanillaBlockClassClosureExporter.java with
+Java 25 against that player's 26.3 server jar and libraries; it is an exporter output, never a
+checked-in Mojang file. Horizon's current game bootstrap does not yet pass its prepared resource
+root to java_mods or run this exporter, so Ari's game-side change must add both: publish the
+table in horizon-prepare's output and call StdHost::with_prepared_game_block_classes while
+building each client and dedicated-server host. The census can exercise the table before that
+game wiring lands.
+
+
 `tools/unmodelled_calls.py` prints and can save, per corpus, one row per jar
 (`verdict`, `unknown`, `calls`) and the ranked table. A single jar can be reproduced by
 hand:

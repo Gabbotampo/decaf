@@ -17,6 +17,9 @@
 //!   built-in containers are `java`, `minecraft`, `fabricloader`, `mixinextras`
 //!   and the host's Fabric API ids.
 
+#[path = "support/scratch.rs"]
+mod scratch;
+
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{
     fs,
@@ -76,7 +79,7 @@ fn zip_bytes(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn build(test: &str) -> Run {
-    let root = std::env::temp_dir().join(format!(
+    let root = scratch::unique_path(&format!(
         "horizon-native-java-fabric-mods-{test}-{}",
         std::process::id()
     ));

@@ -61,8 +61,7 @@ use std::{
 };
 
 use crate::{
-    MethodRef, NativeError, Value, collection_value, expect_ref, identifier_parse, path_join,
-    path_value, stable_hash,
+    MethodRef, NativeError, Value, expect_ref, identifier_parse, path_join, path_value, stable_hash,
 };
 
 pub use crate::game_rules::GameRuleValue;
@@ -301,6 +300,39 @@ fn identifier_text(value: &Value) -> Option<String> {
 }
 
 /// Answer one call on a marker [`owns`] says is this module's.
+/// A registry's `keySet()`: `Collections.unmodifiableSet(byLocation.keySet())`,
+/// the ids in the bucket order of the `HashMap` vanilla registered them into.
+/// The ids only: the caller makes the set (`Host::factory_collection`, #156
+/// P14d2). `None` for any other call.
+pub(crate) fn key_set(
+    facts: &ServerFacts,
+    text: &str,
+    r: &MethodRef,
+) -> Option<Result<Vec<Value>, NativeError>> {
+    if (r.name.as_str(), r.descriptor.as_str()) != ("keySet", "()Ljava/util/Set;") {
+        return None;
+    }
+    let id = text.strip_prefix(REGISTRY)?;
+    let entries = facts.registries.get(id)?;
+    let Some((order, indices)) = facts
+        .registration_order
+        .get(id)
+        .filter(|order| order.len() == entries.len())
+        .and_then(|order| {
+            crate::hash_map_order::key_set_order(order, |id| {
+                crate::hash_map_order::identifier_hash(id)
+            })
+            .map(|indices| (order, indices))
+        })
+    else {
+        return Some(refuse(r).map(|_| Vec::new()));
+    };
+    Some(Ok(indices
+        .into_iter()
+        .map(|index| identifier_parse(&order[index]))
+        .collect()))
+}
+
 pub(crate) fn answer(
     facts: &ServerFacts,
     text: &str,
@@ -403,28 +435,7 @@ pub(crate) fn answer(
                     wanted.is_some_and(|wanted| entries.contains(&wanted)),
                 )))
             }
-            // `Collections.unmodifiableSet(byLocation.keySet())`: the ids in
-            // the bucket order of the `HashMap` vanilla registered them into.
-            ("keySet", "()Ljava/util/Set;") => {
-                let Some((order, indices)) = facts
-                    .registration_order
-                    .get(id)
-                    .filter(|order| order.len() == entries.len())
-                    .and_then(|order| {
-                        crate::hash_map_order::key_set_order(order, |id| {
-                            crate::hash_map_order::identifier_hash(id)
-                        })
-                        .map(|indices| (order, indices))
-                    })
-                else {
-                    return refuse(r);
-                };
-                let keys: Vec<Value> = indices
-                    .into_iter()
-                    .map(|index| identifier_parse(&order[index]))
-                    .collect();
-                Ok(collection_value("set", &keys))
-            }
+            // `keySet()` is a host object ([`key_set`]).
             _ => refuse(r),
         };
     }
@@ -878,7 +889,7 @@ mod tests {
         facts
             .registration_order
             .insert("minecraft:item".into(), Arc::new(ids.to_vec()));
-        let key_set = call("net/minecraft/core/Registry", "keySet", "()Ljava/util/Set;");
+        let key_set_call = call("net/minecraft/core/Registry", "keySet", "()Ljava/util/Set;");
         let expected: Vec<Value> = [
             "minecraft:stone",
             "demo:t1",
@@ -895,11 +906,17 @@ mod tests {
         .map(|id| identifier_parse(id))
         .collect();
         assert_eq!(
-            answer(&facts, "game/registry/minecraft:item", &key_set, &[]).unwrap(),
-            collection_value("set", &expected)
+            key_set(&facts, "game/registry/minecraft:item", &key_set_call)
+                .unwrap()
+                .unwrap(),
+            expected
         );
         // `facts()` lists blocks with no registration order.
-        assert!(answer(&facts, "game/registry/minecraft:block", &key_set, &[]).is_err());
+        assert!(
+            key_set(&facts, "game/registry/minecraft:block", &key_set_call)
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]

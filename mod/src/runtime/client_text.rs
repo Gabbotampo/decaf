@@ -17,7 +17,7 @@
 //! drawing path formats by.
 
 use crate::runtime::client_values::{Colour, FLAGS, STYLE, Style, TEXT_COLOR};
-use crate::runtime::{MethodRef, Value, expect_ref, return_desc};
+use crate::runtime::{Host, MethodRef, NativeError, Runtime, Value, expect_ref, return_desc};
 
 use super::{flag, int_arg, marker};
 
@@ -135,6 +135,31 @@ pub(super) fn text_static(r: &MethodRef) -> Option<Value> {
 /// `ChatFormatting.getByName`/`getByCode`.
 pub(super) fn text_invoke(r: &MethodRef, args: &[Value]) -> Option<Value> {
     match (r.owner.as_str(), r.name.as_str()) {
+        ("net/minecraft/network/chat/TextColor", "parseColor") => {
+            let text = expect_ref(args.first()?)?;
+            let colour = if let Some(hex) = text.strip_prefix('#') {
+                // TextColor.parseColor delegates to Integer.parseInt(hex, 16)
+                // and accepts any spelling whose value fits 24 bits (including
+                // leading zeroes), rather than requiring six digits.
+                let significant = hex.trim_start_matches('0');
+                let value = if hex.is_empty() {
+                    None
+                } else if significant.is_empty() {
+                    Some(0)
+                } else if significant.chars().all(|c| c.is_ascii_hexdigit()) {
+                    u32::from_str_radix(significant, 16).ok()
+                } else {
+                    None
+                };
+                value.filter(|value| *value <= 0xff_ffff).map(Colour::Rgb)
+            } else {
+                Colour::from_text(text)
+            };
+            Some(marker(match colour {
+                Some(colour) => format!("style-result/success/{}", colour.code()),
+                None => "style-result/error".into(),
+            }))
+        }
         ("net/minecraft/network/chat/TextColor", "fromRgb") => Some(marker(format!(
             "{TEXT_COLOR}{}",
             Colour::Rgb(int_arg(args, 0)? as u32 & 0xff_ffff).code()
@@ -227,6 +252,59 @@ pub(super) fn component_call(r: &MethodRef, args: &[Value]) -> Option<ComponentC
 /// A call on a style, a text colour or a `ChatFormatting` constant;
 /// `receiver` is the object itself, which a `with…` that changes nothing
 /// hands back (Java's `return this`).
+pub(crate) fn runtime_call<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    receiver: Option<&Value>,
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if let Some(result) = receiver
+        .and_then(crate::runtime::game_object::text)
+        .and_then(|text| text.strip_prefix("style-result/"))
+    {
+        let (success, payload) = match result.strip_prefix("success/") {
+            Some(code) => (true, Some(code)),
+            None if result == "error" => (false, None),
+            None => return None,
+        };
+        return Some(Ok(match (r.name.as_str(), r.descriptor.as_str()) {
+            ("result", "()Ljava/util/Optional;") => {
+                crate::runtime::host_optional::optional_wrap(match (payload, success) {
+                    (Some(code), true) => marker(format!("{TEXT_COLOR}{code}")),
+                    _ => Value::Ref(None),
+                })
+            }
+            ("isError", "()Z") => flag(!success),
+            _ => return None,
+        }));
+    }
+    if r.owner != "net/minecraft/network/chat/Style"
+        || r.name != "applyFormats"
+        || r.descriptor != "([Lnet/minecraft/ChatFormatting;)Lnet/minecraft/network/chat/Style;"
+    {
+        return None;
+    }
+    let object = receiver.and_then(crate::runtime::game_object::text)?.clone();
+    let codes = object.strip_prefix(STYLE)?;
+    let array = args.first()?;
+    let formats = runtime.array(array).ok()?;
+    Some(match apply_formats(codes, &formats) {
+        Some(value) => Ok(value),
+        None => Err(NativeError::UnknownHostCall(r.clone())),
+    })
+}
+
+pub(super) fn apply_formats(codes: &str, formats: &[Value]) -> Option<Value> {
+    let mut style = Style::parse(codes)?;
+    for value in formats {
+        style = style.apply(formatting_code(value)?, false)?;
+        if style == Style::default() {
+            return Some(marker(STYLE));
+        }
+    }
+    Some(marker(format!("{STYLE}{}", style.codes())))
+}
+
 pub(super) fn text_call(
     object: &str,
     receiver: &Value,
@@ -248,13 +326,59 @@ pub(super) fn text_call(
         .position(|setter| *setter == name);
         let next = match (name, returns) {
             ("isEmpty", "Z") => return Some(flag(codes.is_empty())),
-            // `Objects.equals` of the colours is `TextColor.equals`: the value.
+            ("getColor", _) => {
+                return Some(style.colour.map_or(Value::Ref(None), |colour| {
+                    marker(format!("{TEXT_COLOR}{}", colour.code()))
+                }));
+            }
+            ("getShadowColor", _) => {
+                // A style without an unsupported field has no shadow color;
+                // a shadow-bearing style is counted because its field is not
+                // represented separately in the handle key.
+                if style.extra {
+                    return None;
+                }
+                return Some(Value::Ref(None));
+            }
+            ("isBold" | "isItalic" | "isUnderlined" | "isStrikethrough" | "isObfuscated", "Z") => {
+                let at = match name {
+                    "isBold" => 0,
+                    "isItalic" => 1,
+                    "isUnderlined" => 2,
+                    "isStrikethrough" => 3,
+                    _ => 4,
+                };
+                return Some(flag(style.flags[at] == Some(true)));
+            }
+            ("getClickEvent" | "getHoverEvent" | "getInsertion", _) => {
+                if style.extra {
+                    return None;
+                }
+                return Some(Value::Ref(None));
+            }
             ("withColor", _) => match colour_arg(args.first()?)? {
                 colour if colour.map(Colour::value) == style.colour.map(Colour::value) => style,
                 colour => Style { colour, ..style },
             },
+            ("withClickEvent" | "withHoverEvent" | "withInsertion" | "withFont", _) => {
+                if matches!(args.first(), Some(Value::Ref(None))) && !style.extra {
+                    return Some(receiver.clone());
+                }
+                return None;
+            }
             ("applyFormat" | "applyLegacyFormat", _) => {
                 style.apply(formatting_code(args.first()?)?, name == "applyLegacyFormat")?
+            }
+            ("applyTo", _) => {
+                let other_text = crate::runtime::game_object::text(args.first()?)?;
+                let other = Style::parse(other_text.strip_prefix(STYLE)?)?;
+                if style == Style::default() {
+                    return Some(args.first()?.clone());
+                }
+                if other == Style::default() {
+                    return Some(receiver.clone());
+                }
+                style.apply_to(other)
             }
             _ => {
                 let mut next = style;
@@ -270,6 +394,7 @@ pub(super) fn text_call(
     if let Some(code) = object.strip_prefix(TEXT_COLOR) {
         return match (name, returns) {
             ("getValue", "I") => Some(Value::Int(Colour::parse(code)?.value() as i32)),
+            ("serialize" | "toString", _) => Some(Value::Ref(Some(Colour::parse(code)?.text()))),
             _ => None,
         };
     }
@@ -356,6 +481,92 @@ mod tests {
 
     /// `getStyle()` is the component's style now: what `withStyle` set, in one order however it
     /// was built, the empty style before any, and a counted one with a field the model lacks.
+    #[test]
+    fn style_builders_keep_identity_and_apply_fields() {
+        let empty = marker(STYLE);
+        let bold = method(
+            "net/minecraft/network/chat/Style",
+            "withBold",
+            "(Ljava/lang/Boolean;)Lnet/minecraft/network/chat/Style;",
+        );
+        assert_eq!(
+            text_call(
+                crate::runtime::game_object::text(&empty).unwrap(),
+                &empty,
+                &bold,
+                &[Value::Ref(None)]
+            ),
+            Some(empty.clone())
+        );
+        let color = method(
+            "net/minecraft/network/chat/Style",
+            "withColor",
+            "(I)Lnet/minecraft/network/chat/Style;",
+        );
+        let colored = text_call(
+            crate::runtime::game_object::text(&empty).unwrap(),
+            &empty,
+            &color,
+            &[Value::Int(0x123456)],
+        )
+        .unwrap();
+        let get_color = method(
+            "net/minecraft/network/chat/Style",
+            "getColor",
+            "()Lnet/minecraft/network/chat/TextColor;",
+        );
+        assert_eq!(
+            text_call(
+                crate::runtime::game_object::text(&colored).unwrap(),
+                &colored,
+                &get_color,
+                &[]
+            ),
+            Some(marker("client/text-color/§#123456"))
+        );
+        let apply_to = method(
+            "net/minecraft/network/chat/Style",
+            "applyTo",
+            "(Lnet/minecraft/network/chat/Style;)Lnet/minecraft/network/chat/Style;",
+        );
+        assert_eq!(
+            text_call(
+                crate::runtime::game_object::text(&empty).unwrap(),
+                &empty,
+                &apply_to,
+                std::slice::from_ref(&colored),
+            ),
+            Some(colored)
+        );
+        assert_eq!(
+            apply_formats(
+                "",
+                &[
+                    marker("enum/net/minecraft/ChatFormatting/BOLD"),
+                    marker("enum/net/minecraft/ChatFormatting/RED"),
+                ],
+            ),
+            Some(marker("client/style/§c§l"))
+        );
+    }
+
+    #[test]
+    fn text_color_parse_color_returns_a_result_handle() {
+        let parse = method(
+            "net/minecraft/network/chat/TextColor",
+            "parseColor",
+            "(Ljava/lang/String;)Lcom/mojang/serialization/DataResult;",
+        );
+        assert_eq!(
+            text_invoke(&parse, &[Value::Ref(Some("#123456".into()))]),
+            Some(marker("style-result/success/§#123456"))
+        );
+        assert_eq!(
+            text_invoke(&parse, &[Value::Ref(Some("missing".into()))]),
+            Some(marker("style-result/error"))
+        );
+    }
+
     #[test]
     fn a_component_style_is_its_current_style() {
         let plain = serde_json::json!({"text": "a"});

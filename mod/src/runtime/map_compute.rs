@@ -29,22 +29,54 @@ impl<H: Host> Runtime<'_, H> {
             let [key, value] = args else {
                 return Ok(None);
             };
-            return Ok(Some(map_entry_value(key, value)));
+            // `new KeyValueHolder(k, v)`: `Objects.requireNonNull` of both.
+            if *key == Value::Ref(None) || *value == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let entry = self.host.mint_map_entry(
+                None,
+                key,
+                value,
+                crate::runtime::host_map_entry::EntryMade::Holder,
+            );
+            return Ok(Some(entry));
         }
-        if r.owner == "java/util/Map"
-            && r.name == "ofEntries"
-            && r.descriptor == "([Ljava/util/Map$Entry;)Ljava/util/Map;"
+        // `Map.Entry.copyOf(e)`: a `KeyValueHolder` itself, else `Map.entry(e.getKey(),
+        // e.getValue())`.
+        if r.owner == "java/util/Map$Entry"
+            && r.name == "copyOf"
+            && r.descriptor == "(Ljava/util/Map$Entry;)Ljava/util/Map$Entry;"
         {
-            let Some(array) = args.first() else {
+            let [entry] = args else {
                 return Ok(None);
             };
-            let mut pairs = Vec::new();
-            for entry in self.array(array)?.clone() {
-                let (key, value) = map_entry_parts(&entry)?;
-                pairs.extend([key, value]);
+            if crate::runtime::host_map_entry::is_key_value_holder(entry) {
+                return Ok(Some(entry.clone()));
             }
-            return Ok(Some(collection_value("map", &pairs)));
+            let Some((key, value)) = self.host.map_entry_parts(entry) else {
+                return Ok(None);
+            };
+            if key == Value::Ref(None) || value == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let copy = self.host.mint_map_entry(
+                None,
+                &key,
+                &value,
+                crate::runtime::host_map_entry::EntryMade::Holder,
+            );
+            return Ok(Some(copy));
         }
+        // `Map.ofEntries` is `immutable_collections.rs`'s (Java's `MapN` with
+        // its probe table, as `Map.of`).
         if r.name != "computeIfAbsent"
             || r.descriptor != "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;"
             || !is_map_owner(&r.owner)
@@ -56,7 +88,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         // Only a callback marker is the interpreter's to run; the host keeps
         // its own answer for anything else.
-        if !expect_ref(function).is_some_and(|marker| marker.starts_with("@indy:")) {
+        if crate::runtime::callback_marker::callback_text(function).is_none() {
             return Ok(None);
         }
         let get = MethodRef {

@@ -30,6 +30,8 @@ struct Cli {
     /// `--game-version <version>`: the release the host reports to the
     /// loader and the game's own version detector.
     game_version: Option<String>,
+    /// `--game-block-classes <path>`: the exact prepared 26.3 closure table.
+    game_block_classes: Option<String>,
     path: String,
     kind: Option<String>,
     class: Option<String>,
@@ -42,6 +44,7 @@ impl Cli {
         let mut weave = None;
         let mut links = Vec::new();
         let mut game_version = None;
+        let mut game_block_classes = None;
         let mut positional = Vec::new();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -56,6 +59,8 @@ impl Cli {
                 links.push(args.next()?);
             } else if arg == "--game-version" {
                 game_version = Some(args.next()?);
+            } else if arg == "--game-block-classes" {
+                game_block_classes = Some(args.next()?);
             } else {
                 positional.push(arg);
             }
@@ -67,6 +72,7 @@ impl Cli {
             weave,
             links,
             game_version,
+            game_block_classes,
             path: positional.next()?,
             kind: positional.next(),
             class: positional.next(),
@@ -511,13 +517,28 @@ fn mixin_plan_sort_key(
 /// `callback` carries the mixin class and method (`owner#name`) because a
 /// callback only makes sense together with the class that declares it;
 /// `callback_descriptor` holds the rest of its signature.
-fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
+fn selector_for<'a>(
+    plan: &MixinInjectionPlan,
+    selectors: &'a [horizon_native_java::MixinPlanSelectors],
+) -> Option<&'a horizon_native_java::MixinPlanSelectors> {
+    selectors.iter().find(|selector| {
+        selector.target == plan.target
+            && selector.callback == plan.callback
+            && selector.at == plan.at
+    })
+}
+
+fn mixin_plan_entries(
+    plans: &[MixinInjectionPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
     let mut plans = plans.to_vec();
     plans.sort_by_key(mixin_plan_sort_key);
     plans.dedup();
     plans
         .iter()
         .map(|plan| {
+            let selector = selector_for(plan, selectors);
             serde_json::json!({
                 "target": plan.target.owner,
                 "method": plan.target.name,
@@ -527,16 +548,98 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
                 "at": plan.at,
                 "invoke_target": plan.invoke_target.as_ref().map(method_label),
                 "cancellable": plan.cancellable,
+                "method_descriptor": plan.target.descriptor,
+                "ordinal": selector.and_then(|s| s.ordinal),
+                "opcode": selector.and_then(|s| s.opcode),
+                "shift": selector.and_then(|s| s.shift.clone()),
+                "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+                "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                    (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                    _ => None,
+                }),
             })
         })
         .collect()
 }
 
-/// The `--mixin-plans` report: planning only, no entrypoint is required.
+fn anchor_plan_entries(
+    plans: &[horizon_native_java::MixinAnchorPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == plan.at && s.opcode == plan.opcode);
+        let field_access = plan.site.as_deref().and_then(|site| site.rsplit_once(':')
+            .and_then(|(_, direction)| matches!(direction, "GET" | "PUT").then_some(direction)));
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": plan.at, "site": plan.site,
+            "opcode": selector.and_then(|s| s.opcode), "field_access": field_access,
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+            "cancellable": plan.cancellable, "redirect": plan.redirect,
+        })
+    }).collect()
+}
+
+fn modify_arg_entries(
+    plans: &[horizon_native_java::MixinModifyArgPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == "INVOKE");
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": "INVOKE",
+            "invoke_target": method_label(&plan.invoke_target),
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "opcode": selector.and_then(|s| s.opcode),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+        })
+    }).collect()
+}
+
+fn modify_variable_entries(
+    plans: &[horizon_native_java::MixinModifyVariablePlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == plan.at);
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": plan.at,
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "opcode": selector.and_then(|s| s.opcode),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+        })
+    }).collect()
+}
+
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
     let unresolved = jar.unresolved_invoke_plans();
     let class_warnings = jar.class_annotation_warnings();
+    let selectors = jar.mixin_plan_selectors();
     let configs = jar
         .mixin_configs()
         .iter()
@@ -556,8 +659,14 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     serde_json::json!({
         "status": "ok",
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
-        "plans": mixin_plan_entries(&plans),
-        "unresolved": mixin_plan_entries(&unresolved),
+        "plans": mixin_plan_entries(&plans, &selectors),
+        "unresolved": mixin_plan_entries(&unresolved, &selectors),
+        "anchor_plans": anchor_plan_entries(&jar.mixin_anchor_plans(), &selectors),
+        "unresolved_anchor_plans": anchor_plan_entries(&jar.unresolved_anchor_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
+        "modify_arg_plans": modify_arg_entries(&jar.mixin_modify_arg_plans(), &selectors),
+        "unresolved_modify_arg_plans": modify_arg_entries(&jar.unresolved_modify_arg_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
+        "modify_variable_plans": modify_variable_entries(&jar.mixin_modify_variable_plans(), &selectors),
+        "unresolved_modify_variable_plans": modify_variable_entries(&jar.unresolved_modify_variable_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
         "configs": configs,
         "config_errors": jar
             .mixin_config_errors()
@@ -633,7 +742,7 @@ fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
             "usage: horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] \
-             [--link <jar>]... [--game-version <version>] <mod.jar> \
+             [--link <jar>]... [--game-version <version>] [--game-block-classes <path>] <mod.jar> \
              [main|client|server|neoforge] [class]"
         );
         return ExitCode::FAILURE;
@@ -644,6 +753,7 @@ fn main() -> ExitCode {
         weave,
         links,
         game_version,
+        game_block_classes,
         path,
         kind: requested_kind,
         class: explicit_class,
@@ -768,6 +878,22 @@ fn main() -> ExitCode {
     let mut seed = StdHost::new().with_environment_type(side);
     if let Some(version) = game_version {
         seed = seed.with_game_version(version);
+    }
+    if let Some(path) = game_block_classes {
+        seed = match seed.with_game_block_classes_file(path) {
+            Ok(seed) => seed,
+            Err(error) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "error", "stage": "game-data", "error": error})
+                    );
+                } else {
+                    eprintln!("error loading game block classes: {error}");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
     }
     let mut host = jar.seed_host(seed);
     for link in &links {
@@ -1080,13 +1206,21 @@ fn frame_census(
             pos: [0.5, 64.0, 0.5],
             health: 20.0,
             max_health: 20.0,
+            // These stateful values are not in the census frame snapshot.
+            // The façade must count reads rather than invent answers.
+            using_item: None,
+            sleeping: None,
             ..ClientPlayer::default()
         }),
         level: Some(ClientLevel::default()),
         single_player: true,
         gui_size: [427, 240],
         window_size: [854, 480],
-        gui_scale: 2.0,
+        // The game fills these when it has a live frame; census has no such
+        // values, so every corresponding read remains explicitly counted.
+        gui_scale: None,
+        options: Default::default(),
+        hit_result: None,
         fps: 60,
         render_distance: 12,
         metrics: Arc::new(TextMetrics {
@@ -1165,6 +1299,7 @@ mod tests {
             weave: None,
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: Some("client".into()),
             class: Some("demo.Main".into()),
@@ -1187,6 +1322,7 @@ mod tests {
             weave: None,
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1203,6 +1339,7 @@ mod tests {
             weave: Some("out.jar".into()),
             links: Vec::new(),
             game_version: None,
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1224,6 +1361,7 @@ mod tests {
             weave: None,
             links: vec!["a.jar".into(), "b.jar".into()],
             game_version: Some("26.3".into()),
+            game_block_classes: None,
             path: "mod.jar".into(),
             kind: Some("neoforge".into()),
             class: None,
@@ -1247,6 +1385,26 @@ mod tests {
     }
 
     #[test]
+    fn game_block_class_table_flag_takes_its_value() {
+        let expected = Cli {
+            json: false,
+            mixin_plans: false,
+            weave: None,
+            links: Vec::new(),
+            game_version: None,
+            game_block_classes: Some("classes.json".into()),
+            path: "mod.jar".into(),
+            kind: Some("server".into()),
+            class: None,
+        };
+        assert_eq!(
+            parse(&["--game-block-classes", "classes.json", "mod.jar", "server"]),
+            Some(expected)
+        );
+        assert_eq!(parse(&["mod.jar", "--game-block-classes"]), None);
+    }
+
+    #[test]
     fn bare_jar_is_a_valid_invocation() {
         assert_eq!(
             parse(&["mod.jar"]),
@@ -1256,6 +1414,7 @@ mod tests {
                 weave: None,
                 links: Vec::new(),
                 game_version: None,
+                game_block_classes: None,
                 path: "mod.jar".into(),
                 kind: None,
                 class: None,
