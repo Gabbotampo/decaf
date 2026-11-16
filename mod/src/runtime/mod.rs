@@ -77,6 +77,7 @@ mod game_codecs;
 mod game_hooks;
 mod game_object;
 mod game_rules;
+mod gson_fromjson;
 mod gson_model;
 mod gson_to_json_tree;
 mod gson_tree;
@@ -14634,7 +14635,7 @@ const MAX_GENERIC_SIGNATURE_BYTES: usize = 64 * 1024;
 /// wildcard and generic-array shapes are `java.lang.reflect.Type` handles
 /// (`host_reflect_type.rs`) whose key is the node itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum GenericType {
+pub(crate) enum GenericType {
     /// A class or array type: the internal name (`java/util/List`) or the
     /// array descriptor (`[Ljava/lang/String;`), exactly the marker
     /// `Field.getType` answers.
@@ -14662,7 +14663,7 @@ enum GenericType {
 
 /// What declares a type variable (`TypeVariable.getGenericDeclaration`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum TypeDeclaration {
+pub(crate) enum TypeDeclaration {
     /// A class: its internal name.
     Class(String),
     /// A method or constructor: its class, name and descriptor.
@@ -30079,6 +30080,12 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_gson_fromjson(&r, receiver.as_ref(), &args)
+                    ) {
+                        // Gson's bounded reflective fromJson adapter (`gson_fromjson.rs`).
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         gson_to_json_tree::instance_call(
                             self,
                             &r,
@@ -30086,6 +30093,7 @@ impl<H: Host> Runtime<'_, H> {
                             &args,
                         )
                     ) {
+                        // Gson's `toJsonTree` instance surface (`gson_to_json_tree.rs`).
                         value
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))
