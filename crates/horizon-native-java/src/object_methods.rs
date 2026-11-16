@@ -945,6 +945,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Count a read of an identity hash, which no run can reproduce.
     fn count_identity_hash(&mut self) -> Result<Value, NativeError> {
+        self.host.mark_nondeterministic("java-identity-hash");
         self.host.unknown_operand_call(&MethodRef {
             owner: "java/lang/Object".into(),
             name: "hashCode".into(),

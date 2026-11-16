@@ -2368,6 +2368,9 @@ pub trait Host {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
 
+    /// Mark an inherently nondeterministic Java answer; hosts without census diagnostics ignore it.
+    fn mark_nondeterministic(&mut self, _marker: &str) {}
+
     /// Reserve one DFU construction node and any callback roots it introduces
     /// against this jar's lifetime budget.
     fn reserve_dfu_codec(
@@ -3500,6 +3503,8 @@ pub struct StdHost {
     collections_paused: bool,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
+    /// Runtime outcomes whose Java answer is inherently per-process or order-dependent.
+    nondeterministic: BTreeSet<String>,
     /// The threads the jar made and started (`parked_threads.rs`).
     threads: parked_threads::ThreadTable,
     strict_unknown_host_calls: bool,
@@ -3668,6 +3673,7 @@ impl StdHost {
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
             unknown_host_calls: BTreeMap::new(),
+            nondeterministic: BTreeSet::new(),
             threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
@@ -3705,6 +3711,14 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    pub(crate) fn mark_nondeterministic(&mut self, marker: &str) {
+        self.nondeterministic.insert(marker.to_owned());
+    }
+
+    pub fn nondeterministic_markers(&self) -> Vec<String> {
+        self.nondeterministic.iter().cloned().collect()
     }
 
     /// Named DFU construction refusals for the current jar.
@@ -5416,6 +5430,10 @@ impl Host for StdHost {
 
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
+    }
+
+    fn mark_nondeterministic(&mut self, marker: &str) {
+        self.mark_nondeterministic(marker);
     }
 
     fn jar_module_descriptor(&self) -> Option<bool> {
@@ -7616,6 +7634,7 @@ impl Host for StdHost {
                 {
                     return self.unknown_host_call(r);
                 }
+                self.mark_nondeterministic("java-identity-hash");
                 Ok(Value::Int(match value {
                     Value::Ref(None) => 0,
                     _ => stable_hash(&value_text(value)),

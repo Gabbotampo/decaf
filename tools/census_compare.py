@@ -173,10 +173,17 @@ def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]
     # which binary still has the instability. The union remains the exclusion set
     # for the base-to-head movement table, preserving the old report contract.
     flaky_by_binary: dict[str, dict[tuple[str, str, str, str], list[dict]]] = {}
+    inherent_by_binary: dict[str, dict[tuple[str, str, str, str], list[dict]]] = {}
     all_flaky: dict[tuple[str, str, str, str], list[dict]] = {}
     for label, payloads in repetitions.items():
         found = differing_rows(payloads, role)
+        inherent = {
+            key: runs for key, runs in found.items()
+            if any(isinstance(row, dict) and row.get("nondeterministic") for row in runs)
+        }
+        found = {key: runs for key, runs in found.items() if key not in inherent}
         flaky_by_binary[label] = found
+        inherent_by_binary[label] = inherent
         all_flaky.update(found)
     excluded = set(all_flaky)
     return {"base": {"sha": base.get("sha"), "totals": totals(base, role, excluded)},
@@ -186,7 +193,9 @@ def compare_payloads(base: dict, merged: dict, repetitions: dict[str, list[dict]
                                  "merged": nondeterministic_rows(merged)},
             "flaky": flaky_rows(all_flaky),
             "base_flaky": flaky_rows(flaky_by_binary.get("base", {})),
-            "merged_flaky": flaky_rows(flaky_by_binary.get("merged", {}))}
+            "merged_flaky": flaky_rows(flaky_by_binary.get("merged", {})),
+            "base_inherent": flaky_rows(inherent_by_binary.get("base", {})),
+            "merged_inherent": flaky_rows(inherent_by_binary.get("merged", {}))}
 
 
 def markdown(report: dict) -> str:
@@ -209,8 +218,8 @@ def markdown(report: dict) -> str:
         lines.append(f"| {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {item['base_verdict']} → {item['merged_verdict']} | {item['base_unknown']} → {item['merged_unknown']} | {calls(item['vanished'])} | {calls(item['appeared'])} | {others(item.get('other_changes', []))} | {item['attribution']} |")
     if not report["moved"]:
         lines.append("| — | — | — | — | — | — | — | — | — | — |")
-    lines += ["", "## Non-deterministic wall guards", "",
-              "A row here fired the distant wall-clock hang guard. It is marked nondeterministic and is never treated as an ordinary refusal.", "",
+    lines += ["", "## Non-deterministic rows", "",
+              "A row here has an inherent nondeterminism marker (for example Java's random immutable-collection iteration). It is never treated as an ordinary flaky row or refusal.", "",
               "| Binary | Corpus | Mode | Role | Jar | Marker | Error |", "|---|---|---|---|---|---|---|"]
     guards = report.get("nondeterministic", {})
     for binary in ("base", "merged"):
@@ -224,6 +233,8 @@ def markdown(report: dict) -> str:
               "| Binary | Corpus | Mode | Role | Jar | Repetitions |", "|---|---|---|---|---|---|"]
     stability_rows = [("base", item) for item in report.get("base_flaky", [])]
     stability_rows += [("merged/head", item) for item in report.get("merged_flaky", [])]
+    stability_rows += [("base/inherent", item) for item in report.get("base_inherent", [])]
+    stability_rows += [("merged/inherent", item) for item in report.get("merged_inherent", [])]
     if stability_rows:
         for binary, item in stability_rows:
             lines.append(f"| {binary} | {item['corpus']} | {item['mode']} | {item['role']} | `{item['jar']}` | {len(item['runs'])} |")

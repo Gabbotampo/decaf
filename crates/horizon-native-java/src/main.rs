@@ -710,6 +710,7 @@ fn execution_json(
         "unknown_host_calls": host.unknown_host_calls(),
         "client_registrations": host.client_registration_summary(),
         "parked_threads": parked_threads_json(host),
+        "nondeterministic": host.nondeterministic_markers(),
         "payload_directions": host
             .payload_registrations()
             .iter()
