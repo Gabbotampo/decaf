@@ -1,2 +1,0 @@
-import net.minecraft.world.item.ToolMaterial;
-public class tool_material_oracle { public static void main(String[] a) { for (var f: ToolMaterial.class.getFields()) if (f.getType()==ToolMaterial.class) try { var t=(ToolMaterial)f.get(null); System.out.println(f.getName()+
