@@ -24,7 +24,15 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/neoforged/fml/ModContainer.java",
-        "package net.neoforged.fml; public class ModContainer { public String getModId(){return null;} public String getNamespace(){return null;} }",
+        "package net.neoforged.fml; import net.neoforged.bus.api.IEventBus; import net.neoforged.neoforgespi.language.IModInfo; public class ModContainer { public String getModId(){return null;} public String getNamespace(){return null;} public IModInfo getModInfo(){return null;} public IEventBus getEventBus(){return null;} }",
+    ),
+    (
+        "net/neoforged/bus/api/IEventBus.java",
+        "package net.neoforged.bus.api; public interface IEventBus {}",
+    ),
+    (
+        "net/neoforged/neoforgespi/language/IModInfo.java",
+        "package net.neoforged.neoforgespi.language; public interface IModInfo { String getModId(); }",
     ),
     (
         "net/neoforged/fml/ModLoadingContext.java",
@@ -48,6 +56,15 @@ const STUBS: &[(&str, &str)] = &[
     ),
 ];
 
+const ORACLE: &str = include_str!("fixtures/neoforge_api_slice/java25.txt");
+
+fn expected(name: &str) -> &'static str {
+    ORACLE
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("missing oracle row {name}"))
+}
+
 const PROBE: &str = r#"package demo;
 
 import net.neoforged.fml.ModContainer;
@@ -68,7 +85,10 @@ public final class Probe {
         PayloadRegistrar registrar = new RegisterPayloadHandlersEvent().registrar("1");
         Object object = registrar;
         PayloadRegistrar refined = registrar.versioned("2").optional();
-        active = container.getModId() + "|" + context.getActiveNamespace()
+        active = container.getModId() + "|" + container.getNamespace()
+            + "|" + (container.getEventBus() != null)
+            + "|" + container.getModInfo().getModId()
+            + "|" + context.getActiveNamespace()
             + "|" + FMLLoader.isProduction() + "|" + !DatagenModLoader.isRunningDataGen()
             + "|" + (object instanceof PayloadRegistrar) + "|" + (registrar == refined)
             + "|" + (registrar != refined);
@@ -78,7 +98,11 @@ public final class Probe {
 
     public static String outside() {
         ModLoadingContext context = ModLoadingContext.get();
-        return context.getActiveContainer().getModId() + "|" + context.getActiveNamespace();
+        return context.getActiveContainer().getModId() + "|"
+            + context.getActiveContainer().getNamespace() + "|"
+            + (context.getActiveContainer().getEventBus() == null) + "|"
+            + context.getActiveContainer().getModInfo().getModId() + "|"
+            + context.getActiveNamespace();
     }
 
     public static String contextIdentity() {
@@ -176,17 +200,23 @@ fn neoforge_loader_and_payload_handles_match_java25_oracle() {
     let mut host = jar.seed_host(StdHost::new().with_mod("demo", "1.0"));
     jar.execute("demo.Probe", None, "neoforge", &mut host)
         .unwrap();
+    assert_eq!(text(&jar, &mut host, "active"), expected("active"));
+    assert_eq!(text(&jar, &mut host, "outside"), expected("outside"));
     assert_eq!(
-        text(&jar, &mut host, "active"),
-        "demo|demo|true|true|true|false|true"
+        text(&jar, &mut host, "contextIdentity"),
+        expected("contextIdentity")
     );
-    assert_eq!(text(&jar, &mut host, "outside"), "minecraft|minecraft");
-    assert_eq!(text(&jar, &mut host, "contextIdentity"), "true");
-    assert_eq!(text(&jar, &mut host, "dataGen"), "false");
-    assert_eq!(text(&jar, &mut host, "gameDir"), "/horizon/game");
+    assert_eq!(
+        text(&jar, &mut host, "dataGen"),
+        expected("dataGen(normal)")
+    );
+    assert_eq!(text(&jar, &mut host, "gameDir"), expected("gameDir"));
 
     let mut datagen = jar.seed_host(StdHost::new().with_mod("demo", "1.0").with_data_gen(true));
-    assert_eq!(text(&jar, &mut datagen, "dataGen"), "true");
+    assert_eq!(
+        text(&jar, &mut datagen, "dataGen"),
+        expected("dataGen(data-gen)")
+    );
     let mut unknown_mode = jar.seed_host(
         StdHost::new()
             .with_mod("demo", "1.0")
