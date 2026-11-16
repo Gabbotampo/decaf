@@ -226,6 +226,7 @@ mod reflect_override;
 mod regex_calls;
 mod registry_contents;
 mod registry_lookup;
+mod render_math;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
@@ -243,6 +244,8 @@ mod type_switch;
 mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
+mod vanilla_holders;
+mod vanilla_holders_table;
 mod vanilla_registries;
 mod vanilla_values;
 pub mod verdict;
@@ -2370,6 +2373,11 @@ pub trait Host {
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
+    fn register_render_handle(&mut self, _key: &str) {}
+
+    fn owns_render_handle(&self, _key: &str) -> bool {
+        false
+    }
 
     /// Reserve one DFU construction node and any callback roots it introduces
     /// against this jar's lifetime budget.
@@ -2777,6 +2785,11 @@ pub trait Host {
     /// An unseeded service answers an empty list, never a classpath scan.
     fn service_providers(&self, _service: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// A Fabric origin's stored singleton root list, when this host models it.
+    fn origin_paths(&mut self, _receiver: &Value, _path: &str) -> Option<Value> {
+        None
     }
 
     /// Text a jar wrote to `System.out`. The bounded host keeps it in memory for the length of
@@ -3551,6 +3564,9 @@ pub struct StdHost {
     /// The client surface's registrations and current firing
     /// (`client_surface`): key mappings, HUD elements, the frame's snapshot.
     client: client_surface::ClientState,
+    render_objects: BTreeMap<String, render_math::Obj>,
+    /// Render handles allocated by this host, including objects before their constructor runs.
+    render_handles: BTreeSet<String>,
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
@@ -3706,10 +3722,20 @@ impl StdHost {
             next_ranged_attribute: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
+            render_objects: BTreeMap::new(),
+            render_handles: BTreeSet::new(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
         }
+    }
+
+    pub(crate) fn register_render_handle(&mut self, key: &str) {
+        self.render_handles.insert(key.to_owned());
+    }
+
+    pub(crate) fn owns_render_handle(&self, key: &str) -> bool {
+        self.render_handles.contains(key)
     }
 
     /// Make an unmodeled host call fail instead of returning its neutral Java
@@ -3993,6 +4019,32 @@ impl StdHost {
             return jar_object::collection(marker);
         }
         let made = self.new_collection(class, values);
+        if let Some(marker) = expect_ref(&made) {
+            self.cached_collections.insert(cache, marker.clone());
+        }
+        made
+    }
+
+    /// The loader wraps metadata collections in a fresh unmodifiable view,
+    /// cached per receiver and getter just like the mutable stand-ins.
+    pub(crate) fn cached_unmodifiable_collection(
+        &mut self,
+        of: &Value,
+        member: &str,
+        class: &str,
+        values: Vec<Value>,
+    ) -> Value {
+        let Some(identity) = cache_identity(of) else {
+            return self.unmodifiable_as(class, values);
+        };
+        let cache = (identity, member.to_owned());
+        if let Some(marker) = self.cached_collections.get(&cache)
+            && (self.mutable_collections.contains_key(marker)
+                || self.unmodifiable_collections.contains_key(marker))
+        {
+            return jar_object::collection(marker.clone());
+        }
+        let made = self.unmodifiable_as(class, values);
         if let Some(marker) = expect_ref(&made) {
             self.cached_collections.insert(cache, marker.clone());
         }
@@ -5420,6 +5472,14 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn register_render_handle(&mut self, key: &str) {
+        self.register_render_handle(key);
+    }
+
+    fn owns_render_handle(&self, key: &str) -> bool {
+        self.owns_render_handle(key)
+    }
+
     fn unknown_operand_call(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         self.unknown_host_call(r)
     }
@@ -6005,6 +6065,15 @@ impl Host for StdHost {
         self.merged_service_providers(service)
     }
 
+    fn origin_paths(&mut self, receiver: &Value, path: &str) -> Option<Value> {
+        Some(self.cached_unmodifiable_collection(
+            receiver,
+            "getPaths",
+            "java/util/Collections$SingletonList",
+            vec![path_value(path)],
+        ))
+    }
+
     fn resource_stream_text(&mut self, marker: &str) -> Option<String> {
         let (bytes, index) = self.resource_streams.get_mut(marker)?;
         let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
@@ -6237,6 +6306,9 @@ impl Host for StdHost {
         {
             return Ok(value);
         }
+        if let Some(value) = vanilla_holders::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = self.client_static(r) {
             return value;
         }
@@ -6281,6 +6353,9 @@ impl Host for StdHost {
             } else {
                 host_registry::registry(id)
             });
+        }
+        if let Some(value) = render_math::static_field(r) {
+            return Ok(value);
         }
         // A modelled game enum's constant is its `enum/<class>/<NAME>` marker,
         // the same value `values()` lists.
@@ -7818,6 +7893,12 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        let mut render_objects = std::mem::take(&mut self.render_objects);
+        let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
+        self.render_objects = render_objects;
+        if let Some(result) = render_result {
+            return result;
+        }
         if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
             return result;
         }
@@ -9716,6 +9797,19 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            if r.name == "remove"
+                && r.descriptor == "()V"
+                && self.iterator_sources.get(marker).is_some_and(|source| {
+                    source.starts_with("java/util/Collections$Unmodifiable")
+                        || source == "java/util/Collections$SingletonList"
+                })
+            {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/UnsupportedOperationException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
                 ("next", "()Ljava/lang/Object;") => {
@@ -11430,11 +11524,10 @@ impl Host for StdHost {
                 // The container keeps its root paths: one list per container.
                 let id = host_fabric_loader::container_id(receiver).unwrap_or_default();
                 let roots = vec![path_value(&format!("/horizon/mods/{id}"))];
-                Ok(self.cached_collection(
+                Ok(self.cached_unmodifiable_collection(
                     receiver,
                     "getRootPaths",
-                    stand_in_class("list"),
-                    false,
+                    "java/util/Collections$SingletonList",
                     roots,
                 ))
             }
@@ -11469,19 +11562,15 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
-            // The metadata keeps each of these: one empty collection per
-            // metadata object and member, the same on every call.
+            // Metadata handles without a recorded V1 document are the
+            // bounded opaque-loader fallback. Keep the old per-receiver
+            // collection identity for this unknown path; V0 and builtin
+            // documents are handled by fabric_mods.rs and remain counted.
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getProvides" | "getAuthors" | "getContributors" | "getLicense",
                 "()Ljava/util/Collection;",
-            ) => Ok(self.cached_collection(
-                receiver,
-                &r.name,
-                stand_in_class("list"),
-                false,
-                Vec::new(),
-            )),
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
@@ -11490,14 +11579,8 @@ impl Host for StdHost {
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getDependencies",
-                "()Ljava/util/Map;",
-            ) => Ok(self.cached_collection(
-                receiver,
-                "getDependencies",
-                stand_in_class("map"),
-                false,
-                Vec::new(),
-            )),
+                "()Ljava/util/Collection;" | "()Ljava/util/Map;",
+            ) => self.counted_metadata_collection(r, receiver),
             (
                 "net/fabricmc/loader/api/Version",
                 "getFriendlyString" | "getRaw" | "toString",
@@ -16029,6 +16112,8 @@ fn host_models_class(name: &str) -> bool {
         "net/neoforged/",
         "net/minecraftforge/",
         "com/google/gson/",
+        "com/mojang/",
+        "org/joml/",
         "org/spongepowered/asm/mixin/injection/callback/",
     ];
     is_platform_class(name) || ROOTS.iter().any(|root| name.starts_with(root))
@@ -23459,6 +23544,10 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
+        if render_math::is_class(class) {
+            self.host.register_render_handle(&key);
+            return render_math::new_value(class, &key);
+        }
         if let Some(value) = model_layers::new_object(class, &key) {
             return value;
         }

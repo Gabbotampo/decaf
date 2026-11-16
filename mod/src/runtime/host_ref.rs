@@ -357,6 +357,8 @@ pub enum HostKind {
     FabricModContainer,
     /// A Fabric `ModMetadata`: key its mod id.
     FabricModMetadata,
+    /// A Fabric metadata dependency: key its mod id and dependency kind.
+    FabricModDependency,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
     FabricModOriginKind,
@@ -594,6 +596,8 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
+    /// Pure PoseStack/JOML render values.
+    RenderObject,
     /// Pure client model-layer builder values and trees.
     CubeDeformation,
     PartPose,
@@ -1715,6 +1719,15 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_fabric_loader::OBJECT_METHODS,
     },
     KindInfo {
+        kind: HostKind::FabricModDependency,
+        tag: "fdep",
+        class: ClassRule::Unknown {
+            declared: crate::runtime::host_fabric_loader::dependency_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::runtime::host_fabric_loader::OBJECT_METHODS,
+    },
+    KindInfo {
         kind: HostKind::FabricModOrigin,
         tag: "fmo",
         class: ClassRule::Unknown {
@@ -2545,6 +2558,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::runtime::client_reload::converter_class),
         canonical: never_canonical,
         methods: &crate::runtime::client_reload::CONVERTER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RenderObject,
+        tag: "rmat",
+        class: ClassRule::FromKey(crate::runtime::render_math::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::CubeDeformation,
