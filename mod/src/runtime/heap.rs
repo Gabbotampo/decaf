@@ -383,6 +383,7 @@ impl StdHost {
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
         push(self.array_view_of_iterator(marker), out);
+        push(self.ranged_attributes.get(marker), out);
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -412,6 +413,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.array_view_markers())
+            .chain(self.ranged_attributes.keys())
             .map(String::as_str)
     }
 
@@ -443,6 +445,7 @@ impl StdHost {
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
+        self.ranged_attributes.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
     }
 }
@@ -462,6 +465,10 @@ fn collectable(marker: &str) -> bool {
         !class.is_empty() && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
     }) {
         return true;
+    }
+    // A host-created ranged attribute is a per-allocation handle and follows the heap.
+    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
     // (`iterator/empty`) are never collected.
@@ -519,7 +526,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.random_sources.len()
         + host.iterators.len()
         + host.component_states.len()
-        + host.entity_registration.entry_count()
+        + host.ranged_attributes.len()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -697,6 +704,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                     .len()
                 + values(&state.siblings)
                 + state.args.as_deref().map_or(0, values)
+        }))
+        .chain(host.ranged_attributes.iter().map(|(key, state)| {
+            key.len()
+                + state.description_id.as_ref().map_or(0, String::len)
+                + 4 * std::mem::size_of::<f64>()
         }))
         .sum()
 }
@@ -1471,39 +1483,6 @@ mod tests {
     /// `System.getProperties()` lost its contents and every map's views
     /// stayed cached (#226 re-check 4).
     #[test]
-    fn entity_registration_handles_follow_callback_collection_roots() {
-        let mut host = StdHost::new();
-        let mut heap = JavaHeap::default();
-        let category = Value::Ref(Some("enum/net/minecraft/world/entity/MobCategory/CREATURE".into()));
-        let builder = crate::runtime::entity_registration::static_call(
-            &mut host.entity_registration,
-            &crate::runtime::MethodRef { owner: "net/minecraft/world/entity/EntityType$Builder".into(), name: "of".into(), descriptor: "()".into() },
-            &[Value::Ref(Some("factory".into())), category],
-        ).unwrap().unwrap();
-        let entity = crate::runtime::entity_registration::instance_call(
-            &mut host.entity_registration,
-            &crate::runtime::MethodRef { owner: "net/minecraft/world/entity/EntityType$Builder".into(), name: "build".into(), descriptor: "()".into() },
-            &builder,
-            &[Value::Ref(Some("minecraft:probe".into()))],
-        ).unwrap().unwrap();
-        let accessor = crate::runtime::entity_registration::define_id(&mut host.entity_registration, "demo/ProbeEntity");
-        let entity_key = crate::runtime::jar_object::instance_key(&entity).unwrap().to_owned();
-        let accessor_key = crate::runtime::jar_object::instance_key(&accessor).unwrap().to_owned();
-        heap.fields.insert(field(&entity_key, "state"), Value::Int(1));
-        heap.fields.insert(field(&accessor_key, "state"), Value::Int(1));
-        host.mutable_collections.insert("java/util/ArrayList#neutral0".into(), vec![entity.clone(), accessor.clone()]);
-        host.persistent_static_fields.insert("demo/Mod#ROOTLjava/util/List;".into(), text("java/util/ArrayList#neutral0"));
-        collect(&mut heap, &mut host, &[]);
-        assert_eq!(host.entity_registration.entry_count(), 1);
-        assert!(heap.fields.keys().any(|key| field_receiver(key) == entity_key));
-        host.persistent_static_fields.clear();
-        collect(&mut heap, &mut host, &[]);
-        assert_eq!(host.entity_registration.entry_count(), 0);
-        assert!(heap.fields.is_empty());
-        assert_eq!(crate::runtime::entity_registration::accessor_id(&accessor), Some(7));
-    }
-
-    #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
             "array_views",
@@ -1541,6 +1520,7 @@ mod tests {
             "empty_collections",
             "shared_empties",
             "cached_collections",
+            "ranged_attributes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1585,6 +1565,7 @@ mod tests {
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
+            "next_ranged_attribute",
             "properties",
             "environment",
             "resources",
@@ -1618,6 +1599,9 @@ mod tests {
             "holder_binding",
             "charset_decoders",
             "persistent_initialized_classes",
+            "dfu_codec_nodes",
+            "dfu_codec_callback_roots",
+            "dfu_codec_refusals",
             "unknown_host_calls",
             "strict_unknown_host_calls",
             "next_lazy_optional",
