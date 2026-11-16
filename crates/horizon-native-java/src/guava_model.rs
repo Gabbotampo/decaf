@@ -258,6 +258,24 @@ impl<H: Host> Runtime<'_, H> {
                 _ => {}
             }
         }
+        if let Some(Value::Ref(Some(kind))) = receiver {
+            let natural = kind == "guava-ordering-natural";
+            let reverse = kind == "guava-ordering-reverse";
+            if natural || reverse {
+                if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
+                    return Ok(Some(Value::Ref(Some(if natural { "Ordering.natural()" } else { "Ordering.natural().reverse()" }.into()))));
+                }
+                if r.name == "compare" && args.len() == 2 {
+                    if args.iter().any(|v| matches!(v, Value::Ref(None))) {
+                        return Err(thrown("java/lang/NullPointerException", None));
+                    }
+                    if let (Value::Ref(Some(a)), Value::Ref(Some(b))) = (&args[0], &args[1]) {
+                        let ord = a.cmp(b) as i32;
+                        return Ok(Some(Value::Int(if reverse { -ord } else { ord })));
+                    }
+                }
+            }
+        }
         if (r.owner == "com/google/common/collect/ImmutableMap"
             || r.owner == "com/google/common/collect/ImmutableBiMap")
             && r.name == "copyOf"
