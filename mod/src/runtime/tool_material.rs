@@ -12,6 +12,14 @@ struct Row {
 pub(crate) struct State {
     handles: BTreeMap<String, Value>,
 }
+impl State {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.handles.len()
+    }
+    pub(crate) fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
+        self.handles.retain(|k, _| keep(k));
+    }
+}
 fn row(name: &str) -> Option<Row> {
     match name {
         "WOOD" => Some(Row {
@@ -66,10 +74,24 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Result<Va
     {
         return None;
     }
-    let v = state
-        .handles
-        .entry(r.name.clone())
-        .or_insert_with(|| jar_object::handle(format!("{OWNER}#{}", r.name)));
+    let v = state.handles.entry(r.name.clone()).or_insert_with(|| {
+        jar_object::handle(format!(
+            "{OWNER}#{}",
+            [
+                "WOOD",
+                "STONE",
+                "COPPER",
+                "IRON",
+                "DIAMOND",
+                "GOLD",
+                "NETHERITE"
+            ]
+            .iter()
+            .position(|n| *n == r.name)
+            .unwrap()
+                + 800000
+        ))
+    });
     Some(Ok(v.clone()))
 }
 pub(crate) fn instance_call(
@@ -82,7 +104,17 @@ pub(crate) fn instance_call(
         return None;
     }
     let key = jar_object::instance_key(receiver)?;
-    let name = key.rsplit_once('#')?.1;
+    let id = key.rsplit_once('#')?.1.parse::<usize>().ok()?;
+    let name = [
+        "WOOD",
+        "STONE",
+        "COPPER",
+        "IRON",
+        "DIAMOND",
+        "GOLD",
+        "NETHERITE",
+    ]
+    .get(id.checked_sub(800000)?)?;
     let x = row(name)?;
     let v = match r.name.as_str() {
         "durability" => Value::Int(x.durability),
@@ -98,12 +130,12 @@ mod tests {
     use super::*;
     #[test]
     fn captured_constants_match_java25_rows() {
-        assert_eq!(row(WOOD).unwrap().durability, 59);
-        assert_eq!(row(STONE).unwrap().durability, 131);
-        assert_eq!(row(COPPER).unwrap().durability, 190);
-        assert_eq!(row(IRON).unwrap().durability, 250);
-        assert_eq!(row(DIAMOND).unwrap().durability, 1561);
-        assert_eq!(row(GOLD).unwrap().durability, 32);
-        assert_eq!(row(NETHERITE).unwrap().durability, 2031);
+        assert_eq!(row("WOOD").unwrap().durability, 59);
+        assert_eq!(row("STONE").unwrap().durability, 131);
+        assert_eq!(row("COPPER").unwrap().durability, 190);
+        assert_eq!(row("IRON").unwrap().durability, 250);
+        assert_eq!(row("DIAMOND").unwrap().durability, 1561);
+        assert_eq!(row("GOLD").unwrap().durability, 32);
+        assert_eq!(row("NETHERITE").unwrap().durability, 2031);
     }
 }
