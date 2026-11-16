@@ -1,0 +1,11 @@
+net.minecraft.world.entity.Entity=8
+net.minecraft.world.entity.LivingEntity=15
+net.minecraft.world.entity.Mob=16
+net.minecraft.world.entity.PathfinderMob=0
+net.minecraft.world.entity.projectile.Projectile=0
+net.minecraft.world.entity.projectile.arrow.AbstractArrow=11
+net.minecraft.world.entity.monster.zombie.Zombie=19
+net.minecraft.world.entity.animal.wolf.Wolf=25
+net.minecraft.world.entity.animal.golem.AbstractGolem=0
+net.minecraft.world.entity.animal.golem.IronGolem=17
+net.minecraft.world.entity.player.Player=21

@@ -97,6 +97,8 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         }),
         ("cbrt", "(D)D") if fdlibm_math => unary(fdlibm::cbrt),
         ("tanh", "(D)D") if fdlibm_math => unary(fdlibm::tanh),
+        ("sin", "(D)D") if math && cfg!(target_arch = "aarch64") => unary(fdlibm::sin),
+        ("cos", "(D)D") if math && cfg!(target_arch = "aarch64") => unary(fdlibm::cos),
         _ => return None,
     })
 }
@@ -186,7 +188,11 @@ mod tests {
             name: "sin".into(),
             descriptor: "(D)D".into(),
         };
-        assert!(static_call(&r, &[Value::Float(0.0)]).is_none());
+        if cfg!(target_arch = "aarch64") {
+            assert!(static_call(&r, &[Value::Float(0.0)]).is_some());
+        } else {
+            assert!(static_call(&r, &[Value::Float(0.0)]).is_none());
+        }
         if !cfg!(target_arch = "aarch64") {
             let r = MethodRef {
                 owner: "java/lang/Math".into(),
@@ -206,5 +212,19 @@ mod tests {
             descriptor: "(DD)D".into(),
         };
         assert!(static_call(&r, &[Value::Float(2.0), Value::Float(10.0)]).is_some());
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_math_sin_cos_match_captured_bits() {
+        for (input, sin_bits, cos_bits) in [
+            (0x66c4110d7079a881, 0xbfef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0xe6c4110d7079a881, 0x3fef84e405049bb1, 0xbfc61b7e6695bf7e),
+            (0x7fe0000000000000, 0x3fe205248cbdb760, 0xbfea719f26c232be),
+            (0x7fefffffffffffff, 0x3f7452fc98b34e97, 0xbfefffe62ecfab76),
+        ] {
+            let input = f64::from_bits(input);
+            assert_eq!(double("sin", &[input]).to_bits(), sin_bits);
+            assert_eq!(double("cos", &[input]).to_bits(), cos_bits);
+        }
     }
 }

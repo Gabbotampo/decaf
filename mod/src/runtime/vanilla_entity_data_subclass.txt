@@ -1,0 +1,7 @@
+child=8
+sibling=8
+grandchild=9
+child2=9
+projectile=8
+pathfinder=16
+tamable=20

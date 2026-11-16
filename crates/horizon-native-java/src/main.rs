@@ -517,13 +517,28 @@ fn mixin_plan_sort_key(
 /// `callback` carries the mixin class and method (`owner#name`) because a
 /// callback only makes sense together with the class that declares it;
 /// `callback_descriptor` holds the rest of its signature.
-fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
+fn selector_for<'a>(
+    plan: &MixinInjectionPlan,
+    selectors: &'a [horizon_native_java::MixinPlanSelectors],
+) -> Option<&'a horizon_native_java::MixinPlanSelectors> {
+    selectors.iter().find(|selector| {
+        selector.target == plan.target
+            && selector.callback == plan.callback
+            && selector.at == plan.at
+    })
+}
+
+fn mixin_plan_entries(
+    plans: &[MixinInjectionPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
     let mut plans = plans.to_vec();
     plans.sort_by_key(mixin_plan_sort_key);
     plans.dedup();
     plans
         .iter()
         .map(|plan| {
+            let selector = selector_for(plan, selectors);
             serde_json::json!({
                 "target": plan.target.owner,
                 "method": plan.target.name,
@@ -533,16 +548,98 @@ fn mixin_plan_entries(plans: &[MixinInjectionPlan]) -> Vec<serde_json::Value> {
                 "at": plan.at,
                 "invoke_target": plan.invoke_target.as_ref().map(method_label),
                 "cancellable": plan.cancellable,
+                "method_descriptor": plan.target.descriptor,
+                "ordinal": selector.and_then(|s| s.ordinal),
+                "opcode": selector.and_then(|s| s.opcode),
+                "shift": selector.and_then(|s| s.shift.clone()),
+                "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+                "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                    (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                    _ => None,
+                }),
             })
         })
         .collect()
 }
 
-/// The `--mixin-plans` report: planning only, no entrypoint is required.
+fn anchor_plan_entries(
+    plans: &[horizon_native_java::MixinAnchorPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == plan.at && s.opcode == plan.opcode);
+        let field_access = plan.site.as_deref().and_then(|site| site.rsplit_once(':')
+            .and_then(|(_, direction)| matches!(direction, "GET" | "PUT").then_some(direction)));
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": plan.at, "site": plan.site,
+            "opcode": selector.and_then(|s| s.opcode), "field_access": field_access,
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+            "cancellable": plan.cancellable, "redirect": plan.redirect,
+        })
+    }).collect()
+}
+
+fn modify_arg_entries(
+    plans: &[horizon_native_java::MixinModifyArgPlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == "INVOKE");
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": "INVOKE",
+            "invoke_target": method_label(&plan.invoke_target),
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "opcode": selector.and_then(|s| s.opcode),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+        })
+    }).collect()
+}
+
+fn modify_variable_entries(
+    plans: &[horizon_native_java::MixinModifyVariablePlan],
+    selectors: &[horizon_native_java::MixinPlanSelectors],
+) -> Vec<serde_json::Value> {
+    plans.iter().map(|plan| {
+        let selector = selectors.iter().find(|s| s.target == plan.target && s.callback == plan.callback && s.at == plan.at);
+        serde_json::json!({
+            "target": plan.target.owner, "method": plan.target.name, "descriptor": plan.target.descriptor,
+            "method_descriptor": plan.target.descriptor,
+            "callback": format!("{}#{}", plan.callback.owner, plan.callback.name),
+            "callback_descriptor": plan.callback.descriptor, "at": plan.at,
+            "ordinal": selector.and_then(|s| s.ordinal),
+            "opcode": selector.and_then(|s| s.opcode),
+            "shift": selector.and_then(|s| s.shift.clone()),
+            "by": selector.and_then(|s| (s.shift.as_deref() == Some("BY")).then_some(s.by)).flatten(),
+            "slice": selector.and_then(|s| match (&s.slice_from, &s.slice_to) {
+                (Some(from), Some(to)) => Some(serde_json::json!({"from": from, "to": to})),
+                _ => None,
+            }),
+        })
+    }).collect()
+}
+
 fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     let plans = jar.mixin_injection_plans();
     let unresolved = jar.unresolved_invoke_plans();
     let class_warnings = jar.class_annotation_warnings();
+    let selectors = jar.mixin_plan_selectors();
     let configs = jar
         .mixin_configs()
         .iter()
@@ -562,8 +659,14 @@ fn mixin_plans_json(jar: &NativeJar) -> serde_json::Value {
     serde_json::json!({
         "status": "ok",
         "targets": mixin_target_labels(plans.iter().map(|plan| &plan.target)),
-        "plans": mixin_plan_entries(&plans),
-        "unresolved": mixin_plan_entries(&unresolved),
+        "plans": mixin_plan_entries(&plans, &selectors),
+        "unresolved": mixin_plan_entries(&unresolved, &selectors),
+        "anchor_plans": anchor_plan_entries(&jar.mixin_anchor_plans(), &selectors),
+        "unresolved_anchor_plans": anchor_plan_entries(&jar.unresolved_anchor_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
+        "modify_arg_plans": modify_arg_entries(&jar.mixin_modify_arg_plans(), &selectors),
+        "unresolved_modify_arg_plans": modify_arg_entries(&jar.unresolved_modify_arg_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
+        "modify_variable_plans": modify_variable_entries(&jar.mixin_modify_variable_plans(), &selectors),
+        "unresolved_modify_variable_plans": modify_variable_entries(&jar.unresolved_modify_variable_plans().into_iter().map(|(plan, _)| plan).collect::<Vec<_>>(), &selectors),
         "configs": configs,
         "config_errors": jar
             .mixin_config_errors()
@@ -607,6 +710,7 @@ fn execution_json(
         "unknown_host_calls": host.unknown_host_calls(),
         "client_registrations": host.client_registration_summary(),
         "parked_threads": parked_threads_json(host),
+        "nondeterministic": host.nondeterministic_markers(),
         "payload_directions": host
             .payload_registrations()
             .iter()
@@ -986,8 +1090,10 @@ fn command_summary(
             }),
             EventContext::default(),
         );
-        let budget =
-            horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(5));
+        let budget = horizon_native_java::ExecutionBudget::deterministic(
+            2_000_000,
+            std::time::Duration::from_secs(300),
+        );
         if let Err(error) = jar.run_game_listener(listener, &mut firing, &mut host, &budget) {
             refused.get_or_insert_with(|| error.to_string());
         }
@@ -1047,8 +1153,10 @@ fn command_summary(
         if let Some(requirement @ horizon_native_java::brigadier::Requirement::Predicate(_)) =
             &node.requirement
         {
-            let budget =
-                horizon_native_java::ExecutionBudget::within(std::time::Duration::from_secs(1));
+            let budget = horizon_native_java::ExecutionBudget::deterministic(
+                2_000_000,
+                std::time::Duration::from_secs(300),
+            );
             let level = match jar.requirement_level(requirement, true, &mut host, &budget) {
                 Ok(level) => serde_json::json!(level),
                 Err(error) => serde_json::json!(error.to_string()),

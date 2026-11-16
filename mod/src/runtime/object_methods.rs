@@ -310,6 +310,12 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     pub(crate) fn java_hash(&mut self, value: &Value) -> Result<Option<i32>, NativeError> {
+        // A stream's marker is an internal capability, not a Java String. Its
+        // Object.hashCode is an identity hash no run can reproduce, so any
+        // collection/table path must stay unknown and be counted by its caller.
+        if self.is_live_stream_value(value) {
+            return Ok(None);
+        }
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::runtime::host_recursion::enter()?;
@@ -508,6 +514,13 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn java_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
         // One level of a nested `equals` (#250).
         let _level = crate::runtime::host_recursion::enter()?;
+        // A stream is an identity object. Its marker is an internal capability,
+        // never a String whose text can participate in Java equality.
+        if expect_ref(a).is_some_and(|text| crate::runtime::stream_pipeline::is_stream_marker(text))
+            || expect_ref(b).is_some_and(|text| crate::runtime::stream_pipeline::is_stream_marker(text))
+        {
+            return Ok(a == b);
+        }
         if let Some(equal) = self.subclass_token_equals(a, b) {
             return match equal {
                 Some(equal) => Ok(equal),
@@ -932,6 +945,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Count a read of an identity hash, which no run can reproduce.
     fn count_identity_hash(&mut self) -> Result<Value, NativeError> {
+        self.host.mark_nondeterministic("java-identity-hash");
         self.host.unknown_operand_call(&MethodRef {
             owner: "java/lang/Object".into(),
             name: "hashCode".into(),
@@ -957,6 +971,11 @@ impl<H: Host> Runtime<'_, H> {
         };
         // An object's methods are its class's: dispatched like any call.
         if !matches!(opcode, 0xb6 | 0xb9) || crate::runtime::jar_object::is_object_handle(handle) {
+            return Ok(None);
+        }
+        // Annotation proxies dispatch their interface members through the reflection model,
+        // which has the held annotation values and Java's proxy contract.
+        if handle.kind() == crate::runtime::host_ref::HostKind::AnnotationProxy {
             return Ok(None);
         }
         if handle.kind() == crate::runtime::host_ref::HostKind::KotlinLazy

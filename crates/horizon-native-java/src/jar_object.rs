@@ -180,7 +180,11 @@ pub(crate) fn spells_key_text(text: &str) -> bool {
 pub(crate) fn is_object_handle(handle: &HostRef) -> bool {
     matches!(
         handle.kind(),
-        HostKind::JarObject | HostKind::Writer | HostKind::Collection | HostKind::GuavaMultimap
+        HostKind::JarObject
+            | HostKind::Writer
+            | HostKind::Collection
+            | HostKind::GuavaMultimap
+            | HostKind::RenderObject
     )
 }
 

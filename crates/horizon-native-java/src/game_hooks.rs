@@ -1112,6 +1112,17 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.clone_original_of(text)
     }
 
+    fn immutable_collection_from(
+        &mut self,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        values: Vec<Value>,
+    ) -> Option<Value> {
+        self.inner
+            .immutable_collection_from(owner, name, kind, values)
+    }
+
     fn neoforge_bus(
         &mut self,
     ) -> Option<(&mut neoforge_bus::BusState, &mut BTreeMap<String, usize>)> {
@@ -1993,6 +2004,7 @@ impl NativeJar {
             linked,
             host: &mut wrapped,
             calls: 0,
+            instructions: 0,
             fields: state.fields.clone(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,
