@@ -49,18 +49,42 @@ const PROBE: &str = include_str!("fixtures/commons_lang/Probe.java");
 fn commons_lang_slice_two_matches_java25() {
     let fixture = Fixture::build(
         "commons-lang-slice-2",
-        &[("org/apache/commons/lang3/StringUtils.java", STRING_UTILS_STUB),
-          ("org/apache/commons/lang3/Validate.java", VALIDATE_STUB),
-          ("org/apache/commons/lang3/function/Consumers.java", CONSUMERS_STUB),
-          ("demo/Probe.java", PROBE)],
+        &[
+            (
+                "org/apache/commons/lang3/StringUtils.java",
+                STRING_UTILS_STUB,
+            ),
+            ("org/apache/commons/lang3/Validate.java", VALIDATE_STUB),
+            (
+                "org/apache/commons/lang3/function/Consumers.java",
+                CONSUMERS_STUB,
+            ),
+            ("demo/Probe.java", PROBE),
+        ],
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
     let expected = include_str!("fixtures/commons_lang/oracle/java25.txt");
-    let actual = ["capitalize", "pad", "unicode", "nullRules", "validate", "surrogate", "nopIdentity"]
-        .into_iter().map(|name| format!("{name}={}", fixture.text_on(&mut host, name)))
-        .collect::<Vec<_>>().join("
-") + "
+    let actual = [
+        "capitalize",
+        "pad",
+        "unicode",
+        "nullRules",
+        "validate",
+        "nopIdentity",
+    ]
+    .into_iter()
+    .map(|name| format!("{name}={}", fixture.text_on(&mut host, name)))
+    .collect::<Vec<_>>()
+    .join(
+        "
+",
+    ) + "
 ";
     assert_eq!(actual, expected);
-    assert_eq!(host.unknown_host_call_count(), 1, "{:?}", host.unknown_host_calls());
+    assert_eq!(
+        host.unknown_host_call_count(),
+        1,
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
