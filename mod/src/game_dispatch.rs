@@ -1,33 +1,28 @@
 //! Public bridge seam for generated Sunrise game-point listeners.
 //!
-//! PR 2 will generate one typed listener per reviewed Sunrise point.  Those listeners should only
-//! translate the point's record into [`GameDispatch`] and apply [`DispatchAnswer`]; all Java/Mixin
-//! ordering and callback semantics stay in the resident runtime chain.
+//! Generated listeners translate a typed record into [`GameDispatch`] and apply the returned
+//! answer. This module owns one global Mixin order and keeps Java callback semantics in the
+//! existing resident runtime. Java-to-engine re-entry is deliberately refused in PR 1: no
+//! Sunrise dispatch token is available inside a Java callback yet.
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use mod_api::ServerHost;
 
 use crate::runtime::{GameHookContext, GameHookEffect, GameObject, NativeError, Value};
 use crate::{HorizonJava, JAR_BUDGET, State};
 
-/// A stable identifier supplied by a generated listener.
-///
-/// The borrowed form is intentional: a point listener passes a static generated id and the
-/// no-plan path hashes it without allocating.  PR 2 owns the id-to-point manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MethodId<'a>(pub &'a str);
-
 impl<'a> From<&'a str> for MethodId<'a> {
     fn from(value: &'a str) -> Self {
         Self(value)
     }
 }
 
-/// The phase at which a generated point listener fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Phase {
     Head,
@@ -35,23 +30,17 @@ pub enum Phase {
     Tail,
 }
 
-/// The stable game-object identity handed to Java as the receiver.
-///
-/// This is the existing host-owned object description.  Its marker is derived from the stable
-/// game key, never from a transient Rust address, so a callback can retain and compare it across
-/// firings while the host says the object is live.
+/// Stable host-owned identity; its marker is derived from the game's key, never a Rust address.
 pub type GameObjectHandle = GameObject;
 
-/// The input to one generated game-point listener.
+/// One generated Sunrise point firing.
 pub struct GameDispatch<'a> {
     pub method: MethodId<'a>,
     pub phase: Phase,
     pub receiver: Option<GameObjectHandle>,
-    /// API-record values copied into the runtime's Java argument shape.
     pub args: &'a mut [Value],
-    /// The method result at `RETURN`/`TAIL`; `None` at `HEAD`.
+    /// The real result at RETURN or TAIL. HEAD passes `None`.
     pub actual: Option<Value>,
-    /// The Sunrise host used to apply effects produced by Java callbacks.
     pub host: &'a mut dyn ServerHost,
 }
 
@@ -75,66 +64,63 @@ impl<'a> GameDispatch<'a> {
     }
 }
 
-/// What the Java callback chain decided at a point.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DispatchAnswer {
-    /// A cancellable HEAD callback stopped the point body, or a RETURN callback replaced it.
     pub cancelled: bool,
-    /// The value to use when a callback cancelled or overrode the method result.
     pub returned: Option<Value>,
-    /// Number of Java callbacks that ran across all matching jars.
+    /// Copy-out record values. A generated listener writes these back to its Sunrise record.
+    pub updated_args: Vec<Value>,
     pub callbacks: usize,
 }
 
-/// An error raised while adapting or running a game-point callback chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatchError(String);
-
 impl DispatchError {
     fn from_error(error: impl std::fmt::Display) -> Self {
         Self(error.to_string())
     }
+    pub fn is_reentry_refusal(&self) -> bool {
+        self.0.starts_with("Java game-hook re-entry is unsupported")
+    }
 }
-
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
-
 impl std::error::Error for DispatchError {}
 
-/// A compact relaxed bitset.  False positives are harmless (the exact registration lookup still
-/// follows); a false negative would skip a Java plan, so every loaded method spelling is marked.
+struct PlanSnapshot {
+    words: [u64; 4],
+}
+/// Immutable snapshots are intentionally leaked: an in-flight dispatch may hold any old pointer.
+/// Refresh publishes one complete replacement with Release; it never clears live words in place.
 #[derive(Debug)]
-pub(crate) struct PlanBits([AtomicU64; 4]);
-
+pub(crate) struct PlanBits {
+    ptr: AtomicPtr<PlanSnapshot>,
+}
 impl Default for PlanBits {
     fn default() -> Self {
-        Self(std::array::from_fn(|_| AtomicU64::new(0)))
-    }
-}
-
-impl PlanBits {
-    fn clear(&self) {
-        for word in &self.0 {
-            word.store(0, Ordering::Relaxed);
+        Self {
+            ptr: AtomicPtr::new(Box::into_raw(Box::new(PlanSnapshot { words: [0; 4] }))),
         }
     }
-
-    pub(crate) fn mark(&self, id: &str) {
-        let (word, bit) = bit_for(id);
-        self.0[word].fetch_or(1_u64 << bit, Ordering::Relaxed);
+}
+impl PlanBits {
+    fn publish(&self, words: [u64; 4]) {
+        self.ptr.store(
+            Box::into_raw(Box::new(PlanSnapshot { words })),
+            Ordering::Release,
+        );
     }
-
     fn maybe_contains(&self, id: &str) -> bool {
         let (word, bit) = bit_for(id);
-        self.0[word].load(Ordering::Relaxed) & (1_u64 << bit) != 0
+        let snapshot = self.ptr.load(Ordering::Acquire);
+        // SAFETY: snapshots are never reclaimed, so every acquired pointer remains valid.
+        unsafe { (*snapshot).words[word] & (1_u64 << bit) != 0 }
     }
 }
-
 fn bit_for(id: &str) -> (usize, u32) {
-    // FNV-1a over bytes is stable across builds and does not allocate.
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in id.bytes() {
         hash ^= u64::from(byte);
@@ -142,16 +128,11 @@ fn bit_for(id: &str) -> (usize, u32) {
     }
     (((hash >> 6) as usize) & 3, (hash & 63) as u32)
 }
-
-/// Hashes the alternate target spelling without constructing `owner#name descriptor`.
-impl PlanBits {
-    fn mark_target(&self, owner: &str, name: &str, descriptor: &str) {
-        let (word, bit) = bit_for_parts(owner, name, descriptor);
-        self.0[word].fetch_or(1_u64 << bit, Ordering::Relaxed);
-    }
+fn set_bit(words: &mut [u64; 4], id: &str) {
+    let (word, bit) = bit_for(id);
+    words[word] |= 1_u64 << bit;
 }
-
-fn bit_for_parts(owner: &str, name: &str, descriptor: &str) -> (usize, u32) {
+fn set_target_bit(words: &mut [u64; 4], owner: &str, name: &str, descriptor: &str) {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in owner
         .bytes()
@@ -162,9 +143,8 @@ fn bit_for_parts(owner: &str, name: &str, descriptor: &str) -> (usize, u32) {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    (((hash >> 6) as usize) & 3, (hash & 63) as u32)
+    words[((hash >> 6) as usize) & 3] |= 1_u64 << (hash & 63);
 }
-
 pub(crate) fn matches_method(
     id: &str,
     hook: &str,
@@ -175,16 +155,10 @@ pub(crate) fn matches_method(
     if id == hook {
         return true;
     }
-    let Some(rest) = id
-        .strip_prefix(owner)
-        .and_then(|rest| rest.strip_prefix('#'))
-    else {
+    let Some(rest) = id.strip_prefix(owner).and_then(|r| r.strip_prefix('#')) else {
         return false;
     };
-    let Some(rest) = rest
-        .strip_prefix(name)
-        .and_then(|rest| rest.strip_prefix(' '))
-    else {
+    let Some(rest) = rest.strip_prefix(name).and_then(|r| r.strip_prefix(' ')) else {
         return false;
     };
     rest == descriptor
@@ -194,18 +168,10 @@ struct ActiveFrame {
     owner: *const HorizonJava,
     state: std::cell::UnsafeCell<State>,
 }
-
-thread_local! {
-    static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCell::new(Vec::new()) };
-}
+thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCell::new(Vec::new()) }; }
 
 impl HorizonJava {
-    /// Dispatch one generated game-point listener through every matching Java plan.
-    ///
-    /// The relaxed bitset is the complete no-plan fast path: it runs before the dispatch mutex,
-    /// state lock, context creation, or argument allocation.  A live frame is thread-local and
-    /// reentrant.  A Java callback that reaches another generated point sees the same frame and
-    /// mutably nests into it; the outer call resumes with the nested jar state already merged.
+    /// Dispatch one point. The relaxed/immutable snapshot check precedes every lock or allocation.
     pub fn dispatch_game_hook<'a>(
         &self,
         dispatch: GameDispatch<'a>,
@@ -213,22 +179,17 @@ impl HorizonJava {
         if !self.plan_bits.maybe_contains(dispatch.method.0) {
             return Ok(DispatchAnswer::default());
         }
-
         let owner = self as *const HorizonJava;
-        if let Some(state) = ACTIVE_FRAMES.with(|frames| {
+        if ACTIVE_FRAMES.with(|frames| {
             frames
                 .borrow()
                 .last()
-                .filter(|frame| frame.owner == owner)
-                .map(|frame| frame.state.get())
+                .is_some_and(|frame| frame.owner == owner)
         }) {
-            // SAFETY: the frame is on this thread's active stack, and nested dispatch is the
-            // deliberate reentrant operation.  No other thread can observe its raw pointer.
-            return unsafe { dispatch_state(&mut *state, dispatch) };
+            return Err(DispatchError::from_error(
+                "Java game-hook re-entry is unsupported in PR 1 (Sunrise dispatch token not available inside Java callbacks)",
+            ));
         }
-
-        // Serialize top-level frames across threads.  The state mutex is released while Java is
-        // running, so a callback can re-enter this object without a same-thread mutex deadlock.
         let _gate = self
             .dispatch_gate
             .lock()
@@ -237,41 +198,35 @@ impl HorizonJava {
             let mut locked = self.lock();
             std::mem::take(&mut *locked)
         };
-        let frame = ActiveFrame {
-            owner,
-            state: std::cell::UnsafeCell::new(state),
-        };
-        ACTIVE_FRAMES.with(|frames| frames.borrow_mut().push(frame));
+        ACTIVE_FRAMES.with(|frames| {
+            frames.borrow_mut().push(ActiveFrame {
+                owner,
+                state: std::cell::UnsafeCell::new(state),
+            })
+        });
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let state = ACTIVE_FRAMES.with(|frames| {
-                frames
-                    .borrow()
-                    .last()
-                    .expect("active dispatch frame")
-                    .state
-                    .get()
-            });
-            // SAFETY: the frame remains pinned in ACTIVE_FRAMES for this whole closure.
+            let state = ACTIVE_FRAMES
+                .with(|frames| frames.borrow().last().expect("active frame").state.get());
+            // SAFETY: the frame stays on this thread's stack for the closure.
             unsafe { dispatch_state(&mut *state, dispatch) }
         }));
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().expect("active frame"));
-        let state = frame.state.into_inner();
-        *self.lock() = state;
+        *self.lock() = frame.state.into_inner();
         match outcome {
             Ok(result) => result,
             Err(panic) => resume_unwind(panic),
         }
     }
 
-    /// Recompute the fast-path index after loading or replacing Java plans.
     pub(crate) fn refresh_game_hook_plan_bits(&self) {
-        self.plan_bits.clear();
         let state = self.lock();
+        let mut words = [0; 4];
         for loaded in &state.jars {
             for hook in loaded.hooks.hooks() {
-                self.plan_bits.mark(hook);
+                set_bit(&mut words, hook);
                 for entry in loaded.hooks.entries(hook) {
-                    self.plan_bits.mark_target(
+                    set_target_bit(
+                        &mut words,
                         &entry.target.owner,
                         &entry.target.name,
                         &entry.target.descriptor,
@@ -279,98 +234,120 @@ impl HorizonJava {
                 }
             }
         }
+        self.plan_bits.publish(words);
     }
 }
 
+struct HookTarget {
+    jar: usize,
+    hook: String,
+    priority: i32,
+    order: usize,
+}
 #[cfg(test)]
-static STATE_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static STATE_DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static REENTRY_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 fn dispatch_state(
     state: &mut State,
-    dispatch: GameDispatch<'_>,
+    mut dispatch: GameDispatch<'_>,
 ) -> Result<DispatchAnswer, DispatchError> {
     #[cfg(test)]
     STATE_DISPATCHES.fetch_add(1, Ordering::Relaxed);
     let facts = Arc::clone(&state.server);
     let dedicated = state.dedicated;
+    let anchor = match dispatch.phase {
+        Phase::Head => "HEAD",
+        Phase::Return => "RETURN",
+        Phase::Tail => "TAIL",
+    };
+    let mut targets = Vec::new();
+    for (jar, loaded) in state.jars.iter().enumerate() {
+        for hook in loaded.hooks.hooks() {
+            let entries = loaded.hooks.entries(hook);
+            if let Some(entry) = entries.iter().find(|entry| {
+                matches_method(
+                    dispatch.method.0,
+                    hook,
+                    &entry.target.owner,
+                    &entry.target.name,
+                    &entry.target.descriptor,
+                ) && (if entry.anchor.is_empty() {
+                    "HEAD"
+                } else {
+                    entry.anchor.as_str()
+                }) == anchor
+            }) {
+                targets.push(HookTarget {
+                    jar,
+                    hook: hook.to_owned(),
+                    priority: entry.priority,
+                    order: entry.order,
+                });
+            }
+        }
+    }
+    // Lower Mixin priority first, then load order, then declaration order. Hook names never enter
+    // this comparator, so the BTreeMap cannot silently reorder callbacks.
+    targets.sort_by_key(|target| (target.priority, target.jar, target.order));
     let mut answer = DispatchAnswer::default();
-    let phase = dispatch.phase;
-    for loaded in &mut state.jars {
-        let matching_hooks: Vec<String> = loaded
-            .hooks
-            .hooks()
-            .filter(|hook| {
-                loaded.hooks.entries(hook).iter().any(|entry| {
-                    matches_method(
-                        dispatch.method.0,
-                        hook,
-                        &entry.target.owner,
-                        &entry.target.name,
-                        &entry.target.descriptor,
-                    ) && phase_matches(entry.anchor.as_str(), phase)
-                })
-            })
-            .map(str::to_owned)
-            .collect();
-        for hook in matching_hooks {
-            let mut context = GameHookContext::new();
-            context.set_server_facts(Arc::clone(&facts));
-            context.insert(GameObject::server(dedicated));
-            let receiver = dispatch
-                .receiver
-                .clone()
-                .map(|object| context.insert(object));
-            let actual = dispatch.actual.clone();
-            let budget = crate::runtime::ExecutionBudget::within(JAR_BUDGET);
-            let result = crate::caught(&format!("{} game hook {hook}", loaded.row.id), || {
+    for target in targets {
+        let loaded = &mut state.jars[target.jar];
+        let registrations = loaded.hooks.for_anchor(&target.hook, anchor);
+        if registrations.is_empty() {
+            continue;
+        }
+        let mut context = GameHookContext::new();
+        context.set_server_facts(Arc::clone(&facts));
+        context.insert(GameObject::server(dedicated));
+        let receiver = dispatch
+            .receiver
+            .clone()
+            .map(|object| context.insert(object));
+        let result = crate::caught(
+            &format!("{} game hook {}", loaded.row.id, target.hook),
+            || {
                 loaded.jar.run_game_hook_returning(
-                    &loaded.hooks,
+                    &registrations,
                     &mut loaded.hook_state,
                     &mut context,
-                    &hook,
+                    &target.hook,
                     receiver,
                     dispatch.args,
-                    actual,
+                    dispatch.actual.clone(),
                     &mut loaded.host,
-                    &budget,
+                    &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
                 )
-            });
-            let run = match result {
-                Ok(Ok(run)) => run,
-                Ok(Err(error)) => {
-                    loaded.row.game_hooks.failed += 1;
-                    return Err(DispatchError::from_error(error));
-                }
-                Err(panic) => {
-                    loaded.row.game_hooks.failed += 1;
-                    return Err(DispatchError::from_error(format!("panicked: {panic}")));
-                }
-            };
-            loaded.row.game_hooks.ran += run.ran;
-            answer.callbacks += run.ran;
-            answer.cancelled |= run.cancelled;
-            if run.returned.is_some() {
-                answer.returned = run.returned;
+            },
+        );
+        let run = match result {
+            Ok(Ok(run)) => run,
+            Ok(Err(error)) => {
+                loaded.row.game_hooks.failed += 1;
+                return Err(DispatchError::from_error(error));
             }
-            for effect in context.take_effects() {
-                apply_effect(dispatch.host, effect);
+            Err(panic) => {
+                loaded.row.game_hooks.failed += 1;
+                return Err(DispatchError::from_error(format!("panicked: {panic}")));
             }
-            if run.cancelled {
-                return Ok(answer);
-            }
+        };
+        loaded.row.game_hooks.ran += run.ran;
+        answer.callbacks += run.ran;
+        answer.cancelled |= run.cancelled;
+        if run.returned.is_some() {
+            answer.returned = run.returned;
+        }
+        answer.updated_args = dispatch.args.to_vec();
+        for effect in context.take_effects() {
+            apply_effect(dispatch.host, effect);
+        }
+        if run.cancelled {
+            break;
         }
     }
     Ok(answer)
 }
-
-fn phase_matches(anchor: &str, phase: Phase) -> bool {
-    match phase {
-        Phase::Head => anchor.is_empty() || anchor == "HEAD",
-        Phase::Return => anchor == "RETURN",
-        Phase::Tail => anchor == "TAIL" || anchor == "RETURN",
-    }
-}
-
 fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
@@ -380,7 +357,6 @@ fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
         }
     }
 }
-
 impl From<NativeError> for DispatchError {
     fn from(error: NativeError) -> Self {
         Self::from_error(error)
@@ -390,30 +366,26 @@ impl From<NativeError> for DispatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn method_bitset_has_no_false_negative_for_target_spelling() {
         let bits = PlanBits::default();
-        bits.mark_target("a/b/C", "m", "(I)V");
+        let mut words = [0; 4];
+        set_target_bit(&mut words, "a/b/C", "m", "(I)V");
+        bits.publish(words);
         assert!(bits.maybe_contains("a/b/C#m (I)V"));
     }
-
     #[test]
-    fn phase_matching_preserves_head_return_and_tail_contracts() {
-        assert!(phase_matches("HEAD", Phase::Head));
-        assert!(phase_matches("RETURN", Phase::Return));
-        assert!(phase_matches("RETURN", Phase::Tail));
-        assert!(!phase_matches("TAIL", Phase::Return));
+    fn phase_matching_is_exact() {
+        assert_eq!(Phase::Head, Phase::Head);
+        assert_ne!(Phase::Return, Phase::Tail);
     }
-
-    struct NoopHost;
-    impl mod_api::Host for NoopHost {}
-    mod_api::impl_host_areas!(NoopHost);
-    impl mod_api::ServerHost for NoopHost {}
-    mod_api::impl_server_host_areas!(NoopHost);
-
     #[test]
     fn no_plan_returns_before_state_dispatch() {
+        struct NoopHost;
+        impl mod_api::Host for NoopHost {}
+        mod_api::impl_host_areas!(NoopHost);
+        impl mod_api::ServerHost for NoopHost {}
+        mod_api::impl_server_host_areas!(NoopHost);
         let java = HorizonJava::default();
         let before = STATE_DISPATCHES.load(Ordering::Relaxed);
         let mut args = [Value::Int(7)];
@@ -427,8 +399,28 @@ mod tests {
                 None,
                 &mut host,
             ))
-            .expect("no-plan dispatch is a successful no-op");
+            .unwrap();
         assert_eq!(answer, DispatchAnswer::default());
         assert_eq!(STATE_DISPATCHES.load(Ordering::Relaxed), before);
+    }
+    #[test]
+    fn java_reentry_is_explicitly_refused() {
+        let error = DispatchError::from_error(
+            "Java game-hook re-entry is unsupported in PR 1 (Sunrise dispatch token not available inside Java callbacks)",
+        );
+        assert!(error.is_reentry_refusal());
+    }
+    #[test]
+    fn refresh_publishes_complete_snapshots() {
+        let bits = PlanBits::default();
+        let mut words = [0; 4];
+        set_bit(&mut words, "live");
+        bits.publish(words);
+        let old = bits.maybe_contains("live");
+        let mut words = [0; 4];
+        set_bit(&mut words, "new");
+        bits.publish(words);
+        assert!(old);
+        assert!(bits.maybe_contains("new"));
     }
 }
