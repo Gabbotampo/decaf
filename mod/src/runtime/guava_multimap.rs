@@ -64,6 +64,23 @@ fn is_view<H: Host>(this: &Runtime<'_, H>, key: &str) -> bool {
     field(this, key, "view").is_some()
 }
 
+fn cached_view<H: Host>(
+    this: &mut Runtime<'_, H>,
+    source: &str,
+    name: &str,
+    class: &str,
+) -> Value {
+    if let Some(view) = field(this, source, name) {
+        return view;
+    }
+    let view = handle(this.new_object_key(class));
+    let view_key = handle_key(&view).expect("Guava view is a handle");
+    put_field(this, &view_key, "view", Value::Ref(Some(name.to_owned())));
+    put_field(this, &view_key, "target", handle(source.to_owned()));
+    put_field(this, source, name, view.clone());
+    view
+}
+
 fn value_collection_class(kind: &str) -> &'static str {
     match kind {
         "hash" => "java/util/HashSet",
@@ -347,6 +364,18 @@ fn invoke_multimap<H: Host>(
             Ok(Some(remove_one(this, &source, &args[0], &args[1])?))
         }
         ("size", "()I") => Ok(Some(Value::Int(size(this, &source)?))),
+        ("keySet", "()Ljava/util/Set;") => Ok(Some(cached_view(
+            this,
+            &source,
+            "keySet",
+            "com/google/common/collect/AbstractMapBasedMultimap$KeySet",
+        ))),
+        ("values", "()Ljava/util/Collection;") => Ok(Some(cached_view(
+            this,
+            &source,
+            "values",
+            "com/google/common/collect/AbstractMultimap$Values",
+        ))),
         _ => this.host.unknown_operand_call(r).map(Some),
     }
 }
