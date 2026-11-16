@@ -49,46 +49,18 @@ const PROBE: &str = include_str!("fixtures/commons_lang/Probe.java");
 fn commons_lang_slice_two_matches_java25() {
     let fixture = Fixture::build(
         "commons-lang-slice-2",
-        &[
-            (
-                "org/apache/commons/lang3/StringUtils.java",
-                STRING_UTILS_STUB,
-            ),
-            ("org/apache/commons/lang3/Validate.java", VALIDATE_STUB),
-            (
-                "org/apache/commons/lang3/function/Consumers.java",
-                CONSUMERS_STUB,
-            ),
-            ("demo/Probe.java", PROBE),
-        ],
+        &[("org/apache/commons/lang3/StringUtils.java", STRING_UTILS_STUB),
+          ("org/apache/commons/lang3/Validate.java", VALIDATE_STUB),
+          ("org/apache/commons/lang3/function/Consumers.java", CONSUMERS_STUB),
+          ("demo/Probe.java", PROBE)],
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
-    assert_eq!(
-        fixture.text_on(&mut host, "capitalize"),
-        "<null>||Hello|Éclair|😀x|ǅuro|ßeta"
-    );
-    assert_eq!(
-        fixture.text_on(&mut host, "pad"),
-        "<null>|   |ab   |😀   |abxyx|xyxab|ééé|ab   |ab   |   ab|   ab|ab\u{f600}\u{f600}\u{f600}|\u{f600}\u{f600}\u{f600}ab"
-    );
-    assert_eq!(
-        fixture.text_on(&mut host, "unicode"),
-        "false|true|true|true|fallback|fallback|\u{a0}"
-    );
-    assert_eq!(
-        fixture.text_on(&mut host, "nullRules"),
-        "right-null|left-null|repeat-null|contains-null|contains-needle-null|blank-null"
-    );
-    assert_eq!(
-        fixture.text_on(&mut host, "validate"),
-        "java.lang.IllegalArgumentException:The validated expression is false|java.lang.IllegalArgumentException:bad é 7|java.lang.IllegalArgumentException:The validated expression is false|ok"
-    );
-    assert_eq!(fixture.text_on(&mut host, "surrogate"), "<null>");
-    assert_eq!(fixture.text_on(&mut host, "nopIdentity"), "true");
-    assert_eq!(
-        host.unknown_host_call_count(),
-        1,
-        "{:?}",
-        host.unknown_host_calls()
-    );
+    let expected = include_str!("fixtures/commons_lang/oracle/java25.txt");
+    let actual = ["capitalize", "pad", "unicode", "nullRules", "validate", "surrogate", "nopIdentity"]
+        .into_iter().map(|name| format!("{name}={}", fixture.text_on(&mut host, name)))
+        .collect::<Vec<_>>().join("
+") + "
+";
+    assert_eq!(actual, expected);
+    assert_eq!(host.unknown_host_call_count(), 1, "{:?}", host.unknown_host_calls());
 }
