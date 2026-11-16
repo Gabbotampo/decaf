@@ -64,6 +64,7 @@ pub enum ContentBuilderEvent {
 pub(crate) struct BuilderFlags {
     flags: BTreeSet<&'static str>,
     codec: Option<String>,
+    predicate: Option<String>,
 }
 
 impl BuilderFlags {
@@ -118,9 +119,9 @@ impl ContentBuilders {
                 if codec.is_some() {
                     flags.codec = codec;
                 }
-                if let Some(predicate) = predicate {
+                if predicate.is_some() {
                     flags.flags.insert("sync_predicate");
-                    flags.codec.get_or_insert(predicate);
+                    flags.predicate = predicate;
                 }
                 None
             }
