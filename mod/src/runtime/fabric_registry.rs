@@ -15,9 +15,6 @@
 //! builder call on anything but a handle is counted.
 
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_ATTACHMENT_PREDICATE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const BUILDER: &str = "net/fabricmc/fabric/api/event/registry/FabricRegistryBuilder";
 
@@ -66,10 +63,9 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
         && matches!(r.name.as_str(), "all" | "targetOnly" | "allButTarget")
         && args.is_empty()
     {
-        let serial = NEXT_ATTACHMENT_PREDICATE.fetch_add(1, Ordering::Relaxed);
         return Some(Ok(Value::Host(HostRef::new(
             HostKind::JarObject,
-            format!("attachment-sync-predicate/{}/{}", r.name, serial),
+            format!("attachment-sync-predicate/{}", r.name),
         ))));
     }
     match (r.owner.as_str(), r.name.as_str()) {
@@ -111,7 +107,24 @@ pub(crate) fn instance_call(
     host: &mut StdHost,
     r: &MethodRef,
     receiver: &Value,
+    args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if r.owner == "net/fabricmc/fabric/api/attachment/v1/AttachmentSyncPredicate"
+        && r.name == "test"
+    {
+        let marker = crate::runtime::jar_object::instance_key(receiver)?;
+        let same = args.first()? == args.get(1)?;
+        let result = if marker.ends_with("/all") {
+            true
+        } else if marker.ends_with("/targetOnly") {
+            same
+        } else if marker.ends_with("/allButTarget") {
+            !same
+        } else {
+            return None;
+        };
+        return Some(Ok(Value::Int(result as i32)));
+    }
     if r.owner != BUILDER {
         return None;
     }
