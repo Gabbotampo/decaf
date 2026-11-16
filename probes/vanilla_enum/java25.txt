@@ -1,0 +1,1 @@
+ORACLE FAILED: missing com.mojang.serialization.Codec; classpath directory requires correction before capture.
