@@ -21,7 +21,7 @@ fn captured_real_263_java25_rows_are_stable() {
 use horizon_native_java::{StdHost, Value};
 #[test]
 fn probe_rows_match_java25_capture() {
- let probe = format!("package demo;\n{}", include_str!("fixtures/entity_registration/Probe.java"));
+ let probe: &'static str = Box::leak(format!("package demo;\n{}", include_str!("fixtures/entity_registration/Probe.java")).into_boxed_str());
  let sources = [
   ("demo/Probe.java", &probe),
   ("net/minecraft/SharedConstants.java", include_str!("fixtures/entity_registration/stubs/net/minecraft/SharedConstants.java")),
