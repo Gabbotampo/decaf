@@ -111,6 +111,7 @@ mod host_gson_type;
 mod host_guava;
 mod host_ids;
 mod host_invoke;
+mod host_item_stack_template;
 mod host_iterator;
 mod host_jdk;
 mod host_jdk_constant;
