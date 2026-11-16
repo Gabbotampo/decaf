@@ -140,6 +140,14 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
             "dfuConstruction",
             CountedAs("true|false|true|false|true|true|false|true"),
         ),
+        ("countedOperations", CountedAs("8")),
+        (
+            "dfuText",
+            Exact(
+                "Field[x: Int]|OptionalFieldCodec[x: Int]|OptionalFieldCodec[x: Int][xmapped]|Int[xmapped]",
+            ),
+        ),
+        ("forgedDfuReceiver", CountedAs("false")),
         // A pair is never equal to a JDK object (#199 F4).
         ("pairVsJdk", Exact("falsefalsefalsefalsefalse")),
     ];

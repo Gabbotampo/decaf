@@ -169,4 +169,33 @@ public final class HostCodecs {
     Object c = Codec.STRING;
     return "" + (c == Codec.STRING) + (c instanceof Codec);
   }
+  /** Broad DFU operations are deliberately counted until the execution phase is modelled. */
+  public static String countedOperations() {
+    int calls = 0;
+    try { Codec.INT.listOf(); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.dispatch(x -> Codec.INT, x -> 1); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.orElse(Codec.INT); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.validate(x -> null); calls++; } catch (Throwable ignored) {}
+    try { Codec.EMPTY.codec(); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.encodeStart(null, 1); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.decode(null, null); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.parse(null, null); calls++; } catch (Throwable ignored) {}
+    return Integer.toString(calls);
+  }
+
+  /** A network StreamCodec is not a DFU Codec and must fail the JVM cast. */
+  public static String forgedDfuReceiver() {
+    boolean rejected = false;
+    try {
+      ((Codec<Object>) (Object) ByteBufCodecs.INT).xmap(x -> x, x -> x);
+    } catch (ClassCastException expected) {
+      rejected = true;
+    }
+    return Boolean.toString(rejected);
+  }
+  /** Deterministic structural text for the phase-1 nodes. */
+  public static String dfuText() {
+    return Codec.INT.fieldOf("x") + "|" + Codec.INT.optionalFieldOf("x") + "|"
+        + Codec.INT.optionalFieldOf("x", 7) + "|" + Codec.INT.xmap(x -> x + 1, x -> x - 1);
+  }
 }
