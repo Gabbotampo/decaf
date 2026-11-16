@@ -23,8 +23,8 @@ impl<H: Host> Runtime<'_, H> {
         };
         self.enum_constants.contains_key(marker)
             || crate::runtime::jar_object::object_class(value)
-                .and_then(|class| self.class(&class))
-                .and_then(|file| Some(file.super_name.as_str()))
+                .and_then(|class| self.class(class))
+                .map(|file| file.super_name.as_str())
                 == Some("java/lang/Enum")
     }
 
