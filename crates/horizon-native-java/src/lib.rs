@@ -8020,6 +8020,25 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if r.owner == "java/net/URI" && r.name == "toURL" && r.descriptor == "()Ljava/net/URL;" {
+            if let Some(text) = host_jdk_value::uri_text(receiver) {
+                let Some((scheme, _)) = text.split_once(':') else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("URI is not absolute".into()),
+                        frame: None,
+                    });
+                };
+                if !matches!(scheme, "http" | "https" | "file" | "jar" | "ftp") {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/net/MalformedURLException".into(),
+                        message: Some(format!("unknown protocol: {scheme}")),
+                        frame: None,
+                    });
+                }
+                return Ok(Value::Ref(Some(format!("url/{text}"))));
+            }
+        }
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
         self.render_objects = render_objects;
