@@ -920,7 +920,11 @@ impl<H: Host> GameHookHost<'_, H> {
                 fact(object.count.map(Value::Int))
             }
             ("isEmpty", "()Z") if object.kind == GameObjectKind::ItemStack => {
-                fact(object.count.map(|c| Value::Int(i32::from(c <= 0))))
+                fact(object.count.map(|c| {
+                    Value::Int(i32::from(
+                        c <= 0 || object.type_id.as_deref() == Some("minecraft/air"),
+                    ))
+                }))
             }
             ("getItem", "()Lnet/minecraft/world/item/Item;")
                 if object.kind == GameObjectKind::ItemStack =>
