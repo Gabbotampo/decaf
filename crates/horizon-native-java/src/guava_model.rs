@@ -245,6 +245,19 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if r.owner == "com/google/common/collect/Ordering" {
+            match (r.name.as_str(), r.descriptor.as_str(), receiver) {
+                ("natural", "()Lcom/google/common/collect/Ordering;", None) =>
+                    return Ok(Some(Value::Ref(Some("guava-ordering-natural".into())))),
+                ("reverse", "()Lcom/google/common/collect/Ordering;", Some(Value::Ref(Some(v))))
+                    if v == "guava-ordering-natural" =>
+                    return Ok(Some(Value::Ref(Some("guava-ordering-reverse".into())))),
+                ("reverse", "()Lcom/google/common/collect/Ordering;", Some(Value::Ref(Some(v))))
+                    if v == "guava-ordering-reverse" =>
+                    return Ok(Some(Value::Ref(Some("guava-ordering-natural".into())))),
+                _ => {}
+            }
+        }
         if (r.owner == "com/google/common/collect/ImmutableMap"
             || r.owner == "com/google/common/collect/ImmutableBiMap")
             && r.name == "copyOf"
