@@ -316,11 +316,15 @@ def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
         return False
     count = int.from_bytes(data[8:10], "big")
     offset = 10
-    for _ in range(1, count):
+    # Entries are numbered 1..count-1; a long or double takes two numbers (JVMS 4.4.5), so the
+    # index advances by two for those. Without that the walk would read past the pool.
+    index = 1
+    while index < count:
         if offset >= len(data):
             return False
         tag = data[offset]
         offset += 1
+        index += 1
         if tag == 1:
             size = int.from_bytes(data[offset:offset + 2], "big")
             offset += 2
@@ -335,6 +339,7 @@ def class_has_utf8_constant(data: bytes, wanted: str) -> bool:
             offset += 4
         elif tag in (5, 6):
             offset += 8
+            index += 1
         elif tag in (7, 8, 16, 19, 20):
             offset += 2
         elif tag in (9, 10, 11, 12, 17, 18):
@@ -643,7 +648,8 @@ def main(argv: list[str] | None = None) -> int:
                 closure = ledger.Closure()
                 closure_error = f"Fabric dependency predicate oracle unavailable: {fabric_oracle_error}"
             else:
-                matcher = fabric_oracle.matches if name != "neoforge" else hybrid_pack.maven_version_satisfies
+                matcher = (fabric_oracle.matches if name != "neoforge"
+                           else hybrid_pack.maven_version_satisfies)
                 closure = ledger.dependency_closure(jar, index, version_matcher=matcher)
             missing = list(closure.missing)
             requirements = closure.missing_requirements
@@ -686,15 +692,18 @@ def main(argv: list[str] | None = None) -> int:
                     game_block_classes,
                 )
             row = result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
-            if via and result.get("status") == "ok":
-                baseline = probe_one(probe, exec_jar, kind, baseline_deps, args.game_version, game_block_classes)
+            if via:
+                # The row is the consumer's whole run with this jar linked in; `via` says so, and
+                # the baseline (the consumer without this jar) shows what this jar added.
                 row["via"] = via
-                row["baseline_unknown"] = baseline.get("unknown_host_call_count")
-                row["unknown_delta"] = (result.get("unknown_host_call_count", 0) - baseline.get("unknown_host_call_count", 0))
-                if via_candidates:
+                if len(via_candidates) > 1:
                     row["via_candidates"] = via_candidates
-            elif via:
-                row["via"] = via
+                if result.get("status") == "ok":
+                    baseline = probe_one(probe, exec_jar, kind, baseline_deps, args.game_version,
+                                         game_block_classes)
+                    row["baseline_unknown"] = baseline.get("unknown_host_call_count")
+                    row["unknown_delta"] = (result.get("unknown_host_call_count", 0)
+                                            - baseline.get("unknown_host_call_count", 0))
             return row
 
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
