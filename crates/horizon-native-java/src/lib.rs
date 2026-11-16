@@ -6277,9 +6277,14 @@ impl Host for StdHost {
         // fixture. Keep the signed zero and NaN payload exactly as Java does.
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             ("java/lang/Double", "doubleToRawLongBits", "(D)J") => {
-                return Ok(Value::Long(
-                    expect_float(r, Self::argument(r, args, 0)?)?.to_bits() as i64,
-                ));
+                let value = expect_float(r, Self::argument(r, args, 0)?)?;
+                // Value::Float cannot preserve every Java NaN payload.  The
+                // raw bits are therefore untrustworthy; keep this call
+                // counted instead of answering a fabricated payload.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(Value::Long(value.to_bits() as i64));
             }
             ("java/lang/Double", "doubleToLongBits", "(D)J") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)?;
@@ -6292,6 +6297,11 @@ impl Host for StdHost {
             }
             ("java/lang/Float", "floatToRawIntBits", "(F)I") => {
                 let value = expect_float(r, Self::argument(r, args, 0)?)? as f32;
+                // See the double raw-bit case above: a NaN payload is not a
+                // trustworthy value in the bounded interpreter.
+                if value.is_nan() {
+                    return self.unknown_host_call(r);
+                }
                 return Ok(Value::Int(value.to_bits() as i32));
             }
             ("java/lang/Float", "floatToIntBits", "(F)I") => {
