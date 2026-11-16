@@ -8,11 +8,12 @@
 //! enter these point registrations; generated record copy-back is deferred to PR 2.
 
 use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, MutexGuard};
 
 use mod_api::ServerHost;
 
@@ -173,6 +174,79 @@ struct ActiveFrame {
 thread_local! { static ACTIVE_FRAMES: RefCell<Vec<ActiveFrame>> = const { RefCell::new(Vec::new()) }; }
 #[cfg(test)]
 thread_local! { static FORCE_CALLBACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+static BLOCK_CALLBACK: std::sync::Mutex<Option<Arc<std::sync::Barrier>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) enum StateGuard<'a> {
+    Locked {
+        _gate: MutexGuard<'a, ()>,
+        state: MutexGuard<'a, State>,
+    },
+    Active {
+        state: *mut State,
+        _marker: std::marker::PhantomData<&'a mut State>,
+    },
+}
+
+impl Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Locked { state, .. } => state,
+            Self::Active { state, .. } => {
+                // SAFETY: the active frame is owned by this thread and remains on its TLS stack
+                // for the guard's lifetime.
+                unsafe { &**state }
+            }
+        }
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Locked { state, .. } => state,
+            Self::Active { state, .. } => {
+                // SAFETY: the active frame is owned by this thread and remains on its TLS stack
+                // for the guard's lifetime.
+                unsafe { &mut **state }
+            }
+        }
+    }
+}
+
+pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
+    let owner = owner as *const HorizonJava;
+    if let Some(state) = ACTIVE_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .last()
+            .filter(|frame| frame.owner == owner)
+            .map(|frame| frame.state.get())
+    }) {
+        return StateGuard::Active {
+            state,
+            _marker: std::marker::PhantomData,
+        };
+    }
+    let gate = owner_ref(owner)
+        .dispatch_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = owner_ref(owner)
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    StateGuard::Locked { _gate: gate, state }
+}
+
+fn owner_ref<'a>(owner: *const HorizonJava) -> &'a HorizonJava {
+    // SAFETY: the caller derives this pointer from a live HorizonJava reference and the guard
+    // keeps that owner alive for the returned borrow.
+    unsafe { &*owner }
+}
 
 impl HorizonJava {
     /// Dispatch one point. The relaxed/immutable snapshot check precedes every lock or allocation.
@@ -208,7 +282,10 @@ impl HorizonJava {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = {
-            let mut locked = self.lock();
+            let mut locked = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *locked)
         };
         ACTIVE_FRAMES.with(|frames| {
@@ -224,7 +301,10 @@ impl HorizonJava {
             unsafe { dispatch_state(&mut *state, dispatch) }
         }));
         let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().expect("active frame"));
-        *self.lock() = frame.state.into_inner();
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = frame.state.into_inner();
         match outcome {
             Ok(result) => result,
             Err(panic) => resume_unwind(panic),
@@ -232,10 +312,6 @@ impl HorizonJava {
     }
 
     pub(crate) fn refresh_game_hook_plan_bits(&self) {
-        let _gate = self
-            .dispatch_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = self.lock();
         let mut words = [0; 4];
         for loaded in &state.jars {
@@ -322,25 +398,27 @@ fn dispatch_state(
         let result = crate::caught(
             &format!("{} game hook {}", loaded.row.id, target.hook),
             || {
-                loaded
-                    .jar
-                    .run_game_hook_returning(
-                        &registrations,
-                        &mut loaded.hook_state,
-                        &mut context,
-                        &target.hook,
-                        receiver,
-                        dispatch.args,
-                        dispatch.actual.clone(),
-                        &mut loaded.host,
-                        &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
-                    )
-                    .inspect(|_| {
-                        #[cfg(test)]
-                        if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
-                            panic!("dispatcher callback panic fixture");
-                        }
-                    })
+                let callback = loaded.jar.run_game_hook_returning(
+                    &registrations,
+                    &mut loaded.hook_state,
+                    &mut context,
+                    &target.hook,
+                    receiver,
+                    dispatch.args,
+                    dispatch.actual.clone(),
+                    &mut loaded.host,
+                    &crate::runtime::ExecutionBudget::within(JAR_BUDGET),
+                );
+                #[cfg(test)]
+                if let Some(barrier) = BLOCK_CALLBACK.lock().unwrap().take() {
+                    barrier.wait();
+                }
+                callback.inspect(|_| {
+                    #[cfg(test)]
+                    if FORCE_CALLBACK_PANIC.with(std::cell::Cell::get) {
+                        panic!("dispatcher callback panic fixture");
+                    }
+                })
             },
         );
         let run = match result {
@@ -393,7 +471,8 @@ mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     struct CountingAllocator;
@@ -776,6 +855,78 @@ mod tests {
         java.lock().jars.clear();
         java.refresh_game_hook_plan_bits();
         assert_eq!(stop_dispatch(&java, Phase::Tail).unwrap().callbacks, 0);
+    }
+
+    #[test]
+    fn dispatch_state_is_not_visible_empty_to_other_hooks() {
+        let java = Arc::new(HorizonJava::default());
+        java.lock().jars.push(load(
+            "blocked",
+            "Blocked",
+            "@Mixin(MinecraftServer.class) public class Blocked { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"ran\"); } }",
+        ));
+        java.refresh_game_hook_plan_bits();
+        let callback_latch = Arc::new(Barrier::new(2));
+        *BLOCK_CALLBACK.lock().unwrap() = Some(Arc::clone(&callback_latch));
+        let java_a = Arc::clone(&java);
+        let dispatch = thread::spawn(move || stop_dispatch(&java_a, Phase::Tail).unwrap());
+        callback_latch.wait();
+
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let java_b = Arc::clone(&java);
+        let started_b = Arc::clone(&started);
+        let finished_b = Arc::clone(&finished);
+        let entry = thread::spawn(move || {
+            started_b.store(true, Ordering::Release);
+            java_b.ensure_jars("26.3");
+            let mut state = java_b.lock();
+            assert_eq!(state.jars.len(), 1);
+            state.jars[0].row.game_hooks.unlisted += 1;
+            finished_b.store(true, Ordering::Release);
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(!finished.load(Ordering::Acquire));
+        callback_latch.wait();
+        assert_eq!(dispatch.join().unwrap().callbacks, 1);
+        entry.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        let state = java.lock();
+        assert_eq!(state.jars.len(), 1);
+        assert_eq!(state.jars[0].row.game_hooks.unlisted, 1);
+    }
+
+    #[test]
+    fn active_frame_serves_hooks_and_refresh_without_deadlock() {
+        let java = HorizonJava::default();
+        java.lock().jars.push(load(
+            "nested_entry",
+            "NestedEntry",
+            "@Mixin(MinecraftServer.class) public class NestedEntry { @Inject(method=\"stopServer\", at=@At(\"TAIL\")) private void t(CallbackInfo ci) { System.out.println(\"ran\"); } }",
+        ));
+        java.refresh_game_hook_plan_bits();
+        let state = {
+            let mut locked = java.lock();
+            std::mem::take(&mut *locked)
+        };
+        let owner = &java as *const HorizonJava;
+        ACTIVE_FRAMES.with(|frames| {
+            frames.borrow_mut().push(ActiveFrame {
+                owner,
+                state: std::cell::UnsafeCell::new(state),
+            })
+        });
+        java.ensure_jars("26.3");
+        java.refresh_game_hook_plan_bits();
+        let frame = ACTIVE_FRAMES.with(|frames| frames.borrow_mut().pop().unwrap());
+        let mut state = frame.state.into_inner();
+        assert_eq!(state.jars.len(), 1);
+        state.jars[0].row.game_hooks.unlisted += 1;
+        *java.lock() = state;
+        assert!(java.plan_bits.maybe_contains("java_server_stopped"));
+        assert_eq!(stop_dispatch(&java, Phase::Tail).unwrap().callbacks, 1);
     }
 
     #[test]

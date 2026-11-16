@@ -1581,10 +1581,8 @@ impl Hooks for HorizonJava {
 }
 
 impl HorizonJava {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock(&self) -> game_dispatch::StateGuard<'_> {
+        game_dispatch::lock_state(self)
     }
 
     fn lock_client(&self) -> std::sync::MutexGuard<'_, client::State> {
