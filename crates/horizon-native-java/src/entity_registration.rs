@@ -467,7 +467,8 @@ pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Va
             if current.starts_with("net/minecraft/") {
                 return None;
             }
-            current = state.supers.get(&current)?.clone();
+            let Some(parent) = state.supers.get(&current) else { break 0 };
+            current = parent.clone();
         }
     };
     if id > 254 {
