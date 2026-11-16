@@ -23,7 +23,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/neoforged/fml/ModContainer.java",
-        "package net.neoforged.fml; import net.neoforged.bus.api.IEventBus; import net.neoforged.neoforgespi.language.IModInfo; public class ModContainer { public String getModId(){return null;} public String getNamespace(){return null;} public IModInfo getModInfo(){return null;} public IEventBus getEventBus(){return null;} }",
+        "package net.neoforged.fml; import net.neoforged.bus.api.IEventBus; import net.neoforged.neoforgespi.language.IModInfo; public class ModContainer { public String getModId(){return null;} public String getNamespace(){return null;} public IModInfo getModInfo(){return null;} public IEventBus getEventBus(){return null;} public void registerExtensionPoint(Class<?> type, IExtensionPoint point) {} }",
     ),
     (
         "net/neoforged/bus/api/IEventBus.java",
@@ -31,7 +31,19 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/neoforged/neoforgespi/language/IModInfo.java",
-        "package net.neoforged.neoforgespi.language; public interface IModInfo { String getModId(); }",
+        "package net.neoforged.neoforgespi.language; import org.apache.maven.artifact.versioning.ArtifactVersion; public interface IModInfo { String getModId(); ArtifactVersion getVersion(); }",
+    ),
+    (
+        "net/neoforged/fml/IExtensionPoint.java",
+        "package net.neoforged.fml; public interface IExtensionPoint {}",
+    ),
+    (
+        "net/neoforged/neoforge/network/registration/HandlerThread.java",
+        "package net.neoforged.neoforge.network.registration; public enum HandlerThread { MAIN, NETWORK }",
+    ),
+    (
+        "org/apache/maven/artifact/versioning/ArtifactVersion.java",
+        "package org.apache.maven.artifact.versioning; public interface ArtifactVersion { String toString(); }",
     ),
     (
         "net/neoforged/fml/ModLoadingContext.java",
@@ -51,17 +63,18 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/neoforged/neoforge/network/registration/PayloadRegistrar.java",
-        "package net.neoforged.neoforge.network.registration; public class PayloadRegistrar { public PayloadRegistrar versioned(String v){return null;} public PayloadRegistrar optional(){return null;} }",
+        "package net.neoforged.neoforge.network.registration; public class PayloadRegistrar { public PayloadRegistrar versioned(String v){return null;} public PayloadRegistrar optional(){return null;} public PayloadRegistrar executesOn(HandlerThread t){return null;} public PayloadRegistrar playToServer(Object type, Object codec, Object handler){return this;} }",
     ),
 ];
 
 const ORACLE: &str = include_str!("fixtures/neoforge_api_slice/java25.txt");
 
-fn expected(name: &str) -> &'static str {
+fn oracle_rows() -> String {
     ORACLE
         .lines()
-        .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
-        .unwrap_or_else(|| panic!("missing oracle row {name}"))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 const PROBE: &str = r#"package demo;
@@ -80,14 +93,8 @@ public final class Probe {
 
     public Probe() {
         ModLoadingContext context = ModLoadingContext.get();
-        try {
-            PayloadRegistrar registrar = new RegisterPayloadHandlersEvent().registrar("1");
-            registrar.versioned("2");
-        } catch (Throwable ignored) {
-            // An unmodeled refinement is deliberately counted and returns the
-            // neutral null; the real jar would continue only if it catches it.
-        }
-        active = context.getActiveNamespace();
+        ModContainer container = context.getActiveContainer();
+        active = answeredRows(context, container);
     }
 
     public static String active() { return active; }
@@ -104,6 +111,31 @@ public final class Probe {
     public static String contextIdentity() {
         return String.valueOf(ModLoadingContext.get() == ModLoadingContext.get());
     }
+
+    private static String answeredRows(ModLoadingContext context, ModContainer container) {
+        return "contextIdentity=" + (context == ModLoadingContext.get()) + "\n"
+            + "activeModId=" + container.getModId() + "\n"
+            + "activeNamespace=" + container.getNamespace() + "\n"
+            + "activeEventBusIdentity=" + (container.getEventBus() == container.getEventBus()) + "\n"
+            + "activeInfoModId=" + container.getModInfo().getModId() + "\n"
+            + "activeInfoVersion=" + container.getModInfo().getVersion() + "\n"
+            + "registrarClass=" + new RegisterPayloadHandlersEvent().registrar("1").getClass().getName();
+    }
+
+    public static String answered() { return active; }
+
+    public static String counted() {
+        ModContainer container = ModLoadingContext.get().getActiveContainer();
+        container.registerExtensionPoint(Extension.class, new Extension());
+        PayloadRegistrar registrar = new RegisterPayloadHandlersEvent().registrar("1");
+        PayloadRegistrar refined = registrar.versioned("2");
+        registrar.optional();
+        registrar.executesOn(null);
+        if (refined != null) refined.playToServer(null, null, null);
+        return "done";
+    }
+
+    public static final class Extension implements net.neoforged.fml.IExtensionPoint {}
 
     public static ModLoadingContext context() { return ModLoadingContext.get(); }
 
@@ -153,7 +185,7 @@ fn text(jar: &NativeJar, host: &mut StdHost, method: &str) -> String {
 }
 
 #[test]
-fn neoforge_loader_and_payload_handles_match_java25_oracle() {
+fn neoforge_loader_oracle_rows_and_counted_unknowns_are_exact() {
     let root = scratch::Scratch::new("neoforge-api");
     let src = root.join("src");
     let classes = root.join("classes");
@@ -196,9 +228,34 @@ fn neoforge_loader_and_payload_handles_match_java25_oracle() {
     let mut host = jar.seed_host(StdHost::new().with_mod("demo", "1.0"));
     jar.execute("demo.Probe", None, "neoforge", &mut host)
         .unwrap();
+    assert_eq!(text(&jar, &mut host, "answered"), oracle_rows());
+    let before_unknown = host.unknown_host_calls().to_vec();
+    let before_payloads = host.payload_registrations().len();
     assert_eq!(
-        text(&jar, &mut host, "contextIdentity"),
-        expected("contextIdentity")
+        text(&jar, &mut host, "counted"),
+        "done",
+    );
+    for needle in [
+        "net/neoforged/fml/ModContainer#registerExtensionPoint(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
+        "net/neoforged/neoforge/network/registration/PayloadRegistrar#versioned(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
+        "net/neoforged/neoforge/network/registration/PayloadRegistrar#optional()Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
+        "net/neoforged/neoforge/network/registration/PayloadRegistrar#executesOn(Lnet/neoforged/neoforge/network/registration/HandlerThread;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
+    ] {
+        let before = before_unknown
+            .iter()
+            .find(|(call, _)| call == needle)
+            .map_or(0, |(_, count)| *count);
+        let after = host
+            .unknown_host_calls()
+            .iter()
+            .find(|(call, _)| call == needle)
+            .map_or(0, |(_, count)| *count);
+        assert!(after > before, "{needle} was not counted; unknown={:?}", host.unknown_host_calls());
+    }
+    assert_eq!(
+        host.payload_registrations().len(),
+        before_payloads,
+        "a counted refinement must not silently record an unrefined channel"
     );
     let mut datagen = jar.seed_host(StdHost::new().with_mod("demo", "1.0"));
     let before = datagen.unknown_host_call_count();

@@ -1,5 +1,7 @@
-# Captured on Java 25.0.5+8 against real NeoForge 26.3.0.101/FML jars.
-# Command: javac --release 21 -cp loader-12.0.12.jar:neoforge-26.3.0.101-universal.jar:bus-8.0.5.jar:minecraft-server-patched-26.3.0.101.jar:maven-artifact-3.10.0.jar Oracle.java && java -cp .:loader-12.0.12.jar:neoforge-26.3.0.101-universal.jar:bus-8.0.5.jar:minecraft-server-patched-26.3.0.101.jar:maven-artifact-3.10.0.jar:log4j-api-2.26.0.jar:logging-1.7.12.jar:slf4j-api-2.0.17.jar Oracle
 contextIdentity=true
-activeError=java.lang.NullPointerException
-datagen=false
+activeModId=demo
+activeNamespace=demo
+activeEventBusIdentity=true
+activeInfoModId=demo
+activeInfoVersion=1.0
+registrarClass=net.neoforged.neoforge.network.registration.PayloadRegistrar
