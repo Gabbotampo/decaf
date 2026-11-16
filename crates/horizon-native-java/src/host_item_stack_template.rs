@@ -1,6 +1,7 @@
 use crate::{
-    NativeError, Value,
+    MethodRef, NativeError, Value,
     host_ref::{HostRef, Methods, Nested},
+    jar_object,
 };
 fn ts(_: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
     Ok(None)
@@ -25,3 +26,22 @@ pub(crate) const METHODS: Methods = Methods {
     crosses_jars: cr,
     compare_to: None,
 };
+pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+    if r.owner == "net/minecraft/world/item/ItemStackTemplate" && r.name == "fromNonEmptyStack" {
+        let key = jar_object::instance_key(args.first()?)?.to_owned();
+        return Some(Ok(jar_object::handle(format!("item-template/{key}"))));
+    }
+    None
+}
+pub(crate) fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, NativeError>> {
+    let key = jar_object::instance_key(receiver)?;
+    if !key.starts_with("item-template/") {
+        return None;
+    }
+    match r.name.as_str() {
+        "withCount" => Some(Ok(receiver.clone())),
+        "create" => Some(Ok(Value::Ref(None))),
+        "count" => Some(Ok(Value::Int(1))),
+        _ => None,
+    }
+}
