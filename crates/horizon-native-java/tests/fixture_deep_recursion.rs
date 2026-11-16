@@ -33,6 +33,7 @@ public final class GsonBuilder {\n\
 public GsonBuilder setFieldNamingPolicy(FieldNamingPolicy policy) { return this; }\n\
 public GsonBuilder setPrettyPrinting() { return this; }\n\
 public GsonBuilder excludeFieldsWithModifiers(int... modifiers) { return this; }\n\
+public GsonBuilder enableComplexMapKeySerialization() { return this; }\n\
 public Gson create() { throw new AssertionError(); }\n}\n";
 const FIELD_NAMING_STUB: &str = "package com.google.gson;\n\
 public class FieldNamingPolicy { public static FieldNamingPolicy LOWER_CASE_WITH_UNDERSCORES; }\n";
@@ -93,6 +94,8 @@ fn gson_writes_enums_and_serialized_names_as_java_25() {
         "sodiumOptions",
         "enumValues",
         "enumMapKeys",
+        "enumBodyValue",
+        "enumBodyMapKey",
     ] {
         let (text, unknown) = run(&fixture, method);
         if text != expected(method) || !unknown.is_empty() {

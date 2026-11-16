@@ -597,6 +597,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
+            ("enableComplexMapKeySerialization", "()Lcom/google/gson/GsonBuilder;") => answer(),
             ("setPrettyPrinting", "()Lcom/google/gson/GsonBuilder;") => {
                 let mut style = self.gson_style(&marker);
                 style.formatting = Formatting::pretty();
@@ -1058,16 +1059,38 @@ impl<H: Host> Runtime<'_, H> {
             })
     }
 
+    /// The enum class whose constant field carries Gson's @SerializedName.
+    ///
+    /// A constant-specific enum body is an anonymous subclass (for example
+    /// Probe$Split$1), but EnumTypeAdapter uses the declaring enum class
+    /// (Probe$Split) when it reads the constant field annotation.
+    fn gson_enum_declaring_class(&self, class: &str) -> Option<String> {
+        let mut current = class.to_owned();
+        loop {
+            let file = self.class(&current)?;
+            if file.super_name == "java/lang/Enum" {
+                return Some(current);
+            }
+            if file.super_name.is_empty() || file.super_name == current {
+                return None;
+            }
+            current = file.super_name.clone();
+        }
+    }
+
     fn gson_enum_text(&self, value: &Value) -> Option<String> {
         let marker = expect_ref(value)?;
         let (name, class) = if let Some((name, _)) = self.enum_constants.get(marker) {
-            (name.clone(), crate::jar_object::object_class(value))
+            let class = crate::jar_object::object_class(value)
+                .and_then(|class| self.gson_enum_declaring_class(class));
+            (name.clone(), class)
         } else {
             let rest = marker.strip_prefix("enum/")?;
             let (class, name) = rest.rsplit_once('/')?;
-            (name.to_owned(), Some(class))
+            (name.to_owned(), Some(class.to_owned()))
         };
         class
+            .as_deref()
             .and_then(|class| self.gson_enum_name(class, &name))
             .or(Some(name))
     }

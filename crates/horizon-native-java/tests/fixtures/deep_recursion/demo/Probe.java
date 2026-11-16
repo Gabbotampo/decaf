@@ -52,6 +52,13 @@ public final class Probe {
                 return "off";
             }
         },
+        @SerializedName("body_named")
+        NAMED_OFF {
+            @Override
+            public String toString() {
+                return "named-off";
+            }
+        },
         SAFE,
         UNLIMITED
     }
@@ -102,12 +109,24 @@ public final class Probe {
     }
 
     public static String enumMapKeys() {
-        Gson gson = new GsonBuilder().create();
+        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
         Map<Tagged, Integer> tagged = new LinkedHashMap<>();
         tagged.put(Tagged.B, 1);
         Map<Split, Integer> split = new LinkedHashMap<>();
         split.put(Split.OFF, 1);
         return gson.toJson(tagged) + "|" + gson.toJson(split);
+    }
+
+    public static String enumBodyValue() {
+        Gson gson = new GsonBuilder().create();
+        return gson.toJson(Split.NAMED_OFF);
+    }
+
+    public static String enumBodyMapKey() {
+        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
+        Map<Split, Integer> split = new LinkedHashMap<>();
+        split.put(Split.NAMED_OFF, 1);
+        return gson.toJson(split);
     }
 
     public static class Renamed {
@@ -140,6 +159,8 @@ public final class Probe {
         System.out.println("sodiumOptions=" + sodiumOptions());
         System.out.println("enumValues=" + enumValues());
         System.out.println("enumMapKeys=" + enumMapKeys());
+        System.out.println("enumBodyValue=" + enumBodyValue());
+        System.out.println("enumBodyMapKey=" + enumBodyMapKey());
         System.out.println("annotatedFields=" + annotatedFields());
         System.out.println("ambiguousAlternates=" + ambiguousAlternates());
     }

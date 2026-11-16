@@ -59,10 +59,22 @@ const COUNTED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "cmpTreeMap",
+        &["java/lang/String#compareTo(Ljava/lang/String;)I"],
+    ),
+    (
         "cmpMax",
         &[
             "java/util/Collections#max(Ljava/util/Collection;Ljava/util/Comparator;)Ljava/lang/Object;",
         ],
+    ),
+    (
+        "cmpLambdaCombined",
+        &["java/lang/String#compareTo(Ljava/lang/String;)I"],
+    ),
+    (
+        "cmpReturnsNonInteger",
+        &["java/lang/String#compareTo(Ljava/lang/String;)I"],
     ),
     (
         "cmpModifiesList",
@@ -79,8 +91,20 @@ const DEPARTURES: &[(&str, &str)] = &[
     ("cmpHashCodeText", "true,false,false"),
     // `Arrays.sort(T[], Comparator)` is not modelled: counted.
     ("cmpArraysSort", "null|"),
+    // `String.compareTo(String)` inside a lambda comparator is counted (as
+    // on main).
+    ("cmpTreeMap", "{b=3}|bb ab cb "),
     // `Collections.max(coll, Comparator)` is not modelled: counted.
     ("cmpMax", "null,ccc,a|"),
+    // `String.compareTo(String)` inside a lambda comparator is counted (as
+    // on main).
+    (
+        "cmpLambdaCombined",
+        "[ccc, dd, bb, aa, c, a],[ccc, dd, bb, aa, c, a]",
+    ),
+    // `String.compareTo(String)` inside a lambda comparator is counted (as
+    // on main).
+    ("cmpReturnsNonInteger", "[b, a, c]"),
 ];
 
 fn shown(out: Result<Value, horizon_native_java::NativeError>) -> String {
