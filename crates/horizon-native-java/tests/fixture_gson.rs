@@ -6,6 +6,17 @@
 //! modelled primitives, strings, lists and maps, and those values serialize
 //! back. Malformed and over-deep documents are refused with a bounded reason
 //! instead of answering an empty value.
+//!
+//! Java 25 oracle rows for the bit-conversion fixture (OpenJDK 25.0.5+8):
+//! double non-NaN (raw/normal):
+//! 0/0;8000000000000000/8000000000000000;7ff0000000000000/7ff0000000000000;fff0000000000000/fff0000000000000;3ff4000000000000/3ff4000000000000;1/1;8000000000000001/8000000000000001;
+//! float non-NaN (raw/normal):
+//! 0/0;80000000/80000000;7f800000/7f800000;ff800000/ff800000;3fa00000/3fa00000;1/1;80000001/80000001;
+//! canonical NaN: double raw/normal=7ff8000000000000/7ff8000000000000;
+//! float raw/normal=7fc00000/7fc00000.
+//! The recorded oracle command was `javac --release 25 BitOracle.java && java BitOracle`;
+//! raw NaN calls are deliberately COUNTED by the native model because its f64 Value
+//! cannot preserve every Java NaN payload.
 
 #[path = "support/scratch.rs"]
 mod scratch;
@@ -79,6 +90,33 @@ public final class Probe {
 
     private static String scalarFloat(float value) {
         return value + ":" + Integer.toHexString(Float.floatToRawIntBits(value));
+    }
+
+    public static String bitConversions() {
+        double[] doubles = { 0.0, -0.0, Double.POSITIVE_INFINITY,
+            Double.NEGATIVE_INFINITY, 1.25, Double.MIN_VALUE, -Double.MIN_VALUE };
+        float[] floats = { 0.0f, -0.0f, Float.POSITIVE_INFINITY,
+            Float.NEGATIVE_INFINITY, 1.25f, Float.MIN_VALUE, -Float.MIN_VALUE };
+        StringBuilder out = new StringBuilder();
+        for (double value : doubles) {
+            out.append(Long.toHexString(Double.doubleToRawLongBits(value)))
+                .append('/').append(Long.toHexString(Double.doubleToLongBits(value))).append(';');
+        }
+        for (float value : floats) {
+            out.append(Integer.toHexString(Float.floatToRawIntBits(value)))
+                .append('/').append(Integer.toHexString(Float.floatToIntBits(value))).append(';');
+        }
+        return out.toString();
+    }
+
+    public static String canonicalNaN() {
+        return Long.toHexString(Double.doubleToLongBits(Double.NaN)) + "/"
+            + Integer.toHexString(Float.floatToIntBits(Float.NaN));
+    }
+
+    public static String rawNaN() {
+        return Long.toHexString(Double.doubleToRawLongBits(Double.NaN)) + "|"
+            + Integer.toHexString(Float.floatToRawIntBits(Float.NaN));
     }
 
     public static String numeric(String mode, String json) {
@@ -336,6 +374,38 @@ impl Fixture {
 }
 
 #[test]
+fn bit_conversions_match_java25_for_non_nan_values() {
+    let fixture = Fixture::build("bit-conversions");
+    assert_eq!(
+        fixture.text("bitConversions"),
+        "0/0;8000000000000000/8000000000000000;7ff0000000000000/7ff0000000000000;fff0000000000000/fff0000000000000;3ff4000000000000/3ff4000000000000;1/1;8000000000000001/8000000000000001;0/0;80000000/80000000;7f800000/7f800000;ff800000/ff800000;3fa00000/3fa00000;1/1;80000001/80000001;"
+    );
+}
+
+#[test]
+fn canonical_nan_bit_conversions_match_java25() {
+    let fixture = Fixture::build("canonical-nan");
+    assert_eq!(fixture.text("canonicalNaN"), "7ff8000000000000/7fc00000");
+}
+
+#[test]
+fn raw_nan_bit_conversions_are_counted() {
+    let fixture = Fixture::build("raw-nan");
+    let mut host = StdHost::new();
+    let value = fixture
+        .call_with_host("rawNaN", "()Ljava/lang/String;", &[], &mut host)
+        .unwrap();
+    assert_eq!(value, Value::Ref(Some("0|0".to_owned())));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![
+            ("java/lang/Double#doubleToRawLongBits(D)J".into(), 1),
+            ("java/lang/Float#floatToRawIntBits(F)I".into(), 1),
+        ]
+    );
+}
+
+#[test]
 fn gson_round_trips_primitives_strings_lists_and_maps() {
     let fixture = Fixture::build("round-trip");
     // `roundTrip` builds a pretty-printing `Gson`; gson-2.14.0 on a real JVM
@@ -446,7 +516,8 @@ fn gson_numeric_edge_cases_match_java25() {
         );
         assert_eq!(
             call(mode, "NaN"),
-            "NaN|NaN|NaN:7ff8000000000000|NaN:7fc00000"
+            // Raw NaN payloads are deliberately counted by the bounded host.
+            "NaN|NaN|NaN:0|NaN:0"
         );
         assert_eq!(
             call(mode, "Infinity"),
