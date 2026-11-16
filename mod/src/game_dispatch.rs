@@ -219,12 +219,12 @@ impl DerefMut for StateGuard<'_> {
 }
 
 pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
-    let owner = owner as *const HorizonJava;
+    let owner_ptr = owner as *const HorizonJava;
     if let Some(state) = ACTIVE_FRAMES.with(|frames| {
         frames
             .borrow()
             .last()
-            .filter(|frame| frame.owner == owner)
+            .filter(|frame| frame.owner == owner_ptr)
             .map(|frame| frame.state.get())
     }) {
         return StateGuard::Active {
@@ -232,21 +232,15 @@ pub(crate) fn lock_state(owner: &HorizonJava) -> StateGuard<'_> {
             _marker: std::marker::PhantomData,
         };
     }
-    let gate = owner_ref(owner)
+    let gate = owner
         .dispatch_gate
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let state = owner_ref(owner)
+    let state = owner
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     StateGuard::Locked { _gate: gate, state }
-}
-
-fn owner_ref<'a>(owner: *const HorizonJava) -> &'a HorizonJava {
-    // SAFETY: the caller derives this pointer from a live HorizonJava reference and the guard
-    // keeps that owner alive for the returned borrow.
-    unsafe { &*owner }
 }
 
 impl HorizonJava {

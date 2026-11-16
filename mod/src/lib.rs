@@ -133,8 +133,8 @@ const LOG: &str = "Horizon Java";
 pub struct HorizonJava {
     state: Mutex<State>,
     client: Mutex<client::State>,
-    /// Serializes top-level Java dispatches while allowing same-thread re-entry through the
-    /// thread-local frame owned by `game_dispatch`.
+    /// Serializes state access with top-level Java dispatches while allowing same-thread access
+    /// through the thread-local frame owned by `game_dispatch`.
     pub(crate) dispatch_gate: Mutex<()>,
     pub(crate) plan_bits: game_dispatch::PlanBits,
 }
