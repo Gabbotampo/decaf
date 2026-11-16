@@ -18,25 +18,12 @@ pub(crate) fn registrar(version: &Value) -> Value {
 }
 
 pub(crate) fn instance_call(
-    r: &crate::runtime::MethodRef,
-    receiver: &Value,
-    args: &[Value],
+    _r: &crate::runtime::MethodRef,
+    _receiver: &Value,
+    _args: &[Value],
 ) -> Option<Value> {
-    if !matches!(receiver, Value::Host(handle) if handle.kind() == HostKind::NeoForgePayloadRegistrar)
-    {
-        return None;
-    }
-    let returns_registrar = r
-        .descriptor
-        .ends_with("Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;");
-    if returns_registrar && matches!(r.name.as_str(), "versioned" | "optional" | "executesOn") {
-        // NeoForge returns a new registrar for these builder refinements. The
-        // builder's registration methods are recorded by the existing payload
-        // model; this module only preserves the typed builder identity.
-        return Some(registrar(
-            &args.first().cloned().unwrap_or(Value::Ref(None)),
-        ));
-    }
+    // Refinements carry transport state in NeoForge. Until that state is
+    // modeled, leave the call at the counted boundary.
     None
 }
 
@@ -71,6 +58,6 @@ mod tests {
                 "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;"
                     .into(),
         };
-        assert!(instance_call(&method, &value, &[Value::Ref(Some("2".into()))]).is_some());
+        assert!(instance_call(&method, &value, &[Value::Ref(Some("2".into()))]).is_none());
     }
 }

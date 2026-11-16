@@ -959,11 +959,6 @@ impl<H: Host> Runtime<'_, H> {
         if !matches!(opcode, 0xb6 | 0xb9) || crate::runtime::jar_object::is_object_handle(handle) {
             return Ok(None);
         }
-        // Annotation proxies dispatch their interface members through the reflection model,
-        // which has the held annotation values and Java's proxy contract.
-        if handle.kind() == crate::runtime::host_ref::HostKind::AnnotationProxy {
-            return Ok(None);
-        }
         if handle.kind() == crate::runtime::host_ref::HostKind::KotlinLazy
             && let Some(value) =
                 crate::runtime::kotlin_stdlib::instance(self, r, receiver.unwrap_or(&Value::Ref(None)), args)

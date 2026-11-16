@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::host_ref::{HostKind, HostRef};
-use crate::model_layers;
 use crate::{MethodRef, NativeError, Value};
 
 const PARTICLE_REGISTRY: &str =
@@ -64,7 +63,6 @@ pub(crate) struct State {
     model_locations: BTreeMap<String, (String, String)>,
     menu_screens: BTreeSet<String>,
     static_values: BTreeMap<String, Value>,
-    pub(crate) model_data: model_layers::State,
 }
 
 fn client_handle(text: impl Into<String>) -> Value {
@@ -293,9 +291,6 @@ const HUD_IDS: &[&str] = &[
 
 /// Static fields whose values are canonical identifiers or enum constants.
 pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Value> {
-    if let Some(value) = model_layers::static_field(&mut state.model_data, r) {
-        return Some(value);
-    }
     let cache_key = format!("{}#{}:{}", r.owner, r.name, r.descriptor);
     if let Some(value) = state.static_values.get(&cache_key) {
         return Some(value.clone());
@@ -357,9 +352,6 @@ pub(crate) fn invoke(
     r: &MethodRef,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    if let Some(value) = model_layers::invoke(&mut state.model_data, r, args) {
-        return Some(value);
-    }
     match (r.owner.as_str(), r.name.as_str()) {
         (PARTICLE_TYPES, "simple") => {
             let limiter = match r.descriptor.as_str() {
@@ -569,9 +561,6 @@ pub(crate) fn instance(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    if let Some(value) = model_layers::instance(&mut state.model_data, r, receiver, args) {
-        return Some(value);
-    }
     if let Some(answer) = profile_map_call(r, receiver, args) {
         return Some(answer);
     }

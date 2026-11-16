@@ -13,14 +13,11 @@ use crate::runtime::{Host, MethodRef, StdHost, Value, host_service};
 const MOD_LOADING_CONTEXT: &str = "net/neoforged/fml/ModLoadingContext";
 const FML_LOADER: &str = "net/neoforged/fml/loading/FMLLoader";
 
-pub(crate) fn static_call(host: &mut StdHost, r: &MethodRef) -> Option<Value> {
+pub(crate) fn static_call(_host: &mut StdHost, r: &MethodRef) -> Option<Value> {
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (MOD_LOADING_CONTEXT, "get", "()Lnet/neoforged/fml/ModLoadingContext;") => Some(
             host_service::thread_local_loader_singleton(MOD_LOADING_CONTEXT),
         ),
-        ("net/neoforged/neoforge/data/loading/DatagenModLoader", "isRunningDataGen", "()Z") => {
-            host.data_gen_value()
-        }
         (FML_LOADER, "isProduction", "()Z") => Some(Value::Int(1)),
         (FML_LOADER, "getGameDir", "()Ljava/nio/file/Path;") => {
             Some(crate::runtime::host_path::path_value("/horizon/game"))

@@ -1,1 +1,0 @@
-package net.fabricmc.loader.api.metadata; import java.nio.file.Path; import java.util.List; public interface ModOrigin { enum Kind { PATH, NESTED, UNKNOWN } Kind getKind(); List<Path> getPaths(); String getParentModId(); String getParentSubLocation(); }

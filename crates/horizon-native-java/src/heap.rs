@@ -1583,7 +1583,6 @@ mod tests {
             "environment_type",
             "game_version",
             "development_environment",
-            "data_gen",
             "random_bit_scope",
             "console_out",
             "io_files",

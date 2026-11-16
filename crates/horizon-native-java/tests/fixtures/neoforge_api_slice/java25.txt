@@ -1,9 +1,5 @@
-# Java 25 / NeoForge 26.3.0.101 javap-captured rows
-# ModLoadingContext.get() is ThreadLocal.withInitial; getActiveContainer() falls back to minecraft.
-active=demo|demo|true|demo|demo|true|true|true|false|true
-outside=minecraft|minecraft|true|minecraft|minecraft
+# Captured on Java 25.0.5+8 against real NeoForge 26.3.0.101/FML jars.
+# Command: javac --release 21 -cp loader-12.0.12.jar:neoforge-26.3.0.101-universal.jar:bus-8.0.5.jar:minecraft-server-patched-26.3.0.101.jar:maven-artifact-3.10.0.jar Oracle.java && java -cp .:loader-12.0.12.jar:neoforge-26.3.0.101-universal.jar:bus-8.0.5.jar:minecraft-server-patched-26.3.0.101.jar:maven-artifact-3.10.0.jar:log4j-api-2.26.0.jar:logging-1.7.12.jar:slf4j-api-2.0.17.jar Oracle
 contextIdentity=true
-dataGen(normal)=false
-dataGen(data-gen)=true
-contextThread=distinct
-gameDir=/horizon/game
+activeError=java.lang.NullPointerException
+datagen=false

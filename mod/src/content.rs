@@ -449,7 +449,7 @@ fn usable_id(id: &str) -> bool {
 /// The jars under the game's `config/horizon_java/java-mods/`, sorted by file name so one run's
 /// report reads the same as the next. An absent folder is no jars; an unreadable one is a warning,
 /// not a failed start.
-pub(crate) fn read_jar_files() -> Vec<(String, Vec<u8>)> {
+fn read_jar_files() -> Vec<(String, Vec<u8>)> {
     let Ok(game_dir) = std::env::current_dir() else {
         log::warn!("{LOG}: the game folder is unknown; no jars are read");
         return Vec::new();

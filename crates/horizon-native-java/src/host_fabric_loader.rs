@@ -55,7 +55,6 @@ const CONTAINER_TYPES: &[&str] = &[
     "net/fabricmc/loader/api/ModContainer",
 ];
 const METADATA_TYPES: &[&str] = &["net/fabricmc/loader/api/metadata/ModMetadata"];
-const DEPENDENCY_TYPES: &[&str] = &["net/fabricmc/loader/api/metadata/ModDependency"];
 const ORIGIN_TYPES: &[&str] = &["net/fabricmc/loader/api/metadata/ModOrigin"];
 const PERSON_TYPES: &[&str] = &["net/fabricmc/loader/api/metadata/Person"];
 const CONTACT_TYPES: &[&str] = &["net/fabricmc/loader/api/metadata/ContactInformation"];
@@ -66,9 +65,6 @@ pub(crate) fn container_types(_: &str) -> &'static [&'static str] {
 }
 pub(crate) fn metadata_types(_: &str) -> &'static [&'static str] {
     METADATA_TYPES
-}
-pub(crate) fn dependency_types(_: &str) -> &'static [&'static str] {
-    DEPENDENCY_TYPES
 }
 pub(crate) fn origin_types(_: &str) -> &'static [&'static str] {
     ORIGIN_TYPES
@@ -122,20 +118,6 @@ pub(crate) fn metadata(id: &str) -> Value {
 }
 
 /// A metadata handle's mod id.
-pub(crate) fn dependency(mod_id: &str, kind: &str) -> Value {
-    Value::Host(HostRef::of_values(
-        HostKind::FabricModDependency,
-        &[text(mod_id), text(kind)],
-    ))
-}
-
-pub(crate) fn dependency_parts(value: &Value) -> Option<(String, String)> {
-    match strings(value, HostKind::FabricModDependency)?.as_slice() {
-        [Some(mod_id), Some(kind)] => Some((mod_id.clone(), kind.clone())),
-        _ => None,
-    }
-}
-
 pub(crate) fn metadata_id(value: &Value) -> Option<String> {
     strings(value, HostKind::FabricModMetadata)?
         .into_iter()

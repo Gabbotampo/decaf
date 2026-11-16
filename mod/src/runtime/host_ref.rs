@@ -357,8 +357,6 @@ pub enum HostKind {
     FabricModContainer,
     /// A Fabric `ModMetadata`: key its mod id.
     FabricModMetadata,
-    /// A Fabric metadata dependency: key its mod id and dependency kind.
-    FabricModDependency,
     /// A Fabric `ModOrigin`: key its kind and argument.
     FabricModOrigin,
     FabricModOriginKind,
@@ -382,8 +380,7 @@ pub enum HostKind {
     NeoForgeModInfo,
     /// A `ModFileInfo`: key its file's first mod id.
     NeoForgeModFileInfo,
-    /// A NeoForge `PayloadRegistrar` builder. Its key contains a serial and
-    /// the version/refinement values, so a jar cannot forge one with text.
+    /// A NeoForge PayloadRegistrar builder.
     NeoForgePayloadRegistrar,
     /// A `ModConfig.Type` constant: key its name.
     NeoForgeConfigType,
@@ -448,9 +445,6 @@ pub enum HostKind {
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
-    /// A runtime-owned annotation proxy; its key carries the held annotation
-    /// interface descriptor but is never a String marker.
-    AnnotationProxy,
     /// A chat component (`MutableComponent`): key a serial per allocation, then its vanilla
     /// JSON, keys sorted
     /// (`host_component.rs`).
@@ -599,13 +593,6 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
-    /// Pure client model-layer builder values and trees.
-    CubeDeformation,
-    PartPose,
-    CubeListBuilder,
-    MeshDefinition,
-    PartDefinition,
-    LayerDefinition,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1720,15 +1707,6 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_fabric_loader::OBJECT_METHODS,
     },
     KindInfo {
-        kind: HostKind::FabricModDependency,
-        tag: "fdep",
-        class: ClassRule::Unknown {
-            declared: crate::runtime::host_fabric_loader::dependency_types,
-        },
-        canonical: always_canonical,
-        methods: &crate::runtime::host_fabric_loader::OBJECT_METHODS,
-    },
-    KindInfo {
         kind: HostKind::FabricModOrigin,
         tag: "fmo",
         class: ClassRule::Unknown {
@@ -1824,7 +1802,6 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::NeoForgePayloadRegistrar,
         tag: "nfpr",
         class: ClassRule::Fixed("net/neoforged/neoforge/network/registration/PayloadRegistrar"),
-        // Each refinement is a fresh registrar object.
         canonical: never_canonical,
         methods: &crate::runtime::host_service::METHODS,
     },
@@ -2066,13 +2043,6 @@ const KINDS: &[KindInfo] = &[
         // One `Class` per name in a run (`class_precedence`, #124).
         canonical: always_canonical,
         methods: &crate::runtime::host_class::CLASS_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::AnnotationProxy,
-        tag: "anpr",
-        class: ClassRule::FromKey(crate::runtime::annotation_proxy::class_of_key),
-        canonical: always_canonical,
-        methods: &crate::runtime::annotation_proxy::METHODS,
     },
     KindInfo {
         kind: HostKind::Component,
@@ -2567,48 +2537,6 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::runtime::client_reload::converter_class),
         canonical: never_canonical,
         methods: &crate::runtime::client_reload::CONVERTER_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::CubeDeformation,
-        tag: "cdef",
-        class: ClassRule::Fixed(crate::runtime::model_layers::CUBE_DEFORMATION),
-        canonical: never_canonical,
-        methods: &crate::runtime::model_layers::CUBE_DEFORMATION_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::PartPose,
-        tag: "ppose",
-        class: ClassRule::Fixed(crate::runtime::model_layers::PART_POSE),
-        canonical: never_canonical,
-        methods: &crate::runtime::model_layers::PART_POSE_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::CubeListBuilder,
-        tag: "mlbld",
-        class: ClassRule::Fixed(crate::runtime::model_layers::CUBE_LIST_BUILDER),
-        canonical: always_canonical,
-        methods: &crate::runtime::model_layers::IDENTITY_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::MeshDefinition,
-        tag: "mesh",
-        class: ClassRule::Fixed(crate::runtime::model_layers::MESH_DEFINITION),
-        canonical: always_canonical,
-        methods: &crate::runtime::model_layers::IDENTITY_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::PartDefinition,
-        tag: "part",
-        class: ClassRule::Fixed(crate::runtime::model_layers::PART_DEFINITION),
-        canonical: always_canonical,
-        methods: &crate::runtime::model_layers::IDENTITY_METHODS,
-    },
-    KindInfo {
-        kind: HostKind::LayerDefinition,
-        tag: "layer",
-        class: ClassRule::Fixed(crate::runtime::model_layers::LAYER_DEFINITION),
-        canonical: always_canonical,
-        methods: &crate::runtime::model_layers::IDENTITY_METHODS,
     },
 ];
 
