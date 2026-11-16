@@ -216,6 +216,7 @@ mod reflect_override;
 mod regex_calls;
 mod registry_contents;
 mod registry_lookup;
+mod render_math;
 mod sequenced;
 mod service_loader;
 mod stack_walk;
@@ -3479,6 +3480,7 @@ pub struct StdHost {
     /// The client surface's registrations and current firing
     /// (`client_surface`): key mappings, HUD elements, the frame's snapshot.
     client: client_surface::ClientState,
+    render_objects: BTreeMap<String, render_math::Obj>,
     /// The command tree the jar's registration callbacks built and the
     /// command running now (`brigadier.rs`).
     brigadier: brigadier::BrigadierState,
@@ -3628,6 +3630,7 @@ impl StdHost {
             next_reversed_view: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
+            render_objects: BTreeMap::new(),
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
         }
@@ -6122,6 +6125,9 @@ impl Host for StdHost {
                 host_registry::registry(id)
             });
         }
+        if let Some(value) = render_math::static_field(r) {
+            return Ok(value);
+        }
         // A modelled game enum's constant is its `enum/<class>/<NAME>` marker,
         // the same value `values()` lists.
         if r.descriptor == format!("L{};", r.owner)
@@ -7639,6 +7645,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         self.record(r, Some(receiver), args);
+        if let Some(result) = render_math::call(&mut self.render_objects, r, receiver, args) {
+            return result;
+        }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
         }
@@ -15807,6 +15816,8 @@ fn host_models_class(name: &str) -> bool {
         "net/neoforged/",
         "net/minecraftforge/",
         "com/google/gson/",
+        "com/mojang/",
+        "org/joml/",
         "org/spongepowered/asm/mixin/injection/callback/",
     ];
     is_platform_class(name) || ROOTS.iter().any(|root| name.starts_with(root))
@@ -23108,6 +23119,9 @@ impl<H: Host> Runtime<'_, H> {
     /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
+        if render_math::is_class(class) {
+            return render_math::new_value(class, &key);
+        }
         if modelled_writer_class(class) {
             jar_object::writer_handle(key)
         } else {
