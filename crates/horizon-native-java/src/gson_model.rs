@@ -875,7 +875,7 @@ impl<H: Host> Runtime<'_, H> {
                     Some(if tree_mode {
                         format_java_float(*value)
                     } else {
-                        format!("{value}")
+                        crate::jdk_float_text::double_to_string(*value)
                     })
                 } else {
                     Some(non_finite_text(*value, style)?)
