@@ -337,9 +337,16 @@ fn dispatch_state(
             });
             let run = match result {
                 Ok(Ok(run)) => run,
-                Ok(Err(error)) => return Err(DispatchError::from_error(error)),
-                Err(panic) => return Err(DispatchError::from_error(format!("panicked: {panic}"))),
+                Ok(Err(error)) => {
+                    loaded.row.game_hooks.failed += 1;
+                    return Err(DispatchError::from_error(error));
+                }
+                Err(panic) => {
+                    loaded.row.game_hooks.failed += 1;
+                    return Err(DispatchError::from_error(format!("panicked: {panic}")));
+                }
             };
+            loaded.row.game_hooks.ran += run.ran;
             answer.callbacks += run.ran;
             answer.cancelled |= run.cancelled;
             if run.returned.is_some() {
