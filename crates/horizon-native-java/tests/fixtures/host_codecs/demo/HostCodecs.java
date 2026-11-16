@@ -205,6 +205,32 @@ public final class HostCodecs {
     return Boolean.toString(first == second);
   }
 
+  /** MapCodec.unit's empty keys, prefix-preserving encode, supplier-per-decode, and text. */
+  public static String mapUnitExecution() {
+    final int[] calls = {0};
+    java.util.function.Supplier<String> supplier = () -> "sup" + (++calls[0]);
+    MapCodec<String> map = MapCodec.unit(supplier);
+    long keys = map.keys(null).count();
+    String first = map.decode(null, null).result().orElseThrow();
+    String second = map.decode(null, null).result().orElseThrow();
+    com.mojang.serialization.RecordBuilder<Object> prefix = null;
+    boolean samePrefix = map.encode("ignored", null, prefix) == prefix;
+    String mapText = map.toString();
+    String codecText = map.codec().toString();
+    String fieldText = map.codec().fieldOf("x").toString();
+    return first + "|" + second + "|" + calls[0] + "|" + keys + "|" + samePrefix + "|"
+        + mapText + "|" + codecText + "|" + fieldText;
+  }
+
+  public static String mapUnitNull() {
+    MapCodec<String> map = MapCodec.unit((String) null);
+    com.mojang.serialization.RecordBuilder<Object> prefix = null;
+    String decoded;
+    try { decoded = Boolean.toString(map.decode(null, null).result().isPresent()); }
+    catch (Throwable x) { decoded = x.getClass().getName() + "|" + x.getMessage(); }
+    return map + "|" + decoded + "|" + (map.encode(null, null, prefix) == prefix);
+  }
+
   /** StreamCodec.unit retains the value and enforces it on encode. */
   public static String streamUnitIdentity() {
     StreamCodec<Object, String> a = StreamCodec.unit("alpha");
@@ -221,6 +247,34 @@ public final class HostCodecs {
     try { a.encode(null, "beta"); rejected = "none"; }
     catch (Throwable x) { rejected = x.getClass().getName() + "|" + x.getMessage(); }
     return decoded + "|" + accepted + "|" + rejected;
+  }
+
+  public static String streamUnitNull() {
+    StreamCodec<Object, String> codec = StreamCodec.unit(null);
+    String decoded = String.valueOf(codec.decode(null));
+    try {
+      codec.encode(null, null);
+      return decoded + "|accepted";
+    } catch (Throwable x) {
+      return decoded + "|" + x.getClass().getName() + "|" + x.getMessage();
+    }
+  }
+
+  static final class Eq {
+    final int value;
+    Eq(int value) { this.value = value; }
+    @Override public boolean equals(Object other) { return other instanceof Eq x && x.value == value; }
+    @Override public String toString() { return "Eq" + value; }
+  }
+
+  public static String streamUnitCustomEquals() {
+    StreamCodec<Object, Eq> codec = StreamCodec.unit(new Eq(7));
+    boolean equalAccepted;
+    try { codec.encode(null, new Eq(7)); equalAccepted = true; } catch (Throwable x) { equalAccepted = false; }
+    boolean unequalRejected;
+    try { codec.encode(null, new Eq(8)); unequalRejected = false; }
+    catch (IllegalStateException x) { unequalRejected = true; }
+    return codec.decode(null).toString() + "|" + equalAccepted + "|" + unequalRejected;
   }
 
   /** A network StreamCodec is not a DFU Codec and must be refused before dispatch. */

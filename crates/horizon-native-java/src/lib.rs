@@ -25590,9 +25590,17 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = thread_local::call(self, r, receiver, args) {
             return value.map(Some);
         }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // A game codec factory whose result a class only stores.
         if let Some(value) = stream_codec::static_call(r, args) {
             return Ok(Some(value));
+        }
+        if let Some(value) = receiver
+            .and_then(|receiver| stream_codec::runtime_instance_call(self, r, Some(receiver), args))
+        {
+            return value.map(Some);
         }
         if let Some(value) =
             receiver.and_then(|receiver| stream_codec::instance_call(r, receiver, args))
@@ -29716,6 +29724,11 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
                         // `new String(...)` builds no text yet: counted.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

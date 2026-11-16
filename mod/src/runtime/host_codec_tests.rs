@@ -165,6 +165,8 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
             "mapUnitCodecIdentity",
             Exact(oracle_row("mapUnitCodecIdentity")),
         ),
+        ("mapUnitExecution", Exact(oracle_row("mapUnitExecution"))),
+        ("mapUnitNull", Exact(oracle_row("mapUnitNull"))),
         (
             "streamUnitIdentity",
             Exact(oracle_row("streamUnitIdentity")),
@@ -172,6 +174,11 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         (
             "streamUnitRoundTrip",
             Exact(oracle_row("streamUnitRoundTrip")),
+        ),
+        ("streamUnitNull", Exact(oracle_row("streamUnitNull"))),
+        (
+            "streamUnitCustomEquals",
+            Exact(oracle_row("streamUnitCustomEquals")),
         ),
         (
             "dfuConstruction",
