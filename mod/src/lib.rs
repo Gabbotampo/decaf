@@ -80,15 +80,16 @@ use std::time::Duration;
 use attachments::Lifecycle;
 use game_hooks::Arg;
 use mod_api::{
-    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientSetupEvent,
-    Command, CommandArgumentValue, CommandSource, ConfigFileError, ConfigPath, DimensionKey,
-    EntityInteractEvent, EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow,
-    GameRuleChangedEvent, Hand, Hooks, Host, HostSide, InteractionResult, ItemsEvent,
-    LeftClickBlockEvent, LevelDimension, LevelLoadEvent, LevelRandomHost, LevelRef,
-    LevelTickPostEvent, LevelTickPreEvent, LevelUnloadEvent, LivingDamagePostEvent,
-    LivingDeathEvent, LivingDeathPostEvent, LivingIncomingDamageEvent, PlayerChangedDimensionEvent,
-    PlayerCloneEvent, PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent,
-    PlayerLoggedOutEvent, PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
+    AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
+    ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
+    CommandSource, ConfigFileError, ConfigPath, DimensionKey, EntityInteractEvent,
+    EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
+    Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
+    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
+    LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
+    PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
+    PlayerRef, PlayerRespawnedEvent, PlayerTickPostEvent, PlayerTickPreEvent,
     RegisterCommandsEvent, RegistrationContext, RightClickBlockEvent, RightClickItemEvent,
     RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStartedEvent,
     ServerStartingEvent, ServerStoppedEvent, ServerStoppingEvent, ServerTickEvent, ServerTickPhase,
@@ -470,7 +471,7 @@ impl Hooks for HorizonJava {
                 .count()
         };
         let total = state.jars.len() + state.refused.len();
-        match write_report(host, &state) {
+        match write_report(host, &state, &self.lock_client()) {
             Ok(path) => log::info!(
                 "{LOG} {}: server about to start (dedicated={}); {total} jar(s) in config/{JARS}: {} ran-clean, {} ran-hollow, {} ran-partial, {} refused; report in {path}",
                 env!("CARGO_PKG_VERSION"),
@@ -546,7 +547,7 @@ impl Hooks for HorizonJava {
         for row in state.rows() {
             log::info!("{LOG}: {row}");
         }
-        if let Err(error) = write_report(host, &state) {
+        if let Err(error) = write_report(host, &state, &self.lock_client()) {
             log::warn!("{LOG}: {REPORT} could not be updated at server stopping: {error}");
         }
     }
@@ -1508,20 +1509,48 @@ impl Hooks for HorizonJava {
     /// A dedicated server never fires it. The client owner runs its resident jars here before the
     /// native setup notification returns.
     fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut client = self.lock_client();
         client.ensure_loaded();
         let rows = client.report_rows().count();
         log::info!("{LOG}: stored {rows} client report row(s)");
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
+    }
+
+    fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
+        self.lock_client().level_loaded();
+    }
+
+    fn client_level_unload(
+        &self,
+        _host: &mut dyn ClientHost,
+        _event: &mut ClientLevelUnloadEvent<'_>,
+    ) {
+        self.lock_client().level_unloaded();
+    }
+
+    fn client_stopping(&self, host: &mut dyn ClientHost, _event: &mut ClientStoppingEvent) {
+        let state = self.lock();
+        let mut client = self.lock_client();
+        let rows = client.report_rows().count();
+        if let Err(error) = write_report(host, &state, &client) {
+            log::warn!("{LOG}: {REPORT} could not be flushed at client stopping: {error}");
+        }
+        let dropped = client.teardown();
+        log::info!(
+            "{LOG}: client stopping flushed {rows} row(s), dropped {dropped} resident jar(s)"
+        );
     }
 }
 
 impl HorizonJava {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_client(&self) -> std::sync::MutexGuard<'_, client::State> {
+        self.client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -2749,8 +2778,7 @@ fn load_jar(
 
 /// Writes the report, replacing the previous one, and answers the path it was written to (as a
 /// reader finds it under the game's `config/`).
-fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileError> {
-    let path = ConfigPath::new(REPORT)?;
+fn report_json(state: &State, client: &client::State) -> serde_json::Value {
     let rows: Vec<_> = state
         .jars
         .iter()
@@ -2764,8 +2792,22 @@ fn write_report(host: &dyn Host, state: &State) -> Result<String, ConfigFileErro
         })
         .chain(state.refused.iter().map(JarRow::json))
         .collect();
-    let report =
-        json!({ "schema": SCHEMA, "jars": rows, "game_hook_sites": game_hooks::sites_json() });
+    let client_rows: Vec<_> = client.report_rows().collect();
+    json!({
+        "schema": SCHEMA,
+        "jars": rows,
+        "client_jars": client_rows,
+        "game_hook_sites": game_hooks::sites_json(),
+    })
+}
+
+fn write_report(
+    host: &dyn Host,
+    state: &State,
+    client: &client::State,
+) -> Result<String, ConfigFileError> {
+    let path = ConfigPath::new(REPORT)?;
+    let report = report_json(state, client);
     let mut bytes = serde_json::to_vec_pretty(&report).unwrap_or_default();
     bytes.push(b'\n');
     host.config_files().write(&path, &bytes)?;
@@ -2777,10 +2819,17 @@ mod tests {
     use super::*;
     use mod_api::{DamageContainer, EntityRef, Identifier, PermissionLevel, WorldEpoch};
 
+    #[test]
+    fn report_json_persists_a_client_rows_section() {
+        let report = report_json(&State::default(), &client::State::default());
+        assert_eq!(report["schema"], SCHEMA);
+        assert!(report["client_jars"].is_array());
+    }
+
     /// Two players leave in one poll: Horizon drops both before the first logout hook, so the
     /// first logout's refresh drops the second too. Each logout firing still gets its own
-    /// player's last entry (the same `ServerPlayer` earlier firings handed out), once, and a
-    /// player never listed gets none (#228's re-check B2).
+    /// player's last entry (the same ServerPlayer earlier firings handed out), once, and a
+    /// player never listed gets none (re-check B2).
     #[test]
     fn players_leaving_in_one_poll_each_keep_their_last_entry() {
         let player = |uuid: u128, entity_id: i32| FacadePlayer {

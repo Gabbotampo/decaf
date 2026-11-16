@@ -16,8 +16,10 @@ use crate::runtime;
 #[derive(Default)]
 pub(crate) struct State {
     loaded: bool,
+    world_loaded: bool,
     jars: Vec<LoadedJar>,
     refused: Vec<Row>,
+    retired: Vec<Row>,
 }
 
 struct LoadedJar {
@@ -26,6 +28,14 @@ struct LoadedJar {
     host: StdHost,
     listeners: Vec<GameListener>,
     orderings: Vec<PhaseOrdering>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StageCounts {
+    attempted: usize,
+    failed: usize,
+    disabled: usize,
+    calls: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -38,6 +48,7 @@ struct Row {
     reason: Option<String>,
     entrypoints_ran: usize,
     entrypoints_failed: usize,
+    stages: BTreeMap<String, StageCounts>,
     keys: usize,
     hud_layers: usize,
     listeners: usize,
@@ -67,6 +78,12 @@ impl Row {
             "client": {
                 "entrypoints_ran": self.entrypoints_ran,
                 "entrypoints_failed": self.entrypoints_failed,
+                "stages": self.stages.iter().map(|(stage, counts)| (stage.clone(), serde_json::json!({
+                    "attempted": counts.attempted,
+                    "failed": counts.failed,
+                    "disabled": counts.disabled,
+                    "calls": counts.calls,
+                }))).collect::<serde_json::Map<_, _>>(),
                 "client_keys": self.keys,
                 "client_hud_layers": self.hud_layers,
                 "client_listeners": self.listeners,
@@ -83,6 +100,8 @@ impl State {
         if self.loaded {
             return;
         }
+        self.retired.clear();
+        self.world_loaded = false;
         self.loaded = true;
         let mut parsed = Vec::new();
         for (file, bytes) in crate::content::read_jar_files() {
@@ -152,10 +171,31 @@ impl State {
     }
 
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
-        self.jars
+        self.retired
             .iter()
-            .map(|jar| jar.row.json())
+            .map(Row::json)
+            .chain(self.jars.iter().map(|jar| jar.row.json()))
             .chain(self.refused.iter().map(Row::json))
+    }
+
+    pub(crate) fn level_loaded(&mut self) {
+        self.world_loaded = true;
+    }
+
+    pub(crate) fn level_unloaded(&mut self) {
+        self.world_loaded = false;
+    }
+
+    /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available
+    /// until the next client setup so the final report can be rewritten after teardown.
+    pub(crate) fn teardown(&mut self) -> usize {
+        let mut rows = std::mem::take(&mut self.refused);
+        rows.extend(self.jars.drain(..).map(|jar| jar.row));
+        let count = rows.len();
+        self.retired.extend(rows);
+        self.loaded = false;
+        self.world_loaded = false;
+        count
     }
 }
 
@@ -204,8 +244,12 @@ fn load_jar(
     let mut failures = Vec::new();
     let mut failed_classes = Vec::new();
     for (kind, entry) in &entrypoints {
+        let counts = row.stages.entry((*kind).to_owned()).or_default();
+        counts.attempted += 1;
         if let Some(adapter) = entry.adapter.as_deref() {
             row.entrypoints_failed += 1;
+            counts.failed += 1;
+            counts.disabled += 1;
             failures.push(format!(
                 "{}: entrypoint adapter {adapter} is not supported",
                 entry.class
@@ -227,14 +271,25 @@ fn load_jar(
             Ok(Ok(report)) => {
                 row.entrypoints_ran += 1;
                 row.host_calls += report.calls;
+                if let Some(counts) = row.stages.get_mut(*kind) {
+                    counts.calls += report.calls;
+                }
             }
             Ok(Err(error)) => {
                 row.entrypoints_failed += 1;
+                if let Some(counts) = row.stages.get_mut(*kind) {
+                    counts.failed += 1;
+                    counts.disabled += 1;
+                }
                 failed_classes.push(entry.class.as_str());
                 failures.push(format!("{}: {error}", entry.class));
             }
             Err(panic) => {
                 row.entrypoints_failed += 1;
+                if let Some(counts) = row.stages.get_mut(*kind) {
+                    counts.failed += 1;
+                    counts.disabled += 1;
+                }
                 failed_classes.push(entry.class.as_str());
                 failures.push(format!("{}: panicked: {panic}", entry.class));
             }
@@ -265,23 +320,32 @@ fn load_jar(
         if let Some(host) = imc.reclaim(&loaded.row.file) {
             loaded.host = host;
         }
+        let stage_name = stage.name().to_owned();
+        let counts = loaded.row.stages.entry(stage_name.clone()).or_default();
+        counts.attempted += 1;
+        let before_calls = loaded.host.calls().len();
         let budget = ExecutionBudget::within(JAR_BUDGET);
         let (jar, host) = (&loaded.jar, &mut loaded.host);
-        failures.extend(
-            caught(&format!("{} {}", loaded.row.id, stage.name()), || {
-                jar.run_loading_stage(stage, host, &budget)
-            })
-            .unwrap_or_else(|panic| vec![format!("{}: panicked: {panic}", stage.name())]),
-        );
-        failures.extend(
-            caught(
-                &format!("{} {} deferred work", loaded.row.id, stage.name()),
-                || jar.run_deferred_work(host, &budget),
-            )
-            .unwrap_or_else(|panic| {
-                vec![format!("{} deferred work panicked: {panic}", stage.name())]
-            }),
-        );
+        let stage_failures = caught(&format!("{} {}", loaded.row.id, stage.name()), || {
+            jar.run_loading_stage(stage, host, &budget)
+        })
+        .unwrap_or_else(|panic| vec![format!("{}: panicked: {panic}", stage.name())]);
+        let deferred_failures = caught(
+            &format!("{} {} deferred work", loaded.row.id, stage.name()),
+            || jar.run_deferred_work(host, &budget),
+        )
+        .unwrap_or_else(|panic| vec![format!("{} deferred work panicked: {panic}", stage.name())]);
+        let stage_failed = !stage_failures.is_empty() || !deferred_failures.is_empty();
+        let calls = loaded.host.calls().len().saturating_sub(before_calls);
+        let counts = loaded.row.stages.get_mut(&stage_name).expect("stage count");
+        counts.calls += calls;
+        if stage_failed {
+            counts.failed += 1;
+            counts.disabled += 1;
+        }
+        loaded.row.host_calls += calls;
+        failures.extend(stage_failures);
+        failures.extend(deferred_failures);
         imc.lend(
             &loaded.row.file,
             Arc::clone(&loaded.jar),
@@ -332,6 +396,73 @@ mod tests {
         }
         zip.finish().unwrap();
         NativeJar::from_bytes(&bytes.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn client_state_reuses_resident_listeners_across_world_rejoin() {
+        let mut state = State {
+            loaded: true,
+            world_loaded: true,
+            ..State::default()
+        };
+        state.jars.push(LoadedJar {
+            row: Row {
+                listeners: 1,
+                ..Row::default()
+            },
+            jar: Arc::new(jar(&[])),
+            host: StdHost::new(),
+            listeners: vec![],
+            orderings: vec![],
+        });
+        state.level_unloaded();
+        state.level_loaded();
+        assert_eq!(state.jars.len(), 1);
+        assert_eq!(state.jars[0].row.listeners, 1);
+        assert_eq!(state.report_rows().count(), 1);
+    }
+
+    #[test]
+    fn client_teardown_drops_hosts_and_preserves_one_report_row_for_flush() {
+        let mut state = State {
+            loaded: true,
+            ..State::default()
+        };
+        state.jars.push(LoadedJar {
+            row: Row {
+                id: "fixture".into(),
+                ..Row::default()
+            },
+            jar: Arc::new(jar(&[])),
+            host: StdHost::new(),
+            listeners: vec![],
+            orderings: vec![],
+        });
+        assert_eq!(state.teardown(), 1);
+        assert!(!state.loaded);
+        assert!(state.jars.is_empty());
+        assert_eq!(state.report_rows().count(), 1);
+        state.ensure_loaded();
+        assert!(state.loaded);
+        assert!(state.retired.is_empty());
+    }
+
+    #[test]
+    fn stage_counts_are_serialized_with_calls_and_failure_counters() {
+        let mut row = Row::default();
+        row.stages.insert(
+            "client".into(),
+            StageCounts {
+                attempted: 1,
+                calls: 3,
+                ..StageCounts::default()
+            },
+        );
+        let stages = row.json()["client"]["stages"].clone();
+        assert_eq!(stages["client"]["attempted"], 1);
+        assert_eq!(stages["client"]["calls"], 3);
+        assert_eq!(stages["client"]["failed"], 0);
+        assert_eq!(stages["client"]["disabled"], 0);
     }
 
     #[test]
