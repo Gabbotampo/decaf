@@ -1,2 +1,8 @@
-Captured with Java 25.0.5+8: javac --release 21 OracleStable.java; java -cp <fabric-creative-tab-api-v1-5.0.22+fcdff87f5d.jar>:<fabric-api-base-2.0.6+fcdff87f5d.jar>:<server-game.jar>:<all 26.3 server libraries> OracleStable > java25.txt
-Fabric API module SHA-256: e8acacc7836f39237c83c2a664b039647ee36f93822797acc40cda44666002ea
+Captured on arcweld with Java 25.0.5+8 from the committed Probe.java (the same source used by the Rust fixture):
+JAVA_HOME=/Users/sparks/ava/jdk/jdk-25.0.5+8/Contents/Home
+/Users/sparks/ava/jdk/jdk-25.0.5+8/Contents/Home/bin/javac --release 25 -cp /Users/sparks/ava/scratch/spell-javap/fab.jar:/Users/sparks/ava/scratch/spell-javap/base.jar:/Users/sparks/ava/scratch/vanilla-values/oracle/server-game.jar:/Users/sparks/ava/scratch/vanilla-values/oracle/libraries/*.jar -d /Users/sparks/ava/scratch/spell-javap/oracle25 /Users/sparks/ava/scratch/spell-javap/Probe.java
+/Users/sparks/ava/jdk/jdk-25.0.5+8/Contents/Home/bin/java -cp /Users/sparks/ava/scratch/spell-javap/oracle25:/Users/sparks/ava/scratch/spell-javap/fab.jar:/Users/sparks/ava/scratch/spell-javap/base.jar:/Users/sparks/ava/scratch/vanilla-values/oracle/server-game.jar:/Users/sparks/ava/scratch/vanilla-values/oracle/libraries/*.jar demo.Probe > java25.txt
+creative module (fabric-creative-tab-api-v1-5.0.22+fcdff87f5d.jar): ebd61fb05598ca1c60abc5a875106020e4b56a1eeeeec872efe542fa91aa3f8f
+base module (fabric-api-base-2.0.6+fcdff87f5d.jar): e3b64039e8f261cc24a5013cb8b442cf368f08afa28d01ecdf97f3ccdeb7b63c
+26.3 server-game.jar: a362163eec5d1612d520772bc16e5b39c09e3b234fdc045f56bf544284ee8ae6
+sorted libraries jar-list SHA-256 (full paths in spell-engine-itemgroup-libraries.sorted): 037324b2ca313d5e5ffb8616f270cf354ebf1583ec1a3691ee8c70d01ff3cd44
