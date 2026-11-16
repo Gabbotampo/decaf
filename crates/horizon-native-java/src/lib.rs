@@ -8020,6 +8020,21 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if matches!(receiver, Value::Host(h) if h.kind() == host_ref::HostKind::Matcher)
+            && r.owner == "java/util/regex/Matcher"
+        {
+            if let Value::Host(h) = receiver {
+                if let Some([Value::Ref(Some(pattern)), Value::Ref(Some(input))]) =
+                    h.values().and_then(|v| <[Value; 2]>::try_from(v).ok())
+                {
+                    if r.name == "matches" && r.descriptor == "()Z" {
+                        let matched = java_regex::matches(pattern, input)
+                            .map_err(|_| self.unknown_host_call(r).err().unwrap())?;
+                        return Ok(Value::Int(matched as i32));
+                    }
+                }
+            }
+        }
         if r.owner == "java/net/URI" && r.name == "toURL" && r.descriptor == "()Ljava/net/URL;" {
             if let Some(text) = host_jdk_value::uri_text(receiver) {
                 let Some((scheme, _)) = text.split_once(':') else {
