@@ -34,6 +34,18 @@ pub(crate) struct State {
     ids: BTreeMap<String, u8>,
 }
 
+impl State {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.builders.len() + self.entities.len() + self.dimensions.len()
+    }
+
+    pub(crate) fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
+        self.builders.retain(|key, _| keep(key));
+        self.entities.retain(|key, _| keep(key));
+        self.dimensions.retain(|key, _| keep(key));
+    }
+}
+
 const BUILDER: &str = "net/minecraft/world/entity/EntityType$Builder";
 const ENTITY: &str = "net/minecraft/world/entity/EntityType";
 const ACCESSOR: &str = "net/minecraft/network/syncher/EntityDataAccessor";
