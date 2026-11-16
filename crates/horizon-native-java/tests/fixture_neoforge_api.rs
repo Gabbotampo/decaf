@@ -294,12 +294,24 @@ fn neoforge_loader_oracle_rows_and_counted_unknowns_are_exact() {
     }
     assert_eq!(host.payload_registrations().len(), before_payloads + 3);
     let registrations = &host.payload_registrations()[before_payloads..];
+    assert_eq!(
+        registrations[0].mod_id,
+        Value::Ref(Some("minecraft".into()))
+    );
     assert_eq!(registrations[0].version, Value::Ref(Some("2".into())));
     assert!(!registrations[0].optional);
     assert_eq!(registrations[0].thread, Value::Ref(Some("MAIN".into())));
+    assert_eq!(
+        registrations[1].mod_id,
+        Value::Ref(Some("minecraft".into()))
+    );
     assert_eq!(registrations[1].version, Value::Ref(Some("1".into())));
     assert!(registrations[1].optional);
     assert_eq!(registrations[1].thread, Value::Ref(Some("MAIN".into())));
+    assert_eq!(
+        registrations[2].mod_id,
+        Value::Ref(Some("minecraft".into()))
+    );
     assert_eq!(registrations[2].version, Value::Ref(Some("1".into())));
     assert!(!registrations[2].optional);
     assert_eq!(registrations[2].thread, Value::Ref(None));

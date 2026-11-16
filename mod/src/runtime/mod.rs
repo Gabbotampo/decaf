@@ -2190,6 +2190,9 @@ pub struct RegistryEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayloadRegistration {
     pub direction: String,
+    /// The active NeoForge mod context that owns a NeoForge registration.
+    /// Fabric/Forge rows leave this empty because they have no such field.
+    pub mod_id: Value,
     pub payload_type: Value,
     pub codec: Value,
     pub handler: Value,
@@ -5036,6 +5039,7 @@ impl StdHost {
             Some(row) => row.handler = handler,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction: direction.to_owned(),
+                mod_id: Value::Ref(None),
                 payload_type,
                 codec: Value::Ref(None),
                 handler,
@@ -5084,6 +5088,7 @@ impl StdHost {
             Some(row) => row.codec = codec,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction,
+                mod_id: Value::Ref(None),
                 payload_type: payload_type.clone(),
                 codec,
                 handler: Value::Ref(None),
@@ -11801,9 +11806,19 @@ impl Host for StdHost {
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent",
                 "registrar",
                 "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
-            ) => Ok(neoforge_payload::registrar(
-                args.first().unwrap_or(&Value::Ref(None)),
-            )),
+            ) => {
+                let mod_id = self
+                    .neoforge_imc()
+                    .and_then(|(imc, _)| crate::runtime::neoforge_imc::active_id(imc))
+                    .map_or_else(
+                        || Value::Ref(Some("minecraft".into())),
+                        |id| Value::Ref(Some(id)),
+                    );
+                Ok(neoforge_payload::registrar(
+                    args.first().unwrap_or(&Value::Ref(None)),
+                    &mod_id,
+                ))
+            }
             ("net/neoforged/neoforge/network/registration/PayloadRegistrar", _, descriptor)
                 if descriptor.ends_with(
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
@@ -11821,6 +11836,7 @@ impl Host for StdHost {
                 {
                     let state = crate::runtime::neoforge_payload::state(receiver).unwrap_or(
                         crate::runtime::neoforge_payload::RegistrarState {
+                            mod_id: Value::Ref(None),
                             version: Value::Ref(None),
                             optional: false,
                             thread: Value::Ref(None),
@@ -11828,6 +11844,7 @@ impl Host for StdHost {
                     );
                     self.payload_registrations.push(PayloadRegistration {
                         direction: r.name.clone(),
+                        mod_id: state.mod_id.clone(),
                         payload_type: args[0].clone(),
                         codec: args[1].clone(),
                         handler: args[2].clone(),
@@ -11849,6 +11866,7 @@ impl Host for StdHost {
             {
                 self.payload_registrations.push(PayloadRegistration {
                     direction: "playBidirectional".into(),
+                    mod_id: Value::Ref(None),
                     payload_type: args[1].clone(),
                     codec: args[2].clone(),
                     handler: args[4].clone(),
@@ -43707,6 +43725,7 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playToServer".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("payload-type".into())),
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
@@ -43825,6 +43844,7 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playBidirectional".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("message-class".into())),
                 codec: Value::Ref(Some("encoder".into())),
                 handler: Value::Ref(Some("handler".into())),

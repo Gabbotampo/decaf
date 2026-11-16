@@ -12,6 +12,8 @@ const CLASS: &str = "net/neoforged/neoforge/network/registration/PayloadRegistra
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RegistrarState {
+    /// The active mod context that owns this registrar.
+    pub mod_id: Value,
     pub version: Value,
     pub optional: bool,
     pub thread: Value,
@@ -23,6 +25,7 @@ fn handle(state: RegistrarState) -> Value {
         HostKind::NeoForgePayloadRegistrar,
         &[
             Value::Long(serial as i64),
+            state.mod_id,
             state.version,
             Value::Int(i32::from(state.optional)),
             state.thread,
@@ -30,8 +33,9 @@ fn handle(state: RegistrarState) -> Value {
     ))
 }
 
-pub(crate) fn registrar(version: &Value) -> Value {
+pub(crate) fn registrar(version: &Value, mod_id: &Value) -> Value {
     handle(RegistrarState {
+        mod_id: mod_id.clone(),
         version: version.clone(),
         optional: false,
         // PayloadRegistrar's constructor initializes HandlerThread.MAIN.
@@ -47,13 +51,14 @@ pub(crate) fn state(receiver: &Value) -> Option<RegistrarState> {
         return None;
     }
     let values = handle.values()?;
-    if values.len() != 4 {
+    if values.len() != 5 {
         return None;
     }
     Some(RegistrarState {
-        version: values[1].clone(),
-        optional: matches!(values[2], Value::Int(value) if value != 0),
-        thread: values[3].clone(),
+        mod_id: values[1].clone(),
+        version: values[2].clone(),
+        optional: matches!(values[3], Value::Int(value) if value != 0),
+        thread: values[4].clone(),
     })
 }
 
@@ -106,7 +111,10 @@ mod tests {
 
     #[test]
     fn registrar_refinements_are_distinct_and_copy_state() {
-        let value = registrar(&Value::Ref(Some("1".into())));
+        let value = registrar(
+            &Value::Ref(Some("1".into())),
+            &Value::Ref(Some("demo".into())),
+        );
         assert!(matches!(
             &value,
             Value::Host(handle)
@@ -118,6 +126,10 @@ mod tests {
             descriptor: "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;".into(),
         }, &value, &[Value::Ref(Some("2".into()))]).unwrap();
         assert_ne!(value, versioned);
+        assert_eq!(
+            state(&versioned).unwrap().mod_id,
+            Value::Ref(Some("demo".into()))
+        );
         assert_eq!(
             state(&versioned).unwrap().version,
             Value::Ref(Some("2".into()))

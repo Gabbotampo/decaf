@@ -282,6 +282,7 @@ impl StdHost {
             .iter()
             .for_each(|event| value(event, out));
         for registration in &self.payload_registrations {
+            value(&registration.mod_id, out);
             value(&registration.payload_type, out);
             value(&registration.codec, out);
             value(&registration.handler, out);
