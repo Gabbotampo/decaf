@@ -11193,6 +11193,21 @@ impl Host for StdHost {
                 "getDescription",
                 "()Ljava/lang/String;",
             ) => Ok(Value::Ref(Some(String::new()))),
+            // Metadata handles without a recorded V1 document are the
+            // bounded opaque-loader fallback. Keep the old per-receiver
+            // collection identity for this unknown path; V0 and builtin
+            // documents are handled by fabric_mods.rs and remain counted.
+            (
+                "net/fabricmc/loader/api/metadata/ModMetadata",
+                "getProvides" | "getAuthors" | "getContributors" | "getLicense",
+                "()Ljava/util/Collection;",
+            ) => Ok(self.cached_collection(
+                receiver,
+                &r.name,
+                stand_in_class("list"),
+                false,
+                Vec::new(),
+            )),
             (
                 "net/fabricmc/loader/api/metadata/ModMetadata",
                 "getIconPath",
