@@ -241,6 +241,10 @@ pub enum HostKind {
     ResourceKey,
     /// `net.minecraft.tags.TagKey`: key `registry|location`, or `?…`.
     TagKey,
+    /// Canonical vanilla `MobEffectCategory` enum constants.
+    MobEffectCategory,
+    /// A freshly constructed vanilla `RangedAttribute`.
+    RangedAttribute,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -439,6 +443,9 @@ pub enum HostKind {
     /// A `java.lang.Class`: key its runtime name in internal form, one object
     /// per name in a run (`host_class.rs`).
     Class,
+    /// A runtime-owned annotation proxy; its key carries the held annotation
+    /// interface descriptor but is never a String marker.
+    AnnotationProxy,
     /// A chat component (`MutableComponent`): key a serial per allocation, then its vanilla
     /// JSON, keys sorted
     /// (`host_component.rs`).
@@ -1251,6 +1258,20 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::host_ids::TAG_KEY_METHODS,
     },
     KindInfo {
+        kind: HostKind::MobEffectCategory,
+        tag: "mec",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY),
+        canonical: always_canonical,
+        methods: &crate::runtime::vanilla_values::MOB_EFFECT_CATEGORY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RangedAttribute,
+        tag: "rattr",
+        class: ClassRule::Fixed(crate::runtime::vanilla_values::RANGED_ATTRIBUTE),
+        canonical: never_canonical,
+        methods: &crate::runtime::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
         kind: HostKind::BlockItemId,
         tag: "bii",
         class: ClassRule::Fixed(crate::runtime::host_ids::BLOCK_ITEM_ID),
@@ -2016,6 +2037,13 @@ const KINDS: &[KindInfo] = &[
         // One `Class` per name in a run (`class_precedence`, #124).
         canonical: always_canonical,
         methods: &crate::runtime::host_class::CLASS_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::AnnotationProxy,
+        tag: "anpr",
+        class: ClassRule::FromKey(crate::runtime::annotation_proxy::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::annotation_proxy::METHODS,
     },
     KindInfo {
         kind: HostKind::Component,
