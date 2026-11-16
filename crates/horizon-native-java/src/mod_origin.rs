@@ -109,10 +109,8 @@ pub(super) fn invoke(
         return Ok(None);
     };
     // The kind constant (`enum/<Kind>/PATH`): its name, ordinal and text.
-    if r.owner == ORIGIN_KIND {
-        let Some(named) = kind_name(receiver) else {
-            return Ok(None);
-        };
+    if kind_name(receiver).is_some() {
+        let named = kind_name(receiver).expect("checked above");
         return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
                 Value::Ref(Some(named.to_owned()))
@@ -122,6 +120,9 @@ pub(super) fn invoke(
                 "NESTED" => 1,
                 _ => 2,
             }),
+            ("getDeclaringClass", "()Ljava/lang/Class;") => {
+                crate::host_class::class_value(ORIGIN_KIND)
+            }
             _ => return Ok(None),
         }));
     }
