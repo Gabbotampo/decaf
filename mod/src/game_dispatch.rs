@@ -232,6 +232,10 @@ impl HorizonJava {
     }
 
     pub(crate) fn refresh_game_hook_plan_bits(&self) {
+        let _gate = self
+            .dispatch_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = self.lock();
         let mut words = [0; 4];
         for loaded in &state.jars {
@@ -465,6 +469,14 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[derive(Debug)]
+    struct DispatchObservation {
+        callbacks: Option<usize>,
+        error: Option<String>,
+        failed: usize,
+        unknown: usize,
     }
 
     fn only_lines(trace: Vec<String>, wanted: &[&str]) -> Vec<String> {
@@ -801,14 +813,52 @@ mod tests {
                 let java = Arc::clone(&java);
                 thread::spawn(move || {
                     (0..10)
-                        .map(|_| stop_dispatch(&java, Phase::Tail).unwrap().callbacks)
+                        .map(|_| {
+                            let outcome = stop_dispatch(&java, Phase::Tail);
+                            let (callbacks, error) = match outcome {
+                                Ok(answer) => (Some(answer.callbacks), None),
+                                Err(error) => (None, Some(error.to_string())),
+                            };
+                            let (failed, unknown) = java
+                                .lock()
+                                .jars
+                                .first()
+                                .map(|loaded| {
+                                    (
+                                        loaded.row.game_hooks.failed,
+                                        loaded.host.unknown_host_call_count(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            DispatchObservation {
+                                callbacks,
+                                error,
+                                failed,
+                                unknown,
+                            }
+                        })
                         .collect::<Vec<_>>()
                 })
             })
             .collect::<Vec<_>>();
         refresher.join().unwrap();
-        for worker in workers {
-            assert!(worker.join().unwrap().iter().all(|count| *count == 1));
+        let observations = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let counts = observations
+            .iter()
+            .map(|observation| observation.callbacks)
+            .collect::<Vec<_>>();
+        if observations
+            .iter()
+            .any(|observation| observation.callbacks != Some(1))
+        {
+            let mismatches = observations
+                .iter()
+                .filter(|observation| observation.callbacks != Some(1))
+                .collect::<Vec<_>>();
+            panic!("dispatch counts={counts:?}; mismatches={mismatches:?}");
         }
     }
 
