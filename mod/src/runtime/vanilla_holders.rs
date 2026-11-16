@@ -46,7 +46,7 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         ),
         _ => return None,
     };
-    Some(value(registry, &id, family))
+    Some(value(registry, id, family))
 }
 
 #[cfg(test)]
