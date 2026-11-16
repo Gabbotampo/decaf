@@ -173,26 +173,26 @@ pub(crate) fn static_call(
         "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/Identifier;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" =>
         {
             let holder = make_for_identifier(registry, id_or_key, value, true);
-            if holder.is_some() {
-                if let (Some(registry), Some(id)) = (
+            if holder.is_some()
+                && let (Some(registry), Some(id)) = (
                     crate::host_registry::registry_id(registry),
                     host_ids::identifier_key(id_or_key),
-                ) {
-                    host.record_observed_registry(registry, id.to_owned(), value.clone());
-                }
+                )
+            {
+                host.record_observed_registry(registry, id.to_owned(), value.clone());
             }
             holder
         }
         "(Lnet/minecraft/core/Registry;Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;" =>
         {
             let holder = make_for_key(registry, id_or_key, value, true);
-            if holder.is_some() {
-                if let (Some(registry), Some((_, id))) = (
+            if holder.is_some()
+                && let (Some(registry), Some((_, id))) = (
                     crate::host_registry::registry_id(registry),
                     host_ids::resource_key_parts(id_or_key),
-                ) {
-                    host.record_observed_registry(registry, id, value.clone());
-                }
+                )
+            {
+                host.record_observed_registry(registry, id, value.clone());
             }
             holder
         }
@@ -422,9 +422,7 @@ fn direct_holder_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    let Some((value, _components)) = direct_parts(receiver) else {
-        return None;
-    };
+    let (value, _components) = direct_parts(receiver)?;
     let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (HOLDER | DIRECT_OWNER, "value", "()Ljava/lang/Object;") => Ok(value),
         (HOLDER | DIRECT_OWNER, "isBound", "()Z")
