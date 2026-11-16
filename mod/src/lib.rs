@@ -2937,10 +2937,8 @@ mod tests {
         assert_eq!(java.lock_client().resident_count(), 1);
         Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
         assert_eq!(java.lock_client().resident_count(), 0);
-        let report: serde_json::Value = serde_json::from_slice(
-            report_bytes().lock().unwrap().as_ref().unwrap(),
-        )
-        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
         assert_eq!(report["client_jars"].as_array().unwrap().len(), 1);
         Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
         let client = java.lock_client();
@@ -2956,19 +2954,19 @@ mod tests {
         let mut host = ReportHost;
         Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
         Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
-        let report: serde_json::Value = serde_json::from_slice(
-            report_bytes().lock().unwrap().as_ref().unwrap(),
-        )
-        .unwrap();
+        let report: serde_json::Value =
+            serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
         let row = &report["client_jars"][0];
         assert_eq!(row["verdict"], "ran-partial");
         assert_eq!(row["client"]["entrypoints_ran"], 2);
         assert_eq!(row["client"]["stages"]["Common setup"]["attempted"], 1);
         assert_eq!(row["client"]["stages"]["Common setup"]["failed"], 0);
-        assert!(row["client"]["stages"]["Common setup"]["calls"]
-            .as_u64()
-            .unwrap()
-            > 0);
+        assert!(
+            row["client"]["stages"]["Common setup"]["calls"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert_eq!(row["client"]["stages"]["Enqueue IMC"]["attempted"], 1);
         assert_eq!(row["client"]["stages"]["Enqueue IMC"]["failed"], 1);
         assert_eq!(row["client"]["stages"]["Enqueue IMC"]["disabled"], 1);
