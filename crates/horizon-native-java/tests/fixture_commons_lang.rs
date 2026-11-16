@@ -63,6 +63,7 @@ fn commons_lang_slice_two_matches_java25() {
         ],
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
+    let _surrogate = fixture.text_on(&mut host, "surrogate");
     let expected = include_str!("fixtures/commons_lang/oracle/java25.txt")
         .lines()
         .filter(|line| !line.starts_with("surrogate="))
