@@ -88,7 +88,7 @@ fn call(fixture: &javac_fixture::Fixture, host: &mut StdHost, class: &str, metho
 /// stay through three rounds of 40 garbage-making calls, each round past a
 /// collection, as do row-less objects held in a static, lambdas, an
 /// `Optional`, an entry, an array, a map key, views, an `IdentityHashMap`,
-/// and a `UUID`/`Locale`. Java 25's answer, with the opaque V0 license observation counted on each of the four calls.
+/// and a `UUID`/`Locale`. Java 25's answer, nothing counted.
 #[test]
 fn what_a_jar_keeps_in_cached_collections_survives_collections() {
     let fixture = fixture();
@@ -123,13 +123,10 @@ fn what_a_jar_keeps_in_cached_collections_survives_collections() {
             "round {round}"
         );
     }
-    assert_eq!(
-        host.unknown_host_calls(),
-        vec![(
-            "net/fabricmc/loader/api/metadata/ModMetadata#getLicense()Ljava/util/Collection;"
-                .to_owned(),
-            5,
-        )]
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
     );
 }
 
