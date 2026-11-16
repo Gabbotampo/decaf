@@ -6,31 +6,7 @@ use horizon_native_java::{StdHost, Value};
 
 const ORACLE: &[u8] = include_bytes!("fixtures/spell_engine_itemgroup_java25.txt");
 
-const PROBE: &str = r#"
-package demo;
-import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
-import net.fabricmc.fabric.api.event.Event;
-import net.minecraft.resources.Identifier;
-import net.minecraft.resources.ResourceKey;
-import net.minecraft.world.item.CreativeModeTab;
-public final class Probe {
-  static boolean fired;
-  public static String rows() {
-    ResourceKey<CreativeModeTab> key = ResourceKey.create(
-      ResourceKey.createRegistryKey(Identifier.parse("minecraft:creative_mode_tab")),
-      Identifier.parse("spell_engine:main"));
-    Event<CreativeModeTabEvents.ModifyOutput> first = CreativeModeTabEvents.modifyOutputEvent(key);
-    Event<CreativeModeTabEvents.ModifyOutput> second = CreativeModeTabEvents.modifyOutputEvent(key);
-    String eventClass = first.getClass().getName();
-    String same = Boolean.toString(first == second);
-    String registerReturn = "void";
-    first.register(output -> fired = true);
-    return "event=" + eventClass
-      + "\nsame_event=" + same + "\nregister_return=" + registerReturn
-      + "\nlistener_fired=" + fired + "\n";
-  }
-}
-"#;
+const PROBE: &str = include_str!("fixtures/spell_engine_itemgroup/Probe.java");
 
 const STUBS: &[(&str, &str)] = &[
     (
