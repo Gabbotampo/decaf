@@ -33,17 +33,6 @@
 //!   literals; without it Gson's `IllegalArgumentException` is raised.
 //! * `setLongSerializationPolicy`: `STRING` writes a `long` as a quoted
 //!   number, `DEFAULT` as a number.
-//! * `@SerializedName` (`ReflectiveTypeAdapterFactory.getFieldNames`): a field's
-//!   `value` names its key, not the naming policy; reading accepts the `value` and every
-//!   `alternate`. A document holding more than one of them is not materialized (Gson keeps
-//!   the last in document order, which the parsed document does not keep).
-//! * A jar enum constant (`TypeAdapters.EnumTypeAdapter`) is its constant field's
-//!   `@SerializedName` value, else its `name()`: never its fields. Reflecting over an enum
-//!   wrote its constants' `public static` fields, each the enum again, until the writer's
-//!   `StackOverflowError` (Sodium's options, `excludeFieldsWithModifiers(PRIVATE)`).
-//!
-//! A field whose annotations the class reader could not read (`Field::annotations` is
-//! `None`) has unknown names: a `toJson` writing it, or a `fromJson` reading it, is counted.
 //!
 //! Recorded as counted, because applying them needs data this runtime does not
 //! carry: `setFieldNamingStrategy` and the `registerType*Adapter` calls (their
@@ -78,50 +67,6 @@ const DEFAULT_FIELD_MODIFIERS: u16 = 0x0088;
 const SYNTHETIC: u16 = 0x1000;
 /// The prefix `generateNonExecutableJson()` writes.
 const NON_EXECUTABLE_PREFIX: &str = ")]}'\n";
-/// Gson's `@SerializedName`.
-const SERIALIZED_NAME: &str = "Lcom/google/gson/annotations/SerializedName;";
-/// `ACC_ENUM`: a field that is one of its enum's constants.
-const ACC_ENUM: u16 = 0x4000;
-
-/// What names a field or enum constant in Gson's JSON.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum GsonNames {
-    /// No `@SerializedName`: the naming policy's transform of the field name.
-    Policy,
-    /// `@SerializedName`: its `value`, then its `alternate`s.
-    Annotated(Vec<String>),
-    /// The field's annotations could not be read: its names are unknown (counted).
-    Unknown,
-}
-
-impl GsonNames {
-    /// The names `field` carries.
-    pub(super) fn of(field: &Field) -> Self {
-        let Some(annotations) = field.annotations.as_ref() else {
-            return Self::Unknown;
-        };
-        let Some(annotation) = annotations.iter().find(|a| a.descriptor == SERIALIZED_NAME) else {
-            return Self::Policy;
-        };
-        let Some(AnnotationValue::String(value)) = annotation.values.get("value") else {
-            return Self::Unknown;
-        };
-        let mut names = vec![value.clone()];
-        match annotation.values.get("alternate") {
-            None => {}
-            Some(AnnotationValue::Array(items)) => {
-                for item in items {
-                    let AnnotationValue::String(alternate) = item else {
-                        return Self::Unknown;
-                    };
-                    names.push(alternate.clone());
-                }
-            }
-            Some(_) => return Self::Unknown,
-        }
-        Self::Annotated(names)
-    }
-}
 
 /// `FieldNamingPolicy`'s seven constants and their `translateName` transform.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -407,16 +352,6 @@ impl GsonStyle {
     /// The JSON key a jar field with this name gets.
     pub(super) fn field_name(&self, name: &str) -> String {
         self.naming.transform(name)
-    }
-
-    /// Every JSON key a field answers to, the written one first; `None` where its names are
-    /// unknown.
-    pub(super) fn json_names(&self, name: &str, names: &GsonNames) -> Option<Vec<String>> {
-        match names {
-            GsonNames::Policy => Some(vec![self.field_name(name)]),
-            GsonNames::Annotated(names) => Some(names.clone()),
-            GsonNames::Unknown => None,
-        }
     }
 
     /// Whether `Excluder.excludeField` keeps a field with these access flags:
@@ -1056,17 +991,10 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         let mut members: Vec<(String, Value)> = Vec::new();
-        for (declaring, name, descriptor, access, names) in self.gson_fields(class) {
+        for (declaring, name, descriptor, access) in self.gson_fields(class) {
             if !style.includes_field(access) {
                 continue;
             }
-            // The written key; a field whose annotations are unknown is counted.
-            let Some(key) = style
-                .json_names(&name, &names)
-                .and_then(|keys| keys.into_iter().next())
-            else {
-                return Ok(None);
-            };
             let field = MethodRef {
                 owner: declaring.clone(),
                 name: name.clone(),
@@ -1080,25 +1008,15 @@ impl<H: Host> Runtime<'_, H> {
                     .cloned()
             }
             .unwrap_or_else(|| Value::default_for(&descriptor));
-            // A `boolean` or `char` field holds an `int` here; Gson writes the field's type
-            // (`true`, `"c"`), never the number.
-            let value = match (descriptor.as_str(), value) {
-                ("Z", Value::Int(flag)) => boolean_value(flag != 0),
-                ("C", Value::Int(unit)) => Value::Boxed(Boxed::Character(unit as u16)),
-                (_, value) => value,
-            };
             if !style.serialize_nulls() && matches!(value, Value::Ref(None)) {
                 continue;
             }
-            let (name, value) = if tree_mode {
-                (
-                    self.gson_field_name(&declaring, &name, &descriptor, style),
-                    primitive_box(&descriptor, value),
-                )
+            let name = if tree_mode {
+                self.gson_field_name(&declaring, &name, &descriptor, style)
             } else {
-                (key, value)
+                style.field_name(&name)
             };
-            members.push((name, value));
+            members.push((name, primitive_box(&descriptor, value)));
         }
         if members.is_empty() {
             return Ok(Some("{}".into()));
@@ -1140,6 +1058,29 @@ impl<H: Host> Runtime<'_, H> {
             })
     }
 
+    fn gson_enum_text(&self, value: &Value) -> Option<String> {
+        let marker = expect_ref(value)?;
+        let (name, class) = if let Some((name, _)) = self.enum_constants.get(marker) {
+            (name.clone(), crate::runtime::jar_object::object_class(value))
+        } else {
+            let rest = marker.strip_prefix("enum/")?;
+            let (class, name) = rest.rsplit_once('/')?;
+            (name.to_owned(), Some(class))
+        };
+        class
+            .and_then(|class| self.gson_enum_name(class, &name))
+            .or(Some(name))
+    }
+
+    fn gson_map_key_text(&self, key: &Value) -> Option<String> {
+        if let Some(marker) = expect_ref(key)
+            && (marker.starts_with("enum/") || self.enum_constants.contains_key(marker))
+        {
+            return self.gson_enum_text(key);
+        }
+        Some(value_text(key))
+    }
+
     fn gson_field_name(
         &self,
         declaring: &str,
@@ -1162,18 +1103,18 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Every declared field of `class` and its superclasses with its access
-    /// flags and Gson names, the class's own fields first, exactly Gson's reflection order.
+    /// flags, the class's own fields first, exactly Gson's reflection order.
     /// Static fields are included: whether they are written is the `Excluder`
     /// mask's decision.
-    pub(super) fn gson_fields(&self, class: &str) -> Vec<(String, String, String, u16, GsonNames)> {
-        let mut fields: Vec<(String, String, String, u16, GsonNames)> = Vec::new();
+    pub(super) fn gson_fields(&self, class: &str) -> Vec<(String, String, String, u16)> {
+        let mut fields: Vec<(String, String, String, u16)> = Vec::new();
         let mut current = class.to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
                 break;
             };
             for field in &file.fields {
-                if fields.iter().any(|(_, _, name, _, _)| name == &field.name) {
+                if fields.iter().any(|(_, _, name, _)| name == &field.name) {
                     continue;
                 }
                 fields.push((
@@ -1181,7 +1122,6 @@ impl<H: Host> Runtime<'_, H> {
                     field.name.clone(),
                     field.descriptor.clone(),
                     field.access,
-                    GsonNames::of(field),
                 ));
             }
             if file.super_name.is_empty() || file.super_name == current {
@@ -1190,53 +1130,6 @@ impl<H: Host> Runtime<'_, H> {
             current = file.super_name.clone();
         }
         fields
-    }
-
-    /// What Gson's `EnumTypeAdapter` writes for the jar enum constant `value` named `name`:
-    /// its constant field's `@SerializedName` value, else `name`. A constant with a body is
-    /// an object of the enum's anonymous subclass, whose superclass declares the constant
-    /// field. `None` (counted) where that field or its annotations cannot be read.
-    fn gson_enum_name_for_value(&self, value: &Value, name: &str) -> Option<String> {
-        let class = crate::runtime::jar_object::object_class(value)?;
-        if let Some(name) = self.gson_enum_name(class, name) {
-            return Some(name);
-        }
-        let file = self.class(class)?;
-        let declaring = if file.super_name == "java/lang/Enum" {
-            file
-        } else {
-            self.class(&file.super_name)?
-        };
-        let field = declaring
-            .fields
-            .iter()
-            .find(|field| field.name == name && field.access & ACC_ENUM != 0)?;
-        match GsonNames::of(field) {
-            GsonNames::Policy => Some(name.to_owned()),
-            GsonNames::Annotated(names) => names.into_iter().next(),
-            GsonNames::Unknown => None,
-        }
-    }
-
-    /// The one enum name path shared by values and map keys.
-    fn gson_enum_text(&self, value: &Value) -> Option<String> {
-        let marker = expect_ref(value)?;
-        if let Some((name, _)) = self.enum_constants.get(marker) {
-            return self.gson_enum_name_for_value(value, name);
-        }
-        marker
-            .strip_prefix("enum/")
-            .and_then(|rest| rest.rsplit_once('/').map(|(_, name)| name.to_owned()))
-    }
-
-    /// Gson writes enum map keys using the enum adapter name, never the marker.
-    fn gson_map_key_text(&self, key: &Value) -> Option<String> {
-        if let Some(marker) = expect_ref(key)
-            && (marker.starts_with("enum/") || self.enum_constants.contains_key(marker))
-        {
-            return self.gson_enum_text(key);
-        }
-        Some(value_text(key))
     }
 }
 
@@ -1318,7 +1211,6 @@ fn gson_marker_kind<H: Host>(host: &H, value: &Value, tree_mode: bool) -> Option
 /// `float` as a `double`, so `0.1f` would print `0.10000000149011612`: it is
 /// boxed, and the box goes through Gson's NaN/infinity check (#253 re-check
 /// B7). A `byte`/`short` prints the same either way.
-#[allow(dead_code)]
 fn primitive_box(descriptor: &str, value: Value) -> Value {
     match (descriptor, &value) {
         ("Z", Value::Int(int)) => Value::Boxed(Boxed::Boolean(*int != 0)),

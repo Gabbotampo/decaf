@@ -151,18 +151,6 @@ pub(crate) fn collection_key(text: &str) -> Option<(&str, &str)> {
     .then_some((class, number))
 }
 
-/// A host collection's text whose last `#digits` would look like an object key.
-pub(crate) fn unspell_key(text: String) -> String {
-    if parse_key(&text).is_none() {
-        return text;
-    }
-    let mut text = text;
-    if let Some(at) = text.rfind('#') {
-        text.insert(at, '\\');
-    }
-    text
-}
-
 /// `ClassRule::FromKey` of a host-made collection: the JDK class before the
 /// `#` (`java/util/ArrayList#neutral3` is an `ArrayList`).
 pub(crate) fn collection_class(key: &str) -> &str {

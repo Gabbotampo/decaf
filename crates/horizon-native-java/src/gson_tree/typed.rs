@@ -514,13 +514,13 @@ impl<H: Host> Runtime<'_, H> {
         // object (the mc-armor-hud config shape).
         if !fields
             .iter()
-            .any(|(_, _, _, access, _names)| access & 0x0008 == 0 && style.includes_field(*access))
+            .any(|(_, _, _, access)| access & 0x0008 == 0 && style.includes_field(*access))
         {
             return Ok(None);
         }
         self.ensure_initialized(class)?;
         let object = self.new_object(class);
-        for (declaring, name, descriptor, access, _names) in fields {
+        for (declaring, name, descriptor, access) in fields {
             if !style.includes_field(access) {
                 continue;
             }

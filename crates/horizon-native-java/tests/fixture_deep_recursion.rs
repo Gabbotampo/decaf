@@ -93,7 +93,6 @@ fn gson_writes_enums_and_serialized_names_as_java_25() {
         "sodiumOptions",
         "enumValues",
         "enumMapKeys",
-        "annotatedFields",
     ] {
         let (text, unknown) = run(&fixture, method);
         if text != expected(method) || !unknown.is_empty() {
@@ -115,18 +114,4 @@ fn a_million_frame_recursion_is_a_caught_stack_overflow() {
     assert_eq!(text, expected("deepRecursion"), "{unknown:?}");
     assert_eq!(unknown.len(), 1, "{unknown:?}");
     assert!(unknown[0].starts_with(FRAME_BOUND), "{unknown:?}");
-}
-
-/// A document holding two of one field's names (Gson keeps the last in document order, `b`) is a
-/// counted read answering `null`: never the first name's value.
-#[test]
-fn two_names_of_one_field_are_counted() {
-    let fixture = fixture();
-    let (text, unknown) = run(&fixture, "ambiguousAlternates");
-    assert_eq!(expected("ambiguousAlternates"), "b");
-    assert_eq!(text, "null");
-    assert_eq!(
-        unknown,
-        ["com/google/gson/Gson#fromJson(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;"]
-    );
 }
