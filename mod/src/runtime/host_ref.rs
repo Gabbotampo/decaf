@@ -468,6 +468,7 @@ pub enum HostKind {
     ThreadLocal,
     /// An explicitly seeded Minecraft RandomSource or positional factory.
     RandomSource,
+    ItemStackTemplate,
     /// A codec the attachment model builds: key `compound-tag` or
     /// `codec:<n>`/`map:<n>` (`host_codec.rs`, `attachment_codec.rs`).
     ModelledCodec,
@@ -2134,6 +2135,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::FromKey(crate::runtime::random_source::class_of_key),
         canonical: always_canonical,
         methods: &crate::runtime::random_source::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ItemStackTemplate,
+        tag: "ist",
+        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_item_stack_template::METHODS,
     },
     KindInfo {
         kind: HostKind::ModelledCodec,

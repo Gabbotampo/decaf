@@ -114,6 +114,7 @@ mod host_gson_type;
 mod host_guava;
 mod host_ids;
 mod host_invoke;
+mod host_item_stack_template;
 mod host_iterator;
 mod host_jdk;
 mod host_jdk_constant;
@@ -6756,6 +6757,9 @@ impl Host for StdHost {
             }
             _ => {}
         }
+        if let Some(value) = host_item_stack_template::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -8017,6 +8021,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+            return value;
+        }
         if let Some(value) =
             entity_registration::instance_call(&mut self.entity_registration, r, receiver, args)
         {
