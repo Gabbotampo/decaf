@@ -1525,9 +1525,10 @@ impl Hooks for HorizonJava {
         }
     }
 
-    /// The client finished its first load (NeoForge's `FMLClientSetupEvent`), once per process.
-    /// A dedicated server never fires it. The client owner runs its resident jars here before the
-    /// native setup notification returns.
+    /// Sunrise FMLClientSetupEvent: once per client process on the render thread, after the
+    /// initial client load and before the title screen's first frame. A dedicated server never
+    /// fires it. The client owner runs its resident jars here before the native setup notification
+    /// returns; this owner hook does not claim to dispatch a second Java setup event.
     fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
         let mut client = self.lock_client();
         client.ensure_loaded();
@@ -1536,10 +1537,15 @@ impl Hooks for HorizonJava {
         log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
     }
 
+    /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
+    /// on the client window. The owner currently records only the presence bit; no Java callback
+    /// is emitted because the resident-jars bridge has no client event facade yet.
     fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
         self.lock_client().level_loaded();
     }
 
+    /// Sunrise's client level unload follows the matching load (including disconnects). As with
+    /// load, the borrowed dimension is deliberately not fabricated into a Java callback.
     fn client_level_unload(
         &self,
         _host: &mut dyn ClientHost,
@@ -1548,6 +1554,9 @@ impl Hooks for HorizonJava {
         self.lock_client().level_unloaded();
     }
 
+    /// Sunrise ClientStoppingEvent: once per orderly client process shutdown, after the current
+    /// world is left and saved while client settings and resources remain available. Flush the
+    /// report before dropping the resident per-jar hosts.
     fn client_stopping(&self, host: &mut dyn ClientHost, _event: &mut ClientStoppingEvent) {
         let state = self.lock();
         let mut client = self.lock_client();
@@ -2906,7 +2915,12 @@ mod tests {
             *report_bytes().lock().unwrap() = Some(bytes.to_vec());
             Ok(())
         }
-        fn list(&self, _folder: &ConfigPath) -> Result<Vec<ConfigEntry>, ConfigFileError> {
+        fn list(
+            &self,
+            _folder: &ConfigPath,
+            _after: Option<&str>,
+            _limit: u32,
+        ) -> Result<Vec<ConfigEntry>, ConfigFileError> {
             Ok(Vec::new())
         }
         fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
@@ -2927,9 +2941,6 @@ mod tests {
         }
         fn game_version(&self) -> &'static str {
             "26.3"
-        }
-        fn horizon_version(&self) -> &'static str {
-            "test"
         }
         fn on(&self, _mod_id: &str) -> bool {
             true
@@ -2992,14 +3003,18 @@ mod tests {
             dimension: "minecraft:overworld",
         };
         Hooks::client_level_load(&java, &mut host, &mut load);
+        assert!(java.lock_client().world_loaded());
         let mut unload = ClientLevelUnloadEvent {
             dimension: "minecraft:overworld",
         };
         Hooks::client_level_unload(&java, &mut host, &mut unload);
+        assert!(!java.lock_client().world_loaded());
         Hooks::client_level_load(&java, &mut host, &mut load);
+        assert!(java.lock_client().world_loaded());
         assert_eq!(java.lock_client().resident_count(), 1);
         Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
         assert_eq!(java.lock_client().resident_count(), 0);
+        assert!(!java.lock_client().world_loaded());
         let report: serde_json::Value =
             serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
         assert_eq!(report["client_jars"].as_array().unwrap().len(), 1);

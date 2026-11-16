@@ -2,7 +2,8 @@
 //!
 //! This phase owns one interpreter host per jar on the client. It runs client entrypoints and
 //! NeoForge's client loading stages, then records registrations and listeners for later G1 hooks.
-//! It deliberately does not draw or fire callbacks yet.
+//! It deliberately does not draw or dispatch Java client callbacks yet; the owner hooks only keep
+//! the per-jar hosts and the report inventory alive across the client lifecycle.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -192,6 +193,11 @@ impl State {
     #[cfg(test)]
     pub(crate) fn resident_count(&self) -> usize {
         self.jars.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn world_loaded(&self) -> bool {
+        self.world_loaded
     }
 
     pub(crate) fn report_rows(&self) -> impl Iterator<Item = serde_json::Value> + '_ {
