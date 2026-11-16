@@ -245,7 +245,13 @@ impl<H: Host> Runtime<'_, H> {
                         builder: builder.clone(),
                         flag,
                         codec,
-                        predicate: None,
+                        predicate: (flag == "synced")
+                            .then(|| {
+                                args.get(1)
+                                    .and_then(crate::jar_object::instance_key)
+                                    .map(str::to_owned)
+                            })
+                            .flatten(),
                     });
                 }
                 Ok(Some(crate::jar_object::stored_value(&builder)))
