@@ -24009,6 +24009,9 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(annotation) = self.annotations.get(marker).cloned()
         {
             if matches!(r.name.as_str(), "equals" | "hashCode" | "toString") {
+                if r.name == "equals" && args.first().and_then(expect_ref) == Some(marker) {
+                    return Ok(Some(Value::Int(1)));
+                }
                 if let Some(value) = self.annotation_object_method(&annotation, r, args)? {
                     return Ok(Some(value));
                 }

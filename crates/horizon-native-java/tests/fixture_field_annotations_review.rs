@@ -19,8 +19,11 @@ enum E { A, B }
 
 @Retention(RetentionPolicy.RUNTIME)
 @interface A {
-  byte b(); char c(); double d(); float f(); int i(); E en(); Class<?> cls(); long l();
-  String[] sa(); N n(); N[] na(); String s(); short sh(); int[] ia(); boolean z(); E[] ea(); Class<?>[] ca();
+  byte b() default 1; char c() default 'q'; double d() default 2.0; float f() default 1.0f;
+  int i() default 3; E en() default E.A; Class<?> cls() default String.class; long l() default 4L;
+  String[] sa() default {}; N n() default @N(x=7); N[] na() default {}; String s() default "def";
+  short sh() default 2; int[] ia() default {}; boolean z() default false; E[] ea() default {};
+  Class<?>[] ca() default {};
 }
 
 @Retention(RetentionPolicy.RUNTIME)
@@ -40,6 +43,13 @@ public final class Probe {
     A a = Probe.class.getAnnotation(A.class);
     return a.toString() + "|" + a.equals(a);
   }
+
+  public static String specials() {
+    return Special.class.getAnnotation(A.class).toString();
+  }
+
+  @A(f=Float.NaN, d=Double.POSITIVE_INFINITY)
+  static final class Special {}
 
   public static String inherited() {
     I value = Child.class.getAnnotation(I.class);
@@ -63,6 +73,16 @@ fn annotation_objects_match_java_25_oracle() {
     assert_eq!(
         objects,
         "@A(b=(byte)0x03, c='x', d=2.5, f=1.5f, i=5, en=B, cls=java.lang.String.class, l=6L, sa={\"x\", \"y\"}, n=@N(x=4), na={@N(x=4), @N(x=8)}, s=\"hi\", sh=4, ia={1, 2}, z=true, ea={A, B}, ca={java.lang.String.class, int.class})|true"
+    );
+}
+
+#[test]
+fn special_float_annotation_values_match_java_25_oracle() {
+    let fixture = Fixture::build("field-annotations-specials", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(
+        fixture.text_on(&mut host, "specials"),
+        "@A(b=(byte)0x01, c='q', d=1.0/0.0, f=0.0f/0.0f, i=3, en=A, cls=java.lang.String.class, l=4L, sa={}, n=@N(x=7), na={}, s=\"def\", sh=2, ia={}, z=false, ea={}, ca={})"
     );
 }
 

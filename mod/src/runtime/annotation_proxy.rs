@@ -174,9 +174,31 @@ impl<H: Host> Runtime<'_, H> {
             (AnnotationValue::Int(value), "S" | "I") => value.to_string(),
             (AnnotationValue::Long(value), "J") => format!("{value}L"),
             (AnnotationValue::Float(value), "F") => {
-                format!("{}f", crate::runtime::format_java_float32(*value))
+                if value.is_nan() {
+                    "0.0f/0.0f".to_owned()
+                } else if value.is_infinite() {
+                    if value.is_sign_negative() {
+                        "-1.0f/0.0f".to_owned()
+                    } else {
+                        "1.0f/0.0f".to_owned()
+                    }
+                } else {
+                    format!("{}f", crate::runtime::format_java_float32(*value))
+                }
             }
-            (AnnotationValue::Float(value), "D") => crate::runtime::format_java_float(*value),
+            (AnnotationValue::Float(value), "D") => {
+                if value.is_nan() {
+                    "0.0/0.0".to_owned()
+                } else if value.is_infinite() {
+                    if value.is_sign_negative() {
+                        "-1.0/0.0".to_owned()
+                    } else {
+                        "1.0/0.0".to_owned()
+                    }
+                } else {
+                    crate::runtime::format_java_float(*value)
+                }
+            }
             (AnnotationValue::Annotation(annotation), _) => self.annotation_text(annotation)?,
             _ => return None,
         })
@@ -203,18 +225,57 @@ impl<H: Host> Runtime<'_, H> {
         Some(format!("@{name}({})", values.join(", ")))
     }
 
+    fn annotation_value_equal(
+        &self,
+        left: &AnnotationValue,
+        right: &AnnotationValue,
+        descriptor: &str,
+    ) -> Option<bool> {
+        if let Some(element) = descriptor.strip_prefix('[') {
+            let (AnnotationValue::Array(left), AnnotationValue::Array(right)) = (left, right)
+            else {
+                return Some(false);
+            };
+            return Some(
+                left.len() == right.len()
+                    && left.iter().zip(right).all(|(left, right)| {
+                        self.annotation_value_equal(left, right, element)
+                            .unwrap_or(false)
+                    }),
+            );
+        }
+        match (left, right, descriptor) {
+            (AnnotationValue::Annotation(left), AnnotationValue::Annotation(right), descriptor)
+                if descriptor.starts_with('L') =>
+            {
+                self.annotation_equal(left, right)
+            }
+            // Class and enum members use VM identity, never their class-file
+            // spelling. Without both canonical handles this proxy call counts.
+            (AnnotationValue::String(_), AnnotationValue::String(_), descriptor)
+                if descriptor.starts_with('L') =>
+            {
+                None
+            }
+            (left, right, _) => Some(left == right),
+        }
+    }
+
     fn annotation_equal(&self, left: &Annotation, right: &Annotation) -> Option<bool> {
         if left.descriptor != right.descriptor {
             return Some(false);
         }
         let left = self.annotation_members(left)?;
         let right = self.annotation_members(right)?;
-        Some(left.iter().all(|member| {
-            right
+        let mut equal = true;
+        for member in left {
+            let other = right
                 .iter()
-                .find(|other| other.name == member.name && other.descriptor == member.descriptor)
-                .is_some_and(|other| other.value == member.value)
-        }))
+                .find(|other| other.name == member.name && other.descriptor == member.descriptor)?;
+            equal &=
+                self.annotation_value_equal(&member.value, &other.value, &member.descriptor)?;
+        }
+        Some(equal)
     }
 
     pub(super) fn annotation_object_method(
@@ -225,12 +286,27 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("equals", "(Ljava/lang/Object;)Z") => {
-                let other = args.first().and_then(expect_ref);
-                let equal = other
-                    .and_then(|marker| self.annotations.get(marker))
-                    .and_then(|other| self.annotation_equal(annotation, other))
-                    .unwrap_or(false);
-                Ok(Some(Value::Int(i32::from(equal))))
+                let Some(other) = args.first() else {
+                    return Ok(Some(Value::Int(0)));
+                };
+                match other {
+                    Value::Ref(None) => Ok(Some(Value::Int(0))),
+                    Value::Ref(Some(marker)) if !marker.starts_with("annotation/") => {
+                        Ok(Some(Value::Int(0)))
+                    }
+                    Value::Ref(Some(marker)) => {
+                        let Some(other) = self.annotations.get(marker) else {
+                            return Ok(None);
+                        };
+                        Ok(self
+                            .annotation_equal(annotation, other)
+                            .map(|equal| Value::Int(i32::from(equal))))
+                    }
+                    // A dynamic annotation proxy is not one of our stored
+                    // markers; its identity/member behavior remains COUNTED.
+                    Value::Host(_) => Ok(None),
+                    _ => Ok(Some(Value::Int(0))),
+                }
             }
             ("hashCode", "()I") => Ok(self.annotation_hash(annotation).map(Value::Int)),
             ("toString", "()Ljava/lang/String;") => Ok(self
