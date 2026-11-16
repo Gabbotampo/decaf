@@ -317,9 +317,8 @@ impl<H: Host> Runtime<'_, H> {
                         let Some(other) = self.annotations.get(handle.key()) else {
                             return Ok(None);
                         };
-                        Ok(self
-                            .annotation_equal(annotation, other)
-                            .map(|equal| Value::Int(i32::from(equal))))
+                        let equal = self.annotation_equal(annotation, other);
+                        Ok(equal.map(|equal| Value::Int(i32::from(equal))))
                     }
                     Value::Host(handle) => {
                         let wanted = annotation
