@@ -6782,9 +6782,6 @@ impl Host for StdHost {
         if let Some(value) = dfu_either::static_call(r, args) {
             return value;
         }
-        if let Some(value) = dfu_codec::invoke(self, r, None, args) {
-            return Ok(value);
-        }
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
