@@ -597,7 +597,6 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 answer()
             }
-            ("enableComplexMapKeySerialization", "()Lcom/google/gson/GsonBuilder;") => answer(),
             ("setPrettyPrinting", "()Lcom/google/gson/GsonBuilder;") => {
                 let mut style = self.gson_style(&marker);
                 style.formatting = Formatting::pretty();

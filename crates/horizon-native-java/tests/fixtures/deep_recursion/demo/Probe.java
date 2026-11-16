@@ -109,7 +109,7 @@ public final class Probe {
     }
 
     public static String enumMapKeys() {
-        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
+        Gson gson = new GsonBuilder().create();
         Map<Tagged, Integer> tagged = new LinkedHashMap<>();
         tagged.put(Tagged.B, 1);
         Map<Split, Integer> split = new LinkedHashMap<>();
@@ -123,10 +123,36 @@ public final class Probe {
     }
 
     public static String enumBodyMapKey() {
-        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
+        Gson gson = new GsonBuilder().create();
         Map<Split, Integer> split = new LinkedHashMap<>();
         split.put(Split.NAMED_OFF, 1);
         return gson.toJson(split);
+    }
+
+    public static String enumMapKeysWithComplexFlag() {
+        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
+        Map<Tagged, Integer> tagged = new LinkedHashMap<>();
+        tagged.put(Tagged.B, 1);
+        Map<Split, Integer> split = new LinkedHashMap<>();
+        split.put(Split.OFF, 1);
+        String taggedText = gson.toJson(tagged);
+        if (taggedText == null) {
+            return "counted";
+        }
+        String splitText = gson.toJson(split);
+        return splitText == null ? "counted" : taggedText + "|" + splitText;
+    }
+
+    public static final class ObjectKey {
+        public int n = 1;
+    }
+
+    public static String enumObjectMapKeyWithComplexFlag() {
+        Gson gson = new GsonBuilder().enableComplexMapKeySerialization().create();
+        Map<ObjectKey, Integer> map = new LinkedHashMap<>();
+        map.put(new ObjectKey(), 1);
+        String text = gson.toJson(map);
+        return text == null ? "counted" : text;
     }
 
     public static class Renamed {
@@ -161,6 +187,8 @@ public final class Probe {
         System.out.println("enumMapKeys=" + enumMapKeys());
         System.out.println("enumBodyValue=" + enumBodyValue());
         System.out.println("enumBodyMapKey=" + enumBodyMapKey());
+        System.out.println("enumMapKeysWithComplexFlag=" + enumMapKeysWithComplexFlag());
+        System.out.println("enumObjectMapKeyWithComplexFlag=" + enumObjectMapKeyWithComplexFlag());
         System.out.println("annotatedFields=" + annotatedFields());
         System.out.println("ambiguousAlternates=" + ambiguousAlternates());
     }

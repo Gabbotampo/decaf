@@ -108,8 +108,22 @@ fn gson_writes_enums_and_serialized_names_as_java_25() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A recursion a million frames deep ends in a `StackOverflowError` the jar catches and keeps
-/// running after, never a native overflow; the bound's throw is counted.
+/// Complex map-key serialization changes Gson's representation for object/array keys.
+/// This model deliberately counts the whole Gson operation until it implements Gson's
+/// array-of-pairs form; the Java 25 + gson-2.14.0 rows are captured in the oracle.
+#[test]
+fn gson_complex_map_key_serialization_is_counted() {
+    let fixture = fixture();
+    let expected_unknown =
+        "com/google/gson/Gson#toJson(Ljava/lang/Object;)Ljava/lang/String;";
+    for method in ["enumMapKeysWithComplexFlag", "enumObjectMapKeyWithComplexFlag"] {
+        let (text, unknown) = run(&fixture, method);
+        assert_eq!(text, "counted", "{method}: {unknown:?}");
+        assert_eq!(unknown, vec![expected_unknown], "{method}");
+    }
+}
+
+/// A recursion a million frames deep ends in StackOverflowError the jar catches and keeps
 #[test]
 fn a_million_frame_recursion_is_a_caught_stack_overflow() {
     let fixture = fixture();

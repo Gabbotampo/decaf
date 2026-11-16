@@ -5,5 +5,7 @@ enumValues="ZERO_FRAMES"|"OFF"|"first"|"second"|"C"|["ALWAYS","SAFE","first"]
 enumMapKeys={"second":1}|{"OFF":1}
 enumBodyValue="body_named"
 enumBodyMapKey={"body_named":1}
+enumMapKeysWithComplexFlag={"second":1}|{"OFF":1}
+enumObjectMapKeyWithComplexFlag=[[{"n":1},1]]
 annotatedFields={"n":3,"t":"x","plain_field":1,"letter":"q","off":false}|5|y|2
 ambiguousAlternates=b
