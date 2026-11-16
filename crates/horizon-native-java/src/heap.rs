@@ -701,7 +701,9 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 + state.args.as_deref().map_or(0, values)
         }))
         .chain(host.ranged_attributes.iter().map(|(key, state)| {
-            key.len() + state.description_id.len() + 4 * std::mem::size_of::<f64>()
+            key.len()
+                + state.description_id.as_ref().map_or(0, String::len)
+                + 4 * std::mem::size_of::<f64>()
         }))
         .sum()
 }

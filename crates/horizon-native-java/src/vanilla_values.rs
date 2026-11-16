@@ -66,7 +66,7 @@ const ENTITY_TYPE_TAG_NAMES: &[&str] = &[
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RangedAttributeState {
-    pub description_id: String,
+    pub description_id: Option<String>,
     pub default_value: f64,
     pub min_value: f64,
     pub max_value: f64,
@@ -277,7 +277,7 @@ pub(crate) fn new_ranged_attribute(host: &mut StdHost) -> Value {
     host.ranged_attributes.insert(
         key.clone(),
         RangedAttributeState {
-            description_id: String::new(),
+            description_id: None,
             default_value: 0.0,
             min_value: 0.0,
             max_value: 0.0,
@@ -299,7 +299,11 @@ fn ranged_instance(
     };
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("<init>", "(Ljava/lang/String;DDD)V") => {
-            let id = crate::expect_string(StdHost::argument(r, args, 0)?).to_owned();
+            let id = match StdHost::argument(r, args, 0)? {
+                Value::Ref(Some(id)) => Some(id.clone()),
+                Value::Ref(None) => None,
+                other => Some(crate::expect_string(other).to_owned()),
+            };
             let default_value = crate::expect_float(r, StdHost::argument(r, args, 1)?)?;
             let min_value = crate::expect_float(r, StdHost::argument(r, args, 2)?)?;
             let max_value = crate::expect_float(r, StdHost::argument(r, args, 3)?)?;
@@ -326,7 +330,7 @@ fn ranged_instance(
         ("getMinValue", "()D") => Ok(Value::Float(state.min_value)),
         ("getMaxValue", "()D") => Ok(Value::Float(state.max_value)),
         ("getDescriptionId", "()Ljava/lang/String;") => {
-            Ok(Value::Ref(Some(state.description_id.clone())))
+            Ok(Value::Ref(state.description_id.clone()))
         }
         ("isClientSyncable", "()Z") => Ok(Value::Int(state.syncable as i32)),
         ("setSyncable", "(Z)Lnet/minecraft/world/entity/ai/attributes/Attribute;") => {
@@ -337,12 +341,24 @@ fn ranged_instance(
             let value = crate::expect_float(r, StdHost::argument(r, args, 0)?)?;
             Ok(Value::Float(if value.is_nan() {
                 state.min_value
+            } else if value < state.min_value {
+                state.min_value
             } else {
-                value.clamp(state.min_value, state.max_value)
+                java_min(value, state.max_value)
             }))
         }
         _ => host.unknown_host_call(r),
     }
+}
+
+fn java_min(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        return f64::NAN;
+    }
+    if left == right {
+        return if left == 0.0 { -0.0 } else { left };
+    }
+    if left < right { left } else { right }
 }
 
 fn illegal(message: &str) -> NativeError {
