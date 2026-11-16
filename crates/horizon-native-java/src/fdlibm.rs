@@ -1123,3 +1123,355 @@ fn kernel_tan(mut x: f64, mut y: f64, iy: i32) -> f64 {
     let s = 1.0 + t * z;
     t + a * (s + t * v)
 }
+
+// AArch64 HotSpot Math.sin/cos: fdlibm kernels with the stub's FMA order
+const S: [f64; 6] = [
+    -1.66666666666666324348e-01,
+    8.33333333332248946124e-03,
+    -1.98412698298579493134e-04,
+    2.75573137070700676789e-06,
+    -2.50507602534068634195e-08,
+    1.58969099521155010221e-10,
+];
+const C: [f64; 6] = [
+    4.16666666666666019037e-02,
+    -1.38888888888741095749e-03,
+    2.48015872894767294178e-05,
+    -2.75573143513906633035e-07,
+    2.08757232129817482790e-09,
+    -1.13596475577881948265e-11,
+];
+const INVPIO2: f64 = 6.36619772367581382433e-01;
+// and full Payne-Hanek reduction. x86 callers remain counted by java_math.
+
+const FMA_PIO2_LARGE: [f64; 8] = [
+    1.57079625129699707031e+00,
+    7.54978941586159635335e-08,
+    5.39030252995776476554e-15,
+    3.28200341580791294123e-22,
+    1.27065575308067607349e-29,
+    1.22933308981111328932e-36,
+    2.73370053816464559624e-44,
+    2.16741683877804819444e-51,
+];
+
+/// `generate_kernel_sin`.
+fn kernel_sin(x: f64, y: f64, iy: bool) -> f64 {
+    let z = x * x;
+    let v = z * x;
+    let mut r = z.mul_add(S[5], S[4]);
+    r = z.mul_add(r, S[3]);
+    r = z.mul_add(r, S[2]);
+    r = z.mul_add(r, S[1]);
+    if !iy {
+        v.mul_add(z.mul_add(r, S[0]), x)
+    } else {
+        let t = (-v).mul_add(r, 0.5 * y);
+        let t = (-z).mul_add(t, y);
+        x + v.mul_add(S[0], t)
+    }
+}
+
+/// `generate_kernel_cos`. `ix` is the high word of the *original*
+/// argument: the stub reuses the register, so a reduced argument always
+/// takes the `qx = 0.28125` branch.
+fn kernel_cos(x: f64, y: f64, ix: i32) -> f64 {
+    let z = x * x;
+    let mut r = z.mul_add(C[5], C[4]);
+    r = z.mul_add(r, C[3]);
+    let xy = x * y;
+    r = z.mul_add(r, C[2]);
+    r = z.mul_add(r, C[1]);
+    let zz = z * z;
+    r = z.mul_add(r, C[0]);
+    if ix < 0x3FD33333 {
+        let v = (-zz).mul_add(r, xy);
+        1.0 - 0.5f64.mul_add(z, v)
+    } else {
+        let qx = if ix > 0x3fe90000 {
+            0.28125
+        } else {
+            f64::from_bits(u64::from((ix - 0x0020_0000) as u32) << 32)
+        };
+        let zr_xy = zz.mul_add(r, -xy);
+        let h = 0.5f64.mul_add(z, -qx);
+        let a = 1.0 - qx;
+        a - (h - zr_xy)
+    }
+}
+
+/// `generate__ieee754_rem_pio2` for |x| <= 2^19·π/2; `None` beyond.
+fn rem_pio2_fma(x: f64, ix: i32) -> Option<(i32, f64, f64)> {
+    if ix < 0x4002d97c {
+        return Some(if x.to_bits() as i64 >= 0 {
+            let z = x - PIO2_1;
+            if ix != 0x3ff921fb {
+                let y0 = z - PIO2_1T;
+                (1, y0, (z - y0) - PIO2_1T)
+            } else {
+                let z = z - PIO2_2;
+                let y0 = z - PIO2_2T;
+                (1, y0, (z - y0) - PIO2_2T)
+            }
+        } else {
+            let z = x + PIO2_1;
+            if ix != 0x3ff921fb {
+                let y0 = z + PIO2_1T;
+                (-1, y0, (z - y0) + PIO2_1T)
+            } else {
+                let z = z + PIO2_2;
+                let y0 = z + PIO2_2T;
+                (-1, y0, (z - y0) + PIO2_2T)
+            }
+        });
+    }
+    if ix > 0x413921fb {
+        return None;
+    }
+    let t = x.abs();
+    let fnv = t.mul_add(INVPIO2, 0.5).trunc();
+    let n = fnv as i32;
+    let mut r = (-fnv).mul_add(PIO2_1, t);
+    let mut w = fnv * PIO2_1T;
+    let mut y0 = r - w;
+    if n > 32 || ix == NPIO2_HW[(n - 1) as usize] {
+        let j = ix >> 20;
+        let exponent = |y: f64| ((y.to_bits() << 1) >> 53) as i32;
+        if j - exponent(y0) > 16 {
+            let t = r;
+            let w2 = fnv * PIO2_2;
+            r = t - w2;
+            w = fnv.mul_add(PIO2_2T, w2 - (t - r));
+            y0 = r - w;
+            if j - exponent(y0) > 49 {
+                let t = r;
+                let w3 = fnv * PIO2_3;
+                r = t - w3;
+                w = fnv.mul_add(PIO2_3T, w3 - (t - r));
+                y0 = r - w;
+            }
+        }
+    }
+    let y1 = (r - y0) - w;
+    Some(if x > 0.0 { (n, y0, y1) } else { (-n, -y0, -y1) })
+}
+
+/// Payne–Hanek reduction used by the AArch64 stub for arguments beyond
+/// the medium range. Products are accumulated with FMA, matching the
+/// stub's `fmaddd`/`fmlav` sequence.
+fn rem_pio2_large_fma(x: f64, ix: i32) -> (i32, f64, f64) {
+    let x1p24 = 16_777_216.0;
+    let x1p_24 = 1.0 / x1p24;
+    let bits = x.to_bits();
+    let e0 = (ix >> 20) - (1023 + 23);
+    let mut z = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (((1023 + 23) as u64) << 52));
+    let mut tx = [0.0; 3];
+    for t in &mut tx[..2] {
+        *t = z as i32 as f64;
+        z = (z - *t) * x1p24;
+    }
+    tx[2] = z;
+    let mut nx = 3;
+    while nx > 1 && tx[nx - 1] == 0.0 {
+        nx -= 1;
+    }
+
+    let jk = 4usize;
+    let jx = nx - 1;
+    let mut jv = (e0 - 3) / 24;
+    if jv < 0 {
+        jv = 0;
+    }
+    let mut q0 = e0 - 24 * (jv + 1);
+    let jv = jv as usize;
+    let m = jx + jk;
+    let mut f = [0.0; 20];
+    let mut q = [0.0; 20];
+    let mut iq = [0i32; 20];
+    let mut fq = [0.0; 20];
+    let j0 = jv as i32 - jx as i32;
+    for i in 0..=m {
+        let j = j0 + i as i32;
+        f[i] = if j < 0 {
+            0.0
+        } else {
+            TWO_OVER_PI[j as usize] as f64
+        };
+    }
+    for i in 0..=jk {
+        let mut fw = 0.0;
+        for k in (0..=jx).rev() {
+            fw = tx[k].mul_add(f[jx + i - k], fw);
+        }
+        q[i] = fw;
+    }
+    let mut jz = jk;
+    let (mut n, mut ih);
+    let mut zq;
+    loop {
+        zq = q[jz];
+        for i in 0..jz {
+            let fw = (x1p_24 * zq) as i32 as f64;
+            iq[i] = (zq - x1p24 * fw) as i32;
+            zq = q[jz - 1 - i] + fw;
+        }
+        zq = scalbn(zq, q0);
+        zq -= 8.0 * (zq * 0.125).floor();
+        n = zq as i32;
+        zq -= n as f64;
+        ih = if q0 > 0 {
+            let top = iq[jz - 1] >> (24 - q0);
+            n += top;
+            iq[jz - 1] -= top << (24 - q0);
+            iq[jz - 1] >> (23 - q0)
+        } else if q0 == 0 {
+            iq[jz - 1] >> 23
+        } else if zq >= 0.5 {
+            2
+        } else {
+            0
+        };
+        if ih > 0 {
+            n += 1;
+            let mut carry = 0;
+            for v in iq.iter_mut().take(jz) {
+                let old = *v;
+                if carry == 0 {
+                    if old != 0 {
+                        carry = 1;
+                        *v = 0x1000000 - old;
+                    }
+                } else {
+                    *v = 0xffffff - old;
+                }
+            }
+            if q0 > 0 {
+                iq[jz - 1] &= if q0 == 1 {
+                    0x7fffff
+                } else if q0 == 2 {
+                    0x3fffff
+                } else {
+                    -1
+                };
+            }
+            if ih == 2 {
+                zq = 1.0 - zq;
+                if carry != 0 {
+                    zq -= scalbn(1.0, q0);
+                }
+            }
+        }
+        if zq == 0.0 {
+            let mut any = 0;
+            for &v in iq.iter().take(jz).skip(jk) {
+                any |= v;
+            }
+            if any == 0 {
+                let mut k = 1;
+                while iq[jk - k] == 0 {
+                    k += 1;
+                }
+                for i in (jz + 1)..=(jz + k) {
+                    f[jx + i] = TWO_OVER_PI[jv + i] as f64;
+                    let mut fw = 0.0;
+                    for k in (0..=jx).rev() {
+                        fw = tx[k].mul_add(f[jx + i - k], fw);
+                    }
+                    q[i] = fw;
+                }
+                jz += k;
+                continue;
+            }
+        }
+        break;
+    }
+    if zq == 0.0 {
+        jz -= 1;
+        q0 -= 24;
+        while iq[jz] == 0 {
+            jz -= 1;
+            q0 -= 24;
+        }
+    } else {
+        zq = scalbn(zq, -q0);
+        if zq >= x1p24 {
+            let fw = (x1p_24 * zq) as i32 as f64;
+            iq[jz] = (zq - x1p24 * fw) as i32;
+            jz += 1;
+            q0 += 24;
+            iq[jz] = fw as i32;
+        } else {
+            iq[jz] = zq as i32;
+        }
+    }
+    let mut fw = scalbn(1.0, q0);
+    for i in (0..=jz).rev() {
+        q[i] = fw * iq[i] as f64;
+        fw *= x1p_24;
+    }
+    for i in (0..=jz).rev() {
+        let mut sum = 0.0;
+        for k in 0..=jk.min(jz - i) {
+            sum = q[i + k].mul_add(FMA_PIO2_LARGE[k], sum);
+        }
+        fq[jz - i] = sum;
+    }
+    let mut y0 = 0.0;
+    for i in (0..=jz).rev() {
+        y0 += fq[i];
+    }
+    let mut y1 = fq[0] - y0;
+    for i in 1..=jz {
+        y1 += fq[i];
+    }
+    let (n, y0, y1) = if ih != 0 {
+        (n & 7, -y0, -y1)
+    } else {
+        (n & 7, y0, y1)
+    };
+    if x.is_sign_negative() {
+        (-n, -y0, -y1)
+    } else {
+        (n, y0, y1)
+    }
+}
+
+fn sin_cos(x: f64, is_cos: bool) -> f64 {
+    let ix = high(x) & 0x7fff_ffff;
+    if ix < 0x3e400000 {
+        return if is_cos { 1.0 } else { x };
+    }
+    if ix <= 0x3fe921fb {
+        return if is_cos {
+            kernel_cos(x, 0.0, ix)
+        } else {
+            kernel_sin(x, 0.0, false)
+        };
+    }
+    if ix >= 0x7ff00000 {
+        return f64::from_bits(0x7ff0_0000_0000_0001);
+    }
+    let (n, y0, y1) = rem_pio2_fma(x, ix).unwrap_or_else(|| rem_pio2_large_fma(x, ix));
+    let (value, negate) = if (n & 1 == 1) != is_cos {
+        (
+            kernel_cos(y0, y1, ix),
+            if is_cos { (n ^ (n >> 1)) & 1 } else { n & 2 },
+        )
+    } else {
+        (
+            kernel_sin(y0, y1, true),
+            if is_cos { (n ^ (n >> 1)) & 1 } else { n & 2 },
+        )
+    };
+    if negate != 0 { -value } else { value }
+}
+
+/// `Math.sin` on AArch64 HotSpot.
+pub fn sin(x: f64) -> f64 {
+    sin_cos(x, false)
+}
+
+/// `Math.cos` on AArch64 HotSpot.
+pub fn cos(x: f64) -> f64 {
+    sin_cos(x, true)
+}
