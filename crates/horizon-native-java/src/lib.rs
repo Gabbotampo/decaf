@@ -2377,9 +2377,6 @@ pub trait Host {
         false
     }
 
-    /// Mark an inherently nondeterministic Java answer; hosts without census diagnostics ignore it.
-    fn mark_nondeterministic(&mut self, _marker: &str) {}
-
     /// Reserve one DFU construction node and any callback roots it introduces
     /// against this jar's lifetime budget.
     fn reserve_dfu_codec(
@@ -3540,8 +3537,6 @@ pub struct StdHost {
     collections_paused: bool,
     /// Bounded diagnostics for calls outside the modeled host surface.
     unknown_host_calls: BTreeMap<String, usize>,
-    /// Runtime outcomes whose Java answer is inherently per-process or order-dependent.
-    nondeterministic: BTreeSet<String>,
     /// The threads the jar made and started (`parked_threads.rs`).
     threads: parked_threads::ThreadTable,
     strict_unknown_host_calls: bool,
@@ -3713,7 +3708,6 @@ impl StdHost {
             freed_objects: heap::FreedObjects::default(),
             collections_paused: false,
             unknown_host_calls: BTreeMap::new(),
-            nondeterministic: BTreeSet::new(),
             threads: parked_threads::ThreadTable::default(),
             strict_unknown_host_calls: false,
             next_lazy_optional: 0,
@@ -3761,14 +3755,6 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
-    }
-
-    pub(crate) fn mark_nondeterministic(&mut self, marker: &str) {
-        self.nondeterministic.insert(marker.to_owned());
-    }
-
-    pub fn nondeterministic_markers(&self) -> Vec<String> {
-        self.nondeterministic.iter().cloned().collect()
     }
 
     /// Named DFU construction refusals for the current jar.
@@ -5516,10 +5502,6 @@ impl Host for StdHost {
         self.unknown_host_call_count()
     }
 
-    fn mark_nondeterministic(&mut self, marker: &str) {
-        self.mark_nondeterministic(marker);
-    }
-
     fn jar_module_descriptor(&self) -> Option<bool> {
         reflect_override::module_descriptor_in(&self.resources)
     }
@@ -6544,14 +6526,14 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, None, args) {
             return value;
         }
+        if let Some(value) = neoforge_api::static_call(self, r) {
+            return Ok(value);
+        }
         if let Some(value) = sound_event::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = commons_lang::static_call(self, r, args) {
             return value;
-        }
-        if let Some(value) = neoforge_api::static_call(self, r) {
-            return Ok(value);
         }
         if let Some(value) = pure_helpers::static_call(self, r, args) {
             return value;
@@ -7309,11 +7291,6 @@ impl Host for StdHost {
             ),
             ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
-                if expect_ref(value)
-                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
-                {
-                    return self.unknown_host_call(r);
-                }
                 Ok(Value::Int(match value {
                     Value::Ref(None) => 0,
                     _ => stable_hash(&value_text(value)),
@@ -7759,12 +7736,6 @@ impl Host for StdHost {
             }
             ("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
-                if expect_ref(value)
-                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
-                {
-                    return self.unknown_host_call(r);
-                }
-                self.mark_nondeterministic("java-identity-hash");
                 Ok(Value::Int(match value {
                     Value::Ref(None) => 0,
                     _ => stable_hash(&value_text(value)),
@@ -8017,6 +7988,12 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
             return value;
         }
+        if let Some(value) = neoforge_api::instance_call(self, r, receiver) {
+            return Ok(value);
+        }
+        if let Some(value) = neoforge_payload::instance_call(r, receiver, args) {
+            return Ok(value);
+        }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
@@ -8029,12 +8006,6 @@ impl Host for StdHost {
         }
         // The loader's own objects: `FMLPaths.get`, `Dist` and mod containers.
         if let Some(value) = self.neoforge_loader_instance(r, receiver, args) {
-            return Ok(value);
-        }
-        if let Some(value) = neoforge_api::instance_call(self, r, receiver) {
-            return Ok(value);
-        }
-        if let Some(value) = neoforge_payload::instance_call(r, receiver, args) {
             return Ok(value);
         }
         // The loading stages' event objects (`neoforge_lifecycle.rs`).
@@ -11793,9 +11764,6 @@ impl Host for StdHost {
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
                 ) =>
             {
-                if matches!(r.name.as_str(), "versioned" | "optional" | "executesOn") {
-                    return self.unknown_host_call(r);
-                }
                 if matches!(
                     r.name.as_str(),
                     "playToServer"
@@ -11849,12 +11817,8 @@ impl Host for StdHost {
                 // jar object's is its class's body or `Object`'s identity
                 // hash, neither the host's: counted, never its key (#217).
                 if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
-                    if jar_object::object_key(receiver).is_some()
-                        || expect_ref(receiver)
-                            .is_some_and(|text| stream_pipeline::is_stream_marker(text))
-                    {
-                        self.unknown_host_call(r)?;
-                        return Ok(Value::Ref(Some(stream_pipeline::STREAM_TEXT.into())));
+                    if jar_object::object_key(receiver).is_some() {
+                        return self.unknown_host_call(r);
                     }
                     return Ok(Value::Ref(Some(value_text(receiver))));
                 }
@@ -12189,10 +12153,6 @@ fn builder_append_text<H: Host>(
         | "(Ljava/lang/Object;)Ljava/lang/StringBuffer;" => match value {
             // `append(Object)` is `String.valueOf`: an object a model owns
             // prints its `toString`, and a box prints its value.
-            Value::Ref(Some(text)) if stream_pipeline::is_stream_marker(text) => {
-                host.unknown_operand_call(&crate::jar_text::object_to_string())?;
-                stream_pipeline::STREAM_TEXT.into()
-            }
             Value::Ref(Some(text)) => {
                 crate::java_tostring::modelled_marker(host, value).unwrap_or_else(|| text.clone())
             }
@@ -12352,19 +12312,8 @@ fn slice_utf16(text: &str, start: i32, length: i32) -> String {
 /// Java prints a `boolean` as `true`/`false` and a `char` as the character,
 /// while both are `Value::Int` here; a `float` component prints its `f32`
 /// digits and a `double` its `f64` digits.
-fn java_value_text<H: Host>(
-    host: &mut H,
-    value: &Value,
-    desc: &str,
-) -> Result<String, NativeError> {
-    if matches!(value, Value::Ref(Some(text)) if stream_pipeline::is_stream_marker(text)) {
-        // Object.toString uses the pipeline object's identity hash, which this
-        // interpreter cannot reproduce. Count the observable call and never
-        // expose the random marker text to the jar.
-        host.unknown_operand_call(&crate::jar_text::object_to_string())?;
-        return Ok(stream_pipeline::STREAM_TEXT.into());
-    }
-    Ok(match value {
+fn java_value_text(value: &Value, desc: &str) -> String {
+    match value {
         Value::Int(value) if desc == "Z" => (*value != 0).to_string(),
         Value::Int(value) if desc == "C" => {
             char::from_u32(*value as u32).map_or_else(|| value.to_string(), String::from)
@@ -12373,18 +12322,21 @@ fn java_value_text<H: Host>(
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
+        // A stream never prints its marker (`stream_pipeline.rs`).
+        Value::Ref(Some(value)) if stream_pipeline::is_stream_marker(value) => {
+            stream_pipeline::STREAM_TEXT.into()
+        }
         // Nor does a callback, or a composition holding one: its text names
         // a live callback (`callback_marker.rs`).
         Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
             callback_marker::CALLBACK_TEXT.into()
         }
-
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
         Value::Ref(None) => "null".to_owned(),
         Value::Void => String::new(),
-    })
+    }
 }
 
 fn utf16_index_of(haystack: &str, needle: &str, from: i32) -> i32 {
@@ -16006,12 +15958,8 @@ pub enum NativeError {
         /// The frame the check ran in.
         class: String,
         method: String,
-        /// How long the wall-clock guard allowed.
+        /// How long the budget allowed.
         budget: std::time::Duration,
-        /// Instructions charged when the check fired.
-        instructions: usize,
-        /// The deterministic bound, when this was an instruction refusal.
-        instruction_limit: Option<usize>,
     },
     /// The fail-closed host mode rejected a call with no bounded model.
     UnknownHostCall(MethodRef),
@@ -16065,22 +16013,11 @@ impl std::fmt::Display for NativeError {
                 class,
                 method,
                 budget,
-                instructions,
-                instruction_limit,
-            } => {
-                if let Some(limit) = instruction_limit {
-                    write!(
-                        f,
-                        "native interpreter exceeded its deterministic instruction budget of {limit} steps (at {instructions}) at {class}#{method}"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "native interpreter exceeded its wall-clock hang guard of {:.1}s at {class}#{method}",
-                        budget.as_secs_f64()
-                    )
-                }
-            }
+            } => write!(
+                f,
+                "native interpreter exceeded its {:.1}s execution budget at {class}#{method}",
+                budget.as_secs_f64()
+            ),
             _ => write!(f, "{self:?}"),
         }
     }
@@ -16562,15 +16499,11 @@ pub struct ExecutionBudget {
     /// When the budget expires, and how long it allowed, so the diagnostic can
     /// name the bound rather than only the frame.
     deadline: Option<(std::time::Instant, std::time::Duration)>,
-    instruction_limit: Option<usize>,
 }
 
 impl ExecutionBudget {
-    /// No wall-clock or instruction bound; only the stack bound applies.
-    pub const UNBOUNDED: Self = Self {
-        deadline: None,
-        instruction_limit: None,
-    };
+    /// No wall-clock bound; only the stack bound (`frame_bound.rs`) applies.
+    pub const UNBOUNDED: Self = Self { deadline: None };
 
     /// A budget that expires `limit` from now.
     pub fn within(limit: std::time::Duration) -> Self {
@@ -16578,21 +16511,10 @@ impl ExecutionBudget {
             deadline: std::time::Instant::now()
                 .checked_add(limit)
                 .map(|at| (at, limit)),
-            instruction_limit: None,
         }
     }
 
-    /// A deterministic instruction budget with a distant wall-clock hang cap.
-    pub fn deterministic(instructions: usize, wall_cap: std::time::Duration) -> Self {
-        Self {
-            deadline: std::time::Instant::now()
-                .checked_add(wall_cap)
-                .map(|at| (at, wall_cap)),
-            instruction_limit: Some(instructions),
-        }
-    }
-
-    /// The distant wall cap; `None` for the unbounded budget.
+    /// The bound the budget was built with; `None` for [`Self::UNBOUNDED`].
     pub fn limit(&self) -> Option<std::time::Duration> {
         self.deadline.map(|(_, limit)| limit)
     }
@@ -16601,16 +16523,6 @@ impl ExecutionBudget {
     pub fn expired(&self) -> bool {
         self.deadline
             .is_some_and(|(deadline, _)| std::time::Instant::now() >= deadline)
-    }
-
-    /// The wall-clock hang guard used by interpreter call sites.
-    pub fn wall_expired(&self) -> bool {
-        self.expired()
-    }
-
-    /// The deterministic instruction bound, when this budget has one.
-    pub fn instruction_limit(&self) -> Option<usize> {
-        self.instruction_limit
     }
 }
 
@@ -19429,7 +19341,6 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: persistent_static_fields,
             initialized_classes: persistent_initialized_classes,
@@ -19507,7 +19418,6 @@ impl NativeJar {
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
                 let constructor_args = self.entry_constructor_args(&class_name, &constructor);
-                // FML constructs a mod with its container active (`neoforge_imc.rs`).
                 let constructed = runtime.invoke(
                     &class_name,
                     "<init>",
@@ -19645,7 +19555,6 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields,
             initialized_classes,
@@ -19816,7 +19725,6 @@ impl NativeJar {
             linked: host.linked_class_table().cloned().unwrap_or_default(),
             host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields,
             initialized_classes,
@@ -22081,8 +21989,6 @@ struct Runtime<'a, H> {
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
-    /// Instructions charged by this invocation, shared by all nested frames.
-    instructions: usize,
 }
 /// A `Class.isAssignableFrom` answer (`Runtime::class_assignable`).
 enum Assignable {
@@ -26553,10 +26459,10 @@ impl<H: Host> Runtime<'_, H> {
                             || descriptor.ends_with(")Ljava/io/BufferedWriter;")
                             || descriptor.ends_with(")Ljava/io/StringWriter;") =>
                     {
-                        let text = match args.first() {
-                            Some(value) => java_value_text(&mut *self.host, value, descriptor)?,
-                            None => String::new(),
-                        };
+                        let text = args
+                            .first()
+                            .map(|value| java_value_text(value, descriptor))
+                            .unwrap_or_default();
                         self.io_write(&marker, &text)?;
                         // `return this`: the writer itself.
                         jar_object::stored_value(&marker)
@@ -26572,7 +26478,7 @@ impl<H: Host> Runtime<'_, H> {
                                     .first()
                                     .cloned()
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
-                                java_value_text(&mut *self.host, value, &argument)?
+                                java_value_text(value, &argument)
                             }
                             None => String::new(),
                         };
@@ -27954,12 +27860,6 @@ impl<H: Host> Runtime<'_, H> {
             .ok_or_else(|| NativeError::Metadata("array is not owned by this invocation".into()))
     }
 
-    /// Whether `value` is a stream this runtime made. Stream identity hashes
-    /// stay unknown even when a collection asks through a nested path.
-    fn is_live_stream_value(&self, value: &Value) -> bool {
-        expect_ref(value).is_some_and(|marker| self.is_live_stream(marker))
-    }
-
     fn new_stream(&mut self, class: &str, method: &str, values: Vec<Value>) -> Value {
         let marker = stream_pipeline::stream_marker(class, method, self.next_stream);
         self.next_stream += 1;
@@ -28195,12 +28095,7 @@ impl<H: Host> Runtime<'_, H> {
                 limit: self.depth,
             });
         }
-        if self.budget.wall_expired()
-            || self
-                .budget
-                .instruction_limit()
-                .is_some_and(|limit| self.instructions >= limit)
-        {
+        if self.budget.expired() {
             return Err(self.budget_exceeded(class, method));
         }
         if method != "<clinit>" {
@@ -28229,8 +28124,6 @@ impl<H: Host> Runtime<'_, H> {
             class: class.to_owned(),
             method: method.to_owned(),
             budget: self.budget.limit().unwrap_or_default(),
-            instructions: self.instructions,
-            instruction_limit: self.budget.instruction_limit(),
         }
     }
 
@@ -28472,14 +28365,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         while pc < code.len() {
             budget_ticks = budget_ticks.wrapping_add(1);
-            self.instructions = self.instructions.saturating_add(1);
-            if self
-                .budget
-                .instruction_limit()
-                .is_some_and(|limit| self.instructions > limit)
-                || (budget_ticks & (BUDGET_CHECK_INSTRUCTIONS - 1) == 0
-                    && self.budget.wall_expired())
-            {
+            if budget_ticks & (BUDGET_CHECK_INSTRUCTIONS - 1) == 0 && self.budget.expired() {
                 return Err(self.budget_exceeded(class, method));
             }
             let at = pc;
@@ -30409,10 +30295,10 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         let mut joined = String::new();
                         let (mut next_arg, mut next_constant) = (0, 0);
-                        let mut expand = |placeholder: u8,
-                                          joined: &mut String,
-                                          next_arg: &mut usize,
-                                          next_constant: &mut usize|
+                        let expand = |placeholder: u8,
+                                      joined: &mut String,
+                                      next_arg: &mut usize,
+                                      next_constant: &mut usize|
                          -> Result<(), NativeError> {
                             match placeholder {
                                 1 => {
@@ -30424,11 +30310,7 @@ impl<H: Host> Runtime<'_, H> {
                                     let argument = arguments
                                         .get(*next_arg)
                                         .map_or("Ljava/lang/Object;", String::as_str);
-                                    joined.push_str(&java_value_text(
-                                        &mut *self.host,
-                                        value,
-                                        argument,
-                                    )?);
+                                    joined.push_str(&java_value_text(value, argument));
                                     *next_arg += 1;
                                 }
                                 _ => {
@@ -30450,11 +30332,7 @@ impl<H: Host> Runtime<'_, H> {
                                 let argument = arguments
                                     .get(position)
                                     .map_or("Ljava/lang/Object;", String::as_str);
-                                joined.push_str(&java_value_text(
-                                    &mut *self.host,
-                                    value,
-                                    argument,
-                                )?);
+                                joined.push_str(&java_value_text(value, argument));
                             }
                         } else {
                             for ch in recipe.chars() {
@@ -34975,7 +34853,6 @@ mod tests {
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -35039,7 +34916,6 @@ mod tests {
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -36652,14 +36528,10 @@ modId="minecraft"
                 class,
                 method,
                 budget,
-                instructions,
-                instruction_limit,
             } => {
                 assert_eq!(class, "demo/Spin");
                 assert_eq!(method, "spin");
                 assert_eq!(budget, limit);
-                assert!(instructions > 0);
-                assert_eq!(instruction_limit, None);
             }
             other => panic!("expected the execution budget, got {other:?}"),
         }
@@ -42198,7 +42070,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -42412,7 +42283,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -42601,7 +42471,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -42958,7 +42827,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -43275,7 +43143,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -48534,7 +48401,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
@@ -48593,7 +48459,6 @@ mandatory = true
             linked: Arc::default(),
             host: &mut host,
             calls: 0,
-            instructions: 0,
             fields: BTreeMap::new(),
             static_fields: BTreeMap::new(),
             initialized_classes: std::collections::BTreeSet::new(),
