@@ -28,7 +28,7 @@ use mod_api::{BlocksEvent, ItemsEvent, PackageKind, RegistrationContext};
 use crate::runtime;
 use crate::{JARS, JarRow, LOG, LoadedJar, State, jar_id, load_jar};
 
-/// This mod's manifest id (`mod/horizon-mod.toml`): the package whose namespaces the game's
+/// This mod's manifest id (`mod/sunrise-mod.toml`): the package whose namespaces the game's
 /// declaration fence checks.
 pub(crate) const MOD_ID: &str = "horizon_java";
 
@@ -205,7 +205,7 @@ fn on_own_host(
 }
 
 /// The namespaces this mod may declare content in, exactly as the game's fence checks them
-/// (`horizon-mod-api/src/parts/owned_namespaces.rs`): its own id, then the installed package's
+/// (`sunrise-mod-api/src/parts/owned_namespaces.rs`): its own id, then the installed package's
 /// manifest `namespaces`. A jar's namespace is learned at install time, so it is not here unless
 /// the manifest was built with it; its content belongs in a baked content package instead.
 pub(crate) fn owned_namespaces(context: &RegistrationContext) -> Vec<String> {
@@ -675,7 +675,7 @@ mod tests {
         );
     }
 
-    /// The game's fence (`horizon-mod-api/src/parts/owned_namespaces.rs`) lets a native mod
+    /// The game's fence (`sunrise-mod-api/src/parts/owned_namespaces.rs`) lets a native mod
     /// declare only in its id and its manifest `namespaces`; every other id is a fatal refusal at
     /// start, so the bridge must filter them before they reach the dispatcher.
     #[test]

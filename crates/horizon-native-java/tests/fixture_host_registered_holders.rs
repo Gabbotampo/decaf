@@ -44,7 +44,11 @@ import java.util.Optional;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 public interface Holder<T> {
-  interface Reference<T> extends Holder<T> { ResourceKey<T> key(); }
+  interface Reference<T> extends Holder<T> {
+    ResourceKey<T> key();
+    static <T> Reference<T> createStandAlone(HolderOwner<T> owner, ResourceKey<T> key) { return null; }
+    static <T> Reference<T> createIntrusive(HolderOwner<T> owner, T value) { return null; }
+  }
   interface Direct<T> extends Holder<T> {}
   T value();
   boolean isBound();
@@ -52,6 +56,7 @@ public interface Holder<T> {
   boolean is(Identifier id);
   boolean is(ResourceKey<T> key);
   String getRegisteredName();
+  default Optional<Identifier> getRegisteredNameIfPresent() { return unwrapKey().map(ResourceKey::identifier); }
   Optional<ResourceKey<T>> unwrapKey();
   Kind kind();
   enum Kind { REFERENCE, DIRECT }
@@ -59,6 +64,10 @@ public interface Holder<T> {
   static <T> Holder<T> direct(T value, net.minecraft.core.component.DataComponentMap map) { return null; }
 }
 "#,
+    ),
+    (
+        "net/minecraft/core/HolderOwner.java",
+        "package net.minecraft.core; public interface HolderOwner<T> {}\n",
     ),
     (
         "net/minecraft/core/component/DataComponentMap.java",
@@ -77,6 +86,10 @@ public interface Registry<T> {
   Optional<Holder.Reference<T>> get(Identifier id);
 }
 "#,
+    ),
+    (
+        "net/minecraft/core/registries/Registries.java",
+        "package net.minecraft.core.registries; import net.minecraft.resources.ResourceKey; public final class Registries { public static final ResourceKey<?> ATTRIBUTE = null; }\n",
     ),
     (
         "net/minecraft/core/registries/BuiltInRegistries.java",
@@ -120,7 +133,9 @@ public class RangedAttribute extends Attribute {
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.effect.MobEffect;
 import net.minecraft.world.effect.MobEffectCategory;
 import net.minecraft.world.entity.ai.attributes.Attribute;
@@ -155,6 +170,26 @@ public final class Probe {
     Attribute value = attributeValue(id);
     return facts("wrapped", BuiltInRegistries.ATTRIBUTE.wrapAsHolder(value), id, value);
   }
+  static String error(Throwable error) { return "THROW:" + error.getClass().getName() + ":" + error.getMessage(); }
+  static String name(Holder<?> holder) { try { return "OK:" + holder.getRegisteredName(); } catch (Throwable e) { return error(e); } }
+  static String present(Holder<?> holder) { try { return "OK:" + holder.getRegisteredNameIfPresent(); } catch (Throwable e) { return error(e); } }
+  static String key(Holder.Reference<?> holder) { try { return "OK:" + holder.key(); } catch (Throwable e) { return error(e); } }
+  static String unwrapKey(Holder<?> holder) { try { return "OK:" + holder.unwrapKey(); } catch (Throwable e) { return error(e); } }
+  static String value(Holder<?> holder) { try { return "OK:" + holder.value(); } catch (Throwable e) { return error(e); } }
+  static String bound(Holder<?> holder) { try { return "OK:" + holder.isBound(); } catch (Throwable e) { return error(e); } }
+  static String text(Holder.Reference<?> holder) { try { return "OK:" + holder; } catch (Throwable e) { return error(e); } }
+  static String referenceFacts(String label, Holder.Reference<?> holder) {
+    return label + "|name=" + name(holder) + "|present=" + present(holder) + "|key=" + key(holder)
+      + "|unwrapKey=" + unwrapKey(holder) + "|value=" + value(holder) + "|bound=" + bound(holder)
+      + "|toString=" + text(holder);
+  }
+  public static String unbound() {
+    ResourceKey<Attribute> key = ResourceKey.create(Registries.ATTRIBUTE, Identifier.fromNamespaceAndPath("probe", "unbound"));
+    return referenceFacts("unbound", Holder.Reference.createStandAlone(null, key));
+  }
+  public static String intrusive() {
+    return referenceFacts("intrusive", Holder.Reference.createIntrusive(null, "intrusive"));
+  }
 }
 "#,
     ),
@@ -176,6 +211,9 @@ fn observed_registration_holders_match_java25_oracle() {
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(fixture.text_on(&mut host, "attribute"), captured_rows()[1]);
+    assert_eq!(fixture.text_on(&mut host, "wrapped"), captured_rows()[2]);
+    assert_eq!(fixture.text_on(&mut host, "unbound"), captured_rows()[3]);
+    assert_eq!(fixture.text_on(&mut host, "intrusive"), captured_rows()[4]);
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",

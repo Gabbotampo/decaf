@@ -22,7 +22,14 @@ const HOLDER_TYPES: &[&str] = &[OWNER, HOLDER, "java/lang/Object"];
 /// A holder reference is a concrete game object. Its object hash is the
 /// identity hash and therefore remains counted; the identity itself is exact
 /// because each observed registration carries one registry key and value.
-fn holder(registry_key: Value, id: Value, value: Value, bound: bool, game_owned: bool) -> Value {
+fn holder_with_owner(
+    registry_key: Value,
+    id: Value,
+    value: Value,
+    bound: bool,
+    game_owned: bool,
+    owner_null: bool,
+) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::RegistryHolder,
         &[
@@ -30,9 +37,13 @@ fn holder(registry_key: Value, id: Value, value: Value, bound: bool, game_owned:
             id,
             value,
             Value::Int(i32::from(bound)),
-            Value::Int(i32::from(game_owned)),
+            Value::Int(if owner_null { 2 } else { i32::from(game_owned) }),
         ],
     ))
+}
+
+fn holder(registry_key: Value, id: Value, value: Value, bound: bool, game_owned: bool) -> Value {
+    holder_with_owner(registry_key, id, value, bound, game_owned, false)
 }
 
 struct Parts {
@@ -41,6 +52,7 @@ struct Parts {
     value: Value,
     bound: bool,
     game_owned: bool,
+    owner_null: bool,
 }
 
 fn parts(value: &Value) -> Option<Parts> {
@@ -59,9 +71,10 @@ fn parts(value: &Value) -> Option<Parts> {
         Value::Int(1) => true,
         _ => return None,
     };
-    let game_owned = match game_owned {
-        Value::Int(0) => false,
-        Value::Int(1) => true,
+    let (game_owned, owner_null) = match game_owned {
+        Value::Int(0) => (false, false),
+        Value::Int(1) => (true, false),
+        Value::Int(2) => (false, true),
         _ => return None,
     };
     Some(Parts {
@@ -70,6 +83,7 @@ fn parts(value: &Value) -> Option<Parts> {
         value,
         bound,
         game_owned,
+        owner_null,
     })
 }
 
@@ -141,6 +155,57 @@ pub(crate) fn registered_id(value: &Value) -> Option<String> {
     parts(value).map(|parts| parts.id)
 }
 
+fn reference_from_key(key: &Value, value: Value, bound: bool) -> Option<Value> {
+    let (registry_key, id, _id_text) = key_parts(key)?;
+    Some(holder_with_owner(
+        registry_key,
+        id,
+        value,
+        bound,
+        false,
+        true,
+    ))
+}
+
+fn intrusive_holder(value: Value) -> Value {
+    holder(Value::Ref(None), Value::Ref(None), value, false, false)
+}
+
+fn intrusive_value(value: &Value) -> Option<Value> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::RegistryHolder {
+        return None;
+    }
+    let [
+        Value::Ref(None),
+        Value::Ref(None),
+        value,
+        Value::Int(0),
+        Value::Int(0),
+    ] = <[Value; 5]>::try_from(handle.values()?).ok()?
+    else {
+        return None;
+    };
+    Some(value)
+}
+
+fn intrusive_unbound_value(value: &Value) -> NativeError {
+    let text = match value {
+        Value::Ref(Some(text)) => text.clone(),
+        Value::Ref(None) => "null".into(),
+        _ => crate::value_text(value),
+    };
+    NativeError::UncaughtException {
+        class: "java/lang/IllegalStateException".into(),
+        message: Some(format!(
+            "Trying to access unbound value '{text}' from registry null"
+        )),
+        frame: None,
+    }
+}
+
 /// `Registry.registerForHolder`'s two 26.3 overloads. An unmodelled registry,
 /// id or value shape stays counted instead of inventing a holder.
 pub(crate) fn static_call(
@@ -148,6 +213,31 @@ pub(crate) fn static_call(
     r: &MethodRef,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if r.owner == OWNER && r.name == "createStandAlone" {
+        if r.descriptor
+            != "(Lnet/minecraft/core/HolderOwner;Lnet/minecraft/resources/ResourceKey;)Lnet/minecraft/core/Holder$Reference;"
+        {
+            return Some(host.unknown_host_call(r));
+        }
+        let Some(key) = args.get(1) else {
+            return Some(host.unknown_host_call(r));
+        };
+        return Some(
+            reference_from_key(key, Value::Ref(None), false)
+                .map_or_else(|| host.unknown_host_call(r), Ok),
+        );
+    }
+    if r.owner == OWNER && r.name == "createIntrusive" {
+        if r.descriptor
+            != "(Lnet/minecraft/core/HolderOwner;Ljava/lang/Object;)Lnet/minecraft/core/Holder$Reference;"
+        {
+            return Some(host.unknown_host_call(r));
+        }
+        let Some(value) = args.get(1) else {
+            return Some(host.unknown_host_call(r));
+        };
+        return Some(Ok(intrusive_holder(value.clone())));
+    }
     if r.owner == HOLDER && r.name == "direct" {
         let valid = matches!(
             r.descriptor.as_str(),
@@ -330,6 +420,10 @@ fn holder_to_string(
     nested: &mut dyn Nested,
 ) -> Result<Option<String>, NativeError> {
     let value = Value::Host(handle.clone());
+    if let Some(value) = intrusive_value(&value) {
+        let text = nested.text(&value)?;
+        return Ok(text.map(|text| format!("Reference{{null={text}}}")));
+    }
     let parts =
         parts(&value).ok_or_else(|| NativeError::Metadata("malformed registry holder".into()))?;
     let key = nested.text(&entry_key(&parts))?;
@@ -343,18 +437,21 @@ fn holder_to_string(
         .map(|(key, value)| format!("Reference{{{key}={value}}}")))
 }
 
-fn unbound_value(parts: &Parts) -> NativeError {
-    let registry =
-        host_ids::registry_name(&parts.registry_key).unwrap_or_else(|| "unknown:registry".into());
+fn unbound_value(parts: &Parts) -> Option<NativeError> {
+    let registry = host_ids::registry_name(&parts.registry_key)?;
     let key = format!("ResourceKey[{registry} / {}]", parts.id);
-    let owner = format!("Registry[ResourceKey[minecraft:root / {registry}] (Stable)]");
-    NativeError::UncaughtException {
+    let owner = if parts.owner_null {
+        "null".into()
+    } else {
+        format!("Registry[ResourceKey[minecraft:root / {registry}] (Stable)]")
+    };
+    Some(NativeError::UncaughtException {
         class: "java/lang/IllegalStateException".into(),
         message: Some(format!(
             "Trying to access unbound value '{key}' from registry {owner}"
         )),
         frame: None,
-    }
+    })
 }
 
 const DIRECT_OWNER: &str = "net/minecraft/core/Holder$Direct";
@@ -498,6 +595,28 @@ pub(crate) fn instance_call(
     if direct_parts(receiver).is_some() {
         return direct_holder_call(host, r, receiver, args);
     }
+    if let Some(value) = intrusive_value(receiver) {
+        let answer = match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (HOLDER | OWNER, "value", "()Ljava/lang/Object;") => Ok(value),
+            (HOLDER | OWNER, "isBound", "()Z") | (HOLDER | OWNER, "areComponentsBound", "()Z") => {
+                Ok(Value::Int(0))
+            }
+            (HOLDER | OWNER, "kind", "()Lnet/minecraft/core/Holder$Kind;") => {
+                Ok(Value::Ref(Some(format!("enum/{KIND}/REFERENCE"))))
+            }
+            (HOLDER | OWNER, "key", "()Lnet/minecraft/resources/ResourceKey;")
+            | (HOLDER | OWNER, "getRegisteredName", "()Ljava/lang/String;")
+            | (HOLDER | OWNER, "getRegisteredNameIfPresent", "()Ljava/util/Optional;")
+            | (HOLDER | OWNER, "unwrapKey", "()Ljava/util/Optional;")
+            | (HOLDER | OWNER, "unwrap", "()Lcom/mojang/datafixers/util/Either;")
+            | (HOLDER | OWNER, "is", "(Lnet/minecraft/resources/Identifier;)Z")
+            | (HOLDER | OWNER, "is", "(Lnet/minecraft/resources/ResourceKey;)Z") => {
+                Err(intrusive_unbound_value(&value))
+            }
+            _ => return Some(host.unknown_host_call(r)),
+        };
+        return Some(answer);
+    }
     if crate::host_registry::registry_id(receiver).is_some() {
         return registry_call(host, r, receiver, args);
     }
@@ -511,7 +630,10 @@ pub(crate) fn instance_call(
             if parts.game_owned || parts.bound {
                 Ok(parts.value.clone())
             } else {
-                Err(unbound_value(&parts))
+                match unbound_value(&parts) {
+                    Some(error) => Err(error),
+                    None => return Some(host.unknown_host_call(r)),
+                }
             }
         }
         (HOLDER | OWNER, "getRegisteredName", "()Ljava/lang/String;") => {

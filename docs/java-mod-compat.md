@@ -893,7 +893,7 @@ registration can be probed.
 The native CLI's `--json` form returns
 `{status,kind,entrypoints,host_calls,payload_directions}` on success and a structured
 `{status,error,stage}` object on load, discovery, or execution failure. A launcher can use that verdict to
-select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo horizon-mod
+select the native path or fall back to `horizon-jvm` without parsing human diagnostics. `cargo sunrise-mod
 check` runs the same bounded probe as an optional `native` field in its JSON report, trying Fabric `main`,
 `client`, and `server` entrypoints before a NeoForge `@Mod` entrypoint. The launcher prints the selected kind,
 executes every declaration for that selected kind (retaining the first as the compatibility `entrypoint`),
@@ -1292,7 +1292,7 @@ The typed declaration path runs before `Assets::load`; jars without declarations
 without mutating the live game tables.
 
 The end-to-end typed adapter has a source-built regression fixture in
-`crates/horizon-mods/tests/native_fixture.rs`. It compiles a small Fabric entrypoint, packages block,
+`crates/native-mods/tests/native_fixture.rs`. It compiles a small Fabric entrypoint, packages block,
 item, and mob-effect declarations, executes the jar, and feeds those declarations through
 `NativeDeclarations::from_registry_entries` and `Content::from_native`; this verifies that typed content
 reaches Horizon content planning without requiring a game installation.
@@ -1302,7 +1302,7 @@ A game-owned adapter can enrich an opaque callback registration explicitly with
 already-enriched entries and then uses the same all-or-nothing typed sink as metadata declarations, so a
 Java callback cannot silently install an untyped object into a live registry.
 
-The typed half of that boundary now lives in `horizon-mods::native::NativeDeclarations`. It implements
+The typed half of that boundary now lives in `native_mods::native::NativeDeclarations`. It implements
 `TypedRegistrySink`, validates names and block/item/effect properties, and collects Horizon's existing
 `Block`, `Item`, and `MobEffect` declarations for the pre-`Assets::load` phase. `Content::from_native`
 turns that collection into declaration-only content that the existing resource planner consumes. The game's
@@ -1328,7 +1328,7 @@ Four pieces.
 | `horizon-compat` | Java, built with a pinned JDK | The class library: `net.minecraft.*`, `net.fabricmc.*`, `net.neoforged.*`, Mixin's bootstrap. Mostly generated from a spec; a few thousand lines of real logic. |
 | `crates/horizon-jvm` | Rust | Embeds the JRE, owns the classloader and the lifecycle, exports the ABI, dispatches events. |
 | `crates/horizon-native-java` | Rust | Optional bounded interpreter for simple entrypoints; explicit host callbacks and diagnostics, with JVM fallback. |
-| `crates/horizon-mod-abi` | Rust | Census, mapping catalog, remapper/shim generator, verdicts. Offline tool; the game never needs it. |
+| `crates/native-mod-abi` | Rust | Census, mapping catalog, remapper/shim generator, verdicts. Offline tool; the game never needs it. |
 
 Fabric Loader and Mixin are **used as they are** (Apache-2.0, MIT): discovery, dependency resolution,
 entrypoints, `Mixin` weaving, access wideners, JiJ. We are a game provider to Fabric, not a reimplementation

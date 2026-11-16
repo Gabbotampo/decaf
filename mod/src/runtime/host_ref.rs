@@ -598,6 +598,8 @@ pub enum HostKind {
     CommonsNop,
     /// Vanilla's FileToIdConverter record.
     FileToIdConverter,
+    /// Pure PoseStack/JOML render values.
+    RenderObject,
     /// Pure client model-layer builder values and trees.
     CubeDeformation,
     PartPose,
@@ -841,10 +843,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::GsonTypeToken,
         &crate::runtime::host_gson_type::TOKEN_CLASS_SIDE,
     ),
-    (
-        HostKind::DfuPair,
-        &crate::runtime::host_codec::PAIR_CLASS_SIDE,
-    ),
+    (HostKind::DfuPair, &crate::runtime::host_codec::PAIR_CLASS_SIDE),
     (
         HostKind::GameEvent,
         &crate::runtime::host_game_event::EVENT_CLASS_SIDE,
@@ -882,10 +881,7 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         HostKind::StreamCodec,
         &crate::runtime::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
-    (
-        HostKind::RandomSource,
-        &crate::runtime::random_source::CLASS_SIDE,
-    ),
+    (HostKind::RandomSource, &crate::runtime::random_source::CLASS_SIDE),
 ];
 
 /// One row of the kind table.
@@ -2573,6 +2569,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::client_reload::CONVERTER_METHODS,
     },
     KindInfo {
+        kind: HostKind::RenderObject,
+        tag: "rmat",
+        class: ClassRule::FromKey(crate::runtime::render_math::class_of_key),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
         kind: HostKind::CubeDeformation,
         tag: "cdef",
         class: ClassRule::Fixed(crate::runtime::model_layers::CUBE_DEFORMATION),
@@ -2711,11 +2714,7 @@ impl HostRef {
     }
 
     /// A callback handle keyed `key` that carries `row` (`callback_marker.rs`).
-    pub(crate) fn with_row(
-        kind: HostKind,
-        key: String,
-        row: crate::runtime::callback_marker::Row,
-    ) -> Self {
+    pub(crate) fn with_row(kind: HostKind, key: String, row: crate::runtime::callback_marker::Row) -> Self {
         let mut handle = Self::new(kind, key);
         handle.row = Some(Arc::new(row));
         handle
@@ -3154,10 +3153,7 @@ mod tests {
             );
             // A collection element.
             assert_eq!(
-                crate::runtime::parse_value_marker(&crate::runtime::collection_item_marker(
-                    &handle
-                ))
-                .ok(),
+                crate::runtime::parse_value_marker(&crate::runtime::collection_item_marker(&handle)).ok(),
                 Some(handle.clone()),
                 "{held:?}"
             );
