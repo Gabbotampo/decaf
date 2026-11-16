@@ -19,14 +19,21 @@ pub(crate) const LAYER_DEFINITION: &str =
     "net/minecraft/client/model/geom/builders/LayerDefinition";
 
 #[derive(Clone, Debug, PartialEq)]
+enum VisibleFaces {
+    All,
+    Set(Value),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct Cube {
-    origin: [f64; 3],
-    size: [f64; 3],
-    grow: [f64; 3],
+    name: Option<String>,
+    origin: [f32; 3],
+    size: [f32; 3],
+    grow: [f32; 3],
     tex: [i32; 2],
     mirror: bool,
-    tex_scale: [f64; 2],
-    visible: [bool; 6],
+    tex_scale: [f32; 2],
+    visible: VisibleFaces,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,8 +45,8 @@ struct Builder {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Node {
-    cubes: Vec<Cube>,
-    pose: [f64; 9],
+    cube_source: String,
+    pose: [f32; 9],
     children: Vec<(String, String)>,
 }
 
@@ -62,24 +69,24 @@ pub(crate) struct State {
     builders: BTreeMap<String, Builder>,
     meshes: BTreeMap<String, Mesh>,
     layers: BTreeMap<String, Layer>,
-    deformations: BTreeMap<String, [f64; 3]>,
-    poses: BTreeMap<String, [f64; 9]>,
+    deformations: BTreeMap<String, [f32; 3]>,
+    poses: BTreeMap<String, [f32; 9]>,
     static_values: BTreeMap<String, Value>,
 }
 
-fn value_f64(value: &Value) -> Option<f64> {
+fn value_f32(value: &Value) -> Option<f32> {
     match value {
-        Value::Float(v) => Some(*v),
-        Value::Int(v) => Some(*v as f64),
-        Value::Long(v) => Some(*v as f64),
+        Value::Float(v) => Some(*v as f32),
+        Value::Int(v) => Some(*v as f32),
+        Value::Long(v) => Some(*v as f32),
         _ => None,
     }
 }
 
-fn floats<const N: usize>(args: &[Value]) -> Option<[f64; N]> {
+fn floats<const N: usize>(args: &[Value]) -> Option<[f32; N]> {
     args.iter()
         .take(N)
-        .map(value_f64)
+        .map(value_f32)
         .collect::<Option<Vec<_>>>()?
         .try_into()
         .ok()
@@ -114,15 +121,15 @@ fn kind(value: &Value, expected: HostKind) -> Option<&HostRef> {
     }
 }
 
-fn values(handle: &HostRef) -> Option<Vec<f64>> {
+fn values(handle: &HostRef) -> Option<Vec<f32>> {
     handle
         .values()?
         .iter()
-        .map(value_f64)
+        .map(value_f32)
         .collect::<Option<Vec<_>>>()
 }
 
-fn deformation_values(state: &State, value: &Value) -> Option<[f64; 3]> {
+fn deformation_values(state: &State, value: &Value) -> Option<[f32; 3]> {
     let handle = kind(value, HostKind::CubeDeformation)?;
     if let Some(values) = state.deformations.get(handle.key()) {
         return Some(*values);
@@ -131,7 +138,7 @@ fn deformation_values(state: &State, value: &Value) -> Option<[f64; 3]> {
     values.as_slice().try_into().ok()
 }
 
-fn pose_values(state: &State, value: &Value) -> Option<[f64; 9]> {
+fn pose_values(state: &State, value: &Value) -> Option<[f32; 9]> {
     let handle = kind(value, HostKind::PartPose)?;
     if let Some(values) = state.poses.get(handle.key()) {
         return Some(*values);
@@ -140,22 +147,21 @@ fn pose_values(state: &State, value: &Value) -> Option<[f64; 9]> {
     values.as_slice().try_into().ok()
 }
 
-fn deformation(_state: &mut State, values: [f64; 3]) -> Value {
+fn deformation(values: [f32; 3]) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::CubeDeformation,
-        &values.map(Value::Float),
+        &values.map(|value| Value::Float(value as f64)),
     ))
 }
 
-fn pose(state: &mut State, values: [f64; 9]) -> Value {
-    let _ = state;
+fn pose(values: [f32; 9]) -> Value {
     Value::Host(HostRef::of_values(
         HostKind::PartPose,
-        &values.map(Value::Float),
+        &values.map(|value| Value::Float(value as f64)),
     ))
 }
 
-fn zero_pose() -> [f64; 9] {
+fn zero_pose() -> [f32; 9] {
     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
 }
 
@@ -180,10 +186,8 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Value> {
             CUBE_DEFORMATION,
             "NONE",
             "Lnet/minecraft/client/model/geom/builders/CubeDeformation;",
-        ) => deformation(state, [0.0, 0.0, 0.0]),
-        (PART_POSE, "ZERO", "Lnet/minecraft/client/model/geom/PartPose;") => {
-            pose(state, zero_pose())
-        }
+        ) => deformation([0.0, 0.0, 0.0]),
+        (PART_POSE, "ZERO", "Lnet/minecraft/client/model/geom/PartPose;") => pose(zero_pose()),
         _ => return None,
     };
     state.static_values.insert(key, value.clone());
@@ -212,19 +216,19 @@ pub(crate) fn invoke(
             if r.descriptor == "(FFF)Lnet/minecraft/client/model/geom/PartPose;" =>
         {
             let [x, y, z] = floats(args)?;
-            pose(state, [x, y, z, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            pose([x, y, z, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
         }
         (PART_POSE, "rotation")
             if r.descriptor == "(FFF)Lnet/minecraft/client/model/geom/PartPose;" =>
         {
             let [x, y, z] = floats(args)?;
-            pose(state, [0.0, 0.0, 0.0, x, y, z, 1.0, 1.0, 1.0])
+            pose([0.0, 0.0, 0.0, x, y, z, 1.0, 1.0, 1.0])
         }
         (PART_POSE, "offsetAndRotation")
             if r.descriptor == "(FFFFFF)Lnet/minecraft/client/model/geom/PartPose;" =>
         {
             let [x, y, z, xr, yr, zr] = floats(args)?;
-            pose(state, [x, y, z, xr, yr, zr, 1.0, 1.0, 1.0])
+            pose([x, y, z, xr, yr, zr, 1.0, 1.0, 1.0])
         }
         (CUBE_DEFORMATION, "extend") => return None,
         (LAYER_DEFINITION, "create")
@@ -250,28 +254,59 @@ pub(crate) fn invoke(
     Some(Ok(value))
 }
 
-fn add_box(builder: &mut Builder, args: &[Value], state: &State) -> Option<()> {
-    let [x, y, z, w, h, d] = floats::<6>(args)?;
-    let (grow, tex_scale, visible) = if let Some(value) = args.get(6) {
-        if let Some(grow) = deformation_values(state, value) {
-            let tex_scale = if args.len() >= 9 {
-                [value_f64(args.get(7)?)?, value_f64(args.get(8)?)?]
-            } else {
-                [1.0, 1.0]
-            };
-            (grow, tex_scale, [true; 6])
-        } else {
-            ([0.0, 0.0, 0.0], [1.0, 1.0], [true; 6])
-        }
+fn add_box(builder: &mut Builder, descriptor: &str, args: &[Value], state: &State) -> Option<()> {
+    let string_name = descriptor.starts_with("(Ljava/lang/String;");
+    let base = usize::from(string_name);
+    let name = string_name.then(|| text(args.first()?)).flatten();
+    let origin = [
+        value_f32(args.get(base)?)?,
+        value_f32(args.get(base + 1)?)?,
+        value_f32(args.get(base + 2)?)?,
+    ];
+    let size = [
+        value_f32(args.get(base + 3)?)?,
+        value_f32(args.get(base + 4)?)?,
+        value_f32(args.get(base + 5)?)?,
+    ];
+    let has_set = descriptor.contains("Ljava/util/Set;");
+    let has_boolean = descriptor
+        .ends_with(")Lnet/minecraft/client/model/geom/builders/CubeListBuilder;")
+        && descriptor.contains("Z)");
+    let has_deformation = descriptor.contains("CubeDeformation;");
+    let grow = if has_deformation {
+        deformation_values(state, args.get(base + 6)?)?
     } else {
-        ([0.0, 0.0, 0.0], [1.0, 1.0], [true; 6])
+        [0.0; 3]
+    };
+    let mirror = if has_boolean {
+        matches!(args.get(base + 6), Some(Value::Int(value)) if *value != 0)
+    } else {
+        builder.mirror
+    };
+    let visible = if has_set {
+        VisibleFaces::Set(args.get(base + 6)?.clone())
+    } else {
+        VisibleFaces::All
+    };
+    let tex_scale = if has_deformation && !string_name && args.len() == 9 {
+        [value_f32(args.get(7)?)?, value_f32(args.get(8)?)?]
+    } else {
+        [1.0, 1.0]
+    };
+    let tex = if string_name && !has_deformation && args.len() == 9 {
+        [int(args.get(7)?)?, int(args.get(8)?)?]
+    } else if string_name && has_deformation && args.len() == 10 {
+        [int(args.get(8)?)?, int(args.get(9)?)?]
+    } else {
+        builder.tex
     };
     builder.cubes.push(Cube {
-        origin: [x, y, z],
-        size: [w, h, d],
+        name,
+        origin,
+        size,
         grow,
-        tex: builder.tex,
-        mirror: builder.mirror,
+        tex,
+        mirror,
         tex_scale,
         visible,
     });
@@ -290,7 +325,7 @@ pub(crate) fn instance(
             ("<init>", "(F)V") => {
                 state
                     .deformations
-                    .insert(handle.key().to_owned(), [value_f64(args.first()?)?; 3]);
+                    .insert(handle.key().to_owned(), [value_f32(args.first()?)?; 3]);
                 Some(Ok(Value::Void))
             }
             ("<init>", "(FFF)V") => {
@@ -301,16 +336,13 @@ pub(crate) fn instance(
             }
             ("extend", "(F)Lnet/minecraft/client/model/geom/builders/CubeDeformation;") => {
                 let old = deformation_values(state, receiver)?;
-                let by = value_f64(args.first()?)?;
-                Some(Ok(deformation(state, old.map(|v| v + by))))
+                let by = value_f32(args.first()?)?;
+                Some(Ok(deformation(old.map(|value| value + by))))
             }
-            ("extend", "(FFF)Lnet/minecraft/client/model/geom/builders/CubeDeformation;") => {
+            ("extend", "(FFF)Lnet/minecraft/client.model.geom.builders.CubeDeformation;") => {
                 let old = deformation_values(state, receiver)?;
                 let by = floats::<3>(args)?;
-                Some(Ok(deformation(
-                    state,
-                    std::array::from_fn(|i| old[i] + by[i]),
-                )))
+                Some(Ok(deformation(std::array::from_fn(|i| old[i] + by[i]))))
             }
             _ => None,
         };
@@ -325,69 +357,64 @@ pub(crate) fn instance(
             ("translated", "(FFF)Lnet/minecraft/client/model/geom/PartPose;") => {
                 let old = pose_values(state, receiver)?;
                 let [x, y, z] = floats(args)?;
-                Some(Ok(pose(
-                    state,
-                    [
-                        old[0] + x,
-                        old[1] + y,
-                        old[2] + z,
-                        old[3],
-                        old[4],
-                        old[5],
-                        old[6],
-                        old[7],
-                        old[8],
-                    ],
-                )))
+                Some(Ok(pose([
+                    old[0] + x,
+                    old[1] + y,
+                    old[2] + z,
+                    old[3],
+                    old[4],
+                    old[5],
+                    old[6],
+                    old[7],
+                    old[8],
+                ])))
             }
             ("withScale", "(F)Lnet/minecraft/client/model/geom/PartPose;") => {
                 let old = pose_values(state, receiver)?;
-                let scale = value_f64(args.first()?)?;
-                Some(Ok(pose(
-                    state,
-                    [
-                        old[0], old[1], old[2], old[3], old[4], old[5], scale, scale, scale,
-                    ],
-                )))
+                let scale = value_f32(args.first()?)?;
+                Some(Ok(pose([
+                    old[0], old[1], old[2], old[3], old[4], old[5], scale, scale, scale,
+                ])))
             }
-            ("x", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[0]))),
-            ("y", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[1]))),
-            ("z", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[2]))),
-            ("xRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[3]))),
-            ("yRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[4]))),
-            ("zRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[5]))),
-            ("xScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[6]))),
-            ("yScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[7]))),
-            ("zScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[8]))),
+            ("x", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[0] as f64))),
+            ("y", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[1] as f64))),
+            ("z", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[2] as f64))),
+            ("xRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[3] as f64))),
+            ("yRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[4] as f64))),
+            ("zRot", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[5] as f64))),
+            ("xScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[6] as f64))),
+            ("yScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[7] as f64))),
+            ("zScale", "()F") => Some(Ok(Value::Float(pose_values(state, receiver)?[8] as f64))),
             _ => None,
         };
     }
     if let Some(handle) = kind(receiver, HostKind::CubeListBuilder) {
         let key = handle.key().to_owned();
-        let mut builder = state.builders.remove(&key)?;
         let result = match r.name.as_str() {
             "texOffs" if args.len() == 2 => {
-                builder.tex = [int(args.first()?)?, int(args.get(1)?)?];
+                let tex = [int(args.first()?)?, int(args.get(1)?)?];
+                state.builders.get_mut(&key)?.tex = tex;
                 Some(Ok(receiver.clone()))
             }
             "mirror" if args.is_empty() => {
-                builder.mirror = true;
+                state.builders.get_mut(&key)?.mirror = true;
                 Some(Ok(receiver.clone()))
             }
             "mirror" if args.len() == 1 => {
-                builder.mirror = args
-                    .first()
-                    .is_some_and(|v| matches!(v, Value::Int(i) if *i != 0));
+                let mirror = matches!(args.first(), Some(Value::Int(value)) if *value != 0);
+                state.builders.get_mut(&key)?.mirror = mirror;
                 Some(Ok(receiver.clone()))
             }
             "addBox" => {
-                add_box(&mut builder, args, state)?;
-                Some(Ok(receiver.clone()))
+                let mut builder = state.builders.remove(&key)?;
+                let result = add_box(&mut builder, r.descriptor.as_str(), args, state)
+                    .map(|_| Ok(receiver.clone()));
+                state.builders.insert(key, builder);
+                result
             }
             "getCubes" => None,
             _ => None,
         };
-        state.builders.insert(key, builder);
         return result;
     }
     if r.owner == MESH_DEFINITION && r.name == "<init>" && r.descriptor == "()V" {
@@ -420,39 +447,107 @@ pub(crate) fn instance(
                 .unwrap_or(Value::Ref(None));
             return Some(Ok(child));
         }
-        if r.name == "addOrReplaceChild" && args.len() == 3 {
+        if r.name == "addOrReplaceChild" && args.len() == 2 {
             let name = text(args.first()?)?;
-            let builder = kind(args.get(1)?, HostKind::CubeListBuilder)?;
-            let pose = pose_values(state, args.get(2)?)?;
-            let builder = state.builders.get(builder.key())?.clone();
-            let mesh = state.meshes.get_mut(mesh_key)?;
-            let existing = mesh
+            let child = kind(args.get(1)?, HostKind::PartDefinition)?;
+            let (child_mesh, child_node) = child.key().split_once('|')?;
+            if child_mesh != mesh_key {
+                return None;
+            }
+            let old = state
+                .meshes
+                .get(mesh_key)?
                 .nodes
                 .get(node_key)?
                 .children
                 .iter()
                 .find(|(child_name, _)| child_name == &name)
                 .map(|(_, child)| child.clone());
-            if let Some(child) = existing {
-                let node = mesh.nodes.get_mut(&child)?;
-                node.cubes = builder.cubes;
-                node.pose = pose;
-                return Some(Ok(handle(HostKind::PartDefinition, child)));
+            let old_children = old
+                .as_ref()
+                .and_then(|key| state.meshes.get(mesh_key)?.nodes.get(key))
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            let mesh = state.meshes.get_mut(mesh_key)?;
+            let node = mesh.nodes.get_mut(child_node)?;
+            for (old_name, old_key) in old_children {
+                if let Some(entry) = node
+                    .children
+                    .iter_mut()
+                    .find(|(child_name, _)| child_name == &old_name)
+                {
+                    entry.1 = old_key;
+                } else {
+                    node.children.push((old_name, old_key));
+                }
             }
-            let child = format!("part#{}", mesh.nodes.len());
-            mesh.nodes
+            if let Some(entry) = mesh
+                .nodes
                 .get_mut(node_key)?
                 .children
-                .push((name, child.clone()));
+                .iter_mut()
+                .find(|(child_name, _)| child_name == &name)
+            {
+                entry.1 = child_node.to_owned();
+            } else {
+                mesh.nodes
+                    .get_mut(node_key)?
+                    .children
+                    .push((name, child_node.to_owned()));
+            }
+            return Some(Ok(handle(HostKind::PartDefinition, child.key().to_owned())));
+        }
+        if r.name == "addOrReplaceChild" && args.len() == 3 {
+            let name = text(args.first()?)?;
+            let builder_key = kind(args.get(1)?, HostKind::CubeListBuilder)?
+                .key()
+                .to_owned();
+            let pose = pose_values(state, args.get(2)?)?;
+            if !state.builders.contains_key(&builder_key) {
+                return None;
+            }
+            let old = state
+                .meshes
+                .get(mesh_key)?
+                .nodes
+                .get(node_key)?
+                .children
+                .iter()
+                .find(|(child_name, _)| child_name == &name)
+                .map(|(_, child)| child.clone());
+            let inherited = old
+                .as_ref()
+                .and_then(|key| state.meshes.get(mesh_key)?.nodes.get(key))
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            let child = next_key(state, "part");
+            let mesh = state.meshes.get_mut(mesh_key)?;
+            if let Some(entry) = mesh
+                .nodes
+                .get_mut(node_key)?
+                .children
+                .iter_mut()
+                .find(|(child_name, _)| child_name == &name)
+            {
+                entry.1 = child.clone();
+            } else {
+                mesh.nodes
+                    .get_mut(node_key)?
+                    .children
+                    .push((name, child.clone()));
+            }
             mesh.nodes.insert(
                 child.clone(),
                 Node {
-                    cubes: builder.cubes,
+                    cube_source: builder_key,
                     pose,
-                    children: Vec::new(),
+                    children: inherited,
                 },
             );
-            return Some(Ok(handle(HostKind::PartDefinition, child)));
+            return Some(Ok(handle(
+                HostKind::PartDefinition,
+                format!("{mesh_key}|{child}"),
+            )));
         }
     }
     None
@@ -465,7 +560,7 @@ pub(crate) fn ensure_mesh(state: &mut State, key: &str) {
         nodes.insert(
             root.clone(),
             Node {
-                cubes: Vec::new(),
+                cube_source: String::new(),
                 pose: zero_pose(),
                 children: Vec::new(),
             },
@@ -474,11 +569,11 @@ pub(crate) fn ensure_mesh(state: &mut State, key: &str) {
     });
 }
 
-fn record_float(value: f64) -> i32 {
-    (value as f32).to_bits() as i32
+fn record_float(value: f32) -> i32 {
+    value.to_bits() as i32
 }
 
-fn pose_hash(values: [f64; 9]) -> i32 {
+fn pose_hash(values: [f32; 9]) -> i32 {
     values.into_iter().fold(1i32, |hash, value| {
         hash.wrapping_mul(31).wrapping_add(record_float(value))
     })
@@ -487,9 +582,9 @@ fn pose_hash(values: [f64; 9]) -> i32 {
 fn pose_text(handle: &HostRef, _nested: &mut dyn Nested) -> Result<Option<String>, NativeError> {
     let values = handle
         .values()
-        .and_then(|values| values.iter().map(value_f64).collect::<Option<Vec<_>>>())
+        .and_then(|values| values.iter().map(value_f32).collect::<Option<Vec<_>>>())
         .and_then(|values| values.try_into().ok());
-    let Some(values): Option<[f64; 9]> = values else {
+    let Some(values): Option<[f32; 9]> = values else {
         return Ok(None);
     };
     let names = [
@@ -502,7 +597,7 @@ fn pose_text(handle: &HostRef, _nested: &mut dyn Nested) -> Result<Option<String
             .zip(values)
             .map(|(name, value)| format!(
                 "{name}={}",
-                crate::jdk_float_text::float_to_string(value)
+                crate::jdk_float_text::float_to_string(value as f64)
             ))
             .collect::<Vec<_>>()
             .join(", ")
@@ -527,9 +622,9 @@ pub(crate) const PART_POSE_METHODS: Methods = Methods {
     hash_code: |handle, _| {
         Ok(handle
             .values()
-            .and_then(|values| values.iter().map(value_f64).collect::<Option<Vec<_>>>())
-            .and_then(|v| v.try_into().ok())
-            .map(pose_hash))
+            .and_then(|values| values.iter().map(value_f32).collect::<Option<Vec<_>>>())
+            .and_then(|v: Vec<f32>| v.try_into().ok())
+            .map(|v: [f32; 9]| pose_hash(v)))
     },
     equals: |handle, other, _| {
         let Value::Host(other) = other else {
