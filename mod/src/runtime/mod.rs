@@ -203,6 +203,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod vanilla_entity_data_pool;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
 #[doc(hidden)]

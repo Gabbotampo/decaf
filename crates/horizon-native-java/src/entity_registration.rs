@@ -440,33 +440,16 @@ pub(crate) fn instance_call(
     None
 }
 
-const VANILLA_POOL: &[(&str, u16)] = &[
-    ("net/minecraft/world/entity/Entity", 8),
-    ("net/minecraft/world/entity/LivingEntity", 15),
-    ("net/minecraft/world/entity/Mob", 16),
-    ("net/minecraft/world/entity/projectile/Projectile", 0),
-    (
-        "net/minecraft/world/entity/projectile/arrow/AbstractArrow",
-        11,
-    ),
-    ("net/minecraft/world/entity/animal/golem/AbstractGolem", 0),
-    ("net/minecraft/world/entity/animal/golem/IronGolem", 17),
-    ("net/minecraft/world/entity/animal/wolf/Wolf", 25),
-    ("net/minecraft/world/entity/monster/zombie/Zombie", 19),
-    ("net/minecraft/world/entity/player/Player", 21),
-];
+fn pool_last(state: &State, class: &str) -> Option<u16> {
+    if let Some(last) = state.ids.get(class) {
+        return Some(*last);
+    }
+    let (_parent, max) = crate::vanilla_entity_data_pool::row(class)?;
+    max
+}
 
 pub(crate) fn note_hierarchy(state: &mut State, entries: &[(String, String)]) {
     state.supers.extend(entries.iter().cloned());
-}
-
-fn pool_last(state: &State, class: &str) -> Option<u16> {
-    state.ids.get(class).copied().or_else(|| {
-        VANILLA_POOL
-            .iter()
-            .find(|(name, _)| *name == class)
-            .map(|(_, count)| count.saturating_sub(1))
-    })
 }
 
 pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Value, NativeError>> {
@@ -477,6 +460,11 @@ pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Va
         }
         if current == "net/minecraft/world/entity/Entity" {
             break 0;
+        }
+        if current.starts_with("net/minecraft/")
+            && crate::vanilla_entity_data_pool::row(&current).is_none()
+        {
+            return None;
         }
         let parent = state.supers.get(&current)?.clone();
         current = parent;
