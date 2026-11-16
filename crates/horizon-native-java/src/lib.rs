@@ -2367,6 +2367,8 @@ pub trait Host {
     fn described_instance_of(&self, _key: &str, _wanted: &str) -> Option<bool> {
         None
     }
+    fn note_entity_data_hierarchy(&mut self, _entries: &[(String, String)]) {}
+
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -6510,6 +6512,10 @@ impl Host for StdHost {
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
         vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
+    }
+
+    fn note_entity_data_hierarchy(&mut self, entries: &[(String, String)]) {
+        entity_registration::note_hierarchy(&mut self.entity_registration, entries);
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
@@ -28185,6 +28191,32 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
     }
 
+    fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
+        let Some(mut class_name) = args
+            .first()
+            .and_then(host_class::class_name)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let mut entries = Vec::new();
+        for _ in 0..256 {
+            let Some(file) = self.class(&class_name) else {
+                break;
+            };
+            let parent = file.super_name.clone();
+            if parent.is_empty() {
+                break;
+            }
+            entries.push((class_name.clone(), parent.clone()));
+            if parent == "java/lang/Object" {
+                break;
+            }
+            class_name = parent;
+        }
+        self.host.note_entity_data_hierarchy(&entries);
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -28242,7 +28274,14 @@ impl<H: Host> Runtime<'_, H> {
             return match redirect {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
                     Some(receiver) => self.host.invoke_instance(&r, receiver, args),
-                    None => self.host.invoke(&r, args),
+                    None => {
+                        if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
+                            && r.name == "defineId"
+                        {
+                            self.prepare_entity_data_hierarchy(args);
+                        }
+                        self.host.invoke(&r, args)
+                    }
                 },
                 JarCallRedirect::Jar(r) => {
                     self.invoke(&r.owner, &r.name, &r.descriptor, receiver, args)
@@ -28319,7 +28358,14 @@ impl<H: Host> Runtime<'_, H> {
             }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
-                None => self.host.invoke(&r, args),
+                None => {
+                    if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
+                        && r.name == "defineId"
+                    {
+                        self.prepare_entity_data_hierarchy(args);
+                    }
+                    self.host.invoke(&r, args)
+                }
             };
         };
         // `if_acmp`'s producer analysis, looked up once per frame
@@ -30133,7 +30179,15 @@ impl<H: Host> Runtime<'_, H> {
                                         )
                                     }
                                 } else {
-                                    invoke_or_catch!(at, self.host.invoke(&resolved, &args))
+                                    invoke_or_catch!(at, {
+                                        if resolved.owner
+                                            == "net/minecraft/network/syncher/SynchedEntityData"
+                                            && resolved.name == "defineId"
+                                        {
+                                            self.prepare_entity_data_hierarchy(&args);
+                                        }
+                                        self.host.invoke(&resolved, &args)
+                                    })
                                 }
                             } else if let Some(receiver) = receiver.as_ref() {
                                 // A library's own functional interface (log4j's
@@ -30186,7 +30240,15 @@ impl<H: Host> Runtime<'_, H> {
                                     )
                                 }
                             } else {
-                                invoke_or_catch!(at, self.host.invoke(&resolved, &args))
+                                invoke_or_catch!(at, {
+                                    if resolved.owner
+                                        == "net/minecraft/network/syncher/SynchedEntityData"
+                                        && resolved.name == "defineId"
+                                    {
+                                        self.prepare_entity_data_hierarchy(&args);
+                                    }
+                                    self.host.invoke(&resolved, &args)
+                                })
                             }
                         }
                     } else {

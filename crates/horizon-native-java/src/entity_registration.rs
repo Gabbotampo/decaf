@@ -42,6 +42,7 @@ pub(crate) struct State {
     entities: BTreeMap<String, Entity>,
     dimensions: BTreeMap<String, (f64, f64, f64)>,
     ids: BTreeMap<String, u16>,
+    supers: BTreeMap<String, String>,
     registered: BTreeSet<String>,
 }
 
@@ -90,7 +91,7 @@ fn arg_string(v: &Value) -> Option<String> {
         .map(str::to_owned)
         .or_else(|| expect_ref(v).cloned())
 }
-pub(crate) fn category_constant(name: &str) -> Value {
+pub(crate) fn category_constant(name: &str) -> Option<Value> {
     let names = [
         "MONSTER",
         "CREATURE",
@@ -101,11 +102,11 @@ pub(crate) fn category_constant(name: &str) -> Value {
         "WATER_AMBIENT",
         "MISC",
     ];
-    let id = names.iter().position(|n| *n == name).unwrap_or(0);
-    jar_object::handle(format!(
+    let id = names.iter().position(|n| *n == name)?;
+    Some(jar_object::handle(format!(
         "net/minecraft/world/entity/MobCategory#{}",
         710_000 + id
-    ))
+    )))
 }
 fn category_name(value: &Value) -> Option<&'static str> {
     let id: usize = jar_object::instance_key(value)?
@@ -200,7 +201,7 @@ pub(crate) fn static_field(
             "MISC",
         ];
         if names.contains(&r.name.as_str()) {
-            return Some(Ok(category_constant(&r.name)));
+            return category_constant(&r.name).map(Ok);
         }
     }
     if r.owner == "net/minecraft/network/syncher/EntityDataSerializers"
@@ -410,7 +411,7 @@ pub(crate) fn instance_call(
         let e = state.entities.get(&k)?;
         let (entity_width, entity_height, entity_eye_height) = (e.width, e.height, e.eye_height);
         let out = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("getCategory", _) => category_constant(&e.category),
+            ("getCategory", _) => category_constant(&e.category)?,
             ("canSerialize", "()Z") => Value::Int(e.serialize as i32),
             ("canSpawnFarFromPlayer", "()Z") => Value::Int(e.far_from_player as i32),
             ("isAllowedInPeaceful", "()Z") => Value::Int(e.peaceful as i32),
@@ -443,35 +444,51 @@ const VANILLA_POOL: &[(&str, u16)] = &[
     ("net/minecraft/world/entity/Entity", 8),
     ("net/minecraft/world/entity/LivingEntity", 15),
     ("net/minecraft/world/entity/Mob", 16),
+    ("net/minecraft/world/entity/projectile/Projectile", 0),
     (
         "net/minecraft/world/entity/projectile/arrow/AbstractArrow",
         11,
     ),
-    ("net/minecraft/world/entity/monster/zombie/Zombie", 19),
-    ("net/minecraft/world/entity/animal/wolf/Wolf", 25),
+    ("net/minecraft/world/entity/animal/golem/AbstractGolem", 0),
     ("net/minecraft/world/entity/animal/golem/IronGolem", 17),
+    ("net/minecraft/world/entity/animal/wolf/Wolf", 25),
+    ("net/minecraft/world/entity/monster/zombie/Zombie", 19),
     ("net/minecraft/world/entity/player/Player", 21),
 ];
 
+pub(crate) fn note_hierarchy(state: &mut State, entries: &[(String, String)]) {
+    state.supers.extend(entries.iter().cloned());
+}
+
+fn pool_last(state: &State, class: &str) -> Option<u16> {
+    state.ids.get(class).copied().or_else(|| {
+        VANILLA_POOL
+            .iter()
+            .find(|(name, _)| *name == class)
+            .map(|(_, count)| count.saturating_sub(1))
+    })
+}
+
 pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Value, NativeError>> {
-    let next = if let Some(next) = state.ids.get_mut(class_name) {
-        next
-    } else {
-        let (_, count) = VANILLA_POOL.iter().find(|(name, _)| *name == class_name)?;
-        state.ids.entry(class_name.to_owned()).or_insert(*count)
+    let mut current = class_name.to_owned();
+    let id = loop {
+        if let Some(last) = pool_last(state, &current) {
+            break last.saturating_add(1);
+        }
+        if current == "net/minecraft/world/entity/Entity" {
+            break 0;
+        }
+        let parent = state.supers.get(&current)?.clone();
+        current = parent;
     };
-    if *next > 254 {
+    if id > 254 {
         return Some(Err(NativeError::UncaughtException {
             class: "java/lang/IllegalArgumentException".into(),
-            message: Some(format!(
-                "Data value id is too big with {}! (Max is 254)",
-                *next
-            )),
+            message: Some(format!("Data value id is too big with {id}! (Max is 254)")),
             frame: None,
         }));
     }
-    let id = *next;
-    *next += 1;
+    state.ids.insert(class_name.to_owned(), id);
     Some(Ok(jar_object::handle(format!("{ACCESSOR}#{id}"))))
 }
 
@@ -493,9 +510,7 @@ mod tests {
     #[test]
     fn builder_and_accessor_surface_keeps_vanilla_defaults() {
         let mut state = State::default();
-        let category = Value::Ref(Some(
-            "enum/net/minecraft/world/entity/MobCategory/CREATURE".into(),
-        ));
+        let category = category_constant("CREATURE").unwrap();
         let b = static_call(&mut state, &MethodRef { owner: BUILDER.into(), name: "of".into(), descriptor: "(Lnet/minecraft/world/entity/EntityType$EntityFactory;Lnet/minecraft/world/entity/MobCategory;)Lnet/minecraft/world/entity/EntityType$Builder;".into() }, &[Value::Ref(Some("factory".into())), category]).unwrap().unwrap();
         instance_call(
             &mut state,

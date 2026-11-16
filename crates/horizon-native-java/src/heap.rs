@@ -1564,7 +1564,7 @@ mod tests {
     fn entity_registration_handles_follow_callback_collection_roots() {
         let mut host = StdHost::new();
         let mut heap = JavaHeap::default();
-        let category = crate::entity_registration::category_constant("CREATURE");
+        let category = crate::entity_registration::category_constant("CREATURE").unwrap();
         let builder = crate::entity_registration::static_call(
             &mut host.entity_registration,
             &crate::MethodRef {
