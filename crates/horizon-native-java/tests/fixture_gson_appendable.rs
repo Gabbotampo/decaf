@@ -390,10 +390,11 @@ fn unsupported_appendable_is_counted() {
 }
 
 #[test]
-fn object_to_json_composes_reflection_and_exact_writer_options() {
+fn object_to_json_matches_captured_java25_gson_oracle_byte_for_byte() {
     let f = Fixture::new();
+    let actual = format!("{}\n", f.text("objectToJson"));
     assert_eq!(
-        f.text("objectToJson"),
-        r#"{"name":"\u003ccfg\u003e","count":-9,"enabled":true,"ratio":-98.0,"tags":["\u003ca\u003e","b"],"values":{"x":96,"y":17},"nested":{"label":"n0","amount":47}}|P={\n  "name": "\u003ccfg\u003e",\n  "count": -9,\n  "enabled": true,\n  "ratio": -98.0,\n  "tags": [\n    "\u003ca\u003e",\n    "b"\n  ],\n  "values": {\n    "x": 96,\n    "y": 17\n  },\n  "nested": {\n    "label": "n0",\n    "amount": 47\n  }\n}|N={\n  "name": "\u003ccfg\u003e",\n  "count": -9,\n  "enabled": true,\n  "ratio": -98.0,\n  "nullable": null,\n  "tags": [\n    "\u003ca\u003e",\n    "b"\n  ],\n  "values": {\n    "x": 96,\n    "y": 17\n  },\n  "nested": {\n    "label": "n0",\n    "amount": 47\n  }\n}|H={\n  "name": "<cfg>",\n  "count": -9,\n  "enabled": true,\n  "ratio": -98.0,\n  "nullable": null,\n  "tags": [\n    "<a>",\n    "b"\n  ],\n  "values": {\n    "x": 96,\n    "y": 17\n  },\n  "nested": {\n    "label": "n0",\n    "amount": 47\n  }\n}"#
+        actual.as_bytes(),
+        include_bytes!("fixtures/gson_tojson_object/oracle/java25.txt")
     );
 }
