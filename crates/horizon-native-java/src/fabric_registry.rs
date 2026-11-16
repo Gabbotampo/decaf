@@ -113,7 +113,11 @@ pub(crate) fn instance_call(
         && r.name == "test"
     {
         let marker = crate::jar_object::instance_key(receiver)?;
-        let same = args.first()? == args.get(1)?;
+        let same = match (args.first()?, args.get(1)?) {
+            (Value::Host(a), Value::Host(b)) => a.same_object(b).unwrap_or(false),
+            (Value::Ref(a), Value::Ref(b)) => a == b,
+            _ => false,
+        };
         let result = if marker.ends_with("/all") {
             true
         } else if marker.ends_with("/targetOnly") {
