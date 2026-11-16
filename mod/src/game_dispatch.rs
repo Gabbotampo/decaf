@@ -361,8 +361,11 @@ static EFFECT_TRACE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::
 
 fn apply_effect(host: &mut dyn ServerHost, effect: GameHookEffect) {
     #[cfg(test)]
-    if let GameHookEffect::SystemMessage { text, .. } = &effect {
+    {
+        let GameHookEffect::SystemMessage { text, .. } = &effect;
         EFFECT_TRACE.lock().unwrap().push(text.clone());
+        let _ = host;
+        return;
     }
     match effect {
         GameHookEffect::SystemMessage { player, text } => {
@@ -627,18 +630,7 @@ mod tests {
             ),
         ];
         java.refresh_game_hook_plan_bits();
-        let mut args = [Value::Ref(Some("game/blockstate/x".into()))];
-        let mut host = PlayerTickHost { spectator: BTreeMap::new() };
-        let error = java
-            .dispatch_game_hook(GameDispatch::new(
-                MethodId("java_destroy_speed"),
-                Phase::Return,
-                Some(GameObject::player(1, "Alex")),
-                &mut args,
-                Some(Value::Float(1.5)),
-                &mut host,
-            ))
-            .unwrap_err();
+        let error = destroy_speed_dispatch(&java, 1.5).unwrap_err();
         assert!(error.to_string().contains("CancellationException"));
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.failed, 1);
