@@ -448,7 +448,9 @@ fn dispatch_state(
                     release.wait();
                 }
                 #[cfg(test)]
-                if let Some(target) = NESTED_DISPATCH_TARGET.lock().unwrap().take() {
+                let nested_target = NESTED_DISPATCH_TARGET.lock().unwrap().take();
+                #[cfg(test)]
+                if let Some(target) = nested_target {
                     tests::dispatch_nested_for_test(&target);
                 }
                 callback.inspect(|_| {
