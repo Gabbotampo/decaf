@@ -74,10 +74,24 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Result<Va
     {
         return None;
     }
-    let v = state
-        .handles
-        .entry(r.name.clone())
-        .or_insert_with(|| jar_object::handle(format!("{OWNER}#{}", r.name)));
+    let v = state.handles.entry(r.name.clone()).or_insert_with(|| {
+        jar_object::handle(format!(
+            "{OWNER}#{}",
+            [
+                "WOOD",
+                "STONE",
+                "COPPER",
+                "IRON",
+                "DIAMOND",
+                "GOLD",
+                "NETHERITE"
+            ]
+            .iter()
+            .position(|n| *n == r.name)
+            .unwrap()
+                + 800000
+        ))
+    });
     Some(Ok(v.clone()))
 }
 pub(crate) fn instance_call(
