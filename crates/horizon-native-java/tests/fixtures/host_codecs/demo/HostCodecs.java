@@ -4,7 +4,9 @@ import com.mojang.datafixers.kinds.App;
 import com.mojang.datafixers.util.Pair;
 import com.mojang.datafixers.util.Either;
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.Lifecycle;
 import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.util.StringRepresentable;
 import java.util.*;
 
 /** DataFixerUpper's Pair and the game's codecs as host objects (#156 P5c). */
@@ -172,14 +174,14 @@ public final class HostCodecs {
   /** Broad DFU operations are deliberately counted until the execution phase is modelled. */
   public static String countedOperations() {
     int calls = 0;
-    try { Codec.INT.listOf(); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.dispatch(x -> Codec.INT, x -> 1); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.orElse(Codec.INT); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.validate(x -> null); calls++; } catch (Throwable ignored) {}
-    try { Codec.EMPTY.codec(); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.encodeStart(null, 1); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.decode(null, null); calls++; } catch (Throwable ignored) {}
-    try { Codec.INT.parse(null, null); calls++; } catch (Throwable ignored) {}
+    try { Codec.INT.listOf(); } catch (Throwable ignored) {} finally { calls++; }
+    try { ((Codec) Codec.INT).dispatch(null, null); } catch (Throwable ignored) {} finally { calls++; }
+    try { ((Codec) Codec.INT).orElse((Codec) Codec.INT); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.validate(x -> null); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.EMPTY.codec(); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.encodeStart(null, 1); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.decode(null, null); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.parse(null, null); } catch (Throwable ignored) {} finally { calls++; }
     return Integer.toString(calls);
   }
 
@@ -196,6 +198,47 @@ public final class HostCodecs {
   /** Deterministic structural text for the phase-1 nodes. */
   public static String dfuText() {
     return Codec.INT.fieldOf("x") + "|" + Codec.INT.optionalFieldOf("x") + "|"
-        + Codec.INT.optionalFieldOf("x", 7) + "|" + Codec.INT.xmap(x -> x + 1, x -> x - 1);
+        + Codec.INT.optionalFieldOf("x", 7) + "|"
+        + Codec.INT.optionalFieldOf("x", 7, (Lifecycle) null) + "|"
+        + Codec.INT.xmap(x -> x + 1, x -> x - 1);
+  }
+  /** StreamCodec and a game EnumCodec are rejected by every DFU receiver family. */
+  public static String forgedDfuReceivers() {
+    Object stream = ByteBufCodecs.INT;
+    Object game = StringRepresentable.fromEnum(() -> null);
+    return "" + rejectedCodec(stream) + rejectedCodec(game) + rejectedOptional(stream) + rejectedOptional(game)
+        + rejectedXmap(stream) + rejectedXmap(game) + rejectedGetter(stream) + rejectedGetter(game);
+  }
+
+  static boolean rejectedCodec(Object value) {
+    try { ((Codec<Object>) value).fieldOf("x"); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedOptional(Object value) {
+    try { ((Codec<Object>) value).optionalFieldOf("x", 1); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedXmap(Object value) {
+    try { ((Codec<Object>) value).xmap(x -> x, x -> x); return false; } catch (Throwable expected) { return true; }
+  }
+  static boolean rejectedGetter(Object value) {
+    try { ((com.mojang.serialization.MapCodec<Object>) value).forGetter(x -> x); return false; } catch (Throwable expected) { return true; }
+  }
+
+  /** Builds xmap inside a callback, drops the callback/source references, forces GC, then uses the handle. */
+  public static String callbackXmapUse() {
+    final Codec<?>[] box = new Codec<?>[1];
+    java.util.function.Supplier<Codec<?>> maker = () -> {
+      Codec<?> value = Codec.INT.xmap(x -> x, x -> x);
+      box[0] = value;
+      return value;
+    };
+    Codec<?> kept = maker.get();
+    maker = null;
+    box[0] = null;
+    for (int i = 0; i < 300; i++) {
+      Object[] waste = new Object[1024];
+      waste[0] = i;
+    }
+    System.gc();
+    return kept.toString();
   }
 }

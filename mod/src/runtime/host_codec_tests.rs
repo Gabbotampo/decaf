@@ -144,10 +144,12 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         (
             "dfuText",
             Exact(
-                "Field[x: Int]|OptionalFieldCodec[x: Int]|OptionalFieldCodec[x: Int][xmapped]|Int[xmapped]",
+                "Field[x: Int]|OptionalFieldCodec[x: Int]|OptionalFieldCodec[x: Int][xmapped]|OptionalFieldCodec[x: Int][flatXmapped]|Int[xmapped]",
             ),
         ),
         ("forgedDfuReceiver", CountedAs("false")),
+        ("callbackXmapUse", CountedAs("Int[xmapped]")),
+        ("forgedDfuReceivers", Counted),
         // A pair is never equal to a JDK object (#199 F4).
         ("pairVsJdk", Exact("falsefalsefalsefalsefalse")),
     ];
@@ -181,6 +183,50 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn each_dfu_operation_is_counted_individually() {
+    let mut host = StdHost::new();
+    let answer = jar()
+        .invoke_method_with_args(
+            "demo/HostCodecs",
+            "countedOperations",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(answer, Value::Ref(Some("8".into())));
+    let names: std::collections::BTreeSet<_> = host
+        .unknown_host_calls()
+        .into_iter()
+        .map(|(call, _)| {
+            call.split('#')
+                .nth(1)
+                .unwrap()
+                .split('(')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    for name in [
+        "listOf",
+        "dispatch",
+        "orElse",
+        "validate",
+        "codec",
+        "encodeStart",
+        "decode",
+        "parse",
+    ] {
+        assert!(
+            names.contains(name),
+            "missing counted DFU operation {name}: {names:?}"
+        );
+    }
 }
 
 /// A String is no codec: a payload registered with one names no codec, and the attachment

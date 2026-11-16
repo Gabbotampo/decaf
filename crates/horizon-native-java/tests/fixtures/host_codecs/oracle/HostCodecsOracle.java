@@ -5,7 +5,7 @@ import java.lang.reflect.Method;
 public final class HostCodecsOracle {
   public static void main(String[] args) throws Exception {
     for (String probe : new String[] {"spelled", "spelledTypes", "pairs", "pairMaps", "eithers", "nested", "identityHeld", "codecSingletons", "dfuConstruction", "opaqueCodec", "codecConstants",
-        "codecDuplicate", "codecText", "pairVsJdk"}) {
+        "codecDuplicate", "codecText", "countedOperations", "dfuText", "callbackXmapUse", "forgedDfuReceiver", "forgedDfuReceivers", "pairVsJdk"}) {
       Method m = HostCodecs.class.getMethod(probe);
       Object answer;
       try {

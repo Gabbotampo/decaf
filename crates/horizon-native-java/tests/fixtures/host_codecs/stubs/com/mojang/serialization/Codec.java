@@ -19,6 +19,7 @@ public interface Codec<A> {
     com.mojang.serialization.MapCodec<A> fieldOf(String name);
     com.mojang.serialization.MapCodec<java.util.Optional<A>> optionalFieldOf(String name);
     com.mojang.serialization.MapCodec<A> optionalFieldOf(String name, A defaultValue);
+    com.mojang.serialization.MapCodec<A> optionalFieldOf(String name, A defaultValue, Lifecycle lifecycle);
     <B> Codec<B> listOf();
     <B> Codec<B> dispatch(java.util.function.Function<A, ? extends Codec<B>> type,
                           java.util.function.Function<B, ? extends A> key);

@@ -3,11 +3,11 @@
 //! This family records construction structure and callback roots exactly. Codec
 //! execution (encode/decode/parse) and the broad factory surface remain counted.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, Nested};
-use crate::runtime::{MethodRef, NativeError, Value};
+use crate::runtime::{Host, MethodRef, NativeError, Value};
 
 const CODEC: &str = "com/mojang/serialization/Codec";
 const MAP_CODEC: &str = "com/mojang/serialization/MapCodec";
@@ -101,7 +101,7 @@ fn map_receiver(value: &Value) -> bool {
 struct GraphStats {
     nodes: usize,
     depth: usize,
-    callback_roots: HashSet<String>,
+    callback_roots: BTreeSet<String>,
     seen: HashSet<String>,
 }
 
@@ -128,20 +128,26 @@ fn walk(value: &Value, depth: usize, stats: &mut GraphStats) {
     }
 }
 
-fn node(tag: &str, values: Vec<Value>) -> Result<Value, &'static str> {
+fn node(host: &mut dyn Host, tag: &str, values: Vec<Value>) -> Result<Value, String> {
     let mut stats = GraphStats::default();
     for value in &values {
         walk(value, 1, &mut stats);
     }
     if stats.nodes.saturating_add(1) > MAX_GRAPH_NODES {
-        return Err("DFU codec graph budget exceeded (256 nodes)");
+        return Err(
+            "DFU codec graph budget exceeded: current graph exceeds maximum 256 nodes".into(),
+        );
     }
     if stats.depth > MAX_NODE_DEPTH {
-        return Err("DFU codec nesting depth exceeded (64)");
+        return Err("DFU codec nesting depth exceeded: current depth exceeds maximum 64".into());
     }
     if stats.callback_roots.len() > MAX_CALLBACK_ROOTS {
-        return Err("DFU codec callback-root budget exceeded (64)");
+        return Err(
+            "DFU codec callback-root budget exceeded: current graph exceeds maximum 64 roots"
+                .into(),
+        );
     }
+    host.reserve_dfu_codec(1, &stats.callback_roots)?;
     let mut held = Vec::with_capacity(values.len() + 2);
     held.push(Value::Ref(Some(tag.to_owned())));
     held.push(Value::Long(NEXT_NODE.fetch_add(1, Ordering::Relaxed) as i64));
@@ -221,10 +227,10 @@ fn text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String>, Nat
                 format!("OptionalFieldCodec[{name}: {inner}]")
             };
             if kind == OPTIONAL {
-                if !matches!(values.get(5), Some(Value::Void) | None) {
-                    text.push_str("[xmapped]");
-                } else if !matches!(values.get(6), Some(Value::Void) | None) {
+                if !matches!(values.get(6), Some(Value::Void) | None) {
                     text.push_str("[flatXmapped]");
+                } else if !matches!(values.get(5), Some(Value::Void) | None) {
+                    text.push_str("[xmapped]");
                 }
             }
             Ok(Some(text))
@@ -312,13 +318,33 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         .then(|| constant(&r.descriptor[1..r.descriptor.len() - 1], &r.owner, &r.name))
 }
 
-fn field_name(args: &[Value]) -> Result<String, &'static str> {
+fn field_name(args: &[Value]) -> Result<String, String> {
     let Some(Value::Ref(Some(name))) = args.first() else {
-        return Err("DFU codec field name is not a String");
+        return Err("DFU codec field name is not a String".into());
     };
-    (name.len() <= MAX_FIELD_NAME_BYTES)
-        .then(|| name.clone())
-        .ok_or("DFU codec field-name budget exceeded (256 bytes)")
+    if name.len() > MAX_FIELD_NAME_BYTES {
+        return Err(format!(
+            "DFU codec field-name budget exceeded: current {}, maximum {}",
+            name.len(),
+            MAX_FIELD_NAME_BYTES
+        ));
+    }
+    Ok(name.clone())
+}
+
+fn refuse(host: &mut dyn Host, r: &MethodRef, reason: String) -> Option<Value> {
+    host.dfu_codec_refused(format!(
+        "{}#{}{}: {}",
+        r.owner, r.name, r.descriptor, reason
+    ));
+    None
+}
+
+fn build(host: &mut dyn Host, r: &MethodRef, tag: &str, values: Vec<Value>) -> Option<Value> {
+    match node(host, tag, values) {
+        Ok(value) => Some(value),
+        Err(reason) => refuse(host, r, reason),
+    }
 }
 
 fn optional_parts(descriptor: &str, args: &[Value]) -> Option<(Value, Value)> {
@@ -333,7 +359,12 @@ fn optional_parts(descriptor: &str, args: &[Value]) -> Option<(Value, Value)> {
     }
 }
 
-pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) -> Option<Value> {
+pub(crate) fn invoke(
+    host: &mut dyn Host,
+    r: &MethodRef,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Option<Value> {
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (
             CODEC | PRIMITIVE,
@@ -341,8 +372,13 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
             "(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;",
         ) => {
             let inner = receiver.filter(|value| codec_receiver(value))?.clone();
-            let name = field_name(args).ok()?;
-            node(
+            let name = match field_name(args) {
+                Ok(name) => name,
+                Err(reason) => return refuse(host, r, reason),
+            };
+            build(
+                host,
+                r,
                 FIELD,
                 vec![
                     inner,
@@ -352,16 +388,20 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
                     Value::Void,
                 ],
             )
-            .ok()
         }
         (CODEC | PRIMITIVE, "optionalFieldOf", descriptor)
             if descriptor.starts_with("(Ljava/lang/String;")
                 && descriptor.ends_with(")Lcom/mojang/serialization/MapCodec;") =>
         {
             let inner = receiver.filter(|value| codec_receiver(value))?.clone();
-            let name = field_name(args).ok()?;
+            let name = match field_name(args) {
+                Ok(name) => name,
+                Err(reason) => return refuse(host, r, reason),
+            };
             let (default, lifecycle) = optional_parts(descriptor, args)?;
-            node(
+            build(
+                host,
+                r,
                 OPTIONAL,
                 vec![
                     inner,
@@ -371,7 +411,6 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
                     lifecycle,
                 ],
             )
-            .ok()
         }
         (
             MAP_CODEC,
@@ -380,7 +419,7 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
         ) => {
             let inner = receiver.filter(|value| map_receiver(value))?.clone();
             let getter = args.first().filter(|value| is_callback(value))?.clone();
-            node(GETTER, vec![inner, getter]).ok()
+            build(host, r, GETTER, vec![inner, getter])
         }
         (
             CODEC | PRIMITIVE | MAP_CODEC,
@@ -402,11 +441,12 @@ pub(crate) fn invoke(r: &MethodRef, receiver: Option<&Value>, args: &[Value]) ->
             }
             let to = args.first().filter(|value| is_callback(value))?.clone();
             let from = args.get(1).filter(|value| is_callback(value))?.clone();
-            node(
+            build(
+                host,
+                r,
                 if is_map { MAP_XMAP } else { XMAP },
                 vec![inner.clone(), to, from],
             )
-            .ok()
         }
         _ => None,
     }
@@ -434,12 +474,14 @@ mod tests {
             "demo/P#f(Ljava/lang/Object;)Ljava/lang/Object;",
             "",
         );
+        let mut host = crate::runtime::StdHost::new();
         let inner = constant(
             "com/mojang/serialization/codecs/PrimitiveCodec",
             CODEC,
             "INT",
         );
         let field = invoke(
+            &mut host,
             &method(
                 CODEC,
                 "fieldOf",
@@ -453,6 +495,7 @@ mod tests {
         let forged_text = held_values(&field).unwrap();
         assert!(matches!(forged_text.first(), Some(Value::Ref(Some(tag))) if tag == FIELD));
         let getter = invoke(
+            &mut host,
             &method(
                 MAP_CODEC,
                 "forGetter",
@@ -467,6 +510,7 @@ mod tests {
         let stream = Value::Host(HostRef::new(HostKind::StreamCodec, "stream"));
         assert!(
             invoke(
+                &mut host,
                 &method(
                     CODEC,
                     "xmap",
@@ -480,6 +524,7 @@ mod tests {
         let forged = Value::Ref(Some("dfu-field,1".into()));
         assert!(
             invoke(
+                &mut host,
                 &method(
                     MAP_CODEC,
                     "forGetter",
@@ -506,7 +551,9 @@ mod tests {
             CODEC,
             "INT",
         );
+        let mut host = crate::runtime::StdHost::new();
         let mapped = invoke(
+            &mut host,
             &method(
                 CODEC,
                 "xmap",
@@ -526,5 +573,92 @@ mod tests {
             crate::runtime::heap::collect(&mut heap, &mut host, &[]);
         }
         assert!(held_values(&mapped).unwrap().iter().any(is_callback));
+    }
+    #[test]
+    fn per_jar_budgets_refuse_with_current_and_maximum() {
+        let field_method = method(
+            CODEC,
+            "fieldOf",
+            "(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;",
+        );
+        let inner = constant(
+            "com/mojang/serialization/codecs/PrimitiveCodec",
+            CODEC,
+            "INT",
+        );
+        let mut host = crate::runtime::StdHost::new();
+        for index in 0..256 {
+            let name = Value::Ref(Some(format!("field-{index}")));
+            assert!(invoke(&mut host, &field_method, Some(&inner), &[name]).is_some());
+        }
+        assert!(
+            invoke(
+                &mut host,
+                &field_method,
+                Some(&inner),
+                &[Value::Ref(Some("overflow".into()))]
+            )
+            .is_none()
+        );
+        assert!(host.dfu_codec_refusals().iter().any(|text| {
+            text.contains("node budget exceeded")
+                && text.contains("current 256")
+                && text.contains("maximum 256")
+        }));
+
+        let mut callback_host = crate::runtime::StdHost::new();
+        let xmap_method = method(
+            CODEC,
+            "xmap",
+            "(Ljava/util/function/Function;Ljava/util/function/Function;)Lcom/mojang/serialization/Codec;",
+        );
+        for index in 0..64 {
+            let callback = callback_marker::lambda_from_text(
+                "demo/Budget",
+                index as u16,
+                "java/util/function/Function",
+                "demo/Budget#map(Ljava/lang/Object;)Ljava/lang/Object;",
+                "",
+            );
+            assert!(
+                invoke(
+                    &mut callback_host,
+                    &xmap_method,
+                    Some(&inner),
+                    &[callback.clone(), callback],
+                )
+                .is_some()
+            );
+        }
+        let callback = callback_marker::lambda_from_text(
+            "demo/Budget",
+            64,
+            "java/util/function/Function",
+            "demo/Budget#map(Ljava/lang/Object;)Ljava/lang/Object;",
+            "",
+        );
+        assert!(
+            invoke(
+                &mut callback_host,
+                &xmap_method,
+                Some(&inner),
+                &[callback.clone(), callback],
+            )
+            .is_none()
+        );
+        assert!(callback_host.dfu_codec_refusals().iter().any(|text| {
+            text.contains("callback-root budget exceeded")
+                && text.contains("current 64")
+                && text.contains("maximum 64")
+        }));
+
+        let mut name_host = crate::runtime::StdHost::new();
+        let long_name = Value::Ref(Some("x".repeat(MAX_FIELD_NAME_BYTES + 1)));
+        assert!(invoke(&mut name_host, &field_method, Some(&inner), &[long_name]).is_none());
+        assert!(name_host.dfu_codec_refusals().iter().any(|text| {
+            text.contains("field-name budget exceeded")
+                && text.contains("current 257")
+                && text.contains("maximum 256")
+        }));
     }
 }
