@@ -1,0 +1,2 @@
+Captured with Java 25.0.5+8: javac --release 21 OracleStable.java; java -cp <fabric-creative-tab-api-v1-5.0.22+fcdff87f5d.jar>:<fabric-api-base-2.0.6+fcdff87f5d.jar>:<server-game.jar>:<all 26.3 server libraries> OracleStable > java25.txt
+Fabric API module SHA-256: e8acacc7836f39237c83c2a664b039647ee36f93822797acc40cda44666002ea
