@@ -463,12 +463,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tag(&getter).as_deref(), Some(GETTER));
-        assert!(
-            held_values(&getter)
-                .unwrap()
-                .iter()
-                .any(|value| is_callback(value))
-        );
+        assert!(held_values(&getter).unwrap().iter().any(is_callback));
         let stream = Value::Host(HostRef::new(HostKind::StreamCodec, "stream"));
         assert!(
             invoke(
@@ -530,11 +525,6 @@ mod tests {
         for _ in 0..3 {
             crate::heap::collect(&mut heap, &mut host, &[]);
         }
-        assert!(
-            held_values(&mapped)
-                .unwrap()
-                .iter()
-                .any(|value| is_callback(value))
-        );
+        assert!(held_values(&mapped).unwrap().iter().any(is_callback));
     }
 }
