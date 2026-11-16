@@ -831,7 +831,13 @@ fn mark_kotlin_lazy_states(
 /// collection elements and iterator snapshot.
 pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String]) {
     let collectable = Collectable::new(heap, host);
+    let mut render_roots = Vec::new();
+    host.root_texts(&mut render_roots);
+    render_roots.extend(extra.iter().map(String::as_str));
+    let render_live = crate::render_math::reachable_keys(&host.render_objects, render_roots);
     if collectable.markers.is_empty() {
+        host.render_objects
+            .retain(|key, _| render_live.contains(key));
         return;
     }
     let mut pending = Vec::new();
@@ -1038,6 +1044,8 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
     host.prune_keyed_tables(keep);
+    host.render_objects
+        .retain(|key, _| render_live.contains(key));
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
 }
@@ -1473,6 +1481,61 @@ mod tests {
     /// classified: #233's `cached_collections` slipped past the audit, so
     /// `System.getProperties()` lost its contents and every map's views
     /// stayed cached (#226 re-check 4).
+
+    #[test]
+    fn render_objects_follow_the_collector() {
+        let (mut host, mut heap) = graph("demo/Render#1");
+        let stack = crate::render_math::new_value("", "com/mojang/blaze3d/vertex/PoseStack#10");
+        crate::render_math::construct(
+            &mut host.render_objects,
+            &stack,
+            "com/mojang/blaze3d/vertex/PoseStack",
+            &[],
+        );
+        let last = crate::render_math::call(
+            &mut host.render_objects,
+            &crate::MethodRef {
+                owner: "com/mojang/blaze3d/vertex/PoseStack".into(),
+                name: "last".into(),
+                descriptor: "()Lcom/mojang/blaze3d/vertex/PoseStack$Pose;".into(),
+            },
+            &stack,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let matrix = crate::render_math::call(
+            &mut host.render_objects,
+            &crate::MethodRef {
+                owner: "com/mojang/blaze3d/vertex/PoseStack$Pose".into(),
+                name: "pose".into(),
+                descriptor: "()Lorg/joml/Matrix4f;".into(),
+            },
+            &last,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        host.persistent_static_fields.insert(
+            "demo/Render#STACKLcom/mojang/blaze3d/vertex/PoseStack;".into(),
+            stack.clone(),
+        );
+        host.retain(&matrix);
+        collect(&mut heap, &mut host, &[]);
+        assert!(
+            host.render_objects
+                .contains_key("com/mojang/blaze3d/vertex/PoseStack#10")
+        );
+        assert!(
+            host.render_objects
+                .contains_key("com/mojang/blaze3d/vertex/PoseStack#10/pose/0/matrix4")
+        );
+        host.persistent_static_fields.clear();
+        host.release(&matrix);
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.render_objects.is_empty());
+    }
+
     #[test]
     fn every_host_field_is_classified_for_the_collector() {
         const COLLECTOR_READS: &[&str] = &[
@@ -1548,6 +1611,7 @@ mod tests {
             "threads",
             "game_event",
             "client",
+            "render_objects",
             "brigadier",
             "imc",
         ];

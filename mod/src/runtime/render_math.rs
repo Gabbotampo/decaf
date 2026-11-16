@@ -1,7 +1,7 @@
 //! Exact bounded model of pure PoseStack/JOML render math.
 #![allow(dead_code, private_interfaces)]
 use crate::runtime::{HostKind, HostRef, MethodRef, NativeError, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Copy, Debug)]
 struct M4([f32; 16]);
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +54,27 @@ fn key(v: &Value) -> Option<&str> {
         Value::Host(h) if h.kind() == HostKind::RenderObject => Some(h.key()),
         _ => None,
     }
+}
+pub(crate) fn reachable_keys<'a>(
+    map: &BTreeMap<String, Obj>,
+    roots: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut live: BTreeSet<String> = roots
+        .into_iter()
+        .filter(|root| map.contains_key(*root))
+        .map(str::to_owned)
+        .collect();
+    let mut pending: Vec<String> = live.iter().cloned().collect();
+    while let Some(key) = pending.pop() {
+        if let Some(Obj::Stack(slots)) = map.get(&key) {
+            for slot in slots {
+                if live.insert(slot.clone()) {
+                    pending.push(slot.clone());
+                }
+            }
+        }
+    }
+    live
 }
 fn f(v: &Value) -> Option<f32> {
     match v {
