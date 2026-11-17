@@ -3,7 +3,7 @@ use crate::{MethodRef, NativeError, Value};
 pub(crate) const URL_METHODS: Methods = Methods {
     to_string: |h, _| Ok(Some(h.key().to_owned())),
     hash_code: |_, _| Ok(None),
-    equals: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
     instance_of: instance_of_class,
     crosses_jars: |_, _| true,
     compare_to: None,
@@ -16,7 +16,7 @@ pub enum UrlError {
     Unsupported,
 }
 fn scheme(uri: &str) -> Option<&str> {
-    let (s, rest) = uri.split_once(':')?;
+    let (s, _rest) = uri.split_once(':')?;
     if s.is_empty()
         || !s.bytes().enumerate().all(|(i, b)| {
             b.is_ascii_alphabetic()
