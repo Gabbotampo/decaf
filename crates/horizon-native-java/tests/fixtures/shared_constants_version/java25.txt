@@ -6,7 +6,3 @@ data|5023|main
 pack-server|121.0
 pack-client|97.1
 same|true
-data-same|true
-pack-same|true
-values-server|121
-values-client|97
