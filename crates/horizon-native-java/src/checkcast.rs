@@ -222,15 +222,16 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.count_cast(value, target);
         }
-        // Gson tree values are modeled references with a closed class hierarchy.
-        // Apply the same exact rows as `instanceof`, including LinkedTreeMap.
-        if crate::gson_tree::is_tree(value)
-            || crate::jar_object::object_class(value) == Some(crate::gson_tree::TREE_MAP)
+        // A Gson tree value, or a `LinkedTreeMap` in either form the model makes (a tree
+        // object, or the map a `fromJson` read hands back): the class's whole hierarchy is
+        // `gson_tree`'s table, so the cast is exact either way. It is decided from the
+        // class, never from the value's form: `(Map) gson.fromJson(json, Map.class)` holds.
+        if let Some(class) = crate::jar_object::object_class(value)
+            && (crate::gson_tree::is_tree(value) || class == crate::gson_tree::TREE_MAP)
         {
-            if crate::gson_tree::instance_of(value, target) {
+            if crate::gson_tree::class_instance_of(class, target) {
                 return Ok(());
             }
-            let class = crate::jar_object::object_class(value).unwrap_or_default();
             return Err(class_cast_exception(class, target));
         }
         // A host handle is its kind's class, and only a handle is one of a
