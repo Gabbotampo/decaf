@@ -610,8 +610,11 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
+    /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
+    /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
     RegexMatcher,
-    Url,
+    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    ItemStackTemplate,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2639,17 +2642,18 @@ const KINDS: &[KindInfo] = &[
     },
     KindInfo {
         kind: HostKind::RegexMatcher,
-        tag: "rpat",
-        class: ClassRule::Fixed("java/util/regex/Pattern"),
+        tag: "rxm",
+        class: ClassRule::Fixed("java/util/regex/Matcher"),
+        // A serial per `matcher` call.
         canonical: always_canonical,
-        methods: &crate::runtime::host_jdk_constant::PATTERN_METHODS,
+        methods: &crate::runtime::host_jdk_constant::MATCHER_METHODS,
     },
     KindInfo {
-        kind: HostKind::Url,
-        tag: "url",
-        class: ClassRule::Fixed("java/net/URL"),
-        canonical: never_canonical,
-        methods: &crate::runtime::host_jdk_value::URI_METHODS,
+        kind: HostKind::ItemStackTemplate,
+        tag: "ist",
+        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_item_stack_template::METHODS,
     },
 ];
 
