@@ -24345,6 +24345,55 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toString", descriptor) if descriptor.ends_with(")Ljava/lang/String;") => {
+                let Some(array) = args.first() else {
+                    return Ok(None);
+                };
+                if *array == Value::Ref(None) {
+                    return Ok(Some(Value::Ref(Some("null".into()))));
+                }
+                let Some(class) = host_array::exact_class(array) else {
+                    return Ok(None);
+                };
+                let values = self
+                    .arrays
+                    .get(host_array::array_key(array).unwrap())
+                    .map(|a| a.values().into_owned())
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?;
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    let part = match value {
+                        Value::Ref(None) => "null".to_owned(),
+                        Value::Ref(Some(text))
+                            if !class.starts_with("[L")
+                                || !value_class::string_instance_of(&text, "java/lang/String") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Ref(Some(text)) => text,
+                        Value::Int(value) if class.ends_with('Z') => (value != 0).to_string(),
+                        Value::Int(value) if class.ends_with('C') => {
+                            let Some(character) = char::from_u32(value as u32) else {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            };
+                            if (0xD800..=0xDFFF).contains(&(value as u32)) {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                            character.to_string()
+                        }
+                        Value::Int(value) => value.to_string(),
+                        Value::Long(value) => value.to_string(),
+                        Value::Float(value) if class.ends_with('F') => format_java_float32(value),
+                        Value::Float(value) => format_java_float(value),
+                        _ => return self.host.unknown_operand_call(r).map(Some),
+                    };
+                    parts.push(part);
+                }
+                let text = parts.join(", ");
+                Ok(Some(Value::Ref(Some(format!("[{text}]")))))
+            }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
                 let (start, end) = if r.name == "copyOf" {
@@ -24411,15 +24460,56 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(self.new_array_value(&class, values)))
             }
-            ("fill", descriptor) if descriptor.starts_with('[') => {
-                let Some(key) = args.first().and_then(host_array::array_key) else {
+            ("fill", descriptor) if descriptor.starts_with("([") => {
+                let Some(array) = args.first() else {
                     return Ok(None);
                 };
-                let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
-                if let Some(data) = self.arrays.get_mut(key)
-                    && !data.fill(value)
-                {
+                let Some(key) = host_array::array_key(array) else {
                     return Ok(None);
+                };
+                let len = self.arrays.get(key).map_or(0, array_data::ArrayData::len);
+                let range = descriptor.ends_with("III)V") || descriptor.contains(";II)V");
+                let (from, to, value_index) = if !range {
+                    (0, len, 1)
+                } else {
+                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
+                    if from > to {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!("fromIndex({from}) > toIndex({to})")),
+                            frame: None,
+                        });
+                    }
+                    if from < 0 || to > len as i32 {
+                        let bad = if from < 0 { from } else { to };
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/ArrayIndexOutOfBoundsException".into(),
+                            message: Some(format!("Array index out of range: {bad}")),
+                            frame: None,
+                        });
+                    }
+                    (from as usize, to as usize, 3)
+                };
+                let value = StdHost::argument(r, args, value_index)?.clone();
+                if let Some(class) = host_array::exact_class(array)
+                    && let Some(component) = host_array::component_of(class)
+                    && primitive_descriptor(component).is_none()
+                {
+                    self.check_array_store(array, &value)?;
+                }
+                if let Some(data) = self.arrays.get_mut(key) {
+                    if from == 0 && to == len {
+                        if !data.fill(value) {
+                            return Ok(None);
+                        }
+                    } else {
+                        for index in from..to {
+                            if !data.store(index, value.clone()) {
+                                return Ok(None);
+                            }
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }

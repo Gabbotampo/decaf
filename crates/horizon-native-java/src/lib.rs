@@ -24359,23 +24359,36 @@ impl<H: Host> Runtime<'_, H> {
                     .ok_or_else(|| {
                         NativeError::Metadata("array is not owned by this invocation".into())
                     })?;
-                let text = values
-                    .iter()
-                    .map(|value| match value {
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    let part = match value {
                         Value::Ref(None) => "null".to_owned(),
-                        Value::Ref(Some(text)) => text.clone(),
-                        Value::Int(value) if class.ends_with('Z') => (*value != 0).to_string(),
-                        Value::Int(value) if class.ends_with('C') => char::from_u32(*value as u32)
-                            .unwrap_or('\u{fffd}')
-                            .to_string(),
+                        Value::Ref(Some(text))
+                            if !class.starts_with("[L")
+                                || !value_class::string_instance_of(&text, "java/lang/String") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Ref(Some(text)) => text,
+                        Value::Int(value) if class.ends_with('Z') => (value != 0).to_string(),
+                        Value::Int(value) if class.ends_with('C') => {
+                            let Some(character) = char::from_u32(value as u32) else {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            };
+                            if (0xD800..=0xDFFF).contains(&(value as u32)) {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                            character.to_string()
+                        }
                         Value::Int(value) => value.to_string(),
                         Value::Long(value) => value.to_string(),
-                        Value::Float(value) if class.ends_with('F') => format_java_float32(*value),
-                        Value::Float(value) => format_java_float(*value),
-                        other => format!("{other:?}"),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                        Value::Float(value) if class.ends_with('F') => format_java_float32(value),
+                        Value::Float(value) => format_java_float(value),
+                        _ => return self.host.unknown_operand_call(r).map(Some),
+                    };
+                    parts.push(part);
+                }
+                let text = parts.join(", ");
                 Ok(Some(Value::Ref(Some(format!("[{text}]")))))
             }
             ("copyOf", _) | ("copyOfRange", _) => {
