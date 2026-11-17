@@ -199,6 +199,20 @@ public final class Probe {
         return new GsonBuilder().setPrettyPrinting().create().toJson(sample());
     }
 
+    public static String separatorRows() {
+        Map<String, Object> object = new LinkedHashMap<>();
+        object.put("a", 1);
+        object.put("b", List.of(1, 2));
+        Gson compact = new GsonBuilder().setFormattingStyle(
+            FormattingStyle.COMPACT.withSpaceAfterSeparators(true)).create();
+        Gson noNewline = new GsonBuilder().setFormattingStyle(
+            FormattingStyle.PRETTY.withNewline("")).create();
+        return compact.toJson(object) + "|" + compact.toJson(List.of(1, 2)) + "|"
+            + compact.toJson(new LinkedHashMap<>()) + "|" + compact.toJson(List.of()) + "|"
+            + noNewline.toJson(object) + "|" + noNewline.toJson(List.of(1, 2)) + "|"
+            + noNewline.toJson(new LinkedHashMap<>()) + "|" + noNewline.toJson(List.of());
+    }
+
     public static String html() {
         return new GsonBuilder().create().toJson("a<b&c>d=e'f\"g");
     }
@@ -508,6 +522,13 @@ fn compact_and_pretty_documents_are_gson_text() {
         fixture.text("pretty"),
         "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"empty\": {},\n  \"none\": []\n}"
     );
+}
+
+#[test]
+fn separator_rows_match_gson_214() {
+    let fixture = Fixture::build("separator-rows");
+    assert_eq!(fixture.text("separatorRows"),
+        r#"{"a": 1, "b": [1, 2]}|[1, 2]|{}|[]|{  "a": 1,   "b": [    1,     2  ]}|[    1,     2  ]|{}|[]"#);
 }
 
 #[test]
