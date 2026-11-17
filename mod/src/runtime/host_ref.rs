@@ -613,6 +613,7 @@ pub enum HostKind {
     /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
     /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
     RegexMatcher,
+    FabricBlockApiLookup,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2645,6 +2646,13 @@ const KINDS: &[KindInfo] = &[
         // A serial per `matcher` call.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::MATCHER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricBlockApiLookup,
+        tag: "fbal",
+        class: ClassRule::Fixed("net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
 ];
 

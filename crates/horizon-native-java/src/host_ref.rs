@@ -2646,14 +2646,14 @@ const KINDS: &[KindInfo] = &[
         // A serial per `matcher` call.
         canonical: always_canonical,
         methods: &crate::host_jdk_constant::MATCHER_METHODS,
-    },    KindInfo {
+    },
+    KindInfo {
         kind: HostKind::FabricBlockApiLookup,
         tag: "fbal",
         class: ClassRule::Fixed("net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup"),
         canonical: always_canonical,
         methods: &crate::host_events::DECLARED_TYPE_METHODS,
     },
-
 ];
 
 impl HostKind {
