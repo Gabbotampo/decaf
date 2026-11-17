@@ -84,8 +84,8 @@ fn values_of(value: &Value, kind: HostKind) -> Option<Vec<Value>> {
 
 /// The one text a one-value handle of `kind` holds.
 fn held_text(value: &Value, kind: HostKind) -> Option<String> {
-    match values_of(value, kind)?.as_slice() {
-        [Value::Ref(Some(held))] => Some(held.clone()),
+    match values_of(value, kind)?.first() {
+        Some(Value::Ref(Some(held))) => Some(held.clone()),
         _ => None,
     }
 }
