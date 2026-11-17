@@ -2376,7 +2376,9 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
-    fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) {}
+    fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
+        false
+    }
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -4713,7 +4715,8 @@ impl StdHost {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
+            ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
+            ("load", "(Ljava/io/InputStream;)V") => {
                 let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
                     self.resource_streams.get_mut(stream).map(|(bytes, index)| {
                         let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
@@ -5665,8 +5668,9 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
-    fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) {
+    fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
         self.properties_put_all(marker, entries);
+        true
     }
     fn register_render_handle(&mut self, key: &str) {
         self.register_render_handle(key);
@@ -28053,6 +28057,39 @@ impl<H: Host> Runtime<'_, H> {
     /// string. Objects of a jar's own class are not instantiated (that needs
     /// field injection the native path does not model), so their JSON shape is
     /// returned as a modelled map, never as a masked empty value.
+    fn invoke_properties_reader(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/util/Properties"
+            || r.name != "load"
+            || r.descriptor != "(Ljava/io/Reader;)V"
+        {
+            return Ok(None);
+        }
+        let (Some(marker), Some(reader)) = (
+            receiver.and_then(expect_ref),
+            args.first().and_then(jar_object::object_key),
+        ) else {
+            return Ok(None);
+        };
+        let Some(text) = self.string_readers.remove(reader) else {
+            return Ok(None);
+        };
+        self.string_readers.insert(reader.to_owned(), String::new());
+        let entries = properties_entries(&text).map_err(|m| NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some(m),
+            frame: None,
+        })?;
+        if !self.host.properties_put_all(marker, entries) {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(Some(Value::Void))
+    }
+
     fn invoke_gson(
         &mut self,
         r: &MethodRef,
@@ -30653,6 +30690,11 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_properties_reader(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
