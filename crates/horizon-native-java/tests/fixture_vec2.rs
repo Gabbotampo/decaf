@@ -18,11 +18,9 @@ fn vec2_rows_match_java25() {
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
     let text = fixture.text_on(&mut host, "rows");
+    assert_eq!(text, ORACLE);
     assert_eq!(
-        (text, host.unknown_host_calls()),
-        (
-            ORACLE.to_owned(),
-            vec![("net/minecraft/world/phys/Vec2#<init>(FF)V".to_owned(), 1)]
-        )
+        host.unknown_host_calls(),
+        vec![("net/minecraft/world/phys/Vec2#<init>(FF)V".to_owned(), 1)]
     );
 }
