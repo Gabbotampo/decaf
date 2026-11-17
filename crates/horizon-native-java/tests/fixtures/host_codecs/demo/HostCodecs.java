@@ -388,4 +388,18 @@ public final class HostCodecs {
     System.gc();
     return kept.toString();
   }
+  public static String reviewTextForms() {
+    Codec<Integer> flat = Codec.INT.flatXmap(x -> com.mojang.serialization.DataResult.success(x + 1), x -> com.mojang.serialization.DataResult.success(x - 1));
+    Codec<Integer> comap = Codec.INT.comapFlatMap(x -> com.mojang.serialization.DataResult.success(x + 1), x -> x - 1);
+    MapCodec<String> unit = MapCodec.unit("u");
+    Codec<java.util.Optional<Integer>> optional = Codec.INT.optionalFieldOf("x").codec().flatXmap(x -> com.mojang.serialization.DataResult.success(x), x -> com.mojang.serialization.DataResult.success(x));
+    Codec<One> created = RecordCodecBuilder.create(x -> (App) null);
+    MapCodec<One> mapped = RecordCodecBuilder.mapCodec(x -> (App) null);
+    return flat + "|" + comap + "|" + unit + "|" + optional + "|" + created + "|" + mapped + "|" + mapped.codec();
+  }
+  static int createCalls;
+  public static String createCounter() { createCalls = 0; RecordCodecBuilder.create(x -> { createCalls++; return (App) null; }); return Integer.toString(createCalls); }
+  public static String createThrows() { try { RecordCodecBuilder.create(x -> { throw new IllegalArgumentException("boom"); }); return "none"; } catch (Throwable t) { return t.getClass().getName() + ":" + t.getMessage(); } }
+  public static String encodeUnknown() { try { Codec.INT.encodeStart(null, 1); } catch (Throwable ignored) {} return "called"; }
+
 }

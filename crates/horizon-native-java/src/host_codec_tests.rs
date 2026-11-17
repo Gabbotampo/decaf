@@ -194,6 +194,10 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
             CountedAs(oracle_row("countedOperations")),
         ),
         ("dfuText", Exact(oracle_row("dfuText"))),
+        ("reviewTextForms", CountedAs(oracle_row("reviewTextForms"))),
+        ("createCounter", Exact(oracle_row("createCounter"))),
+        ("createThrows", Exact(oracle_row("createThrows"))),
+        ("encodeUnknown", CountedAs(oracle_row("encodeUnknown"))),
         (
             "forgedDfuReceiver",
             CountedAs(oracle_row("forgedDfuReceiver")),
