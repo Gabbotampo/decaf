@@ -7,5 +7,5 @@ Java 25 capture of the real 26.3 server jar. The same `demo/Probe.java` source i
 . ~/ava/env.sh
 mkdir -p /tmp/shared-constants-version-capture
 javac -cp ~/ava/minecraft-26.3-server-game.jar -d /tmp/shared-constants-version-capture oracle/Capture.java
-java -cp /tmp/shared-constants-version-capture:~/ava/minecraft-26.3-server-game.jar Capture
+java -cp /tmp/shared-constants-version-capture:/Users/sparks/ava/minecraft-26.3-server-game.jar Capture
 ```
