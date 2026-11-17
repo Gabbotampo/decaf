@@ -330,8 +330,11 @@ pub(crate) const CONFIG_TYPE_METHODS: Methods = Methods {
 /// a different record.
 pub(crate) const WORLD_VERSION_METHODS: Methods = Methods {
     equals: |handle, other, _| {
+        let left = world_version_name(&Value::Host(handle.clone()));
         Ok(Some(match other {
-            Value::Host(other) => other.kind() == HostKind::WorldVersion && other == handle,
+            Value::Host(other) if other.kind() == HostKind::WorldVersion => {
+                left.is_some() && left == world_version_name(&Value::Host(other.clone()))
+            }
             _ => false,
         }))
     },
