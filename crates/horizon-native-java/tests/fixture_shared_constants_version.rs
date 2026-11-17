@@ -22,7 +22,7 @@ fn rows_match_java25() {
             .with_game_version("26.3"),
     );
     assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
-    assert!(h.unknown_host_calls().is_empty());
+    assert_eq!(h.unknown_host_calls(), vec![]);
 }
 #[test]
 fn unmodelled_world_version_method_is_counted() {
