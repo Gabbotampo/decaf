@@ -267,6 +267,10 @@ impl StdHost {
             // host answers the version it was seeded with, and nothing when
             // the caller did not supply one.
             (
+                "net/minecraft/SharedConstants",
+                "getCurrentVersion",
+                "()Lnet/minecraft/WorldVersion;",
+            ) | (
                 "net/minecraft/DetectedVersion",
                 "tryDetectVersion",
                 "()Lnet/minecraft/WorldVersion;",
