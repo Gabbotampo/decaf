@@ -702,6 +702,10 @@ impl StdHost {
         }
         let marker = |pointer: String| loader::pointed(Pointed::CustomValue, id, &pointer);
         if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
+            if let serde_json::Value::Array(items) = value {
+                let values = items.iter().enumerate().map(|(i, v)| loader::custom_value(id, &child(pointer, &i.to_string()), v)).collect();
+                return match self.new_host_iterator(values, None) { Some(iterator) => Ok(iterator), None => self.unknown_host_call(r) };
+            }
             if let serde_json::Value::Object(entries) = value {
                 let mut pairs = Vec::with_capacity(entries.len() * 2);
                 for (key, child_value) in entries {
