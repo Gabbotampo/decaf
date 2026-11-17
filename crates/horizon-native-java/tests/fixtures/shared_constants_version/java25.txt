@@ -3,3 +3,5 @@ id|26.3
 protocol|777
 stable|true
 same|true
+detected-same|true
+current-detected|true

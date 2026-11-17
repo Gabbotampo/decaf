@@ -266,8 +266,24 @@ impl StdHost {
             // The real game reports the running client's own version; the
             // host answers the version it was seeded with, and nothing when
             // the caller did not supply one.
-            ("net/minecraft/SharedConstants", "getCurrentVersion", "()Lnet/minecraft/WorldVersion;") => Some(self.game_version.as_deref().map_or(Value::Ref(None), loader::world_version)),
-            ("net/minecraft/DetectedVersion", "tryDetectVersion", "()Lnet/minecraft/WorldVersion;") => Some(self.game_version.as_deref().map_or(Value::Ref(None), loader::world_version_fresh)),
+            (
+                "net/minecraft/SharedConstants",
+                "getCurrentVersion",
+                "()Lnet/minecraft/WorldVersion;",
+            ) => Some(
+                self.game_version
+                    .as_deref()
+                    .map_or(Value::Ref(None), loader::world_version),
+            ),
+            (
+                "net/minecraft/DetectedVersion",
+                "tryDetectVersion",
+                "()Lnet/minecraft/WorldVersion;",
+            ) => Some(
+                self.game_version
+                    .as_deref()
+                    .map_or(Value::Ref(None), loader::world_version_fresh),
+            ),
             _ => None,
         }
     }
