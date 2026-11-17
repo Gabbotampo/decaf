@@ -8099,11 +8099,20 @@ impl Host for StdHost {
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
         }
-        if matches!(receiver, Value::Host(handle) if handle.kind() == HostKind::LiveGameObject)
+        if let Value::Host(handle) = receiver
+            && handle.kind() == HostKind::LiveGameObject
             && r.name == "isRemoved"
             && r.descriptor == "()Z"
         {
-            return Ok(Value::Int(0));
+            return if handle.key_text().contains(":removed") {
+                Ok(Value::Int(1))
+            } else if handle.key_text().starts_with("ServerPlayer:")
+                || handle.key_text().starts_with("AbstractContainerMenu:")
+            {
+                Ok(Value::Int(0))
+            } else {
+                self.unknown_host_call(r)
+            };
         }
         if let Some(value) =
             tool_material::instance_call(&mut self.tool_material, r, receiver, args)
