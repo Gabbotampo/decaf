@@ -550,11 +550,22 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let Some(list) = args.first() else {
             return Ok(None);
         };
+        // A list is a host handle (`Value::Host`, keyed `list/…`, `sublist/…`) or an older `Ref`
+        // marker: the view checks below need its key either way. (`expect_ref` alone missed every
+        // handle, so a subList view was reversed as a detached copy, silently.)
+        let key: Option<String> = match list {
+            Value::Host(handle) => Some(handle.key().to_owned()),
+            Value::Ref(Some(marker)) => Some(marker.clone()),
+            _ => None,
+        };
         let immutable = self
             .host_collection_class(list)
             .is_some_and(|class| class.starts_with("java/util/ImmutableCollections$"))
-            || expect_ref(list).is_some_and(|marker| self.host.is_jdk_list_of(marker))
-            || expect_ref(list)
+            || key
+                .as_deref()
+                .is_some_and(|marker| self.host.is_jdk_list_of(marker))
+            || key
+                .as_deref()
                 .is_some_and(|marker| self.host.unmodifiable_view_source(marker).is_some());
         if immutable {
             let size = crate::runtime::runtime_collection_values(self.host, list)?.len();
@@ -571,7 +582,10 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             self.host.unknown_operand_call(r)?;
             return Ok(None);
         };
-        if expect_ref(list).is_some_and(|marker| self.host.sub_list_link(marker).is_some()) {
+        if key
+            .as_deref()
+            .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
+        {
             let set = MethodRef {
                 owner: "java/util/List".into(),
                 name: "set".into(),
