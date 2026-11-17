@@ -1,7 +1,3 @@
-|  For an introduction type: /help intro
-
-jshell> 
-jshell> java.lang.IllegalStateException:boom
+java.lang.IllegalStateException:boom
 
 java.util.IllegalFormatConversionException:d != demo.Probe$Named
-jshell> 
