@@ -26722,21 +26722,23 @@ impl<H: Host> Runtime<'_, H> {
                         );
                         Ok(Some(Value::Void))
                     }
-                    ("hasNextLine", "()Z") => self
-                        .scanners
-                        .get(&marker)
-                        .map(|st| {
-                            Ok(Some(Value::Int(
-                                if !st.closed
-                                    && scanner_model::next_line(&st.text, st.pos).is_some()
-                                {
-                                    1
-                                } else {
-                                    0
-                                },
-                            )))
-                        })
-                        .unwrap_or(Ok(None)),
+                    ("hasNextLine", "()Z") => {
+                        let Some(st) = self.scanners.get(&marker) else {
+                            return Ok(None);
+                        };
+                        // Java's `Scanner.ensureOpen()` runs first: a closed scanner throws
+                        // rather than answering `false`.
+                        if st.closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalStateException".into(),
+                                message: Some("Scanner closed".into()),
+                                frame: None,
+                            });
+                        }
+                        Ok(Some(Value::Int(i32::from(
+                            scanner_model::next_line(&st.text, st.pos).is_some(),
+                        ))))
+                    }
                     ("nextLine", "()Ljava/lang/String;") => {
                         let Some(st) = self.scanners.get_mut(&marker) else {
                             return Ok(None);
