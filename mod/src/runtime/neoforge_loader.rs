@@ -376,7 +376,12 @@ impl StdHost {
     /// container's bus, info and extension points, a mod info's id and
     /// version, a file info's version, a config type's name and ordinal, a
     /// world version's name.
-    fn neoforge_loader_handle(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
+    fn neoforge_loader_handle(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Value> {
         if let Some(id) = loader::container_id(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 // A `javafml` mod's container is an `FMLModContainer`, whose
@@ -455,8 +460,12 @@ impl StdHost {
             && r.descriptor
                 == "(Lnet/minecraft/server/packs/PackType;)Lnet/minecraft/server/packs/metadata/pack/PackFormat;"
         {
-            if loader::world_version_name(receiver).is_none() { return None; }
-            let Some(Value::Ref(Some(marker))) = args.first() else { return None; };
+            if loader::world_version_name(receiver).is_none() {
+                return None;
+            }
+            let Some(Value::Ref(Some(marker))) = args.first() else {
+                return None;
+            };
             let (major, minor) = match marker.as_str() {
                 "enum/net/minecraft/server/packs/PackType/SERVER_DATA" => (121, 0),
                 "enum/net/minecraft/server/packs/PackType/CLIENT_RESOURCES" => (97, 1),
