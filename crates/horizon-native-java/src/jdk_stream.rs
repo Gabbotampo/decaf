@@ -551,6 +551,20 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             return Ok(None);
         };
         let Some(mut values) = self.host.mutable_collection_values(list) else {
+            let immutable = self
+                .host_collection_class(list)
+                .is_some_and(|class| class.starts_with("java/util/ImmutableCollections$"));
+            if immutable {
+                let size = crate::runtime_collection_values(self.host, list)?.len();
+                if size >= 2 {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/UnsupportedOperationException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                return Ok(Some(Value::Void));
+            }
             self.host.unknown_operand_call(r)?;
             return Ok(None);
         };
