@@ -4,7 +4,6 @@
 //! factories stay on the counted host path because their seeds come from game
 //! or thread state.
 
-
 use crate::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
 };
@@ -110,7 +109,6 @@ pub(crate) enum State {
     XoroshiroPositional { lo: u64, hi: u64 },
 }
 
-
 impl State {
     fn class(&self) -> &'static str {
         match self {
@@ -125,7 +123,9 @@ impl State {
 
 impl StdHost {
     pub(crate) fn generate_unique_seed(&mut self) -> i64 {
-        self.random_seed_uniquifier = self.random_seed_uniquifier.wrapping_mul(1_181_783_497_276_652_981);
+        self.random_seed_uniquifier = self
+            .random_seed_uniquifier
+            .wrapping_mul(1_181_783_497_276_652_981);
         (self.random_seed_uniquifier as i64) ^ self.random_time_origin.elapsed().as_nanos() as i64
     }
 
@@ -147,11 +147,7 @@ impl StdHost {
     }
 
     fn random_handle(&mut self, state: State) -> Value {
-        let key = format!(
-            "{}#{}",
-            state.class(),
-            self.random_sources.len()
-        );
+        let key = format!("{}#{}", state.class(), self.random_sources.len());
         self.random_sources.insert(key.clone(), state);
         Value::Host(HostRef::new(HostKind::RandomSource, key))
     }
