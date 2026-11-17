@@ -61,7 +61,8 @@ impl<H: Host> Runtime<'_, H> {
                 )
             })
             .flatten()
-            .transpose()?;
+            .transpose()
+            .ok()?;
         java_format::format(format, args.as_deref())
     }
 
