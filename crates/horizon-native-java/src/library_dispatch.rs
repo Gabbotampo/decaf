@@ -304,8 +304,9 @@ impl<H: Host> Runtime<'_, H> {
         let result = return_desc(&r.descriptor).to_owned();
         if kind == "map"
             && r.name == "object2BooleanEntrySet"
-            && r.descriptor
+            && (r.descriptor
                 == "()Lit/unimi/dsi/fastutil/objects/Object2BooleanSortedMap$FastSortedEntrySet;"
+                || r.descriptor == "()Ljava/lang/Iterable;")
         {
             return self
                 .host
