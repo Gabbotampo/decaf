@@ -7,9 +7,7 @@ public final class Probe {
   String a=e.getString();
   String b=Boolean.toString(CommonComponents.EMPTY==CommonComponents.EMPTY);
   String c=Boolean.toString(e.equals(Component.empty()));
-  var codec=Identifier.CODEC;
   String d=Boolean.toString(Identifier.CODEC==Identifier.CODEC);
-  String f=Boolean.toString(codec.fieldOf("id")!=null);
-  return String.join("|",a,b,c,d,f);
+  return String.join("|",a,b,c,d);
  }
 }

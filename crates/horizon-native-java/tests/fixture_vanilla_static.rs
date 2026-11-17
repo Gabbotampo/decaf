@@ -30,6 +30,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
 ];
 const PROBE: &str = include_str!("fixtures/vanilla_static/demo/Probe.java");
+const COUNTED: &str = include_str!("fixtures/vanilla_static/demo/Counted.java");
 const ORACLE: &str = include_str!("fixtures/vanilla_static/java25.txt");
 #[test]
 fn vanilla_static_rows_match_java25() {
@@ -38,5 +39,14 @@ fn vanilla_static_rows_match_java25() {
     let f = Fixture::build("vanilla-static", &files);
     let mut h = f.jar.seed_host(StdHost::new());
     assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
+    assert!(h.unknown_host_calls().is_empty());
+}
+#[test]
+fn vanilla_static_field_of_is_counted() {
+    let mut files = STUBS.to_vec();
+    files.push(("demo/Counted.java", COUNTED));
+    let f = Fixture::build("vanilla-static-counted", &files);
+    let mut h = f.jar.seed_host(StdHost::new());
+    assert_eq!(f.text_on(&mut h, "run"), "true");
     assert_eq!(h.unknown_host_calls(), vec![("com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned(), 1)]);
 }
