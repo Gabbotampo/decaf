@@ -466,15 +466,6 @@ impl StdHost {
                 _ => None,
             };
         }
-        if let Some((major, minor)) = loader::pack_parts(receiver) {
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("major", "()I") => Some(Value::Int(major)),
-                ("minor", "()I") => Some(Value::Int(minor)),
-                ("version", "()I") => Some(Value::Int(major)),
-                ("series", "()Ljava/lang/String;") => Some(Value::Ref(Some("main".into()))),
-                _ => None,
-            };
-        }
         None
     }
 
