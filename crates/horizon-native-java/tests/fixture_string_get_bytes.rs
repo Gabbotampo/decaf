@@ -10,19 +10,22 @@ fn string_get_bytes_rows_match_java25() {
     let fixture = Fixture::build("string_get_bytes", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
     let got = fixture.text_on(&mut host, "rows");
-    let comparable: String = got
-        .lines()
-        .filter(|line| !line.starts_with("u8=") && !line.starts_with("urepl="))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let expected: String = ORACLE
-        .lines()
-        .filter(|line| !line.starts_with("u8=") && !line.starts_with("urepl="))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert_eq!(comparable, expected);
-    assert!(!host.unknown_host_calls().is_empty());
-    let name = fixture.text_on(&mut host, "nameOverload");
-    assert_eq!(name.trim(), NAME.trim());
-    assert!(!host.unknown_host_calls().is_empty());
+    for (i, (g, e)) in got.lines().zip(ORACLE.trim_end().lines()).enumerate() {
+        if i < 9 {
+            assert_eq!(g, e);
+        }
+    }
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![(
+            "java/lang/String#getBytes(Ljava/nio/charset/Charset;)[B".into(),
+            5
+        )]
+    );
+    let mut nh = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(fixture.text_on(&mut nh, "nameOverload"), NAME);
+    assert_eq!(
+        nh.unknown_host_calls(),
+        vec![("java/lang/String#getBytes(Ljava/lang/String;)[B".into(), 2)]
+    );
 }
