@@ -316,6 +316,10 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
+        // Fabric resource condition types' ids and codecs (`fabric_resource_conditions.rs`).
+        for held in self.fabric_resource_conditions.values() {
+            value(held, out);
+        }
         // Fabric creative tab builders' and tabs' recorded arguments (`host_creative_tab.rs`).
         for held in self.creative_tab.values() {
             value(held, out);
@@ -1711,6 +1715,7 @@ mod tests {
             "entity_registration",
             "tool_material",
             "fabric_block_api",
+            "fabric_resource_conditions",
             "creative_tab",
             "vec2",
         ];
