@@ -4795,8 +4795,25 @@ impl StdHost {
                 values.extend([key, value]);
                 Ok(Some(Value::Ref(None)))
             }
-            ("stringPropertyNames", "()Ljava/util/Set;")
-            | ("keys", "()Ljava/util/Enumeration;")
+            ("stringPropertyNames", "()Ljava/util/Set;") => {
+                let values = self
+                    .mutable_collections
+                    .get(marker)
+                    .map(|pairs| {
+                        pairs
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .filter_map(|pair| match &pair[0] {
+                                Value::Ref(Some(k)) => Some(Value::Ref(Some(k.clone()))),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(Some(self.new_collection("java/util/LinkedHashSet", values)))
+            }
+            ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
             | ("keySet", "()Ljava/util/Set;")
             | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
