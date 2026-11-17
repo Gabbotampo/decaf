@@ -1,1 +1,1 @@
-true|false|true|true\n
+true|false|true|true
