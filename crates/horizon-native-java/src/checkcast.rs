@@ -191,6 +191,12 @@ impl<H: Host> Runtime<'_, H> {
         if *value == Value::Ref(None) || target == "java/lang/Object" {
             return Ok(());
         }
+        if let Value::Ref(Some(marker)) = value
+            && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable
+            && matches!(target, "java/lang/String" | "java/lang/CharSequence" | "java/lang/Comparable" | "java/io/Serializable" | "java/lang/constant/Constable")
+        {
+            return self.count_cast(value, target);
+        }
         // A `String` spelling an object's key is a `String`, certainly: no
         // other value is that text (`jar_object.rs`).
         if let Value::Ref(Some(text)) = value
@@ -616,6 +622,9 @@ impl<H: Host> Runtime<'_, H> {
         // known gap, #167's review).
         if matches!(value, Value::Ref(_)) && crate::value_class::is_plain_string(marker) {
             return false;
+        }
+        if matches!(value, Value::Ref(Some(_))) && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable {
+            return true;
         }
         // An object a library model built itself: the model knows its whole
         // type, so its `false` is an answer.
