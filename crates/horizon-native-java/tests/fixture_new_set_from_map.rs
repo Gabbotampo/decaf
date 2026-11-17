@@ -43,6 +43,10 @@ public final class Probe {
   public static String linkedMapDifferential() { return differential(true); }
   public static String duplicate() { Map<String,Boolean> m=new HashMap<>(); m.put("x",true); return ex(()->Collections.newSetFromMap(m)); }
   public static String nullMap() { return ex(()->Collections.newSetFromMap(null)); }
+  public static String chmExact() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); boolean a=s.add("a"), d=s.add("a"), c=s.contains("a"), r=s.remove("a"), n=s.remove("z"); String e=ex(()->s.add(null)); return a+"|"+d+"|"+c+"|"+r+"|"+n+"|"+s.size()+"|"+s.isEmpty()+"|"+e; }
+  public static String chmIterate() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("b"); s.add("a"); return s.toString(); }
+  public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return java.util.Arrays.toString(s.toArray()); }
+  public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return String.valueOf(s.stream().findFirst()); }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
@@ -75,8 +79,27 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
         "nullMap",
         "hashMapDifferential",
         "linkedMapDifferential",
+        "chmExact",
     ] {
         assert_eq!(fixture.text(method), expected(method), "{method}");
+    }
+}
+
+#[test]
+fn concurrent_hash_map_order_dependent_operations_are_counted() {
+    let fixture = fixture();
+    for method in ["chmIterate", "chmToArray", "chmStream"] {
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        fixture.text_on(&mut host, method);
+        assert_eq!(
+            host.unknown_host_calls()
+                .iter()
+                .map(|(_, n)| *n)
+                .sum::<usize>(),
+            1,
+            "{method}: {:?}",
+            host.unknown_host_calls()
+        );
     }
 }
 
