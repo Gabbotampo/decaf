@@ -6727,6 +6727,27 @@ impl Host for StdHost {
         if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
             return value;
         }
+        if r.owner == "net/fabricmc/fabric/api/resource/v1/ResourceLoader"
+            && r.name == "registerBuiltinPack"
+            && r.descriptor
+                == "(Lnet/minecraft/resources/Identifier;Lnet/fabricmc/loader/api/ModContainer;Lnet/minecraft/network/chat/Component;Lnet/fabricmc/fabric/api/resource/v1/pack/PackActivationType;)Z"
+        {
+            let id = Self::argument(r, args, 0)?;
+            let container = Self::argument(r, args, 1)?;
+            let Some(mod_id) = host_fabric_loader::container_id(container) else {
+                return self.unknown_host_call(r);
+            };
+            let Some(id) = host_ids::identifier_key(id) else {
+                return self.unknown_host_call(r);
+            };
+            let Some((namespace, path)) = id.split_once(":") else {
+                return self.unknown_host_call(r);
+            };
+            let resource = format!("resourcepacks/{namespace}/{path}");
+            return Ok(Value::Int(
+                (self.resource(&resource).is_some() && self.fabric_mod_present(&mod_id)) as i32,
+            ));
+        }
         if let Some(value) =
             fabric_resource_conditions::static_call(&mut self.fabric_resource_conditions, r, args)
         {
