@@ -57,35 +57,31 @@ fn formatter_jar_tostring_capture() {
     );
     assert_eq!(h.unknown_host_calls(), vec![]);
 }
+/// Java 25's answers for the counted cases, one line each in `CASES` order.
+const JAVA25_COUNTED: &str = include_str!("fixtures/format_jar_tostring/java25_counted.txt");
+
+const FORMATTED: &str = "java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;";
+const FORMAT: &str =
+    "java/lang/String#format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;";
+
+/// Cases Decaf counts, each in a fresh host: a jar `toString()` that throws (Java throws it
+/// from `format`; the host's `jar_to_string` refuses a throwing `toString`, so the format is
+/// counted), a jar `Formattable` (its `formatTo` isn't run), and a non-`%s` conversion of a jar
+/// object (`%d` throws `IllegalFormatConversionException` in Java; counted here). A counted
+/// `format` returns null without throwing, so the probe's own result isn't Java's: only the
+/// count is asserted, and `java25_counted.txt` records what Java answers.
 #[test]
 fn formatter_counted_cases() {
-    for (name, sig) in [
-        (
-            "boom",
-            "java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;",
-        ),
-        (
-            "fmt",
-            "java/lang/String#formatted([Ljava/lang/Object;)Ljava/lang/String;",
-        ),
-        (
-            "mixed",
-            "java/lang/String#format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
-        ),
-    ] {
-        let j = jar();
-        let mut h = StdHost::new();
-        let v = call(&j, &mut h, name);
-        if name == "mixed" {
-            assert_eq!(
-                v,
-                Value::Ref(Some(
-                    "java.util.IllegalFormatConversionException:d != demo.Probe$Named".into()
-                ))
-            );
-        } else {
-            assert_eq!(v, Value::Ref(None));
-        }
-        assert_eq!(h.unknown_host_calls(), vec![(sig.into(), 1)]);
+    let cases = [("boom", FORMATTED), ("fmt", FORMATTED), ("mixed", FORMAT)];
+    assert_eq!(JAVA25_COUNTED.lines().count(), cases.len());
+    for (name, signature) in cases {
+        let jar = jar();
+        let mut host = StdHost::new();
+        call(&jar, &mut host, name);
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![(signature.to_owned(), 1)],
+            "{name}"
+        );
     }
 }

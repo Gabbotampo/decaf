@@ -39,13 +39,18 @@ impl<H: Host> Runtime<'_, H> {
             // `String.format(f, (Object[]) null)` formats every argument as
             // null.
             Value::Ref(None) => None,
-            array => Some(self.array(array).ok()?.into_owned()),
+            array => match self.array(array) {
+                Ok(values) => Some(values.into_owned()),
+                // An argument array the runtime doesn't hold: counted.
+                Err(_) => return Ok(None),
+            },
         };
         if locale.is_none() && default_locale_sensitive(format, args.as_deref()) {
             return Ok(None);
         }
-        let args = args
-            .map(|values| {
+        let args = match args {
+            None => None,
+            Some(values) => {
                 if values
                     .iter()
                     .any(|value| crate::runtime::jar_object::packaged_object_class(value).is_some())
@@ -53,16 +58,15 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(None);
                 }
+                // A jar `toString()` that throws makes the whole format throw (`?`).
                 Some(
                     values
                         .iter()
                         .map(|value| self.format_arg(value))
-                        .collect::<Result<Vec<_>, _>>(),
+                        .collect::<Result<Vec<_>, _>>()?,
                 )
-            })
-            .flatten()
-            .transpose()
-            .ok()?;
+            }
+        };
         Ok(java_format::format(format, args.as_deref()))
     }
 

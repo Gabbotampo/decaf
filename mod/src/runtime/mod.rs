@@ -27363,9 +27363,9 @@ impl<H: Host> Runtime<'_, H> {
                         // A call the formatter cannot answer exactly stays
                         // with the host, as an unknown call.
                         let text = match args {
-                            [format, values] => self.java_format(None, format, values),
+                            [format, values] => self.java_format(None, format, values)?,
                             [locale, format, values] => {
-                                self.java_format(Some(locale), format, values)
+                                self.java_format(Some(locale), format, values)?
                             }
                             _ => None,
                         };
@@ -30881,7 +30881,8 @@ impl<H: Host> Runtime<'_, H> {
                         // `text.formatted(args)` is `String.format(text, args)`.
                         // A call the formatter refuses goes to the host as
                         // the `formatted` call it is, so the count names it.
-                        match self.java_format(None, &format, values) {
+                        // A jar `toString()` that throws makes `formatted` throw it.
+                        match invoke_or_catch!(at, self.java_format(None, &format, values)) {
                             Some(text) => Value::Ref(Some(text)),
                             None => {
                                 invoke_or_catch!(at, self.host.invoke_instance(&r, &format, &args))
