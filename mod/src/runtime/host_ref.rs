@@ -613,6 +613,9 @@ pub enum HostKind {
     /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
     /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
     RegexMatcher,
+    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    ItemStackTemplate,
+    /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
 }
 
@@ -2646,6 +2649,13 @@ const KINDS: &[KindInfo] = &[
         // A serial per `matcher` call.
         canonical: always_canonical,
         methods: &crate::runtime::host_jdk_constant::MATCHER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ItemStackTemplate,
+        tag: "ist",
+        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_item_stack_template::METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,
