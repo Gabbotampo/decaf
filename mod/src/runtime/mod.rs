@@ -7289,7 +7289,10 @@ impl Host for StdHost {
                 "encode",
                 "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
             ) => {
-                let text = expect_string(Self::argument(r, args, 0)?).replace("\u{FFFD}", "?");
+                let text = expect_string(Self::argument(r, args, 0)?);
+                if text.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
                 match Self::argument(r, args, 1)? {
                     Value::Ref(Some(s)) if s == "charset/UTF-8" => {}
                     _ => return self.unknown_host_call(r),

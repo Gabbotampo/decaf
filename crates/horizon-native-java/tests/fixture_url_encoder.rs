@@ -25,13 +25,15 @@ fn url_encoder_utf8_matches_java25() {
         "{:?}",
         host.unknown_host_calls()
     );
-    let _ = fixture.jar.invoke_method_with_args(
-        "demo/Probe",
-        "rowsOtherCharset",
-        "()Ljava/lang/String;",
-        None,
-        &[],
-        &mut host,
-    );
-    assert_eq!(host.unknown_host_calls(), vec![("java/net/URLEncoder#encode(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;".into(), 1)]);
+    for method in ["rowsOtherCharset", "loneSurrogate", "replacementChar"] {
+        let _ = fixture.jar.invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        );
+        assert_eq!(host.unknown_host_calls(), vec![("java/net/URLEncoder#encode(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;".into(), 3)]);
+    }
 }
