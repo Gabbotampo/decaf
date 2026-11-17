@@ -44,21 +44,23 @@ impl<H: Host> Runtime<'_, H> {
         if locale.is_none() && default_locale_sensitive(format, args.as_deref()) {
             return None;
         }
-        let args = args.map(|values| {
-            if values
-                .iter()
-                .any(|value| crate::runtime::jar_object::packaged_object_class(value).is_some())
-                && format_has_non_string_conversion(format)
-            {
-                return None;
-            }
-            Some(
-                values
+        let args = args
+            .map(|values| {
+                if values
                     .iter()
-                    .map(|value| self.format_arg(value))
-                    .collect::<Vec<_>>(),
-            )
-        })?;
+                    .any(|value| crate::runtime::jar_object::packaged_object_class(value).is_some())
+                    && format_has_non_string_conversion(format)
+                {
+                    return None;
+                }
+                Some(
+                    values
+                        .iter()
+                        .map(|value| self.format_arg(value))
+                        .collect::<Result<Vec<_>, _>>(),
+                )
+            })
+            .transpose()?;
         java_format::format(format, args.as_deref())
     }
 
@@ -82,26 +84,26 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Arg::Opaque);
         }
         let marker = match value {
-            Value::Ref(None) => return Arg::Null,
-            Value::Int(value) => return Arg::Int(*value),
-            Value::Long(value) => return Arg::Long(*value),
+            Value::Ref(None) => return Ok(Arg::Null),
+            Value::Int(value) => return Ok(Arg::Int(*value)),
+            Value::Long(value) => return Ok(Arg::Long(*value)),
             // A bare floating-point value is a `Double`; a `Float` is boxed.
-            Value::Float(value) => return Arg::Double(*value),
-            Value::Boxed(boxed) => return boxed_arg(*boxed),
+            Value::Float(value) => return Ok(Arg::Double(*value)),
+            Value::Boxed(boxed) => return Ok(boxed_arg(*boxed)),
             Value::Host(handle) => {
                 return match self.host_ref_text(handle, "", "") {
-                    Ok(Some(text)) => Arg::Str(text),
-                    _ => Arg::Opaque,
+                    Ok(Some(text)) => Ok(Arg::Str(text)),
+                    _ => Ok(Arg::Opaque),
                 };
             }
-            Value::Void => return Arg::Opaque,
+            Value::Void => return Ok(Arg::Opaque),
             Value::Ref(Some(marker)) => marker,
         };
         if let Some(text) = self.builder_text(value) {
-            return Arg::Str(text.clone());
+            return Ok(Arg::Str(text.clone()));
         }
         if value_class::is_plain_string(marker) {
-            return Arg::Str(marker.clone());
+            return Ok(Arg::Str(marker.clone()));
         }
         // A jar object prints its own `toString` (`jar_text.rs`); one that
         // throws, or that only the JVM can print (an identity hash), is
@@ -111,14 +113,15 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(Some(Value::Ref(Some(text)))) => Ok(Arg::Str(text)),
                 Ok(Some(Value::Ref(None))) => Ok(Arg::Null),
                 Ok(Some(_)) => Ok(Arg::Opaque),
-                Ok(None) | Err(_) => Ok(Arg::Opaque),
+                Ok(None) => Ok(Arg::Opaque),
+                Err(error) => return Err(error),
             };
         }
         // A model object whose `toString` the host answers; anything else
         // (a marker no model prints) cannot be printed or hashed exactly.
         match self.host.modelled_to_string(value) {
-            Some(text) => Arg::Str(text),
-            None => Arg::Opaque,
+            Some(text) => Ok(Arg::Str(text)),
+            None => Ok(Arg::Opaque),
         }
     }
 }
