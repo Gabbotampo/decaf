@@ -612,6 +612,25 @@ impl<H: Host> Runtime<'_, H> {
         // A primitive class has no instances; `int.class.isInstance(1)` is
         // false on the JVM too. A host handle answers by its kind's row, an
         // unknown answer counted (`checkcast.rs`).
+        if crate::gson_tree::is_tree(&value) {
+            let instance = crate::gson_tree::instance_of(&value, &wanted);
+            if r.name == "isInstance" {
+                return Ok(Some(Value::Int(i32::from(instance))));
+            }
+            if instance || is_null {
+                return Ok(Some(value));
+            }
+            let class = crate::jar_object::object_class(&value).unwrap_or_default();
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/ClassCastException".into(),
+                message: Some(format!(
+                    "Cannot cast {} to {}",
+                    class.replace('/', "."),
+                    wanted.replace('/', ".")
+                )),
+                frame: None,
+            });
+        }
         let instance = match &value {
             Value::Host(handle) if !crate::jar_object::is_object_handle(handle) => {
                 self.handle_instance_of(handle, &wanted)?

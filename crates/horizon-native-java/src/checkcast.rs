@@ -222,6 +222,15 @@ impl<H: Host> Runtime<'_, H> {
             }
             return self.count_cast(value, target);
         }
+        // Gson tree values are modeled references with a closed class hierarchy.
+        // Apply the same exact rows as `instanceof`, including LinkedTreeMap.
+        if crate::gson_tree::is_tree(value) {
+            if crate::gson_tree::instance_of(value, target) {
+                return Ok(());
+            }
+            let class = crate::jar_object::object_class(value).unwrap_or_default();
+            return Err(class_cast_exception(&class, target));
+        }
         // A host handle is its kind's class, and only a handle is one of a
         // handle kind's classes (`host_ref.rs`): `(String) Optional.empty()`
         // and `(Optional<?>) "text"` throw.
