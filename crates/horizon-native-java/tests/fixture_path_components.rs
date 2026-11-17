@@ -1,6 +1,7 @@
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 const PROBE: &str = include_str!("fixtures/path_components/demo/Probe.java");
+const ORACLE: &str = include_str!("fixtures/path_components/java25.txt");
 #[test]
 fn path_components() {
     let f = javac_fixture::Fixture::build("path-components", &[("demo/Probe.java", PROBE)]);
@@ -21,12 +22,7 @@ fn path_components() {
         _ => panic!("{v:?}"),
     };
     assert_eq!(
-        s,
-        "file=c|parent=/a/b/..|root=/|count=4|name=a|oor=IllegalArgumentException:null|sub=a/b|abs=true|empty=null|eq=true"
-    );
-    assert!(
-        h.unknown_host_calls().is_empty(),
-        "{:?}",
-        h.unknown_host_calls()
+        (s, h.unknown_host_calls()),
+        (ORACLE.to_string(), Vec::new())
     );
 }
