@@ -8024,8 +8024,10 @@ impl Host for StdHost {
                 }))
             }
             ("java/lang/System", "currentTimeMillis", "()J") => {
-                Ok(Value::Int(self.current_time_millis))
+                Ok(Value::Long(i64::from(self.current_time_millis)))
             }
+            // Unlike the host-seeded currentTimeMillis, nanoTime has Java’s arbitrary origin.
+            // It is intentionally a real monotonic clock and therefore is not replay-deterministic.
             ("java/lang/System", "nanoTime", "()J") => Ok(Value::Long(
                 self.nano_time_origin.elapsed().as_nanos() as i64,
             )),
