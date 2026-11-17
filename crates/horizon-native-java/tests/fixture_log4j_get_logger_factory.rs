@@ -55,8 +55,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
 ];
 
-const GET_MESSAGE_FACTORY: &str =
-    "org/apache/logging/log4j/Logger#getMessageFactory()Lorg/apache/logging/log4j/message/MessageFactory;";
+const GET_MESSAGE_FACTORY: &str = "org/apache/logging/log4j/Logger#getMessageFactory()Lorg/apache/logging/log4j/message/MessageFactory;";
 
 fn fixture() -> Fixture {
     let mut sources = STUBS.to_vec();
@@ -86,6 +85,10 @@ fn a_plain_factory_is_counted() {
     for (method, counted) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture.text_on(&mut host, method);
-        assert_eq!(host.unknown_host_calls(), vec![(counted.to_owned(), 1)], "{method}");
+        assert_eq!(
+            host.unknown_host_calls(),
+            vec![(counted.to_owned(), 1)],
+            "{method}"
+        );
     }
 }
