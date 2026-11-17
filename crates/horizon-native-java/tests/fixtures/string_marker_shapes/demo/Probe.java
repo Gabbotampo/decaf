@@ -18,4 +18,5 @@ public final class Probe {
  public static String stream(){return row(built("stream/","x"));}
  public static String textures(){return row(built("textures/gui/","a.png"));}
  public static String models(){return row(built("models/item/","x"));}
+ public static void main(String[] a){System.out.println("hello="+hello());System.out.println("client="+client());System.out.println("blockPos="+blockPos());System.out.println("typed="+typed());System.out.println("registry="+registry());System.out.println("payload="+payload());System.out.println("payloadContext="+payloadContext());System.out.println("iterator="+iterator());System.out.println("enumX="+enumX());System.out.println("game="+game());System.out.println("list="+list());System.out.println("particle="+particle());System.out.println("callback="+callback());System.out.println("stream="+stream());System.out.println("textures="+textures());System.out.println("models="+models());}
 }

@@ -1,1 +1,16 @@
-hello=jshell> client=jshell> blockPos=jshell> typed=jshell> registry=jshell> payload=jshell> payloadContext=jshell> iterator=jshell> enumX=jshell> game=jshell> list=jshell> particle=jshell> callback=jshell> stream=jshell> textures=jshell> models=jshell> 
+hello=true|5|true
+client=true|8|true
+blockPos=true|11|true
+typed=true|7|true
+registry=true|10|true
+payload=true|9|true
+payloadContext=true|17|true
+iterator=true|10|true
+enumX=true|6|true
+game=true|6|true
+list=true|11|true
+particle=true|10|true
+callback=true|9|true
+stream=true|8|true
+textures=true|18|true
+models=true|13|true
