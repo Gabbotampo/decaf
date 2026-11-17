@@ -18,7 +18,7 @@ public class Probe {
     StringBuilder b = new StringBuilder();
     try { "[%s]".formatted(new Boom()); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
     b.append("\n");
-    try { "[%s]".formatted(new Fmt()); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
+    try { b.append("[%s]".formatted(new Fmt())); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
     b.append("\n");
     try { String.format("%d %s", new Named(), new Named()); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
     return b.toString();
