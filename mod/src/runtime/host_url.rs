@@ -11,7 +11,6 @@ fn scheme(uri: &str) -> Option<&str> {
             b.is_ascii_alphabetic()
                 || (i > 0 && (b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.')))
         })
-       
     {
         None
     } else {
