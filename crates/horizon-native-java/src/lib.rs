@@ -4718,11 +4718,14 @@ impl StdHost {
             ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
             ("load", "(Ljava/io/InputStream;)V") => {
                 let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
-                    self.resource_streams.get_mut(stream).map(|(bytes, index)| {
+                    if let Some((bytes, index)) = self.resource_streams.get_mut(stream) {
                         let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
                         *index = bytes.len();
-                        text
-                    })
+                        return Some(text);
+                    }
+                    let path = self.io_paths.get(stream)?;
+                    let bytes = self.io_file_bytes.get(path)?;
+                    Some(bytes.iter().map(|b| *b as char).collect())
                 });
                 let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
