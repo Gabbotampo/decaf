@@ -3631,6 +3631,8 @@ pub struct StdHost {
     imc: neoforge_imc::ImcHandle,
     entity_registration: entity_registration::State,
     tool_material: tool_material::State,
+    /// one table per host; a conflict between two jars' registrations is not detected
+    fabric_block_api: fabric_block_api::State,
 }
 
 impl Default for StdHost {
@@ -3795,6 +3797,7 @@ impl StdHost {
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
+            fabric_block_api: fabric_block_api::State::default(),
         }
     }
 
@@ -6702,7 +6705,7 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
-        if let Some(value) = fabric_block_api::static_call(r, args) {
+        if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
             return value;
         }
         if let Some(value) =
@@ -8232,7 +8235,9 @@ impl Host for StdHost {
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
-        if let Some(value) = fabric_block_api::instance_call(r, receiver, args) {
+        if let Some(value) =
+            fabric_block_api::instance_call(&mut self.fabric_block_api, r, receiver, args)
+        {
             return value;
         }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {

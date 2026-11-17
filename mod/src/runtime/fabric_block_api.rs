@@ -1,9 +1,11 @@
 use crate::runtime::host_ref::{HostKind, HostRef};
 use crate::runtime::{MethodRef, NativeError, Value, host_class, host_ids};
-use std::sync::{Mutex, OnceLock};
+use std::collections::BTreeMap;
 
-static LOOKUPS: OnceLock<Mutex<std::collections::HashMap<String, (String, String)>>> =
-    OnceLock::new();
+#[derive(Debug, Default, Clone)]
+pub(crate) struct State {
+    lookups: BTreeMap<String, (String, String)>,
+}
 
 fn thrown(class: &str, message: &str) -> NativeError {
     NativeError::UncaughtException {
@@ -24,7 +26,11 @@ fn canonical(name: &str) -> Option<String> {
         Some(dotted.replace('$', "."))
     }
 }
-pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
+pub(crate) fn static_call(
+    state: &mut State,
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
     if r.owner != "net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup" || r.name != "get" {
         return None;
     }
@@ -33,9 +39,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     let api = host_class::class_name(api)?.to_string();
     let ctx = host_class::class_name(ctx)?.to_string();
     let key = format!("{id}|{api}|{ctx}");
-    let map = LOOKUPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let mut map = map.lock().unwrap();
-    if let Some((old_api, old_ctx)) = map.get(&id) {
+    if let Some((old_api, old_ctx)) = state.lookups.get(&id) {
         if old_api != &api || old_ctx != &ctx {
             let (Some(oa), Some(oc), Some(na), Some(nc)) = (
                 canonical(old_api),
@@ -53,7 +57,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             )));
         }
     } else {
-        map.insert(id, (api.clone(), ctx.clone()));
+        state.lookups.insert(id, (api.clone(), ctx.clone()));
     }
     Some(Ok(Value::Host(HostRef::new(
         HostKind::FabricBlockApiLookup,
@@ -61,6 +65,7 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     ))))
 }
 pub(crate) fn instance_call(
+    _state: &mut State,
     r: &MethodRef,
     recv: &Value,
     args: &[Value],
