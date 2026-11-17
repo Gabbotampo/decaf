@@ -1,1 +1,1 @@
-true|true|true|true|encode:java.lang.NullPointerException|null-ok
+true|true|true|true|encode|null-ok
