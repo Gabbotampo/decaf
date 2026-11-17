@@ -694,7 +694,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     values.to_vec(),
                     (&r.owner, &r.name, &r.descriptor),
                 )?;
-                self.host.invoke_instance(
+                let iterator = self.host.invoke_instance(
                     &MethodRef {
                         owner: "java/util/List".into(),
                         name: "iterator".into(),
@@ -702,7 +702,12 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     },
                     &list,
                     &[],
-                )?
+                )?;
+                if let Some(marker) = crate::expect_ref(&iterator) {
+                    self.host
+                        .set_host_iterator_source(marker, "java/util/stream/Stream".into());
+                }
+                iterator
             }
             ("sum", "()I") => Value::Int(
                 values
