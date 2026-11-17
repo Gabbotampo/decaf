@@ -714,10 +714,9 @@ impl StdHost {
                     .enumerate()
                     .map(|(i, v)| loader::custom_value(id, &child(pointer, &i.to_string()), v))
                     .collect();
-                return match self.new_host_iterator(
-                    values,
-                    Some("java/util/Collections$UnmodifiableList".into()),
-                ) {
+                return match self
+                    .new_host_iterator(values, Some("fabric/custom-value/array".into()))
+                {
                     Some(iterator) => Ok(iterator),
                     None => self.unknown_host_call(r),
                 };
@@ -733,10 +732,9 @@ impl StdHost {
                     &pairs,
                     crate::runtime::host_map_entry::EntryMade::Holder,
                 );
-                return match self.new_host_iterator(
-                    entries,
-                    Some("java/util/Collections$UnmodifiableMap".into()),
-                ) {
+                return match self
+                    .new_host_iterator(entries, Some("fabric/custom-value/object".into()))
+                {
                     Some(iterator) => Ok(iterator),
                     None => self.unknown_host_call(r),
                 };
