@@ -15,3 +15,16 @@ fn scanner_rows_match_java25() {
     assert_eq!(rows, JAVA25.trim_end_matches('\n'));
     assert_eq!(host.unknown_host_calls(), vec![]);
 }
+
+#[test]
+fn malformed_utf8_is_counted() {
+    let f = javac_fixture::Fixture::build("scanner_bigint", &[("demo/Probe.java", PROBE)]);
+    let mut host = f.jar.seed_host(horizon_native_java::StdHost::new());
+    let malformed = f.text_on(&mut host, "malformed");
+    assert_eq!(malformed, "|bad:false:NoSuchElementException:No line found");
+    // Invalid UTF-8 is deliberately left unknown; Scanner.hasNextLine is counted once.
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![("java/util/Scanner#hasNextLine()Z".into(), 1)]
+    );
+}
