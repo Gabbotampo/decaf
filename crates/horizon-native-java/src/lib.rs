@@ -26727,7 +26727,13 @@ impl<H: Host> Runtime<'_, H> {
                         .get(&marker)
                         .map(|st| {
                             Ok(Some(Value::Int(
-                                !st.closed && scanner_model::next_line(&st.text, st.pos).is_some(),
+                                if !st.closed
+                                    && scanner_model::next_line(&st.text, st.pos).is_some()
+                                {
+                                    1
+                                } else {
+                                    0
+                                },
                             )))
                         })
                         .unwrap_or(Ok(None)),
