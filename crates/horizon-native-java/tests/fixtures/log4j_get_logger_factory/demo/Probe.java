@@ -34,6 +34,8 @@ public class Probe {
         Logger a = LogManager.getLogger("x", f1);
         Logger b = LogManager.getLogger("x", f1);
         Logger c = LogManager.getLogger("x", f2);
+        // Logging through a factory logger is any logger's output call (Decaf: a no-op).
+        a.info("hello {}", "x");
         return (a.getMessageFactory() == f1) + ":" + (a == b) + ":" + (a != c) + ":" + a.getName();
     }
 
@@ -51,8 +53,14 @@ public class Probe {
         return "" + (LogManager.getLogger("p", c).getMessageFactory() == c);
     }
 
+    /** Counted in Decaf: a level check needs a logging configuration the host doesn't have. */
+    public static String levelCheck() {
+        return "" + LogManager.getLogger("lc", new A()).isDebugEnabled();
+    }
+
     public static void main(String[] x) {
         System.out.print(rows());
         System.out.print("\nplainFactory=" + plainFactory());
+        System.out.print("\nlevelCheck=" + levelCheck());
     }
 }

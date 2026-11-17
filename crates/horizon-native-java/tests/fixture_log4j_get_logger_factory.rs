@@ -19,7 +19,7 @@ const JAVA25_COUNTED: &str = include_str!("fixtures/log4j_get_logger_factory/jav
 const STUBS: &[(&str, &str)] = &[
     (
         "org/apache/logging/log4j/Logger.java",
-        "package org.apache.logging.log4j; import org.apache.logging.log4j.message.MessageFactory; public interface Logger { String getName(); <MF extends MessageFactory> MF getMessageFactory(); }",
+        "package org.apache.logging.log4j; import org.apache.logging.log4j.message.MessageFactory; public interface Logger { String getName(); <MF extends MessageFactory> MF getMessageFactory(); void info(String m, Object p); boolean isDebugEnabled(); }",
     ),
     (
         "org/apache/logging/log4j/LogManager.java",
@@ -56,6 +56,7 @@ const STUBS: &[(&str, &str)] = &[
 ];
 
 const GET_MESSAGE_FACTORY: &str = "org/apache/logging/log4j/Logger#getMessageFactory()Lorg/apache/logging/log4j/message/MessageFactory;";
+const IS_DEBUG_ENABLED: &str = "org/apache/logging/log4j/Logger#isDebugEnabled()Z";
 
 fn fixture() -> Fixture {
     let mut sources = STUBS.to_vec();
@@ -76,7 +77,10 @@ fn mod_factory_loggers_match_java25() {
 #[test]
 fn a_plain_factory_is_counted() {
     let fixture = fixture();
-    let cases = [("plainFactory", GET_MESSAGE_FACTORY)];
+    let cases = [
+        ("plainFactory", GET_MESSAGE_FACTORY),
+        ("levelCheck", IS_DEBUG_ENABLED),
+    ];
     let captured: Vec<&str> = JAVA25_COUNTED
         .lines()
         .map(|line| line.split_once('=').expect("method=answer").0)
