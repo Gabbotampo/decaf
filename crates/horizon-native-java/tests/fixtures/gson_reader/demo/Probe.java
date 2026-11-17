@@ -14,7 +14,7 @@ public final class Probe {
     b.append("string=").append(one(g,new StringReader("{\"n\":3,\"s\":\"ok\",\"xs\":[1,2],\"nested\":{\"k\":\"v\"}}"))).append('\n');
     Path p=Path.of("reader-config.json"); Files.writeString(p,"{\"n\":4,\"s\":\"file\",\"xs\":[3],\"nested\":{\"k\":\"f\"}}");
     b.append("file=").append(one(g,Files.newBufferedReader(p))).append('\n');
-    try (Reader r=new InputStreamReader(Probe.class.getResourceAsStream("/resource-config.json"))) { b.append("resource=").append(one(g,r)).append('\n'); }
+    Reader r=new InputStreamReader(Probe.class.getResourceAsStream("/resource-config.json")); b.append("resource=").append(one(g,r)).append('\n');
     b.append("missing=").append(one(g,new StringReader("{\"n\":1}"))).append('\n');
     b.append("empty=").append(one(g,new StringReader(""))).append('\n');
     return b.toString();

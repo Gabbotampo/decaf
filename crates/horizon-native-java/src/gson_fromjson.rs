@@ -693,10 +693,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(text) = self.gson_source(args.first(), reader) else {
                     return self.count_gson_fromjson(r, receiver, args);
                 };
-                if reader {
-                    if let Some(marker) = args.first().and_then(crate::jar_object::object_key) {
-                        self.string_readers.remove(marker);
-                    }
+                if reader && let Some(marker) = args.first().and_then(crate::jar_object::object_key)
+                {
+                    self.string_readers.remove(marker);
                 }
                 return match self.gson_read_text(&text, &target, &style)? {
                     Some(value) => Ok(Some(value)),
