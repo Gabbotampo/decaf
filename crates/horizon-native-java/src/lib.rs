@@ -8099,6 +8099,67 @@ impl Host for StdHost {
         {
             return value;
         }
+        if r.owner == "java/util/concurrent/atomic/AtomicBoolean" {
+            let Some(key) = instance_field_key(
+                receiver,
+                &MethodRef {
+                    owner: r.owner.clone(),
+                    name: "value".into(),
+                    descriptor: "Z".into(),
+                },
+            ) else {
+                return self.unknown_host_call(r);
+            };
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("<init>", "()V") => {
+                    self.fields.insert(key, Value::Int(0));
+                    return Ok(Value::Void);
+                }
+                ("<init>", "(Z)V") => {
+                    if let Some(Value::Int(value)) = args.first() {
+                        self.fields.insert(key, Value::Int((*value != 0) as i32));
+                        return Ok(Value::Void);
+                    }
+                }
+                ("get", "()Z") => {
+                    if let Some(Value::Int(value)) = self.fields.get(&key) {
+                        return Ok(Value::Int(*value));
+                    }
+                }
+                ("set" | "lazySet", "(Z)V") => {
+                    if let Some(Value::Int(value)) = args.first() {
+                        self.fields.insert(key, Value::Int((*value != 0) as i32));
+                        return Ok(Value::Void);
+                    }
+                }
+                ("compareAndSet", "(ZZ)Z") => {
+                    if let (Some(Value::Int(expect)), Some(Value::Int(update)), Some(Value::Int(current))) =
+                        (args.first(), args.get(1), self.fields.get(&key))
+                    {
+                        if current == expect {
+                            self.fields.insert(key, Value::Int((*update != 0) as i32));
+                            return Ok(Value::Int(1));
+                        }
+                        return Ok(Value::Int(0));
+                    }
+                }
+                ("getAndSet", "(Z)Z") => {
+                    if let (Some(Value::Int(update)), Some(Value::Int(current))) =
+                        (args.first(), self.fields.get(&key))
+                    {
+                        let old = *current;
+                        self.fields.insert(key, Value::Int((*update != 0) as i32));
+                        return Ok(Value::Int(old));
+                    }
+                }
+                ("toString", "()Ljava/lang/String;") => {
+                    if let Some(Value::Int(value)) = self.fields.get(&key) {
+                        return Ok(Value::Ref(Some((*value != 0).to_string())));
+                    }
+                }
+                _ => {}
+            }
+        }
         self.record(r, Some(receiver), args);
         if let Some(v) = host_url::instance_call(r, receiver) {
             return v;
