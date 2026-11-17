@@ -703,10 +703,16 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                     &list,
                     &[],
                 )?;
-                if let Some(marker) = crate::runtime::expect_ref(&iterator) {
-                    eprintln!("TAG stream iterator {marker}");
+                // The list's iterator is a host handle (`iterator/N`), not a `Ref` marker:
+                // tag it by its key, so its `remove()` throws as `Stream.iterator()`'s does.
+                let key = match &iterator {
+                    Value::Host(handle) => Some(handle.key().to_owned()),
+                    Value::Ref(Some(marker)) => Some(marker.clone()),
+                    _ => None,
+                };
+                if let Some(key) = key {
                     self.host
-                        .set_host_iterator_source(marker, "java/util/stream/Stream".into());
+                        .set_host_iterator_source(&key, "java/util/stream/Stream".into());
                 }
                 iterator
             }

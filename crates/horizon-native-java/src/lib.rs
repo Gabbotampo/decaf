@@ -10079,7 +10079,6 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-            eprintln!("REMOVE handler marker={marker}");
             if r.name == "remove" && r.descriptor == "()V" {
                 let source = self.iterator_sources.get(marker).map(String::as_str);
                 if source.is_some_and(|source| {
