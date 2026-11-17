@@ -193,7 +193,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         if let Value::Ref(Some(marker)) = value
             && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable
-            && target != "java/lang/Object"
+            && matches!(target, "java/lang/String" | "java/lang/CharSequence" | "java/lang/Comparable" | "java/io/Serializable" | "java/lang/constant/Constable")
         {
             return self.count_cast(value, target);
         }
