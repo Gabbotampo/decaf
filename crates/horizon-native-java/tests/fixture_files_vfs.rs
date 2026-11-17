@@ -3,7 +3,7 @@ mod scratch;
 use horizon_native_java::{NativeJar, StdHost, Value};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 use zip::write::SimpleFileOptions;
-const SOURCE: &str = r#"import java.nio.file.*; import java.util.*; public class FilesProbe { public static String rows() throws Exception { Path d=Paths.get("game/files-vfs"); Path sub=d.resolve("sub"); Path p=sub.resolve("x.txt"); List<String> r=new ArrayList<>(); r.add("dir0="+Files.exists(sub, LinkOption.NOFOLLOW_LINKS)); Files.createDirectories(sub); r.add("dir1="+Files.exists(sub, LinkOption.NOFOLLOW_LINKS)+",isDir="+Files.isDirectory(sub, LinkOption.NOFOLLOW_LINKS)+",isReg="+Files.isRegularFile(sub, LinkOption.NOFOLLOW_LINKS)+",read="+Files.isReadable(sub)+",sym="+Files.isSymbolicLink(sub)+",exec="+Files.isExecutable(sub)); Files.writeString(p,"hello"); r.add("file="+Files.exists(p, LinkOption.NOFOLLOW_LINKS)+",isDir="+Files.isDirectory(p, LinkOption.NOFOLLOW_LINKS)+",isReg="+Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)+",read="+Files.isReadable(p)+",sym="+Files.isSymbolicLink(p)+",exec="+Files.isExecutable(p)+",text="+Files.readString(p)); r.add("list="+Files.list(sub).count()); Files.delete(p); r.add("afterDelete="+Files.exists(p, LinkOption.NOFOLLOW_LINKS)+",not="+Files.notExists(p)); Path m=d.resolve("missing"); r.add("missing="+Files.exists(m, LinkOption.NOFOLLOW_LINKS)+",not="+Files.notExists(m)+",read="+Files.isReadable(m)+",sym="+Files.isSymbolicLink(m)+",exec="+Files.isExecutable(m)); return String.join("\\n",r); } }"#;
+const SOURCE: &str = include_str!("fixtures/files_vfs/FilesProbe.java");
 fn javac() -> PathBuf {
     std::env::var_os("JAVA_HOME")
         .map(|h| PathBuf::from(h).join("bin/javac"))

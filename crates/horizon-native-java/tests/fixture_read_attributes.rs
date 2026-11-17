@@ -11,8 +11,6 @@ mod javac_fixture;
 use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 
-const JAVA25_CAPTURE: &str = include_str!("fixtures/files_vfs/java25.txt");
-
 const PROBE: &str = include_str!("fixtures/read_attributes/Probe.java");
 
 #[test]
