@@ -39,11 +39,11 @@ fn math_to_radians_matches_java25() {
             &mut host,
         )
         .unwrap();
-    let text = match answer {
-        horizon_native_java::Value::Ref(Some(text)) => text,
+    match answer {
+        horizon_native_java::Value::Ref(Some(_)) => {}
         other => panic!("{other:?}"),
-    };
-    let _java25 = COUNTED.trim_end();
+    }
+    let _ = COUNTED.trim_end();
     assert_eq!(
         host.unknown_host_calls(),
         [("java/lang/Double#doubleToRawLongBits(D)J".to_owned(), 1)]
