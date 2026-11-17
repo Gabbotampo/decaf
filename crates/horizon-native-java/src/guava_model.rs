@@ -413,9 +413,23 @@ impl<H: Host> Runtime<'_, H> {
                 self.invoke_immutable_of(r, args)
             }
             "com/google/common/collect/ImmutableList"
-                if r.name == "builder"
-                    && r.descriptor == "()Lcom/google/common/collect/ImmutableList$Builder;" =>
+                if (r.name == "builder"
+                    && r.descriptor == "()Lcom/google/common/collect/ImmutableList$Builder;")
+                    || (r.name == "builderWithExpectedSize"
+                        && r.descriptor
+                            == "(I)Lcom/google/common/collect/ImmutableList$Builder;") =>
             {
+                if r.name == "builderWithExpectedSize" {
+                    let expected = expect_int(&args[0])?;
+                    if expected < 0 {
+                        return Err(thrown(
+                            "java/lang/IllegalArgumentException",
+                            Some(format!(
+                                "expectedSize cannot be negative but was: {expected}"
+                            )),
+                        ));
+                    }
+                }
                 Ok(Some(self.new_object("guava-immutable-list-builder")))
             }
             "com/google/common/collect/ImmutableList$Builder" => {
