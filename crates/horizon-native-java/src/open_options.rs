@@ -210,7 +210,7 @@ fn check(elements: &[Value]) -> Verdict {
             Some("APPEND + TRUNCATE_EXISTING not allowed"),
         ));
     }
-    let silent = |name: &&str| matches!(*name, "WRITE" | "SYNC" | "DSYNC" | "SPARSE");
+    let silent = |name: &&str| matches!(*name, "WRITE");
     if has("CREATE") && has("APPEND") {
         return Verdict::CreateOrTruncate;
     }
