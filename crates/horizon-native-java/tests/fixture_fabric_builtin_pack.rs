@@ -140,8 +140,7 @@ fn another_mods_container_is_counted() {
     other.text_on(&mut host_other, "rows");
     let mut unknown = host_other.unknown_host_calls();
     unknown.sort();
-    assert_eq!(
-        unknown,
-        vec![(REGISTER.to_owned(), 8), (REGISTER_SUB_PATH.to_owned(), 2)]
-    );
+    let mut expected = vec![(REGISTER.to_owned(), 8), (REGISTER_SUB_PATH.to_owned(), 2)];
+    expected.sort();
+    assert_eq!(unknown, expected);
 }
