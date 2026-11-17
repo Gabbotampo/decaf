@@ -14,9 +14,10 @@ fn properties_load_matches_java25() {
         ("p6.properties", b"trail=x\\"),
         ("p7.properties", b"bad=\\u12G4\n"),
     ];
-    let f = javac_fixture::Fixture::build_with_lib(
+    let f = javac_fixture::Fixture::build_with_mod_json_and_extra(
         "properties-load",
         &[("demo/Probe.java", PROBE)],
+        "{}",
         extras,
     );
     let mut h = f.jar.seed_host(horizon_native_java::StdHost::new());
