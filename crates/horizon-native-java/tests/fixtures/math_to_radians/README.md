@@ -13,3 +13,5 @@ rm -rf classes && mkdir classes
 The probe calls `java.lang.Math.toRadians(double)` for signed zero, finite,
 NaN, infinities, and the smallest positive subnormal. Java 25's implementation
 is `angdeg * 0.017453292519943295`, confirmed with `javap -c -p java.lang.Math`.
+
+The nanBits row is counted because raw NaN payload bits are CPU-dependent (ARM and x86 HotSpot may differ).
