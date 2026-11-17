@@ -41740,7 +41740,7 @@ mandatory = true
         let mut default_host = StdHost::new();
         assert_eq!(
             default_host.invoke(&current_time_millis, &[]).unwrap(),
-            Value::Int(0)
+            Value::Long(0)
         );
         let identity_hash = MethodRef {
             owner: "java/lang/System".into(),
