@@ -1,6 +1,7 @@
 package demo;
-import java.util.*; import java.math.*;
-public final class Probe { public static String rows(){
-StringBuilder s=new StringBuilder(); for(String x:new String[]{"","a","a\n","a\r\n","a\r","a\n\n"}){Scanner z=new Scanner(x); s.append(z.hasNextLine()).append(':'); while(z.hasNextLine())s.append('[').append(z.nextLine()).append(']'); s.append('|');}
-Scanner z=new Scanner("a b\n"); s.append(z.hasNextLine()).append(':').append(z.next()).append(':').append(z.hasNextLine()).append(':').append(z.nextLine()).append('|');
-for(String x:new String[]{"-1","2147483648","2147483647","9223372036854775808","-9223372036854775809"})s.append(new BigInteger(x).intValue()).append('|'); return s.toString(); }}
+import java.util.*; import java.math.*; import java.io.*; import java.nio.file.*;
+public final class Probe { public static String rows(){StringBuilder s=new StringBuilder();
+try{Path p=Files.createTempFile("sc470","txt"); Files.writeString(p,"a\r\nb\r\nc",java.nio.charset.StandardCharsets.UTF_8); Scanner z=new Scanner(p.toFile()); s.append(z.hasNextLine()).append(':').append(z.nextLine()).append('|').append(z.nextLine()).append('|').append(z.nextLine()).append('|').append(z.hasNextLine()); try{z.nextLine();}catch(Exception e){s.append('|').append(e.getClass().getSimpleName()).append(':').append(e.getMessage());} z.close(); try{z.hasNextLine();}catch(Exception e){s.append('|').append(e.getClass().getSimpleName()).append(':').append(e.getMessage());} Files.delete(p);}catch(Exception e){s.append(e);}
+try{new Scanner(new File("/definitely/missing/scanner470"));}catch(Exception e){s.append('|').append(e.getClass().getSimpleName()).append(':').append(e.getMessage());}
+try{Path p=Files.createTempFile("sc470e","txt"); Files.write(p,new byte[0]); s.append('|').append(new Scanner(p.toFile()).hasNextLine()); Files.delete(p);}catch(Exception e){s.append('|').append(e);}
+return s.toString();}}
