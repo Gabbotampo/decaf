@@ -12,16 +12,6 @@ struct Row {
 pub(crate) struct State {
     handles: BTreeMap<String, Value>,
 }
-impl State {
-    pub(crate) fn entry_count(&self) -> usize {
-        self.handles.len()
-    }
-    pub(crate) fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
-        // The map is keyed by constant name; liveness is the handle's own key.
-        self.handles
-            .retain(|_, handle| jar_object::object_key(handle).is_some_and(&keep));
-    }
-}
 fn row(name: &str) -> Option<Row> {
     match name {
         "WOOD" => Some(Row {
