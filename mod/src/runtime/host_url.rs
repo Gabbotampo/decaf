@@ -40,14 +40,6 @@ pub fn to_url_text(uri: &str) -> Result<String, UrlError> {
     if s == "jar" && !uri.contains("!/") {
         return Err(UrlError::Jar);
     }
-    if matches!(s.as_str(), "http" | "https" | "file" | "ftp")
-        && (uri.contains("@")
-            || uri.contains("[")
-            || uri.contains("%")
-            || uri.matches(':').count() > 1)
-    {
-        return Err(UrlError::Unsupported);
-    }
     let tail = &uri[raw.len()..];
     if tail.starts_with(":///") && s != "jar" {
         return Ok(format!("{s}:/{}", &tail[4..]));
