@@ -1,8 +1,9 @@
 0R=key=value;|0I=key=value;
 1R=a=b;c=d;e=f;g=h;i=j;|1I=a=b;c=d;e=f;g=h;i=j;
-2R=cont=onetwo;even=x\\;y=z;|2I=cont=onetwo;even=x\\;y=z;
-3R=u=é;|3I=u=é;
+2R=cont=one\n  two;even=xy=z;|2I=cont=one\n  two;even=xy=z;
+3R=u=é;|3I=u=Ã©;
 4R==emptykey;empty=;|4I==emptykey;empty=;
 5R=dup=two;|5I=dup=two;
 6R=trail=x;|6I=trail=x;
-7R=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.|7I=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.
+7R=bad=G4;|7I=bad=G4;
+counted=counted:y
