@@ -13101,6 +13101,16 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/world/entity/EquipmentSlot" => {
             &["MAINHAND", "OFFHAND", "FEET", "LEGS", "CHEST", "HEAD"]
         }
+        // Bookshelf builds codec helpers for these vanilla enums during class
+        // initialization. Their enum-ness is exact; constants remain counted
+        // unless this table has their declaration order.
+        "net/minecraft/world/item/Rarity"
+        | "net/minecraft/world/entity/ai/attributes/AttributeModifier$Operation"
+        | "net/minecraft/core/Direction$Plane"
+        | "net/minecraft/world/entity/MobCategory"
+        | "net/minecraft/world/item/DyeColor"
+        | "net/minecraft/sounds/SoundSource"
+        | "net/minecraft/world/Difficulty" => &[],
         "net/minecraft/world/level/block/Rotation" => &[
             "NONE",
             "CLOCKWISE_90",
@@ -13493,6 +13503,14 @@ impl StdHost {
             },
             _ => return self.unknown_host_call(r),
         };
+        if handle.kind() == HostKind::Class && r.name == "isEnum" && r.descriptor == "()Z" {
+            if let Some(class) = crate::runtime::host_class::class_name(&Value::Host(handle.clone())) {
+                if game_enum_constants(class).is_some() {
+                    self.unknown_host_call(r)?;
+                    return Ok(Value::Int(1));
+                }
+            }
+        }
         let answer = match r.name.as_str() {
             // A callback's text: counted, a text answered, never its key.
             "toString" if handle.kind() == HostKind::Callback => {
@@ -13948,7 +13966,7 @@ fn is_codec_type(name: &str) -> bool {
             | "com/mojang/serialization/MapCodec"
             | "com/mojang/serialization/codecs/PrimitiveCodec"
             | "com/mojang/serialization/codecs/RecordCodecBuilder"
-    )
+    ) || name.ends_with("Codec")
 }
 
 fn empty_collection_kind(descriptor: &str) -> Option<&'static str> {
