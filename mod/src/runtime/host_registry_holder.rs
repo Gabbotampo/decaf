@@ -402,10 +402,15 @@ fn registry_call(
             let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
                 return Some(host.unknown_host_call(r));
             };
-            let Some(entry) = host.observed_registry_entry(&registry, &id) else {
-                return Some(host.unknown_host_call(r));
-            };
-            Some(Ok(entry.value.clone()))
+            if let Some(entry) = host.observed_registry_entry(&registry, &id) {
+                return Some(Ok(crate::runtime::host_optional::optional_wrap(entry.value.clone())));
+            }
+            if registry == "minecraft:entity_type" {
+                return Some(Ok(crate::runtime::host_optional::optional_wrap(
+                    crate::runtime::vanilla_entity_types::handle(&id),
+                )));
+            }
+            return Some(host.unknown_host_call(r));
         }
         ("getResourceKey", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
             let Some(value) = args.first() else {
