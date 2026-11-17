@@ -4697,7 +4697,16 @@ impl StdHost {
                     raw.iter().map(|b| *b as char).collect()
                 };
                 *index = bytes.len();
-                let additions = match properties_entries(&text) { Ok(v) => v, Err(message) => return Err(NativeError::UncaughtException { class: "java/lang/IllegalArgumentException".into(), message: Some(message), frame: None }) };
+                let additions = match properties_entries(&text) {
+                    Ok(v) => v,
+                    Err(message) => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(message),
+                            frame: None,
+                        });
+                    }
+                };
                 let values = self
                     .mutable_collections
                     .entry(marker.to_owned())
@@ -14507,7 +14516,7 @@ fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
             ))
         })
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "Malformed \uxxxx encoding.".to_owned()))
+        .ok_or_else(|| "Malformed \\uxxxx encoding.".to_owned()))
 }
 fn property_unescape(text: &str) -> Option<String> {
     let mut out = String::new();
