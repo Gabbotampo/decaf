@@ -612,7 +612,7 @@ impl<H: Host> Runtime<'_, H> {
         // A primitive class has no instances; `int.class.isInstance(1)` is
         // false on the JVM too. A host handle answers by its kind's row, an
         // unknown answer counted (`checkcast.rs`).
-        if crate::gson_tree::is_tree(value) {
+        if crate::gson_tree::is_tree(&value) {
             let instance = crate::gson_tree::instance_of(&value, &wanted);
             if r.name == "isInstance" {
                 return Ok(Some(Value::Int(i32::from(instance))));
