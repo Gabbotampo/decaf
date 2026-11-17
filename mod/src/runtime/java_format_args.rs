@@ -60,6 +60,7 @@ impl<H: Host> Runtime<'_, H> {
                         .collect::<Result<Vec<_>, _>>(),
                 )
             })
+            .flatten()
             .transpose()?;
         java_format::format(format, args.as_deref())
     }
