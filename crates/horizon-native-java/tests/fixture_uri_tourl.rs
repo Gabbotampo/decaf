@@ -11,6 +11,6 @@ fn uri_tourl_rows() {
     assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
     assert_eq!(
         h.unknown_host_calls(),
-        vec!["java/net/URL#openStream()Ljava/io/InputStream;"]
+        vec![("java/net/URL#openStream()Ljava/io/InputStream;".into(), 1)]
     );
 }
