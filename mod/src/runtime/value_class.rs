@@ -29,6 +29,7 @@ pub(crate) const STRING_TYPES: &[&str] = &[
 /// The prefixes of marker families that are host handles now (#156): no
 /// runtime value is text spelled so, so such a text is a `String`.
 const RETIRED_PREFIXES: &[&str] = &[
+    "particle/",
     "array/",
     "brigadier/",
     "config-holder/",
@@ -113,41 +114,6 @@ pub(crate) fn string_instance_of(marker: &str, wanted: &str) -> bool {
 /// or a class the collection model gives supertypes.
 fn collection_class(class: &str) -> bool {
     crate::runtime::is_collection_owner(class) || !crate::runtime::java_immutable::supertypes(class).is_empty()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape {
-    String,
-    Marker,
-    Undecidable,
-}
-
-pub(crate) fn string_shape(marker: &str) -> Shape {
-    if is_plain_string(marker) {
-        return Shape::String;
-    }
-    // Only these prefixes are still emitted as text markers. Other marker
-    // spellings were retired into handles (#156 P17), so jar text is exact.
-    const LIVE_TEXT_MARKER_PREFIXES: &[&str] = &[
-        "enum/",
-        "game/",
-        "client/",
-        "iterator/",
-        "stream/",
-        "block-pos/",
-        "typed/",
-        "registry/",
-        "payload/",
-        "payload-context/",
-    ];
-    if LIVE_TEXT_MARKER_PREFIXES
-        .iter()
-        .any(|p| marker.starts_with(p))
-    {
-        Shape::Marker
-    } else {
-        Shape::String
-    }
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
