@@ -587,6 +587,14 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             }
             return Ok(Some(Value::Void));
         }
+        if self.host_collection_class(list).as_deref() == Some("java/util/Arrays$ArrayList")
+            && key
+                .as_deref()
+                .is_some_and(|marker| marker.contains("neutral"))
+        {
+            self.host.unknown_operand_call(r)?;
+            return Ok(None);
+        }
         let Some(mut values) = self.host.mutable_collection_values(list) else {
             self.host.unknown_operand_call(r)?;
             return Ok(None);

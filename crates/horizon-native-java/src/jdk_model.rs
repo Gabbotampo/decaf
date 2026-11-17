@@ -740,7 +740,6 @@ impl crate::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        self.unknown_host_call(r)?;
         Ok(self.new_collection(super::stand_in_class("list"), range))
     }
 }
