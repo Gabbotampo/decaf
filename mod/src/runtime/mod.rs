@@ -4692,9 +4692,15 @@ impl StdHost {
                 else {
                     return self.unknown_host_call(r).map(Some);
                 };
-                let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
+                let raw = &bytes[*index..];
+                let is_reader = r.descriptor == "(Ljava/io/Reader;)V";
+                let text = if is_reader {
+                    String::from_utf8_lossy(raw).into_owned()
+                } else {
+                    raw.iter().map(|b| *b as char).collect()
+                };
                 *index = bytes.len();
-                let additions = properties_entries(&text);
+                let additions = match properties_entries(&text) { Ok(v) => v, Err(message) => return Err(NativeError::UncaughtException { class: "java/lang/IllegalArgumentException".into(), message: Some(message), frame: None }) };
                 let values = self
                     .mutable_collections
                     .entry(marker.to_owned())
@@ -14430,52 +14436,107 @@ fn string_from_char_code(code: i32) -> String {
     char::from_u32(code as u32).map_or_else(String::new, String::from)
 }
 
-fn properties_entries(text: &str) -> Vec<(String, String)> {
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut logical = Vec::new();
+    let mut current = String::new();
+    let mut cont = false;
+    for raw in text.lines() {
+        let mut line = raw.strip_suffix('\r').unwrap_or(raw).to_owned();
+        if cont {
+            let n = line.chars().take_while(|c| *c == ' ').count();
+            line.drain(..n);
+        }
+        let mut slashes = 0;
+        for c in line.chars().rev() {
+            if c == '\\' {
+                slashes += 1;
+            } else {
+                break;
+            }
+        }
+        cont = slashes % 2 == 1;
+        if cont {
+            line.pop();
+        }
+        current.push_str(&line);
+        if !cont {
+            logical.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        logical.push(current);
+    }
+    Ok(logical
+        .into_iter()
+        .filter_map(|line| {
+            let chars: Vec<char> = line.chars().collect();
+            let mut i = 0;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i == chars.len() || chars[i] == '#' || chars[i] == '!' {
+                return None;
+            }
+            let start = i;
+            let mut sep = None;
+            let mut escaped = false;
+            while i < chars.len() {
+                let c = chars[i];
+                if !escaped && (c == '=' || c == ':' || c.is_whitespace()) {
+                    sep = Some(i);
+                    break;
+                }
+                if c == '\\' {
+                    escaped = !escaped;
+                } else {
+                    escaped = false;
+                }
+                i += 1;
+            }
+            let k_end = sep.unwrap_or(chars.len());
+            let mut j = sep.unwrap_or(chars.len());
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '=' || chars[j] == ':') {
+                j += 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+            }
+            Some((
+                property_unescape(&chars[start..k_end].iter().collect::<String>())?,
+                property_unescape(&chars[j..].iter().collect::<String>())?,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Malformed \uxxxx encoding.".to_owned())
+}
+fn property_unescape(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = text.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
             continue;
         }
-        let (key, value) = match line.split_once('=') {
-            Some((key, value)) => (key, value),
-            None => match line.split_once(':') {
-                Some((key, value)) => (key, value),
-                None => match line.split_once(char::is_whitespace) {
-                    Some((key, value)) => (key, value),
-                    None => (line, ""),
-                },
-            },
-        };
-        entries.push((
-            property_unescape(key.trim()),
-            property_unescape(value.trim()),
-        ));
-    }
-    entries
-}
-
-/// Undo the escapes a `.properties` value may carry.
-fn property_unescape(text: &str) -> String {
-    let mut value = String::with_capacity(text.len());
-    let mut escaped = false;
-    for character in text.chars() {
-        if escaped {
-            value.push(match character {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                'f' => '\u{0c}',
-                other => other,
-            });
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else {
-            value.push(character);
+        match it.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{0c}'),
+            Some('u') => {
+                let mut n = 0u32;
+                for _ in 0..4 {
+                    n = n * 16 + it.next()?.to_digit(16)?;
+                }
+                out.push(char::from_u32(n)?);
+            }
+            Some(x) => out.push(x),
+            None => out.push('\\'),
         }
     }
-    value
+    Some(out)
 }
 
 /// The JDK's range check for a list read, write or removal.

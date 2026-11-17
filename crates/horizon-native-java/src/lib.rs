@@ -4697,7 +4697,7 @@ impl StdHost {
                     raw.iter().map(|b| *b as char).collect()
                 };
                 *index = bytes.len();
-                let additions = properties_entries(&text);
+                let additions = match properties_entries(&text) { Ok(v) => v, Err(message) => return Err(NativeError::UncaughtException { class: "java/lang/IllegalArgumentException".into(), message: Some(message), frame: None }) };
                 let values = self
                     .mutable_collections
                     .entry(marker.to_owned())
@@ -14433,7 +14433,7 @@ fn string_from_char_code(code: i32) -> String {
     char::from_u32(code as u32).map_or_else(String::new, String::from)
 }
 
-fn properties_entries(text: &str) -> Vec<(String, String)> {
+fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
     let mut logical = Vec::new();
     let mut current = String::new();
     let mut cont = false;
@@ -14463,7 +14463,7 @@ fn properties_entries(text: &str) -> Vec<(String, String)> {
     if !current.is_empty() {
         logical.push(current);
     }
-    logical
+    Ok(logical
         .into_iter()
         .filter_map(|line| {
             let chars: Vec<char> = line.chars().collect();
@@ -14506,7 +14506,8 @@ fn properties_entries(text: &str) -> Vec<(String, String)> {
                 property_unescape(&chars[j..].iter().collect::<String>())?,
             ))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Malformed \uxxxx encoding.".to_owned())
 }
 fn property_unescape(text: &str) -> Option<String> {
     let mut out = String::new();
