@@ -19,9 +19,10 @@ made, so the mod never drifts from ``crates/horizon-native-java``:
 
 The vendored files are committed: a clean clone builds the mod without running this tool.
 
-Two mods carry the copy: ``mod/`` (the Sunrise build) and ``mod-horizon/`` (the official Horizon
-build, on ``horizon-mod-api``). Each gets the same bytes in its own ``src/runtime/``; a mod folder that
-does not exist in a tree is skipped, and every one that exists is written and checked.
+By default the tool writes and checks ``mod/`` (the Sunrise build), the only mod whose copy is
+committed. ``--mod mod-horizon`` does the same for ``mod-horizon/`` (the official Horizon build, on
+``horizon-mod-api``), whose copy is not committed: its CI job and a local build generate it first
+(docs/mod-horizon.md). The bytes are the same in every mod.
 
 There is one check, ``--check``: it regenerates the copy in memory from
 ``crates/horizon-native-java/src`` **as it is now** and compares it byte for byte with the committed
@@ -52,7 +53,8 @@ from pathlib import Path, PurePosixPath
 
 # The crate the runtime comes from, and the mods that carry a copy of it.
 RUNTIME_SRC = Path("crates/horizon-native-java/src")
-MODS = (Path("mod"), Path("mod-horizon"))
+# The mod whose copy is committed and checked by default; `--mod` names others.
+DEFAULT_MODS = (Path("mod"),)
 # `main.rs` is the command-line probe: neither a module of the library nor anything the mod calls.
 SKIP = {PurePosixPath("main.rs")}
 # The crate-root path a vendored file's `crate::` becomes.
@@ -100,9 +102,9 @@ def included_files(src: Path, path: Path, original: bytes) -> list[PurePosixPath
     return out
 
 
-def vendor_dirs(root: Path) -> list[Path]:
-    """Each mod's `src/runtime/`, relative to `root`, for the mod folders this tree has."""
-    return [mod / "src" / "runtime" for mod in MODS if (root / mod).is_dir()]
+def vendor_dirs(mods: tuple[Path, ...]) -> list[Path]:
+    """Each named mod's `src/runtime/`, relative to the tree's root."""
+    return [mod / "src" / "runtime" for mod in mods]
 
 
 def vendored_files_on_disk(root: Path, vendor: Path) -> set[str]:
@@ -143,7 +145,7 @@ def expected(root: Path) -> dict[str, tuple[bytes, bytes]]:
     return files
 
 
-def drift(root: Path) -> list[str]:
+def drift(root: Path, mods: tuple[Path, ...] = DEFAULT_MODS) -> list[str]:
     """Every difference between the committed copies and what the runtime source vendors to now.
 
     Byte for byte, file by file, in every mod: a hand edit to a `src/runtime/`, a runtime change
@@ -151,7 +153,7 @@ def drift(root: Path) -> list[str]:
     """
     problems = []
     files = expected(root)
-    for vendor in vendor_dirs(root):
+    for vendor in vendor_dirs(mods):
         target = root / vendor
         for name, (_, vendored_bytes) in sorted(files.items()):
             path = target / name
@@ -168,9 +170,9 @@ def drift(root: Path) -> list[str]:
     return problems
 
 
-def write(root: Path) -> None:
+def write(root: Path, mods: tuple[Path, ...] = DEFAULT_MODS) -> None:
     files = expected(root)
-    for vendor in vendor_dirs(root):
+    for vendor in vendor_dirs(mods):
         target = root / vendor
         target.mkdir(parents=True, exist_ok=True)
         for name, (_, vendored_bytes) in sorted(files.items()):
@@ -190,10 +192,23 @@ def main(argv: list[str]) -> int:
         help="fail unless mod/src/runtime is exactly what the runtime source vendors to now",
     )
     parser.add_argument("--repo", type=Path, default=None, help="the tree to vendor (default: this one)")
+    parser.add_argument(
+        "--mod",
+        dest="mods",
+        type=Path,
+        action="append",
+        default=None,
+        help="a mod folder to vendor into or check, instead of mod/ (repeatable), e.g. mod-horizon",
+    )
     args = parser.parse_args(argv)
     root = (args.repo or repo_root()).resolve()
+    mods = tuple(args.mods) if args.mods else DEFAULT_MODS
+    for mod in mods:
+        if not (root / mod).is_dir():
+            parser.error(f"{mod}: no such mod folder in {root}")
+    dirs = ", ".join(str(vendor) for vendor in vendor_dirs(mods))
     if args.check:
-        problems = drift(root)
+        problems = drift(root, mods)
         for problem in problems:
             print(f"drift: {problem}", file=sys.stderr)
         if problems:
@@ -203,11 +218,9 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
             return 1
-        dirs = ", ".join(str(vendor) for vendor in vendor_dirs(root))
         print(f"{len(expected(root))} vendored file(s) match {RUNTIME_SRC} in {dirs}")
         return 0
-    write(root)
-    dirs = ", ".join(str(vendor) for vendor in vendor_dirs(root))
+    write(root, mods)
     print(f"vendored {len(expected(root))} file(s) into {dirs}")
     return 0
 

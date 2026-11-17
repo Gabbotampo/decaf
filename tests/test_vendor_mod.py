@@ -69,26 +69,31 @@ class VendorModTests(unittest.TestCase):
         self.assertEqual(same.returncode, 0, same.stderr)
         self.assertIn("vendored file(s) match", same.stdout)
 
-    def test_every_mod_folder_gets_the_copy_and_is_checked(self):
-        # `mod-horizon/` (the official-Horizon build) carries the same copy as `mod/`; a tree with
-        # only `mod/` is unchanged, and an edit in either copy fails the check.
+    def test_only_mod_is_vendored_unless_another_mod_is_named(self):
+        # `mod-horizon/` (the official-Horizon build) is never committed with its copy: the default
+        # run and check touch `mod/` only, and `--mod mod-horizon` writes and checks that folder.
         with tempfile.TemporaryDirectory() as scratch:
             tree = copy_tree(Path(scratch) / "tree")
             (tree / "mod-horizon").mkdir()
-            self.assertEqual(check(tree, "--check")[0], 1, "an empty mod-horizon/src/runtime drifts")
+            self.assertEqual(check(tree, "--check")[0], 0, "the default check ignores mod-horizon/")
             subprocess.run([sys.executable, str(VENDOR), "--repo", str(tree)], check=True,
                            capture_output=True, timeout=120)
-            self.assertEqual(check(tree, "--check")[0], 0)
-            for mod in ("mod", "mod-horizon"):
-                self.assertEqual(
-                    (tree / mod / "src" / "runtime" / "mod.rs").read_bytes(),
-                    (tree / "mod" / "src" / "runtime" / "mod.rs").read_bytes(),
-                )
+            self.assertFalse((tree / "mod-horizon" / "src" / "runtime").exists())
+            self.assertEqual(check(tree, "--check", "--mod", "mod-horizon")[0], 1, "not generated yet")
+            subprocess.run([sys.executable, str(VENDOR), "--mod", "mod-horizon", "--repo", str(tree)],
+                           check=True, capture_output=True, timeout=120)
+            self.assertEqual(check(tree, "--check", "--mod", "mod-horizon")[0], 0)
+            self.assertEqual(
+                (tree / "mod-horizon" / "src" / "runtime" / "mod.rs").read_bytes(),
+                (tree / "mod" / "src" / "runtime" / "mod.rs").read_bytes(),
+            )
             edited = tree / "mod-horizon" / "src" / "runtime" / "brigadier.rs"
             edited.write_bytes(edited.read_bytes() + b"\n")
-            code, stderr = check(tree, "--check")
+            self.assertEqual(check(tree, "--check")[0], 0, "an edit there never fails the default check")
+            code, stderr = check(tree, "--check", "--mod", "mod-horizon")
             self.assertEqual(code, 1)
             self.assertIn("mod-horizon/src/runtime/brigadier.rs", stderr)
+            self.assertNotEqual(check(tree, "--mod", "no-such-mod")[0], 0)
 
     def test_one_edited_byte_fails_the_check(self):
         with tempfile.TemporaryDirectory() as scratch:

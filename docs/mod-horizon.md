@@ -7,11 +7,14 @@ upstream and someone wanted Java mods in the official game; that side owns it (#
 
 - **Gabbotampo's side owns this build**: its bridge code, its pin, its CI job and its in-game proofs.
   Sunrise-side bridge changes made in `mod/` are not ported here by the maintainers.
-- **It never holds a runtime PR.** The `mod-horizon` CI job is `continue-on-error`; when an
-  interpreter change breaks it, the fix is a follow-up here.
-- **The runtime is generated, never copied by hand**: `tools/vendor.py` writes the same
-  `crates/horizon-native-java/src` copy into `mod/src/runtime/` and `mod-horizon/src/runtime/`, and
-  `vendor.py --check` checks both.
+- **It never holds a runtime PR.** The `mod-horizon` CI job is `continue-on-error`, and the `gates`
+  job's vendor check covers `mod/` only; when an interpreter change breaks this build, the fix is a
+  follow-up here.
+- **Its runtime copy is generated, never committed**: `python3 tools/vendor.py --mod mod-horizon`
+  writes the same `crates/horizon-native-java/src` copy as `mod/src/runtime/` into
+  `mod-horizon/src/runtime/` (ignored by git). The `mod-horizon` CI job runs it first; run it locally
+  before a build. Plain `vendor.py` and `vendor.py --check` touch `mod/` only, so no runtime PR has to
+  regenerate or commit anything for this build.
 
 ## What differs from `mod/`
 
