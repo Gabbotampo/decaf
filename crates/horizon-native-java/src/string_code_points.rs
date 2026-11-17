@@ -47,10 +47,6 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(Value::Ref(Some(text))) = receiver else {
                     return Ok(None);
                 };
-                // U+FFFD may be genuine or a lost lone surrogate (#447); count it.
-                if text.contains('\u{FFFD}') {
-                    return Ok(None);
-                }
                 // A `String` receiver: an object (a builder) is a handle.
                 if self.string_builders.contains_key(text)
                     && crate::jar_object::parse_key(text).is_none()
@@ -130,6 +126,10 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(Value::Ref(Some(text))) = receiver else {
                     return Ok(None);
                 };
+                // U+FFFD may be genuine or a lost lone surrogate (#447); count it.
+                if text.contains('\u{FFFD}') {
+                    return Some(self.host.unknown_host_call(r));
+                }
                 let charset = if r.descriptor == "()[B" {
                     "UTF-8"
                 } else {
