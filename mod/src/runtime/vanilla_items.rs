@@ -1237,3 +1237,25 @@ const FIELDS: &[&str] = &[
     "ZOMBIE_VILLAGER_SPAWN_EGG",
     "ZOMBIFIED_PIGLIN_SPAWN_EGG",
 ];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capture_matches_all_fields() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/vanilla_items/java25.txt");
+        let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/horizon-native-java/tests/fixtures/vanilla_items/java25.txt");
+        let text = std::fs::read_to_string(&path)
+            .or_else(|_| std::fs::read_to_string(&fallback))
+            .expect("vanilla Items Java 25 capture");
+        let rows: Vec<_> = text.lines().collect();
+        assert_eq!(super::FIELDS.len(), rows.len());
+        for row in rows {
+            let (field, id) = row.split_once('|').unwrap();
+            assert_eq!(super::field_id(field).as_deref(), Some(id));
+        }
+        assert_eq!(super::field_id("CHAIN"), None);
+        assert_eq!(super::field_id("NOT_A_FIELD"), None);
+    }
+}

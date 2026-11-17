@@ -1242,9 +1242,14 @@ const FIELDS: &[&str] = &[
 mod tests {
     #[test]
     fn capture_matches_all_fields() {
-        let rows: Vec<_> = include_str!("../tests/fixtures/vanilla_items/java25.txt")
-            .lines()
-            .collect();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/vanilla_items/java25.txt");
+        let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../crates/horizon-native-java/tests/fixtures/vanilla_items/java25.txt");
+        let text = std::fs::read_to_string(&path)
+            .or_else(|_| std::fs::read_to_string(&fallback))
+            .expect("vanilla Items Java 25 capture");
+        let rows: Vec<_> = text.lines().collect();
         assert_eq!(super::FIELDS.len(), rows.len());
         for row in rows {
             let (field, id) = row.split_once('|').unwrap();
