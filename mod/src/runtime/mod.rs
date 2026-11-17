@@ -25954,6 +25954,55 @@ impl<H: Host> Runtime<'_, H> {
         Some(self.new_array_value(&format!("[L{};", r.owner), values))
     }
 
+    /// `E.valueOf(String)` on a game enum whose constants the host lists
+    /// (`game_enum_constants`): the same value `E.values()` holds at that
+    /// constant's position, so it is the constant itself. `Enum.valueOf`'s
+    /// failures are Java's: a null name is `NullPointerException("Name is
+    /// null")`, an unknown one `IllegalArgumentException("No enum constant
+    /// <canonical class name>.<name>")`.
+    fn invoke_game_enum_value_of(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "valueOf" || r.descriptor != format!("(Ljava/lang/String;)L{};", r.owner) {
+            return Ok(None);
+        }
+        let Some(constants) = game_enum_constants(&r.owner) else {
+            return Ok(None);
+        };
+        let name = match args.first() {
+            Some(Value::Ref(Some(name))) => name,
+            Some(Value::Ref(None)) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Name is null".into()),
+                    frame: None,
+                });
+            }
+            _ => return Ok(None),
+        };
+        let Some(index) = constants.iter().position(|constant| constant == name) else {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/IllegalArgumentException".into(),
+                message: Some(format!(
+                    "No enum constant {}.{name}",
+                    r.owner.replace(['/', '$'], ".")
+                )),
+                frame: None,
+            });
+        };
+        let values = MethodRef {
+            owner: r.owner.clone(),
+            name: "values".into(),
+            descriptor: format!("()[L{};", r.owner),
+        };
+        let Some(array) = self.invoke_game_enum_values(&values) else {
+            return Ok(None);
+        };
+        Ok(self.array(&array)?.get(index).cloned())
+    }
+
     /// Answer the vanilla static helpers mod bootstraps call.
     ///
     /// `Util.make(Supplier)` and `Util.make(value, Consumer)` are shorthands
@@ -30521,6 +30570,10 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_game_enum_value_of(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,

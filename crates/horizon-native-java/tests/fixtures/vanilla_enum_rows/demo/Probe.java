@@ -38,6 +38,10 @@ public final class Probe {
     }
     row(out, "SoundSource.valueOf", () -> SoundSource.valueOf("PLAYERS") == SoundSource.PLAYERS);
     row(out, "SoundSource.field", () -> SoundSource.RECORDS.getName());
+    row(out, "SoundSource.valueOf.values", () -> SoundSource.valueOf("UI") == SoundSource.values()[10]);
+    row(out, "SoundSource.valueOf.unknown", () -> SoundSource.valueOf("NOPE"));
+    row(out, "SoundSource.valueOf.lowercase", () -> SoundSource.valueOf("players"));
+    row(out, "SoundSource.valueOf.null", () -> SoundSource.valueOf(null));
     row(out, "SoundSource.fresh", () -> SoundSource.values() != SoundSource.values());
     row(out, "Operation.count", () -> AttributeModifier.Operation.values().length);
     for (int i = 0; i < 3; i++) {
@@ -56,6 +60,7 @@ public final class Probe {
         () ->
             AttributeModifier.Operation.valueOf("ADD_VALUE")
                 == AttributeModifier.Operation.ADD_VALUE);
+    row(out, "Operation.valueOf.unknown", () -> AttributeModifier.Operation.valueOf("NOPE"));
     row(out, "HumanoidArm.count", () -> HumanoidArm.values().length);
     for (int i = 0; i < 2; i++) {
       int at = i;
