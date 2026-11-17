@@ -701,8 +701,8 @@ impl StdHost {
                     pairs.push(text(key.clone()));
                     pairs.push(loader::custom_value(id, &child(pointer, key), child_value));
                 }
-                let entries = self.host.mint_map_entries(&Value::Ref(None), &pairs, crate::host_map_entry::EntryMade::Holder);
-                return self.host.new_host_iterator(entries, None).ok_or_else(|| self.unknown_host_call(r).unwrap_err());
+                let entries = self.mint_map_entries(&Value::Ref(None), &pairs, crate::host_map_entry::EntryMade::Holder);
+                return match self.new_host_iterator(entries, None) { Some(iterator) => Ok(iterator), None => self.unknown_host_call(r) };
             }
         }
         match (r.name.as_str(), r.descriptor.as_str(), value) {
