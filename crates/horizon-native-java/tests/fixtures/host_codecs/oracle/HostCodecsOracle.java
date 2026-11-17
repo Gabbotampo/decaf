@@ -5,7 +5,7 @@ import java.lang.reflect.Method;
 public final class HostCodecsOracle {
   public static void main(String[] args) throws Exception {
     for (String probe : new String[] {"spelled", "spelledTypes", "pairs", "pairMaps", "recordConstruction", "identifierCodec", "eithers", "nested", "codecSingletons", "dfuConstruction", "opaqueCodec",
-        "codecDuplicate", "reviewTextForms", "createCounter", "createThrows", "encodeUnknown", "codecText", "mapUnitIdentity", "mapUnitText", "mapUnitCodecIdentity", "mapUnitExecution", "mapUnitNull", "streamUnitIdentity", "streamUnitRoundTrip", "streamUnitNull", "streamUnitCustomEquals", "countedOperations", "dfuText", "callbackXmapUse", "forgedDfuReceiver", "forgedDfuReceivers", "pairVsJdk"}) {
+        "codecDuplicate", "textFlatXmap", "textComapFlatMap", "textMapXmap", "textMapFlatXmap", "textList", "textRecord", "createCounter", "createCounterNull", "createThrows", "encodeUnknown", "codecText", "mapUnitIdentity", "mapUnitText", "mapUnitCodecIdentity", "mapUnitExecution", "mapUnitNull", "streamUnitIdentity", "streamUnitRoundTrip", "streamUnitNull", "streamUnitCustomEquals", "countedOperations", "dfuText", "callbackXmapUse", "forgedDfuReceiver", "forgedDfuReceivers", "pairVsJdk"}) {
       Method m = HostCodecs.class.getMethod(probe);
       Object answer;
       try {

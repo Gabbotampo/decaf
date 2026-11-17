@@ -225,7 +225,7 @@ public final class HostCodecs {
   /** Broad DFU operations are deliberately counted until the execution phase is modelled. */
   public static String countedOperations() {
     int calls = 0;
-    try { Codec.INT.listOf(); } catch (Throwable ignored) {} finally { calls++; }
+    try { Codec.INT.listOf(1, 3); } catch (Throwable ignored) {} finally { calls++; }
     try { ((Codec) Codec.INT).dispatch(null, null); } catch (Throwable ignored) {} finally { calls++; }
     try { ((Codec) Codec.INT).orElse((Codec) Codec.INT); } catch (Throwable ignored) {} finally { calls++; }
     try { Codec.INT.validate(x -> null); } catch (Throwable ignored) {} finally { calls++; }
@@ -388,17 +388,69 @@ public final class HostCodecs {
     System.gc();
     return kept.toString();
   }
-  public static String reviewTextForms() {
-    Codec<Integer> flat = Codec.INT.flatXmap(x -> com.mojang.serialization.DataResult.success(x + 1), x -> com.mojang.serialization.DataResult.success(x - 1));
-    Codec<Integer> comap = Codec.INT.comapFlatMap(x -> com.mojang.serialization.DataResult.success(x + 1), x -> x - 1);
-    MapCodec<String> unit = MapCodec.unit("u");
-    Codec<java.util.Optional<Integer>> optional = Codec.INT.optionalFieldOf("x").codec().flatXmap(x -> com.mojang.serialization.DataResult.success(x), x -> com.mojang.serialization.DataResult.success(x));
-    Codec<One> created = RecordCodecBuilder.create(x -> (App) null);
-    MapCodec<One> mapped = RecordCodecBuilder.mapCodec(x -> (App) null);
-    return flat + "|" + comap + "|" + unit + "|" + optional + "|" + created + "|" + mapped + "|" + mapped.codec();
+  // One probe per text form, so each is either exact or counted on its own (#410 review).
+  private static com.mojang.serialization.DataResult<Integer> ok(int value) {
+    return com.mojang.serialization.DataResult.success(value);
   }
+
+  /** `Codec.flatXmap`: the receiver's text and a suffix. */
+  public static String textFlatXmap() {
+    return String.valueOf(Codec.INT.flatXmap(x -> ok(x + 1), x -> ok(x - 1)));
+  }
+
+  /** `Codec.comapFlatMap`. */
+  public static String textComapFlatMap() {
+    return String.valueOf(Codec.INT.comapFlatMap(x -> ok(x + 1), x -> x - 1));
+  }
+
+  /** `MapCodec.xmap` over a field. */
+  public static String textMapXmap() {
+    return String.valueOf(Codec.INT.fieldOf("x").xmap(x -> x + 1, x -> x - 1));
+  }
+
+  /** `MapCodec.flatXmap` over a field. */
+  public static String textMapFlatXmap() {
+    return String.valueOf(Codec.INT.fieldOf("x").flatXmap(x -> ok(x + 1), x -> ok(x - 1)));
+  }
+
+  /** A list codec, and one mapped. */
+  public static String textList() {
+    return Codec.INT.listOf() + "|" + Codec.STRING.listOf().xmap(x -> x, x -> x);
+  }
+
+  /**
+   * A record codec built by `create`, its map codec twin, and that one's `codec()`. Their text
+   * holds a lambda's identity hash, which differs every run, so only its fixed start is read.
+   */
+  public static String textRecord() {
+    Codec<One> created = RecordCodecBuilder.create(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(One::a)).apply(i, One::new));
+    MapCodec<One> mapped = RecordCodecBuilder.mapCodec(i ->
+        i.group(Codec.INT.fieldOf("a").forGetter(One::a)).apply(i, One::new));
+    String start = "RecordCodec[UnitDecoder[";
+    return created.toString().startsWith(start) + "|" + mapped.toString().startsWith(start)
+        + "|" + mapped.codec().toString().startsWith(start);
+  }
+
   static int createCalls;
-  public static String createCounter() { createCalls = 0; RecordCodecBuilder.create(x -> { createCalls++; return (App) null; }); return Integer.toString(createCalls); }
+
+  /** `create` runs its builder callback once, while it is called. */
+  public static String createCounter() {
+    createCalls = 0;
+    Codec<One> codec = RecordCodecBuilder.create(i -> {
+      createCalls++;
+      return i.group(Codec.INT.fieldOf("a").forGetter(One::a)).apply(i, One::new);
+    });
+    return createCalls + "|" + (codec != null);
+  }
+
+  /** Once too when the callback hands back nothing a builder made. */
+  public static String createCounterNull() {
+    createCalls = 0;
+    RecordCodecBuilder.create(x -> { createCalls++; return (App) null; });
+    return Integer.toString(createCalls);
+  }
+
   public static String createThrows() { try { RecordCodecBuilder.create(x -> { throw new IllegalArgumentException("boom"); }); return "none"; } catch (Throwable t) { return t.getClass().getName() + ":" + t.getMessage(); } }
   public static String encodeUnknown() { try { Codec.INT.encodeStart(null, 1); } catch (Throwable ignored) {} return "called"; }
 
