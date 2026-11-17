@@ -10074,23 +10074,21 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-            if r.name == "remove"
-                && r.descriptor == "()V"
-                && self.iterator_sources.get(marker).is_some_and(|source| {
+            if r.name == "remove" && r.descriptor == "()V" {
+                let source = self.iterator_sources.get(marker).map(String::as_str);
+                if source.is_some_and(|source| {
                     source.starts_with("java/util/Collections$Unmodifiable")
                         || source == "java/util/Collections$SingletonList"
                         || source.starts_with("java/util/stream/")
-                })
-            {
-                return Err(NativeError::UncaughtException {
-                    class: "java/lang/UnsupportedOperationException".into(),
-                    message: if source.starts_with("java/util/stream/") {
-                        Some("remove".into())
-                    } else {
-                        None
-                    },
-                    frame: None,
-                });
+                }) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/UnsupportedOperationException".into(),
+                        message: source
+                            .filter(|source| source.starts_with("java/util/stream/"))
+                            .map(|_| "remove".into()),
+                        frame: None,
+                    });
+                }
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
