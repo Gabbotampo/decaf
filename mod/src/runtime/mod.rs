@@ -10127,7 +10127,9 @@ impl Host for StdHost {
             }
             ("java/nio/file/Path", "getFileName", "()Ljava/nio/file/Path;") => {
                 let original = path_text(receiver);
-                if original.is_empty() { return Ok(path_value("")); }
+                if original.is_empty() {
+                    return Ok(path_value(""));
+                }
                 let p = original.trim_end_matches('/');
                 Ok(p.rsplit('/')
                     .next()
