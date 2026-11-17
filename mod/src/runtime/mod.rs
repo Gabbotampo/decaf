@@ -30567,6 +30567,14 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if r.owner == "java/lang/String"
+                        && r.name == "format"
+                        && (r.descriptor
+                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                            || r.descriptor
+                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
+                    {
+                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
