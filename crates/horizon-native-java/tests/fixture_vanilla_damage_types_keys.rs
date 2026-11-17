@@ -10,7 +10,10 @@ mod javac_fixture;
 use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 
-const STUBS: &[(&str, &str)] = &[("net/minecraft/world/damagesource/DamageTypes.java", "package net.minecraft.world.damagesource; import net.minecraft.resources.ResourceKey; public interface DamageTypes { public static final ResourceKey PLAYER_ATTACK = null, ARROW = null; }")];
+const STUBS: &[(&str, &str)] = &[(
+    "net/minecraft/world/damagesource/DamageTypes.java",
+    "package net.minecraft.world.damagesource; import net.minecraft.resources.ResourceKey; public interface DamageTypes { public static final ResourceKey PLAYER_ATTACK = null, ARROW = null; }",
+)];
 const PROBE: &str = include_str!("fixtures/vanilla_damage_types_keys/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/vanilla_damage_types_keys/java25.txt");
 
