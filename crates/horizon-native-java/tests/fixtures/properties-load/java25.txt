@@ -1,9 +1,17 @@
-0R=key=value;|0I=key=value;
-1R=a=b;c=d;e=f;g=h;i=j;|1I=a=b;c=d;e=f;g=h;i=j;
-2R=cont=one\n  two;even=xy=z;|2I=cont=one\n  two;even=xy=z;
-3R=u=é;|3I=u=Ã©;
-4R==emptykey;empty=;|4I==emptykey;empty=;
-5R=dup=two;|5I=dup=two;
-6R=trail=x;|6I=trail=x;
-7R=bad=G4;|7I=bad=G4;
+x0R=a b=c;
+x0I=a b=c;
+x1R=a=one#two;
+x1I=a=one#two;
+x2R=a\fb=;
+x2I=a\fb=;
+x3R=a b=c;
+x3I=aÂ b=c;
+x4R=a=b;
+x4I=a=b;
+x5R=x5R=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.
+x5I=x5I=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.
+x6R=x6R=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.
+x6I=x6I=java.lang.IllegalArgumentException:Malformed \uxxxx encoding.
+x7R=e=é;
+x7I=e=Ã©;
 counted=counted:y
