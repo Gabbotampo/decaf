@@ -185,8 +185,11 @@ impl StdHost {
                 Some(self.random_seeded(LEGACY, as_long(seed)?))
             }
             ("create", "()Lnet/minecraft/util/RandomSource;", []) => {
-                let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64);
-                let seed = nanos ^ (self.random_sources.len() as i64).wrapping_mul(0x9E3779B97F4A7C15u64 as i64);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as i64);
+                let seed = nanos
+                    ^ (self.random_sources.len() as i64).wrapping_mul(0x9E3779B97F4A7C15u64 as i64);
                 Some(self.random_seeded(LEGACY, seed))
             }
             ("createThreadLocalInstance", "(J)Lnet/minecraft/util/RandomSource;", [seed]) => {

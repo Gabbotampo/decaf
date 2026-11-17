@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::runtime::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::runtime::{MethodRef, NativeError, StdHost, Value};
 
 pub(crate) fn is_bit_conversion(r: &MethodRef) -> bool {
@@ -181,6 +183,14 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str(), args) {
             ("create", "(J)Lnet/minecraft/util/RandomSource;", [seed]) => {
                 Some(self.random_seeded(LEGACY, as_long(seed)?))
+            }
+            ("create", "()Lnet/minecraft/util/RandomSource;", []) => {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as i64);
+                let seed = nanos
+                    ^ (self.random_sources.len() as i64).wrapping_mul(0x9E3779B97F4A7C15u64 as i64);
+                Some(self.random_seeded(LEGACY, seed))
             }
             ("createThreadLocalInstance", "(J)Lnet/minecraft/util/RandomSource;", [seed]) => {
                 Some(self.random_seeded(SINGLE, as_long(seed)?))
