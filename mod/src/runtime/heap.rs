@@ -1704,6 +1704,7 @@ mod tests {
             "imc",
             "entity_registration",
             "tool_material",
+            "fabric_block_api",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             // Live-object keys the host issued or tombstoned: host identities, never jar objects.
