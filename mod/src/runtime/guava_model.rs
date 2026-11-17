@@ -477,7 +477,7 @@ impl<H: Host> Runtime<'_, H> {
                                 std::slice::from_ref(value),
                             )?;
                         }
-                        return Ok(Some(receiver.clone()));
+                        Ok(Some(receiver.clone()))
                     }
                     "add" if !args.is_empty() => {
                         if args[0] == Value::Ref(None) {
@@ -502,6 +502,79 @@ impl<H: Host> Runtime<'_, H> {
                                 },
                                 &list,
                                 std::slice::from_ref(value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "addAll"
+                        if r.descriptor
+                            == "(Ljava/lang/Iterable;)Lcom/google/common/collect/ImmutableList$Builder;" =>
+                    {
+                        let values = runtime_collection_values(&*self.host, &args[0])?;
+                        if let Some((i, _)) = values
+                            .iter()
+                            .enumerate()
+                            .find(|(_, v)| **v == Value::Ref(None))
+                        {
+                            return Err(thrown(
+                                "java/lang/NullPointerException",
+                                Some(format!("at index {i}")),
+                            ));
+                        }
+                        let list =
+                            self.fields.get(&list_field).cloned().unwrap_or_else(|| {
+                                self.host.empty_mutable_collection("list").unwrap()
+                            });
+                        self.fields
+                            .entry(list_field.clone())
+                            .or_insert_with(|| list.clone());
+                        for value in values {
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(&value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "addAll"
+                        if r.descriptor
+                            == "(Ljava/util/Iterator;)Lcom/google/common/collect/ImmutableList$Builder;" =>
+                    {
+                        let iterator = &args[0];
+                        let marker = crate::runtime::host_iterator::marker(iterator)
+                            .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?;
+                        let (_, length, _) = self
+                            .host
+                            .host_iterator(marker)
+                            .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?;
+                        let list =
+                            self.fields.get(&list_field).cloned().unwrap_or_else(|| {
+                                self.host.empty_mutable_collection("list").unwrap()
+                            });
+                        self.fields
+                            .entry(list_field.clone())
+                            .or_insert_with(|| list.clone());
+                        for _ in 0..length {
+                            let value = self.host.host_iterator_next(marker)?;
+                            if value == Value::Ref(None) {
+                                return Err(thrown(
+                                    "java/lang/NullPointerException",
+                                    Some("at index 0".into()),
+                                ));
+                            }
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(&value),
                             )?;
                         }
                         Ok(Some(receiver.clone()))
