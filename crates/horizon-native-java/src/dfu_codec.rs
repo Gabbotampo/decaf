@@ -112,10 +112,11 @@ fn codec_receiver(value: &Value) -> bool {
     let Some(tag) = tag(value) else {
         return false;
     };
-    matches!(
+    (matches!(
         tag.as_str(),
         CONSTANT | XMAP | FLAT_XMAP | COMAP_FLAT_MAP | UNIT_CODEC | LIST | RECORD
-    ) && !map_codec(value)
+    ) || crate::host_codec::opaque_codec_type(value).is_some_and(|t| t == CODEC || t == PRIMITIVE))
+        && !map_codec(value)
 }
 
 fn map_receiver(value: &Value) -> bool {
