@@ -32,7 +32,6 @@ mod array_store;
 mod array_views;
 mod attachment_codec;
 mod bigdecimal_slice;
-mod scanner_model;
 mod block_entity_types;
 mod block_item_id;
 mod boxed;
@@ -222,6 +221,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod scanner_model;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
@@ -26685,30 +26685,80 @@ impl<H: Host> Runtime<'_, H> {
             .cloned();
         match r.owner.as_str() {
             "java/util/Scanner" => {
-                let Some(marker) = receiver_marker else { return Ok(None); };
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
                 match (r.name.as_str(), r.descriptor.as_str()) {
                     ("<init>", "(Ljava/io/File;)V") => {
-                        let Some(path) = args.first().and_then(|v| self.io_path_of(v)) else { return Ok(None); };
+                        let Some(path) = args.first().and_then(|v| self.io_path_of(v)) else {
+                            return Ok(None);
+                        };
                         let key = host_path::sandbox_canonical(&path);
                         let Some(bytes) = self.io_file_bytes.get(&key) else {
-                            return Err(NativeError::UncaughtException { class: "java/io/FileNotFoundException".into(), message: Some(format!("{} (No such file or directory)", path)), frame: None });
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/FileNotFoundException".into(),
+                                message: Some(format!("{} (No such file or directory)", path)),
+                                frame: None,
+                            });
                         };
                         let Ok(text) = String::from_utf8(bytes.clone()) else {
-                            self.scanners.insert(marker, scanner_model::ScannerState { text: String::new(), pos: 0, closed: false });
+                            self.scanners.insert(
+                                marker,
+                                scanner_model::ScannerState {
+                                    text: String::new(),
+                                    pos: 0,
+                                    closed: false,
+                                },
+                            );
                             return Ok(Some(Value::Void));
                         };
-                        self.scanners.insert(marker, scanner_model::ScannerState { text, pos: 0, closed: false });
+                        self.scanners.insert(
+                            marker,
+                            scanner_model::ScannerState {
+                                text,
+                                pos: 0,
+                                closed: false,
+                            },
+                        );
                         Ok(Some(Value::Void))
                     }
-                    ("hasNextLine", "()Z") => self.scanners.get(&marker).map(|st| Ok(Some(Value::Boolean(!st.closed && scanner_model::next_line(&st.text, st.pos).is_some())))).unwrap_or(Ok(None)),
+                    ("hasNextLine", "()Z") => self
+                        .scanners
+                        .get(&marker)
+                        .map(|st| {
+                            Ok(Some(Value::Boolean(
+                                !st.closed && scanner_model::next_line(&st.text, st.pos).is_some(),
+                            )))
+                        })
+                        .unwrap_or(Ok(None)),
                     ("nextLine", "()Ljava/lang/String;") => {
-                        let Some(st) = self.scanners.get_mut(&marker) else { return Ok(None); };
-                        if st.closed { return Err(NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: Some("Scanner closed".into()), frame: None }); }
-                        let Some((line, pos)) = scanner_model::next_line(&st.text, st.pos) else { return Err(NativeError::UncaughtException { class: "java/util/NoSuchElementException".into(), message: Some("No line found".into()), frame: None }); };
-                        st.pos = pos; Ok(Some(Value::Ref(Some(line))))
+                        let Some(st) = self.scanners.get_mut(&marker) else {
+                            return Ok(None);
+                        };
+                        if st.closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalStateException".into(),
+                                message: Some("Scanner closed".into()),
+                                frame: None,
+                            });
+                        }
+                        let Some((line, pos)) = scanner_model::next_line(&st.text, st.pos) else {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/util/NoSuchElementException".into(),
+                                message: Some("No line found".into()),
+                                frame: None,
+                            });
+                        };
+                        st.pos = pos;
+                        Ok(Some(Value::Ref(Some(line))))
                     }
-                    ("close", "()V") => { if let Some(st)=self.scanners.get_mut(&marker){st.closed=true;} Ok(Some(Value::Void)) }
-                    _ => Ok(None)
+                    ("close", "()V") => {
+                        if let Some(st) = self.scanners.get_mut(&marker) {
+                            st.closed = true;
+                        }
+                        Ok(Some(Value::Void))
+                    }
+                    _ => Ok(None),
                 }
             }
             "java/io/File" => {
