@@ -211,6 +211,12 @@ fn check(elements: &[Value]) -> Verdict {
         ));
     }
     let silent = |name: &&str| matches!(*name, "WRITE" | "SYNC" | "DSYNC" | "SPARSE");
+    if has("CREATE") && has("APPEND") {
+        return Verdict::CreateOrTruncate;
+    }
+    if has("WRITE") && !has("CREATE") && !has("CREATE_NEW") {
+        return Verdict::CreateOrTruncate;
+    }
     if has("CREATE")
         && has("TRUNCATE_EXISTING")
         && names

@@ -44,6 +44,12 @@ public final class FilesProbe {
         Path appendMissing = d.resolve("append-missing.txt");
         Files.deleteIfExists(appendMissing);
         r.add("appendMissing=" + attempt(() -> Files.writeString(appendMissing, "z", StandardOpenOption.APPEND)));
+        Path createAppend = d.resolve("create-append.txt");
+        r.add("createAppend=" + attempt(() -> Files.writeString(createAppend, "z", StandardOpenOption.CREATE, StandardOpenOption.APPEND)) + ",text=" + Files.readString(createAppend));
+        r.add("appendTruncate=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.APPEND, StandardOpenOption.TRUNCATE_EXISTING)));
+        r.add("readOption=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.READ)));
+        r.add("writeMissing=" + attempt(() -> Files.writeString(d.resolve("w.txt"), "x", StandardOpenOption.WRITE)));
+        r.add("sync=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.SYNC)));
         return String.join("\n", r);
     }
 }

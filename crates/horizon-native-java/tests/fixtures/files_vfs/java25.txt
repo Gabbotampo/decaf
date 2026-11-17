@@ -8,3 +8,8 @@ createNew=FileAlreadyExistsException:game/files-vfs/existing.txt
 append=ab
 truncateMissing=NoSuchFileException:game/files-vfs/truncate.txt
 appendMissing=NoSuchFileException:game/files-vfs/append-missing.txt
+createAppend=ok,text=z
+appendTruncate=IllegalArgumentException:APPEND + TRUNCATE_EXISTING not allowed
+readOption=IllegalArgumentException:READ not allowed
+writeMissing=NoSuchFileException:game/files-vfs/w.txt
+sync=ok
