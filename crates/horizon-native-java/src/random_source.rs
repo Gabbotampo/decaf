@@ -4,7 +4,6 @@
 //! factories stay on the counted host path because their seeds come from game
 //! or thread state.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
@@ -111,7 +110,6 @@ pub(crate) enum State {
     XoroshiroPositional { lo: u64, hi: u64 },
 }
 
-static NEXT_SOURCE: AtomicU64 = AtomicU64::new(1 << 48);
 
 impl State {
     fn class(&self) -> &'static str {
@@ -126,6 +124,11 @@ impl State {
 }
 
 impl StdHost {
+    pub(crate) fn generate_unique_seed(&mut self) -> i64 {
+        self.random_seed_uniquifier = self.random_seed_uniquifier.wrapping_mul(1_181_783_497_276_652_981);
+        (self.random_seed_uniquifier as i64) ^ self.random_time_origin.elapsed().as_nanos() as i64
+    }
+
     pub(crate) fn random_new(&mut self, class: &str) -> Option<Value> {
         let state = match class {
             LEGACY => State::Legacy {
@@ -147,7 +150,7 @@ impl StdHost {
         let key = format!(
             "{}#{}",
             state.class(),
-            NEXT_SOURCE.fetch_add(1, Ordering::Relaxed)
+            self.random_sources.len()
         );
         self.random_sources.insert(key.clone(), state);
         Value::Host(HostRef::new(HostKind::RandomSource, key))
