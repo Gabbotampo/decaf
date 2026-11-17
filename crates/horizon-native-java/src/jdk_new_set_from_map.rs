@@ -43,7 +43,9 @@ impl StdHost {
         // two map implementations; every other Map stays counted (#316).
         if !matches!(
             class,
-            "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/concurrent/ConcurrentHashMap"
+            "java/util/HashMap"
+                | "java/util/LinkedHashMap"
+                | "java/util/concurrent/ConcurrentHashMap"
         ) {
             return None;
         }
