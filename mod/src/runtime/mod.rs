@@ -26438,7 +26438,7 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
-                        message: Some("null".into()),
+                        message: Some("Cannot invoke \"java.nio.file.Path.getFileSystem()\" because \"path\" is null".into()),
                         frame: None,
                     });
                 }
