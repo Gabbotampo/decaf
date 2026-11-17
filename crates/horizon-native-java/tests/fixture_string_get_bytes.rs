@@ -12,5 +12,7 @@ fn string_get_bytes_rows_match_java25() {
     let got = fixture.text_on(&mut host, "rows");
     assert_eq!(got.trim(), ORACLE.trim());
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
- let name = fixture.text_on(&mut host, "nameOverload"); assert_eq!(name.trim(), NAME.trim()); assert!(!host.unknown_host_calls().is_empty());
+    let name = fixture.text_on(&mut host, "nameOverload");
+    assert_eq!(name.trim(), NAME.trim());
+    assert!(!host.unknown_host_calls().is_empty());
 }
