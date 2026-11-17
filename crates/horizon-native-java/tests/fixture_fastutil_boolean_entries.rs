@@ -4,7 +4,8 @@ const ORACLE: &str = include_str!("fixtures/fastutil_boolean_entries/java25.txt"
 const PROBE: &str = include_str!("fixtures/fastutil_boolean_entries/demo/Probe.java");
 #[test]
 fn fastutil_boolean_entries_matches_java25() {
-    let fixture = javac_fixture::Fixture::build("fastutil_boolean_entries", &[("demo/Probe.java", PROBE)]);
+    let fixture =
+        javac_fixture::Fixture::build("fastutil_boolean_entries", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     let answer = fixture
         .jar
