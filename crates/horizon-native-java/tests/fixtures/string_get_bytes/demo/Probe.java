@@ -18,7 +18,9 @@ public class Probe {
   o.append(row("ua",()->b(u.getBytes(StandardCharsets.US_ASCII)))).append("\n");
   o.append(row("ul",()->b(u.getBytes(StandardCharsets.ISO_8859_1)))).append("\n");
   o.append(row("ube",()->b(u.getBytes(StandardCharsets.UTF_16BE)))).append("\n");
-  o.append(row("ule",()->b(u.getBytes(StandardCharsets.UTF_16LE))));
+  o.append(row("ule",()->b(u.getBytes(StandardCharsets.UTF_16LE)))).append("\n");
+  String g="a\uFFFDb";
+  o.append(row("g8",()->b(g.getBytes(StandardCharsets.UTF_8))));
   return o.toString(); }
  public static String nameOverload(){String s="hé"; StringBuilder o=new StringBuilder(); try{o.append("name="+b(s.getBytes("UTF-8"))+"\n");}catch(Throwable e){o.append("name="+e.getClass().getName()+":"+e.getMessage()+"\n");} try{o.append("bad="+b(s.getBytes("NOPE")));}catch(Throwable e){o.append("bad="+e.getClass().getName()+":"+e.getMessage());} return o.toString();}
 }

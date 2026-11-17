@@ -126,9 +126,11 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(Value::Ref(Some(text))) = receiver else {
                     return Ok(None);
                 };
-                // U+FFFD may be genuine or a lost lone surrogate (#447); count it.
+                // U+FFFD may be genuine or a lone surrogate the string lost on the way in (#447):
+                // Java encodes the two differently, so decline and let the host count the call
+                // (no host model answers getBytes). A genuine U+FFFD is counted too: conservative.
                 if text.contains('\u{FFFD}') {
-                    return Some(self.host.unknown_host_call(r));
+                    return Ok(None);
                 }
                 let charset = if r.descriptor == "()[B" {
                     "UTF-8"
