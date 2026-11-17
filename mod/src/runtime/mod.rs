@@ -26927,10 +26927,10 @@ impl<H: Host> Runtime<'_, H> {
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if let Some(bytes) = self.io_file_bytes.get(&path) {
-                            if std::str::from_utf8(bytes).is_err() {
-                                return self.host.unknown_operand_call(r).map(Some);
-                            }
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && std::str::from_utf8(bytes).is_err()
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
                         }
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
@@ -27016,19 +27016,22 @@ impl<H: Host> Runtime<'_, H> {
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("write", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        let text = args
-                            .get(1)
-                            .and_then(|value| self.owned_array(value))
-                            .map(|bytes| {
-                                let bytes = bytes
-                                    .iter()
-                                    .map(|value| match value {
-                                        Value::Int(byte) => *byte as u8,
-                                        _ => 0,
-                                    })
-                                    .collect::<Vec<_>>();
-                                String::from_utf8_lossy(&bytes).into_owned()
-                            })
+                        let raw_bytes =
+                            args.get(1)
+                                .and_then(|value| self.owned_array(value))
+                                .map(|values| {
+                                    values
+                                        .iter()
+                                        .map(|value| match value {
+                                            Value::Int(byte) => *byte as u8,
+                                            _ => 0,
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
+                        let text = raw_bytes
+                            .as_deref()
+                            .map(String::from_utf8_lossy)
+                            .map(std::borrow::Cow::into_owned)
                             .unwrap_or_default();
                         // Lines (`write(Path, Iterable)`) never reach the model's text.
                         let bytes = args
@@ -27039,7 +27042,11 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_change(&path, watch_service::Change::Unmodelled);
                         }
-                        self.io_store_file(path, text)?;
+                        if let Some(bytes) = raw_bytes {
+                            self.io_store_bytes(path, bytes)?;
+                        } else {
+                            self.io_store_file(path, text)?;
+                        }
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)
@@ -27451,11 +27458,11 @@ impl<H: Host> Runtime<'_, H> {
                 // bounded reader surface consumes a file.
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
-                        if let Some(path) = self.io_paths.get(&marker) {
-                            if let Some(bytes) = self.io_file_bytes.get(path).cloned() {
-                                self.string_readers.insert(marker.clone(), String::new());
-                                return Ok(Some(self.io_bytes_array(bytes)));
-                            }
+                        if let Some(path) = self.io_paths.get(&marker)
+                            && let Some(bytes) = self.io_file_bytes.get(path).cloned()
+                        {
+                            self.string_readers.insert(marker.clone(), String::new());
+                            return Ok(Some(self.io_bytes_array(bytes)));
                         }
                         let text = self.string_readers.remove(&marker).unwrap_or_default();
                         self.string_readers.insert(marker.clone(), String::new());
