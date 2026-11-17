@@ -92,7 +92,21 @@ fn arg_string(v: &Value) -> Option<String> {
         .or_else(|| expect_ref(v).cloned())
 }
 pub(crate) fn enum_values(owner: &str) -> Option<Vec<Value>> {
-    (owner == "net/minecraft/world/entity/MobCategory").then(|| ["MONSTER", "CREATURE", "AMBIENT", "AXOLOTLS", "UNDERGROUND_WATER_CREATURE", "WATER_CREATURE", "WATER_AMBIENT", "MISC"].into_iter().filter_map(category_constant).collect())
+    (owner == "net/minecraft/world/entity/MobCategory").then(|| {
+        [
+            "MONSTER",
+            "CREATURE",
+            "AMBIENT",
+            "AXOLOTLS",
+            "UNDERGROUND_WATER_CREATURE",
+            "WATER_CREATURE",
+            "WATER_AMBIENT",
+            "MISC",
+        ]
+        .into_iter()
+        .filter_map(category_constant)
+        .collect()
+    })
 }
 
 pub(crate) fn category_constant(name: &str) -> Option<Value> {
@@ -472,7 +486,9 @@ pub(crate) fn define_id(state: &mut State, class_name: &str) -> Option<Result<Va
             if current.starts_with("net/minecraft/") {
                 return None;
             }
-            let Some(parent) = state.supers.get(&current) else { break 0 };
+            let Some(parent) = state.supers.get(&current) else {
+                break 0;
+            };
             current = parent.clone();
         }
     };
