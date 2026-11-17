@@ -1777,6 +1777,8 @@ mod tests {
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.
             "jar_registries",
             "registry_lifecycles",
+            "random_seed_uniquifier",
+            "random_time_origin",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
