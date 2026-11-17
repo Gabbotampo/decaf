@@ -9,6 +9,10 @@ public final class Probe {
   o.append("id|").append(v.id()).append('\n');
   o.append("protocol|").append(v.protocolVersion()).append('\n');
   o.append("stable|").append(v.stable()).append('\n');
+  o.append("data|").append(v.dataVersion().version()).append('|').append(v.dataVersion().series()).append('\n');
+  o.append("pack-server|").append(v.packVersion(net.minecraft.server.packs.PackType.SERVER_DATA).major()).append('.').append(v.packVersion(net.minecraft.server.packs.PackType.SERVER_DATA).minor()).append('\n');
+  o.append("pack-client|").append(v.packVersion(net.minecraft.server.packs.PackType.CLIENT_RESOURCES).major()).append('.').append(v.packVersion(net.minecraft.server.packs.PackType.CLIENT_RESOURCES).minor()).append('\n');
+  o.append("same|").append(SharedConstants.getCurrentVersion() == v).append('\n');
   
   return o.toString();
  }
