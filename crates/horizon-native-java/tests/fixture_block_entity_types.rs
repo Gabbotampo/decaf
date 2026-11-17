@@ -21,6 +21,7 @@ fn block_entity_types_rows_match_java25_oracle() {
                 "net/minecraft/world/level/block/entity/BlockEntityType.java",
                 TYPE,
             ),
+            ("net/minecraft/core/registries/BuiltInRegistries.java", REG),
         ],
     );
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
