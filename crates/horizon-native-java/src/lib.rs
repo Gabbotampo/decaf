@@ -26353,6 +26353,13 @@ impl<H: Host> Runtime<'_, H> {
                             Some(text) => Value::Ref(Some(text.clone())),
                             None => match seeded_text {
                                 Some(text) => Value::Ref(Some(text)),
+                                None if path.starts_with("/horizon/") => {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/io/IOException".into(),
+                                        message: Some(format!("{path}: no such file")),
+                                        frame: None,
+                                    });
+                                }
                                 None => return Ok(None),
                             },
                         }
