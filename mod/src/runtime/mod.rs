@@ -224,6 +224,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod scanner_model;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
@@ -19845,6 +19846,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20060,6 +20062,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20231,6 +20234,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -22442,6 +22446,7 @@ struct Runtime<'a, H> {
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
+    scanners: BTreeMap<String, scanner_model::ScannerState>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
@@ -26682,6 +26687,89 @@ impl<H: Host> Runtime<'_, H> {
             })
             .cloned();
         match r.owner.as_str() {
+            "java/util/Scanner" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("<init>", "(Ljava/io/File;)V") => {
+                        let Some(path) = args.first().and_then(|v| self.io_path_of(v)) else {
+                            return Ok(None);
+                        };
+                        let key = host_path::sandbox_canonical(&path);
+                        let Some(bytes) = self.io_file_bytes.get(&key) else {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/FileNotFoundException".into(),
+                                message: Some(format!("{} (No such file or directory)", path)),
+                                frame: None,
+                            });
+                        };
+                        let Ok(text) = String::from_utf8(bytes.clone()) else {
+                            self.scanners.insert(
+                                marker,
+                                scanner_model::ScannerState {
+                                    text: String::new(),
+                                    pos: 0,
+                                    closed: false,
+                                },
+                            );
+                            return Ok(Some(Value::Void));
+                        };
+                        self.scanners.insert(
+                            marker,
+                            scanner_model::ScannerState {
+                                text,
+                                pos: 0,
+                                closed: false,
+                            },
+                        );
+                        Ok(Some(Value::Void))
+                    }
+                    ("hasNextLine", "()Z") => self
+                        .scanners
+                        .get(&marker)
+                        .map(|st| {
+                            Ok(Some(Value::Int(
+                                if !st.closed
+                                    && scanner_model::next_line(&st.text, st.pos).is_some()
+                                {
+                                    1
+                                } else {
+                                    0
+                                },
+                            )))
+                        })
+                        .unwrap_or(Ok(None)),
+                    ("nextLine", "()Ljava/lang/String;") => {
+                        let Some(st) = self.scanners.get_mut(&marker) else {
+                            return Ok(None);
+                        };
+                        if st.closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalStateException".into(),
+                                message: Some("Scanner closed".into()),
+                                frame: None,
+                            });
+                        }
+                        let Some((line, pos)) = scanner_model::next_line(&st.text, st.pos) else {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/util/NoSuchElementException".into(),
+                                message: Some("No line found".into()),
+                                frame: None,
+                            });
+                        };
+                        st.pos = pos;
+                        Ok(Some(Value::Ref(Some(line))))
+                    }
+                    ("close", "()V") => {
+                        if let Some(st) = self.scanners.get_mut(&marker) {
+                            st.closed = true;
+                        }
+                        Ok(Some(Value::Void))
+                    }
+                    _ => Ok(None),
+                }
+            }
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
@@ -35964,6 +36052,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -36036,6 +36125,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43188,6 +43278,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43402,6 +43493,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43591,6 +43683,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43956,6 +44049,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -44265,6 +44359,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49532,6 +49627,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49591,6 +49687,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
