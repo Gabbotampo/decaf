@@ -26693,6 +26693,7 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             });
         };
+        self.io_paths.insert(marker.to_owned(), path.to_owned());
         self.string_readers.insert(marker.to_owned(), text);
         Ok(())
     }
@@ -26923,6 +26924,11 @@ impl<H: Host> Runtime<'_, H> {
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if let Some(bytes) = self.io_file_bytes.get(&path) {
+                            if std::str::from_utf8(bytes).is_err() {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                        }
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
                             None => match seeded_text {
@@ -27442,6 +27448,12 @@ impl<H: Host> Runtime<'_, H> {
                 // bounded reader surface consumes a file.
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
+                        if let Some(path) = self.io_paths.get(&marker) {
+                            if let Some(bytes) = self.io_file_bytes.get(path).cloned() {
+                                self.string_readers.insert(marker.clone(), String::new());
+                                return Ok(Some(self.io_bytes_array(bytes)));
+                            }
+                        }
                         let text = self.string_readers.remove(&marker).unwrap_or_default();
                         self.string_readers.insert(marker.clone(), String::new());
                         self.io_bytes_array(text.into_bytes())
