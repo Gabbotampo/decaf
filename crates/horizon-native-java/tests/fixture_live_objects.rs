@@ -111,7 +111,7 @@ impl Run {
                 name,
                 desc,
                 None,
-                &[arg.clone()],
+                std::slice::from_ref(arg),
                 &mut self.host,
             )
             .unwrap();
