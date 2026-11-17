@@ -26726,7 +26726,7 @@ impl<H: Host> Runtime<'_, H> {
                         .scanners
                         .get(&marker)
                         .map(|st| {
-                            Ok(Some(Value::Boolean(
+                            Ok(Some(Value::Int(
                                 !st.closed && scanner_model::next_line(&st.text, st.pos).is_some(),
                             )))
                         })
