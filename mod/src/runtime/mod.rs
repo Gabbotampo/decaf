@@ -10082,11 +10082,12 @@ impl Host for StdHost {
                 && self.iterator_sources.get(marker).is_some_and(|source| {
                     source.starts_with("java/util/Collections$Unmodifiable")
                         || source == "java/util/Collections$SingletonList"
+                        || source.starts_with("java/util/stream/")
                 })
             {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/UnsupportedOperationException".into(),
-                    message: None,
+                    message: if source.starts_with("java/util/stream/") { Some("remove".into()) } else { None },
                     frame: None,
                 });
             }
