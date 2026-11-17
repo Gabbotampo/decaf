@@ -35,6 +35,7 @@ mod array_store;
 mod array_views;
 mod attachment_codec;
 mod bigdecimal_slice;
+mod block_entity_types;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -68,6 +69,7 @@ mod enum_value_of;
 pub mod events;
 mod executors;
 mod fabric_api_slice2;
+mod fabric_block_api;
 mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
@@ -3634,6 +3636,8 @@ pub struct StdHost {
     imc: neoforge_imc::ImcHandle,
     entity_registration: entity_registration::State,
     tool_material: tool_material::State,
+    /// one table per host; a conflict between two jars' registrations is not detected
+    fabric_block_api: fabric_block_api::State,
 }
 
 impl Default for StdHost {
@@ -3798,6 +3802,7 @@ impl StdHost {
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
+            fabric_block_api: fabric_block_api::State::default(),
         }
     }
 
@@ -6431,6 +6436,9 @@ impl Host for StdHost {
         if let Some(value) = vanilla_values::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = block_entity_types::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = mod_origin::static_field(r) {
             return Ok(value);
         }
@@ -6705,6 +6713,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
+            return value;
+        }
         if let Some(value) =
             entity_registration::static_call(&mut self.entity_registration, r, args)
         {
@@ -8190,6 +8201,11 @@ impl Host for StdHost {
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
         }
+        if let Some(value) =
+            fabric_block_api::instance_call(&mut self.fabric_block_api, r, receiver, args)
+        {
+            return value;
+        }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
             return value;
         }
@@ -8455,6 +8471,19 @@ impl Host for StdHost {
             }
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("<init>", descriptor) => {
+                    let parameters = descriptor_arguments(descriptor);
+                    if parameters
+                        .iter()
+                        .position(|parameter| parameter == "Ljava/lang/String;")
+                        .and_then(|index| args.get(index))
+                        .is_some_and(|value| matches!(value, Value::Ref(None)))
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("'name' is null".into()),
+                            frame: None,
+                        });
+                    }
                     let marker = marker.clone();
                     self.note_thread_made(&marker, descriptor, args);
                     Ok(Value::Void)
@@ -10041,7 +10070,30 @@ impl Host for StdHost {
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
             ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
-                Ok(path_value(path_text(receiver)))
+                let path = path_text(receiver);
+                let abs = path.starts_with('/');
+                let mut out: Vec<&str> = Vec::new();
+                for part in path.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            if out.last() == Some(&"..") {
+                                if !abs {
+                                    out.push("..");
+                                }
+                            } else if out.pop().is_none() && !abs {
+                                out.push("..");
+                            }
+                        }
+                        x => out.push(x),
+                    }
+                }
+                let text = if abs {
+                    format!("/{}", out.join("/"))
+                } else {
+                    out.join("/")
+                };
+                Ok(path_value(&text))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 let child = expect_string(Self::argument(r, args, 0)?);
@@ -10055,15 +10107,66 @@ impl Host for StdHost {
                 Ok(path_value(&path_join(path_text(receiver), child)))
             }
             ("java/nio/file/Path", "getFileName", "()Ljava/nio/file/Path;") => {
-                let name = path_text(receiver).rsplit('/').next().unwrap_or_default();
-                Ok(path_value(name))
+                let original = path_text(receiver);
+                if original.is_empty() {
+                    return Ok(path_value(""));
+                }
+                let p = original.trim_end_matches('/');
+                Ok(p.rsplit('/')
+                    .next()
+                    .filter(|x| !x.is_empty())
+                    .map_or(Value::Ref(None), path_value))
             }
             ("java/nio/file/Path", "getParent", "()Ljava/nio/file/Path;") => {
-                let path = path_text(receiver);
-                Ok(path
+                let p = path_text(receiver).trim_end_matches('/');
+                let parent = p
                     .rsplit_once('/')
-                    .filter(|(parent, _)| !parent.is_empty())
-                    .map_or(Value::Ref(None), |(parent, _)| path_value(parent)))
+                    .map(|(a, _)| if a.is_empty() { "/" } else { a });
+                Ok(parent.map_or(Value::Ref(None), path_value))
+            }
+            ("java/nio/file/Path", "getRoot", "()Ljava/nio/file/Path;") => {
+                Ok(if path_text(receiver).starts_with('/') {
+                    path_value("/")
+                } else {
+                    Value::Ref(None)
+                })
+            }
+            ("java/nio/file/Path", "getNameCount", "()I") => {
+                Ok(Value::Int(path_names(path_text(receiver)).len() as i32))
+            }
+            ("java/nio/file/Path", "getName", "(I)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let i = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if i < 0 || i as usize >= p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(p[i as usize]))
+            }
+            ("java/nio/file/Path", "subpath", "(II)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let a = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                let b = match Self::argument(r, args, 1)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if a < 0 || b <= a || b as usize > p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(&p[a as usize..b as usize].join("/")))
             }
             ("java/lang/Class", "getName", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(class_binary_name(receiver))))
@@ -11351,6 +11454,24 @@ impl Host for StdHost {
             | ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => {
                 self.unknown_host_call(r)
             }
+            (
+                "net/minecraft/core/Registry",
+                "getKey",
+                "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;",
+            ) if host_registry::registry_id(receiver) == Some("minecraft:block_entity_type")
+                && args
+                    .first()
+                    .and_then(crate::runtime::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .is_some() =>
+            {
+                let id = args
+                    .first()
+                    .and_then(crate::runtime::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .unwrap_or_default();
+                Ok(host_ids::identifier_of_text(id))
+            }
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
             // their registry wrappers by `registry.key().identifier()`.
@@ -12193,6 +12314,16 @@ fn expect_string(value: &Value) -> &str {
 /// `java.io.File.hashCode` on Linux: `path.hashCode() ^ 1234321`.
 fn file_hash(path: &str) -> i32 {
     stable_hash(path) ^ 1234321
+}
+
+/// A `Path`'s name elements, as `UnixPath` counts them: the text between separators, with
+/// repeated and trailing separators ignored. The empty path is one empty name (Java 25:
+/// `Path.of("").getNameCount() == 1`, `getName(0)` is `""`); the root alone has none.
+fn path_names(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    text.split('/').filter(|name| !name.is_empty()).collect()
 }
 
 fn path_join(base: &str, child: &str) -> String {
@@ -24605,7 +24736,17 @@ impl<H: Host> Runtime<'_, H> {
                 )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
-                Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
+                let value = StdHost::argument(r, args, 0)?;
+                if let Value::Ref(Some(text)) = value
+                    && value_class::is_plain_string(text)
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Argument is not an array".into()),
+                        frame: None,
+                    });
+                }
+                Value::Int(self.array(value)?.len() as i32)
             }
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
