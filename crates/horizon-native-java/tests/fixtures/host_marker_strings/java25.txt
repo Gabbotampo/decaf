@@ -1,0 +1,10 @@
+s0=abc/hcb:x|9|true|true|ABC/HCB:X|abc
+s1=list/hobj:x|11|true|true|LIST/HOBJ:X|lis
+s2=hcb:|4|true|true|HCB:|hcb
+s3=enum/x|6|true|true|ENUM/X|enu
+s4=client/x|8|true|true|CLIENT/X|cli
+s5=game/x|6|true|true|GAME/X|gam
+c0=[demo.Probe$$Lambda/0x00007fff01040210@58644d46]
+c1=[demo.Probe$$Lambda/0x00007fff01040210@58644d46]
+c2={k=demo.Probe$$Lambda/0x00007fff01040210@58644d46}
+c3=Optional[demo.Probe$$Lambda/0x00007fff01040210@58644d46]
