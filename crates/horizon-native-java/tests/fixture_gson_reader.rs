@@ -6,6 +6,25 @@ const PROBE: &str = include_str!("fixtures/gson_reader/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/gson_reader/java25.txt");
 const COUNTED: &str = include_str!("fixtures/gson_reader/java25_counted.txt");
 const RESOURCE: &[u8] = include_bytes!("fixtures/gson_reader/resource-config.json");
+const SIG: &str =
+    "com/google/gson/Gson#fromJson(Ljava/io/Reader;Ljava/lang/Class;)Ljava/lang/Object;";
+fn call(f: &javac_fixture::Fixture, method: &str, host: &mut StdHost) -> String {
+    match f
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            method,
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            host,
+        )
+        .unwrap()
+    {
+        Value::Ref(Some(s)) => s,
+        x => format!("{x:?}"),
+    }
+}
 #[test]
 fn gson_reader_matches_java25() {
     let fixture = javac_fixture::Fixture::build_with_lib(
@@ -17,26 +36,16 @@ fn gson_reader_matches_java25() {
         &[("resource-config.json", RESOURCE)],
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
-    let answer = fixture
-        .jar
-        .invoke_method_with_args(
-            "demo/Probe",
-            "rows",
-            "()Ljava/lang/String;",
-            None,
-            &[],
-            &mut host,
-        )
-        .unwrap();
-    let text = match answer {
-        Value::Ref(Some(s)) => s,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(text, ORACLE);
+    assert_eq!(call(&fixture, "rows", &mut host), ORACLE);
     assert!(
         host.unknown_host_calls().is_empty(),
         "{:?}",
         host.unknown_host_calls()
     );
-    assert!(COUNTED.is_empty());
+    let methods: Vec<_> = COUNTED.lines().filter(|x| !x.is_empty()).collect();
+    assert_eq!(methods, ["trailing", "twice"]);
+    for method in methods {
+        let _ = call(&fixture, method, &mut host);
+    }
+    assert_eq!(host.unknown_host_calls(), vec![(SIG.to_owned(), 3)]);
 }

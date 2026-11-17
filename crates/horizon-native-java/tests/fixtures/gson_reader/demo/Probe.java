@@ -16,9 +16,10 @@ public final class Probe {
     b.append("file=").append(one(g,Files.newBufferedReader(p))).append('\n');
     try (Reader r=new InputStreamReader(Probe.class.getResourceAsStream("/resource-config.json"))) { b.append("resource=").append(one(g,r)).append('\n'); }
     b.append("missing=").append(one(g,new StringReader("{\"n\":1}"))).append('\n');
-    b.append("trailing=").append(one(g,new StringReader("{\"n\":1} garbage"))).append('\n');
     b.append("empty=").append(one(g,new StringReader(""))).append('\n');
-    StringReader twice=new StringReader("{\"n\":8}"); b.append("twice1=").append(one(g,twice)).append('\n'); b.append("twice2=").append(one(g,twice)).append('\n');
     return b.toString();
+  }
+  public static String trailing() { return one(new Gson(), new StringReader("{\"n\":1} garbage")); }
+  public static String twice() { Gson g=new Gson(); StringReader r=new StringReader("{\"n\":8}"); return one(g,r)+"|"+one(g,r); }
   }
 }
