@@ -957,6 +957,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_list_reverse(r, args)? {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_identifier_runtime(r, receiver, args)? {
             return Ok(Some(value));
         }
