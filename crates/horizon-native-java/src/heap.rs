@@ -319,6 +319,9 @@ impl StdHost {
         for held in self.creative_tab.values() {
             value(held, out);
         }
+        for held in self.creative_tab.values() {
+            value(held, out);
+        }
         // NeoForge attachment types and live values (`neoforge_attachments.rs`).
         self.neoforge_attachments.root_texts(out);
         // The objects the loader built and keeps (an entrypoint instance,

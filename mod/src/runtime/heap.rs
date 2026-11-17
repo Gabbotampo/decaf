@@ -316,6 +316,7 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
+        for held in self.creative_tab.values() { value(held, out); }
         for held in self.creative_tab.values() {
             value(held, out);
         }

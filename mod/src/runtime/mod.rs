@@ -3640,6 +3640,7 @@ pub struct StdHost {
     tool_material: tool_material::State,
     /// one table per host; a conflict between two jars' registrations is not detected
     fabric_block_api: fabric_block_api::State,
+    creative_tab: host_creative_tab::State,
     vec2: vec2::State,
 }
 
@@ -3806,6 +3807,7 @@ impl StdHost {
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
             fabric_block_api: fabric_block_api::State::default(),
+            creative_tab: host_creative_tab::State::default(),
             vec2: vec2::State::default(),
         }
     }
