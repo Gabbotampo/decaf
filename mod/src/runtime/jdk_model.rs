@@ -754,7 +754,6 @@ impl crate::runtime::StdHost {
                 frame: None,
             });
         }
-        eprintln!("SUBLIST parent={marker}");
         let range = values[from as usize..to as usize].to_vec();
         let made = self.new_collection(super::stand_in_class("list"), range);
         let old = match &made {

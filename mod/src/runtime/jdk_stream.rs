@@ -547,7 +547,6 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         {
             return Ok(None);
         }
-        eprintln!("REVERSE args={args:?}");
         let Some(list) = args.first() else {
             return Ok(None);
         };
