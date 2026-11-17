@@ -14532,8 +14532,7 @@ fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
                 property_unescape(&chars[j..].iter().collect::<String>())?,
             ))
         })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "Malformed \\uxxxx encoding.".to_owned()))
+        .collect::<Vec<_>>())
 }
 fn property_unescape(text: &str) -> Option<String> {
     let mut out = String::new();
