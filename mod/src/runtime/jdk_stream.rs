@@ -536,9 +536,20 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
     }
 
     /// `Collections.reverse(list)` reverses a mutable host list in place.
-    pub(crate) fn invoke_list_reverse(&mut self, r: &MethodRef, args: &[Value]) -> Result<Option<Value>, NativeError> {
-        if !(r.owner == "java/util/Collections" && r.name == "reverse" && r.descriptor == "(Ljava/util/List;)V") { return Ok(None); }
-        let Some(list) = args.first() else { return Ok(None); };
+    pub(crate) fn invoke_list_reverse(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !(r.owner == "java/util/Collections"
+            && r.name == "reverse"
+            && r.descriptor == "(Ljava/util/List;)V")
+        {
+            return Ok(None);
+        }
+        let Some(list) = args.first() else {
+            return Ok(None);
+        };
         let Some(mut values) = self.host.mutable_collection_values(list) else {
             self.host.unknown_operand_call(r)?;
             return Ok(None);
