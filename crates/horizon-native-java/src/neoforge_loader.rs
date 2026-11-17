@@ -293,7 +293,7 @@ impl StdHost {
             let name = crate::host_path::fml_path_name(receiver)?;
             return fml_path_root(name).map(crate::path_value);
         }
-        if let Some(value) = self.neoforge_loader_handle(r, receiver) {
+        if let Some(value) = self.neoforge_loader_handle(r, receiver, args) {
             return Some(value);
         }
         let marker = match receiver {
@@ -371,7 +371,7 @@ impl StdHost {
     /// container's bus, info and extension points, a mod info's id and
     /// version, a file info's version, a config type's name and ordinal, a
     /// world version's name.
-    fn neoforge_loader_handle(&mut self, r: &MethodRef, receiver: &Value) -> Option<Value> {
+    fn neoforge_loader_handle(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
         if let Some(id) = loader::container_id(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 // A `javafml` mod's container is an `FMLModContainer`, whose
@@ -403,7 +403,7 @@ impl StdHost {
                 (
                     "registerExtensionPoint",
                     "(Ljava/lang/Class;Ljava/util/function/Supplier;)V",
-                ) => Some(Value::Void),
+                ) if args.len() == 2 && !matches!(args[0], Value::Ref(None)) && !matches!(args[1], Value::Ref(None)) => Some(Value::Void),
                 _ => None,
             };
         }
