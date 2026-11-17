@@ -26704,6 +26704,9 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         };
+                        // Java's strict decoder stops at malformed input and the scanner
+                        // ends there (`lastException`); how much of the valid prefix it
+                        // yields depends on StreamDecoder's buffering, so reads are counted.
                         let Ok(text) = String::from_utf8(bytes.clone()) else {
                             self.scanners.insert(
                                 marker,
@@ -26711,7 +26714,7 @@ impl<H: Host> Runtime<'_, H> {
                                     text: String::new(),
                                     pos: 0,
                                     closed: false,
-                                    unknown: false,
+                                    unknown: true,
                                 },
                             );
                             return Ok(Some(Value::Void));
@@ -26739,6 +26742,9 @@ impl<H: Host> Runtime<'_, H> {
                                 message: Some("Scanner closed".into()),
                                 frame: None,
                             });
+                        }
+                        if st.unknown {
+                            return Ok(None);
                         }
                         Ok(Some(Value::Int(i32::from(
                             scanner_model::next_line(&st.text, st.pos).is_some(),
@@ -27062,30 +27068,32 @@ impl<H: Host> Runtime<'_, H> {
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("write", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        let text = args
-                            .get(1)
-                            .and_then(|value| self.owned_array(value))
-                            .map(|bytes| {
-                                let bytes = bytes
-                                    .iter()
-                                    .map(|value| match value {
-                                        Value::Int(byte) => *byte as u8,
-                                        _ => 0,
-                                    })
-                                    .collect::<Vec<_>>();
-                                String::from_utf8_lossy(&bytes).into_owned()
-                            })
-                            .unwrap_or_default();
-                        // Lines (`write(Path, Iterable)`) never reach the model's text.
-                        let bytes = args
-                            .get(1)
-                            .is_some_and(|value| self.owned_array(value).is_some());
-                        if bytes {
-                            self.watch_whole_write(&path, text.is_empty());
-                        } else {
-                            self.watch_change(&path, watch_service::Change::Unmodelled);
+                        let bytes =
+                            args.get(1)
+                                .and_then(|value| self.owned_array(value))
+                                .map(|bytes| {
+                                    bytes
+                                        .iter()
+                                        .map(|value| match value {
+                                            Value::Int(byte) => *byte as u8,
+                                            _ => 0,
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
+                        match bytes {
+                            // `write(Path, byte[])` writes the bytes as they are: keep them raw,
+                            // so a later reader (a strict `Scanner` decoder, `readAllBytes`) sees
+                            // malformed UTF-8 rather than its lossy re-encoding.
+                            Some(bytes) => {
+                                self.watch_whole_write(&path, bytes.is_empty());
+                                self.io_store_bytes(path, bytes)?;
+                            }
+                            // Lines (`write(Path, Iterable)`) never reach the model's text.
+                            None => {
+                                self.watch_change(&path, watch_service::Change::Unmodelled);
+                                self.io_store_file(path, String::new())?;
+                            }
                         }
-                        self.io_store_file(path, text)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)

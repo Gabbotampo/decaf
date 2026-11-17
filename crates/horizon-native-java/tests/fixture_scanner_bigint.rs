@@ -20,11 +20,15 @@ fn scanner_rows_match_java25() {
 fn malformed_utf8_is_counted() {
     let f = javac_fixture::Fixture::build("scanner_bigint", &[("demo/Probe.java", PROBE)]);
     let mut host = f.jar.seed_host(horizon_native_java::StdHost::new());
-    let malformed = f.text_on(&mut host, "malformed");
-    assert_eq!(malformed, "|bad:false:NoSuchElementException:No line found");
-    // Invalid UTF-8 is deliberately left unknown; Scanner.hasNextLine is counted once.
+    // Java answers `|bad:false:NoSuchElementException:No line found`; Decaf leaves the
+    // strict decoder's malformed-input stop unknown, so the text is not Java's and only
+    // the count is pinned: both reads after the malformed input are counted.
+    let _ = f.text_on(&mut host, "malformed");
     assert_eq!(
         host.unknown_host_calls(),
-        vec![("java/util/Scanner#hasNextLine()Z".into(), 1)]
+        vec![
+            ("java/util/Scanner#hasNextLine()Z".into(), 1),
+            ("java/util/Scanner#nextLine()Ljava/lang/String;".into(), 1),
+        ]
     );
 }
