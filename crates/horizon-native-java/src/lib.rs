@@ -12582,12 +12582,6 @@ fn java_value_text<H: Host>(
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        // Nor does a callback, or a composition holding one: its text names
-        // a live callback (`callback_marker.rs`).
-        Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
-            callback_marker::CALLBACK_TEXT.into()
-        }
-
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
@@ -13616,10 +13610,6 @@ fn value_text(value: &Value) -> String {
             // A stream never prints its marker (`stream_pipeline.rs`).
             if stream_pipeline::is_stream_marker(value) {
                 return stream_pipeline::STREAM_TEXT.into();
-            }
-            // Nor does a callback (`callback_marker.rs`).
-            if callback_marker::holds_callback(value) {
-                return callback_marker::CALLBACK_TEXT.into();
             }
             value.clone()
         }
