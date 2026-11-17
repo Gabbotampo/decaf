@@ -527,8 +527,10 @@ fn compact_and_pretty_documents_are_gson_text() {
 #[test]
 fn separator_rows_match_gson_214() {
     let fixture = Fixture::build("separator-rows");
-    assert_eq!(fixture.text("separatorRows"),
-        r#"{"a": 1, "b": [1, 2]}|[1, 2]|{}|[]|{  "a": 1,   "b": [    1,     2  ]}|[    1,     2  ]|{}|[]"#);
+    assert_eq!(
+        fixture.text("separatorRows"),
+        r#"{"a": 1, "b": [1, 2]}|[1, 2]|{}|[]|{  "a": 1,   "b": [    1,     2  ]}|[  1,   2]|{}|[]"#
+    );
 }
 
 #[test]
