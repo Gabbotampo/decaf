@@ -1060,7 +1060,10 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Int((count - pos).max(0))
             }
             ("skip", "(J)J") if array_stream.is_some() => {
-                let amount = args.first().and_then(boxed_long).unwrap_or(0).max(0) as usize;
+                let Some(amount) = args.first().and_then(boxed_long) else {
+                    return Ok(None);
+                };
+                let amount = amount.max(0) as usize;
                 let pos = match self.fields.get(&field("pos", "I")) {
                     Some(Value::Int(pos)) => (*pos).max(0) as usize,
                     _ => 0,
