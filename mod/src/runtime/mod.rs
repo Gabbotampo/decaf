@@ -30874,14 +30874,6 @@ impl<H: Host> Runtime<'_, H> {
                         // NeoForge's `IEventBus#addListener` (`neoforge_bus.rs`).
                         value
                     } else if r.owner == "java/lang/String"
-                        && r.name == "format"
-                        && (r.descriptor
-                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
-                            || r.descriptor
-                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
-                    {
-                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
-                    } else if r.owner == "java/lang/String"
                         && r.name == "formatted"
                         && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
                         && let Some(format) = receiver.clone()

@@ -21,10 +21,10 @@ impl<H: Host> Runtime<'_, H> {
         format: &Value,
         args: &Value,
     ) -> Result<Option<String>, NativeError> {
-        if let Some(locale) = locale {
-            if !formats_like_us(locale) {
-                return Ok(None);
-            }
+        if let Some(locale) = locale
+            && !formats_like_us(locale)
+        {
+            return Ok(None);
         }
         // The player's default FORMAT locale is outside the bounded host.
         // Keep only conversions whose output cannot observe it; grouping,

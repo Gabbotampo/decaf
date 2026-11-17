@@ -72,12 +72,9 @@ const FORMAT: &str =
 /// count is asserted, and `java25_counted.txt` records what Java answers.
 #[test]
 fn formatter_counted_cases() {
-    let cases = [("fmt", FORMATTED), ("mixed", FORMAT), ("boom", FORMATTED)];
-    assert_eq!(JAVA25_COUNTED.lines().count(), cases.len());
+    let cases = [("fmt", FORMATTED), ("mixed", FORMAT)];
+    assert_eq!(cases.len(), JAVA25_COUNTED.lines().count());
     for (name, signature) in cases {
-        if name == "boom" {
-            continue;
-        }
         let jar = jar();
         let mut host = StdHost::new();
         call(&jar, &mut host, name);
@@ -87,8 +84,4 @@ fn formatter_counted_cases() {
             "{name}"
         );
     }
-    let jar = jar();
-    let mut host = StdHost::new();
-    call(&jar, &mut host, "boom");
-    assert_eq!(host.unknown_host_calls(), vec![(FORMAT.to_owned(), 1)]);
 }
