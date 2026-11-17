@@ -3640,6 +3640,7 @@ pub struct StdHost {
     tool_material: tool_material::State,
     /// one table per host; a conflict between two jars' registrations is not detected
     fabric_block_api: fabric_block_api::State,
+    creative_tab: host_creative_tab::State,
     vec2: vec2::State,
 }
 
@@ -3814,6 +3815,7 @@ impl StdHost {
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
             fabric_block_api: fabric_block_api::State::default(),
+            creative_tab: host_creative_tab::State::default(),
             vec2: vec2::State::default(),
         }
     }
@@ -6861,7 +6863,7 @@ impl Host for StdHost {
         if let Some(value) = host_item_stack_template::static_call(r, args) {
             return value;
         }
-        if let Some(value) = host_creative_tab::static_call(r, args) {
+        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
@@ -8083,7 +8085,9 @@ impl Host for StdHost {
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
         }
-        if let Some(value) = host_creative_tab::instance_call(r, receiver, args) {
+        if let Some(value) =
+            host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
+        {
             return value;
         }
         if let Value::Host(handle) = receiver
