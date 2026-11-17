@@ -1,0 +1,253 @@
+{
+  "generated": "2026-11-17",
+  "rows": [
+    {
+      "vanilla": "net.minecraft.server.level.ServerPlayerGameMode#destroyBlock",
+      "descriptor": "(Lnet/minecraft/core/BlockPos;)Z",
+      "sunrise": "sunrise_client::game::native_player_break::Game::player_destroy_block",
+      "anchor": "HEAD; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; source signature confirmed."
+    },
+    {
+      "vanilla": "net.minecraft.server.level.ServerPlayerGameMode#useItemOn",
+      "descriptor": "(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/Level;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/InteractionHand;Lnet/minecraft/world/phys/BlockHitResult;)Lnet/minecraft/world/InteractionResult;",
+      "sunrise": "sunrise_client::game::native_hooks::Game::use_item_on_block",
+      "anchor": "HEAD; no row emitted",
+      "fit": "NO FIT",
+      "evidence": "Design note measured refusal; explicit candidate only."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.player.Player#attack",
+      "descriptor": "(Lnet/minecraft/world/entity/Entity;)V",
+      "sunrise": "sunrise_client::game::melee::Game::attack",
+      "anchor": "HEAD; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; Rust attack is routed/merged."
+    },
+    {
+      "vanilla": "net.minecraft.world.item.ItemStack#use",
+      "descriptor": "(Lnet/minecraft/world/level/Level;Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/InteractionHand;)Lnet/minecraft/world/InteractionResult;",
+      "sunrise": "sunrise_client::game::native_hooks::use_item_hand::Game::use_item_in_hand",
+      "anchor": "HEAD; refusal",
+      "fit": "NO FIT",
+      "evidence": "Design note measured refusal."
+    },
+    {
+      "vanilla": "net.minecraft.world.level.block.state.BlockBehaviour#randomTick",
+      "descriptor": "(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/core/BlockPos;Lnet/minecraft/util/RandomSource;)V",
+      "sunrise": "sunrise_client::game::native_hooks::base::GameLevel::native_random_tick",
+      "anchor": "HEAD/RETURN unavailable; native.mixin/helper only",
+      "fit": "NO FIT",
+      "evidence": "Design note measured functions.json refusal; lower-crate/marker issue."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.item.ItemEntity#playerTouch",
+      "descriptor": "(Lnet/minecraft/world/entity/player/Player;)V",
+      "sunrise": "sunrise_client::game::lan_actions::pickups::Game::guest_pickups",
+      "anchor": "HEAD; cancellable",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; guest pickup merges ItemEntity/Player.take."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.ExperienceOrb#playerTouch",
+      "descriptor": "(Lnet/minecraft/world/entity/player/Player;)V",
+      "sunrise": "sunrise_client::game::lan_actions::pickups::Game::guest_orbs",
+      "anchor": "HEAD; cancellable",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point."
+    },
+    {
+      "vanilla": "net.minecraft.world.inventory.ResultSlot#onTake",
+      "descriptor": "(Lnet/minecraft/world/entity/player/Player;Lnet/minecraft/world/item/ItemStack;)V",
+      "sunrise": "sunrise_client::game::inventory_slots::Game::craft_result",
+      "anchor": "HEAD; void/cancel semantics",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; ItemStack ABI still review."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.Entity#causeFallDamage",
+      "descriptor": "(DFLnet/minecraft/world/damagesource/DamageSource;)Z",
+      "sunrise": "sunrise_client::game::mounts::Game::rider_fall_damage",
+      "anchor": "HEAD; cancellable",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured fall point; routed passenger behavior merged."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.LivingEntity#addEffect",
+      "descriptor": "(Lnet/minecraft/world/effect/MobEffectInstance;)Z",
+      "sunrise": "sunrise_client::game::native_living_effects::Game::living_add_effect",
+      "anchor": "HEAD; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; overload with source is separate Java method."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.LivingEntity#jumpFromGround",
+      "descriptor": "()V",
+      "sunrise": "sunrise_client::game::native_mob_refs::Game::mob_jump",
+      "anchor": "HEAD/RETURN; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; Rust jumpStart/jumpEnd split."
+    },
+    {
+      "vanilla": "net.minecraft.server.level.ServerPlayer#teleport",
+      "descriptor": "(Lnet/minecraft/world/entity/TeleportTransition;)Lnet/minecraft/server/level/ServerPlayer;",
+      "sunrise": "sunrise_client::game::native_entity_moves::Game::entity_teleport_to",
+      "anchor": "HEAD/RETURN; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; Rust travel split across server_travel/lan_actions."
+    },
+    {
+      "vanilla": "net.minecraft.server.PlayerAdvancements#award",
+      "descriptor": "(Lnet/minecraft/advancements/AdvancementHolder;Ljava/lang/String;)Z",
+      "sunrise": "sunrise_client::game::advancements::Game::award",
+      "anchor": "HEAD; cancellable",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; exact Java source signature confirmed."
+    },
+    {
+      "vanilla": "net.minecraft.world.level.biome.Biome#getPrecipitationAt",
+      "descriptor": "(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/biome/Biome$Precipitation;",
+      "sunrise": "sunrise_client::game::weather::Game::precipitation",
+      "anchor": "RETURN; result override",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured candidate; weather Rust entry is merged."
+    },
+    {
+      "vanilla": "net.minecraft.world.level.block.LiquidBlock#shouldSpreadLiquid",
+      "descriptor": "(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/level/block/state/BlockState;)Z",
+      "sunrise": "sunrise_client::game::native_hooks::liquid::LevelAccess::liquid_interaction",
+      "anchor": "no point; native.mixin/helper only",
+      "fit": "NO FIT",
+      "evidence": "Design note explicitly refused lower-level owner/no handle."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.Entity#startRiding",
+      "descriptor": "(Lnet/minecraft/world/entity/Entity;Z)Z",
+      "sunrise": "sunrise_client::game::native_entity_riding::Game::entity_start_riding",
+      "anchor": "HEAD; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; sendEventAndTriggers overload is distinct and Rust merged."
+    },
+    {
+      "vanilla": "net.minecraft.world.entity.player.Inventory#setSelectedSlot",
+      "descriptor": "(I)V",
+      "sunrise": "sunrise_client::game::native_server::Game::player_set_selected_slot",
+      "anchor": "HEAD; cancellable result",
+      "fit": "EXACT FIT",
+      "evidence": "Design note measured point; SetHeldSlot network path merged."
+    },
+    {
+      "vanilla": "Minecraft#startAttack",
+      "descriptor": "()Z",
+      "sunrise": "none",
+      "anchor": "HOOK",
+      "fit": "NO FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "Minecraft#continueAttack",
+      "descriptor": "(Z)V",
+      "sunrise": "attack_entity",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "Player#attack",
+      "descriptor": "(Entity)V",
+      "sunrise": "attack_entity",
+      "anchor": "HOOK",
+      "fit": "EXACT FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "Player#isSweepAttack",
+      "descriptor": "(FZZ)Z",
+      "sunrise": "sweep_attack",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#hurtServer",
+      "descriptor": "(ServerLevel,DamageSource,F)Z",
+      "sunrise": "living_damage_pre/post",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#knockback",
+      "descriptor": "(DDDLDamageSource;FZ)V",
+      "sunrise": "living_knockback",
+      "anchor": "HOOK",
+      "fit": "EXACT FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#setLastHurtMob",
+      "descriptor": "(Entity)V",
+      "sunrise": "none",
+      "anchor": "HOOK",
+      "fit": "NO FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "MultiPlayerGameMode#attack",
+      "descriptor": "(Player,Entity)V",
+      "sunrise": "attack_entity",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "ItemCooldowns#addCooldown",
+      "descriptor": "(Item,I)V",
+      "sunrise": "player_attack_cooldown_reset",
+      "anchor": "HOOK",
+      "fit": "NO FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#updateUsingItem",
+      "descriptor": "()V",
+      "sunrise": "living_entity_use_item_tick",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#startUsingItem",
+      "descriptor": "(InteractionHand)V",
+      "sunrise": "living_entity_use_item_start",
+      "anchor": "HOOK",
+      "fit": "EXACT FIT",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "LivingEntity#stopUsingItem",
+      "descriptor": "()V",
+      "sunrise": "living_entity_use_item_stop",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "Minecraft#startUseItem",
+      "descriptor": "()V",
+      "sunrise": "use_item",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    },
+    {
+      "vanilla": "ItemStack#useOn",
+      "descriptor": "(UseOnContext)InteractionResult",
+      "sunrise": "use_item",
+      "anchor": "HOOK",
+      "fit": "FITS WITH A STATED DIFFERENCE",
+      "evidence": "Verified against pinned Sunrise hook doc comments and javap."
+    }
+  ]
+}
