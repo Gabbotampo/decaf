@@ -20,6 +20,26 @@ const STUBS: &[(&str, &str)] = &[
         r#"package com.mojang.serialization; public interface Codec<T> { com.mojang.serialization.MapCodec<T> fieldOf(String s); com.mojang.serialization.DataResult<T> encodeStart(DynamicOps ops,Object o); com.mojang.serialization.DataResult<T> parse(DynamicOps ops,Object o); com.mojang.serialization.DataResult<com.mojang.datafixers.util.Pair<T,T>> decode(DynamicOps ops,Object o); }"#,
     ),
     (
+        "com/mojang/serialization/DynamicOps.java",
+        r#"package com.mojang.serialization; public interface DynamicOps {}"#,
+    ),
+    (
+        "com/mojang/serialization/DataResult.java",
+        r#"package com.mojang.serialization; public interface DataResult<T> {}"#,
+    ),
+    (
+        "com/mojang/serialization/JsonOps.java",
+        r#"package com.mojang.serialization; public final class JsonOps implements DynamicOps { public static final JsonOps INSTANCE=null; }"#,
+    ),
+    (
+        "com/mojang/datafixers/util/Pair.java",
+        r#"package com.mojang.datafixers.util; public final class Pair<A,B> {}"#,
+    ),
+    (
+        "com/google/gson/JsonPrimitive.java",
+        r#"package com.google.gson; public final class JsonPrimitive { public JsonPrimitive(String s){} }"#,
+    ),
+    (
         "com/mojang/serialization/MapCodec.java",
         r#"package com.mojang.serialization; public interface MapCodec<T> extends Codec<T> {}"#,
     ),
