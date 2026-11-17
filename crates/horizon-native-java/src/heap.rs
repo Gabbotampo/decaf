@@ -1706,6 +1706,7 @@ mod tests {
             "imc",
             "entity_registration",
             "tool_material",
+            "fabric_block_api",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
