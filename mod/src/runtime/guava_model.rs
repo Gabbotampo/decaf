@@ -420,7 +420,7 @@ impl<H: Host> Runtime<'_, H> {
                             == "(I)Lcom/google/common/collect/ImmutableList$Builder;") =>
             {
                 if r.name == "builderWithExpectedSize" {
-                    let expected = expect_int(&args[0])?;
+                    let expected = expect_int(r, &args[0])?;
                     if expected < 0 {
                         return Err(thrown(
                             "java/lang/IllegalArgumentException",
