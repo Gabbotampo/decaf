@@ -1,0 +1,8 @@
+  public static boolean registerBuiltinPack(net.minecraft.resources.Identifier, net.fabricmc.loader.api.ModContainer, net.minecraft.network.chat.Component, net.fabricmc.fabric.api.resource.v1.pack.PackActivationType);
+    16: invokestatic registerBuiltinPack:(Identifier,String,ModContainer,Component,PackActivationType)Z
+    74: invokestatic exists:(Path)Z
+    82: invokeinterface List.isEmpty:()Z
+    514: ifnonnull 84
+    77: ifnonnull 84
+    82: iconst_0
+    133: ireturn
