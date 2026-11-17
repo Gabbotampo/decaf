@@ -187,7 +187,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         ),
         (
             "dfuConstruction",
-            CountedAs("true|false|true|false|true|true|false|true"),
+            Exact("true|false|true|false|true|true|false|true"),
         ),
         (
             "countedOperations",
@@ -205,7 +205,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         // Counted (the callback's result is no product), but still run exactly once.
         (
             "createCounterNull",
-            CountedAs(oracle_row("createCounterNull")),
+            Exact(oracle_row("createCounterNull")),
         ),
         ("createThrows", Exact(oracle_row("createThrows"))),
         ("encodeUnknown", CountedAs(oracle_row("encodeUnknown"))),
