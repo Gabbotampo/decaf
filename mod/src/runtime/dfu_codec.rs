@@ -581,7 +581,11 @@ fn runtime_record_builder<H: Host>(
         Err(reason) => return runtime_refuse(runtime, r, reason),
     };
     let Some(app) = runtime.invoke_callback(callback, &[instance])? else {
-        runtime_refuse(runtime, r, "RecordCodecBuilder callback returned null".into())?;
+        runtime_refuse(
+            runtime,
+            r,
+            "RecordCodecBuilder callback returned null".into(),
+        )?;
         return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
     };
     if matches!(app, Value::Ref(None) | Value::Void) {

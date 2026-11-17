@@ -203,10 +203,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         ("textRecord", Counted),
         ("createCounter", Exact(oracle_row("createCounter"))),
         // Counted (the callback's result is no product), but still run exactly once.
-        (
-            "createCounterNull",
-            Exact(oracle_row("createCounterNull")),
-        ),
+        ("createCounterNull", Exact(oracle_row("createCounterNull"))),
         ("createThrows", Exact(oracle_row("createThrows"))),
         ("encodeUnknown", CountedAs(oracle_row("encodeUnknown"))),
         ("parseUnknown", CountedAs(oracle_row("parseUnknown"))),
