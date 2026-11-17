@@ -739,7 +739,7 @@ impl StdHost {
             ("getAsObject" | "getAsArray", _, _) => Ok(marker(pointer.to_owned())),
             ("getAsString", _, serde_json::Value::String(string)) => Ok(text(string.clone())),
             ("getAsBoolean", _, serde_json::Value::Bool(flag)) => Ok(Value::Int(i32::from(*flag))),
-            ("getAsNumber", _, serde_json::Value::Number(number)) => Ok(Value::Float(number.to_string().parse::<f64>().unwrap_or(0.0))),
+            ("getAsNumber", _, serde_json::Value::Number(number)) => match number.to_string().parse::<f64>() { Ok(value) => Ok(Value::Float(value)), Err(_) => self.unknown_host_call(r), },
             ("size", "()I", serde_json::Value::Object(entries)) => {
                 Ok(Value::Int(entries.len() as i32))
             }
