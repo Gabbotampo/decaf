@@ -1,6 +1,13 @@
-use crate::runtime::{MethodRef, NativeError, Value};
 use crate::runtime::host_ref::{Methods, instance_of_class};
-pub(crate) const URL_METHODS: Methods = Methods { to_string: |h, _| Ok(Some(h.key().to_owned())), hash_code: |_, _| Ok(None), equals: |_, _| Ok(None), instance_of: instance_of_class, crosses_jars: |_, _| true, compare_to: None };
+use crate::runtime::{MethodRef, NativeError, Value};
+pub(crate) const URL_METHODS: Methods = Methods {
+    to_string: |h, _| Ok(Some(h.key().to_owned())),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _| Ok(None),
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| true,
+    compare_to: None,
+};
 #[derive(Debug, PartialEq)]
 pub enum UrlError {
     Relative,
@@ -30,10 +37,21 @@ pub fn to_url_text(uri: &str) -> Result<String, UrlError> {
     ) {
         return Err(UrlError::UnknownProtocol);
     };
-    if s == "jar" && !uri.contains("!/") { return Err(UrlError::Jar); }
-    if matches!(s.as_str(), "http"|"https"|"file"|"ftp") && (uri.contains("@") || uri.contains("[") || uri.contains("%") || uri.matches(':').count()>1) { return Err(UrlError::Unsupported); }
+    if s == "jar" && !uri.contains("!/") {
+        return Err(UrlError::Jar);
+    }
+    if matches!(s.as_str(), "http" | "https" | "file" | "ftp")
+        && (uri.contains("@")
+            || uri.contains("[")
+            || uri.contains("%")
+            || uri.matches(':').count() > 1)
+    {
+        return Err(UrlError::Unsupported);
+    }
     let tail = &uri[raw.len()..];
-    if tail.starts_with("///") && s != "jar" { return Ok(format!("{s}:/{}", &tail[3..])); }
+    if tail.starts_with("///") && s != "jar" {
+        return Ok(format!("{s}:/{}", &tail[3..]));
+    }
     Ok(format!("{s}{tail}"))
 }
 pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, NativeError>> {
@@ -66,7 +84,11 @@ pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, Na
             message: Some("URI is not absolute".into()),
             frame: None,
         }),
-        Err(UrlError::Jar) => Err(NativeError::UncaughtException { class: "java/net/MalformedURLException".into(), message: Some("no !/ in spec".into()), frame: None }),
+        Err(UrlError::Jar) => Err(NativeError::UncaughtException {
+            class: "java/net/MalformedURLException".into(),
+            message: Some("no !/ in spec".into()),
+            frame: None,
+        }),
         Err(UrlError::Unsupported) => return None,
         Err(UrlError::UnknownProtocol) => Err(NativeError::UncaughtException {
             class: "java/net/MalformedURLException".into(),
