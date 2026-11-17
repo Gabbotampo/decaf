@@ -12,6 +12,8 @@ use horizon_native_java::{Host, StdHost};
 use javac_fixture::Fixture;
 use std::collections::{BTreeMap, BTreeSet};
 
+const JAVA25_CAPTURE: &str = include_str!("fixtures/files_vfs/java25.txt");
+
 const PROBE: &str = r#"package demo;
 
 import java.io.File;
