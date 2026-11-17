@@ -45,12 +45,19 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let args = args.map(|values| {
-            if values.iter().any(|value| crate::jar_object::packaged_object_class(value).is_some())
+            if values
+                .iter()
+                .any(|value| crate::jar_object::packaged_object_class(value).is_some())
                 && format_has_non_string_conversion(format)
             {
                 return None;
             }
-            Some(values.iter().map(|value| self.format_arg(value)).collect::<Vec<_>>())
+            Some(
+                values
+                    .iter()
+                    .map(|value| self.format_arg(value))
+                    .collect::<Vec<_>>(),
+            )
         })?;
         java_format::format(format, args.as_deref())
     }
@@ -189,13 +196,27 @@ fn format_has_non_string_conversion(format: &str) -> bool {
     let bytes = format.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] != b'%' { i += 1; continue; }
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
         i += 1;
-        if i >= bytes.len() { return true; }
-        if bytes[i] == b'%' || bytes[i] == b'n' { i += 1; continue; }
-        while i < bytes.len() && !bytes[i].is_ascii_alphabetic() { i += 1; }
-        if i >= bytes.len() { return true; }
-        if !matches!(bytes[i], b's' | b'S') { return true; }
+        if i >= bytes.len() {
+            return true;
+        }
+        if bytes[i] == b'%' || bytes[i] == b'n' {
+            i += 1;
+            continue;
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return true;
+        }
+        if !matches!(bytes[i], b's' | b'S') {
+            return true;
+        }
         i += 1;
     }
     false
