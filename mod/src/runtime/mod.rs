@@ -10087,7 +10087,11 @@ impl Host for StdHost {
             {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/UnsupportedOperationException".into(),
-                    message: if source.starts_with("java/util/stream/") { Some("remove".into()) } else { None },
+                    message: if source.starts_with("java/util/stream/") {
+                        Some("remove".into())
+                    } else {
+                        None
+                    },
                     frame: None,
                 });
             }

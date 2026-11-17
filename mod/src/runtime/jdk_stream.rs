@@ -554,7 +554,8 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             .host_collection_class(list)
             .is_some_and(|class| class.starts_with("java/util/ImmutableCollections$"))
             || expect_ref(list).is_some_and(|marker| self.host.is_jdk_list_of(marker))
-            || expect_ref(list).is_some_and(|marker| self.host.unmodifiable_view_source(marker).is_some());
+            || expect_ref(list)
+                .is_some_and(|marker| self.host.unmodifiable_view_source(marker).is_some());
         if immutable {
             let size = crate::runtime::runtime_collection_values(self.host, list)?.len();
             if size >= 2 {
@@ -570,6 +571,24 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             self.host.unknown_operand_call(r)?;
             return Ok(None);
         };
+        if expect_ref(list).is_some_and(|marker| self.host.sub_list_link(marker).is_some()) {
+            let set = MethodRef {
+                owner: "java/util/List".into(),
+                name: "set".into(),
+                descriptor: "(ILjava/lang/Object;)Ljava/lang/Object;".into(),
+            };
+            let n = values.len();
+            for i in 0..n / 2 {
+                let j = n - 1 - i;
+                let a = values[i].clone();
+                let b = values[j].clone();
+                self.host
+                    .invoke_instance(&set, list, &[Value::Int(i as i32), b])?;
+                self.host
+                    .invoke_instance(&set, list, &[Value::Int(j as i32), a])?;
+            }
+            return Ok(Some(Value::Void));
+        }
         values.reverse();
         self.host.replace_mutable_collection(list, values);
         Ok(Some(Value::Void))
