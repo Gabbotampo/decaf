@@ -219,6 +219,7 @@ mod parked_threads;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
+mod vec2;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
 #[doc(hidden)]
@@ -3633,6 +3634,7 @@ pub struct StdHost {
     imc: neoforge_imc::ImcHandle,
     entity_registration: entity_registration::State,
     tool_material: tool_material::State,
+    vec2: vec2::State,
 }
 
 impl Default for StdHost {
@@ -3797,6 +3799,7 @@ impl StdHost {
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
+            vec2: vec2::State::default(),
         }
     }
 
@@ -5745,6 +5748,9 @@ impl Host for StdHost {
     }
 
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
+            return value;
+        }
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
             return Ok(value);
@@ -6419,6 +6425,9 @@ impl Host for StdHost {
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
+            return value;
+        }
+        if let Some(value) = vec2::static_field(&mut self.vec2, r) {
             return value;
         }
         if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {

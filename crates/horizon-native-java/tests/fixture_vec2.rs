@@ -7,4 +7,18 @@ public final class Vec2 { public static final Vec2 ZERO=null, ONE=null, UNIT_X=n
 "#;
 const PROBE: &str = include_str!("fixtures/vec2/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/vec2/java25.txt");
-#[test] fn vec2_rows_match_java25(){ let fixture=Fixture::build("vec2", &[("net/minecraft/world/phys/Vec2.java",VEC2),("demo/Probe.java",PROBE)]); let mut host=fixture.jar.seed_host(StdHost::new()); assert_eq!(fixture.text_on(&mut host,"rows"), ORACLE.replace("ZERO|0.0|0.0|0|0\n", "ZERO|0.0|0.0|0|0\n")); }
+#[test]
+fn vec2_rows_match_java25() {
+    let fixture = Fixture::build(
+        "vec2",
+        &[
+            ("net/minecraft/world/phys/Vec2.java", VEC2),
+            ("demo/Probe.java", PROBE),
+        ],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(
+        fixture.text_on(&mut host, "rows"),
+        ORACLE.replace("ZERO|0.0|0.0|0|0\n", "ZERO|0.0|0.0|0|0\n")
+    );
+}
