@@ -2,6 +2,7 @@ package demo;
 import net.minecraft.SharedConstants;
 import net.minecraft.WorldVersion;
 public final class Probe {
+ public static String buildTime() { return "" + SharedConstants.getCurrentVersion().buildTime(); }
  public static String rows() {
   WorldVersion v=SharedConstants.getCurrentVersion();
   StringBuilder o=new StringBuilder();
