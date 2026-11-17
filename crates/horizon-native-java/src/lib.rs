@@ -28088,7 +28088,10 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/util/Properties"
             || r.name != "load"
-            || r.descriptor != "(Ljava/io/Reader;)V"
+            || !matches!(
+                r.descriptor.as_str(),
+                "(Ljava/io/Reader;)V" | "(Ljava/io/InputStream;)V"
+            )
         {
             return Ok(None);
         }
@@ -28103,10 +28106,21 @@ impl<H: Host> Runtime<'_, H> {
         ) else {
             return Ok(None);
         };
-        let Some(text) = self.string_readers.remove(reader) else {
-            return Ok(None);
+        let text = if r.descriptor == "(Ljava/io/InputStream;)V" {
+            let Some(path) = self.io_paths.get(reader) else {
+                return Ok(None);
+            };
+            let Some(bytes) = self.io_file_bytes.get(path) else {
+                return Ok(None);
+            };
+            bytes.iter().map(|b| *b as char).collect::<String>()
+        } else {
+            let Some(text) = self.string_readers.remove(reader) else {
+                return Ok(None);
+            };
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
         };
-        self.string_readers.insert(reader.to_owned(), String::new());
         let entries = properties_entries(&text).map_err(|m| NativeError::UncaughtException {
             class: "java/lang/IllegalArgumentException".into(),
             message: Some(m),
