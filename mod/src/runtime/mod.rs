@@ -26713,7 +26713,7 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
-                        if truncate && !create_new && !self.io_files.contains_key(&path) {
+                        if (truncate || append) && !create_new && !self.io_files.contains_key(&path) {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/NoSuchFileException".into(),
                                 message: Some(display_path.clone()),
