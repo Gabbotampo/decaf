@@ -28075,10 +28075,11 @@ impl<H: Host> Runtime<'_, H> {
         let (Some(marker), Some(reader)) = (
             receiver
                 .and_then(expect_ref)
+                .map(String::as_str)
                 .or_else(|| receiver.and_then(jar_object::object_key)),
             args.first()
                 .and_then(jar_object::object_key)
-                .or_else(|| args.first().and_then(expect_ref)),
+                .or_else(|| args.first().and_then(expect_ref).map(String::as_str)),
         ) else {
             return Ok(None);
         };
