@@ -8,6 +8,7 @@ public final class Probe {
   public static final class Nested { public String k; }
   static String show(Config c) { return c==null?"null":c.n+"|"+c.s+"|"+c.xs+"|"+c.nested.k; }
   static String one(Gson g, Reader r) { try { return show(g.fromJson(r, Config.class)); } catch (Throwable t) { return t.getClass().getName()+":"+t.getMessage(); } }
+  public static void main(String[] args) throws Exception { System.out.print(rows()); }
   public static String rows() throws Exception {
     Gson g=new Gson(); StringBuilder b=new StringBuilder();
     b.append("string=").append(one(g,new StringReader("{\"n\":3,\"s\":\"ok\",\"xs\":[1,2],\"nested\":{\"k\":\"v\"}}"))).append('\n');
