@@ -4695,23 +4695,22 @@ impl StdHost {
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
-                // Only a host resource stream has bytes the host can parse.
-                // Any other stream (a file the jar opened, a null) would load
-                // entries the host never sees, so the call is counted rather
-                // than answered as an empty load.
-                let Some((bytes, index)) = expect_ref(Self::argument(r, args, 0)?)
-                    .and_then(|stream| self.resource_streams.get_mut(stream))
-                else {
+                let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
+                    if r.descriptor == "(Ljava/io/Reader;)V" {
+                        self.string_readers.remove(stream)
+                    } else if let Some(text) = self.string_readers.remove(stream) {
+                        Some(text)
+                    } else {
+                        self.resource_streams.get_mut(stream).map(|(bytes, index)| {
+                            let text = bytes[*index..].iter().map(|b| *b as char).collect();
+                            *index = bytes.len();
+                            text
+                        })
+                    }
+                });
+                let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
                 };
-                let raw = &bytes[*index..];
-                let is_reader = r.descriptor == "(Ljava/io/Reader;)V";
-                let text = if is_reader {
-                    String::from_utf8_lossy(raw).into_owned()
-                } else {
-                    raw.iter().map(|b| *b as char).collect()
-                };
-                *index = bytes.len();
                 let additions = match properties_entries(&text) {
                     Ok(v) => v,
                     Err(message) => {
@@ -14492,82 +14491,72 @@ fn string_from_char_code(code: i32) -> String {
 fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
     let mut logical = Vec::new();
     let mut current = String::new();
-    let mut cont = false;
-    for raw in text.lines() {
-        let mut line = raw.strip_suffix('\r').unwrap_or(raw).to_owned();
-        if cont {
-            let n = line.chars().take_while(|c| *c == ' ').count();
-            line.drain(..n);
+    let mut lines = text.split_inclusive(['\r', '\n']);
+    loop {
+        let Some(raw) = lines.next() else { break };
+        let line = raw
+            .strip_suffix("\r\n")
+            .or_else(|| raw.strip_suffix('\r'))
+            .or_else(|| raw.strip_suffix('\n'))
+            .unwrap_or(raw);
+        let continued = line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
+        let mut part = line.to_owned();
+        if continued {
+            part.pop();
         }
-        let mut slashes = 0;
-        for c in line.chars().rev() {
-            if c == '\\' {
-                slashes += 1;
-            } else {
-                break;
-            }
+        if !current.is_empty() {
+            part = part.trim_start_matches([' ', '\t', '\u{000c}']).to_owned();
         }
-        cont = slashes % 2 == 1;
-        if cont {
-            line.pop();
-        }
-        current.push_str(&line);
-        if !cont {
+        current.push_str(&part);
+        if !continued {
             logical.push(std::mem::take(&mut current));
         }
     }
     if !current.is_empty() {
         logical.push(current);
     }
-    if text.contains("\\u12G4") {
-        return Err("Malformed \\uxxxx encoding.".to_owned());
+    let mut out = Vec::new();
+    for line in logical {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+            i += 1;
+        }
+        if i == chars.len() || chars[i] == '#' || chars[i] == '!' {
+            continue;
+        }
+        let start = i;
+        let mut escaped = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if !escaped && matches!(c, '=' | ':' | ' ' | '\t' | '\u{000c}') {
+                break;
+            }
+            if c == '\\' {
+                escaped = !escaped;
+            } else {
+                escaped = false;
+            }
+            i += 1;
+        }
+        let end = i;
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+            i += 1;
+        }
+        if i < chars.len() && matches!(chars[i], '=' | ':') {
+            i += 1;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+                i += 1;
+            }
+        }
+        out.push((
+            property_unescape(&chars[start..end].iter().collect::<String>())?,
+            property_unescape(&chars[i..].iter().collect::<String>())?,
+        ));
     }
-    Ok(logical
-        .into_iter()
-        .filter_map(|line| {
-            let chars: Vec<char> = line.chars().collect();
-            let mut i = 0;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if i == chars.len() || chars[i] == '#' || chars[i] == '!' {
-                return None;
-            }
-            let start = i;
-            let mut sep = None;
-            let mut escaped = false;
-            while i < chars.len() {
-                let c = chars[i];
-                if !escaped && (c == '=' || c == ':' || c.is_whitespace()) {
-                    sep = Some(i);
-                    break;
-                }
-                if c == '\\' {
-                    escaped = !escaped;
-                } else {
-                    escaped = false;
-                }
-                i += 1;
-            }
-            let k_end = sep.unwrap_or(chars.len());
-            let mut j = sep.unwrap_or(chars.len());
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            if j < chars.len() && (chars[j] == '=' || chars[j] == ':') {
-                j += 1;
-                while j < chars.len() && chars[j].is_whitespace() {
-                    j += 1;
-                }
-            }
-            Some((
-                property_unescape(&chars[start..k_end].iter().collect::<String>())?,
-                property_unescape(&chars[j..].iter().collect::<String>())?,
-            ))
-        })
-        .collect::<Vec<_>>())
+    Ok(out)
 }
-fn property_unescape(text: &str) -> Option<String> {
+fn property_unescape(text: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut it = text.chars();
     while let Some(c) = it.next() {
@@ -14579,19 +14568,25 @@ fn property_unescape(text: &str) -> Option<String> {
             Some('t') => out.push('\t'),
             Some('n') => out.push('\n'),
             Some('r') => out.push('\r'),
-            Some('f') => out.push('\u{0c}'),
+            Some('f') => out.push('\u{c}'),
             Some('u') => {
                 let mut n = 0u32;
                 for _ in 0..4 {
-                    n = n * 16 + it.next()?.to_digit(16)?;
+                    let Some(c) = it.next() else {
+                        return Err("Malformed \\uxxxx encoding.".into());
+                    };
+                    let Some(d) = c.to_digit(16) else {
+                        return Err("Malformed \\uxxxx encoding.".into());
+                    };
+                    n = n * 16 + d;
                 }
-                out.push(char::from_u32(n)?);
+                out.push(char::from_u32(n).unwrap());
             }
             Some(x) => out.push(x),
             None => out.push('\\'),
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// The JDK's range check for a list read, write or removal.
