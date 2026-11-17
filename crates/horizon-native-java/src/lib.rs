@@ -111,6 +111,7 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+mod host_creative_tab;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -3641,6 +3642,7 @@ pub struct StdHost {
     fabric_block_api: fabric_block_api::State,
     /// Fabric resource condition types and their registry (`fabric_resource_conditions.rs`).
     fabric_resource_conditions: fabric_resource_conditions::State,
+    creative_tab: host_creative_tab::State,
     vec2: vec2::State,
 }
 
@@ -3808,6 +3810,7 @@ impl StdHost {
             tool_material: tool_material::State::default(),
             fabric_block_api: fabric_block_api::State::default(),
             fabric_resource_conditions: fabric_resource_conditions::State::default(),
+            creative_tab: host_creative_tab::State::default(),
             vec2: vec2::State::default(),
         }
     }
@@ -6891,6 +6894,9 @@ impl Host for StdHost {
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
+        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) {
+            return value;
+        }
         if let Some(value) = fabric_creative_tab::static_call(r, args) {
             return Ok(value);
         }
@@ -8076,6 +8082,11 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) =
+            host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
+        {
+            return value;
+        }
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
         }
@@ -27595,9 +27606,7 @@ impl<H: Host> Runtime<'_, H> {
         let Value::Host(handle) = value else {
             return None;
         };
-        if handle.kind() != HostKind::Writer
-            || !modelled_writer_class(crate::jar_object::packaged_object_class(value)?)
-        {
+        if !modelled_writer_class(crate::jar_object::packaged_object_class(value)?) {
             return None;
         }
         let marker = handle.key_text();
@@ -28117,10 +28126,9 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("Appendable") =>
                     {
-                        let Some(text) = self.gson_to_json(
+                        let Some(text) = self.gson_to_json_string(
                             args.first().unwrap_or(&Value::Ref(None)),
                             &style,
-                            0,
                         )?
                         else {
                             return self
@@ -28128,10 +28136,6 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        let text = format!(
-                            "{}{text}",
-                            gson_model::non_executable_prefix(&style).unwrap_or("")
-                        );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
                         let Some(target) = args
