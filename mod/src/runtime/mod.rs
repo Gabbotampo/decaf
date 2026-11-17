@@ -4697,6 +4697,36 @@ impl StdHost {
                         frame: None,
                     }
                 })?;
+                if r.descriptor == "(Ljava/io/Reader;)V" {
+                    if let Some(text) = self.string_readers.get(stream).cloned() {
+                        let additions = properties_entries(&text).map_err(|message| {
+                            NativeError::UncaughtException {
+                                class: "java/lang/IllegalArgumentException".into(),
+                                message: Some(message),
+                                frame: None,
+                            }
+                        })?;
+                        let values = self
+                            .mutable_collections
+                            .entry(marker.to_owned())
+                            .or_default();
+                        for (k, v) in additions {
+                            let key = Value::Ref(Some(k));
+                            let val = Value::Ref(Some(v));
+                            if let Some(pair) = values
+                                .as_chunks_mut::<2>()
+                                .0
+                                .iter_mut()
+                                .find(|p| p[0] == key)
+                            {
+                                pair[1] = val;
+                            } else {
+                                values.extend([key, val]);
+                            }
+                        }
+                        return Ok(Some(Value::Void));
+                    }
+                }
                 let owned = format!("{stream}|java/io/ByteArrayInputStream#buf[B");
                 let (owned_bytes, owned_index) =
                     if let Some(array) = self.fields.get(&owned).cloned() {
