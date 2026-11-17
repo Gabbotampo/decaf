@@ -30,9 +30,6 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Value> {
                     && r.descriptor
                         == "(Ljava/util/function/IntFunction;Lnet/minecraft/network/codec/StreamCodec;)Lnet/minecraft/network/codec/StreamCodec;"))
         {
-            if args.iter().any(|value| matches!(value, Value::Ref(None))) {
-                return None;
-            }
             return Some(codec(&format!("{STREAM_CODEC_PREFIX}4"), args));
         }
         if r.owner == STREAM_CODEC
