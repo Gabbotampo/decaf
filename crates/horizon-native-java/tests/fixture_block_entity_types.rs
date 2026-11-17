@@ -8,8 +8,20 @@ const TYPE: &str = include_str!("fixtures/block_entity_types/BlockEntityType.jav
 
 #[test]
 fn block_entity_types_rows_match_java25_oracle() {
-    let fixture =
-        javac_fixture::Fixture::build("block-entity-types", &[("demo/Probe.java", PROBE)]);
+    let fixture = javac_fixture::Fixture::build(
+        "block-entity-types",
+        &[
+            ("demo/Probe.java", PROBE),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntityTypes.java",
+                TYPES,
+            ),
+            (
+                "net/minecraft/world/level/block/entity/BlockEntityType.java",
+                TYPE,
+            ),
+        ],
+    );
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     let answer = fixture.jar.invoke_method_with_args(
         "demo/Probe",
