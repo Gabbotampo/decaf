@@ -78,7 +78,7 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(class) = handle.class()
             && match self.class_known_instance_of(class, "java/util/Formattable") {
                 Some(known) => known,
-                None => handle.kind() == crate::runtime::host_ref::HostKind::JarObject,
+                None => false,
             }
         {
             return Ok(Arg::Opaque);
