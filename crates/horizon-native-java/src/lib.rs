@@ -26698,6 +26698,9 @@ impl<H: Host> Runtime<'_, H> {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
+                        if option_names.iter().any(|name| name.ends_with("/SYNC")) {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         let create_new =
                             option_names.iter().any(|name| name.contains("/CREATE_NEW"));
                         let append = option_names.iter().any(|name| name.contains("/APPEND"));
