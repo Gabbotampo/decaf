@@ -82,9 +82,11 @@ with each mod beside its declared dependencies. Definitions: [docs/unmodelled-ca
 
 **Next:**
 
-- Hand mods real game objects when a Sunrise hook fires. The handle exists now: a live player or
-  menu whose class checks follow the real game's and whose "removed" state comes from the game.
-  Next is wiring it to the menu-open hook, so Architectury's callback runs.
+- Run more library mods' game-class Mixin callbacks (Architectury, Balm and Puzzles Lib re-firing
+  their open-menu events). Each needs a Sunrise hook that fires at the exact moment the Mixin
+  targets; menu opening is sunrise-org/sunrise#1127.
+- Let a library's init run once beside the mods that depend on it (#457): today each jar runs in
+  its own runtime, so Collective's dependents never see its config loaded.
 - Run the most common Mixins through Sunrise's named hooks instead of weaving them. Most of the
   top targets are library mods re-firing their own events.
 - Drive one mod set (the RPG series) end to end in a real game.
