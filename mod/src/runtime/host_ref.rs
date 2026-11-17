@@ -2677,8 +2677,7 @@ static LIVE_GAME_OBJECT_METHODS: Methods = Methods {
     },
     instance_of: |handle, wanted, _| {
         live_declared(handle.key_text())
-            .iter()
-            .any(|c| *c == wanted)
+            .contains(&wanted)
             .then_some(true)
     },
     crosses_jars: |_, _| true,

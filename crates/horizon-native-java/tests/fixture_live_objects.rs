@@ -33,8 +33,7 @@ fn live_object_rows() {
     );
     let mut h = StdHost::new();
     let p = Value::Host(HostRef::live_game_object_for_test("ServerPlayer:1"));
-    let m = Value::Host(HostRef::new(
-        HostKind::LiveGameObject,
+    let m = Value::Host(HostRef::live_game_object_for_test(
         "AbstractContainerMenu:1",
     ));
     let out=f.jar.invoke_method_with_args("demo/Probe","rows","(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/inventory/AbstractContainerMenu;)Ljava/lang/String;",None,&[p,m],&mut h).unwrap();
