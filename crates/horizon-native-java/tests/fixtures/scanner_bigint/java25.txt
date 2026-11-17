@@ -1,1 +1,1 @@
-true:a|b|c|false|NoSuchElementException:No line found|IllegalStateException:Scanner closed|FileNotFoundException:/definitely/missing/scanner470 (No such file or directory)|false
+true:a|b|c|false|NoSuchElementException:No line found|IllegalStateException:Scanner closed|FileNotFoundException:/definitely/missing/scanner470 (No such file or directory)|false|cr:a:B|u:a:B|trail:[a, ]|bad:false::NoSuchElementException:No line found
