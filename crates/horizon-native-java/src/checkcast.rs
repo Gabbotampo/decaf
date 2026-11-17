@@ -623,11 +623,6 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(_)) && crate::value_class::is_plain_string(marker) {
             return false;
         }
-        if matches!(value, Value::Ref(Some(_)))
-            && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable
-        {
-            return true;
-        }
         // An object a library model built itself: the model knows its whole
         // type, so its `false` is an answer.
         if crate::gson_tree::is_tree(value) {
