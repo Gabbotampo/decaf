@@ -29,3 +29,17 @@ fn properties_load_matches_java25() {
         h.unknown_host_calls()
     );
 }
+
+/// `Properties.load` treats `\r\n` as one line terminator, so a `\` continuation carries
+/// across it. Java 25 (`new Properties().load(new StringReader("a=b\\\r\n  c\r\nd=e\r\n"))`)
+/// gives `{a=bc, d=e}`.
+#[test]
+fn crlf_continuation_matches_java25() {
+    assert_eq!(
+        horizon_native_java::properties_entries_for_tests("a=b\\\r\n  c\r\nd=e\r\n"),
+        Ok(vec![
+            ("a".to_owned(), "bc".to_owned()),
+            ("d".to_owned(), "e".to_owned())
+        ])
+    );
+}

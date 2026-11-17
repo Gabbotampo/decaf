@@ -4718,7 +4718,7 @@ impl StdHost {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
+            ("load", "(Ljava/io/Reader;)V") => self.unknown_host_call(r).map(Some),
             ("load", "(Ljava/io/InputStream;)V") => {
                 let source_value = Self::argument(r, args, 0)?;
                 let source = jar_object::object_key(source_value)
@@ -14515,17 +14515,50 @@ fn string_from_char_code(code: i32) -> String {
     char::from_u32(code as u32).map_or_else(String::new, String::from)
 }
 
+/// The physical lines of a `.properties` text, without their terminators: like JDK 25's
+/// `Properties.LineReader`, `\r\n` is ONE terminator, and a lone `\r` or `\n` ends a line too.
+/// (Splitting on `\r` and `\n` separately would turn every `\r\n` into an extra empty line,
+/// which ends a `\`-continued entry early.)
+/// [`properties_entries`] for the integration tests.
+#[doc(hidden)]
+pub fn properties_entries_for_tests(text: &str) -> Result<Vec<(String, String)>, String> {
+    properties_entries(text)
+}
+
+fn properties_physical_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                lines.push(&text[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            b'\n' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
 fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
     let mut logical = Vec::new();
     let mut current = String::new();
-    let mut lines = text.split_inclusive(['\r', '\n']);
-    loop {
-        let Some(raw) = lines.next() else { break };
-        let line = raw
-            .strip_suffix("\r\n")
-            .or_else(|| raw.strip_suffix('\r'))
-            .or_else(|| raw.strip_suffix('\n'))
-            .unwrap_or(raw);
+    for line in properties_physical_lines(text) {
         let continued = line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
         let mut part = line.to_owned();
         if continued {
