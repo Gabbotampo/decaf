@@ -134,6 +134,12 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
         || marker.starts_with("list/")
         || marker.starts_with("particle/")
         || marker.starts_with("iterator/")
+        || marker.starts_with("client/")
+        || marker.starts_with("block-pos/")
+        || marker.starts_with("typed/")
+        || marker.starts_with("registry/")
+        || marker.starts_with("payload/")
+        || marker.starts_with("payload-context/")
     {
         return Shape::Undecidable;
     }
