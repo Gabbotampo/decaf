@@ -1,3 +1,0 @@
-# Java 25 reflection audit: Enchantments public static fields
-# Every public static field observed by EnchantmentsCapture.java was ResourceKey.
-# Non-ResourceKey rows: none (0).

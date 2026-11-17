@@ -32,7 +32,8 @@ mod tests {
             descriptor: KEY.into(),
         };
         let field = static_field(&r).unwrap();
-        let created = crate::runtime::host_ids::resource_key_named("minecraft:enchantment", "knockback");
+        let created =
+            crate::runtime::host_ids::resource_key_named("minecraft:enchantment", "minecraft:knockback");
         assert_eq!(field, created);
         match (field, created) {
             (Value::Host(a), Value::Host(b)) => assert_eq!(a.same_object(&b), Some(true)),
@@ -61,10 +62,7 @@ mod captured_walk_tests {
             match static_field(&r) {
                 Some(Value::Host(_)) => {
                     correct += 1;
-                    let constructed = crate::runtime::host_ids::resource_key_named(
-                        registry,
-                        location.strip_prefix("minecraft:").unwrap(),
-                    );
+                    let constructed = crate::runtime::host_ids::resource_key_named(registry, location);
                     assert_eq!(static_field(&r), Some(constructed));
                 }
                 None => counted += 1,
@@ -72,5 +70,18 @@ mod captured_walk_tests {
             }
         }
         assert_eq!((correct, counted, wrong), (43, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod method_semantics_tests {
+    #[test]
+    fn canonical_key_exposes_registry_and_identifier_parts() {
+        let key =
+            crate::runtime::host_ids::resource_key_named("minecraft:enchantment", "minecraft:knockback");
+        assert_eq!(
+            crate::runtime::host_ids::resource_key_parts(&key),
+            Some(("minecraft:enchantment".into(), "minecraft:knockback".into()))
+        );
     }
 }

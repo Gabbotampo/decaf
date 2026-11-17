@@ -32,7 +32,8 @@ mod tests {
             descriptor: KEY.into(),
         };
         let field = static_field(&r).unwrap();
-        let created = crate::host_ids::resource_key_named("minecraft:enchantment", "knockback");
+        let created =
+            crate::host_ids::resource_key_named("minecraft:enchantment", "minecraft:knockback");
         assert_eq!(field, created);
         match (field, created) {
             (Value::Host(a), Value::Host(b)) => assert_eq!(a.same_object(&b), Some(true)),
@@ -61,10 +62,7 @@ mod captured_walk_tests {
             match static_field(&r) {
                 Some(Value::Host(_)) => {
                     correct += 1;
-                    let constructed = crate::host_ids::resource_key_named(
-                        registry,
-                        location.strip_prefix("minecraft:").unwrap(),
-                    );
+                    let constructed = crate::host_ids::resource_key_named(registry, location);
                     assert_eq!(static_field(&r), Some(constructed));
                 }
                 None => counted += 1,

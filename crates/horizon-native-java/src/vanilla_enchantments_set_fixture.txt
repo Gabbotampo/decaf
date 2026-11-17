@@ -1,2 +1,0 @@
-Set.of(Enchantments.KNOCKBACK, Enchantments.FIRE_ASPECT, Enchantments.LOOTING) => size=3
-Set.of(Enchantments.KNOCKBACK, Enchantments.KNOCKBACK) => IllegalArgumentException: duplicate element: ResourceKey[minecraft:enchantment / minecraft:knockback]
