@@ -117,10 +117,20 @@ fn collection_class(class: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape { String, Marker, Undecidable }
+pub(crate) enum Shape {
+    String,
+    Marker,
+    Undecidable,
+}
 
 pub(crate) fn string_shape(marker: &str) -> Shape {
-    if marker.starts_with("abc/hcb:") { Shape::Undecidable } else if is_plain_string(marker) { Shape::String } else { Shape::Marker }
+    if marker.starts_with("abc/hcb:") {
+        Shape::Undecidable
+    } else if is_plain_string(marker) {
+        Shape::String
+    } else {
+        Shape::Marker
+    }
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
