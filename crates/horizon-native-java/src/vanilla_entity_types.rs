@@ -165,3 +165,8 @@ pub(crate) const ENTITY_TYPES: &[&str] = &[
     "minecraft:lightning_bolt",
     "minecraft:squid",
 ];
+
+pub(crate) fn handle(id: &str) -> Option<crate::Value> {
+    ENTITY_TYPES.binary_search(&id).ok()?;
+    Some(crate::Value::Ref(Some(format!("game/entity_type/{id}"))))
+}

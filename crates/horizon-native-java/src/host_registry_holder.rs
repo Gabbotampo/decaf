@@ -402,6 +402,11 @@ fn registry_call(
             let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
                 return Some(host.unknown_host_call(r));
             };
+            if registry == "minecraft:entity_type"
+                && let Some(value) = crate::vanilla_entity_types::handle(&id)
+            {
+                return Some(Ok(crate::host_optional::optional_wrap(value)));
+            }
             let Some(entry) = host.observed_registry_entry(&registry, &id) else {
                 return Some(host.unknown_host_call(r));
             };
