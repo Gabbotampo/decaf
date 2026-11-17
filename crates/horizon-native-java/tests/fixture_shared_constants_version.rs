@@ -1,5 +1,5 @@
 #[path = "support/javac_fixture.rs"] mod javac_fixture;
-use horizon_native_java::{StdHost, MethodRef, Value, RunLoader};
+use horizon_native_java::{StdHost, MethodRef, Value, RunLoader, Host};
 use javac_fixture::Fixture;
 const WORLD: &str = r#"package net.minecraft; public interface WorldVersion { String name(); String id(); int protocolVersion(); boolean stable(); }"#;
 const SHARED: &str = r#"package net.minecraft; public final class SharedConstants { public static void tryDetectVersion(){} public static WorldVersion getCurrentVersion(){throw new AssertionError();} }"#;
