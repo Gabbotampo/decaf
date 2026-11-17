@@ -197,6 +197,12 @@ impl<H: Host> Runtime<'_, H> {
         let Some(class) = crate::runtime::jar_object::marker_class(&marker) else {
             return Ok(None);
         };
+        if r.owner.starts_with("it/unimi/dsi/fastutil/objects/Object2Boolean")
+            && matches!(r.name.as_str(), "getKey" | "getValue" | "getBooleanValue") {
+            let method = if r.name == "getKey" { "getKey" } else { "getValue" };
+            let value = self.host.invoke_instance(&MethodRef { owner: "java/util/Map$Entry".into(), name: method.into(), descriptor: "()Ljava/lang/Object;".into() }, receiver, args)?;
+            return Ok(Some(if r.name == "getBooleanValue" { unbox_primitive("Z", &value) } else { value }));
+        }
         if class != SIMPLE && class != IMMUTABLE {
             return Ok(None);
         }
@@ -278,6 +284,9 @@ impl<H: Host> Runtime<'_, H> {
         };
         let parameters = descriptor_arguments(&r.descriptor);
         let result = return_desc(&r.descriptor).to_owned();
+        if kind == "map" && r.name == "object2BooleanEntrySet" && r.descriptor == "()Lit/unimi/dsi/fastutil/objects/Object2BooleanSortedMap$FastSortedEntrySet;" {
+            return self.host.invoke_instance(&java_map_entry_set(), &receiver, &[]).map(Some);
+        }
         let primitive = |descriptor: &str| descriptor.len() == 1 && descriptor != "V";
         if !parameters.iter().any(|parameter| primitive(parameter)) && !primitive(&result) {
             return Ok(None);
@@ -1606,6 +1615,10 @@ fn unboxed_to_string(r: &MethodRef, receiver: Option<&Value>) -> Option<Value> {
         Value::Int(number) => number.to_string(),
         _ => return None,
     })))
+}
+
+fn java_map_entry_set() -> MethodRef {
+    MethodRef { owner: "java/util/Map".into(), name: "entrySet".into(), descriptor: "()Ljava/util/Set;".into() }
 }
 
 /// One boxed answer unboxed to `descriptor`, with fastutil's default return
