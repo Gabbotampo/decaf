@@ -843,9 +843,6 @@ pub(crate) fn invoke(
             if (descriptor == "()Lcom/mojang/serialization/Codec;"
                 || descriptor == "(II)Lcom/mojang/serialization/Codec;") =>
         {
-            if descriptor == "(II)Lcom/mojang/serialization/Codec;" {
-                return None;
-            }
             let inner = receiver.filter(|value| codec_receiver(value))?.clone();
             build(host, r, LIST, vec![inner])
         }
