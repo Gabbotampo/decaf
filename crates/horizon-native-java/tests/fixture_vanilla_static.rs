@@ -60,14 +60,12 @@ fn vanilla_static_rows_match_java25() {
     assert!(h.unknown_host_calls().is_empty());
 }
 #[test]
-#[ignore = "Object.hashCode on a host component is answered without a count: #551"]
 fn vanilla_static_hash_is_counted_on_fresh_host() {
     let mut f = STUBS.to_vec();
     f.push(("demo/Probe.java", PROBE));
     let x = Fixture::build("vanilla-static-hash", &f);
     let mut h = x.jar.seed_host(StdHost::new());
-    let got = x.text_on(&mut h, "hash");
-    eprintln!("hash result={got:?}");
+    let _ = x.text_on(&mut h, "hash");
     assert_eq!(
         h.unknown_host_calls(),
         vec![(

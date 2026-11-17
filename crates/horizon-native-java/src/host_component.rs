@@ -423,7 +423,7 @@ fn component_hash(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<i3
         .filter(plain_tree)
         .and_then(|json| {
             if json == serde_json::json!({"text": ""}) {
-                Some(1_085_586_418)
+                None
             } else {
                 tree_hash(&json)
             }
