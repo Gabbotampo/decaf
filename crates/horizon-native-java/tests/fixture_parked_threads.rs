@@ -15,6 +15,13 @@ use javac_fixture::Fixture;
 const PROBE: &str = include_str!("fixtures/parked_threads/Probe.java");
 
 #[test]
+fn null_thread_name_matches_java_25() {
+    let fixture = Fixture::build("parked-threads", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "nullName"), "java.lang.NullPointerException:'name' is null");
+    assert!(host.unknown_host_calls().is_empty());
+}
+
 fn started_threads_are_counted_and_name_what_never_ran() {
     let fixture = Fixture::build("parked-threads", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
