@@ -129,7 +129,12 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
     }
     // Unregistered text-marker families: a runtime-built spelling may be a
     // marker or a jar String (#156 P17), so String checks are counted.
-    if marker.starts_with("enum/") || marker.starts_with("game/") || marker.starts_with("list/") {
+    if marker.starts_with("enum/")
+        || marker.starts_with("game/")
+        || marker.starts_with("list/")
+        || marker.starts_with("particle/")
+        || marker.starts_with("iterator/")
+    {
         return Shape::Undecidable;
     }
     // Callback/object/stream families have registries; absent an entry, text
