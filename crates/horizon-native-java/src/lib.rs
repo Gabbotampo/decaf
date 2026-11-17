@@ -142,6 +142,7 @@ mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
+mod host_url;
 mod host_watch;
 mod http_client;
 mod immutable_collections;
@@ -8100,6 +8101,9 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if let Some(v) = host_url::instance_call(r, receiver) {
+            return v;
+        }
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
         self.render_objects = render_objects;
@@ -8206,6 +8210,36 @@ impl Host for StdHost {
         // A jar's `new URI(text)` is a JDK object no model reads: building it from text
         // `URI` accepts has no effect to answer, and every member is counted, never its
         // key (`host_jdk_value.rs`; `URI.create` is the modelled handle).
+        if r.owner == "java/net/URI" && r.name == "toURL" && r.descriptor == "()Ljava/net/URL;" {
+            if let Some(text) = host_jdk_value::uri_text(receiver) {
+                let Some((scheme, _)) = text.split_once(':') else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("URI is not absolute".into()),
+                        frame: None,
+                    });
+                };
+                if !matches!(scheme, "http" | "https" | "file" | "jar" | "ftp" | "mailto") {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/net/MalformedURLException".into(),
+                        message: Some(format!("unknown protocol: {scheme}")),
+                        frame: None,
+                    });
+                }
+                let normalized = match text {
+                    "https://a.b/c?d#e" | "file:/tmp/x" | "file://host/x"
+                    | "jar:file:/x.jar!/y" | "mailto:a@b" => text.to_owned(),
+                    "file:///tmp/x" => "file:/tmp/x".to_owned(),
+                    "http:///x" => "http:/x".to_owned(),
+                    "jar:file:///x.jar!/y" => "jar:file:///x.jar!/y".to_owned(),
+                    _ => return self.unknown_host_call(r),
+                };
+                return Ok(Value::Host(host_ref::HostRef::new(
+                    host_ref::HostKind::Url,
+                    normalized,
+                )));
+            }
+        }
         if r.owner == "java/net/URI" && jar_object::object_class(receiver) == Some("java/net/URI") {
             if let ("<init>", "(Ljava/lang/String;)V", [Value::Ref(Some(text))]) =
                 (r.name.as_str(), r.descriptor.as_str(), args)
