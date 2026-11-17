@@ -480,6 +480,9 @@ impl<H: Host> Runtime<'_, H> {
                         return Ok(Some(receiver.clone()));
                     }
                     "add" if !args.is_empty() => {
+                        if args[0] == Value::Ref(None) {
+                            return Err(thrown("java/lang/NullPointerException", None));
+                        }
                         let list = match self.fields.get(&list_field).cloned() {
                             Some(list) => list,
                             None => {
