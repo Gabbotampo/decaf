@@ -472,11 +472,16 @@ impl StdHost {
             return Some(loader::world_version_pack(receiver, major, minor));
         }
         if let Some(name) = loader::world_version_name(receiver) {
-            return matches!(
-                (r.name.as_str(), r.descriptor.as_str()),
-                ("name" | "getName", "()Ljava/lang/String;")
-            )
-            .then(|| Value::Ref(Some(name)));
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("name" | "getName", "()Ljava/lang/String;") => Some(Value::Ref(Some(name))),
+                ("id", "()Ljava/lang/String;") => Some(Value::Ref(Some(name))),
+                ("protocolVersion", "()I") => Some(Value::Int(777)),
+                ("stable", "()Z") => Some(Value::Int(1)),
+                ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => {
+                    Some(loader::world_version_pack(receiver, 5023, 0))
+                }
+                _ => None,
+            };
         }
         if let Some((major, minor)) = loader::pack_parts(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
