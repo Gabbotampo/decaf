@@ -425,19 +425,17 @@ pub(crate) fn instance_call(
     if let Some(name) = crate::host_jdk::logger_name(receiver)
         && is_logger_owner(&r.owner)
     {
-        // A logger with a mod's own factory: its name, and the factory where Log4j keeps it as
-        // is. Everything else is counted: logging through it runs the factory's `newMessage`,
-        // jar code a host model can't run.
-        if let Some((exact, factory)) = crate::host_jdk::logger_factory(receiver) {
-            return match (r.name.as_str(), r.descriptor.as_str()) {
-                ("getName", "()Ljava/lang/String;") => Some(Ok(Value::Ref(Some(name)))),
-                ("getMessageFactory", "()Lorg/apache/logging/log4j/message/MessageFactory;")
-                    if exact =>
-                {
-                    Some(Ok(factory))
-                }
-                _ => None,
-            };
+        // A logger with a mod's own factory: the factory itself where Log4j keeps it as is
+        // (`getMessageFactory` on any other is counted). Everything else is any logger's
+        // `logger_call`: output methods are no-ops, as for every logger (whether Log4j would
+        // even build a message, through the factory or a `{}` argument's `toString`, depends on
+        // a logging configuration the host doesn't have), and level checks stay counted.
+        if let Some((exact, factory)) = crate::host_jdk::logger_factory(receiver)
+            && r.name == "getMessageFactory"
+        {
+            return (exact
+                && r.descriptor == "()Lorg/apache/logging/log4j/message/MessageFactory;")
+                .then_some(Ok(factory));
         }
         return logger_call(r, &name);
     }

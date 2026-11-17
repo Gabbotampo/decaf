@@ -105,7 +105,8 @@ pub(crate) fn logger_value(api: &str, name: &str) -> Value {
 /// and two calls with the same pair are the same logger. `exact`: the factory's class extends
 /// `AbstractMessageFactory` or `FormattedMessageFactory`, which Log4j keeps as is, so
 /// `getMessageFactory()` returns it (Java 25 capture, `tests/fixture_log4j_get_logger_factory.rs`);
-/// any other factory is wrapped in an adapter the host doesn't hold.
+/// any other factory is wrapped in an adapter the host doesn't hold. Logging through it is any
+/// logger's no-op, and level checks stay counted (`jdk_model.rs`).
 pub(crate) fn logger_factory_value(name: &str, factory: Value, exact: bool) -> Value {
     let api = if exact {
         "log4j-factory-exact"
