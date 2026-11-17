@@ -29,12 +29,20 @@ fn string_get_bytes_rows_match_java25() {
             assert_eq!(decaf, java);
         }
     }
+    // Each counted `getBytes` result then reaches the probe's `Arrays.toString`, which is counted
+    // too: its argument is an unknown, not an array.
     assert_eq!(
         host.unknown_host_calls(),
-        vec![(
-            "java/lang/String#getBytes(Ljava/nio/charset/Charset;)[B".into(),
-            COUNTED_ROWS.len()
-        )]
+        vec![
+            (
+                "java/lang/String#getBytes(Ljava/nio/charset/Charset;)[B".into(),
+                COUNTED_ROWS.len()
+            ),
+            (
+                "java/util/Arrays#toString([B)Ljava/lang/String;".into(),
+                COUNTED_ROWS.len()
+            ),
+        ]
     );
 
     // `getBytes(String charsetName)` is not modelled: both calls are counted and answer nothing
@@ -45,6 +53,9 @@ fn string_get_bytes_rows_match_java25() {
     assert_eq!(got, "name=null\nbad=null");
     assert_eq!(
         host.unknown_host_calls(),
-        vec![("java/lang/String#getBytes(Ljava/lang/String;)[B".into(), 2)]
+        vec![
+            ("java/lang/String#getBytes(Ljava/lang/String;)[B".into(), 2),
+            ("java/util/Arrays#toString([B)Ljava/lang/String;".into(), 2),
+        ]
     );
 }
