@@ -406,9 +406,12 @@ fn registry_call(
                 return Some(Ok(crate::runtime::host_optional::optional_wrap(entry.value.clone())));
             }
             if registry == "minecraft:entity_type" {
-                return Some(Ok(crate::runtime::host_optional::optional_wrap(
-                    crate::runtime::vanilla_entity_types::handle(&id),
-                )));
+                if let Some(value) = crate::runtime::vanilla_entity_types::handle(&id) {
+                    return Some(Ok(crate::runtime::host_optional::optional_wrap(value)));
+                }
+                if id.starts_with("minecraft:") {
+                    return Some(Ok(crate::runtime::host_optional::empty_optional()));
+                }
             }
             return Some(host.unknown_host_call(r));
         }
