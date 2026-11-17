@@ -460,9 +460,7 @@ impl StdHost {
             && r.descriptor
                 == "(Lnet/minecraft/server/packs/PackType;)Lnet/minecraft/server/packs/metadata/pack/PackFormat;"
         {
-            if loader::world_version_name(receiver).is_none() {
-                return None;
-            }
+            loader::world_version_name(receiver)?;
             let Some(Value::Ref(Some(marker))) = args.first() else {
                 return None;
             };
