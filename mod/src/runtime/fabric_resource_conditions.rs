@@ -58,9 +58,7 @@ pub(crate) struct State {
 impl State {
     /// The values the host holds: collector roots (a codec may hold a jar object).
     pub(crate) fn values(&self) -> impl Iterator<Item = &Value> {
-        self.types
-            .values()
-            .flat_map(|(_, id, codec)| [id, codec])
+        self.types.values().flat_map(|(_, id, codec)| [id, codec])
     }
 }
 
