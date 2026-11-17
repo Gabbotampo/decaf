@@ -26,6 +26,7 @@ fn null_thread_name_matches_java_25() {
     assert_eq!(unknown, "[]");
 }
 
+#[test]
 fn started_threads_are_counted_and_name_what_never_ran() {
     let fixture = Fixture::build("parked-threads", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
