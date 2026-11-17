@@ -2,7 +2,4 @@ name|26.3
 id|26.3
 protocol|777
 stable|true
-data|5023|main
-pack-server|121.0
-pack-client|97.1
 same|true
