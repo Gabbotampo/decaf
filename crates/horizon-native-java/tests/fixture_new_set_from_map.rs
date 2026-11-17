@@ -100,7 +100,7 @@ fn unsupported_map_implementations_are_counted() {
         host.unknown_host_calls()
             .iter()
             .find_map(|(call, count)| (call == factory).then_some(*count)),
-        Some(7),
+        Some(6),
         "unsupported map implementations must remain counted: {:?}",
         host.unknown_host_calls()
     );

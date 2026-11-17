@@ -41,7 +41,10 @@ impl StdHost {
         // `SetFromMap` delegates every operation to the map. The bounded host
         // can prove the exact order/equality/mod-count contract only for these
         // two map implementations; every other Map stays counted (#316).
-        if !matches!(class, "java/util/HashMap" | "java/util/LinkedHashMap") {
+        if !matches!(
+            class,
+            "java/util/HashMap" | "java/util/LinkedHashMap" | "java/util/concurrent/ConcurrentHashMap"
+        ) {
             return None;
         }
         let marker = crate::runtime::jar_object::collection_key_for(
