@@ -5,6 +5,10 @@ use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 const STUBS: &[(&str, &str)] = &[
     (
+        "com/mojang/serialization/MapCodec.java",
+        r#"package com.mojang.serialization; public interface MapCodec<T> extends Codec<T> {}"#,
+    ),
+    (
         "net/minecraft/network/chat/Component.java",
         r#"package net.minecraft.network.chat; public interface Component { static MutableComponent empty(){throw new AssertionError();} String getString(); }"#,
     ),
