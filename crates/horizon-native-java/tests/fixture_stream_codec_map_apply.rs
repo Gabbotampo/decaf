@@ -23,12 +23,12 @@ fn rows_match_java() {
     let f = fixture();
     let mut h = f.jar.seed_host(StdHost::new());
     assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
-    assert_eq!(h.unknown_host_calls(),vec![("net/minecraft/network/codec/StreamCodec#apply(Lnet/minecraft/network/codec/StreamCodec$CodecOperation;)Lnet/minecraft/network/codec/StreamCodec;".into(),1)]);
+    assert_eq!(h.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
 #[test]
 fn encode_counted() {
     let f = fixture();
     let mut h = f.jar.seed_host(StdHost::new());
     f.text_on(&mut h, "counted");
-    assert_eq!(h.unknown_host_calls(),vec![("net/minecraft/network/codec/StreamCodec#apply(Lnet/minecraft/network/codec/StreamCodec$CodecOperation;)Lnet/minecraft/network/codec/StreamCodec;".into(),1),("net/minecraft/network/codec/StreamCodec#encode(Ljava/lang/Object;Ljava/lang/Object;)V".into(),1)]);
+    assert_eq!(h.unknown_host_calls(),vec![("net/minecraft/network/codec/StreamCodec#apply(Lnet/minecraft/network/codec/StreamCodec$CodecOperation;)Lnet/minecraft/network/codec/StreamCodec;".into(),1)]);
 }
