@@ -610,8 +610,9 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
-    /// A java.util.regex.Matcher carrying pattern and input values.
-    Matcher,
+    /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
+    /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
+    RegexMatcher,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2637,6 +2638,14 @@ const KINDS: &[KindInfo] = &[
         canonical: always_canonical,
         methods: &crate::model_layers::IDENTITY_METHODS,
     },
+    KindInfo {
+        kind: HostKind::RegexMatcher,
+        tag: "rmat",
+        class: ClassRule::Fixed("java/util/regex/Matcher"),
+        // A serial per `matcher` call.
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::MATCHER_METHODS,
+    },
 ];
 
 impl HostKind {
@@ -3088,36 +3097,8 @@ mod tests {
         /// non-ASCII text and a NUL.
         fn text(&mut self) -> String {
             const ALPHABET: &[&str] = &[
-                ",",
-                "\\",
-                ":",
-                "h",
-                "r",
-                "i",
-                "l",
-                "f",
-                "B",
-                "5",
-                "-",
-                "opt",
-                "null",
-                "void",
-                "/",
-                "#",
-                " ",
-                "é",
-                "ü",
-                "😀",
-                "\0",
-                "\\,",
-                ",\\",
-                KindInfo {
-                    kind: HostKind::Matcher,
-                    tag: rmat,
-                    class: ClassRule::Fixed(java / util / regex / Matcher),
-                    canonical: never_canonical,
-                    methods: &crate::host_jdk_constant::PATTERN_METHODS,
-                },
+                ",", "\\", ":", "h", "r", "i", "l", "f", "B", "5", "-", "opt", "null", "void", "/",
+                "#", " ", "é", "ü", "😀", "\0", "\\,", ",\\",
             ];
             let length = self.next() % 9;
             (0..length)

@@ -337,22 +337,6 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
             let pattern = expect_string(args.first()?);
             Some(Ok(crate::host_jdk_constant::pattern(pattern)))
         }
-        (
-            "java/util/regex/Pattern",
-            "matcher",
-            "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;",
-        ) => {
-            let pattern =
-                crate::host_jdk_constant::pattern_text(args.first().unwrap_or(&Value::Ref(None)))?;
-            let input = expect_string(args.get(1)?);
-            Some(Ok(Value::Host(crate::host_ref::HostRef::of_values(
-                crate::host_ref::HostKind::Matcher,
-                &[
-                    Value::Ref(Some(pattern)),
-                    Value::Ref(Some(input.to_owned())),
-                ],
-            ))))
-        }
         // The default filesystem. Its watch services are `watch_service.rs`'s;
         // no call here touches the host's disk.
         ("java/nio/file/FileSystems", "getDefault", "()Ljava/nio/file/FileSystem;") => {
@@ -422,20 +406,6 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    if r.owner == "java/util/regex/Pattern"
-        && r.name == "matcher"
-        && r.descriptor == "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
-    {
-        let pattern = crate::host_jdk_constant::pattern_text(receiver)?;
-        let input = expect_string(args.first()?);
-        return Some(Ok(Value::Host(crate::host_ref::HostRef::of_values(
-            crate::host_ref::HostKind::Matcher,
-            &[
-                Value::Ref(Some(pattern)),
-                Value::Ref(Some(input.to_owned())),
-            ],
-        ))));
-    }
     if let Some(comparator) = crate::jdk_stream::comparator_instance(r, receiver, args) {
         return Some(comparator);
     }

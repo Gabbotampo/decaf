@@ -8044,56 +8044,6 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
-        if r.owner == "java/util/regex/Pattern"
-            && r.name == "matcher"
-            && r.descriptor == "(Ljava/lang/CharSequence;)Ljava/util/regex/Matcher;"
-        {
-            if let Some(pattern) = host_jdk_constant::pattern_text(receiver) {
-                if let Some(input) = args.first().and_then(|v| match v {
-                    Value::Ref(Some(s)) => Some(s.clone()),
-                    _ => None,
-                }) {
-                    return Ok(Value::Host(host_ref::HostRef::of_values(
-                        host_ref::HostKind::Matcher,
-                        &[Value::Ref(Some(pattern)), Value::Ref(Some(input))],
-                    )));
-                }
-            }
-        }
-        if matches!(receiver, Value::Host(h) if h.kind() == host_ref::HostKind::Matcher)
-            && r.owner == "java/util/regex/Matcher"
-        {
-            if let Value::Host(h) = receiver {
-                if let Some([Value::Ref(Some(pattern)), Value::Ref(Some(input))]) =
-                    h.values().and_then(|v| <[Value; 2]>::try_from(v).ok())
-                {
-                    if r.name == "matches" && r.descriptor == "()Z" {
-                        let matched = java_regex::matches(&pattern, &input)
-                            .map_err(|_| NativeError::Truncated)?;
-                        return Ok(Value::Int(matched as i32));
-                    }
-                }
-            }
-        }
-        if r.owner == "java/net/URI" && r.name == "toURL" && r.descriptor == "()Ljava/net/URL;" {
-            if let Some(text) = host_jdk_value::uri_text(receiver) {
-                let Some((scheme, _)) = text.split_once(':') else {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some("URI is not absolute".into()),
-                        frame: None,
-                    });
-                };
-                if !matches!(scheme, "http" | "https" | "file" | "jar" | "ftp") {
-                    return Err(NativeError::UncaughtException {
-                        class: "java/net/MalformedURLException".into(),
-                        message: Some(format!("unknown protocol: {scheme}")),
-                        frame: None,
-                    });
-                }
-                return Ok(Value::Ref(Some(format!("url/{text}"))));
-            }
-        }
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
         self.render_objects = render_objects;
