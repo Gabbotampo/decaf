@@ -48,26 +48,20 @@ impl<H: Host> Runtime<'_, H> {
         if locale.is_none() && default_locale_sensitive(format, args.as_deref()) {
             return Ok(None);
         }
-        let args = match args {
-            None => None,
-            Some(values) => {
-                if values
-                    .iter()
-                    .any(|value| crate::runtime::jar_object::packaged_object_class(value).is_some())
-                    && format_has_non_string_conversion(format)
-                {
-                    return Ok(None);
-                }
-                // A jar `toString()` that throws makes the whole format throw (`?`).
-                Some(
-                    values
-                        .iter()
-                        .map(|value| self.format_arg(value))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+        let values = args;
+        let mut resolve = |index: usize, conversion: char| {
+            let Some(values) = values.as_deref() else {
+                return Ok(Some(Arg::Null));
+            };
+            let Some(value) = values.get(index) else {
+                return Ok(None);
+            };
+            if conversion != 's' && crate::runtime::jar_object::packaged_object_class(value).is_some() {
+                return Ok(None);
             }
+            self.format_arg(value).map(Some)
         };
-        Ok(java_format::format(format, args.as_deref()))
+        java_format::format_with(format, values.is_some(), &mut resolve)
     }
 
     /// One element of the `Object[]`, classed as `Object.getClass` would
@@ -199,34 +193,4 @@ fn formats_like_us(locale: &Value) -> bool {
         ),
         _ => false,
     }
-}
-
-fn format_has_non_string_conversion(format: &str) -> bool {
-    let bytes = format.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if i >= bytes.len() {
-            return true;
-        }
-        if bytes[i] == b'%' || bytes[i] == b'n' {
-            i += 1;
-            continue;
-        }
-        while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return true;
-        }
-        if !matches!(bytes[i], b's' | b'S') {
-            return true;
-        }
-        i += 1;
-    }
-    false
 }
