@@ -13132,6 +13132,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        "java/nio/file/LinkOption" => &["NOFOLLOW_LINKS"],
         // `Collector.of`'s characteristics (`stream_pipeline.rs`).
         "java/util/stream/Collector$Characteristics" => {
             &["CONCURRENT", "UNORDERED", "IDENTITY_FINISH"]
@@ -26712,7 +26713,10 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
-                        if (truncate || append || write_only) && !create && !create_new && !self.io_files.contains_key(&path)
+                        if (truncate || append || write_only)
+                            && !create
+                            && !create_new
+                            && !self.io_files.contains_key(&path)
                         {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/NoSuchFileException".into(),
