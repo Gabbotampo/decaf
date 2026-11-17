@@ -41730,7 +41730,7 @@ mandatory = true
         };
         assert_eq!(
             host.invoke(&current_time_millis, &[]).unwrap(),
-            Value::Int(1_700_000_000)
+            Value::Long(1_700_000_000)
         );
 
         // The default is deterministic too; no host clock is consulted.
