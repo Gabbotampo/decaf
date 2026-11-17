@@ -26703,6 +26703,8 @@ impl<H: Host> Runtime<'_, H> {
                         let truncate = option_names
                             .iter()
                             .any(|name| name.contains("/TRUNCATE_EXISTING"));
+                        let create = option_names.iter().any(|name| name.ends_with("/CREATE"));
+                        let write_only = option_names.iter().any(|name| name.ends_with("/WRITE"));
                         if create_new && self.io_files.contains_key(&path) {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/FileAlreadyExistsException".into(),
@@ -26710,7 +26712,7 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
-                        if (truncate || append) && !create_new && !self.io_files.contains_key(&path)
+                        if (truncate || append || write_only) && !create && !create_new && !self.io_files.contains_key(&path)
                         {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/NoSuchFileException".into(),
