@@ -116,22 +116,6 @@ fn collection_class(class: &str) -> bool {
     crate::runtime::is_collection_owner(class) || !crate::runtime::java_immutable::supertypes(class).is_empty()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape {
-    String,
-    Marker,
-    Undecidable,
-}
-pub(crate) fn string_shape(marker: &str) -> Shape {
-    if marker.starts_with("abc/hcb:") {
-        Shape::Undecidable
-    } else if is_plain_string(marker) {
-        Shape::String
-    } else {
-        Shape::Marker
-    }
-}
-
 pub(crate) fn is_plain_string(marker: &str) -> bool {
     // Only the process-local random-tagged stream marker is a runtime object.
     // A jar String with the same public shape but another tag is still a String.
