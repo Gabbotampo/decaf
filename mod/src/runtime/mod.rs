@@ -3353,6 +3353,8 @@ pub struct StdHost {
     /// included), and the `BlockItem` built for each block: vanilla's
     /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
     constructed_items: BTreeSet<String>,
+    live_objects_issued: BTreeSet<String>,
+    live_objects_removed: BTreeSet<String>,
     /// Objects a vanilla block constructor built (a mod's block subclasses
     /// included), so `asItem()` answers only blocks it knows.
     constructed_blocks: BTreeSet<String>,
@@ -3643,6 +3645,8 @@ impl Default for StdHost {
 }
 
 impl StdHost {
+    pub fn live_object_issued(&mut self, key: &str) { self.live_objects_issued.insert(key.to_owned()); }
+    pub fn live_object_removed(&mut self, key: &str, _reason: &str) { self.live_objects_removed.insert(key.to_owned()); }
     pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
         self.registry_lifecycles
             .get(id)
@@ -3681,6 +3685,8 @@ impl StdHost {
             linked_classes: Arc::default(),
             game_block_classes: Arc::default(),
             constructed_items: BTreeSet::new(),
+            live_objects_issued: BTreeSet::new(),
+            live_objects_removed: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
@@ -8104,11 +8110,9 @@ impl Host for StdHost {
             && r.name == "isRemoved"
             && r.descriptor == "()Z"
         {
-            return if handle.key_text().contains(":removed") {
+            return if self.live_objects_removed.contains(handle.key_text()) {
                 Ok(Value::Int(1))
-            } else if handle.key_text().starts_with("ServerPlayer:")
-                || handle.key_text().starts_with("AbstractContainerMenu:")
-            {
+            } else if self.live_objects_issued.contains(handle.key_text()) {
                 Ok(Value::Int(0))
             } else {
                 self.unknown_host_call(r)
