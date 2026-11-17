@@ -7275,11 +7275,29 @@ impl Host for StdHost {
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
                 Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
             }
-            ("java/net/URLEncoder", "encode", "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;") => {
+            (
+                "java/net/URLEncoder",
+                "encode",
+                "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
+            ) => {
                 let text = expect_string(Self::argument(r, args, 0)?);
-                match Self::argument(r, args, 1)? { Value::Ref(Some(s)) if s == "charset/UTF-8" => {}, _ => return self.unknown_host_call(r), }
+                match Self::argument(r, args, 1)? {
+                    Value::Ref(Some(s)) if s == "charset/UTF-8" => {}
+                    _ => return self.unknown_host_call(r),
+                }
                 let mut out = String::new();
-                for byte in text.as_bytes() { let c = *byte as char; if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*' | '_') { out.push(c); } else if c == ' ' { out.push('+'); } else { out.push('%'); out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize])); out.push(char::from(b"0123456789ABCDEF"[(byte & 0xf) as usize])); } }
+                for byte in text.as_bytes() {
+                    let c = *byte as char;
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*' | '_') {
+                        out.push(c);
+                    } else if c == ' ' {
+                        out.push('+');
+                    } else {
+                        out.push('%');
+                        out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+                        out.push(char::from(b"0123456789ABCDEF"[(byte & 0xf) as usize]));
+                    }
+                }
                 Ok(Value::Ref(Some(out)))
             }
             // Java 25's locale cache (`host_jdk_constant.rs`): `Locale.of("en", "US")` and
