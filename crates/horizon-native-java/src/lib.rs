@@ -19935,6 +19935,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20150,6 +20151,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20321,6 +20323,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -22532,6 +22535,7 @@ struct Runtime<'a, H> {
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
+    io_stream_paths: BTreeMap<String, String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
@@ -26744,6 +26748,8 @@ impl<H: Host> Runtime<'_, H> {
             });
         };
         self.string_readers.insert(marker.to_owned(), text);
+        self.io_stream_paths
+            .insert(marker.to_owned(), path.to_owned());
         Ok(())
     }
 
@@ -36134,6 +36140,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -36206,6 +36213,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43358,6 +43366,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43572,6 +43581,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43761,6 +43771,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -44126,6 +44137,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -44435,6 +44447,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49702,6 +49715,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49761,6 +49775,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
