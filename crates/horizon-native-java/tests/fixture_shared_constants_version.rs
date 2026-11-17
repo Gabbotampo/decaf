@@ -2,7 +2,7 @@
 mod javac_fixture;
 use horizon_native_java::{Host, MethodRef, RunLoader, StdHost};
 use javac_fixture::Fixture;
-const WORLD: &str = r#"package net.minecraft; public interface WorldVersion { String name(); String id(); int protocolVersion(); boolean stable(); net.minecraft.world.level.storage.DataVersion dataVersion(); net.minecraft.server.packs.metadata.pack.PackFormat packVersion(net.minecraft.server.packs.PackType); java.util.Date buildTime(); }"#;
+const WORLD: &str = r#"package net.minecraft; public interface WorldVersion { String name(); String id(); int protocolVersion(); boolean stable(); net.minecraft.world.level.storage.DataVersion dataVersion(); net.minecraft.server.packs.metadata.pack.PackFormat packVersion(net.minecraft.server.packs.PackType type); java.util.Date buildTime(); }"#;
 const SHARED: &str = r#"package net.minecraft; public final class SharedConstants { public static void tryDetectVersion(){} public static WorldVersion getCurrentVersion(){throw new AssertionError();} }"#;
 const DATA: &str = r#"package net.minecraft.world.level.storage; public final class DataVersion { public int version(){throw new AssertionError();} public String series(){throw new AssertionError();} }"#;
 const PACK: &str = r#"package net.minecraft.server.packs.metadata.pack; public final class PackFormat { public int major(){throw new AssertionError();} public int minor(){throw new AssertionError();} }"#;
