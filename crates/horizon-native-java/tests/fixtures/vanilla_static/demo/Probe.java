@@ -10,4 +10,5 @@ public final class Probe {
   String d=Boolean.toString(Identifier.CODEC==Identifier.CODEC);
   return String.join("|",a,b,c,d);
  }
+ public static String counted() { return Boolean.toString(Identifier.CODEC.fieldOf("id") != null); }
 }
