@@ -225,7 +225,8 @@ impl<H: Host> Runtime<'_, H> {
         // Gson tree values are modeled references with a closed class hierarchy.
         // Apply the same exact rows as `instanceof`, including LinkedTreeMap.
         if crate::gson_tree::is_tree(value)
-            || crate::jar_object::object_class(value) == Some(crate::gson_tree::TREE_MAP) {
+            || crate::jar_object::object_class(value) == Some(crate::gson_tree::TREE_MAP)
+        {
             if crate::gson_tree::instance_of(value, target) {
                 return Ok(());
             }
