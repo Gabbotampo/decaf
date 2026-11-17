@@ -13135,6 +13135,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        "java/nio/file/LinkOption" => &["NOFOLLOW_LINKS"],
         // `Collector.of`'s characteristics (`stream_pipeline.rs`).
         "java/util/stream/Collector$Characteristics" => {
             &["CONCURRENT", "UNORDERED", "IDENTITY_FINISH"]
@@ -26700,12 +26701,17 @@ impl<H: Host> Runtime<'_, H> {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
+                        if option_names.iter().any(|name| name.ends_with("/SYNC")) {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         let create_new =
                             option_names.iter().any(|name| name.contains("/CREATE_NEW"));
                         let append = option_names.iter().any(|name| name.contains("/APPEND"));
                         let truncate = option_names
                             .iter()
                             .any(|name| name.contains("/TRUNCATE_EXISTING"));
+                        let create = option_names.iter().any(|name| name.ends_with("/CREATE"));
+                        let write_only = option_names.iter().any(|name| name.ends_with("/WRITE"));
                         if create_new && self.io_files.contains_key(&path) {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/FileAlreadyExistsException".into(),
@@ -26713,7 +26719,10 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
-                        if (truncate || append) && !create_new && !self.io_files.contains_key(&path)
+                        if (truncate || append || write_only)
+                            && !create
+                            && !create_new
+                            && !self.io_files.contains_key(&path)
                         {
                             return Err(NativeError::UncaughtException {
                                 class: "java/nio/file/NoSuchFileException".into(),
