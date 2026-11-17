@@ -13,6 +13,12 @@ fn rows_match_java25() {
         &[
             ("net/minecraft/WorldVersion.java", WORLD),
             ("net/minecraft/SharedConstants.java", SHARED),
+            ("net/minecraft/world/level/storage/DataVersion.java", DATA),
+            (
+                "net/minecraft/server/packs/metadata/pack/PackFormat.java",
+                PACK,
+            ),
+            ("net/minecraft/server/packs/PackType.java", TYPE),
             ("demo/Probe.java", PROBE),
         ],
     );
@@ -31,6 +37,12 @@ fn unmodelled_world_version_method_is_counted() {
         &[
             ("net/minecraft/WorldVersion.java", WORLD),
             ("net/minecraft/SharedConstants.java", SHARED),
+            ("net/minecraft/world/level/storage/DataVersion.java", DATA),
+            (
+                "net/minecraft/server/packs/metadata/pack/PackFormat.java",
+                PACK,
+            ),
+            ("net/minecraft/server/packs/PackType.java", TYPE),
             ("demo/Probe.java", PROBE),
         ],
     );
