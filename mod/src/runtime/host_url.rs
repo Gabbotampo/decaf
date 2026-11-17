@@ -49,8 +49,8 @@ pub fn to_url_text(uri: &str) -> Result<String, UrlError> {
         return Err(UrlError::Unsupported);
     }
     let tail = &uri[raw.len()..];
-    if tail.starts_with("///") && s != "jar" {
-        return Ok(format!("{s}:/{}", &tail[3..]));
+    if tail.starts_with(":///") && s != "jar" {
+        return Ok(format!("{s}:/{}", &tail[4..]));
     }
     Ok(format!("{s}{tail}"))
 }
