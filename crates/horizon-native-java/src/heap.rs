@@ -1703,6 +1703,7 @@ mod tests {
             "brigadier",
             "imc",
             "entity_registration",
+            "tool_material",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",

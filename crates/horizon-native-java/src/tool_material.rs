@@ -95,12 +95,18 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Result<Va
     Some(Ok(v.clone()))
 }
 pub(crate) fn instance_call(
-    _state: &mut State,
+    state: &mut State,
     r: &MethodRef,
     receiver: &Value,
     _args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     if r.owner != OWNER {
+        return None;
+    }
+    // Only a constant this model handed out answers: a jar's own
+    // `new ToolMaterial(..)` is a different object and stays counted, whatever
+    // number its allocation key ends in.
+    if !state.handles.values().any(|handle| handle == receiver) {
         return None;
     }
     let key = jar_object::instance_key(receiver)?;
