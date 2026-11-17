@@ -1,6 +1,6 @@
 //! `ByteBufCodecs.map` / `collection` (#472, `stream_codec.rs`).
 //!
-//! `fixtures/stream_codecs/demo/Probe.java` runs on Java 25 against the 26.3 jar and its
+//! `fixtures/stream_codec_rows/demo/Probe.java` runs on Java 25 against the 26.3 jar and its
 //! libraries (`java25.txt`, command in the README), and here against compile-only stubs: only
 //! `demo/` ships. Building a codec is exact and counts nothing (vanilla builds it lazily, so even
 //! a null factory doesn't throw); using one (`encode`) is counted.
@@ -8,8 +8,8 @@ use horizon_native_java::StdHost;
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 use javac_fixture::Fixture;
-const PROBE: &str = include_str!("fixtures/stream_codecs/demo/Probe.java");
-const ORACLE: &str = include_str!("fixtures/stream_codecs/java25.txt");
+const PROBE: &str = include_str!("fixtures/stream_codec_rows/demo/Probe.java");
+const ORACLE: &str = include_str!("fixtures/stream_codec_rows/java25.txt");
 const STUB: &str = r#"package net.minecraft.network.codec; public interface StreamCodec<B,V>{ void encode(B b,V v); V decode(B b); }"#;
 const CODECS: &str = r#"package net.minecraft.network.codec; import java.util.function.*; public final class ByteBufCodecs { public static final StreamCodec<Object,Integer> VAR_INT=null; public static final StreamCodec<Object,String> STRING_UTF8=null; public static <K,V> StreamCodec<Object,java.util.Map<K,V>> map(IntFunction<java.util.Map<K,V>> f,StreamCodec<Object,K> k,StreamCodec<Object,V> v){throw new AssertionError();} public static <E> StreamCodec<Object,java.util.Collection<E>> collection(IntFunction<java.util.Collection<E>> f,StreamCodec<Object,E> e){throw new AssertionError();} }"#;
 fn fixture() -> Fixture {
