@@ -581,8 +581,13 @@ fn runtime_record_builder<H: Host>(
         Err(reason) => return runtime_refuse(runtime, r, reason),
     };
     let Some(app) = runtime.invoke_callback(callback, &[instance])? else {
-        return Ok(None);
+        runtime_refuse(runtime, r, "RecordCodecBuilder callback returned null".into())?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
     };
+    if matches!(app, Value::Ref(None)) {
+        runtime_refuse(runtime, r, "RecordCodecBuilder callback returned null".into())?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
+    }
     if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) {
         return runtime_refuse(
             runtime,
