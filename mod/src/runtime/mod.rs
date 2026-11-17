@@ -113,6 +113,7 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+mod host_creative_tab;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -6863,6 +6864,9 @@ impl Host for StdHost {
         if let Some(value) = host_item_stack_template::static_call(r, args) {
             return value;
         }
+        if let Some(value) = host_creative_tab::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -8080,6 +8084,9 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+            return value;
+        }
+        if let Some(value) = host_creative_tab::instance_call(r, receiver, args) {
             return value;
         }
         if let Value::Host(handle) = receiver
