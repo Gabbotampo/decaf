@@ -14,14 +14,8 @@ public class Probe {
       "[%s]".formatted((Object)null),
       "[%s]".formatted(new Nully()));
   }
-  public static String counted() {
-    StringBuilder b = new StringBuilder();
-    try { "[%s]".formatted(new Boom()); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
-    b.append("\n");
-    try { b.append("[%s]".formatted(new Fmt())); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
-    b.append("\n");
-    try { String.format("%d %s", new Named(), new Named()); } catch (Throwable t) { b.append(t.getClass().getName()).append(":").append(t.getMessage()); }
-    return b.toString();
-  }
+  public static String boom() { try { "[%s]".formatted(new Boom()); return "ok"; } catch (Throwable t) { return t.getClass().getName()+":"+t.getMessage(); } }
+  public static String fmt() { try { return "[%s]".formatted(new Fmt()); } catch (Throwable t) { return t.getClass().getName()+":"+t.getMessage(); } }
+  public static String mixed() { try { return String.format("%d %s", new Named(), new Named()); } catch (Throwable t) { return t.getClass().getName()+":"+t.getMessage(); } }
   public static void main(String[] a) { System.out.print(rows()); }
 }
