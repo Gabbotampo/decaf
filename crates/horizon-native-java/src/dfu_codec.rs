@@ -582,17 +582,21 @@ fn runtime_record_builder<H: Host>(
     let Some(app) = runtime.invoke_callback(callback, &[instance])? else {
         return Ok(None);
     };
-    if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) {
-        return runtime_refuse(
-            runtime,
-            r,
-            "RecordCodecBuilder callback did not return an App node".into(),
-        );
-    }
-    match node(runtime.host, output_tag, vec![app]) {
-        Ok(value) => Ok(Some(value)),
-        Err(reason) => runtime_refuse(runtime, r, reason),
-    }
+    // The jar's callback has now run once, as `create` runs it. Whatever follows, the call
+    // is answered here: left to the rest of the dispatch it would reach this model a second
+    // time (`invoke_game_helpers`) and run the callback again.
+    let reason = if matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) {
+        match node(runtime.host, output_tag, vec![app]) {
+            Ok(value) => return Ok(Some(value)),
+            Err(reason) => reason,
+        }
+    } else {
+        "RecordCodecBuilder callback did not return an App node".to_owned()
+    };
+    // Not a product this model builds: recorded, and counted by the host, which hands back
+    // its opaque codec.
+    refuse(runtime.host, r, reason);
+    runtime.host.invoke(r, args).map(Some)
 }
 
 /// Runtime-dependent members of the unit MapCodec nodes. Construction stays in [`invoke`]
@@ -839,12 +843,11 @@ pub(crate) fn invoke(
             (tag(receiver).as_deref() == Some(UNIT))
                 .then(|| build(host, r, UNIT_CODEC, vec![receiver_held_value(receiver)?]))?
         }
-        (CODEC | PRIMITIVE, "listOf", descriptor)
-            if (descriptor == "()Lcom/mojang/serialization/Codec;"
-                || descriptor == "(II)Lcom/mojang/serialization/Codec;") =>
-        {
-            // listOf has no oracle-backed structural text yet; keep it counted.
-            return None;
+        // `listOf()` prints `ListCodec[inner]` (the fixture's `textList` row). The bounded
+        // `listOf(min, max)` has no captured text, so it stays counted.
+        (CODEC | PRIMITIVE, "listOf", "()Lcom/mojang/serialization/Codec;") => {
+            let inner = receiver.filter(|value| codec_receiver(value))?.clone();
+            build(host, r, LIST, vec![inner])
         }
         (
             CODEC | PRIMITIVE | MAP_CODEC,
