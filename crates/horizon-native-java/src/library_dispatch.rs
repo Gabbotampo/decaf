@@ -973,7 +973,7 @@ impl<H: Host> Runtime<'_, H> {
             let Some(length) = self.owned_array(&array).map(|values| values.len()) else {
                 return Ok(None);
             };
-            let (offset, end) = match r.descriptor.as_str() {
+            let (offset, count) = match r.descriptor.as_str() {
                 "([B)V" => (0, length),
                 "([BII)V" => {
                     let offset = args.get(1).and_then(boxed_integer).unwrap_or(0).max(0) as usize;
@@ -988,7 +988,7 @@ impl<H: Host> Runtime<'_, H> {
             self.fields
                 .insert(field("mark", "I"), Value::Int(offset as i32));
             self.fields
-                .insert(field("count", "I"), Value::Int(end as i32));
+                .insert(field("count", "I"), Value::Int(count as i32));
             return Ok(Some(Value::Void));
         }
         // What the stream yields next: the array-backed stream's slice, or the
@@ -1061,14 +1061,8 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("skip", "(J)J") if array_stream.is_some() => {
                 let amount = args.first().and_then(boxed_long).unwrap_or(0).max(0) as usize;
-                let pos = match self.fields.get(&field("pos", "I")) {
-                    Some(Value::Int(pos)) => (*pos).max(0) as usize,
-                    _ => 0,
-                };
-                let count = match self.fields.get(&field("count", "I")) {
-                    Some(Value::Int(count)) => (*count).max(0) as usize,
-                    _ => 0,
-                };
+                let pos = match self.fields.get(&field("pos", "I")) { Some(Value::Int(pos)) => (*pos).max(0) as usize, _ => 0 };
+                let count = match self.fields.get(&field("count", "I")) { Some(Value::Int(count)) => (*count).max(0) as usize, _ => 0 };
                 let skipped = amount.min(count.saturating_sub(pos));
                 self.fields.insert(field("pos", "I"), Value::Int(pos.saturating_add(skipped) as i32));
                 Value::Long(skipped as i64)
@@ -1102,7 +1096,9 @@ impl<H: Host> Runtime<'_, H> {
                     if offset < 0 || length < 0 || offset as usize + length as usize > capacity {
                         return Err(NativeError::UncaughtException {
                             class: "java/lang/IndexOutOfBoundsException".into(),
-                            message: None,
+                            message: Some(format!(
+                                "Range [{offset}, {offset} + {length}) out of bounds for length {capacity}",
+                            )),
                             frame: None,
                         });
                     }
