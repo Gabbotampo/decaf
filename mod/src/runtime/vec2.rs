@@ -30,6 +30,15 @@ fn row(name: &str) -> Option<Row> {
 pub(crate) struct State {
     handles: BTreeMap<String, Value>,
 }
+impl State {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.handles.len()
+    }
+    pub(crate) fn retain_keys(&mut self, keep: impl Fn(&str) -> bool) {
+        self.handles
+            .retain(|_, value| jar_object::object_key(value).is_some_and(&keep));
+    }
+}
 pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Result<Value, NativeError>> {
     if r.owner != OWNER
         || r.descriptor != "Lnet/minecraft/world/phys/Vec2;"
@@ -51,6 +60,7 @@ pub(crate) fn static_field(state: &mut State, r: &MethodRef) -> Option<Result<Va
     .position(|name| *name == r.name)
     .unwrap()
         + 900000;
+    // 900000+ cannot collide: the jar never allocates a Vec2 itself; new Vec2 is counted.
     let v = state
         .handles
         .entry(r.name.clone())
