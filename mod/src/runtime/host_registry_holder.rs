@@ -419,7 +419,8 @@ fn registry_call(
                     return Some(Ok(value));
                 }
                 if id.starts_with("minecraft:") {
-                    return Some(Ok(crate::runtime::vanilla_entity_types::handle("minecraft:pig").unwrap_or(Value::Ref(None))));
+                    return Some(Ok(crate::runtime::vanilla_entity_types::handle("minecraft:pig")
+                        .unwrap_or(Value::Ref(None))));
                 }
             }
             Some(host.unknown_host_call(r))
