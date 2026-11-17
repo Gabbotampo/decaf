@@ -7,7 +7,6 @@
 use crate::host_ref::{
     ClassHierarchy, ClassSide, HostKind, HostRef, Methods, exact_class_rules_out,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{MethodRef, NativeError, StdHost, Value};
 
