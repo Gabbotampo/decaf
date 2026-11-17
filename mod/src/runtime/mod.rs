@@ -3645,8 +3645,12 @@ impl Default for StdHost {
 }
 
 impl StdHost {
-    pub fn live_object_issued(&mut self, key: &str) { self.live_objects_issued.insert(key.to_owned()); }
-    pub fn live_object_removed(&mut self, key: &str, _reason: &str) { self.live_objects_removed.insert(key.to_owned()); }
+    pub fn live_object_issued(&mut self, key: &str) {
+        self.live_objects_issued.insert(key.to_owned());
+    }
+    pub fn live_object_removed(&mut self, key: &str, _reason: &str) {
+        self.live_objects_removed.insert(key.to_owned());
+    }
     pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
         self.registry_lifecycles
             .get(id)
