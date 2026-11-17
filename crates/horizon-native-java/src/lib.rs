@@ -4261,7 +4261,7 @@ impl StdHost {
 
     fn resource_stream(&mut self, name: &str) -> Value {
         let name = name.strip_prefix('/').unwrap_or(name);
-        let Some(marker) = self.resource(name).map(str::to_owned) else {
+        let Some(marker) = self.resource(name).map(|value| value.to_owned()) else {
             return Value::Ref(None);
         };
         let bytes = self.resource_bytes.get(name).cloned().or_else(|| {
