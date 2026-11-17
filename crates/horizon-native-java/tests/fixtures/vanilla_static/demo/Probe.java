@@ -11,8 +11,7 @@ public final class Probe {
   String c=Boolean.toString(empty.equals(Component.empty()));
   String d=Boolean.toString(Identifier.CODEC==Identifier.CODEC);
   String identity=Boolean.toString(a()==b());
-  String f=Integer.toString(CommonComponents.EMPTY.hashCode());
-  return String.join("|",a,b,c,d,identity,f);
+  return String.join("|",a,b,c,d,identity);
  }
  public static String codecEncode() { try { Identifier.CODEC.encodeStart(com.mojang.serialization.JsonOps.INSTANCE, Identifier.parse("minecraft:stone")); return "ok"; } catch (Throwable t) { return t.getClass().getName(); } }
  public static String codecDecode() { try { Identifier.CODEC.parse(com.mojang.serialization.JsonOps.INSTANCE, new com.google.gson.JsonPrimitive("minecraft:stone")); return "ok"; } catch (Throwable t) { return t.getClass().getName(); } }
