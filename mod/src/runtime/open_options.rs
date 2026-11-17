@@ -151,7 +151,10 @@ fn invoke_files<H: Host>(
     };
     match check(&elements) {
         Verdict::Throws(error) => Err(error),
-        Verdict::Unmodelled => Ok(Some(rt.host.unknown_operand_call(r)?)),
+        Verdict::Unmodelled => {
+            let opened = rt.invoke_io(r, receiver, args, class, method)?;
+            Ok(opened)
+        }
         Verdict::CreateOrTruncate => {
             let opened = rt.invoke_io(r, receiver, args, class, method)?;
             if r.name == "newOutputStream"

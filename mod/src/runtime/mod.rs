@@ -26677,8 +26677,8 @@ impl<H: Host> Runtime<'_, H> {
                                 Some(text) => Value::Ref(Some(text)),
                                 None if path.starts_with("/horizon/") => {
                                     return Err(NativeError::UncaughtException {
-                                        class: "java/io/IOException".into(),
-                                        message: Some(format!("{path}: no such file")),
+                                        class: "java/nio/file/NoSuchFileException".into(),
+                                        message: Some(display_path.clone()),
                                         frame: None,
                                     });
                                 }
