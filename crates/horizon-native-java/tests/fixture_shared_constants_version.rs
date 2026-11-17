@@ -55,7 +55,8 @@ fn build_time_is_counted() {
             .with_run_loader(RunLoader::NeoForge)
             .with_game_version("26.3"),
     );
-    let _ = f.text_on(&mut h, "buildTime");
+    let text = f.text_on(&mut h, "buildTime");
+    eprintln!("buildTime result: {text:?}");
     assert_eq!(
         h.unknown_host_calls(),
         vec![(
