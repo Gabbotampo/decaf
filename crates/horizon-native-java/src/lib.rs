@@ -10715,21 +10715,50 @@ impl Host for StdHost {
             ("java/lang/String", "getBytes", "()[B")
             | ("java/lang/String", "getBytes", "(Ljava/nio/charset/Charset;)[B") => {
                 let text = expect_string(receiver);
-                let charset = if r.descriptor == "()[B" { "UTF-8" } else {
-                    let Some(Value::Ref(Some(marker))) = args.first() else { return Err(NativeError::UncaughtException { class: "java/lang/NullPointerException".into(), message: Some("null".into()), frame: None }); };
-                    let Some(name) = marker.strip_prefix("charset/") else { return self.unknown_host_call(r).map(Some); }; name
+                let charset = if r.descriptor == "()[B" {
+                    "UTF-8"
+                } else {
+                    let Some(Value::Ref(Some(marker))) = args.first() else {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("null".into()),
+                            frame: None,
+                        });
+                    };
+                    let Some(name) = marker.strip_prefix("charset/") else {
+                        return self.unknown_host_call(r).map(Some);
+                    };
+                    name
                 };
                 let bytes: Vec<u8> = match charset {
                     "UTF-8" => text.as_bytes().to_vec(),
-                    "US-ASCII" => text.chars().map(|c| if c.is_ascii() { c as u8 } else { b'?' }).collect(),
-                    "ISO-8859-1" => text.chars().map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' }).collect(),
-                    "UTF-16" => { let mut out = vec![0xfe, 0xff]; for u in text.encode_utf16() { out.extend_from_slice(&u.to_be_bytes()); } out },
+                    "US-ASCII" => text
+                        .chars()
+                        .map(|c| if c.is_ascii() { c as u8 } else { b'?' })
+                        .collect(),
+                    "ISO-8859-1" => text
+                        .chars()
+                        .map(|c| if (c as u32) <= 0xff { c as u8 } else { b'?' })
+                        .collect(),
+                    "UTF-16" => {
+                        let mut out = vec![0xfe, 0xff];
+                        for u in text.encode_utf16() {
+                            out.extend_from_slice(&u.to_be_bytes());
+                        }
+                        out
+                    }
                     "UTF-16BE" => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
                     "UTF-16LE" => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
                     _ => return self.unknown_host_call(r).map(Some),
                 };
                 let marker = self.new_array("byte", "getBytes");
-                self.arrays.insert(marker.clone(), bytes.into_iter().map(|b| Value::Int((b as i8) as i32)).collect());
+                self.arrays.insert(
+                    marker.clone(),
+                    bytes
+                        .into_iter()
+                        .map(|b| Value::Int((b as i8) as i32))
+                        .collect(),
+                );
                 Ok(Value::Ref(Some(marker)))
             }
             ("java/lang/String", "startsWith", "(Ljava/lang/String;)Z") => {
