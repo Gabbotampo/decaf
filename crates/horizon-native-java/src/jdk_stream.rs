@@ -589,7 +589,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         }
         if key
             .as_deref()
-            .is_some_and(|marker| marker.contains("#sublist-"))
+            .is_some_and(|marker| self.host.is_detached_sub_list(marker))
         {
             self.host.unknown_operand_call(r)?;
             return Ok(None);

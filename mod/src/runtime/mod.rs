@@ -2768,6 +2768,13 @@ pub trait Host {
         None
     }
 
+    /// Whether `marker` is a detached `subList` copy (`jdk_model.rs::sub_list`): a
+    /// write through it does not reach its parent list, so `Collections.reverse`
+    /// on it is counted rather than answered.
+    fn is_detached_sub_list(&self, _marker: &str) -> bool {
+        false
+    }
+
     fn store_sub_list_link(&mut self, _marker: &str, _link: Option<mod_count::SubListLink>) {}
 
     /// The `subList` copies taken from `parent`.
@@ -3494,6 +3501,8 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
+    detached_sub_lists: BTreeSet<String>,
     /// Live SetFromMap marker -> backing map marker.
     set_from_map_views: BTreeMap<String, String>,
     next_set_from_map: u64,
@@ -3761,6 +3770,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            detached_sub_lists: BTreeSet::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
             component_states: BTreeMap::new(),
@@ -6112,6 +6122,10 @@ impl Host for StdHost {
             return None;
         }
         self.sub_lists.get(marker).cloned()
+    }
+
+    fn is_detached_sub_list(&self, marker: &str) -> bool {
+        self.detached_sub_lists.contains(marker)
     }
 
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {

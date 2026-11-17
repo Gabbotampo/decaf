@@ -756,16 +756,18 @@ impl crate::runtime::StdHost {
         }
         let range = values[from as usize..to as usize].to_vec();
         let made = self.new_collection(super::stand_in_class("list"), range);
-        let old = match &made {
-            Value::Host(handle) => handle.key().to_owned(),
-            Value::Ref(Some(marker)) => marker.clone(),
-            _ => return Ok(made),
-        };
-        let key = format!("java/util/Arrays$ArrayList#sublist-{old}");
-        if let Some(values) = self.mutable_collections.remove(&old) {
-            self.mutable_collections.insert(key.clone(), values);
+        // A detached copy: remember it, so `Collections.reverse` on it is counted
+        // (a write through it would not reach the parent, #496).
+        match &made {
+            Value::Host(handle) => {
+                self.detached_sub_lists.insert(handle.key().to_owned());
+            }
+            Value::Ref(Some(marker)) => {
+                self.detached_sub_lists.insert(marker.clone());
+            }
+            _ => {}
         }
-        Ok(crate::runtime::jar_object::collection(key))
+        Ok(made)
     }
 }
 
