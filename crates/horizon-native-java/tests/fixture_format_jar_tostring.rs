@@ -73,7 +73,7 @@ const FORMAT: &str =
 #[test]
 fn formatter_counted_cases() {
     let cases = [("fmt", FORMATTED), ("mixed", FORMAT), ("boom", FORMATTED)];
-    assert_eq!(JAVA25_COUNTED.lines().count(), 2);
+    assert_eq!(JAVA25_COUNTED.lines().count(), cases.len());
     for (name, signature) in cases {
         if name == "boom" {
             continue;
