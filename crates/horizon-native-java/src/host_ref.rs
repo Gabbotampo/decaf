@@ -2640,7 +2640,7 @@ const KINDS: &[KindInfo] = &[
     },
     KindInfo {
         kind: HostKind::RegexMatcher,
-        tag: "rmat",
+        tag: "rxm",
         class: ClassRule::Fixed("java/util/regex/Matcher"),
         // A serial per `matcher` call.
         canonical: always_canonical,
