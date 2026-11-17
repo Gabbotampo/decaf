@@ -610,6 +610,7 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
+    RegexMatcher,
     Url,
 }
 
@@ -2635,6 +2636,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::model_layers::LAYER_DEFINITION),
         canonical: always_canonical,
         methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RegexMatcher,
+        tag: "rpat",
+        class: ClassRule::Fixed("java/util/regex/Pattern"),
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::PATTERN_METHODS,
     },
     KindInfo {
         kind: HostKind::Url,
