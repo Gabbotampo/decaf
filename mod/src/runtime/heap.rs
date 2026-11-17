@@ -1641,7 +1641,6 @@ mod tests {
         const COLLECTOR_READS: &[&str] = &[
             "array_views",
             "resource_streams",
-            "io_stream_paths",
             "calls",
             "invocations",
             "posted_events",
