@@ -9,7 +9,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenHashMap.java",
-        r#"package it.unimi.dsi.fastutil.objects; import java.util.*; public class Object2BooleanLinkedOpenHashMap<K> { public Object2BooleanLinkedOpenHashMap() {} public boolean put(K k, boolean v) { throw new UnsupportedOperationException(); } public boolean removeBoolean(K k) { throw new UnsupportedOperationException(); } public Object2BooleanMap.FastSortedEntrySet<K> object2BooleanEntrySet() { throw new UnsupportedOperationException(); } }"#,
+        r#"package it.unimi.dsi.fastutil.objects; import java.util.*; public class Object2BooleanLinkedOpenHashMap<K> { public Object2BooleanLinkedOpenHashMap() {} public boolean put(K k, boolean v) { throw new UnsupportedOperationException(); } public boolean removeBoolean(K k) { throw new UnsupportedOperationException(); } public java.lang.Iterable<Object2BooleanMap.Entry<K>> object2BooleanEntrySet() { throw new UnsupportedOperationException(); } }"#,
     ),
 ];
 const PROBE: &str = include_str!("fixtures/fastutil_boolean_entries/demo/Probe.java");
