@@ -478,7 +478,7 @@ impl StdHost {
                 ("protocolVersion", "()I") => Some(Value::Int(777)),
                 ("stable", "()Z") => Some(Value::Int(1)),
                 ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => {
-                    Some(loader::world_version_pack(receiver, 5023, 0))
+                    Some(loader::world_version_data(receiver, 5023))
                 }
                 _ => None,
             };

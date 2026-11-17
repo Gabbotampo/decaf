@@ -270,6 +270,12 @@ pub(crate) fn world_version_pack(value: &Value, major: i32, minor: i32) -> Value
         &[text(&format!("pack:{major}:{minor}"))],
     ))
 }
+pub(crate) fn world_version_data(value: &Value, version: i32) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::WorldVersion,
+        &[text(&format!("data:{version}:main"))],
+    ))
+}
 pub(crate) fn pack_parts(value: &Value) -> Option<(i32, i32)> {
     let s = held_text(value, HostKind::WorldVersion)?;
     let mut it = s.strip_prefix("pack:")?.split(':');
