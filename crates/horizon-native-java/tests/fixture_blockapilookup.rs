@@ -1,6 +1,6 @@
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
-use horizon_native_java::StdHost;
+use horizon_native_java::{StdHost, Value};
 use javac_fixture::Fixture;
 const LOOKUP: &str = r#"package net.fabricmc.fabric.api.lookup.v1.block;
 import net.minecraft.core.Direction; import net.minecraft.resources.Identifier;
@@ -59,5 +59,16 @@ fn registrations_are_per_host() {
     let mut first = f.jar.seed_host(StdHost::new());
     let _ = f.text_on(&mut first, "rows");
     let mut second = f.jar.seed_host(StdHost::new());
-    assert_eq!(f.text_on(&mut second, "run"), "ok");
+    let value = f
+        .jar
+        .invoke_method_with_args(
+            "demo/Isolation",
+            "run",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut second,
+        )
+        .expect("run");
+    assert!(matches!(value, Value::Ref(Some(ref text)) if text == "ok"));
 }
