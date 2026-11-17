@@ -31,6 +31,15 @@ pub fn to_url_text(uri: &str) -> Result<String, UrlError> {
     Ok(uri.to_owned())
 }
 pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, NativeError>> {
+    if r.owner == "java/net/URL" {
+        if let Value::Host(h) = receiver {
+            if h.kind() == crate::runtime::host_ref::HostKind::Url {
+                if r.name == "toExternalForm" || r.name == "toString" { return Some(Ok(Value::Ref(Some(h.key().to_owned())))); }
+                if r.name == "getProtocol" { return Some(Ok(Value::Ref(Some(h.key().split(':').next().unwrap_or("").to_owned())))); }
+            }
+        }
+        return None;
+    }
     if r.owner != "java/net/URI" || r.name != "toURL" {
         return None;
     }
