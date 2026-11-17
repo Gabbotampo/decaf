@@ -109,6 +109,9 @@ fn map_codec(value: &Value) -> bool {
 }
 
 fn codec_receiver(value: &Value) -> bool {
+    if crate::runtime::host_codec::opaque_codec_type(value).is_some_and(|t| t == CODEC || t == PRIMITIVE) {
+        return true;
+    }
     let Some(tag) = tag(value) else {
         return false;
     };
@@ -120,6 +123,9 @@ fn codec_receiver(value: &Value) -> bool {
 }
 
 fn map_receiver(value: &Value) -> bool {
+    if crate::runtime::host_codec::opaque_codec_type(value).is_some_and(|t| t == MAP_CODEC) {
+        return true;
+    }
     map_codec(value) && !matches!(tag(value).as_deref(), Some(GETTER))
 }
 
