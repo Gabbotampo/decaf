@@ -35,7 +35,6 @@ fn rows_match_java25() {
     assert_eq!(h.unknown_host_calls(), vec![]);
 }
 #[test]
-#[ignore = "an unmodelled host method is answered without a count: #551"]
 fn build_time_is_counted() {
     let f = Fixture::build(
         "shared-constants-version-counted",
