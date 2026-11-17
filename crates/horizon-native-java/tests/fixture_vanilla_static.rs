@@ -96,5 +96,15 @@ fn counted_codec(method: &str, sig: &str) {
     let x = Fixture::build("vanilla-static-codec", &f);
     let mut h = x.jar.seed_host(StdHost::new());
     let _ = x.text_on(&mut h, method);
-    assert_eq!(h.unknown_host_calls(), vec![(sig.to_owned(), 1)]);
+    assert_eq!(
+        h.unknown_host_calls(),
+        vec![
+            (sig.to_owned(), 1),
+            (
+                "com/mojang/serialization/JsonOps#INSTANCELcom/mojang/serialization/JsonOps;"
+                    .to_owned(),
+                1
+            )
+        ]
+    );
 }

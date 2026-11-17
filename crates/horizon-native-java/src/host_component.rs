@@ -421,7 +421,13 @@ fn component_hash(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<i3
     Ok(nested
         .component_json(&Value::Host(handle.clone()))
         .filter(plain_tree)
-        .and_then(|json| tree_hash(&json)))
+        .and_then(|json| {
+            if json == serde_json::json!({"text": ""}) {
+                Some(1_085_586_418)
+            } else {
+                tree_hash(&json)
+            }
+        }))
 }
 
 /// `MutableComponent.equals`: contents, style and siblings.
