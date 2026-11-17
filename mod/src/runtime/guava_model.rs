@@ -23,8 +23,8 @@
 
 use super::*;
 
-/// The composite operations of Guava's two natural orderings (`callback_marker`
-/// answers their `toString`).
+/// The composite operations of Guava's two natural orderings. Their `toString`,
+/// like every callback's, is counted (`callback_marker::CALLBACK_TEXT`).
 pub(crate) const GUAVA_NATURAL: &str = "cmp.guava-natural";
 pub(crate) const GUAVA_REVERSE_NATURAL: &str = "cmp.guava-reverse-natural";
 

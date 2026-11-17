@@ -467,19 +467,7 @@ fn equals(handle: &HostRef, other: &Value) -> Option<bool> {
 /// `hashCode` name its hidden class and identity hash, which no run
 /// reproduces (counted).
 pub(crate) const METHODS: Methods = Methods {
-    // Only Guava's natural orderings have a known `toString`; every other
-    // callback's is its hidden class's and is counted.
-    to_string: |handle, _| {
-        Ok(match handle.row() {
-            Some(Row::Composite { op, .. }) if op == crate::runtime::guava_model::GUAVA_NATURAL => {
-                Some("Ordering.natural()".to_owned())
-            }
-            Some(Row::Composite { op, .. }) if op == crate::runtime::guava_model::GUAVA_REVERSE_NATURAL => {
-                Some("Ordering.natural().reverse()".to_owned())
-            }
-            _ => None,
-        })
-    },
+    to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: |handle, other, _| Ok(equals(handle, other)),
     instance_of,

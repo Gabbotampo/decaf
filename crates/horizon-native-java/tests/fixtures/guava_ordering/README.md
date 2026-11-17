@@ -7,3 +7,6 @@ library jar of 26.3) prints `java25.txt`:
 
 `reverse.null` carries the JVM's helpful NullPointerException text: Guava's
 `ReverseNaturalOrdering.compare` checks only `left`, then calls `right.compareTo(left)`.
+
+`toString()` is not in the probe: the interpreter counts it on every callback handle,
+these orderings included (`callback_marker::CALLBACK_TEXT`). jamlib only compares.

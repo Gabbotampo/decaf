@@ -28,8 +28,6 @@ public final class Probe {
     p(out, "naturalIdentity", Ordering.natural() == n);
     p(out, "reverseIdentity", n.reverse() == r);
     p(out, "reverseReverse", r.reverse() == n);
-    p(out, "natural.toString", n);
-    p(out, "reverse.toString", r);
     try {
       n.compare(null, "a");
       p(out, "natural.null", "ok");

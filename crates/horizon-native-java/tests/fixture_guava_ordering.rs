@@ -29,4 +29,11 @@ fn guava_ordering_rows_match_java25() {
     );
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(fixture.text_on(&mut host, "rows"), ORACLE);
+    // Every Ordering call the probe makes is answered; nothing is counted.
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
