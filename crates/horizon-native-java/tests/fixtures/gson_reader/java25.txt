@@ -1,0 +1,9 @@
+string=3|ok|[1, 2]|v
+file=4|file|[3]|f
+resource=5|resource|[9, 10]|r
+missing=java.lang.NullPointerException:Cannot read field "k" because "<parameter1>.nested" is null
+trailing=com.google.gson.JsonSyntaxException:com.google.gson.stream.MalformedJsonException: Use JsonReader.setStrictness(Strictness.LENIENT) to accept malformed JSON at line 1 column 10 path $
+See https://github.com/google/gson/blob/main/Troubleshooting.md#malformed-json
+empty=null
+twice1=java.lang.NullPointerException:Cannot read field "k" because "<parameter1>.nested" is null
+twice2=null
