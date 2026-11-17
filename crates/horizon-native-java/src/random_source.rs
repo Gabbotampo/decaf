@@ -182,6 +182,10 @@ impl StdHost {
             ("create", "(J)Lnet/minecraft/util/RandomSource;", [seed]) => {
                 Some(self.random_seeded(LEGACY, as_long(seed)?))
             }
+            ("create", "()Lnet/minecraft/util/RandomSource;", []) => {
+                let seed = 0x5DEECE66Di64 ^ self.random_sources.len() as i64;
+                Some(self.random_seeded(LEGACY, seed))
+            }
             ("createThreadLocalInstance", "(J)Lnet/minecraft/util/RandomSource;", [seed]) => {
                 Some(self.random_seeded(SINGLE, as_long(seed)?))
             }
