@@ -55,25 +55,7 @@ fn build_time_is_counted() {
             .with_run_loader(RunLoader::NeoForge)
             .with_game_version("26.3"),
     );
-    let v = h
-        .invoke(
-            &MethodRef {
-                owner: "net/minecraft/SharedConstants".into(),
-                name: "getCurrentVersion".into(),
-                descriptor: "()Lnet/minecraft/WorldVersion;".into(),
-            },
-            &[],
-        )
-        .unwrap();
-    let _ = h.invoke_instance(
-        &MethodRef {
-            owner: "net/minecraft/WorldVersion".into(),
-            name: "id".into(),
-            descriptor: "()Ljava/lang/String;".into(),
-        },
-        &v,
-        &[],
-    );
+    let _ = f.text_on(&mut h, "buildTime");
     assert_eq!(
         h.unknown_host_calls(),
         vec![(
