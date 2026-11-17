@@ -754,16 +754,19 @@ impl crate::runtime::StdHost {
                 frame: None,
             });
         }
+        eprintln!("SUBLIST parent={marker}");
         let range = values[from as usize..to as usize].to_vec();
         let made = self.new_collection(super::stand_in_class("list"), range);
-        if let Value::Ref(Some(old)) = made {
-            let key = format!("java/util/Arrays$ArrayList#sublist-{old}");
-            if let Some(values) = self.mutable_collections.remove(&old) {
-                self.mutable_collections.insert(key.clone(), values);
-            }
-            return Ok(crate::runtime::jar_object::collection(key));
+        let old = match &made {
+            Value::Host(handle) => handle.key().to_owned(),
+            Value::Ref(Some(marker)) => marker.clone(),
+            _ => return Ok(made),
+        };
+        let key = format!("java/util/Arrays$ArrayList#sublist-{old}");
+        if let Some(values) = self.mutable_collections.remove(&old) {
+            self.mutable_collections.insert(key.clone(), values);
         }
-        Ok(made)
+        Ok(crate::runtime::jar_object::collection(key))
     }
 }
 
