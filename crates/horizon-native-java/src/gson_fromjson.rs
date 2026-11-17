@@ -189,6 +189,7 @@ impl<H: Host> Runtime<'_, H> {
             Value::Ref(None) => None,
             Value::Ref(Some(text)) if !reader => Some(text.clone()),
             value if reader => crate::jar_object::object_key(value)
+                .or_else(|| crate::expect_ref(value))
                 .and_then(|marker| self.string_readers.get(marker))
                 .cloned(),
             _ => None,
