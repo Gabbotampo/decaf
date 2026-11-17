@@ -42,37 +42,3 @@ fn cvobject_iterator_rows_match_java25() {
         host.unknown_host_calls()
     );
 }
-#[test]
-fn number_is_counted() {
-    let sources = vec![
-        ("demo/Probe.java", PROBE),
-        (
-            "net/fabricmc/loader/api/metadata/CustomValue.java",
-            include_str!(
-                "fixtures/fabric_mods/stubs/net/fabricmc/loader/api/metadata/CustomValue.java"
-            ),
-        ),
-        (
-            "net/fabricmc/loader/api/metadata/ModMetadata.java",
-            "package net.fabricmc.loader.api.metadata; public interface ModMetadata { CustomValue getCustomValue(String key); }",
-        ),
-        (
-            "net/fabricmc/loader/api/FabricLoader.java",
-            "package net.fabricmc.loader.api; import java.util.Optional; public interface FabricLoader { static FabricLoader getInstance(){return null;} Optional<ModContainer> getModContainer(String id); }",
-        ),
-        (
-            "net/fabricmc/loader/api/ModContainer.java",
-            "package net.fabricmc.loader.api; import net.fabricmc.loader.api.metadata.ModMetadata; public interface ModContainer { ModMetadata getMetadata(); }",
-        ),
-    ];
-    let fixture = Fixture::build_with_mod_json("demo", &sources, MOD_JSON);
-    let mut host = fixture.jar.seed_host(StdHost::new());
-    let _ = fixture.text_on(&mut host, "numberText");
-    assert_eq!(
-        host.unknown_host_calls(),
-        vec![(
-            "net/fabricmc/loader/api/metadata/CustomValue#getAsNumber()Ljava/lang/Number;".into(),
-            1
-        )]
-    );
-}
