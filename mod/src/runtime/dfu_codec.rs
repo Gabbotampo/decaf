@@ -584,8 +584,11 @@ fn runtime_record_builder<H: Host>(
         runtime_refuse(runtime, r, "RecordCodecBuilder callback returned null".into())?;
         return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
     };
-    if matches!(app, Value::Ref(None)) {
-        runtime_refuse(runtime, r, "RecordCodecBuilder callback returned null".into())?;
+    if matches!(app, Value::Ref(None) | Value::Void) {
+        runtime.host.dfu_codec_refused(format!(
+            "{}#{}{}: RecordCodecBuilder callback returned null",
+            r.owner, r.name, r.descriptor
+        ));
         return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
     }
     if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) {
