@@ -755,7 +755,15 @@ impl crate::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        Ok(self.new_collection(super::stand_in_class("list"), range))
+        let made = self.new_collection(super::stand_in_class("list"), range);
+        if let Value::Ref(Some(old)) = made {
+            let key = format!("java/util/Arrays$ArrayList#sublist-{old}");
+            if let Some(values) = self.mutable_collections.remove(&old) {
+                self.mutable_collections.insert(key.clone(), values);
+            }
+            return Ok(crate::jar_object::collection(key));
+        }
+        Ok(made)
     }
 }
 
