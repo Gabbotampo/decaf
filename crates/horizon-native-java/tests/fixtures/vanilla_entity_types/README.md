@@ -8,5 +8,5 @@ CP=$HOME/ava/minecraft-26.3-server-game.jar:$(find $HOME/ava/scratch/vanilla-val
 O=$HOME/ava/scratch/entity-type-table-classes
 mkdir -p "$O"
 $J/javac -cp "$CP" -d "$O" oracle/EntityTypesCapture.java
-$J/java -cp "$O:$CP" oracle.EntityTypesCapture > java25.txt
+$J/java -cp "$O:$CP" oracle.EntityTypesCapture 2>/dev/null | sed "s/^\[[^]]*\] \[main\/INFO\]: \[STDOUT\]: //" > java25.txt
 ```
