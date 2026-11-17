@@ -1,1 +1,5 @@
-true|true|true|true|encode:java.lang.NullPointerException|null-ok
+distinctMaps=true
+distinctCollections=true
+mapIsCodec=true
+collectionIsCodec=true
+nullFactory=ok
