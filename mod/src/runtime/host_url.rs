@@ -82,9 +82,10 @@ pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, Na
         }),
         Err(UrlError::UnknownProtocol) => Err(NativeError::UncaughtException {
             class: "java/net/MalformedURLException".into(),
+            // Java looks the protocol up lowercased and names it so (`DATA:x` gives `data`).
             message: Some(format!(
                 "unknown protocol: {}",
-                text.split(':').next().unwrap_or("")
+                text.split(':').next().unwrap_or("").to_ascii_lowercase()
             )),
             frame: None,
         }),

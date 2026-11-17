@@ -22,4 +22,7 @@ file:x => file:x | file:x | file
 http:x => http:x | http:x | http
 http://u@h:80/p => http://u@h:80/p | http://u@h:80/p | http
 http://a/%7e?q#f => http://a/%7e?q#f | http://a/%7e?q#f | http
+DATA:x => java.net.MalformedURLException:unknown protocol: data
+Nio:/x => java.net.MalformedURLException:unknown protocol: nio
+Http://A.B/C => http://A.B/C | http://A.B/C | http
 unknown=openStream
