@@ -11,6 +11,7 @@ public class Probe {
   List<Integer> u=Collections.unmodifiableList(new ArrayList<>(List.of(1,2))); s.append(err(()->Collections.reverse(u))).append('|');
   Iterator<Integer> si=Stream.of(1,2,3).iterator(); si.next(); s.append(err(si::remove)).append('|');
   List<Integer> ll=new LinkedList<>(List.of(1,2,3)); Iterator<Integer> li=ll.iterator(); Collections.reverse(ll); s.append(err(li::next)).append('|');
+  s.append(err(()->Collections.reverse(null))).append('|');
   return s.toString(); }
  public static String subListReverse(){ List<Integer> p=new ArrayList<>(List.of(1,2,3,4)); List<Integer> sub=p.subList(1,3); rev(sub); return p.toString(); }
  public static void main(String[] x){System.out.print(rows());}

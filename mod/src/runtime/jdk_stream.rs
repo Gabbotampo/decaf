@@ -550,6 +550,15 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let Some(list) = args.first() else {
             return Ok(None);
         };
+        if matches!(list, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some(
+                    "Cannot invoke \"java.util.List.size()\" because \"list\" is null".into(),
+                ),
+                frame: None,
+            });
+        }
         // A list is a host handle (`Value::Host`, keyed `list/…`, `sublist/…`) or an older `Ref`
         // marker: the view checks below need its key either way. (`expect_ref` alone missed every
         // handle, so a subList view was reversed as a detached copy, silently.)
