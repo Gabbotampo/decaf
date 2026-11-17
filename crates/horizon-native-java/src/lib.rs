@@ -13824,7 +13824,7 @@ fn format_java_string_call<H: Host>(
         (
             "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
             [locale, format, values],
-        ) => { eprintln!("FMT dispatch locale overload"); runtime.java_format(Some(locale), format, values)? },
+        ) => runtime.java_format(Some(locale), format, values)?,
         _ => None,
     };
     match text {

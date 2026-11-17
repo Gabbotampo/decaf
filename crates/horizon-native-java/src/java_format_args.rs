@@ -21,11 +21,10 @@ impl<H: Host> Runtime<'_, H> {
         format: &Value,
         args: &Value,
     ) -> Result<Option<String>, NativeError> {
-        eprintln!("FMT entry locale={:?} format={:?} args={:?}", locale, format, args);
         if let Some(locale) = locale {
-            let ok = formats_like_us(locale);
-            eprintln!("FMT locale_ok={ok}");
-            if !ok { return Ok(None); }
+            if !formats_like_us(locale) {
+                return Ok(None);
+            }
         }
         // The player's default FORMAT locale is outside the bounded host.
         // Keep only conversions whose output cannot observe it; grouping,
@@ -60,9 +59,7 @@ impl<H: Host> Runtime<'_, H> {
             if conversion != 's' && crate::jar_object::packaged_object_class(value).is_some() {
                 return Ok(None);
             }
-            let result = self.format_arg(value);
-            eprintln!("FMT resolve index={index} conversion={conversion} result={}", if result.is_ok() { "Ok" } else { "Err" });
-            result.map(Some)
+            self.format_arg(value).map(Some)
         };
         java_format::format_with(format, values.is_some(), &mut resolve)
     }
