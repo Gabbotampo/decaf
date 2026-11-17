@@ -34,8 +34,14 @@ pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, Na
     if r.owner == "java/net/URL" {
         if let Value::Host(h) = receiver {
             if h.kind() == crate::runtime::host_ref::HostKind::Url {
-                if r.name == "toExternalForm" || r.name == "toString" { return Some(Ok(Value::Ref(Some(h.key().to_owned())))); }
-                if r.name == "getProtocol" { return Some(Ok(Value::Ref(Some(h.key().split(':').next().unwrap_or("").to_owned())))); }
+                if r.name == "toExternalForm" || r.name == "toString" {
+                    return Some(Ok(Value::Ref(Some(h.key().to_owned()))));
+                }
+                if r.name == "getProtocol" {
+                    return Some(Ok(Value::Ref(Some(
+                        h.key().split(':').next().unwrap_or("").to_owned(),
+                    ))));
+                }
             }
         }
         return None;
