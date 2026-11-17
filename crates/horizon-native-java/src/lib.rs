@@ -4713,7 +4713,7 @@ impl StdHost {
         r: &MethodRef,
         marker: &str,
         args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
+    ) -> Result<Option<Value>, NativeError> { eprintln!("LOAD properties_member args={:?}", args);
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
             ("load", "(Ljava/io/InputStream;)V") => {
@@ -28065,7 +28065,7 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
-    ) -> Result<Option<Value>, NativeError> {
+    ) -> Result<Option<Value>, NativeError> { eprintln!("LOAD invoke_reader args={:?}", args);
         if r.owner != "java/util/Properties"
             || r.name != "load"
             || r.descriptor != "(Ljava/io/Reader;)V"
