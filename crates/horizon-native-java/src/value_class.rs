@@ -129,9 +129,6 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
     }
     // Unregistered text-marker families: a runtime-built spelling may be a
     // marker or a jar String (#156 P17), so String checks are counted.
-    if marker.starts_with("registry/minecraft:") {
-        return Shape::Marker;
-    }
     if marker.starts_with("enum/")
         || marker.starts_with("game/")
         || marker.starts_with("list/")
