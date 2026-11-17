@@ -2782,7 +2782,12 @@ impl HostKind {
 impl HostRef {
     /// A handle with `key` as it is (a number, a name). A key that holds
     /// values is built with [`Self::of_values`].
-    pub fn new(kind: HostKind, key: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn live_game_object_for_test(key: impl Into<String>) -> Self {
+        Self::new(HostKind::LiveGameObject, key)
+    }
+
+    pub(crate) fn new(kind: HostKind, key: impl Into<String>) -> Self {
         Self {
             kind,
             key: Arc::new(key.into()),

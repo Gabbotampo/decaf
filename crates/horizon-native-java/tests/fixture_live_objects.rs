@@ -32,7 +32,7 @@ fn live_object_rows() {
         ],
     );
     let mut h = StdHost::new();
-    let p = Value::Host(HostRef::new(HostKind::LiveGameObject, "ServerPlayer:1"));
+    let p = Value::Host(HostRef::live_game_object_for_test("ServerPlayer:1"));
     let m = Value::Host(HostRef::new(
         HostKind::LiveGameObject,
         "AbstractContainerMenu:1",
