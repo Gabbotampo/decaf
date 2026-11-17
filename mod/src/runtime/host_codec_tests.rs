@@ -209,6 +209,7 @@ fn pairs_and_codecs_answer_as_java_25_or_count() {
         ),
         ("createThrows", Exact(oracle_row("createThrows"))),
         ("encodeUnknown", CountedAs(oracle_row("encodeUnknown"))),
+        ("parseUnknown", CountedAs(oracle_row("parseUnknown"))),
         (
             "forgedDfuReceiver",
             CountedAs(oracle_row("forgedDfuReceiver")),

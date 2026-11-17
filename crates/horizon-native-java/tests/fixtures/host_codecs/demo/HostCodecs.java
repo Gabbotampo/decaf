@@ -453,5 +453,6 @@ public final class HostCodecs {
 
   public static String createThrows() { try { RecordCodecBuilder.create(x -> { throw new IllegalArgumentException("boom"); }); return "none"; } catch (Throwable t) { return t.getClass().getName() + ":" + t.getMessage(); } }
   public static String encodeUnknown() { try { Codec.INT.encodeStart(null, 1); } catch (Throwable ignored) {} return "called"; }
+  public static String parseUnknown() { try { Codec.INT.parse(null, 1); } catch (Throwable ignored) {} return "called"; }
 
 }

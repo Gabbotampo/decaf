@@ -20,6 +20,7 @@ createCounter=1|true
 createCounterNull=1
 createThrows=java.lang.IllegalArgumentException:boom
 encodeUnknown=called
+parseUnknown=called
 codecText=String|Int|Bool
 mapUnitIdentity=false
 mapUnitText=Unit[alpha]|Unit[alpha]
