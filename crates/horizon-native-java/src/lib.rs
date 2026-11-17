@@ -27549,6 +27549,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
+                if self.reader_positions_unknown.contains(&marker) && r.name != "close" {
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
                 }
