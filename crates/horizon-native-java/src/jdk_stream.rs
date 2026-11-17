@@ -591,8 +591,10 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             .as_deref()
             .is_some_and(|marker| self.host.is_detached_sub_list(marker))
         {
+            // Counted once, and answered as a no-op: returning `None` here would
+            // let the fallback count the same call a second time.
             self.host.unknown_operand_call(r)?;
-            return Ok(None);
+            return Ok(Some(Value::Void));
         }
         let Some(mut values) = self.host.mutable_collection_values(list) else {
             self.host.unknown_operand_call(r)?;
