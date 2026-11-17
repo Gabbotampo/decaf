@@ -617,6 +617,7 @@ pub enum HostKind {
     ItemStackTemplate,
     /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
+    Url,
     /// A live Sunrise game object (entity or menu), keyed by stable identity.
     LiveGameObject,
 }
@@ -2665,6 +2666,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup"),
         canonical: always_canonical,
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Url,
+        tag: "url",
+        class: ClassRule::Fixed("java/net/URL"),
+        canonical: never_canonical,
+        methods: &crate::runtime::host_url::URL_METHODS,
     },
     KindInfo {
         kind: HostKind::LiveGameObject,
