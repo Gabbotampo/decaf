@@ -102,7 +102,8 @@ impl<H: Host> Runtime<'_, H> {
         if crate::jar_object::packaged_object_class(value).is_some() {
             return match self.jar_to_string(value, "java/util/Formatter", "format") {
                 Ok(Some(Value::Ref(Some(text)))) => Arg::Str(text),
-                Ok(Some(Value::Ref(None))) | Ok(Some(_)) => Arg::Opaque,
+                Ok(Some(Value::Ref(None))) => Arg::Null,
+                Ok(Some(_)) => Arg::Opaque,
                 Ok(None) | Err(_) => Arg::Opaque,
             };
         }
