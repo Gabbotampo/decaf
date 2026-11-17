@@ -49,7 +49,7 @@
 //! (`serde_json` here keeps object keys sorted, not in file order),
 //! `ContactInformation.asMap` (a `HashMap` in Fabric), `getCustomValues`,
 //! `getDependencies`, a custom number's `getAsNumber` (Fabric's is a
-//! `LazilyParsedNumber`), an icon path, and a `getAs*` of the wrong type.
+//! a parsed `Double` from `JsonReader.nextDouble()`, an icon path, and a `getAs*` of the wrong type.
 
 use super::*;
 
@@ -739,6 +739,12 @@ impl StdHost {
             ("getAsObject" | "getAsArray", _, _) => Ok(marker(pointer.to_owned())),
             ("getAsString", _, serde_json::Value::String(string)) => Ok(text(string.clone())),
             ("getAsBoolean", _, serde_json::Value::Bool(flag)) => Ok(Value::Int(i32::from(*flag))),
+            ("getAsNumber", _, serde_json::Value::Number(number)) => {
+                match number.to_string().parse::<f64>() {
+                    Ok(value) => Ok(Value::Float(value)),
+                    Err(_) => self.unknown_host_call(r),
+                }
+            }
             ("size", "()I", serde_json::Value::Object(entries)) => {
                 Ok(Value::Int(entries.len() as i32))
             }
