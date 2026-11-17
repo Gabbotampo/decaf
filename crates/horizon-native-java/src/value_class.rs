@@ -126,6 +126,12 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
     if is_plain_string(marker) {
         return Shape::String;
     }
+    if ["time-unit/", "coding-error-action/", "unicode-block/", "locale/", "regex-pattern/", "artifact-version/"]
+        .iter()
+        .any(|prefix| marker.starts_with(prefix))
+    {
+        return Shape::String;
+    }
     if MARKER_HEADS
         .iter()
         .any(|p| marker.starts_with(&format!("{p}/")))
