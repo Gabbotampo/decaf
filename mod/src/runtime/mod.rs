@@ -26210,7 +26210,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 let path = host_path::sandbox_canonical(&display_path);
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
-                    ("exists", "()Z") => Value::Int(i32::from(present)),
+                    ("exists", "()Z") => Value::Int(i32::from(self.io_files.contains_key(&path))),
                     // `file_attributes.rs`: what the model knows the path to be.
                     ("isFile", "()Z") => Value::Int(i32::from(
                         self.file_kind(&path) == file_attributes::FileKind::RegularFile,
@@ -26309,8 +26309,9 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = host_path::sandbox_canonical(&display_path);
-                let seeded = self.resource(path.trim_start_matches('/')).is_some();
-                let present = self.io_files.contains_key(&path) || seeded;
+                let seeded_text =
+                    library_dispatch::resource_text(self.host, path.trim_start_matches('/'));
+                let present = self.io_files.contains_key(&path) || seeded_text.is_some();
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
@@ -26353,8 +26354,8 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
-                            None => match self.resource(path.trim_start_matches('/')) {
-                                Some(text) => Value::Ref(Some(text.to_owned())),
+                            None => match seeded_text {
+                                Some(text) => Value::Ref(Some(text)),
                                 None => return Ok(None),
                             },
                         }
