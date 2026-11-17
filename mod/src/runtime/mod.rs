@@ -16,6 +16,7 @@ use std::{
     fs::File,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ mod array_store;
 mod array_views;
 mod attachment_codec;
 mod bigdecimal_slice;
+mod block_entity_types;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -68,9 +70,13 @@ mod enum_value_of;
 pub mod events;
 mod executors;
 mod fabric_api_slice2;
+mod fabric_biome_modifications;
+mod fabric_block_api;
+mod fabric_builtin_pack;
 mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
+mod fabric_resource_conditions;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
@@ -111,6 +117,7 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+mod host_creative_tab;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -125,6 +132,7 @@ mod host_gson_type;
 mod host_guava;
 mod host_ids;
 mod host_invoke;
+mod host_item_stack_template;
 mod host_iterator;
 mod host_jdk;
 mod host_jdk_constant;
@@ -145,6 +153,7 @@ mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
+mod host_url;
 mod host_watch;
 mod http_client;
 mod immutable_collections;
@@ -219,6 +228,7 @@ mod parked_threads;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
+mod vec2;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
 #[doc(hidden)]
@@ -263,6 +273,7 @@ mod vanilla_block_items;
 mod vanilla_blocks;
 mod vanilla_holders;
 mod vanilla_holders_table;
+mod vanilla_items;
 mod vanilla_registries;
 mod vanilla_registry_keys;
 mod vanilla_values;
@@ -2369,6 +2380,9 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
+        false
+    }
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -3366,6 +3380,8 @@ pub struct StdHost {
     /// integer value, so this is intentionally an `i32` rather than a host
     /// clock read.  Keeping the value seeded makes bootstrap replayable.
     current_time_millis: i32,
+    /// Monotonic origin for `System.nanoTime`; each host gets its own clock.
+    nano_time_origin: Instant,
     mods: BTreeMap<String, String>,
     /// Each mod of a linked NeoForge jar: its own version, its file's first
     /// mod and that mod's version (`ModList`, `LoadingModList.getModFileById`,
@@ -3375,6 +3391,9 @@ pub struct StdHost {
     /// classes, for class precedence (`class_precedence.rs`).
     run_loader: class_precedence::RunLoader,
     own_loader_classes: BTreeSet<String>,
+    /// The running jar's own mod id (its `fabric.mod.json`'s or `neoforge.mods.toml`'s): the one
+    /// container whose files the host holds exactly (`fabric_builtin_pack.rs`).
+    own_mod_id: Option<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
@@ -3491,6 +3510,8 @@ pub struct StdHost {
     shared_empties: BTreeMap<&'static str, String>,
     /// Explicitly seeded Minecraft RandomSource state, keyed by its host handle.
     random_sources: BTreeMap<String, random_source::State>,
+    random_seed_uniquifier: u64,
+    random_time_origin: std::time::Instant,
     /// The collections Java hands out as the same object on every call (a
     /// map's views, `System.getProperties()`), by what they are of: their
     /// keys (`StdHost::cached_collection`).
@@ -3633,6 +3654,14 @@ pub struct StdHost {
     imc: neoforge_imc::ImcHandle,
     entity_registration: entity_registration::State,
     tool_material: tool_material::State,
+    /// one table per host; a conflict between two jars' registrations is not detected
+    fabric_block_api: fabric_block_api::State,
+    /// Fabric resource condition types and their registry (`fabric_resource_conditions.rs`).
+    fabric_resource_conditions: fabric_resource_conditions::State,
+    creative_tab: host_creative_tab::State,
+    /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
+    fabric_biome_modifications: fabric_biome_modifications::State,
+    vec2: vec2::State,
 }
 
 impl Default for StdHost {
@@ -3684,10 +3713,12 @@ impl StdHost {
             block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
+            nano_time_origin: Instant::now(),
             mods: BTreeMap::new(),
             neoforge_mod_files: BTreeMap::new(),
             run_loader: class_precedence::RunLoader::default(),
             own_loader_classes: BTreeSet::new(),
+            own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
@@ -3733,6 +3764,8 @@ impl StdHost {
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             random_sources: BTreeMap::new(),
+            random_seed_uniquifier: 8_682_522_807_148_012,
+            random_time_origin: std::time::Instant::now(),
             empty_collections: std::collections::BTreeSet::new(),
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
@@ -3797,6 +3830,11 @@ impl StdHost {
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
+            fabric_block_api: fabric_block_api::State::default(),
+            fabric_resource_conditions: fabric_resource_conditions::State::default(),
+            creative_tab: host_creative_tab::State::default(),
+            fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            vec2: vec2::State::default(),
         }
     }
 
@@ -4264,7 +4302,7 @@ impl StdHost {
 
     fn resource_stream(&mut self, name: &str) -> Value {
         let name = name.strip_prefix('/').unwrap_or(name);
-        let Some(marker) = self.resource(name).map(str::to_owned) else {
+        let Some(marker) = self.resource(name).map(|value| value.to_owned()) else {
             return Value::Ref(None);
         };
         let bytes = self.resource_bytes.get(name).cloned().or_else(|| {
@@ -4661,6 +4699,26 @@ impl StdHost {
     /// parse happens here; `getProperty` answers from the same table `get`
     /// uses. The format's escapes and continuations are read as plain
     /// assignments, which is what a metadata file declares.
+    pub(crate) fn properties_put_all(&mut self, marker: &str, additions: Vec<(String, String)>) {
+        let values = self
+            .mutable_collections
+            .entry(marker.to_owned())
+            .or_default();
+        for (key, value) in additions {
+            let key = Value::Ref(Some(key));
+            let value = Value::Ref(Some(value));
+            match values
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .find(|pair| pair[0] == key)
+            {
+                Some(pair) => pair[1] = value,
+                None => values.extend([key, value]),
+            }
+        }
+    }
+
     fn properties_member(
         &mut self,
         r: &MethodRef,
@@ -4668,36 +4726,32 @@ impl StdHost {
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
-            ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
-                // Only a host resource stream has bytes the host can parse.
-                // Any other stream (a file the jar opened, a null) would load
-                // entries the host never sees, so the call is counted rather
-                // than answered as an empty load.
-                let Some((bytes, index)) = expect_ref(Self::argument(r, args, 0)?)
-                    .and_then(|stream| self.resource_streams.get_mut(stream))
-                else {
+            ("load", "(Ljava/io/Reader;)V") => self.unknown_host_call(r).map(Some),
+            ("load", "(Ljava/io/InputStream;)V") => {
+                let source_value = Self::argument(r, args, 0)?;
+                let source = jar_object::object_key(source_value)
+                    .or_else(|| expect_ref(source_value).map(String::as_str))
+                    .and_then(|stream| {
+                        if let Some((bytes, index)) = self.resource_streams.get_mut(stream) {
+                            let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
+                            *index = bytes.len();
+                            return Some(text);
+                        }
+                        let path = self.io_paths.get(stream)?;
+                        let bytes = self.io_file_bytes.get(path)?;
+                        Some(bytes.iter().map(|b| *b as char).collect())
+                    });
+                let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
                 };
-                let text = String::from_utf8_lossy(&bytes[*index..]).into_owned();
-                *index = bytes.len();
-                let additions = properties_entries(&text);
-                let values = self
-                    .mutable_collections
-                    .entry(marker.to_owned())
-                    .or_default();
-                for (key, value) in additions {
-                    let key = Value::Ref(Some(key));
-                    let value = Value::Ref(Some(value));
-                    match values
-                        .as_chunks_mut::<2>()
-                        .0
-                        .iter_mut()
-                        .find(|pair| pair[0] == key)
-                    {
-                        Some(pair) => pair[1] = value,
-                        None => values.extend([key, value]),
+                let additions = properties_entries(&text).map_err(|message| {
+                    NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some(message),
+                        frame: None,
                     }
-                }
+                })?;
+                self.properties_put_all(marker, additions);
                 Ok(Some(Value::Void))
             }
             ("getProperty", "(Ljava/lang/String;)Ljava/lang/String;") => {
@@ -4752,8 +4806,58 @@ impl StdHost {
                 values.extend([key, value]);
                 Ok(Some(Value::Ref(None)))
             }
-            ("stringPropertyNames", "()Ljava/util/Set;")
-            | ("keys", "()Ljava/util/Enumeration;")
+            ("stringPropertyNames", "()Ljava/util/Set;") => {
+                // JDK 25: `enumerateStringProperties(h)` fills a new `HashMap<String, String>`
+                // with the defaults chain's entries first, then this table's (a later put
+                // overwrites an earlier key), keeping only entries whose key and value are both
+                // `String`s; the answer is `Collections.unmodifiableSet(h.keySet())`, a snapshot
+                // in `HashMap` order that throws on `add`.
+                let mut chain = Vec::new();
+                let mut current = Some(marker.to_owned());
+                let mut seen = BTreeSet::new();
+                while let Some(owner) = current
+                    && seen.insert(owner.clone())
+                {
+                    current = self.properties_defaults(&owner);
+                    chain.push(owner);
+                }
+                let mut keys: Vec<Value> = Vec::new();
+                for owner in chain.iter().rev() {
+                    let Some(pairs) = self.mutable_collections.get(owner) else {
+                        continue;
+                    };
+                    for pair in pairs.as_chunks::<2>().0 {
+                        if let (Value::Ref(Some(_)), Value::Ref(Some(_))) = (&pair[0], &pair[1])
+                            && !keys.contains(&pair[0])
+                        {
+                            keys.push(pair[0].clone());
+                        }
+                    }
+                }
+                // `h.keySet()` iterates the `HashMap`'s bins, not insertion order
+                // (`hash_map_order.rs`); a bin Java would turn into a tree has no known order,
+                // so the call is counted rather than guessed.
+                let texts: Vec<&str> = keys
+                    .iter()
+                    .filter_map(|key| match key {
+                        Value::Ref(Some(text)) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(order) = crate::runtime::hash_map_order::key_set_order(&texts, |text| {
+                    crate::runtime::hash_map_order::java_string_hash(text)
+                }) else {
+                    return self.unknown_host_call(r).map(Some);
+                };
+                let keys: Vec<Value> = order.into_iter().map(|i| keys[i].clone()).collect();
+                let snapshot = self.new_collection("java/util/HashSet", keys);
+                match self.unmodifiable_view_as("java/util/Collections$UnmodifiableSet", &snapshot)
+                {
+                    Some(view) => Ok(Some(view)),
+                    None => self.unknown_host_call(r).map(Some),
+                }
+            }
+            ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
             | ("keySet", "()Ljava/util/Set;")
             | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
@@ -5631,6 +5735,10 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
+        self.properties_put_all(marker, entries);
+        true
+    }
     fn register_render_handle(&mut self, key: &str) {
         self.register_render_handle(key);
     }
@@ -5745,6 +5853,9 @@ impl Host for StdHost {
     }
 
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
+            return value;
+        }
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
             return Ok(value);
@@ -6421,6 +6532,9 @@ impl Host for StdHost {
         if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
             return value;
         }
+        if let Some(value) = vec2::static_field(&mut self.vec2, r) {
+            return value;
+        }
         if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {
             return value;
         }
@@ -6428,6 +6542,9 @@ impl Host for StdHost {
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
         if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
+        if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
         if let Some(value) = mod_origin::static_field(r) {
@@ -6704,6 +6821,30 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
+            return value;
+        }
+        // Fabric's `ResourceLoader.registerBuiltinPack` (`fabric_builtin_pack.rs`).
+        match fabric_builtin_pack::register(
+            r,
+            args,
+            self.own_mod_id.as_deref(),
+            self.resources.keys().map(String::as_str),
+        ) {
+            fabric_builtin_pack::Call::Other => {}
+            fabric_builtin_pack::Call::Counted => return self.unknown_host_call(r),
+            fabric_builtin_pack::Call::Answer(made) => return Ok(Value::Int(i32::from(made))),
+        }
+        if let Some(value) =
+            fabric_resource_conditions::static_call(&mut self.fabric_resource_conditions, r, args)
+        {
+            return value;
+        }
+        if let Some(value) =
+            fabric_biome_modifications::static_call(&mut self.fabric_biome_modifications, r, args)
+        {
+            return value;
+        }
         if let Some(value) =
             entity_registration::static_call(&mut self.entity_registration, r, args)
         {
@@ -6828,6 +6969,9 @@ impl Host for StdHost {
             }
             _ => {}
         }
+        if let Some(value) = host_item_stack_template::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -6857,6 +7001,9 @@ impl Host for StdHost {
             return value;
         }
         if let Some(value) = fabric_registry::static_call(r, args) {
+            return value;
+        }
+        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) {
             return value;
         }
         if let Some(value) = fabric_creative_tab::static_call(r, args) {
@@ -7243,6 +7390,40 @@ impl Host for StdHost {
             }
             ("java/util/UUID", "fromString", "(Ljava/lang/String;)Ljava/util/UUID;") => {
                 Ok(uuid_value(expect_string(Self::argument(r, args, 0)?))?)
+            }
+            (
+                "java/net/URLEncoder",
+                "encode",
+                "(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;",
+            ) => {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
+                let text = expect_string(Self::argument(r, args, 0)?);
+                if text.contains('\u{FFFD}') {
+                    return self.unknown_host_call(r);
+                }
+                match Self::argument(r, args, 1)? {
+                    Value::Ref(Some(s)) if s == "charset/UTF-8" => {}
+                    _ => return self.unknown_host_call(r),
+                }
+                let mut out = String::new();
+                for byte in text.as_bytes() {
+                    let c = *byte as char;
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*' | '_') {
+                        out.push(c);
+                    } else if c == ' ' {
+                        out.push('+');
+                    } else {
+                        out.push('%');
+                        out.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+                        out.push(char::from(b"0123456789ABCDEF"[(byte & 0xf) as usize]));
+                    }
+                }
+                Ok(Value::Ref(Some(out)))
             }
             // Java 25's locale cache (`host_jdk_constant.rs`): `Locale.of("en", "US")` and
             // `forLanguageTag("en-US")` are the `Locale.US` object. A form the model does not
@@ -7723,6 +7904,9 @@ impl Host for StdHost {
                     "literal" | "translatable" | "translatableEscape" | "translatableWithFallback"
                 ) && descriptor.ends_with("Lnet/minecraft/network/chat/MutableComponent;") =>
             {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 let kind = if name == "literal" {
                     "literal"
@@ -7775,61 +7959,16 @@ impl Host for StdHost {
                 "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
             )
             | ("java/nio/file/Path", "of", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 if !host_path::encodable(text) {
                     self.unknown_host_call(r)?;
                 }
                 Ok(path_value(text))
             }
-            // The virtual filesystem keeps no files of its own: a path is
-            // readable only when the caller seeded the same resource name.
-            // A read of anything else reports Java's `IOException`, which a
-            // config bootstrap catches and answers by writing defaults; it
-            // never becomes a null that a later `String.split` NPEs on.
-            ("java/nio/file/Files", "exists" | "notExists", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                let exists = self.resource(path.trim_start_matches('/')).is_some();
-                Ok(Value::Int(i32::from(if r.name == "exists" {
-                    exists
-                } else {
-                    !exists
-                })))
-            }
-            ("java/nio/file/Files", "readString", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                match self.resource(path.trim_start_matches('/')) {
-                    Some(text) => Ok(Value::Ref(Some(text.to_owned()))),
-                    None => Err(NativeError::UncaughtException {
-                        class: "java/io/IOException".into(),
-                        message: Some(format!("{path}: no such file")),
-                        frame: None,
-                    }),
-                }
-            }
-            (
-                "java/nio/file/Files",
-                "createDirectories" | "createFile" | "write" | "writeString" | "delete"
-                | "deleteIfExists",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                Ok(Self::argument(r, args, 0)?.clone())
-            }
-            // Moves and copies the file model can't make (`files_move.rs`)
-            // are counted: answering the target did nothing.
-            ("java/nio/file/Files", "move" | "copy", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                self.unknown_host_call(r)
-            }
-            (
-                "java/nio/file/Files",
-                "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
+            // Filesystem state is modelled by Runtime::io_files/io_dirs in invoke_io.
             // `ResourceKey.create(registryKey, id)` interns the key of
             // `registryKey.identifier()` and `id` (`host_ids.rs`).
             ("net/minecraft/resources/ResourceKey", "create", descriptor)
@@ -7856,6 +7995,9 @@ impl Host for StdHost {
             // Text `URI` refuses (its message names the component) or this model does
             // not parse exactly is counted (`host_jdk_value::uri_parts`).
             ("java/net/URI", "create" | "parse", "(Ljava/lang/String;)Ljava/net/URI;") => {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 if host_jdk_value::uri_parts(text).is_none() {
                     return self.unknown_host_call(r);
@@ -7959,8 +8101,13 @@ impl Host for StdHost {
                 }))
             }
             ("java/lang/System", "currentTimeMillis", "()J") => {
-                Ok(Value::Int(self.current_time_millis))
+                Ok(Value::Long(i64::from(self.current_time_millis)))
             }
+            // Unlike the host-seeded currentTimeMillis, nanoTime has Java’s arbitrary origin.
+            // It is intentionally a real monotonic clock and therefore is not replay-deterministic.
+            ("java/lang/System", "nanoTime", "()J") => Ok(Value::Long(
+                self.nano_time_origin.elapsed().as_nanos() as i64,
+            )),
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
             }
@@ -8093,6 +8240,14 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         if let Some(value) =
+            host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
+        {
+            return value;
+        }
+        if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+            return value;
+        }
+        if let Some(value) =
             tool_material::instance_call(&mut self.tool_material, r, receiver, args)
         {
             return value;
@@ -8103,6 +8258,9 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if let Some(v) = host_url::instance_call(r, receiver) {
+            return v;
+        }
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
         self.render_objects = render_objects;
@@ -8206,9 +8364,6 @@ impl Host for StdHost {
         if let Some(answer) = self.uuid_member(r, receiver, args) {
             return answer;
         }
-        // A jar's `new URI(text)` is a JDK object no model reads: building it from text
-        // `URI` accepts has no effect to answer, and every member is counted, never its
-        // key (`host_jdk_value.rs`; `URI.create` is the modelled handle).
         if r.owner == "java/net/URI" && jar_object::object_class(receiver) == Some("java/net/URI") {
             if let ("<init>", "(Ljava/lang/String;)V", [Value::Ref(Some(text))]) =
                 (r.name.as_str(), r.descriptor.as_str(), args)
@@ -8229,6 +8384,24 @@ impl Host for StdHost {
         }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) =
+            fabric_block_api::instance_call(&mut self.fabric_block_api, r, receiver, args)
+        {
+            return value;
+        }
+        if let Some(value) =
+            fabric_resource_conditions::instance_call(&self.fabric_resource_conditions, r, receiver)
+        {
+            return value;
+        }
+        if let Some(value) = fabric_biome_modifications::instance_call(
+            &mut self.fabric_biome_modifications,
+            r,
+            receiver,
+            args,
+        ) {
             return value;
         }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
@@ -8496,6 +8669,19 @@ impl Host for StdHost {
             }
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("<init>", descriptor) => {
+                    let parameters = descriptor_arguments(descriptor);
+                    if parameters
+                        .iter()
+                        .position(|parameter| parameter == "Ljava/lang/String;")
+                        .and_then(|index| args.get(index))
+                        .is_some_and(|value| matches!(value, Value::Ref(None)))
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("'name' is null".into()),
+                            frame: None,
+                        });
+                    }
                     let marker = marker.clone();
                     self.note_thread_made(&marker, descriptor, args);
                     Ok(Value::Void)
@@ -8614,7 +8800,9 @@ impl Host for StdHost {
                 return Ok(self.resource_enumeration(name));
             }
         }
-        if r.owner == "java/io/InputStream" || r.owner == "java/io/ByteArrayInputStream" {
+        if (r.owner == "java/io/InputStream" || r.owner == "java/io/ByteArrayInputStream")
+            && expect_ref(receiver).is_some_and(|marker| self.resource_streams.contains_key(marker))
+        {
             let marker = expect_ref(receiver).ok_or_else(|| {
                 NativeError::Metadata("malformed java/io/InputStream marker".into())
             })?;
@@ -10080,7 +10268,30 @@ impl Host for StdHost {
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
             ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
-                Ok(path_value(path_text(receiver)))
+                let path = path_text(receiver);
+                let abs = path.starts_with('/');
+                let mut out: Vec<&str> = Vec::new();
+                for part in path.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            if out.last() == Some(&"..") {
+                                if !abs {
+                                    out.push("..");
+                                }
+                            } else if out.pop().is_none() && !abs {
+                                out.push("..");
+                            }
+                        }
+                        x => out.push(x),
+                    }
+                }
+                let text = if abs {
+                    format!("/{}", out.join("/"))
+                } else {
+                    out.join("/")
+                };
+                Ok(path_value(&text))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 let child = expect_string(Self::argument(r, args, 0)?);
@@ -10094,15 +10305,66 @@ impl Host for StdHost {
                 Ok(path_value(&path_join(path_text(receiver), child)))
             }
             ("java/nio/file/Path", "getFileName", "()Ljava/nio/file/Path;") => {
-                let name = path_text(receiver).rsplit('/').next().unwrap_or_default();
-                Ok(path_value(name))
+                let original = path_text(receiver);
+                if original.is_empty() {
+                    return Ok(path_value(""));
+                }
+                let p = original.trim_end_matches('/');
+                Ok(p.rsplit('/')
+                    .next()
+                    .filter(|x| !x.is_empty())
+                    .map_or(Value::Ref(None), path_value))
             }
             ("java/nio/file/Path", "getParent", "()Ljava/nio/file/Path;") => {
-                let path = path_text(receiver);
-                Ok(path
+                let p = path_text(receiver).trim_end_matches('/');
+                let parent = p
                     .rsplit_once('/')
-                    .filter(|(parent, _)| !parent.is_empty())
-                    .map_or(Value::Ref(None), |(parent, _)| path_value(parent)))
+                    .map(|(a, _)| if a.is_empty() { "/" } else { a });
+                Ok(parent.map_or(Value::Ref(None), path_value))
+            }
+            ("java/nio/file/Path", "getRoot", "()Ljava/nio/file/Path;") => {
+                Ok(if path_text(receiver).starts_with('/') {
+                    path_value("/")
+                } else {
+                    Value::Ref(None)
+                })
+            }
+            ("java/nio/file/Path", "getNameCount", "()I") => {
+                Ok(Value::Int(path_names(path_text(receiver)).len() as i32))
+            }
+            ("java/nio/file/Path", "getName", "(I)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let i = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if i < 0 || i as usize >= p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(p[i as usize]))
+            }
+            ("java/nio/file/Path", "subpath", "(II)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let a = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                let b = match Self::argument(r, args, 1)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if a < 0 || b <= a || b as usize > p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(&p[a as usize..b as usize].join("/")))
             }
             ("java/lang/Class", "getName", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(class_binary_name(receiver))))
@@ -11390,6 +11652,24 @@ impl Host for StdHost {
             | ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => {
                 self.unknown_host_call(r)
             }
+            (
+                "net/minecraft/core/Registry",
+                "getKey",
+                "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;",
+            ) if host_registry::registry_id(receiver) == Some("minecraft:block_entity_type")
+                && args
+                    .first()
+                    .and_then(crate::runtime::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .is_some() =>
+            {
+                let id = args
+                    .first()
+                    .and_then(crate::runtime::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .unwrap_or_default();
+                Ok(host_ids::identifier_of_text(id))
+            }
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
             // their registry wrappers by `registry.key().identifier()`.
@@ -12234,6 +12514,16 @@ fn file_hash(path: &str) -> i32 {
     stable_hash(path) ^ 1234321
 }
 
+/// A `Path`'s name elements, as `UnixPath` counts them: the text between separators, with
+/// repeated and trailing separators ignored. The empty path is one empty name (Java 25:
+/// `Path.of("").getNameCount() == 1`, `getName(0)` is `""`); the root alone has none.
+fn path_names(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    text.split('/').filter(|name| !name.is_empty()).collect()
+}
+
 fn path_join(base: &str, child: &str) -> String {
     if child.starts_with('/') || base.is_empty() {
         child.to_owned()
@@ -12600,12 +12890,6 @@ fn java_value_text<H: Host>(
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        // Nor does a callback, or a composition holding one: its text names
-        // a live callback (`callback_marker.rs`).
-        Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
-            callback_marker::CALLBACK_TEXT.into()
-        }
-
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
@@ -13198,6 +13482,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        "java/nio/file/LinkOption" => &["NOFOLLOW_LINKS"],
         // `Collector.of`'s characteristics (`stream_pipeline.rs`).
         "java/util/stream/Collector$Characteristics" => {
             &["CONCURRENT", "UNORDERED", "IDENTITY_FINISH"]
@@ -13670,10 +13955,6 @@ fn value_text(value: &Value) -> String {
             if stream_pipeline::is_stream_marker(value) {
                 return stream_pipeline::STREAM_TEXT.into();
             }
-            // Nor does a callback (`callback_marker.rs`).
-            if callback_marker::holds_callback(value) {
-                return callback_marker::CALLBACK_TEXT.into();
-            }
             value.clone()
         }
         Value::Ref(None) => "null".into(),
@@ -13697,12 +13978,12 @@ fn format_java_string_call<H: Host>(
 ) -> Result<Value, NativeError> {
     let text = match (r.descriptor.as_str(), args) {
         ("(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;", [format, values]) => {
-            runtime.java_format(None, format, values)
+            runtime.java_format(None, format, values)?
         }
         (
             "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
             [locale, format, values],
-        ) => runtime.java_format(Some(locale), format, values),
+        ) => runtime.java_format(Some(locale), format, values)?,
         _ => None,
     };
     match text {
@@ -14350,52 +14631,138 @@ fn string_from_char_code(code: i32) -> String {
     char::from_u32(code as u32).map_or_else(String::new, String::from)
 }
 
-fn properties_entries(text: &str) -> Vec<(String, String)> {
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
-            continue;
-        }
-        let (key, value) = match line.split_once('=') {
-            Some((key, value)) => (key, value),
-            None => match line.split_once(':') {
-                Some((key, value)) => (key, value),
-                None => match line.split_once(char::is_whitespace) {
-                    Some((key, value)) => (key, value),
-                    None => (line, ""),
-                },
-            },
-        };
-        entries.push((
-            property_unescape(key.trim()),
-            property_unescape(value.trim()),
-        ));
-    }
-    entries
+/// The physical lines of a `.properties` text, without their terminators: like JDK 25's
+/// `Properties.LineReader`, `\r\n` is ONE terminator, and a lone `\r` or `\n` ends a line too.
+/// (Splitting on `\r` and `\n` separately would turn every `\r\n` into an extra empty line,
+/// which ends a `\`-continued entry early.)
+/// [`properties_entries`] for the integration tests.
+#[doc(hidden)]
+pub fn properties_entries_for_tests(text: &str) -> Result<Vec<(String, String)>, String> {
+    properties_entries(text)
 }
 
-/// Undo the escapes a `.properties` value may carry.
-fn property_unescape(text: &str) -> String {
-    let mut value = String::with_capacity(text.len());
-    let mut escaped = false;
-    for character in text.chars() {
-        if escaped {
-            value.push(match character {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                'f' => '\u{0c}',
-                other => other,
-            });
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else {
-            value.push(character);
+fn properties_physical_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                lines.push(&text[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            b'\n' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
         }
     }
-    value
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut logical = Vec::new();
+    let mut current = String::new();
+    for line in properties_physical_lines(text) {
+        let continued = line.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
+        let mut part = line.to_owned();
+        if continued {
+            part.pop();
+        }
+        if !current.is_empty() {
+            part = part.trim_start_matches([' ', '\t', '\u{000c}']).to_owned();
+        }
+        current.push_str(&part);
+        if !continued {
+            logical.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        logical.push(current);
+    }
+    let mut out = Vec::new();
+    for line in logical {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+            i += 1;
+        }
+        if i == chars.len() || chars[i] == '#' || chars[i] == '!' {
+            continue;
+        }
+        let start = i;
+        let mut escaped = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if !escaped && matches!(c, '=' | ':' | ' ' | '\t' | '\u{000c}') {
+                break;
+            }
+            if c == '\\' {
+                escaped = !escaped;
+            } else {
+                escaped = false;
+            }
+            i += 1;
+        }
+        let end = i;
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+            i += 1;
+        }
+        if i < chars.len() && matches!(chars[i], '=' | ':') {
+            i += 1;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\u{000c}') {
+                i += 1;
+            }
+        }
+        out.push((
+            property_unescape(&chars[start..end].iter().collect::<String>())?,
+            property_unescape(&chars[i..].iter().collect::<String>())?,
+        ));
+    }
+    Ok(out)
+}
+fn property_unescape(text: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut it = text.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{c}'),
+            Some('u') => {
+                let mut n = 0u32;
+                for _ in 0..4 {
+                    let Some(c) = it.next() else {
+                        return Err("Malformed \\uxxxx encoding.".into());
+                    };
+                    let Some(d) = c.to_digit(16) else {
+                        return Err("Malformed \\uxxxx encoding.".into());
+                    };
+                    n = n * 16 + d;
+                }
+                out.push(char::from_u32(n).unwrap());
+            }
+            Some(x) => out.push(x),
+            None => out.push('\\'),
+        }
+    }
+    Ok(out)
 }
 
 /// The JDK's range check for a list read, write or removal.
@@ -14597,12 +14964,6 @@ fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError>
                 if stream_pipeline::is_stream_marker(marker) {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
                     return stream_pipeline::STREAM_TEXT.into();
-                }
-                // A callback's text is the hidden class and an identity hash:
-                // counted, its key never printed (`callback_marker.rs`).
-                if callback_marker::holds_callback(marker) {
-                    let _ = host.unknown_host_call(&jar_text::object_to_string());
-                    return callback_marker::CALLBACK_TEXT.into();
                 }
                 if crate::runtime::jar_object::packaged_object_class(value).is_some() {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
@@ -19595,6 +19956,7 @@ impl NativeJar {
         let _nested = nested_jars::link_nested_jars(&mut host, self);
         host = host.with_run_loader(self.run_loader());
         host.own_loader_classes = self.loader_namespace_classes();
+        host.own_mod_id = self.fabric_id.clone().or_else(|| self.neoforge_id.clone());
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
                 .fabric_version
@@ -19725,6 +20087,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -19940,6 +20303,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20111,6 +20475,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -22322,6 +22687,7 @@ struct Runtime<'a, H> {
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
+    io_stream_paths: BTreeMap<String, String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
@@ -24395,6 +24761,86 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toString", descriptor) if descriptor.ends_with(")Ljava/lang/String;") => {
+                let Some(array) = args.first() else {
+                    return Ok(None);
+                };
+                if *array == Value::Ref(None) {
+                    return Ok(Some(Value::Ref(Some("null".into()))));
+                }
+                let Some(class) = host_array::exact_class(array) else {
+                    return Ok(None);
+                };
+                let values = self
+                    .arrays
+                    .get(host_array::array_key(array).unwrap())
+                    .map(|a| a.values().into_owned())
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?;
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    let part = match value {
+                        Value::Ref(None) => "null".to_owned(),
+                        Value::Ref(Some(text))
+                            if !class.starts_with("[L")
+                                || !value_class::string_instance_of(&text, "java/lang/String") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Ref(Some(text)) => text,
+                        Value::Boxed(boxed) if class.starts_with("[L") => boxed.text(),
+                        Value::Int(_) | Value::Long(_) | Value::Float(_)
+                            if class.starts_with("[L") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Int(value) if class.ends_with('Z') => (value != 0).to_string(),
+                        Value::Int(value) if class.ends_with('C') => {
+                            let Some(character) = char::from_u32(value as u32) else {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            };
+                            if (0xD800..=0xDFFF).contains(&(value as u32)) {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                            character.to_string()
+                        }
+                        Value::Int(value) => value.to_string(),
+                        Value::Long(value) => value.to_string(),
+                        Value::Float(value) if class.ends_with('F') => format_java_float32(value),
+                        Value::Float(value) => format_java_float(value),
+                        _ => return self.host.unknown_operand_call(r).map(Some),
+                    };
+                    parts.push(part);
+                }
+                let text = parts.join(", ");
+                Ok(Some(Value::Ref(Some(format!("[{text}]")))))
+            }
+            // `Arrays.sort(T[], Comparator)`: TimSort over the array itself, making
+            // the JDK's comparisons in the JDK's order (`tim_sort.rs`, as
+            // `List.sort` does). A comparison that throws leaves the array as the
+            // JDK's is left. A `null` array or comparator is not answered here:
+            // the host counts the call.
+            ("sort", "([Ljava/lang/Object;Ljava/util/Comparator;)V") => {
+                let array = StdHost::argument(r, args, 0)?.clone();
+                let comparator = StdHost::argument(r, args, 1)?.clone();
+                let Some(key) = host_array::array_key(&array).map(str::to_owned) else {
+                    return Ok(None);
+                };
+                if comparator == Value::Ref(None) {
+                    return Ok(None);
+                }
+                let mut values = self.array(&array)?.into_owned();
+                let sorted = self.sort_in_place(&mut values, &comparator);
+                if let Some(data) = self.arrays.get_mut(&key) {
+                    for (index, value) in values.into_iter().enumerate() {
+                        if !data.store(index, value) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                sorted.map(|()| Some(Value::Void))
+            }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
                 let (start, end) = if r.name == "copyOf" {
@@ -24461,15 +24907,56 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(self.new_array_value(&class, values)))
             }
-            ("fill", descriptor) if descriptor.starts_with('[') => {
-                let Some(key) = args.first().and_then(host_array::array_key) else {
+            ("fill", descriptor) if descriptor.starts_with("([") => {
+                let Some(array) = args.first() else {
                     return Ok(None);
                 };
-                let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
-                if let Some(data) = self.arrays.get_mut(key)
-                    && !data.fill(value)
-                {
+                let Some(key) = host_array::array_key(array) else {
                     return Ok(None);
+                };
+                let len = self.arrays.get(key).map_or(0, array_data::ArrayData::len);
+                let range = descriptor.ends_with("III)V") || descriptor.contains(";II)V");
+                let (from, to, value_index) = if !range {
+                    (0, len, 1)
+                } else {
+                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
+                    if from > to {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!("fromIndex({from}) > toIndex({to})")),
+                            frame: None,
+                        });
+                    }
+                    if from < 0 || to > len as i32 {
+                        let bad = if from < 0 { from } else { to };
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/ArrayIndexOutOfBoundsException".into(),
+                            message: Some(format!("Array index out of range: {bad}")),
+                            frame: None,
+                        });
+                    }
+                    (from as usize, to as usize, 3)
+                };
+                let value = StdHost::argument(r, args, value_index)?.clone();
+                if let Some(class) = host_array::exact_class(array)
+                    && let Some(component) = host_array::component_of(class)
+                    && primitive_descriptor(component).is_none()
+                {
+                    self.check_array_store(array, &value)?;
+                }
+                if let Some(data) = self.arrays.get_mut(key) {
+                    if from == 0 && to == len {
+                        if !data.fill(value) {
+                            return Ok(None);
+                        }
+                    } else {
+                        for index in from..to {
+                            if !data.store(index, value.clone()) {
+                                return Ok(None);
+                            }
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -24565,7 +25052,17 @@ impl<H: Host> Runtime<'_, H> {
                 )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
-                Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
+                let value = StdHost::argument(r, args, 0)?;
+                if let Value::Ref(Some(text)) = value
+                    && value_class::is_plain_string(text)
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Argument is not an array".into()),
+                        frame: None,
+                    });
+                }
+                Value::Int(self.array(value)?.len() as i32)
             }
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
@@ -26403,6 +26900,8 @@ impl<H: Host> Runtime<'_, H> {
             });
         };
         self.string_readers.insert(marker.to_owned(), text);
+        self.io_stream_paths
+            .insert(marker.to_owned(), path.to_owned());
         Ok(())
     }
 
@@ -26578,41 +27077,139 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = host_path::sandbox_canonical(&display_path);
+                let seeded_text =
+                    library_dispatch::resource_text(self.host, path.trim_start_matches('/'));
+                let present = self.io_files.contains_key(&path) || seeded_text.is_some();
+                let is_dir = self.io_dirs.contains(&path) || path == "/horizon/game";
+                if args
+                    .first()
+                    .is_some_and(|value| matches!(value, Value::Ref(None)))
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("Cannot invoke \"java.nio.file.Path.getFileSystem()\" because \"path\" is null".into()),
+                        frame: None,
+                    });
+                }
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("exists", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        if !self.io_files.contains_key(&path) {
-                            // A resource the jar ships still answers through the
-                            // host's table.
-                            return Ok(None);
-                        }
-                        Value::Int(1)
+                        Value::Int(i32::from(present))
                     }
                     ("notExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if !self.io_files.contains_key(&path) {
-                            return Ok(None);
-                        }
+                        Value::Int(i32::from(!present))
+                    }
+                    ("isReadable", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(self.io_files.contains_key(&path)))
+                    }
+                    ("isDirectory", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(is_dir))
+                    }
+                    ("isRegularFile", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(present && !self.io_dirs.contains(&path)))
+                    }
+                    ("isSymbolicLink", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
                         Value::Int(0)
+                    }
+                    ("isExecutable", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(self.io_dirs.contains(&path)))
                     }
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
-                            None => return Ok(None),
+                            None => match seeded_text {
+                                Some(text) => Value::Ref(Some(text)),
+                                None if path.starts_with("/horizon/") => {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/nio/file/NoSuchFileException".into(),
+                                        message: Some(display_path.clone()),
+                                        frame: None,
+                                    });
+                                }
+                                None => return Ok(None),
+                            },
                         }
                     }
                     ("writeString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        let option_names = args
+                            .last()
+                            .and_then(|value| self.owned_array(value))
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(expect_ref)
+                                    .map(|value| value.to_owned())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let create_new =
+                            option_names.iter().any(|name| name.contains("/CREATE_NEW"));
+                        let append = option_names.iter().any(|name| name.contains("/APPEND"));
+                        let truncate = option_names
+                            .iter()
+                            .any(|name| name.contains("/TRUNCATE_EXISTING"));
+                        let create = option_names.iter().any(|name| name.ends_with("/CREATE"));
+                        let write_only = option_names.iter().any(|name| name.ends_with("/WRITE"));
+                        if create_new && self.io_files.contains_key(&path) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/FileAlreadyExistsException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
+                        if (truncate || append || write_only)
+                            && !create
+                            && !create_new
+                            && !self.io_files.contains_key(&path)
+                        {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/NoSuchFileException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
+                        // An existing file opened without `TRUNCATE_EXISTING` or `APPEND` (`WRITE`,
+                        // `CREATE`) is overwritten in place: Java keeps the old bytes past the new
+                        // text (`x` over `abc` is `xbc`). Not modelled: count it.
+                        if !option_names.is_empty()
+                            && !truncate
+                            && !append
+                            && !create_new
+                            && self.io_files.contains_key(&path)
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         let text = args
                             .get(1)
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
+                        let text = if append {
+                            format!(
+                                "{}{}",
+                                self.io_files.get(&path).cloned().unwrap_or_default(),
+                                text
+                            )
+                        } else {
+                            text
+                        };
                         self.watch_whole_write(&path, text.is_empty());
                         self.io_store_file_with_charset_args(path, text, args)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
@@ -26662,7 +27259,19 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_created(&path);
                         }
-                        self.io_dirs.insert(path.clone());
+                        let mut current = path.clone();
+                        loop {
+                            self.io_dirs.insert(current.clone());
+                            self.io_files.entry(current.clone()).or_default();
+                            let Some((parent, _)) = current.rsplit_once('/') else {
+                                break;
+                            };
+                            if parent.is_empty() || parent == "/horizon/game" {
+                                break;
+                            }
+                            current = parent.to_owned();
+                        }
+                        self.io_dirs.insert("/horizon/game".to_owned());
                         self.io_files.entry(path.clone()).or_default();
                         self.io_file_bytes.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
@@ -26704,7 +27313,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedReader");
-                        if let Some(reader) = expect_ref(&value) {
+                        if let Some(reader) = jar_object::object_key(&value) {
                             self.io_open_reader(r, reader, &path, false)?;
                         }
                         value
@@ -26713,7 +27322,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedWriter");
-                        if let Some(writer) = expect_ref(&value) {
+                        if let Some(writer) = jar_object::object_key(&value) {
                             self.io_open_writer(writer, Some(path), true)?;
                             self.io_set_writer_charset(writer, args);
                         }
@@ -26723,7 +27332,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileInputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_reader(r, stream, &path, false)?;
                         }
                         value
@@ -26732,7 +27341,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileOutputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_writer(stream, Some(path), true)?;
                         }
                         value
@@ -27003,9 +27612,9 @@ impl<H: Host> Runtime<'_, H> {
                         // A call the formatter cannot answer exactly stays
                         // with the host, as an unknown call.
                         let text = match args {
-                            [format, values] => self.java_format(None, format, values),
+                            [format, values] => self.java_format(None, format, values)?,
                             [locale, format, values] => {
-                                self.java_format(Some(locale), format, values)
+                                self.java_format(Some(locale), format, values)?
                             }
                             _ => None,
                         };
@@ -27282,9 +27891,7 @@ impl<H: Host> Runtime<'_, H> {
         let Value::Host(handle) = value else {
             return None;
         };
-        if handle.kind() != HostKind::Writer
-            || !modelled_writer_class(crate::runtime::jar_object::packaged_object_class(value)?)
-        {
+        if !modelled_writer_class(crate::runtime::jar_object::packaged_object_class(value)?) {
             return None;
         }
         let marker = handle.key_text();
@@ -27631,6 +28238,64 @@ impl<H: Host> Runtime<'_, H> {
     /// string. Objects of a jar's own class are not instantiated (that needs
     /// field injection the native path does not model), so their JSON shape is
     /// returned as a modelled map, never as a masked empty value.
+    fn invoke_properties_reader(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/util/Properties"
+            || r.name != "load"
+            || !matches!(
+                r.descriptor.as_str(),
+                "(Ljava/io/Reader;)V" | "(Ljava/io/InputStream;)V"
+            )
+        {
+            return Ok(None);
+        }
+        let (Some(marker), Some(reader)) = (
+            receiver
+                .and_then(expect_ref)
+                .map(String::as_str)
+                .or_else(|| receiver.and_then(jar_object::object_key)),
+            args.first()
+                .and_then(jar_object::object_key)
+                .or_else(|| args.first().and_then(expect_ref).map(String::as_str)),
+        ) else {
+            return Ok(None);
+        };
+        let text = if r.descriptor == "(Ljava/io/InputStream;)V" {
+            // A stream `Files.newInputStream`/`FileInputStream` opened over a file the
+            // invocation wrote: `io_open_reader` recorded its path. `load(InputStream)`
+            // reads the file's bytes as ISO-8859-1, one char per byte, to the end.
+            let Some(path) = self.io_stream_paths.get(reader).cloned() else {
+                return Ok(None);
+            };
+            let Some(bytes) = self.io_file_bytes.get(&path) else {
+                return Ok(None);
+            };
+            let text = bytes.iter().map(|b| char::from(*b)).collect::<String>();
+            // Consumed: a later read sees the end of the stream.
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
+        } else {
+            let Some(text) = self.string_readers.remove(reader) else {
+                return Ok(None);
+            };
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
+        };
+        let entries = properties_entries(&text).map_err(|m| NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some(m),
+            frame: None,
+        })?;
+        if !self.host.properties_put_all(marker, entries) {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(Some(Value::Void))
+    }
+
     fn invoke_gson(
         &mut self,
         r: &MethodRef,
@@ -27804,10 +28469,9 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("Appendable") =>
                     {
-                        let Some(text) = self.gson_to_json(
+                        let Some(text) = self.gson_to_json_string(
                             args.first().unwrap_or(&Value::Ref(None)),
                             &style,
-                            0,
                         )?
                         else {
                             return self
@@ -27815,10 +28479,6 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        let text = format!(
-                            "{}{text}",
-                            gson_model::non_executable_prefix(&style).unwrap_or("")
-                        );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
                         let Some(target) = args
@@ -29037,6 +29697,87 @@ impl<H: Host> Runtime<'_, H> {
                     let i = read_u16(code, &mut pc)?;
                     stack.push(constant_wide_value(&file.pool, i)?);
                 }
+                0xc4 => {
+                    // JVMS `wide` prefixes the local-variable forms with a
+                    // u2 index, and gives iinc a signed u2 constant.
+                    let wide_op = *code.get(pc).ok_or(NativeError::Truncated)?;
+                    pc += 1;
+                    let index = read_u16(code, &mut pc)? as usize;
+                    match wide_op {
+                        0x15..=0x19 => {
+                            let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                            stack.push(self.dispatch_modify_variable(
+                                VariableAnchor::Load,
+                                index,
+                                local_opcode_type(wide_op - 0x15),
+                                loaded,
+                                class,
+                                method,
+                                desc,
+                                at,
+                            )?);
+                        }
+                        0x36..=0x3a => {
+                            let value = pop(&mut stack, class, method, at)?;
+                            let value = self.dispatch_modify_variable(
+                                VariableAnchor::Store,
+                                index,
+                                local_opcode_type(wide_op - 0x36),
+                                value,
+                                class,
+                                method,
+                                desc,
+                                at,
+                            )?;
+                            if let Some(local) = locals.get_mut(index) {
+                                *local = value;
+                            }
+                        }
+                        0x84 => {
+                            let amount = read_u16(code, &mut pc)? as i16 as i32;
+                            let value = match locals.get(index) {
+                                Some(Value::Int(value)) => value.wrapping_add(amount),
+                                _ => {
+                                    return Err(NativeError::TypeMismatch {
+                                        class: class.to_owned(),
+                                        method: method.to_owned(),
+                                        expected: "int local",
+                                    });
+                                }
+                            };
+                            if let Some(local) = locals.get_mut(index) {
+                                *local = Value::Int(value);
+                            } else {
+                                return Err(NativeError::TypeMismatch {
+                                    class: class.to_owned(),
+                                    method: method.to_owned(),
+                                    expected: "valid local",
+                                });
+                            }
+                        }
+                        0xa9 => {
+                            let target = match locals.get(index) {
+                                Some(Value::Int(target)) => *target as usize,
+                                _ => {
+                                    return Err(NativeError::TypeMismatch {
+                                        class: class.to_owned(),
+                                        method: method.to_owned(),
+                                        expected: "ret address",
+                                    });
+                                }
+                            };
+                            pc = target;
+                        }
+                        _ => {
+                            return Err(NativeError::UnsupportedOpcode {
+                                class: class.to_owned(),
+                                method: method.to_owned(),
+                                opcode: wide_op,
+                                pc: at,
+                            });
+                        }
+                    }
+                }
                 // iadd/isub/imul/idiv/irem. The long twins (odd opcodes) take
                 // the 64-bit path below so no long value is truncated. Add,
                 // subtract and multiply keep the low-order bits on overflow
@@ -30132,6 +30873,19 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if r.owner == "java/lang/String"
+                        && r.name == "format"
+                        && (r.descriptor
+                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                            || r.descriptor
+                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
+                    {
+                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_properties_reader(&r, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
@@ -30431,14 +31185,6 @@ impl<H: Host> Runtime<'_, H> {
                         // NeoForge's `IEventBus#addListener` (`neoforge_bus.rs`).
                         value
                     } else if r.owner == "java/lang/String"
-                        && r.name == "format"
-                        && (r.descriptor
-                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
-                            || r.descriptor
-                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
-                    {
-                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
-                    } else if r.owner == "java/lang/String"
                         && r.name == "formatted"
                         && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
                         && let Some(format) = receiver.clone()
@@ -30447,7 +31193,8 @@ impl<H: Host> Runtime<'_, H> {
                         // `text.formatted(args)` is `String.format(text, args)`.
                         // A call the formatter refuses goes to the host as
                         // the `formatted` call it is, so the count names it.
-                        match self.java_format(None, &format, values) {
+                        // A jar `toString()` that throws makes `formatted` throw it.
+                        match invoke_or_catch!(at, self.java_format(None, &format, values)) {
                             Some(text) => Value::Ref(Some(text)),
                             None => {
                                 invoke_or_catch!(at, self.host.invoke_instance(&r, &format, &args))
@@ -35529,6 +36276,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -35601,6 +36349,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -41246,14 +41995,14 @@ mandatory = true
         };
         assert_eq!(
             host.invoke(&current_time_millis, &[]).unwrap(),
-            Value::Int(1_700_000_000)
+            Value::Long(1_700_000_000)
         );
 
         // The default is deterministic too; no host clock is consulted.
         let mut default_host = StdHost::new();
         assert_eq!(
             default_host.invoke(&current_time_millis, &[]).unwrap(),
-            Value::Int(0)
+            Value::Long(0)
         );
         let identity_hash = MethodRef {
             owner: "java/lang/System".into(),
@@ -42753,6 +43502,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -42967,6 +43717,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43156,6 +43907,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43521,6 +44273,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43830,6 +44583,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49097,6 +49851,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49156,6 +49911,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
