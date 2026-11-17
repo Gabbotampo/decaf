@@ -2684,11 +2684,15 @@ static LIVE_GAME_OBJECT_METHODS: Methods = Methods {
     compare_to: None,
 };
 
+/// The types a live handle's object surely is, by key family: its class and every superclass,
+/// as javap shows them for 26.3 (`tests/fixtures/live_objects/javap_facts.txt`). Interfaces and
+/// anything else stay counted.
 fn live_declared(key: &str) -> &'static [&'static str] {
     match key.split(':').next().unwrap_or("") {
         "ServerPlayer" => &[
             "net/minecraft/server/level/ServerPlayer",
             "net/minecraft/world/entity/player/Player",
+            "net/minecraft/world/entity/Avatar",
             "net/minecraft/world/entity/LivingEntity",
             "net/minecraft/world/entity/Entity",
         ],

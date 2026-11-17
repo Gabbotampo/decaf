@@ -1,28 +1,24 @@
-# Live game object facts
+# live_objects
 
-Captured with JDK 25 `javap -public` from `~/ava/minecraft-26.3-server-game.jar`.
+Oracle for `fixture_live_objects.rs`. A live game object exists only in the running game, so no JVM
+run can answer these rows. The test takes its class rows from the 26.3 jar's own declarations.
 
-```text
-ServerPlayer extends net.minecraft.world.entity.player.Player
-Player extends net.minecraft.world.entity.Avatar implements net.minecraft.world.entity.ContainerUser
-LivingEntity extends net.minecraft.world.entity.Entity
-Entity extends net.minecraft.world.entity.EntityAccess implements net.minecraft.world.level.entity.TraceableEntity
-AbstractContainerMenu is abstract
+`javap_facts.txt` is javap output, nothing else: line 2 (the class declaration) of each class, then
+the three `Entity` methods the probe calls. Produced on arcweld with JDK 25.0.5+8:
+
+```sh
+. ~/ava/env.sh
+J=~/ava/minecraft-26.3-server-game.jar
+for c in net.minecraft.server.level.ServerPlayer net.minecraft.world.entity.player.Player \
+         net.minecraft.world.entity.Avatar net.minecraft.world.entity.LivingEntity \
+         net.minecraft.world.entity.Entity net.minecraft.world.inventory.AbstractContainerMenu; do
+  javap -cp $J $c | sed -n 2p
+done
+javap -cp $J net.minecraft.world.entity.Entity \
+  | grep -E '^  public final boolean isRemoved\(\);|^  public final double getX\(\);|^  public void setPos\(double, double, double\);'
 ```
 
-Methods exercised by the probe:
+The chain is `ServerPlayer` → `Player` → `Avatar` → `LivingEntity` → `Entity`. `Avatar` is easy to
+miss, and the test derives each expected `instanceof` by following these `extends` clauses.
 
-```text
-Entity: public boolean isRemoved();
-Entity: public double getX();
-Entity: public void setPos(double,double,double);
-```
-
-Architectury `dev.architectury.mixin.fabric.MixinServerPlayer#openMenu` (`javap -c -p`, callback body):
-
-```text
-getReturnValue().isPresent();
-PlayerEvent.OPEN_MENU.invoker().open((Player)this, ((ServerPlayer)this).containerMenu);
-```
-
-The expected rows in `javap_facts.txt` are derived from these declarations and callback facts. Unsupported identity/class/position/write operations remain counted.
+Only these excerpts are committed, never a full listing of a Minecraft class.
