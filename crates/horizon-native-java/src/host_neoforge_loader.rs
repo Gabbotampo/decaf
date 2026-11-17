@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
 //! NeoForge's loader objects as host handles (#156 P6, second half): a mod's
 //! `ModContainer`, its `IModInfo`, a `ModFileInfo`, the `ModConfig.Type`
 //! constants and the game's detected `WorldVersion`. Their behaviour stays in
@@ -260,6 +262,11 @@ pub(crate) fn world_version(name: &str) -> Value {
 }
 
 /// A world version handle's name.
+pub(crate) fn world_version_fresh(name: &str) -> Value {
+    let n = NEXT_VERSION.fetch_add(1, Ordering::Relaxed);
+    Value::Host(HostRef::of_values(HostKind::WorldVersion, &[text(name), text(&n.to_string())]))
+}
+
 pub(crate) fn world_version_name(value: &Value) -> Option<String> {
     held_text(value, HostKind::WorldVersion).filter(|s| !s.starts_with("pack:"))
 }
