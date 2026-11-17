@@ -4,6 +4,7 @@ pub(crate) struct ScannerState {
     pub text: String,
     pub pos: usize,
     pub closed: bool,
+    pub unknown: bool,
 }
 
 /// Returns the next line and byte position after its terminator.

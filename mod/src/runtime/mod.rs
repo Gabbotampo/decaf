@@ -26711,6 +26711,7 @@ impl<H: Host> Runtime<'_, H> {
                                     text: String::new(),
                                     pos: 0,
                                     closed: false,
+                                    unknown: false,
                                 },
                             );
                             return Ok(Some(Value::Void));
@@ -26721,6 +26722,7 @@ impl<H: Host> Runtime<'_, H> {
                                 text,
                                 pos: 0,
                                 closed: false,
+                                unknown: false,
                             },
                         );
                         Ok(Some(Value::Void))
@@ -26752,6 +26754,9 @@ impl<H: Host> Runtime<'_, H> {
                                 message: Some("Scanner closed".into()),
                                 frame: None,
                             });
+                        }
+                        if st.unknown {
+                            return Ok(None);
                         }
                         let Some((line, pos)) = scanner_model::next_line(&st.text, st.pos) else {
                             return Err(NativeError::UncaughtException {
