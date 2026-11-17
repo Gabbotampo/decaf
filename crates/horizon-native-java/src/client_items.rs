@@ -238,17 +238,8 @@ fn effect_holder_id(value: &Value) -> Option<String> {
 
 /// `Items.DIAMOND_SWORD` → `minecraft:diamond_sword`: every vanilla item and
 /// block constant is its id's path in upper case.
-pub(super) fn constant_id(field: &str) -> String {
-    // The capture is produced by reflecting over Items after vanilla bootstrap.
-    // Keep the table as the authoritative registry answer; the lowercase rule
-    // remains a compatibility fallback for constants added by a newer jar.
-    if let Some(id) = include_str!("vanilla_items_capture.txt").lines().find_map(|line| {
-        let (name, id) = line.split_once('|')?;
-        (name == field).then_some(id)
-    }) {
-        return id.to_owned();
-    }
-    format!("minecraft:{}", field.to_ascii_lowercase())
+pub(super) fn constant_id(field: &str) -> Option<String> {
+    crate::vanilla_items::field_id(field)
 }
 
 /// `MobEffects.SPEED` → `minecraft:speed`; the constants whose 26.3 id is
