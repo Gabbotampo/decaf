@@ -12,12 +12,24 @@ fn captured(name: &str) -> Option<&'static str> {
         })
 }
 pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
-    if r.descriptor != KEY { return None; }
-    if r.owner == DAMAGE_TYPES {
-        let location = include_str!("vanilla_damage_types_capture.txt").lines().find_map(|l| { let (name, location) = l.split_once('|')?; (name == r.name).then_some(location) })?;
-        return Some(crate::runtime::host_ids::resource_key_named("minecraft:damage_type", location));
+    if r.descriptor != KEY {
+        return None;
     }
-    if r.owner != ENCHANTMENTS { return None; }
+    if r.owner == DAMAGE_TYPES {
+        let location = include_str!("vanilla_damage_types_capture.txt")
+            .lines()
+            .find_map(|l| {
+                let (name, location) = l.split_once('|')?;
+                (name == r.name).then_some(location)
+            })?;
+        return Some(crate::runtime::host_ids::resource_key_named(
+            "minecraft:damage_type",
+            location,
+        ));
+    }
+    if r.owner != ENCHANTMENTS {
+        return None;
+    }
     let rest = captured(&r.name)?;
     let (_registry, location) = rest.split_once('|')?;
     Some(crate::runtime::host_ids::resource_key_named(

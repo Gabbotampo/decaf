@@ -1,0 +1,3 @@
+ResourceKey[minecraft:damage_type / minecraft:player_attack]
+ResourceKey[minecraft:damage_type / minecraft:arrow]
+true
