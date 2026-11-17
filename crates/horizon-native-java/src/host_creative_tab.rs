@@ -1,3 +1,8 @@
+//! Fabric's `FabricCreativeModeTab.builder()` and the vanilla `CreativeModeTab.Builder` it returns
+//! (#453), from the creative-tab module's and the 26.3 jar's bytecode: every `builder()` is a new
+//! builder; its setters store their argument and return the builder; each `build()` is a new tab.
+//! A tab's `getDisplayName()` is the builder's `title`. Answered only when a title was set; vanilla's
+//! default (`Component.empty()`) and every other getter are counted.
 use crate::{
     MethodRef, NativeError, Value,
     host_ref::{HostKind, HostRef},
@@ -6,7 +11,7 @@ use std::collections::BTreeMap;
 const FABRIC: &str = "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab";
 const BUILDER: &str = "net/minecraft/world/item/CreativeModeTab$Builder";
 const TAB: &str = "net/minecraft/world/item/CreativeModeTab";
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct State {
     next: u64,
     builders: BTreeMap<String, Option<Value>>,
@@ -51,12 +56,11 @@ pub(crate) fn instance_call(
             if r.name == "build" && r.descriptor == "()Lnet/minecraft/world/item/CreativeModeTab;" {
                 state.next += 1;
                 let k = format!("t#{}", state.next);
-                let title = state
-                    .builders
-                    .get(h.key())?
-                    .clone()
-                    .unwrap_or(Value::Ref(Some("component/empty".into())));
-                state.tabs.insert(k.clone(), title);
+                // No `title` yet: vanilla's default display name, not modelled, so the tab keeps
+                // none and its `getDisplayName()` is counted.
+                if let Some(title) = state.builders.get(h.key())?.clone() {
+                    state.tabs.insert(k.clone(), title);
+                }
                 return Some(Ok(Value::Host(HostRef::new(HostKind::CreativeModeTab, k))));
             }
             if r.descriptor

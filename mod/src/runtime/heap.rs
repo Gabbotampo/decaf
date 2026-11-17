@@ -316,7 +316,7 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
-        for held in self.creative_tab.values() { value(held, out); }
+        // Fabric creative tab builders' and tabs' recorded arguments (`host_creative_tab.rs`).
         for held in self.creative_tab.values() {
             value(held, out);
         }
@@ -1711,6 +1711,7 @@ mod tests {
             "entity_registration",
             "tool_material",
             "fabric_block_api",
+            "creative_tab",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[

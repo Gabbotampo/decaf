@@ -2666,14 +2666,16 @@ const KINDS: &[KindInfo] = &[
         tag: "cmb",
         class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab$Builder"),
         canonical: never_canonical,
-        methods: &crate::host_creative_tab::METHODS,
+        // No overrides: identity `equals`, counted `hashCode`/`toString`.
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::CreativeModeTab,
         tag: "cmt",
         class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab"),
         canonical: never_canonical,
-        methods: &crate::host_creative_tab::METHODS,
+        // No overrides: identity `equals`, counted `hashCode`/`toString`.
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,
