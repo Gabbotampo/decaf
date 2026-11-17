@@ -6,7 +6,7 @@ import java.util.*;
 public final class Probe {
   public static final class Config { public int n; public String s; public List<Integer> xs; public Nested nested; }
   public static final class Nested { public String k; }
-  static String show(Config c) { return c==null?"null":c.n+"|"+c.s+"|"+c.xs+"|"+c.nested.k; }
+  static String show(Config c) { return c==null?"null":c.n+"|"+c.s+"|"+c.xs+"|"+(c.nested==null?"null":c.nested.k); }
   static String one(Gson g, Reader r) { try { return show(g.fromJson(r, Config.class)); } catch (Throwable t) { return t.getClass().getName()+":"+t.getMessage(); } }
   public static void main(String[] args) throws Exception { System.out.print(rows()); }
   public static String rows() throws Exception {
