@@ -4,7 +4,7 @@ mod javac_fixture;
 use javac_fixture::Fixture;
 const PROBE: &str = include_str!("fixtures/stream_codec_map_apply/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/stream_codec_map_apply/java25.txt");
-const STUB: &str = r#"package net.minecraft.network.codec; public interface StreamCodec<B,V>{ void encode(B b,V v); V decode(B b); interface CodecOperation<B,V,O>{ StreamCodec<B,O> apply(StreamCodec<B,V> c); } default <O> StreamCodec<B,O> apply(CodecOperation<B,V,O> o){throw new AssertionError();} default <O> StreamCodec<B,O> map(java.util.function.Function<? super V,? extends O> a,java.util.function.Function<? super O,? extends V> b){throw new AssertionError();}}"#;
+const STUB: &str = r#"package net.minecraft.network.codec; public interface StreamCodec<B,V>{ void encode(B b,V v); V decode(B b); interface CodecOperation<B,V,O>{ StreamCodec<B,O> apply(StreamCodec<B,S> c); } default <O> StreamCodec<B,O> apply(CodecOperation<B,V,O> o){throw new AssertionError();} default <O> StreamCodec<B,O> map(java.util.function.Function<? super V,? extends O> a,java.util.function.Function<? super O,? extends V> b){throw new AssertionError();}}"#;
 fn fixture() -> Fixture {
     Fixture::build(
         "stream-codec-map-apply",
