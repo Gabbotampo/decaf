@@ -1,1 +1,1 @@
-[]|[1]|[2, 1]|[3, 2, 1]|[2, 1]|[3, 2, 1]|ok|ok|UnsupportedOperationException:null|ok|[3, 2, 1]|[1, 3, 2, 4]|UnsupportedOperationException:null|UnsupportedOperationException:remove|ok|
+[]|[1]|[2, 1]|[3, 2, 1]|[2, 1]|[3, 2, 1]|ok|ok|UnsupportedOperationException:null|ok|[3, 2, 1]|UnsupportedOperationException:null|UnsupportedOperationException:remove|ok|

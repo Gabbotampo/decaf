@@ -27,4 +27,11 @@ fn collections_reverse_and_stream_iterator_match_java25() {
         "unknown calls: {unknown:?}"
     );
     assert_eq!(unknown, Vec::<(String, usize)>::new());
+    let mut counted_host = fixture.jar.seed_host(StdHost::new());
+    let counted = fixture.text_on(&mut counted_host, "subListReverse");
+    assert_eq!(counted, "[1, 3, 2, 4]");
+    assert_eq!(
+        counted_host.unknown_host_calls(),
+        vec![("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1)]
+    );
 }
