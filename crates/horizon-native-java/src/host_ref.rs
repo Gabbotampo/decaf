@@ -615,6 +615,7 @@ pub enum HostKind {
     RegexMatcher,
     /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
     ItemStackTemplate,
+    Url,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2654,6 +2655,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
         canonical: always_canonical,
         methods: &crate::host_item_stack_template::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Url,
+        tag: "url",
+        class: ClassRule::Fixed("java/net/URL"),
+        canonical: never_canonical,
+        methods: &crate::host_jdk_value::URI_METHODS,
     },
 ];
 
