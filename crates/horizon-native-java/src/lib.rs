@@ -27135,7 +27135,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedReader");
-                        if let Some(reader) = expect_ref(&value) {
+                        if let Some(reader) = jar_object::object_key(&value) {
                             self.io_open_reader(r, reader, &path, false)?;
                         }
                         value
@@ -27144,7 +27144,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedWriter");
-                        if let Some(writer) = expect_ref(&value) {
+                        if let Some(writer) = jar_object::object_key(&value) {
                             self.io_open_writer(writer, Some(path), true)?;
                             self.io_set_writer_charset(writer, args);
                         }
@@ -27154,7 +27154,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileInputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_reader(r, stream, &path, false)?;
                         }
                         value
@@ -27163,7 +27163,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileOutputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_writer(stream, Some(path), true)?;
                         }
                         value
