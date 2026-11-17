@@ -43,7 +43,7 @@ fn gson_reader_matches_java25() {
         host.unknown_host_calls()
     );
     let methods: Vec<_> = COUNTED.lines().filter(|x| !x.is_empty()).collect();
-    assert_eq!(methods, ["trailing", "twice"]);
+    assert_eq!(methods, ["trailing"]);
     for method in methods {
         let mut counted_host = fixture.jar.seed_host(StdHost::new());
         let _ = call(&fixture, method, &mut counted_host);

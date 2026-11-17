@@ -17,6 +17,7 @@ public final class Probe {
     Reader r=new InputStreamReader(Probe.class.getResourceAsStream("/resource-config.json")); b.append("resource=").append(one(g,r)).append('\n');
     b.append("missing=").append(one(g,new StringReader("{\"n\":1}"))).append('\n');
     b.append("empty=").append(one(g,new StringReader(""))).append('\n');
+    StringReader twice=new StringReader("{\"n\":8}"); b.append("twice=").append(one(g,twice)).append('|').append(one(g,twice)).append('\n');
     return b.toString();
   }
   public static String trailing() { return one(new Gson(), new StringReader("{\"n\":1} garbage")); }
