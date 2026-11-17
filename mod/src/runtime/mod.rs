@@ -4594,6 +4594,11 @@ impl StdHost {
     /// with no list.
     fn set_from_map_values(&self, marker: &str) -> Option<Vec<Value>> {
         let map = self.set_from_map_views.get(marker)?;
+        // ConcurrentHashMap uses different spread, sizing, and transfer rules
+        // from HashMap.  Its iteration order therefore remains counted.
+        if map.starts_with("java/util/concurrent/ConcurrentHashMap#") {
+            return None;
+        }
         let values = self.mutable_collections.get(map)?;
         Some(
             values
