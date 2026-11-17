@@ -14,5 +14,9 @@ public final class Probe {
   String f=Integer.toString(CommonComponents.EMPTY.hashCode());
   return String.join("|",a,b,c,d,e,f);
  }
+ public static String codecEncode() { try { Identifier.CODEC.encodeStart(com.mojang.serialization.JsonOps.INSTANCE, Identifier.parse("minecraft:stone")); return "ok"; } catch (Throwable t) { return t.getClass().getName(); } }
+ public static String codecDecode() { try { Identifier.CODEC.parse(com.mojang.serialization.JsonOps.INSTANCE, new com.google.gson.JsonPrimitive("minecraft:stone")); return "ok"; } catch (Throwable t) { return t.getClass().getName(); } }
+ public static String codecDecodePair() { try { Identifier.CODEC.decode(com.mojang.serialization.JsonOps.INSTANCE, new com.google.gson.JsonPrimitive("minecraft:stone")); return "ok"; } catch (Throwable t) { return t.getClass().getName(); } }
+
  public static String counted() { return Boolean.toString(Identifier.CODEC.fieldOf("id") != null); }
 }

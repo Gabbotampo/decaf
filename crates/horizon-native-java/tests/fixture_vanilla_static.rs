@@ -48,3 +48,33 @@ fn vanilla_static_field_of_is_counted_on_fresh_host() {
     assert_eq!(x.text_on(&mut h, "counted"), "true");
     assert_eq!(h.unknown_host_calls(),vec![("com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned(),1)]);
 }
+
+#[test]
+fn vanilla_static_codec_encode_counted() {
+    counted_codec(
+        "codecEncode",
+        "com/mojang/serialization/Codec#encodeStart(Lcom/mojang/serialization/DynamicOps;Ljava/lang/Object;)Lcom/mojang/serialization/DataResult;",
+    );
+}
+#[test]
+fn vanilla_static_codec_parse_counted() {
+    counted_codec(
+        "codecDecode",
+        "com/mojang/serialization/Codec#parse(Lcom/mojang/serialization/DynamicOps;Ljava/lang/Object;)Lcom/mojang/serialization/DataResult;",
+    );
+}
+#[test]
+fn vanilla_static_codec_decode_counted() {
+    counted_codec(
+        "codecDecodePair",
+        "com/mojang/serialization/Codec#decode(Lcom/mojang/serialization/DynamicOps;Ljava/lang/Object;)Lcom/mojang/serialization/DataResult;",
+    );
+}
+fn counted_codec(method: &str, sig: &str) {
+    let mut f = STUBS.to_vec();
+    f.push(("demo/Probe.java", PROBE));
+    let x = Fixture::build("vanilla-static-codec", &f);
+    let mut h = x.jar.seed_host(StdHost::new());
+    let _ = x.text_on(&mut h, method);
+    assert_eq!(h.unknown_host_calls(), vec![(sig.to_owned(), 1)]);
+}
