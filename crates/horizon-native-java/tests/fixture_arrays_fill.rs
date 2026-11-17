@@ -30,10 +30,16 @@ fn arrays_fill_matches_java25() {
         .join("\n")
         + "\n";
     assert_eq!(actual, expected);
+    // The two rows left out above are counted, each once: an `Object[]` holding a plain
+    // `Object` (Java prints its identity hash) and a `char[]` holding a lone surrogate.
     assert_eq!(
-        host.unknown_host_calls().len(),
-        2,
-        "{:?}",
-        host.unknown_host_calls()
+        host.unknown_host_calls(),
+        vec![
+            ("java/util/Arrays#toString([C)Ljava/lang/String;".into(), 1),
+            (
+                "java/util/Arrays#toString([Ljava/lang/Object;)Ljava/lang/String;".into(),
+                1
+            ),
+        ]
     );
 }

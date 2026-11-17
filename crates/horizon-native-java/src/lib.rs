@@ -24420,6 +24420,31 @@ impl<H: Host> Runtime<'_, H> {
                 let text = parts.join(", ");
                 Ok(Some(Value::Ref(Some(format!("[{text}]")))))
             }
+            // `Arrays.sort(T[], Comparator)`: TimSort over the array itself, making
+            // the JDK's comparisons in the JDK's order (`tim_sort.rs`, as
+            // `List.sort` does). A comparison that throws leaves the array as the
+            // JDK's is left. A `null` array or comparator is not answered here:
+            // the host counts the call.
+            ("sort", "([Ljava/lang/Object;Ljava/util/Comparator;)V") => {
+                let array = StdHost::argument(r, args, 0)?.clone();
+                let comparator = StdHost::argument(r, args, 1)?.clone();
+                let Some(key) = host_array::array_key(&array).map(str::to_owned) else {
+                    return Ok(None);
+                };
+                if comparator == Value::Ref(None) {
+                    return Ok(None);
+                }
+                let mut values = self.array(&array)?.into_owned();
+                let sorted = self.sort_in_place(&mut values, &comparator);
+                if let Some(data) = self.arrays.get_mut(&key) {
+                    for (index, value) in values.into_iter().enumerate() {
+                        if !data.store(index, value) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                sorted.map(|()| Some(Value::Void))
+            }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
                 let (start, end) = if r.name == "copyOf" {
