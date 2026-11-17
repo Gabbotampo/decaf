@@ -2379,6 +2379,7 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) {}
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -4688,6 +4689,26 @@ impl StdHost {
     /// parse happens here; `getProperty` answers from the same table `get`
     /// uses. The format's escapes and continuations are read as plain
     /// assignments, which is what a metadata file declares.
+    pub(crate) fn properties_put_all(&mut self, marker: &str, additions: Vec<(String, String)>) {
+        let values = self
+            .mutable_collections
+            .entry(marker.to_owned())
+            .or_default();
+        for (key, value) in additions {
+            let key = Value::Ref(Some(key));
+            let value = Value::Ref(Some(value));
+            match values
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .find(|pair| pair[0] == key)
+            {
+                Some(pair) => pair[1] = value,
+                None => values.extend([key, value]),
+            }
+        }
+    }
+
     fn properties_member(
         &mut self,
         r: &MethodRef,
@@ -4706,33 +4727,14 @@ impl StdHost {
                 let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
                 };
-                let additions = match properties_entries(&text) {
-                    Ok(v) => v,
-                    Err(message) => {
-                        return Err(NativeError::UncaughtException {
-                            class: "java/lang/IllegalArgumentException".into(),
-                            message: Some(message),
-                            frame: None,
-                        });
+                let additions = properties_entries(&text).map_err(|message| {
+                    NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some(message),
+                        frame: None,
                     }
-                };
-                let values = self
-                    .mutable_collections
-                    .entry(marker.to_owned())
-                    .or_default();
-                for (key, value) in additions {
-                    let key = Value::Ref(Some(key));
-                    let value = Value::Ref(Some(value));
-                    match values
-                        .as_chunks_mut::<2>()
-                        .0
-                        .iter_mut()
-                        .find(|pair| pair[0] == key)
-                    {
-                        Some(pair) => pair[1] = value,
-                        None => values.extend([key, value]),
-                    }
-                }
+                })?;
+                self.properties_put_all(marker, additions);
                 Ok(Some(Value::Void))
             }
             ("getProperty", "(Ljava/lang/String;)Ljava/lang/String;") => {
@@ -5666,6 +5668,9 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) {
+        self.properties_put_all(marker, entries);
+    }
     fn register_render_handle(&mut self, key: &str) {
         self.register_render_handle(key);
     }
@@ -28057,6 +28062,29 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        if r.owner == "java/util/Properties"
+            && r.name == "load"
+            && r.descriptor == "(Ljava/io/Reader;)V"
+        {
+            let (Some(receiver), Some(reader)) = (
+                receiver.and_then(expect_ref),
+                args.first().and_then(jar_object::object_key),
+            ) else {
+                return Ok(None);
+            };
+            let Some(text) = self.string_readers.remove(reader) else {
+                return Ok(None);
+            };
+            self.string_readers.insert(reader.to_owned(), String::new());
+            let entries =
+                properties_entries(&text).map_err(|m| NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(m),
+                    frame: None,
+                })?;
+            self.host.properties_put_all(receiver, entries);
+            return Ok(Some(Value::Void));
+        }
         // `java.io.StringReader` is the Reader a config bootstrap builds for
         // `Gson.fromJson(Reader, Class)`; its text lives beside the reader
         // marker for that call.
