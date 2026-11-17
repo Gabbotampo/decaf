@@ -529,7 +529,7 @@ fn separator_rows_match_gson_214() {
     let fixture = Fixture::build("separator-rows");
     assert_eq!(
         fixture.text("separatorRows"),
-        r#"{"a": 1, "b": [1, 2]}|[1, 2]|{}|[]|{  "a": 1,   "b": [    1,     2  ]}|[  1,   2]|{}|[]"#
+        include_str!("fixtures/gson_builder/separator_rows.java25.txt")
     );
 }
 
