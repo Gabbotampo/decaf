@@ -13,6 +13,7 @@ use std::{
     fs::File,
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -3373,6 +3374,8 @@ pub struct StdHost {
     /// integer value, so this is intentionally an `i32` rather than a host
     /// clock read.  Keeping the value seeded makes bootstrap replayable.
     current_time_millis: i32,
+    /// Monotonic origin for `System.nanoTime`; each host gets its own clock.
+    nano_time_origin: Instant,
     mods: BTreeMap<String, String>,
     /// Each mod of a linked NeoForge jar: its own version, its file's first
     /// mod and that mod's version (`ModList`, `LoadingModList.getModFileById`,
@@ -3702,6 +3705,7 @@ impl StdHost {
             block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
+            nano_time_origin: Instant::now(),
             mods: BTreeMap::new(),
             neoforge_mod_files: BTreeMap::new(),
             run_loader: class_precedence::RunLoader::default(),
@@ -7975,6 +7979,9 @@ impl Host for StdHost {
             }
             ("java/lang/System", "currentTimeMillis", "()J") => {
                 Ok(Value::Int(self.current_time_millis))
+            }
+            ("java/lang/System", "nanoTime", "()J") => {
+                Ok(Value::Int(self.nano_time_origin.elapsed().as_nanos() as i64))
             }
             ("java/lang/System", "lineSeparator", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some("\n".into())))
