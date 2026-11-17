@@ -1,0 +1,17 @@
+#[path = "support/javac_fixture.rs"]
+mod javac_fixture;
+use horizon_native_java::{StdHost, Value};
+use javac_fixture::Fixture;
+const PROBE: &str = include_str!("fixtures/url_encoder/demo/Probe.java");
+const ORACLE: &str = include_str!("fixtures/url_encoder/java25.txt");
+const ENCODER: &str = r#"package java.net; public final class URLEncoder { public static String encode(String s, java.nio.charset.Charset c) { throw new AssertionError(); } }"#;
+#[test]
+fn url_encoder_utf8_matches_java25() {
+    let fixture = Fixture::build("url-encoder", &[("java/net/URLEncoder.java", ENCODER), ("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let answer = fixture.jar.invoke_method_with_args("demo/Probe", "rows", "()Ljava/lang/String;", None, &[], &mut host).unwrap();
+    assert_eq!(answer, Value::Ref(Some(ORACLE.to_owned())));
+    assert!(host.unknown_host_calls().is_empty(), "{:?}", host.unknown_host_calls());
+    let _ = fixture.jar.invoke_method_with_args("demo/Probe", "rowsOtherCharset", "()Ljava/lang/String;", None, &[], &mut host);
+    assert_eq!(host.unknown_host_calls(), vec![("java/net/URLEncoder#encode(Ljava/lang/String;Ljava/nio/charset/Charset;)Ljava/lang/String;".into(), 1)]);
+}
