@@ -110,7 +110,6 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
-mod host_creative_tab;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -3355,8 +3354,6 @@ pub struct StdHost {
     /// included), and the `BlockItem` built for each block: vanilla's
     /// `Item.BY_BLOCK`, which `Block.asItem()` reads.
     constructed_items: BTreeSet<String>,
-    live_objects_issued: BTreeSet<String>,
-    live_objects_removed: BTreeSet<String>,
     /// Objects a vanilla block constructor built (a mod's block subclasses
     /// included), so `asItem()` answers only blocks it knows.
     constructed_blocks: BTreeSet<String>,
@@ -3640,7 +3637,6 @@ pub struct StdHost {
     tool_material: tool_material::State,
     /// one table per host; a conflict between two jars' registrations is not detected
     fabric_block_api: fabric_block_api::State,
-    creative_tab: host_creative_tab::State,
     vec2: vec2::State,
 }
 
@@ -3651,12 +3647,6 @@ impl Default for StdHost {
 }
 
 impl StdHost {
-    pub fn live_object_issued(&mut self, key: &str) {
-        self.live_objects_issued.insert(key.to_owned());
-    }
-    pub fn live_object_removed(&mut self, key: &str, _reason: &str) {
-        self.live_objects_removed.insert(key.to_owned());
-    }
     pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
         self.registry_lifecycles
             .get(id)
@@ -3695,8 +3685,6 @@ impl StdHost {
             linked_classes: Arc::default(),
             game_block_classes: Arc::default(),
             constructed_items: BTreeSet::new(),
-            live_objects_issued: BTreeSet::new(),
-            live_objects_removed: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
             service_providers: BTreeMap::new(),
@@ -3815,7 +3803,6 @@ impl StdHost {
             entity_registration: entity_registration::State::default(),
             tool_material: tool_material::State::default(),
             fabric_block_api: fabric_block_api::State::default(),
-            creative_tab: host_creative_tab::State::default(),
             vec2: vec2::State::default(),
         }
     }
@@ -6863,9 +6850,6 @@ impl Host for StdHost {
         if let Some(value) = host_item_stack_template::static_call(r, args) {
             return value;
         }
-        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) {
-            return value;
-        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -8084,24 +8068,6 @@ impl Host for StdHost {
     ) -> Result<Value, NativeError> {
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
-        }
-        if let Some(value) =
-            host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
-        {
-            return value;
-        }
-        if let Value::Host(handle) = receiver
-            && handle.kind() == HostKind::LiveGameObject
-            && r.name == "isRemoved"
-            && r.descriptor == "()Z"
-        {
-            return if self.live_objects_removed.contains(handle.key_text()) {
-                Ok(Value::Int(1))
-            } else if self.live_objects_issued.contains(handle.key_text()) {
-                Ok(Value::Int(0))
-            } else {
-                self.unknown_host_call(r)
-            };
         }
         if let Some(value) =
             tool_material::instance_call(&mut self.tool_material, r, receiver, args)
@@ -29149,20 +29115,6 @@ impl<H: Host> Runtime<'_, H> {
             .method(method, desc)
             .cloned()
             .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?;
-        if matches!(receiver.as_ref(), Some(Value::Host(handle)) if handle.kind() == HostKind::LiveGameObject)
-            && method == "isRemoved"
-            && desc == "()Z"
-        {
-            return self.host.invoke_instance(
-                &MethodRef {
-                    owner: class.to_owned(),
-                    name: method.to_owned(),
-                    descriptor: desc.to_owned(),
-                },
-                receiver.as_ref().expect("live receiver"),
-                args,
-            );
-        }
         // A game-hook callback's Mixin members on a game object resolve
         // through the host first (`Host::redirect_jar_call`); every other host
         // answers `None` and the body below runs as before.

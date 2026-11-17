@@ -316,6 +316,9 @@ impl StdHost {
         self.brigadier_root_texts(out);
         // A server's saved data (`facade_saved_data.rs`).
         self.saved_data.root_texts(out);
+        for held in self.creative_tab.values() {
+            value(held, out);
+        }
         // NeoForge attachment types and live values (`neoforge_attachments.rs`).
         self.neoforge_attachments.root_texts(out);
         // The objects the loader built and keeps (an entrypoint instance,
@@ -1710,9 +1713,6 @@ mod tests {
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
-            // Live-object keys the host issued or tombstoned: host identities, never jar objects.
-            "live_objects_issued",
-            "live_objects_removed",
             "next_unmodifiable_collection",
             "next_reversed_view",
             "next_ranged_attribute",

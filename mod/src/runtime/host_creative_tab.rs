@@ -1,68 +1,85 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-static NEXT: AtomicU64 = AtomicU64::new(1);
 use crate::runtime::{
     MethodRef, NativeError, Value,
-    host_ref::{HostKind, HostRef, Methods, Nested},
+    host_ref::{HostKind, HostRef},
 };
-fn none(_: &HostRef, _: &mut dyn Nested) -> Result<Option<String>, NativeError> {
-    Ok(None)
+use std::collections::BTreeMap;
+const FABRIC: &str = "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab";
+const BUILDER: &str = "net/minecraft/world/item/CreativeModeTab$Builder";
+const TAB: &str = "net/minecraft/world/item/CreativeModeTab";
+#[derive(Default)]
+pub(crate) struct State {
+    next: u64,
+    builders: BTreeMap<String, Option<Value>>,
+    tabs: BTreeMap<String, Value>,
 }
-fn hash(_: &HostRef, _: &mut dyn Nested) -> Result<Option<i32>, NativeError> {
-    Ok(None)
+impl State {
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Value> {
+        self.builders.values().flatten().chain(self.tabs.values())
+    }
 }
-fn eq(_: &HostRef, _: &Value, _: &mut dyn Nested) -> Result<Option<bool>, NativeError> {
-    Ok(None)
-}
-fn io(_: &HostRef, _: &str, _: &dyn crate::runtime::host_ref::ClassHierarchy) -> Option<bool> {
-    None
-}
-fn cr(_: &HostRef, _: &dyn Fn(&Value) -> bool) -> bool {
-    false
-}
-pub(crate) const METHODS: Methods = Methods {
-    to_string: none,
-    hash_code: hash,
-    equals: eq,
-    instance_of: io,
-    crosses_jars: cr,
-    compare_to: None,
-};
-pub(crate) fn static_call(r: &MethodRef, _args: &[Value]) -> Option<Result<Value, NativeError>> {
-    if r.owner == "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab"
+pub(crate) fn static_call(
+    state: &mut State,
+    r: &MethodRef,
+    _: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if r.owner == FABRIC
         && r.name == "builder"
         && r.descriptor == "()Lnet/minecraft/world/item/CreativeModeTab$Builder;"
     {
+        state.next += 1;
+        let k = format!("b#{}", state.next);
+        state.builders.insert(k.clone(), None);
         return Some(Ok(Value::Host(HostRef::new(
             HostKind::CreativeModeTabBuilder,
-            format!("builder:{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            k,
         ))));
     }
     None
 }
 pub(crate) fn instance_call(
+    state: &mut State,
     r: &MethodRef,
-    receiver: &Value,
-    _args: &[Value],
+    recv: &Value,
+    args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    let Value::Host(h) = receiver else {
-        return None;
-    };
-    if h.kind() == HostKind::CreativeModeTabBuilder {
-        if r.owner == "net/minecraft/world/item/CreativeModeTab$Builder"
-            && r.name == "build"
-            && r.descriptor == "()Lnet/minecraft/world/item/CreativeModeTab;"
-        {
-            return Some(Ok(Value::Host(HostRef::new(
-                HostKind::CreativeModeTab,
-                h.key_text().to_owned(),
-            ))));
-        }
-        if r.owner == "net/minecraft/world/item/CreativeModeTab$Builder"
-            && r.descriptor
+    let Value::Host(h) = recv else { return None };
+    match h.kind() {
+        HostKind::CreativeModeTabBuilder => {
+            if r.owner != BUILDER {
+                return None;
+            };
+            if r.name == "build" && r.descriptor == "()Lnet/minecraft/world/item/CreativeModeTab;" {
+                state.next += 1;
+                let k = format!("t#{}", state.next);
+                let title = state
+                    .builders
+                    .get(h.key())?
+                    .clone()
+                    .unwrap_or(Value::Ref(Some("component/empty".into())));
+                state.tabs.insert(k.clone(), title);
+                return Some(Ok(Value::Host(HostRef::new(HostKind::CreativeModeTab, k))));
+            }
+            if r.descriptor
                 .ends_with("Lnet/minecraft/world/item/CreativeModeTab$Builder;")
-        {
-            return Some(Ok(receiver.clone()));
+            {
+                if r.name == "title" {
+                    state
+                        .builders
+                        .insert(h.key().to_owned(), args.first().cloned());
+                }
+                return Some(Ok(recv.clone()));
+            }
+            None
         }
+        HostKind::CreativeModeTab => {
+            if r.owner == TAB
+                && r.name == "getDisplayName"
+                && r.descriptor == "()Lnet/minecraft/network/chat/Component;"
+            {
+                return Some(Ok(state.tabs.get(h.key())?.clone()));
+            }
+            None
+        }
+        _ => None,
     }
-    None
 }
