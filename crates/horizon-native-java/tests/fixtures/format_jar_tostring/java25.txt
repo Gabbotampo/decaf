@@ -1,0 +1,5 @@
+[named]
+named   |nam|NAMED
+host named
+[null]
+[null]
