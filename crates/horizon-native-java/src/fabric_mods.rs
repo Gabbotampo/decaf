@@ -101,6 +101,13 @@ fn enum_marker(owner: &str, name: &str) -> Value {
     Value::Ref(Some(format!("{owner}/{name}")))
 }
 
+pub(crate) fn enum_constants(owner: &str) -> Option<&'static [&'static str]> {
+    match owner { MOD_ENVIRONMENT => Some(ENVIRONMENTS), CV_TYPE => Some(CV_TYPES), _ => None }
+}
+pub(crate) fn enum_values(owner: &str) -> Option<Vec<Value>> {
+    enum_constants(owner).map(|names| names.iter().map(|name| enum_marker(owner, name)).collect())
+}
+
 fn text(value: impl Into<String>) -> Value {
     Value::Ref(Some(value.into()))
 }
