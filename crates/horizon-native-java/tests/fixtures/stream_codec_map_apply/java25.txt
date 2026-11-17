@@ -1,0 +1,4 @@
+mapDistinct=true
+mapCodec=true
+applyCodec=true
+applyMapCodec=true
