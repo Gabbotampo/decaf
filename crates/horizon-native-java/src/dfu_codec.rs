@@ -843,8 +843,8 @@ pub(crate) fn invoke(
             if (descriptor == "()Lcom/mojang/serialization/Codec;"
                 || descriptor == "(II)Lcom/mojang/serialization/Codec;") =>
         {
-            let inner = receiver.filter(|value| codec_receiver(value))?.clone();
-            build(host, r, LIST, vec![inner])
+            // listOf has no oracle-backed structural text yet; keep it counted.
+            return None;
         }
         (
             CODEC | PRIMITIVE | MAP_CODEC,
