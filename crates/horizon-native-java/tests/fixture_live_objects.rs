@@ -1,6 +1,6 @@
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
-use horizon_native_java::{HostKind, HostRef, StdHost, Value};
+use horizon_native_java::{HostRef, StdHost, Value};
 use javac_fixture::Fixture;
 const PROBE: &str = r#"package demo; public final class Probe { public static String rows(net.minecraft.server.level.ServerPlayer p, net.minecraft.world.inventory.AbstractContainerMenu m){ StringBuilder s=new StringBuilder(); s.append(p instanceof net.minecraft.world.entity.player.Player).append('|').append(p instanceof net.minecraft.world.entity.LivingEntity).append('|').append(p instanceof net.minecraft.world.entity.Entity).append('|').append(p==p).append('|').append(p.isRemoved()); try{s.append('|').append(p.hashCode());}catch(Throwable e){s.append("|unknown_host_call");} try{s.append('|').append(p.getClass());}catch(Throwable e){s.append("|unknown_host_call");} try{s.append('|').append(p.getX());}catch(Throwable e){s.append("|unknown_host_call");} try{p.setPos(1,2,3);}catch(Throwable e){s.append("|unknown_host_call");} return s.toString(); }}"#;
 #[test]
