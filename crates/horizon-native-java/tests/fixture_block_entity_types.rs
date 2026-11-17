@@ -6,18 +6,25 @@ const ORACLE: &str = include_str!("fixtures/block_entity_types/java25.txt");
 
 #[test]
 fn block_entity_types_rows_match_java25_oracle() {
-    let fixture = javac_fixture::Fixture::build(
-        "block-entity-types",
-        &[("demo/Probe.java", PROBE)],
-    );
+    let fixture =
+        javac_fixture::Fixture::build("block-entity-types", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
     let answer = fixture.jar.invoke_method_with_args(
-        "demo/Probe", "rows", "()Ljava/lang/String;", None, &[], &mut host,
+        "demo/Probe",
+        "rows",
+        "()Ljava/lang/String;",
+        None,
+        &[],
+        &mut host,
     );
     let got = match answer {
         Ok(horizon_native_java::Value::Ref(Some(s))) => s,
         other => panic!("probe failed: {other:?}"),
     };
     assert_eq!(got.trim(), ORACLE.trim());
-    assert!(host.unknown_host_calls().is_empty(), "{:?}", host.unknown_host_calls());
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
 }
