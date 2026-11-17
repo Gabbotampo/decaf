@@ -96,6 +96,9 @@ fn is_callback(value: &Value) -> bool {
 }
 
 fn map_codec(value: &Value) -> bool {
+    if crate::runtime::host_codec::opaque_codec_type(value).is_some_and(|t| t == MAP_CODEC) {
+        return true;
+    }
     let Some(tag) = tag(value) else {
         return false;
     };
