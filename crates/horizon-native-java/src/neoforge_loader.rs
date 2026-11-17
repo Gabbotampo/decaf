@@ -298,7 +298,7 @@ impl StdHost {
             let name = crate::host_path::fml_path_name(receiver)?;
             return fml_path_root(name).map(crate::path_value);
         }
-        if let Some(value) = self.neoforge_loader_handle(r, receiver) {
+        if let Some(value) = self.neoforge_loader_handle(r, receiver, args) {
             return Some(value);
         }
         let marker = match receiver {
@@ -376,7 +376,7 @@ impl StdHost {
     /// container's bus, info and extension points, a mod info's id and
     /// version, a file info's version, a config type's name and ordinal, a
     /// world version's name.
-    fn neoforge_loader_handle(&mut self, r: &MethodRef, receiver: &Value) -> Option<Value> {
+    fn neoforge_loader_handle(&mut self, r: &MethodRef, receiver: &Value, args: &[Value]) -> Option<Value> {
         if let Some(id) = loader::container_id(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 // A `javafml` mod's container is an `FMLModContainer`, whose
@@ -455,15 +455,14 @@ impl StdHost {
             && r.descriptor
                 == "(Lnet/minecraft/server/packs/PackType;)Lnet/minecraft/server/packs/metadata/pack/PackFormat;"
         {
-            let is_data = args
-                .first()
-                .map(|v| format!("{v:?}").contains("SERVER_DATA"))
-                .unwrap_or(false);
-            return Some(loader::world_version_pack(
-                receiver,
-                if is_data { 121 } else { 97 },
-                if is_data { 0 } else { 1 },
-            ));
+            if loader::world_version_name(receiver).is_none() { return None; }
+            let Some(Value::Ref(Some(marker))) = args.first() else { return None; };
+            let (major, minor) = match marker.as_str() {
+                "enum/net/minecraft/server/packs/PackType/SERVER_DATA" => (121, 0),
+                "enum/net/minecraft/server/packs/PackType/CLIENT_RESOURCES" => (97, 1),
+                _ => return None,
+            };
+            return Some(loader::world_version_pack(receiver, major, minor));
         }
         if let Some(name) = loader::world_version_name(receiver) {
             return matches!(
