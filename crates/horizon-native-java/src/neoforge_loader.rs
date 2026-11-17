@@ -270,7 +270,8 @@ impl StdHost {
                 "net/minecraft/SharedConstants",
                 "getCurrentVersion",
                 "()Lnet/minecraft/WorldVersion;",
-            ) | (
+            )
+            | (
                 "net/minecraft/DetectedVersion",
                 "tryDetectVersion",
                 "()Lnet/minecraft/WorldVersion;",
