@@ -123,14 +123,31 @@ pub(crate) enum Shape {
 }
 
 pub(crate) fn string_shape(marker: &str) -> Shape {
-    if is_plain_string(marker) { return Shape::String; }
+    if is_plain_string(marker) {
+        return Shape::String;
+    }
     // Only these prefixes are still emitted as text markers. Other marker
     // spellings were retired into handles (#156 P17), so jar text is exact.
     const LIVE_TEXT_MARKER_PREFIXES: &[&str] = &[
-        "enum/", "game/", "client/", "iterator/", "stream/", "block-pos/",
-        "typed/", "registry/", "payload/", "payload-context/",
+        "enum/",
+        "game/",
+        "client/",
+        "iterator/",
+        "stream/",
+        "block-pos/",
+        "typed/",
+        "registry/",
+        "payload/",
+        "payload-context/",
     ];
-    if LIVE_TEXT_MARKER_PREFIXES.iter().any(|p| marker.starts_with(p)) { Shape::Marker } else { Shape::String }
+    if LIVE_TEXT_MARKER_PREFIXES
+        .iter()
+        .any(|p| marker.starts_with(p))
+    {
+        Shape::Marker
+    } else {
+        Shape::String
+    }
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
