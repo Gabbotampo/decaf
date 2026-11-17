@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+static NEXT: AtomicU64 = AtomicU64::new(1);
 use crate::runtime::{
     MethodRef, NativeError, Value,
     host_ref::{HostKind, HostRef, Methods, Nested},
@@ -26,13 +28,13 @@ pub(crate) const METHODS: Methods = Methods {
     compare_to: None,
 };
 pub(crate) fn static_call(r: &MethodRef, _args: &[Value]) -> Option<Result<Value, NativeError>> {
-    if r.owner == "net/minecraft/world/item/CreativeModeTab"
+    if r.owner == "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab"
         && r.name == "builder"
         && r.descriptor == "()Lnet/minecraft/world/item/CreativeModeTab$Builder;"
     {
         return Some(Ok(Value::Host(HostRef::new(
             HostKind::CreativeModeTabBuilder,
-            format!("builder:{}", r.owner),
+            format!("builder:{}", NEXT.fetch_add(1, Ordering::Relaxed)),
         ))));
     }
     None
