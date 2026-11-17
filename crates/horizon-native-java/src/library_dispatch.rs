@@ -1061,10 +1061,19 @@ impl<H: Host> Runtime<'_, H> {
             }
             ("skip", "(J)J") if array_stream.is_some() => {
                 let amount = args.first().and_then(boxed_long).unwrap_or(0).max(0) as usize;
-                let pos = match self.fields.get(&field("pos", "I")) { Some(Value::Int(pos)) => (*pos).max(0) as usize, _ => 0 };
-                let count = match self.fields.get(&field("count", "I")) { Some(Value::Int(count)) => (*count).max(0) as usize, _ => 0 };
+                let pos = match self.fields.get(&field("pos", "I")) {
+                    Some(Value::Int(pos)) => (*pos).max(0) as usize,
+                    _ => 0,
+                };
+                let count = match self.fields.get(&field("count", "I")) {
+                    Some(Value::Int(count)) => (*count).max(0) as usize,
+                    _ => 0,
+                };
                 let skipped = amount.min(count.saturating_sub(pos));
-                self.fields.insert(field("pos", "I"), Value::Int(pos.saturating_add(skipped) as i32));
+                self.fields.insert(
+                    field("pos", "I"),
+                    Value::Int(pos.saturating_add(skipped) as i32),
+                );
                 Value::Long(skipped as i64)
             }
             ("read", "([B)I" | "([BII)I") => {
