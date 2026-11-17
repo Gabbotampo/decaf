@@ -374,10 +374,10 @@ fn registry_call(
             };
             if registry == "minecraft:entity_type" {
                 if let Some(value) = crate::runtime::vanilla_entity_types::handle(&id) {
-                    return Some(Ok(crate::runtime::host_optional::optional_wrap(value)));
+                    return Some(Ok(value));
                 }
                 if id.starts_with("minecraft:") {
-                    return Some(Ok(crate::runtime::host_optional::empty_optional()));
+                    return Some(Ok(Value::Ref(None)));
                 }
             }
             let Some(holder) = observed_holder(host, receiver, &id) else {
@@ -412,7 +412,7 @@ fn registry_call(
                 return Some(host.unknown_host_call(r));
             };
             if let Some(entry) = host.observed_registry_entry(&registry, &id) {
-                return Some(Ok(crate::runtime::host_optional::optional_wrap(entry.value.clone())));
+                return Some(Ok(entry.value.clone()));
             }
             if registry == "minecraft:entity_type" {
                 if let Some(value) = crate::runtime::vanilla_entity_types::handle(&id) {
@@ -469,9 +469,15 @@ fn registry_call(
             let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
                 return Some(host.unknown_host_call(r));
             };
-            Some(Ok(Value::Int(i32::from(
-                host.observed_registry_entry(&registry, &id).is_some(),
-            ))))
+            if host.observed_registry_entry(&registry, &id).is_some() {
+                return Some(Ok(Value::Int(1)));
+            }
+            if registry == "minecraft:entity_type" {
+                return Some(Ok(Value::Int(i32::from(
+                    crate::runtime::vanilla_entity_types::handle(&id).is_some(),
+                ))));
+            }
+            Some(host.unknown_host_call(r))
         }
         _ => None,
     }
