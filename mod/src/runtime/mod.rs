@@ -14561,12 +14561,6 @@ fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError>
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
                     return stream_pipeline::STREAM_TEXT.into();
                 }
-                // A callback's text is the hidden class and an identity hash:
-                // counted, its key never printed (`callback_marker.rs`).
-                if callback_marker::holds_callback(marker) {
-                    let _ = host.unknown_host_call(&jar_text::object_to_string());
-                    return callback_marker::CALLBACK_TEXT.into();
-                }
                 if crate::runtime::jar_object::packaged_object_class(value).is_some() {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
                 }
