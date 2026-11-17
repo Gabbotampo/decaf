@@ -1,2 +1,4 @@
 [fmt]
 java.util.IllegalFormatConversionException:d != demo.Probe$Named
+java.lang.IllegalStateException:boom
+java.lang.IllegalStateException:boom
