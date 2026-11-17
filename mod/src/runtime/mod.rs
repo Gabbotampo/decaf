@@ -27583,9 +27583,7 @@ impl<H: Host> Runtime<'_, H> {
         let Value::Host(handle) = value else {
             return None;
         };
-        if handle.kind() != HostKind::Writer
-            || !modelled_writer_class(crate::runtime::jar_object::packaged_object_class(value)?)
-        {
+        if !modelled_writer_class(crate::runtime::jar_object::packaged_object_class(value)?) {
             return None;
         }
         let marker = handle.key_text();
