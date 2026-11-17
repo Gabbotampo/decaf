@@ -6883,6 +6883,7 @@ impl Host for StdHost {
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
+        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) { return value; }
         if let Some(value) = fabric_creative_tab::static_call(r, args) {
             return Ok(value);
         }
@@ -8068,6 +8069,7 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args) { return value; }
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
         }
