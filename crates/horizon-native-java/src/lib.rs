@@ -13500,13 +13500,14 @@ impl StdHost {
             },
             _ => return self.unknown_host_call(r),
         };
-        if handle.kind() == HostKind::Class && r.name == "isEnum" && r.descriptor == "()Z" {
-            if let Some(class) = crate::host_class::class_name(&Value::Host(handle.clone())) {
-                if game_enum_constants(class).is_some() {
-                    self.unknown_host_call(r)?;
-                    return Ok(Value::Int(1));
-                }
-            }
+        if handle.kind() == HostKind::Class
+            && r.name == "isEnum"
+            && r.descriptor == "()Z"
+            && let Some(class) = crate::host_class::class_name(&Value::Host(handle.clone()))
+            && game_enum_constants(class).is_some()
+        {
+            self.unknown_host_call(r)?;
+            return Ok(Value::Int(1));
         }
         let answer = match r.name.as_str() {
             // A callback's text: counted, a text answered, never its key.
