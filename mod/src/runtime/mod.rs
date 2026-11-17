@@ -26500,10 +26500,44 @@ impl<H: Host> Runtime<'_, H> {
                     ("writeString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        let option_names = args
+                            .last()
+                            .and_then(|value| self.owned_array(value))
+                            .map(|values| values.iter().filter_map(expect_ref).collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        let create_new =
+                            option_names.iter().any(|name| name.contains("/CREATE_NEW"));
+                        let append = option_names.iter().any(|name| name.contains("/APPEND"));
+                        let truncate = option_names
+                            .iter()
+                            .any(|name| name.contains("/TRUNCATE_EXISTING"));
+                        if create_new && self.io_files.contains_key(&path) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/FileAlreadyExistsException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
+                        if truncate && !create_new && !self.io_files.contains_key(&path) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/NoSuchFileException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
                         let text = args
                             .get(1)
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
+                        let text = if append {
+                            format!(
+                                "{}{}",
+                                self.io_files.get(&path).cloned().unwrap_or_default(),
+                                text
+                            )
+                        } else {
+                            text
+                        };
                         self.watch_whole_write(&path, text.is_empty());
                         self.io_store_file_with_charset_args(path, text, args)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
