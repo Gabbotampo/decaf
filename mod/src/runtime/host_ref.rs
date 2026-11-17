@@ -2661,7 +2661,7 @@ const KINDS: &[KindInfo] = &[
         tag: "url",
         class: ClassRule::Fixed("java/net/URL"),
         canonical: never_canonical,
-        methods: &crate::runtime::host_jdk_value::URI_METHODS,
+        methods: &crate::runtime::host_url::URL_METHODS,
     },
 ];
 
