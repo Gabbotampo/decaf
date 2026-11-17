@@ -68,6 +68,7 @@ mod enum_value_of;
 pub mod events;
 mod executors;
 mod fabric_api_slice2;
+mod fabric_block_api;
 mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
@@ -6700,6 +6701,9 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = fabric_block_api::static_call(r, args) {
+            return value;
+        }
         if let Some(value) =
             entity_registration::static_call(&mut self.entity_registration, r, args)
         {
@@ -8225,6 +8229,9 @@ impl Host for StdHost {
         }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = fabric_block_api::instance_call(r, receiver, args) {
             return value;
         }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {

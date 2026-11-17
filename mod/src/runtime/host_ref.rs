@@ -610,6 +610,7 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
+    FabricBlockApiLookup,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2634,6 +2635,13 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::runtime::model_layers::LAYER_DEFINITION),
         canonical: always_canonical,
         methods: &crate::runtime::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricBlockApiLookup,
+        tag: "fbal",
+        class: ClassRule::Fixed("net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup"),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
     },
 ];
 
