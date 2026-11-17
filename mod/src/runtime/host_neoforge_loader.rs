@@ -263,25 +263,6 @@ pub(crate) fn world_version(name: &str) -> Value {
 pub(crate) fn world_version_name(value: &Value) -> Option<String> {
     held_text(value, HostKind::WorldVersion).filter(|s| !s.starts_with("pack:"))
 }
-pub(crate) fn world_version_pack(value: &Value, major: i32, minor: i32) -> Value {
-    let _ = value;
-    Value::Host(HostRef::of_values(
-        HostKind::WorldVersion,
-        &[text(&format!("pack:{major}:{minor}"))],
-    ))
-}
-pub(crate) fn world_version_data(value: &Value, version: i32) -> Value {
-    Value::Host(HostRef::of_values(
-        HostKind::WorldVersion,
-        &[text(&format!("data:{version}:main"))],
-    ))
-}
-pub(crate) fn pack_parts(value: &Value) -> Option<(i32, i32)> {
-    let s = held_text(value, HostKind::WorldVersion)?;
-    let mut it = s.strip_prefix("pack:")?.split(':');
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-}
-
 pub(crate) fn world_version_types(_: &str) -> &'static [&'static str] {
     &["net/minecraft/WorldVersion"]
 }

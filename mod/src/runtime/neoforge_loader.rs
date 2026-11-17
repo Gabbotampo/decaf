@@ -207,7 +207,7 @@ impl StdHost {
     }
 
     /// The loader's static methods: a call with no receiver in the jar.
-    pub(super) fn neoforge_loader_call(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
+    pub(super) fn neoforge_loader_call(&mut self, r: &MethodRef, _args: &[Value]) -> Option<Value> {
         let server = self.environment_type == "SERVER";
         match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
             (
@@ -290,7 +290,7 @@ impl StdHost {
         &mut self,
         r: &MethodRef,
         receiver: &Value,
-        args: &[Value],
+        _args: &[Value],
     ) -> Option<Value> {
         if (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str())
             == (FML_PATHS_CLASS, "get", "()Ljava/nio/file/Path;")
@@ -380,7 +380,7 @@ impl StdHost {
         &mut self,
         r: &MethodRef,
         receiver: &Value,
-        args: &[Value],
+        _args: &[Value],
     ) -> Option<Value> {
         if let Some(id) = loader::container_id(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
@@ -462,7 +462,7 @@ impl StdHost {
                 ("id", "()Ljava/lang/String;") => Some(Value::Ref(Some(name))),
                 ("protocolVersion", "()I") => Some(Value::Int(777)),
                 ("stable", "()Z") => Some(Value::Int(1)),
-                ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => None
+                ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => None,
                 _ => None,
             };
         }
