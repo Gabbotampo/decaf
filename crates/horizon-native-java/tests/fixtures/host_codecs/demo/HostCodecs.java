@@ -343,7 +343,7 @@ public final class HostCodecs {
     return Codec.INT.fieldOf("x") + "|" + Codec.INT.optionalFieldOf("x") + "|"
         + Codec.INT.optionalFieldOf("x", 7) + "|"
         + Codec.INT.optionalFieldOf("x", 7, (Lifecycle) null) + "|"
-        + Codec.INT.xmap(x -> x + 1, x -> x - 1);
+        + Codec.INT.xmap(x -> x + 1, x -> x - 1) + "|" + Codec.INT.listOf(1, 3);
   }
   /** A real game StreamCodec constant is rejected by every DFU receiver family. */
   public static String forgedDfuReceivers() {
