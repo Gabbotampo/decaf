@@ -1,0 +1,1 @@
+plain MessageFactory: getMessageFactory() returns an internal MessageFactory2Adapter, not the supplied factory; this call remains counted.
