@@ -34,5 +34,5 @@ fn vanilla_static_rows_match_java25() {
     let f = Fixture::build("vanilla-static", &files);
     let mut h = f.jar.seed_host(StdHost::new());
     assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
-    assert_eq!(h.unknown_host_calls(), &["net/minecraft/network/chat/Component#empty()Lnet/minecraft/network/chat/MutableComponent;".to_owned(), "com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned()]);
+    assert_eq!(h.unknown_host_calls(), vec![("com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned(), 1)]);
 }
