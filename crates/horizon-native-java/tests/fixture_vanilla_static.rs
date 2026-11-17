@@ -9,7 +9,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/network/chat/MutableComponent.java",
-        r#"package net.minecraft.network.chat; public interface MutableComponent extends Component { public native int hashCode(); }"#,
+        r#"package net.minecraft.network.chat; public interface MutableComponent extends Component {}"#,
     ),
     (
         "net/minecraft/network/chat/CommonComponents.java",
