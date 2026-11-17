@@ -45,11 +45,13 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         let args = args.map(|values| {
-            values
-                .iter()
-                .map(|value| self.format_arg(value))
-                .collect::<Vec<_>>()
-        });
+            if values.iter().any(|value| crate::jar_object::packaged_object_class(value).is_some())
+                && format_has_non_string_conversion(format)
+            {
+                return None;
+            }
+            Some(values.iter().map(|value| self.format_arg(value)).collect::<Vec<_>>())
+        })?;
         java_format::format(format, args.as_deref())
     }
 
@@ -98,10 +100,10 @@ impl<H: Host> Runtime<'_, H> {
         // throws, or that only the JVM can print (an identity hash), is
         // refused here and counted by the host.
         if crate::jar_object::packaged_object_class(value).is_some() {
-            return match self.runtime_value_of(value, "java/util/Formatter", "format") {
+            return match self.jar_to_string(value, "java/util/Formatter", "format") {
                 Ok(Some(Value::Ref(Some(text)))) => Arg::Str(text),
-                Ok(Some(Value::Ref(None))) => Arg::Null,
-                _ => Arg::Opaque,
+                Ok(Some(Value::Ref(None))) | Ok(Some(_)) => Arg::Opaque,
+                Ok(None) | Err(_) => Arg::Opaque,
             };
         }
         // A model object whose `toString` the host answers; anything else
@@ -180,4 +182,20 @@ fn formats_like_us(locale: &Value) -> bool {
         ),
         _ => false,
     }
+}
+
+fn format_has_non_string_conversion(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' { i += 1; continue; }
+        i += 1;
+        if i >= bytes.len() { return true; }
+        if bytes[i] == b'%' || bytes[i] == b'n' { i += 1; continue; }
+        while i < bytes.len() && !bytes[i].is_ascii_alphabetic() { i += 1; }
+        if i >= bytes.len() { return true; }
+        if !matches!(bytes[i], b's' | b'S') { return true; }
+        i += 1;
+    }
+    false
 }
