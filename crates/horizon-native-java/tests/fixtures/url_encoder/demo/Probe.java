@@ -10,6 +10,7 @@ public final class Probe {
   }
   public static String loneSurrogate() { return URLEncoder.encode("\uD800", StandardCharsets.UTF_8); }
   public static String replacementChar() { return URLEncoder.encode("�", StandardCharsets.UTF_8); }
+  public static String nullString() { try { return URLEncoder.encode(null, StandardCharsets.UTF_8); } catch (RuntimeException e) { return e.getClass().getName() + ":" + e.getMessage(); } }
   public static String rowsOtherCharset() { return URLEncoder.encode("a", StandardCharsets.UTF_16); }
   public static void main(String[] args) { System.out.print(rows()); }
 }
