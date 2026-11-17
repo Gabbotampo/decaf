@@ -1,7 +1,3 @@
 hello|true|java.lang.String|5|true|99162322
-abc/hcb:x|true|java.lang.String|9|true|-1119489896
-enum/x|true|java.lang.String|6|true|-1298243862
 game/x|true|java.lang.String|6|true|-1253237349
 list/hobj:x|true|java.lang.String|11|true|493368798
-textures/gui/a.png|true|java.lang.String|18|true|-1200533839
-models/item/x|true|java.lang.String|13|true|355062721
