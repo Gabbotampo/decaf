@@ -308,7 +308,7 @@ impl<H: Host> Runtime<'_, H> {
             };
             return match verdict {
                 Verdict::Yes => Ok(()),
-                Verdict::No => Err(class_cast_exception(class, target)),
+                Verdict::No => Err(class_cast_exception(&class, target)),
                 Verdict::Unknown => self.count_cast(value, target),
             };
         }
