@@ -377,11 +377,19 @@ impl StdHost {
                 // A `javafml` mod's container is an `FMLModContainer`, whose
                 // `getEventBus()` is that mod's bus.
                 ("getEventBus" | "getModEventBus", "()Lnet/neoforged/bus/api/IEventBus;") => {
-                    Some(crate::neoforge_bus::mod_bus(Some(&id)))
+                    // MinecraftModContainer's event bus is null in the real
+                    // loader; FML mod containers own their mod bus.
+                    if id == "minecraft" {
+                        Some(Value::Ref(None))
+                    } else {
+                        Some(crate::neoforge_bus::mod_bus(Some(&id)))
+                    }
                 }
                 // `ModContainer.getModId` is final: the id. (`getNamespace`
                 // is the mods.toml's override, which the host does not read.)
-                ("getModId", "()Ljava/lang/String;") => Some(Value::Ref(Some(id))),
+                ("getModId", "()Ljava/lang/String;") | ("getNamespace", "()Ljava/lang/String;") => {
+                    Some(Value::Ref(Some(id)))
+                }
                 ("getModInfo", "()Lnet/neoforged/neoforgespi/language/IModInfo;") => {
                     Some(loader::mod_info(&id))
                 }
@@ -391,7 +399,15 @@ impl StdHost {
                 (
                     "registerExtensionPoint",
                     "(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
-                ) => Some(Value::Void),
+                ) => None,
+                // FML 12.0.12 `ModContainer.registerExtensionPoint(point, supplier)` is
+                // `extensionPoints.put(point, supplier)` into an `IdentityHashMap`, which takes
+                // null keys and values: nothing throws, the supplier is never called, and only
+                // `getCustomExtension` could read it back, which this host counts. So `void` is
+                // the whole answer (`tests/fixtures/neoforge_extension_point/javap_facts.txt`).
+                ("registerExtensionPoint", "(Ljava/lang/Class;Ljava/util/function/Supplier;)V") => {
+                    Some(Value::Void)
+                }
                 _ => None,
             };
         }

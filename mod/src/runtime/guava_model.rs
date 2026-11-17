@@ -23,6 +23,11 @@
 
 use super::*;
 
+/// The composite operations of Guava's two natural orderings. Their `toString`,
+/// like every callback's, is counted (`callback_marker::CALLBACK_TEXT`).
+pub(crate) const GUAVA_NATURAL: &str = "cmp.guava-natural";
+pub(crate) const GUAVA_REVERSE_NATURAL: &str = "cmp.guava-reverse-natural";
+
 const TYPE_TOKEN: &str = "com/google/common/reflect/TypeToken";
 /// The captured type a `TypeToken` subclass object keeps, under its marker.
 const RUNTIME_TYPE: &str = "#runtimeTypeLjava/lang/reflect/Type;";
@@ -245,6 +250,69 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // Guava's `Ordering.natural()` (the `NaturalOrdering.INSTANCE` singleton)
+        // and its `reverse()` (the `ReverseNaturalOrdering.INSTANCE` singleton,
+        // whose own `reverse()` is `natural()` again): operand-free composites,
+        // so each is one object, as in Guava. jamlib orders its events with them.
+        if r.owner == "com/google/common/collect/Ordering" {
+            match (r.name.as_str(), r.descriptor.as_str(), receiver) {
+                ("natural", "()Lcom/google/common/collect/Ordering;", None) => {
+                    return Ok(Some(crate::runtime::callback_marker::composite(GUAVA_NATURAL, &[])));
+                }
+                ("reverse", "()Lcom/google/common/collect/Ordering;", Some(v)) => {
+                    match crate::runtime::callback_marker::composite_of(v).map(|(op, _)| op) {
+                        Some(op) if op == GUAVA_NATURAL => {
+                            return Ok(Some(crate::runtime::callback_marker::composite(
+                                GUAVA_REVERSE_NATURAL,
+                                &[],
+                            )));
+                        }
+                        Some(op) if op == GUAVA_REVERSE_NATURAL => {
+                            return Ok(Some(crate::runtime::callback_marker::composite(GUAVA_NATURAL, &[])));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((op, _)) = receiver.and_then(crate::runtime::callback_marker::composite_of)
+            && (op == GUAVA_NATURAL || op == GUAVA_REVERSE_NATURAL)
+            && r.name == "compare"
+            && r.descriptor == "(Ljava/lang/Object;Ljava/lang/Object;)I"
+            && let [left, right] = args
+        {
+            let npe = |message: Option<&str>| {
+                Err(thrown(
+                    "java/lang/NullPointerException",
+                    message.map(str::to_owned),
+                ))
+            };
+            // `NaturalOrdering.compare`: `checkNotNull(left); checkNotNull(right);
+            // return left.compareTo(right);`.
+            if op == GUAVA_NATURAL {
+                if *left == Value::Ref(None) || *right == Value::Ref(None) {
+                    return npe(None);
+                }
+                return Ok(Some(Value::Int(crate::runtime::jdk_stream::natural_compare(
+                    left, right,
+                )?)));
+            }
+            // `ReverseNaturalOrdering.compare`: `checkNotNull(left); if (left ==
+            // right) return 0; return right.compareTo(left);`, so a null `right`
+            // is the JVM's helpful NullPointerException.
+            if *left == Value::Ref(None) {
+                return npe(None);
+            }
+            if *right == Value::Ref(None) {
+                return npe(Some(
+                    "Cannot invoke \"java.lang.Comparable.compareTo(Object)\" because \"right\" is null",
+                ));
+            }
+            return Ok(Some(Value::Int(crate::runtime::jdk_stream::natural_compare(
+                right, left,
+            )?)));
+        }
         if (r.owner == "com/google/common/collect/ImmutableMap"
             || r.owner == "com/google/common/collect/ImmutableBiMap")
             && r.name == "copyOf"
@@ -411,6 +479,197 @@ impl<H: Host> Runtime<'_, H> {
                 if r.name == "of" =>
             {
                 self.invoke_immutable_of(r, args)
+            }
+            "com/google/common/collect/ImmutableList"
+                if (r.name == "builder"
+                    && r.descriptor == "()Lcom/google/common/collect/ImmutableList$Builder;")
+                    || (r.name == "builderWithExpectedSize"
+                        && r.descriptor
+                            == "(I)Lcom/google/common/collect/ImmutableList$Builder;") =>
+            {
+                if r.name == "builderWithExpectedSize" {
+                    let expected = expect_int(r, &args[0])?;
+                    if expected < 0 {
+                        return Err(thrown(
+                            "java/lang/IllegalArgumentException",
+                            Some(format!(
+                                "expectedSize cannot be negative but was: {expected}"
+                            )),
+                        ));
+                    }
+                }
+                Ok(Some(self.new_object("guava-immutable-list-builder")))
+            }
+            "com/google/common/collect/ImmutableList$Builder" => {
+                let Some(receiver) = receiver else {
+                    return Ok(None);
+                };
+                let Some(marker) = crate::runtime::jar_object::object_key(receiver).map(str::to_owned)
+                else {
+                    return Ok(None);
+                };
+                let list_field = format!("{marker}|guava#builder-list");
+                match r.name.as_str() {
+                    "add"
+                        if r.descriptor
+                            == "([Ljava/lang/Object;)Lcom/google/common/collect/ImmutableList$Builder;" =>
+                    {
+                        let values = self
+                            .array(
+                                args.first().ok_or_else(|| {
+                                    NativeError::Metadata("missing varargs".into())
+                                })?,
+                            )?
+                            .into_owned();
+                        let list = match self.fields.get(&list_field).cloned() {
+                            Some(list) => list,
+                            None => {
+                                let list = self.host.empty_mutable_collection("list").ok_or_else(
+                                    || NativeError::Metadata("Guava list host missing".into()),
+                                )?;
+                                self.fields.insert(list_field.clone(), list.clone());
+                                list
+                            }
+                        };
+                        for value in values.iter() {
+                            if *value == Value::Ref(None) {
+                                return Err(thrown("java/lang/NullPointerException", None));
+                            }
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "add" if !args.is_empty() => {
+                        if args[0] == Value::Ref(None) {
+                            return Err(thrown("java/lang/NullPointerException", None));
+                        }
+                        let list = match self.fields.get(&list_field).cloned() {
+                            Some(list) => list,
+                            None => {
+                                let list = self.host.empty_mutable_collection("list").ok_or_else(
+                                    || NativeError::Metadata("Guava list host missing".into()),
+                                )?;
+                                self.fields.insert(list_field.clone(), list.clone());
+                                list
+                            }
+                        };
+                        for value in args {
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "addAll"
+                        if r.descriptor
+                            == "(Ljava/lang/Iterable;)Lcom/google/common/collect/ImmutableList$Builder;" =>
+                    {
+                        let values = runtime_collection_values(&*self.host, &args[0])?;
+                        if let Some((i, _)) = values
+                            .iter()
+                            .enumerate()
+                            .find(|(_, v)| **v == Value::Ref(None))
+                        {
+                            return Err(thrown(
+                                "java/lang/NullPointerException",
+                                Some(format!("at index {i}")),
+                            ));
+                        }
+                        let list =
+                            self.fields.get(&list_field).cloned().unwrap_or_else(|| {
+                                self.host.empty_mutable_collection("list").unwrap()
+                            });
+                        self.fields
+                            .entry(list_field.clone())
+                            .or_insert_with(|| list.clone());
+                        for value in values {
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(&value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "addAll"
+                        if r.descriptor
+                            == "(Ljava/util/Iterator;)Lcom/google/common/collect/ImmutableList$Builder;" =>
+                    {
+                        let iterator = &args[0];
+                        let marker = crate::runtime::host_iterator::marker(iterator)
+                            .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?;
+                        let (_, length, _) = self
+                            .host
+                            .host_iterator(marker)
+                            .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?;
+                        let list =
+                            self.fields.get(&list_field).cloned().unwrap_or_else(|| {
+                                self.host.empty_mutable_collection("list").unwrap()
+                            });
+                        self.fields
+                            .entry(list_field.clone())
+                            .or_insert_with(|| list.clone());
+                        for _ in 0..length {
+                            let value = self.host.host_iterator_next(marker)?;
+                            if value == Value::Ref(None) {
+                                return Err(thrown(
+                                    "java/lang/NullPointerException",
+                                    Some("at index 0".into()),
+                                ));
+                            }
+                            self.host.invoke_instance(
+                                &MethodRef {
+                                    owner: "java/util/List".into(),
+                                    name: "add".into(),
+                                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                                },
+                                &list,
+                                std::slice::from_ref(&value),
+                            )?;
+                        }
+                        Ok(Some(receiver.clone()))
+                    }
+                    "build"
+                        if args.is_empty()
+                            && r.descriptor == "()Lcom/google/common/collect/ImmutableList;" =>
+                    {
+                        let values = match self.fields.get(&list_field) {
+                            Some(list) => runtime_collection_values(&*self.host, list)?,
+                            None => Vec::new(),
+                        };
+                        let of = MethodRef {
+                            owner: "com/google/common/collect/ImmutableList".into(),
+                            name: "of".into(),
+                            descriptor: r.descriptor.clone(),
+                        };
+                        match self
+                            .host
+                            .factory_collection(&of.owner, &of.name, "list", values)
+                        {
+                            Some(made) => Ok(Some(made)),
+                            None => self.host.unknown_operand_call(r).map(Some),
+                        }
+                    }
+                    _ => Ok(None),
+                }
             }
             "com/google/common/collect/ImmutableMap"
                 if r.name == "builder"

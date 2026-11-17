@@ -80,6 +80,63 @@ fn thrown(class: &str, message: Option<String>) -> NativeError {
     }
 }
 
+/// The synthetic field a collection marker carries once a counted call may have changed it
+/// (#464): every later call on it is counted too.
+const UNCERTAIN_FIELD: &str = "#collectionUncertain";
+
+/// The collection members that may change their collection.
+fn mutates(name: &str) -> bool {
+    matches!(
+        name,
+        "put"
+            | "putAll"
+            | "putIfAbsent"
+            | "remove"
+            | "replace"
+            | "replaceAll"
+            | "compute"
+            | "computeIfAbsent"
+            | "computeIfPresent"
+            | "merge"
+            | "add"
+            | "addAll"
+            | "removeAll"
+            | "retainAll"
+            | "removeIf"
+            | "clear"
+    )
+}
+
+impl<H: Host> Runtime<'_, H> {
+    fn uncertain_key(collection: &Value) -> Option<String> {
+        expect_ref(collection).map(|marker| format!("{marker}|{UNCERTAIN_FIELD}"))
+    }
+
+    /// Whether a counted call may have changed `collection` (#464).
+    fn collection_uncertain(&self, collection: &Value) -> bool {
+        Self::uncertain_key(collection).is_some_and(|key| self.fields.contains_key(&key))
+    }
+
+    /// Count `r`, an identity-collection call whose answer depends on an identity the runtime
+    /// doesn't keep, and answer its neutral value. Never fall through to the rest of the
+    /// dispatch: a counted call must not also run (#464). A counted mutation leaves `changed`
+    /// uncertain, so its later calls are counted rather than answered from contents the call may
+    /// have changed.
+    fn count_identity_call(
+        &mut self,
+        r: &MethodRef,
+        changed: &Value,
+    ) -> Result<Value, NativeError> {
+        let neutral = self.host.unknown_operand_call(r)?;
+        if mutates(&r.name)
+            && let Some(key) = Self::uncertain_key(changed)
+        {
+            self.fields.insert(key, Value::Int(1));
+        }
+        Ok(neutral)
+    }
+}
+
 impl<H: Host> Runtime<'_, H> {
     /// `probe(pe)`: `floorMod(pe.hashCode(), buckets)`, then `pe.equals(ee)`
     /// slot by slot until an empty slot.
@@ -403,6 +460,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb9)) else {
             return self.unordered_argument(r, args);
         };
+        // A counted call may have changed this collection (#464): its contents are unknown.
+        if self.collection_uncertain(receiver) {
+            return self.count_identity_call(r, receiver).map(Some);
+        }
         // SetFromMap is a live mutable view; its retain/remove operations must
         // reach the backing map through hash collection dispatch.
         if self.host.is_set_from_map(receiver) {
@@ -445,6 +506,23 @@ impl<H: Host> Runtime<'_, H> {
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_MAP) {
             return self.identity_map_member(r, receiver, args);
         }
+        // Gson's `LinkedTreeMap` (a `fromJson` read's map) keeps `Map`'s
+        // default `compute`/`merge` bodies too, which the host's map model
+        // cannot run over a jar function (#337). With a plain `String` key its
+        // `compareTo` lookup is the `equals` one, so the stored key equal to
+        // `key` is found as `identity_compute` finds it. Any other key is left
+        // to the host, which counts it (#253 re-check B5).
+        if self.host_collection_class(receiver).as_deref() == Some(gson_tree::TREE_MAP)
+            && matches!(args.first(), Some(Value::Ref(Some(key))) if value_class::is_plain_string(key))
+        {
+            let entries = match self.host.mutable_collection_entries(receiver) {
+                Some(entries) => entries,
+                None => self.collection_elements(receiver)?,
+            };
+            if let Some(answer) = self.identity_compute(r, receiver, &entries, args)? {
+                return Ok(Some(answer));
+            }
+        }
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET)
             && !self.host.is_set_from_map(receiver)
         {
@@ -482,8 +560,7 @@ impl<H: Host> Runtime<'_, H> {
             .iter()
             .any(|stored| self.identity_unknown(value, stored));
         if ambiguous {
-            self.host.unknown_operand_call(r)?;
-            return Ok(Some(Value::Ref(None)));
+            return self.count_identity_call(r, receiver).map(Some);
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
@@ -775,7 +852,8 @@ impl<H: Host> Runtime<'_, H> {
     /// `IdentityHashMap`, whose stored key equal to `key` (if any) is `key`
     /// itself: `IdentityHashMap` keeps `Map`'s default bodies (`get`, the
     /// function run through the interpreter, then `put` or `remove`), which
-    /// the host's own models could not run over a jar function. `Ok(None)`
+    /// the host's own models could not run over a jar function. Gson's
+    /// `LinkedTreeMap` with a `String` key runs here too (#337). `Ok(None)`
     /// for every other member.
     fn identity_compute(
         &mut self,
@@ -890,7 +968,9 @@ impl<H: Host> Runtime<'_, H> {
             _ => false,
         });
         if ambiguous {
-            return self.host.unknown_operand_call(r).map(|_| Some(None));
+            return self
+                .count_identity_call(r, &source)
+                .map(|value| Some(Some(value)));
         }
         Ok(None)
     }
@@ -933,7 +1013,7 @@ impl<H: Host> Runtime<'_, H> {
                 .step_by(2)
                 .any(|stored| self.identity_unknown(key, stored));
             if ambiguous {
-                return self.host.unknown_operand_call(r).map(|_| None);
+                return self.count_identity_call(r, receiver).map(Some);
             }
             // Every stored key equal to `key` is `key` itself, or none is:
             // the identity lookup is the equality one, so the host answers,
@@ -957,7 +1037,7 @@ impl<H: Host> Runtime<'_, H> {
                     .any(|stored| self.identity_unknown(key, stored))
             });
             if ambiguous {
-                return self.host.unknown_operand_call(r).map(|_| None);
+                return self.count_identity_call(r, receiver).map(Some);
             }
             return Ok(None);
         }
@@ -971,7 +1051,7 @@ impl<H: Host> Runtime<'_, H> {
                 .step_by(2)
                 .any(|stored| self.identity_unknown(value, stored));
             if ambiguous {
-                return self.host.unknown_operand_call(r).map(|_| None);
+                return self.count_identity_call(r, receiver).map(Some);
             }
             return Ok(None);
         }

@@ -279,6 +279,8 @@ pub enum HostKind {
     Holder,
     /// A `Holder.Reference` returned by a jar-owned `Registry.registerForHolder`: key the registry key, id and value.
     RegistryHolder,
+    /// A `Holder.Direct` returned by `Holder.direct`: key the held value and component map.
+    DirectHolder,
     /// The value a holder's registration registered: key the serial.
     Registered,
     /// A Fabric `FabricRegistryBuilder`: key the [`HostRef::of_values`] of
@@ -382,6 +384,7 @@ pub enum HostKind {
     NeoForgeModInfo,
     /// A `ModFileInfo`: key its file's first mod id.
     NeoForgeModFileInfo,
+    NeoForgePayloadRegistrar,
     /// A `ModConfig.Type` constant: key its name.
     NeoForgeConfigType,
     /// A detected `WorldVersion`: key its name.
@@ -462,6 +465,8 @@ pub enum HostKind {
     OpaqueCodec,
     /// A pure network StreamCodec factory result.
     StreamCodec,
+    /// A synchronous java.lang.ThreadLocal holder.
+    ThreadLocal,
     /// An explicitly seeded Minecraft RandomSource or positional factory.
     RandomSource,
     /// A codec the attachment model builds: key `compound-tag` or
@@ -605,6 +610,22 @@ pub enum HostKind {
     MeshDefinition,
     PartDefinition,
     LayerDefinition,
+    /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
+    /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
+    RegexMatcher,
+    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    ItemStackTemplate,
+    /// Fabric CreativeModeTab builder and built tab handles.
+    CreativeModeTabBuilder,
+    CreativeModeTab,
+    /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
+    FabricBlockApiLookup,
+    Url,
+    /// A Fabric `ResourceConditionType` that `create` made (`fabric_resource_conditions.rs`).
+    FabricResourceConditionType,
+    /// A Fabric `BiomeModification` that `BiomeModifications.create` made
+    /// (`fabric_biome_modifications.rs`).
+    FabricBiomeModification,
 }
 
 /// How a kind's Java class follows from its key.
@@ -1381,6 +1402,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_registry_holder::METHODS,
     },
     KindInfo {
+        kind: HostKind::DirectHolder,
+        tag: "dhold",
+        class: ClassRule::Fixed("net/minecraft/core/Holder$Direct"),
+        canonical: never_canonical,
+        methods: &crate::host_registry_holder::DIRECT_METHODS,
+    },
+    KindInfo {
         kind: HostKind::Registered,
         tag: "rgd",
         class: ClassRule::Unknown {
@@ -1820,6 +1848,13 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::host_neoforge_loader::OBJECT_METHODS,
     },
     KindInfo {
+        kind: HostKind::NeoForgePayloadRegistrar,
+        tag: "nfpr",
+        class: ClassRule::Fixed("net/neoforged/neoforge/network/registration/PayloadRegistrar"),
+        canonical: never_canonical,
+        methods: &crate::host_service::METHODS,
+    },
+    KindInfo {
         kind: HostKind::NeoForgeConfigType,
         tag: "nfct",
         class: ClassRule::Unknown {
@@ -2108,6 +2143,14 @@ const KINDS: &[KindInfo] = &[
         // Every factory call allocates a new implementation object.
         canonical: always_canonical,
         methods: &crate::stream_codec::STREAM_CODEC_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ThreadLocal,
+        tag: "thrl",
+        class: ClassRule::FromKey(crate::thread_local::class_of_key),
+        // A withInitial call allocates the JDK private SuppliedThreadLocal object.
+        canonical: always_canonical,
+        methods: &crate::thread_local::THREAD_LOCAL_METHODS,
     },
     KindInfo {
         kind: HostKind::RandomSource,
@@ -2607,6 +2650,73 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::model_layers::LAYER_DEFINITION),
         canonical: always_canonical,
         methods: &crate::model_layers::IDENTITY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RegexMatcher,
+        tag: "rxm",
+        class: ClassRule::Fixed("java/util/regex/Matcher"),
+        // A serial per `matcher` call.
+        canonical: always_canonical,
+        methods: &crate::host_jdk_constant::MATCHER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::ItemStackTemplate,
+        tag: "ist",
+        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        canonical: always_canonical,
+        methods: &crate::host_item_stack_template::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTabBuilder,
+        tag: "cmb",
+        class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab$Builder"),
+        canonical: never_canonical,
+        // No overrides: identity `equals`, counted `hashCode`/`toString`.
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTab,
+        tag: "cmt",
+        class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab"),
+        canonical: never_canonical,
+        // No overrides: identity `equals`, counted `hashCode`/`toString`.
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricBlockApiLookup,
+        tag: "fbal",
+        class: ClassRule::Fixed("net/fabricmc/fabric/api/lookup/v1/block/BlockApiLookup"),
+        canonical: always_canonical,
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Url,
+        tag: "url",
+        class: ClassRule::Fixed("java/net/URL"),
+        canonical: never_canonical,
+        methods: &crate::host_url::URL_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricResourceConditionType,
+        tag: "frct",
+        // The anonymous `ResourceConditionType$1`: surely a `ResourceConditionType`; its exact
+        // class (`getClass`) is counted.
+        class: ClassRule::Unknown {
+            declared: crate::fabric_resource_conditions::declared_types,
+        },
+        canonical: never_canonical,
+        // It overrides only `id()` and `codec()`: identity `equals`, `hashCode`/`toString`
+        // counted (they print the identity hash).
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FabricBiomeModification,
+        tag: "fbm",
+        // `create` is `new BiomeModification(id)`, and its constructor is package-private.
+        class: ClassRule::Fixed(crate::fabric_biome_modifications::MODIFICATION),
+        canonical: never_canonical,
+        // It overrides nothing of `Object`: identity `equals`, `hashCode`/`toString` counted.
+        methods: &crate::host_events::DECLARED_TYPE_METHODS,
     },
 ];
 

@@ -4,6 +4,8 @@
 //! Fabric metadata, and executes a small no-argument bytecode subset. Calls
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -12,6 +14,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
+
+#[cfg(test)]
+static TEST_STDOUT_TRACE: Mutex<String> = Mutex::new(String::new());
+
+#[cfg(test)]
+pub(crate) fn take_test_stdout() -> String {
+    std::mem::take(&mut *TEST_STDOUT_TRACE.lock().unwrap())
+}
 
 mod annotation_proxy;
 mod annotation_values;
@@ -22,6 +32,7 @@ mod array_store;
 mod array_views;
 mod attachment_codec;
 mod bigdecimal_slice;
+mod block_entity_types;
 mod block_item_id;
 mod boxed;
 pub mod brigadier;
@@ -55,8 +66,13 @@ mod enum_value_of;
 pub mod events;
 mod executors;
 mod fabric_api_slice2;
+mod fabric_biome_modifications;
+mod fabric_block_api;
+mod fabric_builtin_pack;
+mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
+mod fabric_resource_conditions;
 mod facade_saved_data;
 mod facade_server;
 mod facade_text;
@@ -97,6 +113,7 @@ mod host_codec;
 mod host_collector;
 mod host_component;
 mod host_config;
+mod host_creative_tab;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -111,6 +128,7 @@ mod host_gson_type;
 mod host_guava;
 mod host_ids;
 mod host_invoke;
+mod host_item_stack_template;
 mod host_iterator;
 mod host_jdk;
 mod host_jdk_constant;
@@ -131,6 +149,7 @@ mod host_registry_holder;
 mod host_service;
 mod host_services;
 mod host_type_token;
+mod host_url;
 mod host_watch;
 mod http_client;
 mod immutable_collections;
@@ -184,6 +203,7 @@ mod mod_origin;
 mod model_layers;
 mod modified_utf8;
 mod native_library;
+mod neoforge_api;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
@@ -191,6 +211,7 @@ pub mod neoforge_imc;
 mod neoforge_inject;
 pub mod neoforge_lifecycle;
 mod neoforge_loader;
+mod neoforge_payload;
 mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
@@ -201,7 +222,9 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod server_values;
+mod tool_material;
 mod vanilla_entity_data_pool;
+mod vec2;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
 #[doc(hidden)]
@@ -237,6 +260,7 @@ mod stream_pipeline;
 mod string_code_points;
 mod string_constructors;
 mod synchronized_views;
+mod thread_local;
 mod tim_sort;
 mod tree_map;
 mod type_switch;
@@ -246,6 +270,7 @@ mod vanilla_blocks;
 mod vanilla_holders;
 mod vanilla_holders_table;
 mod vanilla_registries;
+mod vanilla_registry_keys;
 mod vanilla_values;
 pub mod verdict;
 mod watch_service;
@@ -1271,6 +1296,10 @@ pub struct RegisteredGameHook {
     pub cancellable: bool,
     /// How the callback is called and what its answer does.
     pub shape: GameHookShape,
+    /// Mixin's callback priority (lower values run first).
+    pub priority: i32,
+    /// Declaration order after Mixin apply ordering, used for global ties.
+    pub order: usize,
 }
 
 /// The callbacks one jar registered at host hook points, grouped by hook and
@@ -1290,6 +1319,23 @@ impl GameHookRegistrations {
     /// answers an empty slice, so a host can ask unconditionally.
     pub fn entries(&self, hook: &str) -> &[RegisteredGameHook] {
         self.by_hook.get(hook).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// A registration view containing only callbacks at one exact Mixin anchor. The returned
+    /// view preserves the original apply/declaration order.
+    pub fn for_anchor(&self, hook: &str, anchor: &str) -> Self {
+        let mut filtered = Self::default();
+        for entry in self.entries(hook) {
+            let normalized = if entry.anchor.is_empty() {
+                "HEAD"
+            } else {
+                entry.anchor.as_str()
+            };
+            if normalized == anchor {
+                filtered.insert(entry.clone());
+            }
+        }
+        filtered
     }
 
     /// The number of callbacks over every hook.
@@ -2185,9 +2231,16 @@ pub struct RegistryEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayloadRegistration {
     pub direction: String,
+    /// The active NeoForge mod context that owns a NeoForge registration.
+    /// Fabric/Forge rows leave this empty because they have no such field.
+    pub mod_id: Value,
     pub payload_type: Value,
     pub codec: Value,
     pub handler: Value,
+    /// Registrar state copied into this registration by NeoForge's immutable builder.
+    pub version: Value,
+    pub optional: bool,
+    pub thread: Value,
 }
 
 /// Metadata for one Fabric `EntrypointContainer` exposed by the bounded
@@ -2458,6 +2511,10 @@ pub trait Host {
     /// was the marker itself. A host that models the object answers here so
     /// `"" + id` and `id.toString()` agree.
     fn modelled_to_string(&mut self, _value: &Value) -> Option<String> {
+        None
+    }
+    /// Exact text for a host registry whose lifecycle state is modelled.
+    fn registry_text(&self, _value: &Value) -> Option<String> {
         None
     }
 
@@ -3324,6 +3381,9 @@ pub struct StdHost {
     /// classes, for class precedence (`class_precedence.rs`).
     run_loader: class_precedence::RunLoader,
     own_loader_classes: BTreeSet<String>,
+    /// The running jar's own mod id (its `fabric.mod.json`'s or `neoforge.mods.toml`'s): the one
+    /// container whose files the host holds exactly (`fabric_builtin_pack.rs`).
+    own_mod_id: Option<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
@@ -3402,6 +3462,8 @@ pub struct StdHost {
     /// (`FabricRegistryBuilder.buildAndRegister`), by id: the only ones whose
     /// every entry the host saw registered (`registry_contents.rs`).
     jar_registries: BTreeSet<String>,
+    /// Built-in registry ids and whether every observed registration stayed stable.
+    registry_lifecycles: BTreeMap<String, bool>,
     /// The id each `new LevelResource(id)` a jar built carries
     /// (`facade_server.rs`), by the object's marker.
     level_resources: BTreeMap<String, String>,
@@ -3579,6 +3641,15 @@ pub struct StdHost {
     /// FML's `InterModComms` queues, shared with the other jars of a game (`neoforge_imc.rs`).
     imc: neoforge_imc::ImcHandle,
     entity_registration: entity_registration::State,
+    tool_material: tool_material::State,
+    /// one table per host; a conflict between two jars' registrations is not detected
+    fabric_block_api: fabric_block_api::State,
+    /// Fabric resource condition types and their registry (`fabric_resource_conditions.rs`).
+    fabric_resource_conditions: fabric_resource_conditions::State,
+    creative_tab: host_creative_tab::State,
+    /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
+    fabric_biome_modifications: fabric_biome_modifications::State,
+    vec2: vec2::State,
 }
 
 impl Default for StdHost {
@@ -3588,6 +3659,13 @@ impl Default for StdHost {
 }
 
 impl StdHost {
+    pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
+        self.registry_lifecycles
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| crate::vanilla_registries::is_built_in(id))
+    }
+
     pub fn new() -> Self {
         Self {
             properties: BTreeMap::from([
@@ -3627,6 +3705,7 @@ impl StdHost {
             neoforge_mod_files: BTreeMap::new(),
             run_loader: class_precedence::RunLoader::default(),
             own_loader_classes: BTreeSet::new(),
+            own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
@@ -3658,6 +3737,7 @@ impl StdHost {
             identifier_objects: BTreeMap::new(),
             deferred_registers: BTreeMap::new(),
             jar_registries: BTreeSet::new(),
+            registry_lifecycles: BTreeMap::new(),
             level_resources: BTreeMap::new(),
             saved_data: facade_saved_data::SavedDataState::default(),
             neoforge_attachments: neoforge_attachments::AttachmentState::default(),
@@ -3734,6 +3814,12 @@ impl StdHost {
             brigadier: Default::default(),
             imc: neoforge_imc::ImcHandle::default(),
             entity_registration: entity_registration::State::default(),
+            tool_material: tool_material::State::default(),
+            fabric_block_api: fabric_block_api::State::default(),
+            fabric_resource_conditions: fabric_resource_conditions::State::default(),
+            creative_tab: host_creative_tab::State::default(),
+            fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            vec2: vec2::State::default(),
         }
     }
 
@@ -3766,6 +3852,14 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
+    pub fn note_unknown_game_hook(&mut self, method: &str) {
+        *self
+            .unknown_host_calls
+            .entry(format!("game-hook re-entry: {method}"))
+            .or_default() += 1;
     }
 
     pub(crate) fn mark_nondeterministic(&mut self, marker: &str) {
@@ -4193,7 +4287,7 @@ impl StdHost {
 
     fn resource_stream(&mut self, name: &str) -> Value {
         let name = name.strip_prefix('/').unwrap_or(name);
-        let Some(marker) = self.resource(name).map(str::to_owned) else {
+        let Some(marker) = self.resource(name).map(|value| value.to_owned()) else {
             return Value::Ref(None);
         };
         let bytes = self.resource_bytes.get(name).cloned().or_else(|| {
@@ -4730,6 +4824,30 @@ impl StdHost {
         &self.registrations
     }
 
+    /// Record a registry entry whose id and value were observed by a bounded
+    /// `Registry.registerForHolder` call.  The row is deliberately kept in
+    /// the same table as `Registry.register` so later holder lookups can only
+    /// answer for registrations this runtime actually saw.
+    pub(crate) fn record_observed_registry(&mut self, registry: &str, id: String, value: Value) {
+        self.registrations.push(RegistryEntry {
+            registry: registry.to_owned(),
+            id,
+            value,
+            declaration: None,
+        });
+    }
+
+    pub(crate) fn observed_registry_entry(
+        &self,
+        registry: &str,
+        id: &str,
+    ) -> Option<&RegistryEntry> {
+        self.registrations
+            .iter()
+            .rev()
+            .find(|entry| entry.registry == registry && entry.id == id)
+    }
+
     /// The property chain recorded for a constructed item marker, in the
     /// builder's own vocabulary (`stacksTo`, `durability`, `rarity`, ...).
     ///
@@ -5027,9 +5145,13 @@ impl StdHost {
             Some(row) => row.handler = handler,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction: direction.to_owned(),
+                mod_id: Value::Ref(None),
                 payload_type,
                 codec: Value::Ref(None),
                 handler,
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         Some(Value::Int(1))
@@ -5072,9 +5194,13 @@ impl StdHost {
             Some(row) => row.codec = codec,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction,
+                mod_id: Value::Ref(None),
                 payload_type: payload_type.clone(),
                 codec,
                 handler: Value::Ref(None),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         // `CustomPacketPayload.TypeAndCodec`: a non-null pair marker.
@@ -5109,22 +5235,48 @@ impl StdHost {
         Some(Value::Void)
     }
 
+    fn registration_lifecycle_stable(value: &Value) -> Option<bool> {
+        match value {
+            Value::Ref(Some(text)) => match text.as_str() {
+                "registration/stable" | "lifecycle/stable" => Some(true),
+                "registration/experimental" | "lifecycle/experimental" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn registry_register(
         &mut self,
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Option<Value> {
-        if r.owner != "net/minecraft/core/Registry" || r.name != "register" || args.len() < 2 {
+        if !matches!(
+            r.owner.as_str(),
+            "net/minecraft/core/Registry"
+                | "net/minecraft/core/MappedRegistry"
+                | "net/minecraft/core/DefaultedMappedRegistry"
+        ) || r.name != "register"
+            || args.len() < 2
+        {
             return None;
         }
+        let registration_info = receiver.is_some()
+            && r.descriptor
+                == "(Lnet/minecraft/resources/ResourceKey;Ljava/lang/Object;Lnet/minecraft/core/RegistrationInfo;)Lnet/minecraft/core/Holder$Reference;";
+        let value_index = if registration_info {
+            args.len().checked_sub(2)?
+        } else {
+            args.len().checked_sub(1)?
+        };
         let registry = receiver
             .into_iter()
             .chain(args.iter())
             .find_map(host_registry::registry_id)?
             .to_owned();
         let registry = registry.as_str();
-        let id = args.iter().find_map(|value| {
+        let id = args[..value_index].iter().find_map(|value| {
             if let Some(id) = host_ids::identifier_key(value) {
                 let (namespace, path) = id.split_once(':')?;
                 return Some(format!("{namespace}:{path}"));
@@ -5133,9 +5285,24 @@ impl StdHost {
             // through the key rather than a bare identifier. Without reading
             // the id out of the key the host answers null and the caller's
             // static field ends up null. An unnamed key names no id.
-            resource_key_identifier(value).map(|(namespace, path)| format!("{namespace}:{path}"))
+            if let Some((namespace, path)) = resource_key_identifier(value) {
+                return Some(format!("{namespace}:{path}"));
+            }
+            // The legacy overload accepts a String and parses it as an
+            // Identifier (`minecraft:` is the default namespace). Only the
+            // pre-value arguments are inspected, so a registered String value
+            // cannot be mistaken for its id.
+            let text = expect_ref(value)?;
+            let (namespace, path) = text.split_once(':').unwrap_or(("minecraft", text));
+            (!namespace.is_empty() && !path.is_empty()).then(|| format!("{namespace}:{path}"))
         })?;
-        let value = args.last().cloned().unwrap_or(Value::Void);
+        let value = args.get(value_index).cloned().unwrap_or(Value::Void);
+        let lifecycle = if registration_info {
+            args.last().and_then(Self::registration_lifecycle_stable)
+        } else {
+            Some(true)
+        };
+        host_registry::note_registry_lifecycle(self, registry, lifecycle);
         let key = format!("{registry}/{id}");
         // An id the jar's metadata already describes stays opaque: the
         // metadata is the explicit adapter for that row, so inference must not
@@ -5556,6 +5723,8 @@ impl Host for StdHost {
     }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
+        #[cfg(test)]
+        TEST_STDOUT_TRACE.lock().unwrap().push_str(text);
     }
 
     fn reserve_dfu_codec(
@@ -5599,6 +5768,9 @@ impl Host for StdHost {
     }
 
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
+            return value;
+        }
         // A façade object's own field (`facade_server.rs`).
         if let Some(value) = self.facade_field(receiver, r) {
             return Ok(value);
@@ -6141,6 +6313,13 @@ impl Host for StdHost {
         crate::java_tostring::modelled(self, value)
     }
 
+    fn registry_text(&self, value: &Value) -> Option<String> {
+        match crate::host_registry::registry_text(self, value) {
+            Some(Value::Ref(Some(text))) => Some(text),
+            _ => None,
+        }
+    }
+
     fn modelled_to_string_checked(&mut self, value: &Value) -> Result<Option<String>, NativeError> {
         crate::java_tostring::modelled_checked(self, value)
     }
@@ -6265,6 +6444,12 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
+            return value;
+        }
+        if let Some(value) = vec2::static_field(&mut self.vec2, r) {
+            return value;
+        }
         if let Some(value) = entity_registration::static_field(&mut self.entity_registration, r) {
             return value;
         }
@@ -6272,6 +6457,9 @@ impl Host for StdHost {
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
         if let Some(value) = vanilla_values::static_field(r) {
+            return Ok(value);
+        }
+        if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
         if let Some(value) = mod_origin::static_field(r) {
@@ -6325,6 +6513,9 @@ impl Host for StdHost {
         {
             return Ok(value);
         }
+        if let Some(value) = vanilla_registry_keys::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = vanilla_holders::static_field(r) {
             return Ok(value);
         }
@@ -6366,6 +6557,12 @@ impl Host for StdHost {
         // field's own type says which object it is: `Registries.X` is the
         // registry's key (`ResourceKey[minecraft:root / X]`),
         // `BuiltInRegistries.X` the registry (`host_registry.rs`).
+        if r.owner == "net/minecraft/core/RegistrationInfo"
+            && r.name == "BUILT_IN"
+            && r.descriptor == "Lnet/minecraft/core/RegistrationInfo;"
+        {
+            return Ok(Value::Ref(Some("registration/stable".into())));
+        }
         if let Some(id) = registry_static_id(&r.owner, &r.name) {
             return Ok(if r.descriptor == "Lnet/minecraft/resources/ResourceKey;" {
                 host_ids::registry_key_of(id)
@@ -6539,6 +6736,30 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
+            return value;
+        }
+        // Fabric's `ResourceLoader.registerBuiltinPack` (`fabric_builtin_pack.rs`).
+        match fabric_builtin_pack::register(
+            r,
+            args,
+            self.own_mod_id.as_deref(),
+            self.resources.keys().map(String::as_str),
+        ) {
+            fabric_builtin_pack::Call::Other => {}
+            fabric_builtin_pack::Call::Counted => return self.unknown_host_call(r),
+            fabric_builtin_pack::Call::Answer(made) => return Ok(Value::Int(i32::from(made))),
+        }
+        if let Some(value) =
+            fabric_resource_conditions::static_call(&mut self.fabric_resource_conditions, r, args)
+        {
+            return value;
+        }
+        if let Some(value) =
+            fabric_biome_modifications::static_call(&mut self.fabric_biome_modifications, r, args)
+        {
+            return value;
+        }
         if let Some(value) =
             entity_registration::static_call(&mut self.entity_registration, r, args)
         {
@@ -6563,6 +6784,9 @@ impl Host for StdHost {
         // Guava's `Splitter`/`Joiner` and `Lists.newArrayList` (`guava_text.rs`).
         if let Some(value) = self.guava_text(r, None, args) {
             return value;
+        }
+        if let Some(value) = neoforge_api::static_call(self, r) {
+            return Ok(value);
         }
         if let Some(value) = sound_event::static_call(self, r, args) {
             return value;
@@ -6660,6 +6884,9 @@ impl Host for StdHost {
             }
             _ => {}
         }
+        if let Some(value) = host_item_stack_template::static_call(r, args) {
+            return value;
+        }
         if let Some(value) = java_numbers::static_call(r, args) {
             return value;
         }
@@ -6691,6 +6918,12 @@ impl Host for StdHost {
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
         }
+        if let Some(value) = host_creative_tab::static_call(&mut self.creative_tab, r, args) {
+            return value;
+        }
+        if let Some(value) = fabric_creative_tab::static_call(r, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.block_item_id_static(r, args) {
             return value;
         }
@@ -6702,6 +6935,30 @@ impl Host for StdHost {
         }
         if let Some(value) = host_registry_holder::static_call(self, r, args) {
             return value;
+        }
+        match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+            (
+                "com/mojang/serialization/Lifecycle",
+                "stable",
+                "()Lcom/mojang/serialization/Lifecycle;",
+            ) => {
+                return Ok(Value::Ref(Some("lifecycle/stable".into())));
+            }
+            (
+                "com/mojang/serialization/Lifecycle",
+                "experimental",
+                "()Lcom/mojang/serialization/Lifecycle;",
+            ) => {
+                return Ok(Value::Ref(Some("lifecycle/experimental".into())));
+            }
+            (
+                "net/minecraft/core/RegistrationInfo",
+                "experimental",
+                "()Lnet/minecraft/core/RegistrationInfo;",
+            ) => {
+                return Ok(Value::Ref(Some("registration/experimental".into())));
+            }
+            _ => {}
         }
         if let Some(value) = self.registry_register(r, None, args) {
             return Ok(value);
@@ -7418,43 +7675,28 @@ impl Host for StdHost {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_div_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "floorMod", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 java_floor_mod_long(left, right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(divide_by_zero)
             }
             ("java/lang/Math", "addExact", "(JJ)J") => {
                 let left = expect_long(r, Self::argument(r, args, 0)?)?;
                 let right = expect_long(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(long_value)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("long overflow"))
             }
             // Java's float extrema: a NaN operand gives NaN, and -0.0 < 0.0.
             ("java/lang/Math", "max", "(DD)D") => {
@@ -7489,10 +7731,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 let quotient = i64::from(left) / i64::from(right);
                 let remainder = i64::from(left) % i64::from(right);
@@ -7507,10 +7746,7 @@ impl Host for StdHost {
                 let left = expect_int(r, Self::argument(r, args, 0)?)?;
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 if right == 0 {
-                    return Err(NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    });
+                    return Err(divide_by_zero());
                 }
                 // Java computes `a - floorDiv(a, b) * b` in i32 arithmetic, so
                 // a negative divisor produces a negative remainder and the
@@ -7531,10 +7767,7 @@ impl Host for StdHost {
                 let right = expect_int(r, Self::argument(r, args, 1)?)?;
                 left.checked_add(right)
                     .map(Value::Int)
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: r.owner.clone(),
-                        method: r.name.clone(),
-                    })
+                    .ok_or_else(|| arithmetic_exception("integer overflow"))
             }
             ("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;") => {
                 // A model object prints its own `toString`, not its marker.
@@ -7610,55 +7843,7 @@ impl Host for StdHost {
                 }
                 Ok(path_value(text))
             }
-            // The virtual filesystem keeps no files of its own: a path is
-            // readable only when the caller seeded the same resource name.
-            // A read of anything else reports Java's `IOException`, which a
-            // config bootstrap catches and answers by writing defaults; it
-            // never becomes a null that a later `String.split` NPEs on.
-            ("java/nio/file/Files", "exists" | "notExists", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                let exists = self.resource(path.trim_start_matches('/')).is_some();
-                Ok(Value::Int(i32::from(if r.name == "exists" {
-                    exists
-                } else {
-                    !exists
-                })))
-            }
-            ("java/nio/file/Files", "readString", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                let path = path_text(Self::argument(r, args, 0)?);
-                match self.resource(path.trim_start_matches('/')) {
-                    Some(text) => Ok(Value::Ref(Some(text.to_owned()))),
-                    None => Err(NativeError::UncaughtException {
-                        class: "java/io/IOException".into(),
-                        message: Some(format!("{path}: no such file")),
-                        frame: None,
-                    }),
-                }
-            }
-            (
-                "java/nio/file/Files",
-                "createDirectories" | "createFile" | "write" | "writeString" | "delete"
-                | "deleteIfExists",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                Ok(Self::argument(r, args, 0)?.clone())
-            }
-            // Moves and copies the file model can't make (`files_move.rs`)
-            // are counted: answering the target did nothing.
-            ("java/nio/file/Files", "move" | "copy", descriptor)
-                if descriptor.starts_with("(Ljava/nio/file/Path;") =>
-            {
-                self.unknown_host_call(r)
-            }
-            (
-                "java/nio/file/Files",
-                "isDirectory" | "isRegularFile" | "isSymbolicLink" | "isExecutable",
-                descriptor,
-            ) if descriptor.starts_with("(Ljava/nio/file/Path;") => Ok(Value::Int(0)),
+            // Filesystem state is modelled by Runtime::io_files/io_dirs in invoke_io.
             // `ResourceKey.create(registryKey, id)` interns the key of
             // `registryKey.identifier()` and `id` (`host_ids.rs`).
             ("net/minecraft/resources/ResourceKey", "create", descriptor)
@@ -7922,11 +8107,27 @@ impl Host for StdHost {
         args: &[Value],
     ) -> Result<Value, NativeError> {
         if let Some(value) =
+            host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
+        {
+            return value;
+        }
+        if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+            return value;
+        }
+        if let Some(value) =
+            tool_material::instance_call(&mut self.tool_material, r, receiver, args)
+        {
+            return value;
+        }
+        if let Some(value) =
             entity_registration::instance_call(&mut self.entity_registration, r, receiver, args)
         {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if let Some(v) = host_url::instance_call(r, receiver) {
+            return v;
+        }
         let mut render_objects = std::mem::take(&mut self.render_objects);
         let render_result = render_math::call(self, &mut render_objects, r, receiver, args);
         self.render_objects = render_objects;
@@ -8010,6 +8211,12 @@ impl Host for StdHost {
         // A handle's `toString`/`hashCode`/`equals` are its kind's row
         // (`host_ref.rs`), before any model that answers by the call's owner.
         // An object's are its class's: the models below answer them.
+        if r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && let Some(value) = host_registry::registry_text(self, receiver)
+        {
+            return Ok(value);
+        }
         if matches!(receiver, Value::Host(handle) if !jar_object::is_object_handle(handle))
             && (matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
@@ -8024,9 +8231,6 @@ impl Host for StdHost {
         if let Some(answer) = self.uuid_member(r, receiver, args) {
             return answer;
         }
-        // A jar's `new URI(text)` is a JDK object no model reads: building it from text
-        // `URI` accepts has no effect to answer, and every member is counted, never its
-        // key (`host_jdk_value.rs`; `URI.create` is the modelled handle).
         if r.owner == "java/net/URI" && jar_object::object_class(receiver) == Some("java/net/URI") {
             if let ("<init>", "(Ljava/lang/String;)V", [Value::Ref(Some(text))]) =
                 (r.name.as_str(), r.descriptor.as_str(), args)
@@ -8039,8 +8243,32 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
             return value;
         }
+        if let Some(value) = neoforge_api::instance_call(self, r, receiver) {
+            return Ok(value);
+        }
+        if let Some(value) = neoforge_payload::instance_call(r, receiver, args) {
+            return Ok(value);
+        }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
+            return value;
+        }
+        if let Some(value) =
+            fabric_block_api::instance_call(&mut self.fabric_block_api, r, receiver, args)
+        {
+            return value;
+        }
+        if let Some(value) =
+            fabric_resource_conditions::instance_call(&self.fabric_resource_conditions, r, receiver)
+        {
+            return value;
+        }
+        if let Some(value) = fabric_biome_modifications::instance_call(
+            &mut self.fabric_biome_modifications,
+            r,
+            receiver,
+            args,
+        ) {
             return value;
         }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
@@ -8121,7 +8349,7 @@ impl Host for StdHost {
         if let Some(value) = self.holder_call(r, receiver) {
             return value;
         }
-        if let Some(value) = fabric_registry::instance_call(self, r, receiver) {
+        if let Some(value) = fabric_registry::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.block_item_id_instance(r, receiver) {
@@ -8308,6 +8536,19 @@ impl Host for StdHost {
             }
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("<init>", descriptor) => {
+                    let parameters = descriptor_arguments(descriptor);
+                    if parameters
+                        .iter()
+                        .position(|parameter| parameter == "Ljava/lang/String;")
+                        .and_then(|index| args.get(index))
+                        .is_some_and(|value| matches!(value, Value::Ref(None)))
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some("'name' is null".into()),
+                            frame: None,
+                        });
+                    }
                     let marker = marker.clone();
                     self.note_thread_made(&marker, descriptor, args);
                     Ok(Value::Void)
@@ -8426,7 +8667,9 @@ impl Host for StdHost {
                 return Ok(self.resource_enumeration(name));
             }
         }
-        if r.owner == "java/io/InputStream" || r.owner == "java/io/ByteArrayInputStream" {
+        if (r.owner == "java/io/InputStream" || r.owner == "java/io/ByteArrayInputStream")
+            && expect_ref(receiver).is_some_and(|marker| self.resource_streams.contains_key(marker))
+        {
             let marker = expect_ref(receiver).ok_or_else(|| {
                 NativeError::Metadata("malformed java/io/InputStream marker".into())
             })?;
@@ -9892,7 +10135,30 @@ impl Host for StdHost {
                 &host_path::sandbox_absolute(path_text(receiver)),
             )),
             ("java/nio/file/Path", "normalize", "()Ljava/nio/file/Path;") => {
-                Ok(path_value(path_text(receiver)))
+                let path = path_text(receiver);
+                let abs = path.starts_with('/');
+                let mut out: Vec<&str> = Vec::new();
+                for part in path.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            if out.last() == Some(&"..") {
+                                if !abs {
+                                    out.push("..");
+                                }
+                            } else if out.pop().is_none() && !abs {
+                                out.push("..");
+                            }
+                        }
+                        x => out.push(x),
+                    }
+                }
+                let text = if abs {
+                    format!("/{}", out.join("/"))
+                } else {
+                    out.join("/")
+                };
+                Ok(path_value(&text))
             }
             ("java/nio/file/Path", "resolve", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
                 let child = expect_string(Self::argument(r, args, 0)?);
@@ -9906,15 +10172,66 @@ impl Host for StdHost {
                 Ok(path_value(&path_join(path_text(receiver), child)))
             }
             ("java/nio/file/Path", "getFileName", "()Ljava/nio/file/Path;") => {
-                let name = path_text(receiver).rsplit('/').next().unwrap_or_default();
-                Ok(path_value(name))
+                let original = path_text(receiver);
+                if original.is_empty() {
+                    return Ok(path_value(""));
+                }
+                let p = original.trim_end_matches('/');
+                Ok(p.rsplit('/')
+                    .next()
+                    .filter(|x| !x.is_empty())
+                    .map_or(Value::Ref(None), path_value))
             }
             ("java/nio/file/Path", "getParent", "()Ljava/nio/file/Path;") => {
-                let path = path_text(receiver);
-                Ok(path
+                let p = path_text(receiver).trim_end_matches('/');
+                let parent = p
                     .rsplit_once('/')
-                    .filter(|(parent, _)| !parent.is_empty())
-                    .map_or(Value::Ref(None), |(parent, _)| path_value(parent)))
+                    .map(|(a, _)| if a.is_empty() { "/" } else { a });
+                Ok(parent.map_or(Value::Ref(None), path_value))
+            }
+            ("java/nio/file/Path", "getRoot", "()Ljava/nio/file/Path;") => {
+                Ok(if path_text(receiver).starts_with('/') {
+                    path_value("/")
+                } else {
+                    Value::Ref(None)
+                })
+            }
+            ("java/nio/file/Path", "getNameCount", "()I") => {
+                Ok(Value::Int(path_names(path_text(receiver)).len() as i32))
+            }
+            ("java/nio/file/Path", "getName", "(I)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let i = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if i < 0 || i as usize >= p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(p[i as usize]))
+            }
+            ("java/nio/file/Path", "subpath", "(II)Ljava/nio/file/Path;") => {
+                let p = path_names(path_text(receiver));
+                let a = match Self::argument(r, args, 0)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                let b = match Self::argument(r, args, 1)? {
+                    Value::Int(i) => *i,
+                    _ => -1,
+                };
+                if a < 0 || b <= a || b as usize > p.len() {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                Ok(path_value(&p[a as usize..b as usize].join("/")))
             }
             ("java/lang/Class", "getName", "()Ljava/lang/String;") => {
                 Ok(Value::Ref(Some(class_binary_name(receiver))))
@@ -11202,6 +11519,24 @@ impl Host for StdHost {
             | ("java/util/function/Supplier", "get", "()Ljava/lang/Object;") => {
                 self.unknown_host_call(r)
             }
+            (
+                "net/minecraft/core/Registry",
+                "getKey",
+                "(Ljava/lang/Object;)Lnet/minecraft/resources/Identifier;",
+            ) if host_registry::registry_id(receiver) == Some("minecraft:block_entity_type")
+                && args
+                    .first()
+                    .and_then(crate::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .is_some() =>
+            {
+                let id = args
+                    .first()
+                    .and_then(crate::game_object::text)
+                    .and_then(|v| v.strip_prefix("client/block_entity_type/"))
+                    .unwrap_or_default();
+                Ok(host_ids::identifier_of_text(id))
+            }
             // `registry.key()`: the registry's key, `ResourceKey[minecraft:root /
             // <id>]`, the same interned key `Registries.X` is. Libraries index
             // their registry wrappers by `registry.key().identifier()`.
@@ -11801,9 +12136,19 @@ impl Host for StdHost {
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent",
                 "registrar",
                 "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
-            ) => Ok(Value::Ref(Some(
-                "net/neoforged/neoforge/network/registration/PayloadRegistrar".into(),
-            ))),
+            ) => {
+                let mod_id = self
+                    .neoforge_imc()
+                    .and_then(|(imc, _)| crate::neoforge_imc::active_id(imc))
+                    .map_or_else(
+                        || Value::Ref(Some("minecraft".into())),
+                        |id| Value::Ref(Some(id)),
+                    );
+                Ok(neoforge_payload::registrar(
+                    args.first().unwrap_or(&Value::Ref(None)),
+                    &mod_id,
+                ))
+            }
             ("net/neoforged/neoforge/network/registration/PayloadRegistrar", _, descriptor)
                 if descriptor.ends_with(
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
@@ -11819,11 +12164,23 @@ impl Host for StdHost {
                         | "configurationBidirectional"
                 ) && args.len() >= 3
                 {
+                    let state = crate::neoforge_payload::state(receiver).unwrap_or(
+                        crate::neoforge_payload::RegistrarState {
+                            mod_id: Value::Ref(None),
+                            version: Value::Ref(None),
+                            optional: false,
+                            thread: Value::Ref(None),
+                        },
+                    );
                     self.payload_registrations.push(PayloadRegistration {
                         direction: r.name.clone(),
+                        mod_id: state.mod_id.clone(),
                         payload_type: args[0].clone(),
                         codec: args[1].clone(),
                         handler: args[2].clone(),
+                        version: state.version,
+                        optional: state.optional,
+                        thread: state.thread,
                     });
                 }
                 Ok(receiver.clone())
@@ -11839,9 +12196,13 @@ impl Host for StdHost {
             {
                 self.payload_registrations.push(PayloadRegistration {
                     direction: "playBidirectional".into(),
+                    mod_id: Value::Ref(None),
                     payload_type: args[1].clone(),
                     codec: args[2].clone(),
                     handler: args[4].clone(),
+                    version: Value::Ref(None),
+                    optional: false,
+                    thread: Value::Ref(None),
                 });
                 Ok(receiver.clone())
             }
@@ -12018,6 +12379,16 @@ fn expect_string(value: &Value) -> &str {
 /// `java.io.File.hashCode` on Linux: `path.hashCode() ^ 1234321`.
 fn file_hash(path: &str) -> i32 {
     stable_hash(path) ^ 1234321
+}
+
+/// A `Path`'s name elements, as `UnixPath` counts them: the text between separators, with
+/// repeated and trailing separators ignored. The empty path is one empty name (Java 25:
+/// `Path.of("").getNameCount() == 1`, `getName(0)` is `""`); the root alone has none.
+fn path_names(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    text.split('/').filter(|name| !name.is_empty()).collect()
 }
 
 fn path_join(base: &str, child: &str) -> String {
@@ -12386,12 +12757,6 @@ fn java_value_text<H: Host>(
         Value::Long(value) => value.to_string(),
         Value::Float(value) if desc == "F" => format_java_float32(*value),
         Value::Float(value) => format_java_float(*value),
-        // Nor does a callback, or a composition holding one: its text names
-        // a live callback (`callback_marker.rs`).
-        Value::Ref(Some(value)) if callback_marker::holds_callback(value) => {
-            callback_marker::CALLBACK_TEXT.into()
-        }
-
         Value::Ref(Some(value)) => value.clone(),
         Value::Boxed(boxed) => boxed.text(),
         Value::Host(_) => host_text(value),
@@ -12940,6 +13305,14 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        "net/minecraft/sounds/SoundSource" => &[
+            "MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS",
+            "AMBIENT", "VOICE", "UI",
+        ],
+        "net/minecraft/world/entity/ai/attributes/AttributeModifier$Operation" => {
+            &["ADD_VALUE", "ADD_MULTIPLIED_BASE", "ADD_MULTIPLIED_TOTAL"]
+        }
+        "net/minecraft/world/entity/HumanoidArm" => &["LEFT", "RIGHT"],
         "net/minecraft/world/entity/EquipmentSlot" => {
             &["MAINHAND", "OFFHAND", "FEET", "LEGS", "CHEST", "HEAD"]
         }
@@ -12958,6 +13331,7 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "org/slf4j/event/Level" => &["ERROR", "WARN", "INFO", "DEBUG", "TRACE"],
         // The JDK's open options, checked by `Files`' writers (`open_options.rs`).
         "java/nio/file/StandardOpenOption" => open_options::STANDARD_OPEN_OPTIONS,
+        "java/nio/file/LinkOption" => &["NOFOLLOW_LINKS"],
         // `Collector.of`'s characteristics (`stream_pipeline.rs`).
         "java/util/stream/Collector$Characteristics" => {
             &["CONCURRENT", "UNORDERED", "IDENTITY_FINISH"]
@@ -13420,10 +13794,6 @@ fn value_text(value: &Value) -> String {
             // A stream never prints its marker (`stream_pipeline.rs`).
             if stream_pipeline::is_stream_marker(value) {
                 return stream_pipeline::STREAM_TEXT.into();
-            }
-            // Nor does a callback (`callback_marker.rs`).
-            if callback_marker::holds_callback(value) {
-                return callback_marker::CALLBACK_TEXT.into();
             }
             value.clone()
         }
@@ -14348,12 +14718,6 @@ fn object_text(host: &mut StdHost, value: &Value) -> Result<String, NativeError>
                 if stream_pipeline::is_stream_marker(marker) {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
                     return stream_pipeline::STREAM_TEXT.into();
-                }
-                // A callback's text is the hidden class and an identity hash:
-                // counted, its key never printed (`callback_marker.rs`).
-                if callback_marker::holds_callback(marker) {
-                    let _ = host.unknown_host_call(&jar_text::object_to_string());
-                    return callback_marker::CALLBACK_TEXT.into();
                 }
                 if crate::jar_object::packaged_object_class(value).is_some() {
                     let _ = host.unknown_host_call(&jar_text::object_to_string());
@@ -15309,6 +15673,24 @@ fn method_ref_null_check(
 
 fn array_index(value: i32) -> Result<usize, NativeError> {
     usize::try_from(value).map_err(|_| NativeError::Metadata("array index is negative".into()))
+}
+
+/// A catchable `java.lang.ArithmeticException` with the JDK's message.
+///
+/// Integer division by zero and `Math`'s exact operations throw it as a
+/// `RuntimeException` a jar can catch, so it travels as a Java throwable the
+/// frame's handler table can take, not as an interpreter error.
+fn arithmetic_exception(message: &str) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/ArithmeticException".into(),
+        message: Some(message.into()),
+        frame: None,
+    }
+}
+
+/// `idiv`/`irem`/`ldiv`/`lrem` and `Math.floorDiv`/`floorMod` by zero.
+fn divide_by_zero() -> NativeError {
+    arithmetic_exception("/ by zero")
 }
 
 /// The throwable a Java array access raises for an index outside the array.
@@ -19328,6 +19710,7 @@ impl NativeJar {
         let _nested = nested_jars::link_nested_jars(&mut host, self);
         host = host.with_run_loader(self.run_loader());
         host.own_loader_classes = self.loader_namespace_classes();
+        host.own_mod_id = self.fabric_id.clone().or_else(|| self.neoforge_id.clone());
         if let Some(id) = self.fabric_id.as_deref().or(self.neoforge_id.as_deref()) {
             let version = self
                 .fabric_version
@@ -19484,6 +19867,12 @@ impl NativeJar {
         // too, and what this one builds outlives it for the callbacks it
         // registers (`heap.rs`).
         let resident = runtime.adopt_resident_heap();
+        // FML sets ModLoadingContext before class initialization and keeps it
+        // through construction and the stage callback.
+        let active = is_neoforge
+            .then(|| self.mod_annotation_id(&class_name))
+            .flatten();
+        let previous = active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
         let result = (|| -> Result<(), NativeError> {
             runtime.ensure_initialized(&class_name)?;
             // An inherited entrypoint method belongs to the class that
@@ -19514,12 +19903,6 @@ impl NativeJar {
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
                 let constructor_args = self.entry_constructor_args(&class_name, &constructor);
-                // FML constructs a mod with its container active (`neoforge_imc.rs`).
-                let active = is_neoforge
-                    .then(|| self.mod_annotation_id(&class_name))
-                    .flatten();
-                let previous =
-                    active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
                 let constructed = runtime.invoke(
                     &class_name,
                     "<init>",
@@ -19527,9 +19910,6 @@ impl NativeJar {
                     Some(instance.clone()),
                     &constructor_args,
                 );
-                if active.is_some() {
-                    neoforge_imc::set_active(runtime.host, previous.as_deref());
-                }
                 if let Err(error) = constructed {
                     if let NativeError::UncaughtException {
                         class: thrown_class,
@@ -19583,6 +19963,9 @@ impl NativeJar {
             }
             Ok(())
         })();
+        if active.is_some() {
+            neoforge_imc::set_active(runtime.host, previous.as_deref());
+        }
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         let heap = if resident {
@@ -20110,12 +20493,32 @@ impl NativeJar {
     /// edited, or a plan built by hand, cannot register a callback the host
     /// would fail to run. The registrations keep the plans' apply order inside
     /// each hook.
+    fn game_hook_priority(&self, callback_owner: &str) -> i32 {
+        self.classes
+            .get(callback_owner)
+            .and_then(|class| {
+                class.annotations.iter().find_map(|annotation| {
+                    (annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR).then(|| {
+                        annotation
+                            .values
+                            .get("priority")
+                            .and_then(|value| match value {
+                                AnnotationValue::Int(priority) => Some(*priority),
+                                _ => None,
+                            })
+                            .unwrap_or(1000)
+                    })
+                })
+            })
+            .unwrap_or(1000)
+    }
+
     pub fn register_game_hooks(
         &self,
         weave: &LoadTimeMixinWeave,
     ) -> Result<GameHookRegistrations, NativeError> {
         let mut registrations = GameHookRegistrations::default();
-        for hook in &weave.game_hooks {
+        for (order, hook) in weave.game_hooks.iter().enumerate() {
             let named = game_hook_site_named(hook.hook, hook.version).ok_or_else(|| {
                 NativeError::Metadata(format!(
                     "game hook plan names {} version {}, which this runtime does not know",
@@ -20166,6 +20569,8 @@ impl NativeJar {
                 anchor: hook.anchor.clone(),
                 cancellable: hook.plan.cancellable,
                 shape: hook.shape,
+                priority: self.game_hook_priority(&hook.plan.callback.owner),
+                order,
             });
         }
         Ok(registrations)
@@ -23815,6 +24220,33 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether `name` is `wanted` or a subclass (or implementor) of it.
+    pub(crate) fn jar_method_owner(
+        &self,
+        class: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<String> {
+        self.member_owner(class, name, descriptor)
+            .and_then(|(owner, jar)| jar.then_some(owner))
+    }
+
+    pub(crate) fn jar_extends(&self, class: &str, wanted: &str) -> bool {
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            if current == wanted {
+                return true;
+            }
+            let Some(file) = self.class(&current) else {
+                return false;
+            };
+            if file.super_name.is_empty() || file.super_name == current {
+                return false;
+            }
+            current = file.super_name.clone();
+        }
+        false
+    }
+
     pub(crate) fn class_is_instance(&self, name: &str, wanted: &str) -> bool {
         let mut current = jar_object::marker_class_or_text(name).to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
@@ -24079,6 +24511,86 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         }
         match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toString", descriptor) if descriptor.ends_with(")Ljava/lang/String;") => {
+                let Some(array) = args.first() else {
+                    return Ok(None);
+                };
+                if *array == Value::Ref(None) {
+                    return Ok(Some(Value::Ref(Some("null".into()))));
+                }
+                let Some(class) = host_array::exact_class(array) else {
+                    return Ok(None);
+                };
+                let values = self
+                    .arrays
+                    .get(host_array::array_key(array).unwrap())
+                    .map(|a| a.values().into_owned())
+                    .ok_or_else(|| {
+                        NativeError::Metadata("array is not owned by this invocation".into())
+                    })?;
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    let part = match value {
+                        Value::Ref(None) => "null".to_owned(),
+                        Value::Ref(Some(text))
+                            if !class.starts_with("[L")
+                                || !value_class::string_instance_of(&text, "java/lang/String") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Ref(Some(text)) => text,
+                        Value::Boxed(boxed) if class.starts_with("[L") => boxed.text(),
+                        Value::Int(_) | Value::Long(_) | Value::Float(_)
+                            if class.starts_with("[L") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        Value::Int(value) if class.ends_with('Z') => (value != 0).to_string(),
+                        Value::Int(value) if class.ends_with('C') => {
+                            let Some(character) = char::from_u32(value as u32) else {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            };
+                            if (0xD800..=0xDFFF).contains(&(value as u32)) {
+                                return self.host.unknown_operand_call(r).map(Some);
+                            }
+                            character.to_string()
+                        }
+                        Value::Int(value) => value.to_string(),
+                        Value::Long(value) => value.to_string(),
+                        Value::Float(value) if class.ends_with('F') => format_java_float32(value),
+                        Value::Float(value) => format_java_float(value),
+                        _ => return self.host.unknown_operand_call(r).map(Some),
+                    };
+                    parts.push(part);
+                }
+                let text = parts.join(", ");
+                Ok(Some(Value::Ref(Some(format!("[{text}]")))))
+            }
+            // `Arrays.sort(T[], Comparator)`: TimSort over the array itself, making
+            // the JDK's comparisons in the JDK's order (`tim_sort.rs`, as
+            // `List.sort` does). A comparison that throws leaves the array as the
+            // JDK's is left. A `null` array or comparator is not answered here:
+            // the host counts the call.
+            ("sort", "([Ljava/lang/Object;Ljava/util/Comparator;)V") => {
+                let array = StdHost::argument(r, args, 0)?.clone();
+                let comparator = StdHost::argument(r, args, 1)?.clone();
+                let Some(key) = host_array::array_key(&array).map(str::to_owned) else {
+                    return Ok(None);
+                };
+                if comparator == Value::Ref(None) {
+                    return Ok(None);
+                }
+                let mut values = self.array(&array)?.into_owned();
+                let sorted = self.sort_in_place(&mut values, &comparator);
+                if let Some(data) = self.arrays.get_mut(&key) {
+                    for (index, value) in values.into_iter().enumerate() {
+                        if !data.store(index, value) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                sorted.map(|()| Some(Value::Void))
+            }
             ("copyOf", _) | ("copyOfRange", _) => {
                 let source = self.array(StdHost::argument(r, args, 0)?)?.into_owned();
                 let (start, end) = if r.name == "copyOf" {
@@ -24145,15 +24657,56 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 Ok(Some(self.new_array_value(&class, values)))
             }
-            ("fill", descriptor) if descriptor.starts_with('[') => {
-                let Some(key) = args.first().and_then(host_array::array_key) else {
+            ("fill", descriptor) if descriptor.starts_with("([") => {
+                let Some(array) = args.first() else {
                     return Ok(None);
                 };
-                let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
-                if let Some(data) = self.arrays.get_mut(key)
-                    && !data.fill(value)
-                {
+                let Some(key) = host_array::array_key(array) else {
                     return Ok(None);
+                };
+                let len = self.arrays.get(key).map_or(0, array_data::ArrayData::len);
+                let range = descriptor.ends_with("III)V") || descriptor.contains(";II)V");
+                let (from, to, value_index) = if !range {
+                    (0, len, 1)
+                } else {
+                    let from = expect_int(r, StdHost::argument(r, args, 1)?)?;
+                    let to = expect_int(r, StdHost::argument(r, args, 2)?)?;
+                    if from > to {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!("fromIndex({from}) > toIndex({to})")),
+                            frame: None,
+                        });
+                    }
+                    if from < 0 || to > len as i32 {
+                        let bad = if from < 0 { from } else { to };
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/ArrayIndexOutOfBoundsException".into(),
+                            message: Some(format!("Array index out of range: {bad}")),
+                            frame: None,
+                        });
+                    }
+                    (from as usize, to as usize, 3)
+                };
+                let value = StdHost::argument(r, args, value_index)?.clone();
+                if let Some(class) = host_array::exact_class(array)
+                    && let Some(component) = host_array::component_of(class)
+                    && primitive_descriptor(component).is_none()
+                {
+                    self.check_array_store(array, &value)?;
+                }
+                if let Some(data) = self.arrays.get_mut(key) {
+                    if from == 0 && to == len {
+                        if !data.fill(value) {
+                            return Ok(None);
+                        }
+                    } else {
+                        for index in from..to {
+                            if !data.store(index, value.clone()) {
+                                return Ok(None);
+                            }
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -24249,7 +24802,17 @@ impl<H: Host> Runtime<'_, H> {
                 )
             }
             ("getLength", "(Ljava/lang/Object;)I") => {
-                Value::Int(self.array(StdHost::argument(r, args, 0)?)?.len() as i32)
+                let value = StdHost::argument(r, args, 0)?;
+                if let Value::Ref(Some(text)) = value
+                    && value_class::is_plain_string(text)
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Argument is not an array".into()),
+                        frame: None,
+                    });
+                }
+                Value::Int(self.array(value)?.len() as i32)
             }
             ("get", "(Ljava/lang/Object;I)Ljava/lang/Object;")
             | ("getInt", "(Ljava/lang/Object;I)I") => {
@@ -25666,6 +26229,9 @@ impl<H: Host> Runtime<'_, H> {
         {
             return Some(self.new_array_value(&format!("[L{};", r.owner), values));
         }
+        if let Some(values) = crate::entity_registration::enum_values(&r.owner) {
+            return Some(self.new_array_value(&format!("[L{};", r.owner), values));
+        }
         if let Some(values) = crate::vanilla_values::enum_values(r) {
             return Some(self.new_array_value(&format!("[L{};", r.owner), values));
         }
@@ -25678,6 +26244,55 @@ impl<H: Host> Runtime<'_, H> {
             .map(|name| Value::Ref(Some(format!("enum/{}/{name}", r.owner))))
             .collect::<Vec<_>>();
         Some(self.new_array_value(&format!("[L{};", r.owner), values))
+    }
+
+    /// `E.valueOf(String)` on a game enum whose constants the host lists
+    /// (`game_enum_constants`): the same value `E.values()` holds at that
+    /// constant's position, so it is the constant itself. `Enum.valueOf`'s
+    /// failures are Java's: a null name is `NullPointerException("Name is
+    /// null")`, an unknown one `IllegalArgumentException("No enum constant
+    /// <canonical class name>.<name>")`.
+    fn invoke_game_enum_value_of(
+        &mut self,
+        r: &MethodRef,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "valueOf" || r.descriptor != format!("(Ljava/lang/String;)L{};", r.owner) {
+            return Ok(None);
+        }
+        let Some(constants) = game_enum_constants(&r.owner) else {
+            return Ok(None);
+        };
+        let name = match args.first() {
+            Some(Value::Ref(Some(name))) => name,
+            Some(Value::Ref(None)) => {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Name is null".into()),
+                    frame: None,
+                });
+            }
+            _ => return Ok(None),
+        };
+        let Some(index) = constants.iter().position(|constant| constant == name) else {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/IllegalArgumentException".into(),
+                message: Some(format!(
+                    "No enum constant {}.{name}",
+                    r.owner.replace(['/', '$'], ".")
+                )),
+                frame: None,
+            });
+        };
+        let values = MethodRef {
+            owner: r.owner.clone(),
+            name: "values".into(),
+            descriptor: format!("()[L{};", r.owner),
+        };
+        let Some(array) = self.invoke_game_enum_values(&values) else {
+            return Ok(None);
+        };
+        Ok(self.array(&array)?.get(index).cloned())
     }
 
     /// Answer the vanilla static helpers mod bootstraps call.
@@ -25695,9 +26310,25 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = thread_local::call(self, r, receiver, args) {
+            return value.map(Some);
+        }
+        if let Some(value) = dfu_codec::runtime_instance_call(self, r, receiver, args)? {
+            return Ok(Some(value));
+        }
         // A game codec factory whose result a class only stores.
         if let Some(value) = stream_codec::static_call(r, args) {
             return Ok(Some(value));
+        }
+        if let Some(value) = receiver
+            .and_then(|receiver| stream_codec::runtime_instance_call(self, r, Some(receiver), args))
+        {
+            return value.map(Some);
+        }
+        if let Some(value) =
+            receiver.and_then(|receiver| stream_codec::instance_call(r, receiver, args))
+        {
+            return value.map(Some);
         }
         if let Some(value) = self.invoke_game_codec_factory(r) {
             return Ok(Some(value));
@@ -26194,41 +26825,139 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let path = host_path::sandbox_canonical(&display_path);
+                let seeded_text =
+                    library_dispatch::resource_text(self.host, path.trim_start_matches('/'));
+                let present = self.io_files.contains_key(&path) || seeded_text.is_some();
+                let is_dir = self.io_dirs.contains(&path) || path == "/horizon/game";
+                if args
+                    .first()
+                    .is_some_and(|value| matches!(value, Value::Ref(None)))
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("Cannot invoke \"java.nio.file.Path.getFileSystem()\" because \"path\" is null".into()),
+                        frame: None,
+                    });
+                }
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("exists", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        if !self.io_files.contains_key(&path) {
-                            // A resource the jar ships still answers through the
-                            // host's table.
-                            return Ok(None);
-                        }
-                        Value::Int(1)
+                        Value::Int(i32::from(present))
                     }
                     ("notExists", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if !self.io_files.contains_key(&path) {
-                            return Ok(None);
-                        }
+                        Value::Int(i32::from(!present))
+                    }
+                    ("isReadable", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(self.io_files.contains_key(&path)))
+                    }
+                    ("isDirectory", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(is_dir))
+                    }
+                    ("isRegularFile", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(present && !self.io_dirs.contains(&path)))
+                    }
+                    ("isSymbolicLink", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
                         Value::Int(0)
+                    }
+                    ("isExecutable", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        Value::Int(i32::from(self.io_dirs.contains(&path)))
                     }
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
-                            None => return Ok(None),
+                            None => match seeded_text {
+                                Some(text) => Value::Ref(Some(text)),
+                                None if path.starts_with("/horizon/") => {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/nio/file/NoSuchFileException".into(),
+                                        message: Some(display_path.clone()),
+                                        frame: None,
+                                    });
+                                }
+                                None => return Ok(None),
+                            },
                         }
                     }
                     ("writeString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        let option_names = args
+                            .last()
+                            .and_then(|value| self.owned_array(value))
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(expect_ref)
+                                    .map(|value| value.to_owned())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        let create_new =
+                            option_names.iter().any(|name| name.contains("/CREATE_NEW"));
+                        let append = option_names.iter().any(|name| name.contains("/APPEND"));
+                        let truncate = option_names
+                            .iter()
+                            .any(|name| name.contains("/TRUNCATE_EXISTING"));
+                        let create = option_names.iter().any(|name| name.ends_with("/CREATE"));
+                        let write_only = option_names.iter().any(|name| name.ends_with("/WRITE"));
+                        if create_new && self.io_files.contains_key(&path) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/FileAlreadyExistsException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
+                        if (truncate || append || write_only)
+                            && !create
+                            && !create_new
+                            && !self.io_files.contains_key(&path)
+                        {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/nio/file/NoSuchFileException".into(),
+                                message: Some(display_path.clone()),
+                                frame: None,
+                            });
+                        }
+                        // An existing file opened without `TRUNCATE_EXISTING` or `APPEND` (`WRITE`,
+                        // `CREATE`) is overwritten in place: Java keeps the old bytes past the new
+                        // text (`x` over `abc` is `xbc`). Not modelled: count it.
+                        if !option_names.is_empty()
+                            && !truncate
+                            && !append
+                            && !create_new
+                            && self.io_files.contains_key(&path)
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         let text = args
                             .get(1)
                             .map(|value| expect_string(value).to_owned())
                             .unwrap_or_default();
+                        let text = if append {
+                            format!(
+                                "{}{}",
+                                self.io_files.get(&path).cloned().unwrap_or_default(),
+                                text
+                            )
+                        } else {
+                            text
+                        };
                         self.watch_whole_write(&path, text.is_empty());
                         self.io_store_file_with_charset_args(path, text, args)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
@@ -26278,7 +27007,19 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_created(&path);
                         }
-                        self.io_dirs.insert(path.clone());
+                        let mut current = path.clone();
+                        loop {
+                            self.io_dirs.insert(current.clone());
+                            self.io_files.entry(current.clone()).or_default();
+                            let Some((parent, _)) = current.rsplit_once('/') else {
+                                break;
+                            };
+                            if parent.is_empty() || parent == "/horizon/game" {
+                                break;
+                            }
+                            current = parent.to_owned();
+                        }
+                        self.io_dirs.insert("/horizon/game".to_owned());
                         self.io_files.entry(path.clone()).or_default();
                         self.io_file_bytes.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
@@ -26898,9 +27639,7 @@ impl<H: Host> Runtime<'_, H> {
         let Value::Host(handle) = value else {
             return None;
         };
-        if handle.kind() != HostKind::Writer
-            || !modelled_writer_class(crate::jar_object::packaged_object_class(value)?)
-        {
+        if !modelled_writer_class(crate::jar_object::packaged_object_class(value)?) {
             return None;
         }
         let marker = handle.key_text();
@@ -27420,10 +28159,9 @@ impl<H: Host> Runtime<'_, H> {
                             && descriptor.ends_with(")V")
                             && descriptor.contains("Appendable") =>
                     {
-                        let Some(text) = self.gson_to_json(
+                        let Some(text) = self.gson_to_json_string(
                             args.first().unwrap_or(&Value::Ref(None)),
                             &style,
-                            0,
                         )?
                         else {
                             return self
@@ -27431,10 +28169,6 @@ impl<H: Host> Runtime<'_, H> {
                                 .invoke_instance(r, receiver.unwrap_or(&Value::Ref(None)), args)
                                 .map(Some);
                         };
-                        let text = format!(
-                            "{}{text}",
-                            gson_model::non_executable_prefix(&style).unwrap_or("")
-                        );
                         // The writer is the last argument in every overload:
                         // `toJson(src, writer)` and `toJson(src, typeOfSrc, writer)`.
                         let Some(target) = args
@@ -27570,6 +28304,24 @@ impl<H: Host> Runtime<'_, H> {
         if r.owner != "java/lang/Enum" && !game_constant {
             return Ok(None);
         }
+        if game_constant
+            && r.owner == "net/minecraft/sounds/SoundSource"
+            && r.name == "getName"
+            && r.descriptor == "()Ljava/lang/String;"
+        {
+            let name = receiver
+                .and_then(expect_ref)
+                .and_then(|m| m.rsplit("/").next())
+                .map(|n| match n {
+                    "MASTER" => "master".to_owned(),
+                    "MUSIC" => "music".to_owned(),
+                    "RECORDS" => "record".to_owned(),
+                    "BLOCKS" => "block".to_owned(),
+                    "PLAYERS" => "player".to_owned(),
+                    _ => n.to_ascii_lowercase(),
+                });
+            return Ok(name.map(|name| Value::Ref(Some(name))));
+        }
         if game_constant && matches!(r.name.as_str(), "name" | "toString") {
             let name = receiver
                 .and_then(expect_ref)
@@ -27597,6 +28349,37 @@ impl<H: Host> Runtime<'_, H> {
             });
         let recorded = marker.and_then(|marker| self.enum_constants.get(marker).cloned());
         match (r.name.as_str(), r.descriptor.as_str()) {
+            // `Enum.getDeclaringClass()`: the constant's class, or, for a constant
+            // with a body (an anonymous subclass `E$1`), that class's superclass,
+            // which is the enum (`zuper == Enum.class ? clazz : zuper`).
+            ("getDeclaringClass", "()Ljava/lang/Class;") => {
+                // A constant this invocation's `<clinit>` built: its allocation
+                // key names its real class, and the jar's class file its parent.
+                if let Some(key) =
+                    crate::jar_object::object_key(receiver.unwrap_or(&Value::Ref(None)))
+                {
+                    if recorded.is_none() {
+                        return Ok(None);
+                    }
+                    let class = crate::jar_object::class_of_key(key).to_owned();
+                    let Some(parent) = self.class(&class).map(|file| file.super_name.clone())
+                    else {
+                        return Ok(None);
+                    };
+                    let declaring = if parent == "java/lang/Enum" {
+                        class
+                    } else {
+                        parent
+                    };
+                    return Ok(Some(host_class::class_value(&declaring)));
+                }
+                // A host-made `enum/<class>/<name>` marker names the enum itself.
+                let class = marker
+                    .and_then(|marker| marker.strip_prefix("enum/"))
+                    .and_then(|rest| rest.rsplit_once('/'))
+                    .map(|(class, _)| class.to_owned());
+                Ok(class.map(|class| host_class::class_value(&class)))
+            }
             ("name", "()Ljava/lang/String;") | ("toString", "()Ljava/lang/String;") => {
                 Ok(recorded.map(|(name, _)| Value::Ref(Some(name))))
             }
@@ -28207,7 +28990,7 @@ impl<H: Host> Runtime<'_, H> {
     /// inside the callee's frame counted one extra frame per lazily initialized
     /// class on the chain (two of the 12 that refused
     /// `structure_layout_optimizer`).
-    fn invoke(
+    pub(crate) fn invoke(
         &mut self,
         class: &str,
         method: &str,
@@ -28604,6 +29387,87 @@ impl<H: Host> Runtime<'_, H> {
                     let i = read_u16(code, &mut pc)?;
                     stack.push(constant_wide_value(&file.pool, i)?);
                 }
+                0xc4 => {
+                    // JVMS `wide` prefixes the local-variable forms with a
+                    // u2 index, and gives iinc a signed u2 constant.
+                    let wide_op = *code.get(pc).ok_or(NativeError::Truncated)?;
+                    pc += 1;
+                    let index = read_u16(code, &mut pc)? as usize;
+                    match wide_op {
+                        0x15..=0x19 => {
+                            let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
+                            stack.push(self.dispatch_modify_variable(
+                                VariableAnchor::Load,
+                                index,
+                                local_opcode_type(wide_op - 0x15),
+                                loaded,
+                                class,
+                                method,
+                                desc,
+                                at,
+                            )?);
+                        }
+                        0x36..=0x3a => {
+                            let value = pop(&mut stack, class, method, at)?;
+                            let value = self.dispatch_modify_variable(
+                                VariableAnchor::Store,
+                                index,
+                                local_opcode_type(wide_op - 0x36),
+                                value,
+                                class,
+                                method,
+                                desc,
+                                at,
+                            )?;
+                            if let Some(local) = locals.get_mut(index) {
+                                *local = value;
+                            }
+                        }
+                        0x84 => {
+                            let amount = read_u16(code, &mut pc)? as i16 as i32;
+                            let value = match locals.get(index) {
+                                Some(Value::Int(value)) => value.wrapping_add(amount),
+                                _ => {
+                                    return Err(NativeError::TypeMismatch {
+                                        class: class.to_owned(),
+                                        method: method.to_owned(),
+                                        expected: "int local",
+                                    });
+                                }
+                            };
+                            if let Some(local) = locals.get_mut(index) {
+                                *local = Value::Int(value);
+                            } else {
+                                return Err(NativeError::TypeMismatch {
+                                    class: class.to_owned(),
+                                    method: method.to_owned(),
+                                    expected: "valid local",
+                                });
+                            }
+                        }
+                        0xa9 => {
+                            let target = match locals.get(index) {
+                                Some(Value::Int(target)) => *target as usize,
+                                _ => {
+                                    return Err(NativeError::TypeMismatch {
+                                        class: class.to_owned(),
+                                        method: method.to_owned(),
+                                        expected: "ret address",
+                                    });
+                                }
+                            };
+                            pc = target;
+                        }
+                        _ => {
+                            return Err(NativeError::UnsupportedOpcode {
+                                class: class.to_owned(),
+                                method: method.to_owned(),
+                                opcode: wide_op,
+                                pc: at,
+                            });
+                        }
+                    }
+                }
                 // iadd/isub/imul/idiv/irem. The long twins (odd opcodes) take
                 // the 64-bit path below so no long value is truncated. Add,
                 // subtract and multiply keep the low-order bits on overflow
@@ -28618,11 +29482,10 @@ impl<H: Host> Runtime<'_, H> {
                         0x6c => java_int_div(lhs, rhs),
                         _ => java_int_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Int(value));
+                    .ok_or_else(divide_by_zero);
+                    // A zero divisor is a catchable `ArithmeticException`, so
+                    // the frame's own table decides where it lands.
+                    stack.push(Value::Int(invoke_or_catch!(at, value)));
                 }
                 0x61 | 0x65 | 0x69 | 0x6d | 0x71 => {
                     let rhs = pop_long(&mut stack, class, method, at)?;
@@ -28634,11 +29497,8 @@ impl<H: Host> Runtime<'_, H> {
                         0x6d => java_long_div(lhs, rhs),
                         _ => java_long_rem(lhs, rhs),
                     }
-                    .ok_or_else(|| NativeError::Arithmetic {
-                        class: class.to_owned(),
-                        method: method.to_owned(),
-                    })?;
-                    stack.push(Value::Long(value));
+                    .ok_or_else(divide_by_zero);
+                    stack.push(Value::Long(invoke_or_catch!(at, value)));
                 }
                 // fadd/dadd, fsub/dsub, fmul/dmul, fdiv/ddiv, frem/drem. The
                 // `f*` half rounds to `f32` after the operation, exactly as a
@@ -29810,6 +30670,12 @@ impl<H: Host> Runtime<'_, H> {
                         ))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        thread_local::call(self, &r, receiver.as_ref(), &args)
+                            .map_or(Ok(None), |value| value.map(Some))
+                    ) {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
                     ) {
                         // A JDK skeleton's body or a JDK interface default the
@@ -29866,6 +30732,11 @@ impl<H: Host> Runtime<'_, H> {
                         invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
                         // `new String(...)` builds no text yet: counted.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                    ) {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -30206,6 +31077,10 @@ impl<H: Host> Runtime<'_, H> {
                     ) {
                         value
                     } else if let Some(value) = self.invoke_game_enum_values(&r) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_game_enum_value_of(&r, &args))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
@@ -34272,6 +35147,7 @@ mod tests {
     /// decoder; the call stays counted instead of selecting a wrong template.
     #[test]
     fn subclass_constructors_stay_counted() {
+        let _ = take_test_stdout();
         let mut host = StdHost::new();
         host.set_strict_unknown_host_calls(true);
         let call = MethodRef {
@@ -38578,11 +39454,15 @@ mandatory = true
         );
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MAX), Value::Int(1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
         assert!(matches!(
             host.invoke(&add_exact, &[Value::Int(i32::MIN), Value::Int(-1)]),
-            Err(NativeError::Arithmetic { .. })
+            Err(NativeError::UncaughtException { class, message, .. })
+                if class == "java/lang/ArithmeticException"
+                    && message.as_deref() == Some("integer overflow")
         ));
     }
 
@@ -43676,9 +44556,13 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playToServer".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("payload-type".into())),
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
 
@@ -43791,9 +44675,13 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playBidirectional".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("message-class".into())),
                 codec: Value::Ref(Some("encoder".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
     }
