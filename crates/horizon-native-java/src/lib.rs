@@ -10147,19 +10147,11 @@ impl Host for StdHost {
                     Value::Ref(None)
                 })
             }
-            ("java/nio/file/Path", "getNameCount", "()I") => Ok(Value::Int(
-                path_text(receiver)
-                    .trim_matches('/')
-                    .split('/')
-                    .filter(|x| !x.is_empty())
-                    .count() as i32,
-            )),
+            ("java/nio/file/Path", "getNameCount", "()I") => {
+                Ok(Value::Int(path_names(path_text(receiver)).len() as i32))
+            }
             ("java/nio/file/Path", "getName", "(I)Ljava/nio/file/Path;") => {
-                let p: Vec<_> = path_text(receiver)
-                    .trim_matches('/')
-                    .split('/')
-                    .filter(|x| !x.is_empty())
-                    .collect();
+                let p = path_names(path_text(receiver));
                 let i = match Self::argument(r, args, 0)? {
                     Value::Int(i) => *i,
                     _ => -1,
@@ -10174,11 +10166,7 @@ impl Host for StdHost {
                 Ok(path_value(p[i as usize]))
             }
             ("java/nio/file/Path", "subpath", "(II)Ljava/nio/file/Path;") => {
-                let p: Vec<_> = path_text(receiver)
-                    .trim_matches('/')
-                    .split('/')
-                    .filter(|x| !x.is_empty())
-                    .collect();
+                let p = path_names(path_text(receiver));
                 let a = match Self::argument(r, args, 0)? {
                     Value::Int(i) => *i,
                     _ => -1,
@@ -12324,6 +12312,16 @@ fn expect_string(value: &Value) -> &str {
 /// `java.io.File.hashCode` on Linux: `path.hashCode() ^ 1234321`.
 fn file_hash(path: &str) -> i32 {
     stable_hash(path) ^ 1234321
+}
+
+/// A `Path`'s name elements, as `UnixPath` counts them: the text between separators, with
+/// repeated and trailing separators ignored. The empty path is one empty name (Java 25:
+/// `Path.of("").getNameCount() == 1`, `getName(0)` is `""`); the root alone has none.
+fn path_names(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![""];
+    }
+    text.split('/').filter(|name| !name.is_empty()).collect()
 }
 
 fn path_join(base: &str, child: &str) -> String {
