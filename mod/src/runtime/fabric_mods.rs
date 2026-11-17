@@ -98,7 +98,7 @@ const JAVA_SPECIFICATION_VERSION: &str = "25";
 use crate::runtime::host_fabric_loader::{self as loader, Pointed};
 
 fn enum_marker(owner: &str, name: &str) -> Value {
-    Value::Ref(Some(format!("{owner}/{name}")))
+    Value::Ref(Some(format!("enum/{owner}/{name}")))
 }
 
 pub(crate) fn enum_constants(owner: &str) -> Option<&'static [&'static str]> {
@@ -399,6 +399,7 @@ impl StdHost {
                     CV_TYPES
                 };
                 let name = expect_ref(receiver)?
+                    .strip_prefix("enum/")?
                     .strip_prefix(r.owner.as_str())?
                     .strip_prefix('/')?;
                 let ordinal = constants.iter().position(|constant| *constant == name)?;
@@ -409,6 +410,7 @@ impl StdHost {
             }
             (MOD_ENVIRONMENT, "matches", "(Lnet/fabricmc/api/EnvType;)Z") => {
                 let name = expect_ref(receiver)?
+                    .strip_prefix("enum/")?
                     .strip_prefix(MOD_ENVIRONMENT)?
                     .strip_prefix('/')?;
                 let side = Self::argument(r, args, 0)
@@ -712,7 +714,10 @@ impl StdHost {
                     .enumerate()
                     .map(|(i, v)| loader::custom_value(id, &child(pointer, &i.to_string()), v))
                     .collect();
-                return match self.new_host_iterator(values, None) {
+                return match self.new_host_iterator(
+                    values,
+                    Some("java/util/Collections$UnmodifiableList".into()),
+                ) {
                     Some(iterator) => Ok(iterator),
                     None => self.unknown_host_call(r),
                 };
@@ -728,7 +733,10 @@ impl StdHost {
                     &pairs,
                     crate::runtime::host_map_entry::EntryMade::Holder,
                 );
-                return match self.new_host_iterator(entries, None) {
+                return match self.new_host_iterator(
+                    entries,
+                    Some("java/util/Collections$UnmodifiableMap".into()),
+                ) {
                     Some(iterator) => Ok(iterator),
                     None => self.unknown_host_call(r),
                 };
