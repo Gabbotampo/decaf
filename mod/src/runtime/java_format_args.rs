@@ -20,11 +20,11 @@ impl<H: Host> Runtime<'_, H> {
         locale: Option<&Value>,
         format: &Value,
         args: &Value,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, NativeError> {
         if let Some(locale) = locale
             && !formats_like_us(locale)
         {
-            return None;
+            return Ok(None);
         }
         // The player's default FORMAT locale is outside the bounded host.
         // Keep only conversions whose output cannot observe it; grouping,
@@ -33,7 +33,7 @@ impl<H: Host> Runtime<'_, H> {
         // The parameter is a `String`, so any reference is its text; a null
         // format throws.
         let Value::Ref(Some(format)) = format else {
-            return None;
+            return Ok(None);
         };
         let args = match args {
             // `String.format(f, (Object[]) null)` formats every argument as
@@ -42,7 +42,7 @@ impl<H: Host> Runtime<'_, H> {
             array => Some(self.array(array).ok()?.into_owned()),
         };
         if locale.is_none() && default_locale_sensitive(format, args.as_deref()) {
-            return None;
+            return Ok(None);
         }
         let args = args
             .map(|values| {
@@ -51,7 +51,7 @@ impl<H: Host> Runtime<'_, H> {
                     .any(|value| crate::runtime::jar_object::packaged_object_class(value).is_some())
                     && format_has_non_string_conversion(format)
                 {
-                    return None;
+                    return Ok(None);
                 }
                 Some(
                     values
@@ -63,7 +63,7 @@ impl<H: Host> Runtime<'_, H> {
             .flatten()
             .transpose()
             .ok()?;
-        java_format::format(format, args.as_deref())
+        Ok(java_format::format(format, args.as_deref()))
     }
 
     /// One element of the `Object[]`, classed as `Object.getClass` would

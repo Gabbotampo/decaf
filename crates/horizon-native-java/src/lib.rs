@@ -13818,12 +13818,12 @@ fn format_java_string_call<H: Host>(
 ) -> Result<Value, NativeError> {
     let text = match (r.descriptor.as_str(), args) {
         ("(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;", [format, values]) => {
-            runtime.java_format(None, format, values)
+            runtime.java_format(None, format, values)?
         }
         (
             "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
             [locale, format, values],
-        ) => runtime.java_format(Some(locale), format, values),
+        ) => runtime.java_format(Some(locale), format, values)?,
         _ => None,
     };
     match text {
