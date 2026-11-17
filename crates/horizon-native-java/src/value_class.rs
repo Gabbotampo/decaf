@@ -116,11 +116,26 @@ fn collection_class(class: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape { String, Marker, Undecidable }
+pub(crate) enum Shape {
+    String,
+    Marker,
+    Undecidable,
+}
 
 pub(crate) fn string_shape(marker: &str) -> Shape {
-    if is_plain_string(marker) { return Shape::String; }
-    if MARKER_HEADS.iter().any(|p| marker.starts_with(&format!("{p}/"))) || marker.starts_with("enum/") || marker.starts_with("game/") { Shape::Marker } else { Shape::Undecidable }
+    if is_plain_string(marker) {
+        return Shape::String;
+    }
+    if MARKER_HEADS
+        .iter()
+        .any(|p| marker.starts_with(&format!("{p}/")))
+        || marker.starts_with("enum/")
+        || marker.starts_with("game/")
+    {
+        Shape::Marker
+    } else {
+        Shape::Undecidable
+    }
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
