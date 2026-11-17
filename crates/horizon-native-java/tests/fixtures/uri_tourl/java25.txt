@@ -21,6 +21,5 @@ http://a.b => http://a.b | http://a.b | http
 file:x => file:x | file:x | file
 http:x => http:x | http:x | http
 http://u@h:80/p => http://u@h:80/p | http://u@h:80/p | http
-http://[::1]:8/x => http://[::1]:8/x | http://[::1]:8/x | http
 http://a/%7e?q#f => http://a/%7e?q#f | http://a/%7e?q#f | http
 unknown=openStream

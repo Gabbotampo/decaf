@@ -13,7 +13,6 @@ pub enum UrlError {
     Relative,
     UnknownProtocol,
     Jar,
-    Unsupported,
 }
 fn scheme(uri: &str) -> Option<&str> {
     let (s, _rest) = uri.split_once(':')?;
@@ -81,7 +80,6 @@ pub fn instance_call(r: &MethodRef, receiver: &Value) -> Option<Result<Value, Na
             message: Some("no !/ in spec".into()),
             frame: None,
         }),
-        Err(UrlError::Unsupported) => return None,
         Err(UrlError::UnknownProtocol) => Err(NativeError::UncaughtException {
             class: "java/net/MalformedURLException".into(),
             message: Some(format!(
