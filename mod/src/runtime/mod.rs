@@ -4799,22 +4799,55 @@ impl StdHost {
                 Ok(Some(Value::Ref(None)))
             }
             ("stringPropertyNames", "()Ljava/util/Set;") => {
-                let values = self
-                    .mutable_collections
-                    .get(marker)
-                    .map(|pairs| {
-                        pairs
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .filter_map(|pair| match &pair[0] {
-                                Value::Ref(Some(k)) => Some(Value::Ref(Some(k.clone()))),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
+                // JDK 25: `enumerateStringProperties(h)` fills a new `HashMap<String, String>`
+                // with the defaults chain's entries first, then this table's (a later put
+                // overwrites an earlier key), keeping only entries whose key and value are both
+                // `String`s; the answer is `Collections.unmodifiableSet(h.keySet())`, a snapshot
+                // in `HashMap` order that throws on `add`.
+                let mut chain = Vec::new();
+                let mut current = Some(marker.to_owned());
+                let mut seen = BTreeSet::new();
+                while let Some(owner) = current
+                    && seen.insert(owner.clone())
+                {
+                    current = self.properties_defaults(&owner);
+                    chain.push(owner);
+                }
+                let mut keys: Vec<Value> = Vec::new();
+                for owner in chain.iter().rev() {
+                    let Some(pairs) = self.mutable_collections.get(owner) else {
+                        continue;
+                    };
+                    for pair in pairs.as_chunks::<2>().0 {
+                        if let (Value::Ref(Some(_)), Value::Ref(Some(_))) = (&pair[0], &pair[1])
+                            && !keys.contains(&pair[0])
+                        {
+                            keys.push(pair[0].clone());
+                        }
+                    }
+                }
+                // `h.keySet()` iterates the `HashMap`'s bins, not insertion order
+                // (`hash_map_order.rs`); a bin Java would turn into a tree has no known order,
+                // so the call is counted rather than guessed.
+                let texts: Vec<&str> = keys
+                    .iter()
+                    .filter_map(|key| match key {
+                        Value::Ref(Some(text)) => Some(text.as_str()),
+                        _ => None,
                     })
-                    .unwrap_or_default();
-                Ok(Some(self.new_collection("java/util/LinkedHashSet", values)))
+                    .collect();
+                let Some(order) = crate::runtime::hash_map_order::key_set_order(&texts, |text| {
+                    crate::runtime::hash_map_order::java_string_hash(text)
+                }) else {
+                    return self.unknown_host_call(r).map(Some);
+                };
+                let keys: Vec<Value> = order.into_iter().map(|i| keys[i].clone()).collect();
+                let snapshot = self.new_collection("java/util/HashSet", keys);
+                match self.unmodifiable_view_as("java/util/Collections$UnmodifiableSet", &snapshot)
+                {
+                    Some(view) => Ok(Some(view)),
+                    None => self.unknown_host_call(r).map(Some),
+                }
             }
             ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
