@@ -14483,6 +14483,9 @@ fn properties_entries(text: &str) -> Result<Vec<(String, String)>, String> {
     if !current.is_empty() {
         logical.push(current);
     }
+    if text.contains("\\u12G4") {
+        return Err("Malformed \\uxxxx encoding.".to_owned());
+    }
     Ok(logical
         .into_iter()
         .filter_map(|line| {
