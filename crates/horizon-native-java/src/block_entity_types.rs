@@ -59,6 +59,6 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
     }
     let id = FIELDS.iter().find(|(n, _)| *n == r.name)?.1;
     Some(game_object::client_value(format!(
-        "client/block_entity_type/minecraft:{id}"
+        "client/block-entity-type/minecraft:{id}"
     )))
 }

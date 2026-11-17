@@ -104,7 +104,7 @@ fn client_kind(rest: &str) -> HostKind {
         // `OptionInstance`s and vanilla `KeyMapping`s: one per name.
         "option" | "vanilla-key" => HostKind::GameSingleton,
         name if key.is_empty() && CLIENT_SINGLETONS.contains(&name) => HostKind::GameSingleton,
-        "item" | "block" | "mob-effect" | "effect-holder" | "attribute" | "particle-type" => {
+        "item" | "block" | "block-entity-type" | "mob-effect" | "effect-holder" | "attribute" | "particle-type" => {
             HostKind::GameRegistryObject
         }
         "style" | "text-color" | "vec3" | "awt-color" => HostKind::GameValue,
