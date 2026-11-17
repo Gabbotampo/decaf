@@ -13,3 +13,5 @@ appendTruncate=IllegalArgumentException:APPEND + TRUNCATE_EXISTING not allowed
 readOption=IllegalArgumentException:READ not allowed
 writeMissing=NoSuchFileException:game/files-vfs/w.txt
 sync=ok
+dsync=ok
+writeExisting=ok

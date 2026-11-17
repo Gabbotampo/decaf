@@ -52,5 +52,6 @@ fn files_vfs_matches_java25_oracle() {
             include_str!("fixtures/files_vfs/java25.txt").to_owned()
         ))
     );
-    assert_eq!(h.unknown_host_calls(), &[("java/nio/file/Files#writeString(Ljava/nio/file/Path;Ljava/lang/CharSequence;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;".into(), 1)]);
+    // Counted: `SYNC`, `DSYNC` and `WRITE` over an existing file (Java overwrites in place).
+    assert_eq!(h.unknown_host_calls(), &[("java/nio/file/Files#writeString(Ljava/nio/file/Path;Ljava/lang/CharSequence;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;".into(), 3)]);
 }

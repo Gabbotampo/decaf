@@ -26701,9 +26701,6 @@ impl<H: Host> Runtime<'_, H> {
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if option_names.iter().any(|name| name.ends_with("/SYNC")) {
-                            return self.host.unknown_operand_call(r).map(Some);
-                        }
                         let create_new =
                             option_names.iter().any(|name| name.contains("/CREATE_NEW"));
                         let append = option_names.iter().any(|name| name.contains("/APPEND"));
@@ -26729,6 +26726,17 @@ impl<H: Host> Runtime<'_, H> {
                                 message: Some(display_path.clone()),
                                 frame: None,
                             });
+                        }
+                        // An existing file opened without `TRUNCATE_EXISTING` or `APPEND` (`WRITE`,
+                        // `CREATE`) is overwritten in place: Java keeps the old bytes past the new
+                        // text (`x` over `abc` is `xbc`). Not modelled: count it.
+                        if !option_names.is_empty()
+                            && !truncate
+                            && !append
+                            && !create_new
+                            && self.io_files.contains_key(&path)
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
                         }
                         let text = args
                             .get(1)

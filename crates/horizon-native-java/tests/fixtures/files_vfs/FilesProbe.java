@@ -50,6 +50,10 @@ public final class FilesProbe {
         r.add("readOption=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.READ)));
         r.add("writeMissing=" + attempt(() -> Files.writeString(d.resolve("w.txt"), "x", StandardOpenOption.WRITE)));
         r.add("sync=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.SYNC)));
+        r.add("dsync=" + attempt(() -> Files.writeString(existing, "x", StandardOpenOption.DSYNC)));
+        Path inPlace = d.resolve("in-place.txt");
+        Files.writeString(inPlace, "abc");
+        r.add("writeExisting=" + attempt(() -> Files.writeString(inPlace, "x", StandardOpenOption.WRITE)));
         return String.join("\n", r);
     }
 }
