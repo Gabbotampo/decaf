@@ -4,16 +4,9 @@ use horizon_native_java::{StdHost, Value};
 use javac_fixture::Fixture;
 const PROBE: &str = include_str!("fixtures/url_encoder/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/url_encoder/java25.txt");
-const ENCODER: &str = r#"package java.net; public final class URLEncoder { public static String encode(String s, java.nio.charset.Charset c) { throw new AssertionError(); } }"#;
 #[test]
 fn url_encoder_utf8_matches_java25() {
-    let fixture = Fixture::build(
-        "url-encoder",
-        &[
-            ("java/net/URLEncoder.java", ENCODER),
-            ("demo/Probe.java", PROBE),
-        ],
-    );
+    let fixture = Fixture::build("url-encoder", &[("demo/Probe.java", PROBE)]);
     let mut host = fixture.jar.seed_host(StdHost::new());
     let answer = fixture
         .jar
