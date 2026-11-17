@@ -1521,6 +1521,7 @@ impl StdHost {
                 .and_then(|a| {
                     a.strip_prefix(items::ITEM)
                         .or_else(|| a.strip_prefix(items::BLOCK))
+                        .or_else(|| a.strip_prefix("client/block_entity_type/"))
                 })
         {
             return Some(Ok(crate::host_ids::identifier_of_text(id)));

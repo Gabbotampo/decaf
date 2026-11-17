@@ -406,6 +406,7 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (true, "mob-effect") => &["net/minecraft/world/effect/MobEffect"],
         (true, "attribute") => &["net/minecraft/world/entity/ai/attributes/Attribute"],
         (true, "block") => &["net/minecraft/world/level/block/Block"],
+        (true, "block_entity_type") => &["net/minecraft/world/level/block/entity/BlockEntityType"],
         (true, "style") => &["net/minecraft/network/chat/Style"],
         (true, "text-color") => &["net/minecraft/network/chat/TextColor"],
         (_, "key-category") => &["net/minecraft/client/KeyMapping$Category"],
