@@ -4694,17 +4694,11 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/InputStream;)V") | ("load", "(Ljava/io/Reader;)V") => {
                 let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
-                    if r.descriptor == "(Ljava/io/Reader;)V" {
-                        self.string_readers.remove(stream)
-                    } else if let Some(text) = self.string_readers.remove(stream) {
-                        Some(text)
-                    } else {
-                        self.resource_streams.get_mut(stream).map(|(bytes, index)| {
-                            let text = bytes[*index..].iter().map(|b| *b as char).collect();
-                            *index = bytes.len();
-                            text
-                        })
-                    }
+                    self.resource_streams.get_mut(stream).map(|(bytes, index)| {
+                        let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
+                        *index = bytes.len();
+                        text
+                    })
                 });
                 let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
