@@ -26584,7 +26584,7 @@ impl<H: Host> Runtime<'_, H> {
                                 values
                                     .iter()
                                     .filter_map(expect_ref)
-                                    .map(str::to_owned)
+                                    .map(|value| value.to_owned())
                                     .collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
