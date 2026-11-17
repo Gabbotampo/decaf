@@ -456,30 +456,13 @@ impl StdHost {
                 _ => None,
             };
         }
-        if r.name == "packVersion"
-            && r.descriptor
-                == "(Lnet/minecraft/server/packs/PackType;)Lnet/minecraft/server/packs/metadata/pack/PackFormat;"
-        {
-            loader::world_version_name(receiver)?;
-            let Some(Value::Ref(Some(marker))) = args.first() else {
-                return None;
-            };
-            let (major, minor) = match marker.as_str() {
-                "enum/net/minecraft/server/packs/PackType/SERVER_DATA" => (121, 0),
-                "enum/net/minecraft/server/packs/PackType/CLIENT_RESOURCES" => (97, 1),
-                _ => return None,
-            };
-            return Some(loader::world_version_pack(receiver, major, minor));
-        }
         if let Some(name) = loader::world_version_name(receiver) {
             return match (r.name.as_str(), r.descriptor.as_str()) {
                 ("name" | "getName", "()Ljava/lang/String;") => Some(Value::Ref(Some(name))),
                 ("id", "()Ljava/lang/String;") => Some(Value::Ref(Some(name))),
                 ("protocolVersion", "()I") => Some(Value::Int(777)),
                 ("stable", "()Z") => Some(Value::Int(1)),
-                ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => {
-                    Some(loader::world_version_data(receiver, 5023))
-                }
+                ("dataVersion", "()Lnet/minecraft/world/level/storage/DataVersion;") => None
                 _ => None,
             };
         }
