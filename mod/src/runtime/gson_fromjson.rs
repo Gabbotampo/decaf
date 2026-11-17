@@ -695,7 +695,7 @@ impl<H: Host> Runtime<'_, H> {
                 };
                 if reader && let Some(marker) = args.first().and_then(crate::runtime::jar_object::object_key)
                 {
-                    self.string_readers.remove(marker);
+                    self.string_readers.insert(marker.to_owned(), String::new());
                 }
                 return match self.gson_read_text(&text, &target, &style)? {
                     Some(value) => Ok(Some(value)),

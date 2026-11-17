@@ -21,4 +21,8 @@ public final class Probe {
   }
   public static String trailing() { return one(new Gson(), new StringReader("{\"n\":1} garbage")); }
   public static String twice() { Gson g=new Gson(); StringReader r=new StringReader("{\"n\":8}"); return one(g,r)+"|"+one(g,r); }
+  public static String closeString() { StringReader r=new StringReader("{\"n\":1}"); one(new Gson(),r); try { r.close(); return "ok"; } catch (Exception e) { return e.toString(); } }
+  public static String closeFile() throws Exception { Path p=Path.of("close.json"); Files.writeString(p,"{\"n\":1}"); FileReader r=new FileReader(p.toFile()); one(new Gson(),r); r.close(); return "ok"; }
+  public static String closeBuffered() throws Exception { Path p=Path.of("close-b.json"); Files.writeString(p,"{\"n\":1}"); BufferedReader r=Files.newBufferedReader(p); one(new Gson(),r); r.close(); return "ok"; }
+  public static String closeInput() throws Exception { InputStreamReader r=new InputStreamReader(Probe.class.getResourceAsStream("/resource-config.json")); one(new Gson(),r); r.close(); return "ok"; }
 }
