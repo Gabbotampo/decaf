@@ -17,7 +17,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "com/mojang/serialization/Codec.java",
-        r#"package com.mojang.serialization; public interface Codec<T> { com.mojang.serialization.MapCodec<T> fieldOf(String s); }"#,
+        r#"package com.mojang.serialization; public interface Codec<T> { com.mojang.serialization.MapCodec<T> fieldOf(String s); com.mojang.serialization.DataResult<T> encodeStart(DynamicOps ops,Object o); com.mojang.serialization.DataResult<T> parse(DynamicOps ops,Object o); com.mojang.serialization.DataResult<com.mojang.datafixers.util.Pair<T,T>> decode(DynamicOps ops,Object o); }"#,
     ),
     (
         "com/mojang/serialization/MapCodec.java",
@@ -25,7 +25,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/resources/Identifier.java",
-        r#"package net.minecraft.resources; import com.mojang.serialization.Codec; public final class Identifier { public static final Codec<Identifier> CODEC=null; }"#,
+        r#"package net.minecraft.resources; import com.mojang.serialization.Codec; public final class Identifier { public static final Codec<Identifier> CODEC=null; public static Identifier parse(String s){throw new AssertionError();} }"#,
     ),
 ];
 const PROBE: &str = include_str!("fixtures/vanilla_static/demo/Probe.java");
