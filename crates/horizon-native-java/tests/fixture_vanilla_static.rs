@@ -69,7 +69,7 @@ fn vanilla_static_hash_is_counted_on_fresh_host() {
     assert_eq!(
         h.unknown_host_calls(),
         vec![(
-            "net/minecraft/network/chat/MutableComponent#hashCode()I".to_owned(),
+            "net/minecraft/network/chat/Component#hashCode()I".to_owned(),
             1
         )]
     );
