@@ -1,0 +1,4 @@
+ANDESITE|minecraft:andesite
+COBBLESTONE|minecraft:cobblestone
+DIORITE|minecraft:diorite
+CUT_SANDSTONE|minecraft:cut_sandstone
