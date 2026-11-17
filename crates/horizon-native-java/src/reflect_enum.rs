@@ -40,11 +40,7 @@ impl<H: Host> Runtime<'_, H> {
                 && file.super_name == "java/lang/Enum"
         });
         let jdk_enum = crate::jdk_closure::class_is_enum(&class);
-        let game_constants = game_enum_constants(&class).or_else(|| {
-            class
-                .split_once('$')
-                .and_then(|(outer, _)| game_enum_constants(outer))
-        });
+        let game_constants = game_enum_constants(&class);
         // Primitive and array Class objects are never enum classes; Java
         // answers this without consulting class metadata.
         let known_enum = if crate::host_class::is_primitive(&class) || class.starts_with('[') {
@@ -53,6 +49,8 @@ impl<H: Host> Runtime<'_, H> {
             held_enum
                 .or(jdk_enum)
                 .or_else(|| game_constants.map(|_| true))
+                // A game enum whose constants are not listed: an enum all the same.
+                .or_else(|| crate::game_enum_class(&class).then_some(true))
         };
         if is_enum_query {
             return Ok(known_enum.map(|is_enum| Value::Int(i32::from(is_enum))));
