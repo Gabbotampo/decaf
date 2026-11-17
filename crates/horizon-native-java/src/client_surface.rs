@@ -1515,6 +1515,8 @@ impl StdHost {
         }
         // `BuiltInRegistries.ITEM.getKey(item)`: the item's identifier.
         if r.name == "getKey"
+            && (text == "client/registry/minecraft:block_entity_type"
+                || text == "registry/minecraft:block_entity_type")
             && let Some(id) = args
                 .first()
                 .and_then(crate::game_object::text)
