@@ -1,6 +1,6 @@
 //! Vanilla static fields whose initializers produce host handles.
 
-use crate::{MethodRef, Value, host_codec, host_component};
+use crate::{MethodRef, Value, host_codec};
 
 const COMMON_COMPONENTS: &str = "net/minecraft/network/chat/CommonComponents";
 const IDENTIFIER: &str = "net/minecraft/resources/Identifier";

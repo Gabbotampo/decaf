@@ -18,7 +18,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "com/mojang/serialization/Codec.java",
-        r#"package com.mojang.serialization; public interface Codec<T> { Codec<T> fieldOf(String s); }"#,
+        r#"package com.mojang.serialization; public interface Codec<T> { com.mojang.serialization.MapCodec<T> fieldOf(String s); }"#,
     ),
     (
         "net/minecraft/resources/Identifier.java",
