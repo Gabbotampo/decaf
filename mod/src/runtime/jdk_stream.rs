@@ -552,7 +552,8 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         };
         let immutable = self
             .host_collection_class(list)
-            .is_some_and(|class| class.starts_with("java/util/ImmutableCollections$"));
+            .is_some_and(|class| class.starts_with("java/util/ImmutableCollections$"))
+            || expect_ref(list).is_some_and(|marker| self.host.is_jdk_list_of(marker));
         if immutable {
             let size = crate::runtime::runtime_collection_values(self.host, list)?.len();
             if size >= 2 {
