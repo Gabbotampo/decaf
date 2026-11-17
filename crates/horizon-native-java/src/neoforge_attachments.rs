@@ -1346,6 +1346,7 @@ impl NativeJar {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: Default::default(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
