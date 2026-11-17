@@ -23,8 +23,7 @@ const JAVA25_CAPTURE: &str = include_str!("fixtures/fabric_creative_tab/java25.t
 const JAVA25_COUNTED: &str = include_str!("fixtures/fabric_creative_tab/java25_counted.txt");
 const PROBE: &str = include_str!("fixtures/fabric_creative_tab/demo/Probe.java");
 
-const DISPLAY_NAME: &str =
-    "net/minecraft/world/item/CreativeModeTab#getDisplayName()Lnet/minecraft/network/chat/Component;";
+const DISPLAY_NAME: &str = "net/minecraft/world/item/CreativeModeTab#getDisplayName()Lnet/minecraft/network/chat/Component;";
 
 fn fixture() -> Fixture {
     Fixture::build(
