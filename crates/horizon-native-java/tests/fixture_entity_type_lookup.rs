@@ -16,7 +16,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/core/Registry.java",
-        "package net.minecraft.core; import net.minecraft.resources.Identifier; import java.util.Optional; public interface Registry<T>{ Optional<T> getOptional(Identifier i); T getValue(Identifier i); boolean containsKey(Identifier i); }",
+        "package net.minecraft.core; import net.minecraft.resources.Identifier; import java.util.Optional; public interface Registry<T>{ Optional<T> getOptional(Identifier i); Optional<T> get(Identifier i); T getValue(Identifier i); boolean containsKey(Identifier i); }",
     ),
     (
         "net/minecraft/core/DefaultedRegistry.java",
@@ -24,7 +24,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/core/registries/BuiltInRegistries.java",
-        "package net.minecraft.core.registries; import net.minecraft.core.DefaultedRegistry; import net.minecraft.world.entity.EntityType; public final class BuiltInRegistries { public static final DefaultedRegistry<EntityType<?>> ENTITY_TYPE=null; }",
+        "package net.minecraft.core.registries; import net.minecraft.core.DefaultedRegistry; import net.minecraft.world.entity.EntityType; public final class BuiltInRegistries { public static final DefaultedRegistry<EntityType<?>> ENTITY_TYPE=null; public static final DefaultedRegistry<Object> BLOCK=null; }",
     ),
 ];
 
