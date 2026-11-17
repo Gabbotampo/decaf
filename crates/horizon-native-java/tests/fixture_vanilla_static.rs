@@ -1,13 +1,8 @@
-//! Java 25 oracle fixture for CommonComponents.EMPTY and Identifier.CODEC.
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 const STUBS: &[(&str, &str)] = &[
-    (
-        "com/mojang/serialization/MapCodec.java",
-        r#"package com.mojang.serialization; public interface MapCodec<T> extends Codec<T> {}"#,
-    ),
     (
         "net/minecraft/network/chat/Component.java",
         r#"package net.minecraft.network.chat; public interface Component { static MutableComponent empty(){throw new AssertionError();} String getString(); }"#,
@@ -25,6 +20,10 @@ const STUBS: &[(&str, &str)] = &[
         r#"package com.mojang.serialization; public interface Codec<T> { com.mojang.serialization.MapCodec<T> fieldOf(String s); }"#,
     ),
     (
+        "com/mojang/serialization/MapCodec.java",
+        r#"package com.mojang.serialization; public interface MapCodec<T> extends Codec<T> {}"#,
+    ),
+    (
         "net/minecraft/resources/Identifier.java",
         r#"package net.minecraft.resources; import com.mojang.serialization.Codec; public final class Identifier { public static final Codec<Identifier> CODEC=null; }"#,
     ),
@@ -34,19 +33,19 @@ const COUNTED: &str = include_str!("fixtures/vanilla_static/demo/Counted.java");
 const ORACLE: &str = include_str!("fixtures/vanilla_static/java25.txt");
 #[test]
 fn vanilla_static_rows_match_java25() {
-    let mut files = STUBS.to_vec();
-    files.push(("demo/Probe.java", PROBE));
-    let f = Fixture::build("vanilla-static", &files);
-    let mut h = f.jar.seed_host(StdHost::new());
-    assert_eq!(f.text_on(&mut h, "rows"), ORACLE);
+    let mut f = STUBS.to_vec();
+    f.push(("demo/Probe.java", PROBE));
+    let x = Fixture::build("vanilla-static", &f);
+    let mut h = x.jar.seed_host(StdHost::new());
+    assert_eq!(x.text_on(&mut h, "rows"), ORACLE);
     assert!(h.unknown_host_calls().is_empty());
 }
 #[test]
-fn vanilla_static_field_of_is_counted() {
-    let mut files = STUBS.to_vec();
-    files.push(("demo/Counted.java", COUNTED));
-    let f = Fixture::build("vanilla-static-counted", &files);
-    let mut h = f.jar.seed_host(StdHost::new());
-    assert_eq!(f.text_on(&mut h, "run"), "true");
-    assert_eq!(h.unknown_host_calls(), vec![("com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned(), 1)]);
+fn vanilla_static_field_of_is_counted_on_fresh_host() {
+    let mut f = STUBS.to_vec();
+    f.push(("demo/Counted.java", COUNTED));
+    let x = Fixture::build("vanilla-static-counted", &f);
+    let mut h = x.jar.seed_host(StdHost::new());
+    assert_eq!(x.text_on(&mut h, "run"), "true");
+    assert_eq!(h.unknown_host_calls(),vec![("com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".to_owned(),1)]);
 }
