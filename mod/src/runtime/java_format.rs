@@ -61,6 +61,7 @@ pub(crate) enum Arg {
 ///
 /// `args` is `None` for a `null` `Object[]`, which Java formats as if every
 /// argument were `null`.
+#[cfg(test)]
 pub(crate) fn format(format: &str, args: Option<&[Arg]>) -> Option<String> {
     format_with(format, args.is_some(), &mut |index, _| {
         Ok::<_, ()>(args.and_then(|values| values.get(index).cloned()))

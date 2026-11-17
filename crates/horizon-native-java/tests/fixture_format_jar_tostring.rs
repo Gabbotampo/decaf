@@ -87,4 +87,8 @@ fn formatter_counted_cases() {
             "{name}"
         );
     }
+    let jar = jar();
+    let mut host = StdHost::new();
+    call(&jar, &mut host, "boom");
+    assert_eq!(host.unknown_host_calls(), vec![(FORMATTED.to_owned(), 1)]);
 }
