@@ -22,7 +22,7 @@ fn path_components() {
     };
     assert_eq!(
         s,
-        "file=c|parent=/a/b/..|root=null|count=4|name=a|oor=IllegalArgumentException:null|sub=a/b|abs=true|empty=null|eq=true"
+        "file=c|parent=/a/b/..|root=/|count=4|name=a|oor=IllegalArgumentException:null|sub=a/b|abs=true|empty=null|eq=true"
     );
     assert!(
         h.unknown_host_calls().is_empty(),
