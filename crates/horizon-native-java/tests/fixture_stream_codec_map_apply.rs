@@ -9,7 +9,11 @@ fn fixture() -> Fixture {
     Fixture::build(
         "stream-codec-map-apply",
         &[
-            ("net/minecraft/network/codec/StreamCodec.java", STUB), ("net/minecraft/network/codec/ByteBufCodecs.java", "package net.minecraft.network.codec; public final class ByteBufCodecs { public static StreamCodec<Object,Integer> VAR_INT; }"),
+            ("net/minecraft/network/codec/StreamCodec.java", STUB),
+            (
+                "net/minecraft/network/codec/ByteBufCodecs.java",
+                "package net.minecraft.network.codec; public final class ByteBufCodecs { public static StreamCodec<Object,Integer> VAR_INT; }",
+            ),
             ("demo/Probe.java", PROBE),
         ],
     )
