@@ -4,6 +4,8 @@
 //! Fabric metadata, and executes a small no-argument bytecode subset. Calls
 //! outside the loaded jar cross [`Host`], so unsupported behavior is explicit.
 
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -12,6 +14,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
+
+#[cfg(test)]
+static TEST_STDOUT_TRACE: Mutex<String> = Mutex::new(String::new());
+
+#[cfg(test)]
+pub(crate) fn take_test_stdout() -> String {
+    std::mem::take(&mut *TEST_STDOUT_TRACE.lock().unwrap())
+}
 
 mod annotation_proxy;
 mod annotation_values;
@@ -55,6 +65,7 @@ mod enum_value_of;
 pub mod events;
 mod executors;
 mod fabric_api_slice2;
+mod fabric_creative_tab;
 mod fabric_mods;
 mod fabric_registry;
 mod facade_saved_data;
@@ -184,6 +195,7 @@ mod mod_origin;
 mod model_layers;
 mod modified_utf8;
 mod native_library;
+mod neoforge_api;
 pub mod neoforge_attachments;
 pub mod neoforge_bus;
 mod neoforge_event_classes;
@@ -191,6 +203,7 @@ pub mod neoforge_imc;
 mod neoforge_inject;
 pub mod neoforge_lifecycle;
 mod neoforge_loader;
+mod neoforge_payload;
 mod neoforge_subscribe;
 mod nested_jars;
 mod night_config;
@@ -1272,6 +1285,10 @@ pub struct RegisteredGameHook {
     pub cancellable: bool,
     /// How the callback is called and what its answer does.
     pub shape: GameHookShape,
+    /// Mixin's callback priority (lower values run first).
+    pub priority: i32,
+    /// Declaration order after Mixin apply ordering, used for global ties.
+    pub order: usize,
 }
 
 /// The callbacks one jar registered at host hook points, grouped by hook and
@@ -1291,6 +1308,23 @@ impl GameHookRegistrations {
     /// answers an empty slice, so a host can ask unconditionally.
     pub fn entries(&self, hook: &str) -> &[RegisteredGameHook] {
         self.by_hook.get(hook).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// A registration view containing only callbacks at one exact Mixin anchor. The returned
+    /// view preserves the original apply/declaration order.
+    pub fn for_anchor(&self, hook: &str, anchor: &str) -> Self {
+        let mut filtered = Self::default();
+        for entry in self.entries(hook) {
+            let normalized = if entry.anchor.is_empty() {
+                "HEAD"
+            } else {
+                entry.anchor.as_str()
+            };
+            if normalized == anchor {
+                filtered.insert(entry.clone());
+            }
+        }
+        filtered
     }
 
     /// The number of callbacks over every hook.
@@ -2186,9 +2220,16 @@ pub struct RegistryEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PayloadRegistration {
     pub direction: String,
+    /// The active NeoForge mod context that owns a NeoForge registration.
+    /// Fabric/Forge rows leave this empty because they have no such field.
+    pub mod_id: Value,
     pub payload_type: Value,
     pub codec: Value,
     pub handler: Value,
+    /// Registrar state copied into this registration by NeoForge's immutable builder.
+    pub version: Value,
+    pub optional: bool,
+    pub thread: Value,
 }
 
 /// Metadata for one Fabric `EntrypointContainer` exposed by the bounded
@@ -3783,6 +3824,14 @@ impl StdHost {
         self.unknown_host_calls.values().sum()
     }
 
+    /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
+    pub fn note_unknown_game_hook(&mut self, method: &str) {
+        *self
+            .unknown_host_calls
+            .entry(format!("game-hook re-entry: {method}"))
+            .or_default() += 1;
+    }
+
     pub(crate) fn mark_nondeterministic(&mut self, marker: &str) {
         self.nondeterministic.insert(marker.to_owned());
     }
@@ -5066,9 +5115,13 @@ impl StdHost {
             Some(row) => row.handler = handler,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction: direction.to_owned(),
+                mod_id: Value::Ref(None),
                 payload_type,
                 codec: Value::Ref(None),
                 handler,
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         Some(Value::Int(1))
@@ -5111,9 +5164,13 @@ impl StdHost {
             Some(row) => row.codec = codec,
             None => self.payload_registrations.push(PayloadRegistration {
                 direction,
+                mod_id: Value::Ref(None),
                 payload_type: payload_type.clone(),
                 codec,
                 handler: Value::Ref(None),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }),
         }
         // `CustomPacketPayload.TypeAndCodec`: a non-null pair marker.
@@ -5636,6 +5693,8 @@ impl Host for StdHost {
     }
     fn write_console(&mut self, text: &str) {
         self.console_out.push_str(text);
+        #[cfg(test)]
+        TEST_STDOUT_TRACE.lock().unwrap().push_str(text);
     }
 
     fn reserve_dfu_codec(
@@ -6657,6 +6716,9 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, None, args) {
             return value;
         }
+        if let Some(value) = neoforge_api::static_call(self, r) {
+            return Ok(value);
+        }
         if let Some(value) = sound_event::static_call(self, r, args) {
             return value;
         }
@@ -6783,6 +6845,9 @@ impl Host for StdHost {
         }
         if let Some(value) = fabric_registry::static_call(r, args) {
             return value;
+        }
+        if let Some(value) = fabric_creative_tab::static_call(r, args) {
+            return Ok(value);
         }
         if let Some(value) = self.block_item_id_static(r, args) {
             return value;
@@ -8138,6 +8203,12 @@ impl Host for StdHost {
         if let Some(value) = self.guava_text(r, Some(receiver), args) {
             return value;
         }
+        if let Some(value) = neoforge_api::instance_call(self, r, receiver) {
+            return Ok(value);
+        }
+        if let Some(value) = neoforge_payload::instance_call(r, receiver, args) {
+            return Ok(value);
+        }
         // Fabric's container list and per-mod metadata (`fabric_mods.rs`).
         if let Some(value) = self.fabric_mods_instance(r, receiver, args) {
             return value;
@@ -8220,7 +8291,7 @@ impl Host for StdHost {
         if let Some(value) = self.holder_call(r, receiver) {
             return value;
         }
-        if let Some(value) = fabric_registry::instance_call(self, r, receiver) {
+        if let Some(value) = fabric_registry::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) = self.block_item_id_instance(r, receiver) {
@@ -11900,9 +11971,19 @@ impl Host for StdHost {
                 "net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent",
                 "registrar",
                 "(Ljava/lang/String;)Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
-            ) => Ok(Value::Ref(Some(
-                "net/neoforged/neoforge/network/registration/PayloadRegistrar".into(),
-            ))),
+            ) => {
+                let mod_id = self
+                    .neoforge_imc()
+                    .and_then(|(imc, _)| crate::neoforge_imc::active_id(imc))
+                    .map_or_else(
+                        || Value::Ref(Some("minecraft".into())),
+                        |id| Value::Ref(Some(id)),
+                    );
+                Ok(neoforge_payload::registrar(
+                    args.first().unwrap_or(&Value::Ref(None)),
+                    &mod_id,
+                ))
+            }
             ("net/neoforged/neoforge/network/registration/PayloadRegistrar", _, descriptor)
                 if descriptor.ends_with(
                     "Lnet/neoforged/neoforge/network/registration/PayloadRegistrar;",
@@ -11918,11 +11999,23 @@ impl Host for StdHost {
                         | "configurationBidirectional"
                 ) && args.len() >= 3
                 {
+                    let state = crate::neoforge_payload::state(receiver).unwrap_or(
+                        crate::neoforge_payload::RegistrarState {
+                            mod_id: Value::Ref(None),
+                            version: Value::Ref(None),
+                            optional: false,
+                            thread: Value::Ref(None),
+                        },
+                    );
                     self.payload_registrations.push(PayloadRegistration {
                         direction: r.name.clone(),
+                        mod_id: state.mod_id.clone(),
                         payload_type: args[0].clone(),
                         codec: args[1].clone(),
                         handler: args[2].clone(),
+                        version: state.version,
+                        optional: state.optional,
+                        thread: state.thread,
                     });
                 }
                 Ok(receiver.clone())
@@ -11938,9 +12031,13 @@ impl Host for StdHost {
             {
                 self.payload_registrations.push(PayloadRegistration {
                     direction: "playBidirectional".into(),
+                    mod_id: Value::Ref(None),
                     payload_type: args[1].clone(),
                     codec: args[2].clone(),
                     handler: args[4].clone(),
+                    version: Value::Ref(None),
+                    optional: false,
+                    thread: Value::Ref(None),
                 });
                 Ok(receiver.clone())
             }
@@ -19601,6 +19698,12 @@ impl NativeJar {
         // too, and what this one builds outlives it for the callbacks it
         // registers (`heap.rs`).
         let resident = runtime.adopt_resident_heap();
+        // FML sets ModLoadingContext before class initialization and keeps it
+        // through construction and the stage callback.
+        let active = is_neoforge
+            .then(|| self.mod_annotation_id(&class_name))
+            .flatten();
+        let previous = active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
         let result = (|| -> Result<(), NativeError> {
             runtime.ensure_initialized(&class_name)?;
             // An inherited entrypoint method belongs to the class that
@@ -19631,12 +19734,6 @@ impl NativeJar {
                     .cloned()
                     .ok_or_else(|| NativeError::MissingMethod(format!("{class_name}#<init>")))?;
                 let constructor_args = self.entry_constructor_args(&class_name, &constructor);
-                // FML constructs a mod with its container active (`neoforge_imc.rs`).
-                let active = is_neoforge
-                    .then(|| self.mod_annotation_id(&class_name))
-                    .flatten();
-                let previous =
-                    active.and_then(|id| neoforge_imc::set_active(runtime.host, Some(id)));
                 let constructed = runtime.invoke(
                     &class_name,
                     "<init>",
@@ -19644,9 +19741,6 @@ impl NativeJar {
                     Some(instance.clone()),
                     &constructor_args,
                 );
-                if active.is_some() {
-                    neoforge_imc::set_active(runtime.host, previous.as_deref());
-                }
                 if let Err(error) = constructed {
                     if let NativeError::UncaughtException {
                         class: thrown_class,
@@ -19700,6 +19794,9 @@ impl NativeJar {
             }
             Ok(())
         })();
+        if active.is_some() {
+            neoforge_imc::set_active(runtime.host, previous.as_deref());
+        }
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         let heap = if resident {
@@ -20227,12 +20324,32 @@ impl NativeJar {
     /// edited, or a plan built by hand, cannot register a callback the host
     /// would fail to run. The registrations keep the plans' apply order inside
     /// each hook.
+    fn game_hook_priority(&self, callback_owner: &str) -> i32 {
+        self.classes
+            .get(callback_owner)
+            .and_then(|class| {
+                class.annotations.iter().find_map(|annotation| {
+                    (annotation.descriptor == MIXIN_ANNOTATION_DESCRIPTOR).then(|| {
+                        annotation
+                            .values
+                            .get("priority")
+                            .and_then(|value| match value {
+                                AnnotationValue::Int(priority) => Some(*priority),
+                                _ => None,
+                            })
+                            .unwrap_or(1000)
+                    })
+                })
+            })
+            .unwrap_or(1000)
+    }
+
     pub fn register_game_hooks(
         &self,
         weave: &LoadTimeMixinWeave,
     ) -> Result<GameHookRegistrations, NativeError> {
         let mut registrations = GameHookRegistrations::default();
-        for hook in &weave.game_hooks {
+        for (order, hook) in weave.game_hooks.iter().enumerate() {
             let named = game_hook_site_named(hook.hook, hook.version).ok_or_else(|| {
                 NativeError::Metadata(format!(
                     "game hook plan names {} version {}, which this runtime does not know",
@@ -20283,6 +20400,8 @@ impl NativeJar {
                 anchor: hook.anchor.clone(),
                 cancellable: hook.plan.cancellable,
                 shape: hook.shape,
+                priority: self.game_hook_priority(&hook.plan.callback.owner),
+                order,
             });
         }
         Ok(registrations)
@@ -34442,6 +34561,7 @@ mod tests {
     /// decoder; the call stays counted instead of selecting a wrong template.
     #[test]
     fn subclass_constructors_stay_counted() {
+        let _ = take_test_stdout();
         let mut host = StdHost::new();
         host.set_strict_unknown_host_calls(true);
         let call = MethodRef {
@@ -43850,9 +43970,13 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playToServer".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("payload-type".into())),
                 codec: Value::Ref(Some("stream-codec".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
 
@@ -43965,9 +44089,13 @@ mandatory = true
             host.payload_registrations(),
             &[PayloadRegistration {
                 direction: "playBidirectional".into(),
+                mod_id: Value::Ref(None),
                 payload_type: Value::Ref(Some("message-class".into())),
                 codec: Value::Ref(Some("encoder".into())),
                 handler: Value::Ref(Some("handler".into())),
+                version: Value::Ref(None),
+                optional: false,
+                thread: Value::Ref(None),
             }]
         );
     }
