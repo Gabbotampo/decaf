@@ -21,5 +21,4 @@ public final class Probe {
   }
   public static String trailing() { return one(new Gson(), new StringReader("{\"n\":1} garbage")); }
   public static String twice() { Gson g=new Gson(); StringReader r=new StringReader("{\"n\":8}"); return one(g,r)+"|"+one(g,r); }
-  }
 }
