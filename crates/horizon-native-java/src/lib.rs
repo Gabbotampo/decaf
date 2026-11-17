@@ -4713,20 +4713,23 @@ impl StdHost {
         r: &MethodRef,
         marker: &str,
         args: &[Value],
-    ) -> Result<Option<Value>, NativeError> { eprintln!("LOAD properties_member args={:?}", args);
+    ) -> Result<Option<Value>, NativeError> {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
             ("load", "(Ljava/io/InputStream;)V") => {
-                let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
-                    if let Some((bytes, index)) = self.resource_streams.get_mut(stream) {
-                        let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
-                        *index = bytes.len();
-                        return Some(text);
-                    }
-                    let path = self.io_paths.get(stream)?;
-                    let bytes = self.io_file_bytes.get(path)?;
-                    Some(bytes.iter().map(|b| *b as char).collect())
-                });
+                let source_value = Self::argument(r, args, 0)?;
+                let source = jar_object::object_key(source_value)
+                    .or_else(|| expect_ref(source_value).map(String::as_str))
+                    .and_then(|stream| {
+                        if let Some((bytes, index)) = self.resource_streams.get_mut(stream) {
+                            let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
+                            *index = bytes.len();
+                            return Some(text);
+                        }
+                        let path = self.io_paths.get(stream)?;
+                        let bytes = self.io_file_bytes.get(path)?;
+                        Some(bytes.iter().map(|b| *b as char).collect())
+                    });
                 let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
                 };
@@ -28065,7 +28068,7 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
-    ) -> Result<Option<Value>, NativeError> { eprintln!("LOAD invoke_reader args={:?}", args);
+    ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/util/Properties"
             || r.name != "load"
             || r.descriptor != "(Ljava/io/Reader;)V"
