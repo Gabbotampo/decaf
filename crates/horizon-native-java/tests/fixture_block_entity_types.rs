@@ -5,6 +5,7 @@ const PROBE: &str = include_str!("fixtures/block_entity_types/demo/Probe.java");
 const ORACLE: &str = include_str!("fixtures/block_entity_types/java25.txt");
 const TYPES: &str = include_str!("fixtures/block_entity_types/BlockEntityTypes.java");
 const TYPE: &str = include_str!("fixtures/block_entity_types/BlockEntityType.java");
+const REG: &str = include_str!("fixtures/block_entity_types/BuiltInRegistries.java");
 
 #[test]
 fn block_entity_types_rows_match_java25_oracle() {
