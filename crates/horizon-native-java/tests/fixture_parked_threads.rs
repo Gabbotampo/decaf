@@ -20,9 +20,10 @@ fn null_thread_name_matches_java_25() {
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(
         fixture.text_on(&mut host, "nullName"),
-        "java.lang.NullPointerException:'name' is null"
+        include_str!("fixtures/parked_threads/null_name.java25.txt")
     );
-    assert!(host.unknown_host_calls().is_empty());
+    let unknown = format!("{:?}", host.unknown_host_calls());
+    assert_eq!(unknown, "[]");
 }
 
 fn started_threads_are_counted_and_name_what_never_ran() {
