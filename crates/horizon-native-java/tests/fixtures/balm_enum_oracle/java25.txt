@@ -1,4 +1,0 @@
-A|Probe$Plain|Probe$Plain|true|true|Probe
-A|Probe$Body$1|Probe$Body|false|false|Probe$Body
-B|Probe$Body|Probe$Body|true|true|Probe
-[A, B]
