@@ -1,6 +1,6 @@
 //! Vanilla static fields whose initializers produce host handles.
 
-use crate::{dfu_codec, host_component, host_codec, MethodRef, Value};
+use crate::{MethodRef, Value, dfu_codec, host_codec, host_component};
 
 const COMMON_COMPONENTS: &str = "net/minecraft/network/chat/CommonComponents";
 const IDENTIFIER: &str = "net/minecraft/resources/Identifier";
@@ -11,7 +11,9 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (COMMON_COMPONENTS, "EMPTY", COMPONENT) => Some(host_component::literal("")),
         (IDENTIFIER, "CODEC", CODEC) => Some(host_codec::static_codec(
-            "com/mojang/serialization/Codec", IDENTIFIER, "CODEC",
+            "com/mojang/serialization/Codec",
+            IDENTIFIER,
+            "CODEC",
         )),
         _ => None,
     }
