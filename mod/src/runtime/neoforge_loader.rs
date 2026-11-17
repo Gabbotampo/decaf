@@ -451,12 +451,33 @@ impl StdHost {
                 _ => None,
             };
         }
+        if r.name == "packVersion"
+            && r.descriptor
+                == "(Lnet/minecraft/server/packs/PackType;)Lnet/minecraft/server/packs/metadata/pack/PackFormat;"
+        {
+            let is_data = args
+                .first()
+                .map(|v| format!("{v:?}").contains("SERVER_DATA"))
+                .unwrap_or(false);
+            return Some(loader::world_version_pack(
+                receiver,
+                if is_data { 121 } else { 97 },
+                if is_data { 0 } else { 1 },
+            ));
+        }
         if let Some(name) = loader::world_version_name(receiver) {
             return matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
                 ("name" | "getName", "()Ljava/lang/String;")
             )
             .then(|| Value::Ref(Some(name)));
+        }
+        if let Some((major, minor)) = loader::pack_parts(receiver) {
+            return match (r.name.as_str(), r.descriptor.as_str()) {
+                ("major", "()I") => Some(Value::Int(major)),
+                ("minor", "()I") => Some(Value::Int(minor)),
+                _ => None,
+            };
         }
         None
     }
