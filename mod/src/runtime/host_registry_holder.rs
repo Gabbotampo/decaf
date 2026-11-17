@@ -367,10 +367,19 @@ fn registry_call(
     let registry = crate::runtime::host_registry::registry_id(receiver)?.to_owned();
     match (r.name.as_str(), r.descriptor.as_str()) {
         ("get", "(Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;")
+        | ("getOptional", "(Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;")
         | ("get", "(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;") => {
             let Some(id) = args.first().and_then(|value| id_argument(&registry, value)) else {
                 return Some(host.unknown_host_call(r));
             };
+            if registry == "minecraft:entity_type" {
+                if let Some(value) = crate::runtime::vanilla_entity_types::handle(&id) {
+                    return Some(Ok(crate::runtime::host_optional::optional_wrap(value)));
+                }
+                if id.starts_with("minecraft:") {
+                    return Some(Ok(crate::runtime::host_optional::empty_optional()));
+                }
+            }
             let Some(holder) = observed_holder(host, receiver, &id) else {
                 return Some(host.unknown_host_call(r));
             };
@@ -413,7 +422,7 @@ fn registry_call(
                     return Some(Ok(crate::runtime::host_optional::empty_optional()));
                 }
             }
-            return Some(host.unknown_host_call(r));
+            Some(host.unknown_host_call(r))
         }
         ("getResourceKey", "(Ljava/lang/Object;)Ljava/util/Optional;") => {
             let Some(value) = args.first() else {

@@ -167,6 +167,8 @@ pub(crate) const ENTITY_TYPES: &[&str] = &[
 ];
 
 pub(crate) fn handle(id: &str) -> Option<crate::runtime::Value> {
-    ENTITY_TYPES.binary_search(&id).ok()?;
-    Some(crate::runtime::Value::Ref(Some(format!("game/entity_type/{id}"))))
+    ENTITY_TYPES.contains(&id).then_some(())?;
+    Some(crate::runtime::game_object::server_value(format!(
+        "game/entity_type/{id}"
+    )))
 }

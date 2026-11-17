@@ -167,6 +167,8 @@ pub(crate) const ENTITY_TYPES: &[&str] = &[
 ];
 
 pub(crate) fn handle(id: &str) -> Option<crate::Value> {
-    ENTITY_TYPES.iter().any(|entry| *entry == id).then_some(())?;
-    Some(crate::game_object::server_value(format!("game/entity_type/{id}")))
+    ENTITY_TYPES.contains(&id).then_some(())?;
+    Some(crate::game_object::server_value(format!(
+        "game/entity_type/{id}"
+    )))
 }
