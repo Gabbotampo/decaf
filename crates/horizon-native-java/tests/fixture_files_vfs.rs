@@ -49,7 +49,7 @@ fn files_vfs_matches_java25_oracle() {
     assert_eq!(
         v,
         Value::Ref(Some(
-            include_str!("fixtures/files_vfs/oracle.txt").to_owned()
+            include_str!("fixtures/files_vfs/java25.txt").to_owned()
         ))
     );
 }
