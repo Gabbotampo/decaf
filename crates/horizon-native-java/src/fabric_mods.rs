@@ -102,7 +102,11 @@ fn enum_marker(owner: &str, name: &str) -> Value {
 }
 
 pub(crate) fn enum_constants(owner: &str) -> Option<&'static [&'static str]> {
-    match owner { MOD_ENVIRONMENT => Some(ENVIRONMENTS), CV_TYPE => Some(CV_TYPES), _ => None }
+    match owner {
+        MOD_ENVIRONMENT => Some(ENVIRONMENTS),
+        CV_TYPE => Some(CV_TYPES),
+        _ => None,
+    }
 }
 pub(crate) fn enum_values(owner: &str) -> Option<Vec<Value>> {
     enum_constants(owner).map(|names| names.iter().map(|name| enum_marker(owner, name)).collect())
@@ -703,8 +707,15 @@ impl StdHost {
         let marker = |pointer: String| loader::pointed(Pointed::CustomValue, id, &pointer);
         if r.name == "iterator" && r.descriptor == "()Ljava/util/Iterator;" {
             if let serde_json::Value::Array(items) = value {
-                let values = items.iter().enumerate().map(|(i, v)| loader::custom_value(id, &child(pointer, &i.to_string()), v)).collect();
-                return match self.new_host_iterator(values, None) { Some(iterator) => Ok(iterator), None => self.unknown_host_call(r) };
+                let values = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| loader::custom_value(id, &child(pointer, &i.to_string()), v))
+                    .collect();
+                return match self.new_host_iterator(values, None) {
+                    Some(iterator) => Ok(iterator),
+                    None => self.unknown_host_call(r),
+                };
             }
             if let serde_json::Value::Object(entries) = value {
                 let mut pairs = Vec::with_capacity(entries.len() * 2);
@@ -712,8 +723,15 @@ impl StdHost {
                     pairs.push(text(key.clone()));
                     pairs.push(loader::custom_value(id, &child(pointer, key), child_value));
                 }
-                let entries = self.mint_map_entries(&Value::Ref(None), &pairs, crate::host_map_entry::EntryMade::Holder);
-                return match self.new_host_iterator(entries, None) { Some(iterator) => Ok(iterator), None => self.unknown_host_call(r) };
+                let entries = self.mint_map_entries(
+                    &Value::Ref(None),
+                    &pairs,
+                    crate::host_map_entry::EntryMade::Holder,
+                );
+                return match self.new_host_iterator(entries, None) {
+                    Some(iterator) => Ok(iterator),
+                    None => self.unknown_host_call(r),
+                };
             }
         }
         match (r.name.as_str(), r.descriptor.as_str(), value) {
