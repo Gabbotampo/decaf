@@ -212,7 +212,7 @@ impl<H: Host> Runtime<'_, H> {
                     name: method.into(),
                     descriptor: "()Ljava/lang/Object;".into(),
                 },
-                receiver,
+                receiver.expect("entry receiver"),
                 args,
             )?;
             return Ok(Some(if r.name == "getBooleanValue" {
