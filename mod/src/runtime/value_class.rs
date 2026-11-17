@@ -124,13 +124,17 @@ pub(crate) enum Shape {
 }
 
 pub(crate) fn string_shape(marker: &str) -> Shape {
-    if marker.starts_with("abc/hcb:") {
-        Shape::Undecidable
-    } else if is_plain_string(marker) {
-        Shape::String
-    } else {
-        Shape::Marker
+    if is_plain_string(marker) {
+        return Shape::String;
     }
+    // Unregistered text-marker families: a runtime-built spelling may be a
+    // marker or a jar String (#156 P17), so String checks are counted.
+    if marker.starts_with("enum/") || marker.starts_with("game/") || marker.starts_with("list/") {
+        return Shape::Undecidable;
+    }
+    // Callback/object/stream families have registries; absent an entry, text
+    // is exact String data.
+    Shape::String
 }
 
 pub(crate) fn is_plain_string(marker: &str) -> bool {
