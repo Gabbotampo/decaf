@@ -71,27 +71,49 @@ fn invoke_atomic_boolean<H: Host>(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
-    let Some(marker) = receiver.and_then(expect_ref) else { return Ok(None); };
+    let Some(marker) = receiver.and_then(expect_ref) else {
+        return Ok(None);
+    };
     let key = state_key(marker, "#atomicBoolean");
     match (r.name.as_str(), r.descriptor.as_str()) {
-        ("<init>", "()V") => { rt.fields.insert(key, Value::Int(0)); Ok(Some(Value::Void)) }
+        ("<init>", "()V") => {
+            rt.fields.insert(key, Value::Int(0));
+            Ok(Some(Value::Void))
+        }
         ("<init>", "(Z)V") => {
             let value = expect_int(r, args.first().unwrap_or(&Value::Int(0)))? != 0;
-            rt.fields.insert(key, Value::Int(i32::from(value))); Ok(Some(Value::Void))
+            rt.fields.insert(key, Value::Int(i32::from(value)));
+            Ok(Some(Value::Void))
         }
         _ => {
-            let Some(Value::Int(current)) = rt.fields.get(&key).cloned() else { return Ok(None); };
+            let Some(Value::Int(current)) = rt.fields.get(&key).cloned() else {
+                return Ok(None);
+            };
             let value = match (r.name.as_str(), r.descriptor.as_str()) {
                 ("get", "()Z") | ("getPlain", "()Z") | ("getAcquire", "()Z") => Value::Int(current),
                 ("set" | "lazySet" | "setPlain" | "setRelease", "(Z)V") => {
-                    let next = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?; rt.fields.insert(key, Value::Int(i32::from(next != 0))); Value::Void
+                    let next = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+                    rt.fields.insert(key, Value::Int(i32::from(next != 0)));
+                    Value::Void
                 }
                 ("compareAndSet", "(ZZ)Z") => {
-                    let expect = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?; let update = expect_int(r, args.get(1).unwrap_or(&Value::Int(0)))?;
-                    if current == expect { rt.fields.insert(key, Value::Int(i32::from(update != 0))); Value::Int(1) } else { Value::Int(0) }
+                    let expect = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+                    let update = expect_int(r, args.get(1).unwrap_or(&Value::Int(0)))?;
+                    if current == expect {
+                        rt.fields.insert(key, Value::Int(i32::from(update != 0)));
+                        Value::Int(1)
+                    } else {
+                        Value::Int(0)
+                    }
                 }
-                ("getAndSet", "(Z)Z") => { let update = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?; rt.fields.insert(key, Value::Int(i32::from(update != 0))); Value::Int(current) }
-                ("toString", "()Ljava/lang/String;") => Value::Ref(Some((current != 0).to_string())),
+                ("getAndSet", "(Z)Z") => {
+                    let update = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+                    rt.fields.insert(key, Value::Int(i32::from(update != 0)));
+                    Value::Int(current)
+                }
+                ("toString", "()Ljava/lang/String;") => {
+                    Value::Ref(Some((current != 0).to_string()))
+                }
                 _ => return Ok(None),
             };
             Ok(Some(value))
