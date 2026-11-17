@@ -4720,13 +4720,19 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("load", "(Ljava/io/Reader;)V") => return self.unknown_host_call(r).map(Some),
             ("load", "(Ljava/io/InputStream;)V") => {
-                let source = expect_ref(Self::argument(r, args, 0)?).and_then(|stream| {
-                    self.resource_streams.get_mut(stream).map(|(bytes, index)| {
-                        let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
-                        *index = bytes.len();
-                        text
-                    })
-                });
+                let source_value = Self::argument(r, args, 0)?;
+                let source = jar_object::object_key(source_value)
+                    .or_else(|| expect_ref(source_value).map(String::as_str))
+                    .and_then(|stream| {
+                        if let Some((bytes, index)) = self.resource_streams.get_mut(stream) {
+                            let text: String = bytes[*index..].iter().map(|b| *b as char).collect();
+                            *index = bytes.len();
+                            return Some(text);
+                        }
+                        let path = self.io_paths.get(stream)?;
+                        let bytes = self.io_file_bytes.get(path)?;
+                        Some(bytes.iter().map(|b| *b as char).collect())
+                    });
                 let Some(text) = source else {
                     return self.unknown_host_call(r).map(Some);
                 };
@@ -4792,8 +4798,25 @@ impl StdHost {
                 values.extend([key, value]);
                 Ok(Some(Value::Ref(None)))
             }
-            ("stringPropertyNames", "()Ljava/util/Set;")
-            | ("keys", "()Ljava/util/Enumeration;")
+            ("stringPropertyNames", "()Ljava/util/Set;") => {
+                let values = self
+                    .mutable_collections
+                    .get(marker)
+                    .map(|pairs| {
+                        pairs
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .filter_map(|pair| match &pair[0] {
+                                Value::Ref(Some(k)) => Some(Value::Ref(Some(k.clone()))),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Ok(Some(self.new_collection("java/util/LinkedHashSet", values)))
+            }
+            ("keys", "()Ljava/util/Enumeration;")
             | ("propertyNames", "()Ljava/util/Enumeration;")
             | ("keySet", "()Ljava/util/Set;")
             | ("values", "()Ljava/util/Collection;") => self.unknown_host_call(r).map(Some),
@@ -19915,6 +19938,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20130,6 +20154,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -20301,6 +20326,7 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
@@ -22512,6 +22538,7 @@ struct Runtime<'a, H> {
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
+    io_stream_paths: BTreeMap<String, String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
@@ -26724,6 +26751,8 @@ impl<H: Host> Runtime<'_, H> {
             });
         };
         self.string_readers.insert(marker.to_owned(), text);
+        self.io_stream_paths
+            .insert(marker.to_owned(), path.to_owned());
         Ok(())
     }
 
@@ -27135,7 +27164,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedReader");
-                        if let Some(reader) = expect_ref(&value) {
+                        if let Some(reader) = jar_object::object_key(&value) {
                             self.io_open_reader(r, reader, &path, false)?;
                         }
                         value
@@ -27144,7 +27173,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/BufferedWriter");
-                        if let Some(writer) = expect_ref(&value) {
+                        if let Some(writer) = jar_object::object_key(&value) {
                             self.io_open_writer(writer, Some(path), true)?;
                             self.io_set_writer_charset(writer, args);
                         }
@@ -27154,7 +27183,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileInputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_reader(r, stream, &path, false)?;
                         }
                         value
@@ -27163,7 +27192,7 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         let value = self.new_object("java/io/FileOutputStream");
-                        if let Some(stream) = expect_ref(&value) {
+                        if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_writer(stream, Some(path), true)?;
                         }
                         value
@@ -28068,7 +28097,10 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != "java/util/Properties"
             || r.name != "load"
-            || r.descriptor != "(Ljava/io/Reader;)V"
+            || !matches!(
+                r.descriptor.as_str(),
+                "(Ljava/io/Reader;)V" | "(Ljava/io/InputStream;)V"
+            )
         {
             return Ok(None);
         }
@@ -28083,10 +28115,27 @@ impl<H: Host> Runtime<'_, H> {
         ) else {
             return Ok(None);
         };
-        let Some(text) = self.string_readers.remove(reader) else {
-            return Ok(None);
+        let text = if r.descriptor == "(Ljava/io/InputStream;)V" {
+            // A stream `Files.newInputStream`/`FileInputStream` opened over a file the
+            // invocation wrote: `io_open_reader` recorded its path. `load(InputStream)`
+            // reads the file's bytes as ISO-8859-1, one char per byte, to the end.
+            let Some(path) = self.io_stream_paths.get(reader).cloned() else {
+                return Ok(None);
+            };
+            let Some(bytes) = self.io_file_bytes.get(&path) else {
+                return Ok(None);
+            };
+            let text = bytes.iter().map(|b| char::from(*b)).collect::<String>();
+            // Consumed: a later read sees the end of the stream.
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
+        } else {
+            let Some(text) = self.string_readers.remove(reader) else {
+                return Ok(None);
+            };
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
         };
-        self.string_readers.insert(reader.to_owned(), String::new());
         let entries = properties_entries(&text).map_err(|m| NativeError::UncaughtException {
             class: "java/lang/IllegalArgumentException".into(),
             message: Some(m),
@@ -28104,29 +28153,6 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        if r.owner == "java/util/Properties"
-            && r.name == "load"
-            && r.descriptor == "(Ljava/io/Reader;)V"
-        {
-            let (Some(receiver), Some(reader)) = (
-                receiver.and_then(expect_ref),
-                args.first().and_then(jar_object::object_key),
-            ) else {
-                return Ok(None);
-            };
-            let Some(text) = self.string_readers.remove(reader) else {
-                return Ok(None);
-            };
-            self.string_readers.insert(reader.to_owned(), String::new());
-            let entries =
-                properties_entries(&text).map_err(|m| NativeError::UncaughtException {
-                    class: "java/lang/IllegalArgumentException".into(),
-                    message: Some(m),
-                    frame: None,
-                })?;
-            self.host.properties_put_all(receiver, entries);
-            return Ok(Some(Value::Void));
-        }
         // `java.io.StringReader` is the Reader a config bootstrap builds for
         // `Gson.fromJson(Reader, Class)`; its text lives beside the reader
         // marker for that call.
@@ -36100,6 +36126,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -36172,6 +36199,7 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43324,6 +43352,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43538,6 +43567,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -43727,6 +43757,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -44092,6 +44123,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -44401,6 +44433,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49668,6 +49701,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
@@ -49727,6 +49761,7 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),

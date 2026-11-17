@@ -28113,13 +28113,19 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         let text = if r.descriptor == "(Ljava/io/InputStream;)V" {
-            let Some(path) = self.io_paths.get(reader) else {
+            // A stream `Files.newInputStream`/`FileInputStream` opened over a file the
+            // invocation wrote: `io_open_reader` recorded its path. `load(InputStream)`
+            // reads the file's bytes as ISO-8859-1, one char per byte, to the end.
+            let Some(path) = self.io_stream_paths.get(reader).cloned() else {
                 return Ok(None);
             };
-            let Some(bytes) = self.io_file_bytes.get(path) else {
+            let Some(bytes) = self.io_file_bytes.get(&path) else {
                 return Ok(None);
             };
-            bytes.iter().map(|b| *b as char).collect::<String>()
+            let text = bytes.iter().map(|b| char::from(*b)).collect::<String>();
+            // Consumed: a later read sees the end of the stream.
+            self.string_readers.insert(reader.to_owned(), String::new());
+            text
         } else {
             let Some(text) = self.string_readers.remove(reader) else {
                 return Ok(None);
@@ -28144,29 +28150,6 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        if r.owner == "java/util/Properties"
-            && r.name == "load"
-            && r.descriptor == "(Ljava/io/Reader;)V"
-        {
-            let (Some(receiver), Some(reader)) = (
-                receiver.and_then(expect_ref),
-                args.first().and_then(jar_object::object_key),
-            ) else {
-                return Ok(None);
-            };
-            let Some(text) = self.string_readers.remove(reader) else {
-                return Ok(None);
-            };
-            self.string_readers.insert(reader.to_owned(), String::new());
-            let entries =
-                properties_entries(&text).map_err(|m| NativeError::UncaughtException {
-                    class: "java/lang/IllegalArgumentException".into(),
-                    message: Some(m),
-                    frame: None,
-                })?;
-            self.host.properties_put_all(receiver, entries);
-            return Ok(Some(Value::Void));
-        }
         // `java.io.StringReader` is the Reader a config bootstrap builds for
         // `Gson.fromJson(Reader, Class)`; its text lives beside the reader
         // marker for that call.
