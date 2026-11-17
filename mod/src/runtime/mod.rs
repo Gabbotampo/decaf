@@ -10035,6 +10035,10 @@ impl Host for StdHost {
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
+            if r.owner == java / util / stream / Stream {
+                self.iterator_sources
+                    .insert(marker.clone(), java / util / stream / Stream.into());
+            }
             // An `Arrays.asList` view's iterator reads its array live.
             if let Some(view) = expect_ref(receiver) {
                 let view = view.clone();
@@ -10078,6 +10082,7 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            eprintln!("REMOVE handler marker={marker}");
             if r.name == "remove" && r.descriptor == "()V" {
                 let source = self.iterator_sources.get(marker).map(String::as_str);
                 if source.is_some_and(|source| {

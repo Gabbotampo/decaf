@@ -704,6 +704,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                     &[],
                 )?;
                 if let Some(marker) = crate::expect_ref(&iterator) {
+                    eprintln!("TAG stream iterator {marker}");
                     self.host
                         .set_host_iterator_source(marker, "java/util/stream/Stream".into());
                 }
