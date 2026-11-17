@@ -26431,6 +26431,17 @@ impl<H: Host> Runtime<'_, H> {
                 let seeded_text =
                     library_dispatch::resource_text(self.host, path.trim_start_matches('/'));
                 let present = self.io_files.contains_key(&path) || seeded_text.is_some();
+                let is_dir = self.io_dirs.contains(&path) || path == "/horizon/game";
+                if args
+                    .first()
+                    .is_some_and(|value| matches!(value, Value::Ref(None)))
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("null".into()),
+                        frame: None,
+                    });
+                }
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
@@ -26451,7 +26462,7 @@ impl<H: Host> Runtime<'_, H> {
                     ("isDirectory", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        Value::Int(i32::from(self.io_dirs.contains(&path)))
+                        Value::Int(i32::from(is_dir))
                     }
                     ("isRegularFile", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
@@ -26542,7 +26553,19 @@ impl<H: Host> Runtime<'_, H> {
                         } else {
                             self.watch_created(&path);
                         }
-                        self.io_dirs.insert(path.clone());
+                        let mut current = path.clone();
+                        loop {
+                            self.io_dirs.insert(current.clone());
+                            self.io_files.entry(current.clone()).or_default();
+                            let Some((parent, _)) = current.rsplit_once('/') else {
+                                break;
+                            };
+                            if parent.is_empty() || parent == "/horizon/game" {
+                                break;
+                            }
+                            current = parent.to_owned();
+                        }
+                        self.io_dirs.insert("/horizon/game".to_owned());
                         self.io_files.entry(path.clone()).or_default();
                         self.io_file_bytes.entry(path).or_default();
                         args.first().cloned().unwrap_or(Value::Ref(None))
