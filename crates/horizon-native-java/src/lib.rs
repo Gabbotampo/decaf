@@ -7314,6 +7314,9 @@ impl Host for StdHost {
                 if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
                     return self.unknown_host_call(r);
                 }
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 if text.contains('\u{FFFD}') {
                     return self.unknown_host_call(r);
@@ -7816,6 +7819,9 @@ impl Host for StdHost {
                     "literal" | "translatable" | "translatableEscape" | "translatableWithFallback"
                 ) && descriptor.ends_with("Lnet/minecraft/network/chat/MutableComponent;") =>
             {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 let kind = if name == "literal" {
                     "literal"
@@ -7868,6 +7874,9 @@ impl Host for StdHost {
                 "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
             )
             | ("java/nio/file/Path", "of", "(Ljava/lang/String;)Ljava/nio/file/Path;") => {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 if !host_path::encodable(text) {
                     self.unknown_host_call(r)?;
@@ -7901,6 +7910,9 @@ impl Host for StdHost {
             // Text `URI` refuses (its message names the component) or this model does
             // not parse exactly is counted (`host_jdk_value::uri_parts`).
             ("java/net/URI", "create" | "parse", "(Ljava/lang/String;)Ljava/net/URI;") => {
+                if matches!(Self::argument(r, args, 0)?, Value::Ref(None)) {
+                    return self.unknown_host_call(r);
+                }
                 let text = expect_string(Self::argument(r, args, 0)?);
                 if host_jdk_value::uri_parts(text).is_none() {
                     return self.unknown_host_call(r);
