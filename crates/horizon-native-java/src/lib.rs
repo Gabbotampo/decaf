@@ -24370,6 +24370,12 @@ impl<H: Host> Runtime<'_, H> {
                             return self.host.unknown_operand_call(r).map(Some);
                         }
                         Value::Ref(Some(text)) => text,
+                        Value::Boxed(boxed) if class.starts_with("[L") => boxed.text(),
+                        Value::Int(_) | Value::Long(_) | Value::Float(_)
+                            if class.starts_with("[L") =>
+                        {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         Value::Int(value) if class.ends_with('Z') => (value != 0).to_string(),
                         Value::Int(value) if class.ends_with('C') => {
                             let Some(character) = char::from_u32(value as u32) else {

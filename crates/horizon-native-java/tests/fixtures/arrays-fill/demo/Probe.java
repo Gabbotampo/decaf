@@ -12,7 +12,8 @@ public class Probe {
   row(s,"float",()->{float[] a={1,-1};Arrays.fill(a,-0.0F);s.append(Arrays.toString(a));});
   row(s,"double",()->{double[] a={1,-1};Arrays.fill(a,Double.NaN);s.append(Arrays.toString(a));});
   row(s,"object",()->{Object[] a={null,null};Arrays.fill(a,"x");s.append(Arrays.toString(a));});
-  row(s,"object-nonstr",()->{Object[] a={Integer.valueOf(1)};s.append(Arrays.toString(a));});
+  row(s,"object-nonstr",()->{Object[] a={new Object()};s.append(Arrays.toString(a));});
+  row(s,"object-boxed",()->{Object[] a={true,'x',1};s.append(Arrays.toString(a));});
   row(s,"char-surrogate",()->{char[] a={'x'};Arrays.fill(a,'\uD800');s.append(Arrays.toString(a));});
   row(s,"range",()->{int[] a={1,2,3,4};Arrays.fill(a,1,3,7);s.append(Arrays.toString(a));});
   row(s,"from-negative",()->Arrays.fill(new int[2],-1,1,4));
