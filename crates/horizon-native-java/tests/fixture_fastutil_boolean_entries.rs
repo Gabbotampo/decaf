@@ -5,7 +5,7 @@ const ORACLE: &str = include_str!("fixtures/fastutil_boolean_entries/java25.txt"
 const STUBS: &[(&str, &str)] = &[
     (
         "it/unimi/dsi/fastutil/objects/Object2BooleanMap.java",
-        r#"package it.unimi.dsi.fastutil.objects; public interface Object2BooleanMap<K> { interface Entry<K> { K getKey(); boolean getBooleanValue(); } }"#,
+        r#"package it.unimi.dsi.fastutil.objects; public interface Object2BooleanMap<K> { interface Entry<K> extends java.lang.Iterable<Entry<K>> { K getKey(); boolean getBooleanValue(); } }"#,
     ),
     (
         "it/unimi/dsi/fastutil/objects/Object2BooleanLinkedOpenHashMap.java",
