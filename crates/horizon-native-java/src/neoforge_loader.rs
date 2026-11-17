@@ -399,7 +399,11 @@ impl StdHost {
                 (
                     "registerExtensionPoint",
                     "(Ljava/lang/Class;Lnet/neoforged/fml/IExtensionPoint;)V",
-                ) => None,
+                ) => Some(Value::Void),
+                (
+                    "registerExtensionPoint",
+                    "(Ljava/lang/Class;Ljava/util/function/Supplier;)V",
+                ) => Some(Value::Void),
                 _ => None,
             };
         }
