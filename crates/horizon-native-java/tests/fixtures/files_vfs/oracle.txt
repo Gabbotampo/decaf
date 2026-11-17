@@ -1,1 +1,1 @@
-dir0=false\ndir1=true,isDir=true,isReg=false,read=true,sym=false,exec=true\nfile=true,isDir=false,isReg=true,read=true,sym=false,exec=false,text=hello\nlist=1\nafterDelete=false,not=true\nmissing=false,not=true,read=false,sym=false,exec=false
+dir0=false\ndir1=true,isDir=true,isReg=false,read=true,sym=false,exec=true\nfile=true,isDir=false,isReg=true,read=true,sym=false,exec=false,text=hello\nlist=[sub/x.txt]\nafterDelete=false,not=true\nmissing=false,not=true,read=false,sym=false,exec=false
