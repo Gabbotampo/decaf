@@ -1225,12 +1225,13 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
     /// none.
     pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        let unmodifiable = state.unmodifiable;
         match state.finish() {
             Ok(map) => Ok(map),
             Err(entries) => self.factory_or_count(
                 &crate::stream_pipeline::wanted(
-                    "com/google/common/collect/ImmutableMap",
-                    "toImmutableMap",
+                    if unmodifiable { "java/util/stream/Collectors" } else { "com/google/common/collect/ImmutableMap" },
+                    if unmodifiable { "toUnmodifiableMap" } else { "toImmutableMap" },
                     "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
                 ),
                 "map",
