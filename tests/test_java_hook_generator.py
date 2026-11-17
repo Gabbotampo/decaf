@@ -20,8 +20,18 @@ class JavaHookGeneratorTests(unittest.TestCase):
             ]
         }
         target = "sunrise_client::game::melee::Game::attack"
-        self.functions = {"functions": [{"path": target}]}
-        self.points = {"points": [{"path": target, "api_refusal": None, "signature_hash": "abc123"}]}
+        self.functions = {
+            "schema": 1,
+            "build": {"commit": "fixture"},
+            "crates": {},
+            "functions": {target: {"module": "game", "file": "game.rs", "span": [0, 1], "signature_hash": "abc123", "sha256": "deadbeef"}},
+            "refused": {},
+        }
+        self.points = {
+            "schema": 1,
+            "build": {"commit": "fixture"},
+            "points": [{"api_refusal": None, "args": [], "at_return": False, "host": "none", "listener": "listener", "name": "attack", "raw": True, "raw_shape": {"args": [], "outcome": "cancel", "outcome_record_mutable": True, "receiver": {"kind": "none", "ty": None, "write_back": False}, "return_class": "plain", "return_record_mutable": False, "return_ty": "()"}, "record": "Args", "return_listener": "return_listener", "return_ty": "()", "returns": "cancel", "side": "none", "target": target}],
+        }
 
     def test_exact_point_and_stated_difference_hook_emit(self):
         plan = generator.generate(self.mapping, self.functions, self.points)
@@ -35,9 +45,32 @@ class JavaHookGeneratorTests(unittest.TestCase):
 
     def test_refused_or_stale_points_fail_closed(self):
         target = self.mapping["rows"][0]["sunrise"]
-        plan = generator.generate(self.mapping, {"functions": [{"path": target}]}, {"points": [{"path": target, "api_refusal": "Hit has no API type"}]})
+        refused = dict(self.points["points"][0], api_refusal="Hit has no API type")
+        plan = generator.generate(self.mapping, self.functions, {**self.points, "points": [refused]})
         self.assertEqual(plan["inject"], [])
         self.assertTrue(any("refused point" in error for error in plan["errors"]))
+
+    def test_head_return_emits_two_rows_not_replace(self):
+        row = dict(self.mapping["rows"][0], anchor="HEAD/RETURN; cancellable result")
+        plan = generator.generate({"rows": [row]}, self.functions, self.points)
+        self.assertEqual([item["kind"] for item in plan["inject"]], ["head", "return"])
+        self.assertNotIn("replace", {item["kind"] for item in plan["inject"]})
+
+    def test_tail_maps_to_return_with_note(self):
+        row = dict(self.mapping["rows"][0], anchor="TAIL; result")
+        plan = generator.generate({"rows": [row]}, self.functions, self.points)
+        self.assertEqual(plan["inject"][0]["kind"], "return")
+        self.assertIn("TAIL mapped", plan["inject"][0]["note"])
+
+    def test_refusal_anchor_is_not_emitted_as_head(self):
+        row = dict(self.mapping["rows"][0], anchor="HEAD; no row emitted")
+        plan = generator.generate({"rows": [row]}, self.functions, self.points)
+        self.assertEqual(plan["inject"], [])
+        self.assertTrue(any("invalid point anchor" in error for error in plan["errors"]))
+
+    def test_index_shape_is_pinned(self):
+        with self.assertRaises(ValueError):
+            generator.generate(self.mapping, {"functions": []}, self.points)
 
     def test_cli_shape_is_deterministic(self):
         plan = generator.generate(self.mapping, self.functions, self.points)

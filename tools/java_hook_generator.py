@@ -15,45 +15,59 @@ from pathlib import Path
 from typing import Any
 
 
-def _items(value: Any, keys: tuple[str, ...]) -> list[dict[str, Any]]:
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, dict)]
-    if isinstance(value, dict):
-        for key in keys:
-            if isinstance(value.get(key), list):
-                return [item for item in value[key] if isinstance(item, dict)]
-        return [dict(item, path=key) for key, item in value.items() if isinstance(item, dict)]
-    return []
+FUNCTION_KEYS = {"module", "file", "span", "signature_hash", "sha256"}
+POINT_KEYS = {"api_refusal", "args", "at_return", "host", "listener", "name", "raw", "raw_shape", "record", "return_listener", "return_ty", "returns", "side", "target"}
 
 
-def _path(item: dict[str, Any]) -> str | None:
-    for key in ("path", "target", "function", "at", "name"):
-        value = item.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
+def _header(value: Any, keys: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValueError(f"{name} must have exactly {sorted(keys)}")
+    if value.get("schema") != 1 or not isinstance(value.get("build"), dict):
+        raise ValueError(f"{name} must have schema=1 and a build object")
+    if not isinstance(value["build"].get("commit"), str):
+        raise ValueError(f"{name}.build.commit must be a string")
+    return value
 
 
-def _index(value: Any, keys: tuple[str, ...]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for item in _items(value, keys):
-        path = _path(item)
-        if path:
-            result[path] = item
+def _function_index(value: Any) -> dict[str, dict[str, Any]]:
+    value = _header(value, {"schema", "build", "crates", "functions", "refused"}, "functions.json")
+    if not isinstance(value["functions"], dict) or not isinstance(value["refused"], dict):
+        raise ValueError("functions.json functions/refused must be objects")
+    result = {}
+    for path, item in value["functions"].items():
+        if not isinstance(path, str) or not isinstance(item, dict) or set(item) != FUNCTION_KEYS:
+            raise ValueError(f"functions.json.functions[{path!r}] has the wrong shape")
+        result[path] = item
     return result
 
 
-def _phase(anchor: str) -> str | None:
-    value = anchor.split(";", 1)[0].strip().upper()
-    if value == "HEAD":
-        return "head"
-    if value == "RETURN":
-        return "return"
-    if value == "TAIL":
-        return "tail"
-    if value in {"HEAD/RETURN", "RETURN/HEAD", "HEAD/TAIL", "RETURN/TAIL"}:
-        return "replace"
-    return None
+def _point_index(value: Any) -> dict[str, dict[str, Any]]:
+    value = _header(value, {"schema", "build", "points"}, "points.json")
+    if not isinstance(value["points"], list):
+        raise ValueError("points.json points must be an array")
+    result = {}
+    for item in value["points"]:
+        if not isinstance(item, dict) or set(item) != POINT_KEYS or not isinstance(item.get("target"), str):
+            raise ValueError("points.json point has the wrong shape")
+        result[item["target"]] = item
+    return result
+
+
+def _phases(anchor: str) -> list[tuple[str, str | None]]:
+    raw, _, note = anchor.partition(";")
+    raw = raw.strip().upper()
+    note = note.strip()
+    if note and any(word in note.lower() for word in ("refusal", "no row", "unavailable")):
+        return []
+    if raw == "HEAD":
+        return [("head", note or None)]
+    if raw == "RETURN":
+        return [("return", note or None)]
+    if raw == "TAIL":
+        return [("return", "TAIL mapped to Sunrise RETURN" + (f"; {note}" if note else ""))]
+    if raw in {"HEAD/RETURN", "RETURN/HEAD", "HEAD/TAIL", "RETURN/TAIL"}:
+        return [("head", note or None), ("return", note or None)]
+    return []
 
 
 def _slug(vanilla: str, phase: str) -> str:
@@ -76,7 +90,7 @@ def _is_no_fit(row: dict[str, Any]) -> bool:
 
 
 def _point_candidate(row: dict[str, Any]) -> bool:
-    return "::" in str(row.get("sunrise", "")) and _phase(str(row.get("anchor", ""))) is not None
+    return "::" in str(row.get("sunrise", "")) and bool(_phases(str(row.get("anchor", ""))))
 
 
 def _candidate_order(row: dict[str, Any]) -> tuple[int, int]:
@@ -86,8 +100,8 @@ def _candidate_order(row: dict[str, Any]) -> tuple[int, int]:
 
 def generate(mapping: Any, functions: Any, points: Any) -> dict[str, Any]:
     rows = mapping.get("rows", []) if isinstance(mapping, dict) else mapping
-    function_index = _index(functions, ("functions", "items", "entries"))
-    point_index = _index(points, ("points", "items", "entries"))
+    function_index = _function_index(functions)
+    point_index = _point_index(points)
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict) or _is_no_fit(row):
@@ -101,7 +115,10 @@ def generate(mapping: Any, functions: Any, points: Any) -> dict[str, Any]:
         selected = None
         for row in sorted(candidates, key=_candidate_order):
             target = str(row.get("sunrise", ""))
-            phase = _phase(str(row.get("anchor", "")))
+            phases = _phases(str(row.get("anchor", "")))
+            if "::" in target and not phases:
+                errors.append(f"invalid point anchor: {row.get('anchor')}")
+                continue
             if not _point_candidate(row):
                 selected = ("hook", row, None)
                 break
@@ -123,28 +140,22 @@ def generate(mapping: Any, functions: Any, points: Any) -> dict[str, Any]:
         kind, row, point = selected
         method, descriptor = _method(row)
         common = {
-            "id": _slug(row["vanilla"], _phase(str(row.get("anchor", ""))) or "hook"),
             "method": method,
             "descriptor": descriptor,
             "fit": _fit(row),
             "evidence": str(row.get("evidence", "")),
         }
         if kind == "inject":
-            phase = _phase(str(row["anchor"]))
-            entry = {
-                **common,
-                "at": str(row["sunrise"]),
-                "kind": phase,
-                "with": common["id"],
-            }
-            signature = point.get("signature_hash") or point.get("hash")
-            if signature:
-                entry["hash"] = signature
-            if common["fit"] != "EXACT FIT":
-                entry["note"] = common["evidence"]
-            inject.append(entry)
+            signature = function_index[str(row["sunrise"])].get("signature_hash") or point.get("signature_hash") or point.get("hash")
+            for phase, note in _phases(str(row["anchor"])):
+                entry = {**common, "id": _slug(row["vanilla"], phase), "at": str(row["sunrise"]), "kind": phase, "with": _slug(row["vanilla"], phase)}
+                if signature:
+                    entry["hash"] = signature
+                if note or common["fit"] != "EXACT FIT":
+                    entry["note"] = note or common["evidence"]
+                inject.append(entry)
         else:
-            hooks.append({**common, "target": str(row["sunrise"]), "note": common["evidence"]})
+            hooks.append({**common, "id": _slug(row["vanilla"], "hook"), "target": str(row["sunrise"]), "note": common["evidence"]})
 
     inject.sort(key=lambda item: item["id"])
     hooks.sort(key=lambda item: item["id"])
@@ -177,7 +188,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--points", required=True, type=Path)
     parser.add_argument("-o", "--output", type=Path)
     args = parser.parse_args(argv)
-    plan = generate(json.loads(args.mapping.read_text()), json.loads(args.functions.read_text()), json.loads(args.points.read_text()))
+    try:
+        plan = generate(json.loads(args.mapping.read_text()), json.loads(args.functions.read_text()), json.loads(args.points.read_text()))
+    except ValueError as error:
+        print(f"java-hook-generator: {error}", file=sys.stderr)
+        return 2
     if plan["errors"]:
         for error in plan["errors"]:
             print(f"java-hook-generator: {error}", file=sys.stderr)
