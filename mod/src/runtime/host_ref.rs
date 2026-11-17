@@ -2642,7 +2642,7 @@ const KINDS: &[KindInfo] = &[
         tag: "rpat",
         class: ClassRule::Fixed("java/util/regex/Pattern"),
         canonical: always_canonical,
-        methods: &crate::host_jdk_constant::PATTERN_METHODS,
+        methods: &crate::runtime::host_jdk_constant::PATTERN_METHODS,
     },
     KindInfo {
         kind: HostKind::Url,
