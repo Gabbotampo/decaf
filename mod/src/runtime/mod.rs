@@ -26580,7 +26580,13 @@ impl<H: Host> Runtime<'_, H> {
                         let option_names = args
                             .last()
                             .and_then(|value| self.owned_array(value))
-                            .map(|values| values.iter().filter_map(expect_ref).collect::<Vec<_>>())
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(expect_ref)
+                                    .map(str::to_owned)
+                                    .collect::<Vec<_>>()
+                            })
                             .unwrap_or_default();
                         let create_new =
                             option_names.iter().any(|name| name.contains("/CREATE_NEW"));
