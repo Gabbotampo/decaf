@@ -64,7 +64,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// One element of the `Object[]`, classed as `Object.getClass` would
     /// class it (`class_of_value`).
-    fn format_arg(&mut self, value: &Value) -> Arg {
+    fn format_arg(&mut self, value: &Value) -> Result<Arg, NativeError> {
         // Java dispatches %s on Formattable through the jar object's
         // formatTo(Formatter, flags, width, precision), not toString(). The
         // bounded runtime does not yet execute that callback, so refuse the
@@ -79,7 +79,7 @@ impl<H: Host> Runtime<'_, H> {
                 None => handle.kind() == crate::runtime::host_ref::HostKind::JarObject,
             }
         {
-            return Arg::Opaque;
+            return Ok(Arg::Opaque);
         }
         let marker = match value {
             Value::Ref(None) => return Arg::Null,
@@ -108,10 +108,10 @@ impl<H: Host> Runtime<'_, H> {
         // refused here and counted by the host.
         if crate::runtime::jar_object::packaged_object_class(value).is_some() {
             return match self.jar_to_string(value, "java/util/Formatter", "format") {
-                Ok(Some(Value::Ref(Some(text)))) => Arg::Str(text),
-                Ok(Some(Value::Ref(None))) => Arg::Null,
-                Ok(Some(_)) => Arg::Opaque,
-                Ok(None) | Err(_) => Arg::Opaque,
+                Ok(Some(Value::Ref(Some(text)))) => Ok(Arg::Str(text)),
+                Ok(Some(Value::Ref(None))) => Ok(Arg::Null),
+                Ok(Some(_)) => Ok(Arg::Opaque),
+                Ok(None) | Err(_) => Ok(Arg::Opaque),
             };
         }
         // A model object whose `toString` the host answers; anything else
