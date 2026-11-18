@@ -40,6 +40,11 @@ public final class Probe {
   public static String chmIterate() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("b"); s.add("a"); return s.toString(); }
   public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(); return "counted"; }
   public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.stream(); return "counted"; }
+  public static String chmParallelStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.parallelStream(); return "counted"; }
+  public static String chmSpliterator() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.spliterator(); return "counted"; }
+  public static String chmRemoveNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.remove(null)); }
+  public static String chmContainsNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.contains(null)); }
+  public static String countedReads() { chmIterate(); chmToArray(); chmStream(); chmParallelStream(); chmSpliterator(); return "counted"; }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
@@ -54,9 +59,8 @@ public final class Probe {
     System.out.println("duplicate=" + duplicate());
     System.out.println("nullMap=" + nullMap());
     System.out.println("chmExact=" + chmExact());
-    System.out.println("chmIterate=" + chmIterate());
-    System.out.println("chmToArray=" + chmToArray());
-    System.out.println("chmStream=" + chmStream());
+    System.out.println("chmRemoveNull=" + chmRemoveNull());
+    System.out.println("chmContainsNull=" + chmContainsNull());
     System.out.println("identity=" + identity());
     System.out.println("weak=" + weak());
     System.out.println("concurrent=" + concurrent());

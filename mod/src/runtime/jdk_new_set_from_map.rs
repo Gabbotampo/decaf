@@ -196,6 +196,15 @@ impl StdHost {
             }
             ("remove", "(Ljava/lang/Object;)Z") => {
                 let key = args.first()?;
+                if chm && matches!(key, Value::Ref(None)) {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"Object.hashCode()\" because \"key\" is null".into(),
+                        ),
+                        frame: None,
+                    }));
+                }
                 let Some(position) = position(values, key) else {
                     return Some(self.unknown_host_call(r));
                 };

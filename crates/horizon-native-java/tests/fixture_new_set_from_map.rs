@@ -47,6 +47,11 @@ public final class Probe {
   public static String chmIterate() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("b"); s.add("a"); return s.toString(); }
   public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(); return "counted"; }
   public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.stream(); return "counted"; }
+  public static String chmParallelStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.parallelStream(); return "counted"; }
+  public static String chmSpliterator() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.spliterator(); return "counted"; }
+  public static String chmRemoveNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.remove(null)); }
+  public static String chmContainsNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.contains(null)); }
+  public static String countedReads() { chmIterate(); chmToArray(); chmStream(); chmParallelStream(); chmSpliterator(); return "counted"; }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
@@ -61,9 +66,8 @@ public final class Probe {
     System.out.println("duplicate=" + duplicate());
     System.out.println("nullMap=" + nullMap());
     System.out.println("chmExact=" + chmExact());
-    System.out.println("chmIterate=" + chmIterate());
-    System.out.println("chmToArray=" + chmToArray());
-    System.out.println("chmStream=" + chmStream());
+    System.out.println("chmRemoveNull=" + chmRemoveNull());
+    System.out.println("chmContainsNull=" + chmContainsNull());
     System.out.println("identity=" + identity());
     System.out.println("weak=" + weak());
     System.out.println("concurrent=" + concurrent());
@@ -98,6 +102,8 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
         "hashMapDifferential",
         "linkedMapDifferential",
         "chmExact",
+        "chmRemoveNull",
+        "chmContainsNull",
     ] {
         assert_eq!(fixture.text(method), expected(method), "{method}");
     }
@@ -106,33 +112,34 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
 #[test]
 fn concurrent_hash_map_order_dependent_operations_are_counted() {
     let fixture = fixture();
-    for (method, expected) in [
-        ("chmIterate", "java/util/Set#toString()Ljava/lang/String;"),
-        ("chmToArray", "java/util/Set#toArray()[Ljava/lang/Object;"),
-        (
-            "chmStream",
-            "java/util/Set#stream()Ljava/util/stream/Stream;",
-        ),
-    ] {
-        let mut host = fixture.jar.seed_host(StdHost::new());
-        fixture
-            .jar
-            .invoke_method_with_args(
-                "demo/Probe",
-                method,
-                "()Ljava/lang/String;",
-                None,
-                &[],
-                &mut host,
-            )
-            .unwrap_or_else(|error| panic!("{method} failed: {error}"));
-        assert_eq!(
-            host.unknown_host_calls(),
-            vec![(expected.to_owned(), 1)],
-            "{method}: {:?}",
-            host.unknown_host_calls()
-        );
-    }
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "countedReads",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap_or_else(|error| panic!("countedReads failed: {error}"));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![
+            (
+                "java/util/Set#parallelStream()Ljava/util/stream/Stream;".into(),
+                1
+            ),
+            (
+                "java/util/Set#spliterator()Ljava/util/Spliterator;".into(),
+                1
+            ),
+            ("java/util/Set#stream()Ljava/util/stream/Stream;".into(), 1),
+            ("java/util/Set#toArray()[Ljava/lang/Object;".into(), 1),
+            ("java/util/Set#toString()Ljava/lang/String;".into(), 1),
+        ]
+    );
 }
 
 #[test]

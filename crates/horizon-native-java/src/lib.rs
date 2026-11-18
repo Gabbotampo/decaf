@@ -10534,7 +10534,17 @@ impl Host for StdHost {
                 host_collection_values(self, receiver)?.is_empty() as i32,
             )),
             (owner, "contains", "(Ljava/lang/Object;)Z") if is_collection_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let argument = Self::argument(r, args, 0)?;
+                if self.is_chm_set(receiver) && matches!(argument, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"Object.hashCode()\" because \"key\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(argument);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
