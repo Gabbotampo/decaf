@@ -23911,6 +23911,9 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(Some(value));
                 }
                 let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
+                if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
+                    return Ok(Some(answer));
+                }
                 let value = self.host.invoke(&callback.target, &values)?;
                 if let Some(token) = token {
                     self.mod_count_after(token, &value)?;
@@ -24093,6 +24096,9 @@ impl<H: Host> Runtime<'_, H> {
             }
             // `list::add` moves the list's `modCount` as the call would.
             let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
+            if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
+                return Ok(Some(answer));
+            }
             let value = self
                 .host
                 .invoke_instance(&callback.target, &receiver, &rest)?;
@@ -30976,11 +30982,14 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         None
                     };
+                    let mod_answer = mod_token.as_ref().and_then(|token| token.answer.clone());
                     // Whether the answer is a jar method body's own `areturn`
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
                     let mut jar_body = false;
-                    let value = if let Some(value) = anchor_replacement {
+                    let value = if let Some(value) = mod_answer {
+                        value
+                    } else if let Some(value) = anchor_replacement {
                         value
                     } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
                         value
@@ -31725,7 +31734,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         _ => value,
                     };
-                    if let Some(token) = mod_token.filter(|_| !jar_body) {
+                    if let Some(token) =
+                        mod_token.filter(|token| token.answer.is_none() && !jar_body)
+                    {
                         invoke_or_catch!(at, self.mod_count_after(token, &value));
                     }
                     if value != Value::Void {
@@ -31771,7 +31782,12 @@ impl<H: Host> Runtime<'_, H> {
                         let mut captured = captured;
                         // A `subList` operand's `toString` checks its list
                         // (`mod_count.rs`).
-                        invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
+                        if let Some(answer) =
+                            invoke_or_catch!(at, self.sync_sub_list_operands(&captured))
+                        {
+                            stack.push(answer);
+                            continue;
+                        }
                         invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)

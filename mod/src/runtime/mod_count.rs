@@ -260,6 +260,7 @@ pub(crate) struct ModToken {
     creates: Option<(usize, usize)>,
     /// An `ArrayDeque`'s layout to follow (`array_deque.rs`).
     deque: DequeStep,
+    pub(crate) answer: Option<Value>,
     /// A stale `ArrayList.SubList` member that checks `modCount` after its
     /// work (`equals`, `hashCode`, `indexOf`...): throw once it returned.
     throw_after: bool,
@@ -296,7 +297,7 @@ enum SubCheck {
 /// How a call on a `subList` copy goes ahead.
 enum SubSync {
     Ready,
-    Counted,
+    Counted(Value),
     ThrowAfter,
 }
 
@@ -356,7 +357,9 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<ModToken>, NativeError> {
         // A sub-list read as an argument (copied, compared, printed) checks
         // its list first, as its `toArray`/`iterator`/`toString` would.
-        self.sync_sub_list_arguments(r, op, receiver, args)?;
+        if let Some((marker, answer)) = self.sync_sub_list_arguments(r, op, receiver, args)? {
+            return Ok(Some(self.counted_read_token(r, &marker, answer)));
+        }
         if op == 0xb7
             && r.owner == "java/util/ArrayDeque"
             && r.name == "<init>"
@@ -382,6 +385,7 @@ impl<H: Host> Runtime<'_, H> {
                 stamp: ModStamp::default(),
                 creates: None,
                 deque: DequeStep::Init(layout),
+                answer: None,
                 throw_after: false,
             }));
         }
@@ -418,16 +422,17 @@ impl<H: Host> Runtime<'_, H> {
             && !self.host.sub_lists_of(marker).is_empty()
             && self.host.mod_stamp(&root).uncertain > 0;
         if !sub_list && root_is_uncertain && is_collection_read(r) {
-            self.host.unknown_operand_call(r)?;
-            return Ok(None);
+            let answer = self.host.unknown_operand_call(r)?;
+            return Ok(Some(self.counted_read_token(r, marker, answer)));
         }
         let mut throw_after = false;
         if sub_list {
             let point = self.sub_list_check_point(r, marker, target, args)?;
             match self.sync_sub_list(r, marker, point)? {
                 SubSync::Ready => {}
-                // Counted: the view may be stale; the host answers from its copy.
-                SubSync::Counted => return Ok(None),
+                SubSync::Counted(answer) => {
+                    return Ok(Some(self.counted_read_token(r, marker, answer)));
+                }
                 SubSync::ThrowAfter => throw_after = true,
             }
         }
@@ -473,8 +478,23 @@ impl<H: Host> Runtime<'_, H> {
             stamp: self.host.mod_stamp(marker),
             creates,
             deque,
+            answer: None,
             throw_after,
         }))
+    }
+
+    fn counted_read_token(&self, r: &MethodRef, marker: &str, answer: Value) -> ModToken {
+        ModToken {
+            marker: marker.to_owned(),
+            name: r.name.clone(),
+            rule: None,
+            size: 0,
+            stamp: self.host.mod_stamp(marker),
+            creates: None,
+            deque: DequeStep::None,
+            answer: Some(answer),
+            throw_after: false,
+        }
     }
 
     /// After a call that returned: bump by the member's rule, write a
@@ -644,8 +664,8 @@ impl<H: Host> Runtime<'_, H> {
             // The work runs over the root's current range, then throws.
             (ModVerdict::Changed, SubCheck::After) if reslice_all(self) => Ok(SubSync::ThrowAfter),
             _ => {
-                self.host.unknown_operand_call(r)?;
-                Ok(SubSync::Counted)
+                let answer = self.host.unknown_operand_call(r)?;
+                Ok(SubSync::Counted(answer))
             }
         }
     }
@@ -660,9 +680,9 @@ impl<H: Host> Runtime<'_, H> {
         op: u8,
         receiver: Option<&Value>,
         args: &[Value],
-    ) -> Result<(), NativeError> {
+    ) -> Result<Option<(String, Value)>, NativeError> {
         if args.is_empty() || self.host.sub_lists_of_any() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let params = descriptor_arguments(&r.descriptor);
         let text_call = matches!(
@@ -695,19 +715,27 @@ impl<H: Host> Runtime<'_, H> {
                 && (text_call || (collection_receiver && r.name == "equals")));
             if reads {
                 if linked {
-                    self.sync_sub_list(r, &marker, SubCheck::Before)?;
+                    if let SubSync::Counted(answer) =
+                        self.sync_sub_list(r, &marker, SubCheck::Before)?
+                    {
+                        return Ok(Some((marker, answer)));
+                    }
                 } else {
-                    self.host.unknown_operand_call(r)?;
+                    let answer = self.host.unknown_operand_call(r)?;
+                    return Ok(Some((marker, answer)));
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Sub-lists a string concatenation prints: `toString` iterates them.
-    pub(crate) fn sync_sub_list_operands(&mut self, values: &[Value]) -> Result<(), NativeError> {
+    pub(crate) fn sync_sub_list_operands(
+        &mut self,
+        values: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if self.host.sub_lists_of_any() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let to_string = MethodRef {
             owner: "java/util/List".into(),
@@ -718,10 +746,14 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(marker) = expect_ref(value)
                 && self.host.sub_list_link(marker).is_some()
             {
-                self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?;
+                if let SubSync::Counted(answer) =
+                    self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?
+                {
+                    return Ok(Some(answer));
+                }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Re-read a view's range from its parent (a parent's `set` shows).
