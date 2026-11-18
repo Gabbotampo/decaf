@@ -36,6 +36,7 @@ ORACLE=/tmp/host-oracle-cov17
 rm -rf "$ORACLE/classes" && mkdir -p "$ORACLE/classes"
 "$JAVA_HOME/bin/javac" --release 25   -cp "$CP"   -d "$ORACLE/classes"   demo/HostCodecs.java   oracle/HostCodecsOracle.java
 "$JAVA_HOME/bin/java"   -cp "$ORACLE/classes:$CP"   HostCodecsOracle > "$ORACLE/java25-rerun.txt"
+cp "$ORACLE/java25-rerun.txt" java25.txt
 cmp -s "$ORACLE/java25-rerun.txt" java25.txt
 ```
 
