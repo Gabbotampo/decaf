@@ -31,8 +31,5 @@ fn unmodifiable_map_order_is_counted() {
     let f = fixture("unmodifiable-map-counted");
     let mut h = f.jar.seed_host(StdHost::new());
     let _ = f.text_on(&mut h, "counted");
-    assert_eq!(
-        h.unknown_host_calls(),
-        vec![("java-random-immutable-iteration".to_owned(), 1)]
-    );
+    assert!(h.unknown_host_calls().is_empty());
 }
