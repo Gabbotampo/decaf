@@ -616,6 +616,15 @@ impl ToMap {
     /// map), or for Guava's `toImmutableMap` its entries in encounter order.
     pub(crate) fn finish(self) -> Result<Value, Vec<Value>> {
         if let Some(map) = self.map {
+            if self.unmodifiable {
+                let entries = crate::runtime::runtime::host_collection_values(self, &map)?;
+                return Ok(self.factory_unmodifiable(
+                    "java/util/stream/Collectors",
+                    "toUnmodifiableMap",
+                    "map",
+                    entries,
+                ));
+            }
             return Ok(map);
         }
         Err(self
