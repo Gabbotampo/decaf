@@ -20068,6 +20068,7 @@ impl NativeJar {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -20286,6 +20287,7 @@ impl NativeJar {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -20460,6 +20462,7 @@ impl NativeJar {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -22674,6 +22677,7 @@ struct Runtime<'a, H> {
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
     reader_positions_unknown: BTreeSet<String>,
+    io_reader_errors: BTreeMap<String, usize>,
     scanners: BTreeMap<String, scanner_model::ScannerState>,
     io_stream_paths: BTreeMap<String, String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
@@ -26664,7 +26668,7 @@ impl<H: Host> Runtime<'_, H> {
         path: String,
         bytes: Vec<u8>,
     ) -> Result<(), NativeError> {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = Self::io_utf8_lossy(&bytes);
         self.ensure_io_capacity(&path, text.len() + bytes.len())?;
         self.io_file_bytes.insert(path.clone(), bytes);
         self.io_files.insert(path, text);
@@ -26852,6 +26856,141 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Java's UTF-8 decoder reports the malformed subsequence length, which differs from
+    /// `Utf8Error::error_len` for overlong and surrogate encodings.
+    fn io_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let mut index = 0;
+        while index < bytes.len() {
+            let first = bytes[index];
+            let needed = if first <= 0x7f {
+                1
+            } else if (0xc2..=0xdf).contains(&first) {
+                2
+            } else if (0xe0..=0xef).contains(&first) {
+                3
+            } else if (0xf0..=0xf4).contains(&first) {
+                4
+            } else {
+                return Some(1);
+            };
+            let available = bytes.len() - index;
+            let count = available.min(needed);
+            if count < needed {
+                if count == 1 {
+                    return Some(1);
+                }
+                if bytes[index + 1..index + count]
+                    .iter()
+                    .all(|byte| (0x80..=0xbf).contains(byte))
+                {
+                    return Some(count);
+                }
+                return Some(1);
+            }
+            let continuation = bytes[index + 1..index + needed]
+                .iter()
+                .all(|byte| (0x80..=0xbf).contains(byte));
+            let scalar_valid = match needed {
+                1 => true,
+                2 => true,
+                3 => {
+                    (first != 0xe0 || bytes[index + 1] >= 0xa0)
+                        && (first != 0xed || bytes[index + 1] <= 0x9f)
+                }
+                4 => {
+                    (first != 0xf0 || bytes[index + 1] >= 0x90)
+                        && (first != 0xf4 || bytes[index + 1] <= 0x8f)
+                }
+                _ => false,
+            };
+            if !continuation || !scalar_valid {
+                let malformed = if continuation {
+                    needed
+                } else {
+                    1 + bytes[index + 1..index + needed]
+                        .iter()
+                        .take_while(|byte| (0x80..=0xbf).contains(*byte))
+                        .count()
+                };
+                return Some(malformed);
+            }
+            index += needed;
+        }
+        None
+    }
+
+    fn io_read_string_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let length = Self::io_malformed_utf8_len(bytes)?;
+        if bytes.len() < 4
+            && bytes
+                .first()
+                .is_some_and(|byte| (0xf0..=0xf4).contains(byte))
+            && bytes[1..].iter().all(|byte| (0x80..=0xbf).contains(byte))
+        {
+            Some(1)
+        } else {
+            Some(length)
+        }
+    }
+
+    fn io_utf8_lossy(bytes: &[u8]) -> String {
+        let mut text = String::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match std::str::from_utf8(&bytes[index..]) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&bytes[index..index + valid]).unwrap_or_default(),
+                    );
+                    let remaining = &bytes[index + valid..];
+                    let first = remaining[0];
+                    let malformed = if first == 0xed
+                        && remaining.len() >= 3
+                        && (0x80..=0xbf).contains(&remaining[1])
+                        && (0x80..=0xbf).contains(&remaining[2])
+                    {
+                        3
+                    } else if remaining.len() < 2
+                        || ((0xf0..=0xf4).contains(&first) && remaining.len() < 4)
+                    {
+                        remaining.len()
+                    } else {
+                        1
+                    };
+                    text.push('\u{fffd}');
+                    index += valid + malformed;
+                }
+            }
+        }
+        text
+    }
+
+    fn io_reader_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let length = Self::io_malformed_utf8_len(bytes)?;
+        if bytes.len() >= 3
+            && bytes[0] == 0xe0
+            && (0x80..=0xbf).contains(&bytes[1])
+            && (0x80..=0xbf).contains(&bytes[2])
+        {
+            Some(1)
+        } else {
+            Some(length)
+        }
+    }
+
+    fn io_malformed_error(length: usize) -> NativeError {
+        NativeError::UncaughtException {
+            class: "java/nio/charset/MalformedInputException".into(),
+            message: Some(format!("Input length = {length}")),
+            frame: None,
+        }
+    }
+
     /// Open a reader marker over a virtual file, or report the exception Java
     /// raises for a file that does not exist. A config loader guards its read
     /// with `exists` or catches the `IOException` and writes defaults.
@@ -26892,6 +27031,12 @@ impl<H: Host> Runtime<'_, H> {
         };
         self.io_paths.insert(marker.to_owned(), path.to_owned());
         self.string_readers.insert(marker.to_owned(), text);
+        if r.owner == "java/nio/file/Files"
+            && let Some(bytes) = self.io_file_bytes.get(path)
+            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+        {
+            self.io_reader_errors.insert(marker.to_owned(), length);
+        }
         self.io_stream_paths
             .insert(marker.to_owned(), path.to_owned());
         Ok(())
@@ -27216,20 +27361,64 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Value::Int(i32::from(self.io_dirs.contains(&path)))
                     }
+                    ("readAllBytes", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        let Some(bytes) = self.io_file_bytes.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        self.io_bytes_array(bytes)
+                    }
+                    ("readAllLines", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+                        {
+                            return Err(Self::io_malformed_error(length));
+                        }
+                        let Some(text) = self.io_files.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        let lines = text
+                            .split('\n')
+                            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                            .map(|line| Value::Ref(Some(line.to_owned())))
+                            .collect();
+                        self.new_array_list(lines)?
+                    }
+                    ("lines", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;")
+                            && descriptor.ends_with(")Ljava/util/stream/Stream;") =>
+                    {
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+                        {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/UncheckedIOException".into(),
+                                message: Some(format!(
+                                    "java.nio.charset.MalformedInputException: Input length = {length}"
+                                )),
+                                frame: None,
+                            });
+                        }
+                        let Some(text) = self.io_files.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        let lines = text
+                            .split('\n')
+                            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                            .map(|line| Value::Ref(Some(line.to_owned())))
+                            .collect();
+                        self.new_stream(class, method, lines)
+                    }
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         if let Some(bytes) = self.io_file_bytes.get(&path)
-                            && let Err(error) = std::str::from_utf8(bytes)
+                            && let Some(length) = Self::io_read_string_malformed_utf8_len(bytes)
                         {
-                            return Err(NativeError::UncaughtException {
-                                class: "java/nio/charset/MalformedInputException".into(),
-                                message: Some(format!(
-                                    "Input length = {}",
-                                    error.error_len().unwrap_or(1)
-                                )),
-                                frame: None,
-                            });
+                            return Err(Self::io_malformed_error(length));
                         }
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
@@ -27569,6 +27758,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(text) = self.string_readers.remove(reader) else {
                     return Ok(None);
                 };
+                if let Some(length) = self.io_reader_errors.remove(reader) {
+                    self.io_reader_errors.insert(marker.clone(), length);
+                }
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
@@ -27871,6 +28063,11 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
+                }
+                if r.name != "close"
+                    && let Some(length) = self.io_reader_errors.get(&marker)
+                {
+                    return Err(Self::io_malformed_error(*length));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("read", "()I") => match self.string_readers.get_mut(&marker) {
@@ -36396,6 +36593,7 @@ mod tests {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -36471,6 +36669,7 @@ mod tests {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -43626,6 +43825,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -43843,6 +44043,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -44035,6 +44236,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -44403,6 +44605,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -44715,6 +44918,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -49985,6 +50189,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
@@ -50047,6 +50252,7 @@ mandatory = true
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
