@@ -4094,8 +4094,8 @@ impl StdHost {
         // table of its own (`hash_collections.rs`).
         if let Some(marker) = expect_ref(&made) {
             let marker = marker.clone();
-            if self.host.is_unmodifiable_collection(&source) {
-                self.host.mark_unmodifiable_collection(&marker);
+            if self.is_unmodifiable_collection(&source) {
+                self.mark_unmodifiable_collection(&marker);
             }
             self.note_view_copy(&marker, &source);
             self.note_view_kind(&marker, view);
