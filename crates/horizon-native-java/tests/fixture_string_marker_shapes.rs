@@ -45,10 +45,16 @@ fn every_prefix_family_matches_java_or_is_counted() {
         } else {
             assert_eq!(
                 host.unknown_host_calls(),
-                vec![(
-                    "java/lang/String#<instanceof>(Ljava/lang/Object;)Z".into(),
-                    1
-                )],
+                vec![
+                    (
+                        "java/lang/String#<checkcast>(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                        1,
+                    ),
+                    (
+                        "java/lang/String#<instanceof>(Ljava/lang/Object;)Z".into(),
+                        1,
+                    ),
+                ],
                 "{method}"
             );
             let _ = text;

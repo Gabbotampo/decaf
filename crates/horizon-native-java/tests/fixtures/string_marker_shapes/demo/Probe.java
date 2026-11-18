@@ -1,7 +1,7 @@
 package demo;
 public final class Probe {
  static String built(String a,String b){return new StringBuilder(a).append(b).toString();}
- static String row(String s){Object o=s; return (o instanceof String)+"|"+s.length()+"|"+s.equals(s);}
+ static String row(String s){Object o=s; String cast=(String)o; return (o instanceof String)+"|"+cast.length()+"|"+cast.equals(s);}
  public static String hello(){return row(built("hel","lo"));}
  public static String client(){return row(built("client/","x"));}
  public static String blockPos(){return row(built("block-pos/","x"));}
