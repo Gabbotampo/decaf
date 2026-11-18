@@ -33,6 +33,9 @@ fn collections_reverse_and_stream_iterator_match_java25() {
     let _ = fixture.text_on(&mut counted_host, "subListReverse");
     assert_eq!(
         counted_host.unknown_host_calls(),
-        vec![("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1)]
+        vec![
+            ("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1),
+            ("java/util/List#toString()Ljava/lang/String;".into(), 2),
+        ]
     );
 }
