@@ -149,6 +149,17 @@ impl StdHost {
 
     /// Mutators that SetFromMap must route to its backing map. Reads and
     /// iteration use `set_from_map_values` through `mutable_values`.
+    pub(crate) fn is_chm_set(&self, receiver: &Value) -> bool {
+        let Some(marker) = crate::jar_object::object_key(receiver) else {
+            return false;
+        };
+        let Some(map) = self.set_from_map_views.get(marker) else {
+            return false;
+        };
+        map.split_once('#')
+            .is_some_and(|(class, _)| class == "java/util/concurrent/ConcurrentHashMap")
+    }
+
     pub(crate) fn set_from_map_member(
         &mut self,
         r: &MethodRef,
@@ -177,6 +188,13 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
                 let key = args.first()?.clone();
+                if self.is_chm_set(receiver) && matches!(key, Value::Ref(None)) {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some("null".into()),
+                        frame: None,
+                    }));
+                }
                 let Some(position) = position(values, &key) else {
                     return Some(self.unknown_host_call(r));
                 };
