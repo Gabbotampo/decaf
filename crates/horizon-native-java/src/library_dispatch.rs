@@ -303,10 +303,8 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         if r.name == "<init>" {
-            if crate::expect_ref(&receiver).is_some() {
-                if kind == "map" {
-                    self.host.register_mutable_collection(&receiver, kind);
-                }
+            if kind == "map" && crate::expect_ref(&receiver).is_some() {
+                self.host.register_mutable_collection(&receiver, kind);
             }
             return Ok(Some(Value::Void));
         }
