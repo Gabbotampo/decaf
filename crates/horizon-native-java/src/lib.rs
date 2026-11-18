@@ -2635,6 +2635,12 @@ pub trait Host {
         None
     }
 
+    fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
+        false
+    }
+
+    fn mark_unmodifiable_collection(&mut self, _marker: &str) {}
+
     /// A new `Collections$UnmodifiableList` or `$UnmodifiableRandomAccessList`
     /// (`class`) reading `source` live: what `UnmodifiableList.subList` makes
     /// with `new` (#251), whatever `source`'s own class. `None` when the host
@@ -4088,6 +4094,9 @@ impl StdHost {
         // table of its own (`hash_collections.rs`).
         if let Some(marker) = expect_ref(&made) {
             let marker = marker.clone();
+            if self.host.is_unmodifiable_collection(&source) {
+                self.host.mark_unmodifiable_collection(&marker);
+            }
             self.note_view_copy(&marker, &source);
             self.note_view_kind(&marker, view);
         }
@@ -5986,6 +5995,16 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
+    }
+
+    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
+        self.unmodifiable_collections.contains_key(marker)
+    }
+
+    fn mark_unmodifiable_collection(&mut self, marker: &str) {
+        self.unmodifiable_collections
+            .entry(marker.to_owned())
+            .or_insert(None);
     }
 
     fn unmodifiable_list_view_as(&mut self, class: &str, source: &Value) -> Option<Value> {

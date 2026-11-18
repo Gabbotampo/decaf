@@ -1229,7 +1229,9 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         match state.finish() {
             Ok(map) if unmodifiable => {
                 let entries = self.host.mutable_collection_values(&map).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?;
-                Ok(self.host.factory_collection("java/util/stream/Collectors", "toUnmodifiableMap", "map", entries).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?)
+                let made = self.host.factory_collection("java/util/stream/Collectors", "toUnmodifiableMap", "map", entries).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?;
+                self.host.mark_nondeterministic("java-random-immutable-iteration");
+                Ok(made)
             }
             Ok(map) => Ok(map),
             Err(entries) => self.factory_or_count(
