@@ -175,6 +175,7 @@ impl StdHost {
             return None;
         }
         let map = self.set_from_map_views.get(handle.key())?.clone();
+        let chm = self.is_chm_set(receiver);
         let values = self.mutable_collections.get_mut(&map)?;
         let position = |values: &[Value], key: &Value| -> Option<Option<usize>> {
             Some(
@@ -188,7 +189,7 @@ impl StdHost {
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
                 let key = args.first()?.clone();
-                if self.is_chm_set(receiver) && matches!(key, Value::Ref(None)) {
+                if chm && matches!(key, Value::Ref(None)) {
                     return Some(Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
                         message: Some("null".into()),
