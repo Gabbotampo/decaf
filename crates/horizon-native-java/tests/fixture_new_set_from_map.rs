@@ -45,8 +45,8 @@ public final class Probe {
   public static String nullMap() { return ex(()->Collections.newSetFromMap(null)); }
   public static String chmExact() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); boolean a=s.add("a"), d=s.add("a"), c=s.contains("a"), r=s.remove("a"), n=s.remove("z"); String e=ex(()->s.add(null)); return a+"|"+d+"|"+c+"|"+r+"|"+n+"|"+s.size()+"|"+s.isEmpty()+"|"+e; }
   public static String chmIterate() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("b"); s.add("a"); return s.toString(); }
-  public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return java.util.Arrays.toString(s.toArray()); }
-  public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return String.valueOf(s.stream().findFirst()); }
+  public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(); return "counted"; }
+  public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.stream(); return "counted"; }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
@@ -88,7 +88,14 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
 #[test]
 fn concurrent_hash_map_order_dependent_operations_are_counted() {
     let fixture = fixture();
-    for method in ["chmIterate", "chmToArray", "chmStream"] {
+    for (method, expected) in [
+        ("chmIterate", "java/util/Set#toString()Ljava/lang/String;"),
+        ("chmToArray", "java/util/Set#toArray()[Ljava/lang/Object;"),
+        (
+            "chmStream",
+            "java/util/Set#stream()Ljava/util/stream/Stream;",
+        ),
+    ] {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture
             .jar
@@ -101,13 +108,9 @@ fn concurrent_hash_map_order_dependent_operations_are_counted() {
                 &mut host,
             )
             .unwrap_or_else(|error| panic!("{method} failed: {error}"));
-        println!("{method}: {:?}", host.unknown_host_calls());
         assert_eq!(
-            host.unknown_host_calls()
-                .iter()
-                .map(|(_, n)| *n)
-                .sum::<usize>(),
-            1,
+            host.unknown_host_calls(),
+            vec![(expected.to_owned(), 1)],
             "{method}: {:?}",
             host.unknown_host_calls()
         );

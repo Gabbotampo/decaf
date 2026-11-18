@@ -38,8 +38,8 @@ public final class Probe {
   public static String nullMap() { return ex(()->Collections.newSetFromMap(null)); }
   public static String chmExact() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); boolean a=s.add("a"), d=s.add("a"), c=s.contains("a"), r=s.remove("a"), n=s.remove("z"); String e=ex(()->s.add(null)); return a+"|"+d+"|"+c+"|"+r+"|"+n+"|"+s.size()+"|"+s.isEmpty()+"|"+e; }
   public static String chmIterate() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("b"); s.add("a"); return s.toString(); }
-  public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return java.util.Arrays.toString(s.toArray()); }
-  public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); return String.valueOf(s.stream().findFirst()); }
+  public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(); return "counted"; }
+  public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.stream(); return "counted"; }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
