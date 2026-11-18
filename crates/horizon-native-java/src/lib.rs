@@ -26925,9 +26925,9 @@ impl<H: Host> Runtime<'_, H> {
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
                         if let Some(bytes) = self.io_file_bytes.get(&path)
-                            && std::str::from_utf8(bytes).is_err()
+                            && let Err(error) = std::str::from_utf8(bytes)
                         {
-                            return self.host.unknown_operand_call(r).map(Some);
+                            return Err(NativeError::UncaughtException { class: "java/nio/charset/MalformedInputException".into(), message: Some(format!("Input length = {}", error.error_len().unwrap_or(1))), frame: None, });
                         }
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
