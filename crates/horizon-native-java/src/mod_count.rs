@@ -745,12 +745,10 @@ impl<H: Host> Runtime<'_, H> {
         for value in values {
             if let Some(marker) = expect_ref(value)
                 && self.host.sub_list_link(marker).is_some()
-            {
-                if let SubSync::Counted(answer) =
+                && let SubSync::Counted(answer) =
                     self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?
-                {
-                    return Ok(Some(answer));
-                }
+            {
+                return Ok(Some(answer));
             }
         }
         Ok(None)
