@@ -293,6 +293,14 @@ impl<H: Host> Runtime<'_, H> {
         self.host.store_mod_stamp(marker, stamp);
     }
 
+    pub(crate) fn mark_sub_list_unknown(&mut self, marker: &str) {
+        self.bump_mod_count(marker, true);
+        let root = self.mod_count_root(marker);
+        if root != marker {
+            self.bump_mod_count(&root, true);
+        }
+    }
+
     /// The collection whose `modCount` a view's iterator checks: the root
     /// of a chain of sub-lists, the map of a `keySet()`/`values()` copy, the
     /// list under an unmodifiable view.
