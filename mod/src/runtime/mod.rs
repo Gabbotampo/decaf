@@ -31024,6 +31024,9 @@ impl<H: Host> Runtime<'_, H> {
                             .and_then(|v| expect_ref(v))
                             .is_some_and(|m| self.host.sub_list_link(m).is_some())
                     {
+                        if let Some(marker) = receiver.as_ref().and_then(expect_ref) {
+                            self.mark_sub_list_unknown(marker);
+                        }
                         invoke_or_catch!(at, self.host.unknown_operand_call(&r))
                     } else if let Some(owner) =
                         invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
