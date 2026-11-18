@@ -30994,6 +30994,13 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         // A `Class` call on a name a family kind owns (`owned_class.rs`).
                         value
+                    } else if matches!(r.name.as_str(), "replaceAll" | "sort")
+                        && receiver
+                            .as_ref()
+                            .and_then(|v| expect_ref(v).ok())
+                            .is_some_and(|m| self.host.sub_list_link(m).is_some())
+                    {
+                        invoke_or_catch!(at, self.host.unknown_operand_call(&r))
                     } else if let Some(owner) =
                         invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
                     {
