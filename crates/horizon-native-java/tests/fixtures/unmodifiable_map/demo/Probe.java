@@ -1,6 +1,7 @@
 package demo;
 import java.util.*; import java.util.stream.*;
 public class Probe {
+ public static void main(String[] a){System.out.print(rows());}
  static String err(Runnable r){try{r.run();return "ok";}catch(Throwable e){return e.getClass().getName();}}
  static Map<String,Integer> map(){return Stream.of("a","b").collect(Collectors.toUnmodifiableMap(x->x,x->x.length()));}
  public static String rows(){Map<String,Integer> m=map(); StringBuilder s=new StringBuilder();
