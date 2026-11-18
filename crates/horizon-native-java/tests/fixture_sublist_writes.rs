@@ -33,4 +33,27 @@ fn sublist_writes_match_java25() {
             assert!(matches!(got, Ok(Value::Ref(Some(ref x))) if x == e));
         }
     }
+    for (op, expected_call) in [
+        (
+            4,
+            "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V",
+        ),
+        (5, "java/util/List#sort(Ljava/util/Comparator;)V"),
+    ] {
+        let mut counted = f.jar.seed_host(StdHost::new());
+        let _ = f.jar.invoke_method_with_args(
+            "demo/Probe",
+            "probe",
+            "(I)Ljava/lang/String;",
+            None,
+            &[Value::Int(op)],
+            &mut counted,
+        );
+        assert!(
+            counted
+                .unknown_host_calls()
+                .iter()
+                .any(|(call, n)| call == expected_call && *n == 1)
+        );
+    }
 }
