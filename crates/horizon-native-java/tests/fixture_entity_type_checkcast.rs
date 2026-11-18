@@ -69,5 +69,5 @@ fn othermod_lookup_is_counted() {
     let fixture = Fixture::build("entity-type-lookup-counted", &sources);
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(fixture.text_on(&mut host, "othermod"), "false");
-    assert_eq!(host.unknown_host_calls(), &[("net/minecraft/core/DefaultedRegistry#getOptional(Lnet/minecraft/resources/Identifier;)Ljava/util/Optional;".into(), 1)]);
+    assert_eq!(host.unknown_host_calls(), &[("net/minecraft/core/DefaultedRegistry#getValue(Lnet/minecraft/resources/Identifier;)Ljava/lang/Object;".into(), 1)]);
 }
