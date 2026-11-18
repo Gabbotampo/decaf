@@ -492,11 +492,26 @@ fn identity_equals(
 /// adds incarnations); `hashCode` and `toString` counted until each family's
 /// producer answers vanilla's (P16b–e). A game object is the game's, the same
 /// object to every jar's runtime.
+fn identity_instance_of(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn crate::runtime::host_ref::ClassHierarchy,
+) -> Option<bool> {
+    if handle.key().starts_with("game/entity_type/") {
+        return Some(
+            wanted == "net/minecraft/world/entity/EntityType"
+                || hierarchy.is_instance("net/minecraft/world/entity/EntityType", wanted)
+                    == Some(true),
+        );
+    }
+    instance_of_class(handle, wanted, hierarchy)
+}
+
 pub(crate) const IDENTITY_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: identity_equals,
-    instance_of: instance_of_class,
+    instance_of: identity_instance_of,
     crosses_jars: |_, _| true,
     compare_to: None,
 };
