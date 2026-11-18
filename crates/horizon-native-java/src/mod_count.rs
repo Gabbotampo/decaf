@@ -138,6 +138,25 @@ fn tracked(class: &str) -> bool {
 }
 
 /// Members that may change a collection's structure.
+fn is_collection_read(r: &MethodRef) -> bool {
+    matches!(
+        r.name.as_str(),
+        "get"
+            | "size"
+            | "toString"
+            | "iterator"
+            | "listIterator"
+            | "spliterator"
+            | "equals"
+            | "hashCode"
+            | "contains"
+            | "indexOf"
+            | "lastIndexOf"
+            | "isEmpty"
+            | "toArray"
+    )
+}
+
 fn may_modify(name: &str) -> bool {
     matches!(
         name,
@@ -394,6 +413,14 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        let root = self.mod_count_root(marker);
+        let root_is_uncertain = root == marker
+            && !self.host.sub_lists_of(marker).is_empty()
+            && self.host.mod_stamp(&root).uncertain > 0;
+        if !sub_list && root_is_uncertain && is_collection_read(r) {
+            self.host.unknown_operand_call(r)?;
+            return Ok(None);
+        }
         let mut throw_after = false;
         if sub_list {
             let point = self.sub_list_check_point(r, marker, target, args)?;
@@ -652,7 +679,12 @@ impl<H: Host> Runtime<'_, H> {
             let Some(marker) = expect_ref(arg).cloned() else {
                 continue;
             };
-            if self.host.sub_list_link(&marker).is_none() || receiver == Some(arg) {
+            let linked = self.host.sub_list_link(&marker).is_some();
+            let root_uncertain = !linked
+                && self.mod_count_root(&marker) == marker
+                && !self.host.sub_lists_of(&marker).is_empty()
+                && self.host.mod_stamp(&marker).uncertain > 0;
+            if (!linked && !root_uncertain) || receiver == Some(arg) {
                 continue;
             }
             let param = params.get(index).map(String::as_str).unwrap_or("");
@@ -662,7 +694,11 @@ impl<H: Host> Runtime<'_, H> {
             ) || (param == "Ljava/lang/Object;"
                 && (text_call || (collection_receiver && r.name == "equals")));
             if reads {
-                self.sync_sub_list(r, &marker, SubCheck::Before)?;
+                if linked {
+                    self.sync_sub_list(r, &marker, SubCheck::Before)?;
+                } else {
+                    self.host.unknown_operand_call(r)?;
+                }
             }
         }
         Ok(())
