@@ -10,17 +10,17 @@ const CASES: &[(&str, bool)] = &[
     ("stream", true),
     ("textures", false),
     ("models", false),
-    ("client", false),
-    ("blockPos", false),
+    ("client", true),
+    ("blockPos", true),
     ("typed", false),
     ("registry", false),
     ("payload", false),
     ("payloadContext", false),
-    ("iterator", false),
+    ("iterator", true),
     ("enumX", false),
-    ("game", false),
-    ("list", false),
-    ("particle", false),
+    ("game", true),
+    ("list", true),
+    ("particle", true),
 ];
 fn java_line(method: &str) -> &str {
     JAVA25
