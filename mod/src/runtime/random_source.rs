@@ -90,6 +90,7 @@ pub(crate) fn bit_conversion(
 
 pub(crate) const RANDOM_SOURCE: &str = "net/minecraft/util/RandomSource";
 const LEGACY: &str = "net/minecraft/world/level/levelgen/LegacyRandomSource";
+const JAVA_RANDOM: &str = "java/util/Random";
 const SINGLE: &str = "net/minecraft/world/level/levelgen/SingleThreadedRandomSource";
 const XORO: &str = "net/minecraft/world/level/levelgen/XoroshiroRandomSource";
 const LEGACY_POS: &str =
@@ -102,6 +103,7 @@ const BIT_RANDOM: &str = "net/minecraft/world/level/levelgen/BitRandomSource";
 #[derive(Debug, Clone)]
 pub(crate) enum State {
     Legacy { seed: u64 },
+    Java { seed: u64 },
     Single { seed: u64 },
     Xoroshiro { lo: u64, hi: u64 },
     LegacyPositional { seed: i64 },
@@ -112,6 +114,7 @@ impl State {
     fn class(&self) -> &'static str {
         match self {
             Self::Legacy { .. } => LEGACY,
+            Self::Java { .. } => JAVA_RANDOM,
             Self::Single { .. } => SINGLE,
             Self::Xoroshiro { .. } => XORO,
             Self::LegacyPositional { .. } => LEGACY_POS,
@@ -130,6 +133,11 @@ impl StdHost {
 
     pub(crate) fn random_new(&mut self, class: &str) -> Option<Value> {
         let state = match class {
+            JAVA_RANDOM => {
+                return Some(self.java_random_handle(State::Java {
+                    seed: scramble_legacy(0),
+                }));
+            }
             LEGACY => State::Legacy {
                 seed: scramble_legacy(0),
             },
@@ -151,9 +159,21 @@ impl StdHost {
         Value::Host(HostRef::new(HostKind::RandomSource, key))
     }
 
+    fn java_random_handle(&mut self, state: State) -> Value {
+        let key = format!("{JAVA_RANDOM}#{}", self.random_sources.len());
+        self.random_sources.insert(key.clone(), state);
+        crate::runtime::jar_object::handle(key)
+    }
+
     fn random_key(value: &Value) -> Option<String> {
         match value {
             Value::Host(handle) if handle.kind() == HostKind::RandomSource => {
+                Some(handle.key().to_owned())
+            }
+            Value::Host(handle)
+                if handle.kind() == HostKind::JarObject
+                    && class_of_key(handle.key()) == JAVA_RANDOM =>
+            {
                 Some(handle.key().to_owned())
             }
             _ => None,
@@ -247,6 +267,10 @@ impl StdHost {
             self.save_random(key, state);
             return Some(Ok(Value::Void));
         }
+        if r.name == "<init>" && r.descriptor == "()V" && matches!(state, State::Java { .. }) {
+            self.random_sources.remove(&key);
+            return None;
+        }
         if r.name == "<init>" && r.descriptor == "(J)V" {
             let seed = match args {
                 [value] => match as_long(value) {
@@ -265,6 +289,9 @@ impl StdHost {
             };
             state = match state {
                 State::Legacy { .. } => State::Legacy {
+                    seed: scramble_legacy(seed),
+                },
+                State::Java { .. } => State::Java {
                     seed: scramble_legacy(seed),
                 },
                 State::Single { .. } => State::Single {
@@ -290,6 +317,9 @@ impl StdHost {
                 let seed = as_long(args.first()?)?;
                 state = match state {
                     State::Legacy { .. } => State::Legacy {
+                        seed: scramble_legacy(seed),
+                    },
+                    State::Java { .. } => State::Java {
                         seed: scramble_legacy(seed),
                     },
                     State::Single { .. } => State::Single {
@@ -518,7 +548,9 @@ fn next_bits(seed: &mut u64, count: u32) -> i32 {
 }
 fn next_int(state: &mut State) -> i32 {
     match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => next_bits(seed, 32),
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
+            next_bits(seed, 32)
+        }
         State::Xoroshiro { .. } => next_long(state) as i32,
         _ => 0,
     }
@@ -528,7 +560,7 @@ fn next_int_bound(state: &mut State, bound: i32) -> Result<Value, NativeError> {
         return Err(iae("Bound must be positive"));
     }
     let v = match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => {
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
             if bound & (bound - 1) == 0 {
                 ((i64::from(bound) * i64::from(next_bits(seed, 31))) >> 31) as i32
             } else {
@@ -557,7 +589,7 @@ fn next_int_bound(state: &mut State, bound: i32) -> Result<Value, NativeError> {
 }
 fn next_long(state: &mut State) -> i64 {
     match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => {
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
             (i64::from(next_bits(seed, 32)) << 32).wrapping_add(i64::from(next_bits(seed, 32)))
         }
         State::Xoroshiro { lo, hi, .. } => {
@@ -573,14 +605,16 @@ fn next_long(state: &mut State) -> i64 {
 }
 fn next_boolean(state: &mut State) -> bool {
     match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => next_bits(seed, 1) != 0,
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
+            next_bits(seed, 1) != 0
+        }
         State::Xoroshiro { .. } => next_long(state) & 1 != 0,
         _ => false,
     }
 }
 fn next_float(state: &mut State) -> f32 {
     match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => {
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
             next_bits(seed, 24) as f32 / 16_777_216.0
         }
         State::Xoroshiro { .. } => (next_long(state) as u64 >> 40) as f32 / 16_777_216.0,
@@ -589,7 +623,7 @@ fn next_float(state: &mut State) -> f32 {
 }
 fn next_double(state: &mut State) -> f64 {
     match state {
-        State::Legacy { seed, .. } | State::Single { seed, .. } => {
+        State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {
             (((i64::from(next_bits(seed, 26)) << 27) + i64::from(next_bits(seed, 27))) as f64)
                 / 9_007_199_254_740_992.0
         }
