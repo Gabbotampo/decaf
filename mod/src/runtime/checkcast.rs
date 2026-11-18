@@ -193,14 +193,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         if let Value::Ref(Some(marker)) = value
             && crate::runtime::value_class::string_shape(marker) == crate::runtime::value_class::Shape::Undecidable
-            && matches!(
-                target,
-                "java/lang/String"
-                    | "java/lang/CharSequence"
-                    | "java/lang/Comparable"
-                    | "java/io/Serializable"
-                    | "java/lang/constant/Constable"
-            )
+            && crate::runtime::value_class::STRING_TYPES.contains(&target)
         {
             return self.count_cast(value, target);
         }
@@ -641,14 +634,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         if matches!(value, Value::Ref(Some(_)))
             && crate::runtime::value_class::string_shape(marker) == crate::runtime::value_class::Shape::Undecidable
-            && matches!(
-                target,
-                "java/lang/String"
-                    | "java/lang/CharSequence"
-                    | "java/lang/Comparable"
-                    | "java/io/Serializable"
-                    | "java/lang/constant/Constable"
-            )
+            && crate::runtime::value_class::STRING_TYPES.contains(&target)
         {
             return true;
         }
