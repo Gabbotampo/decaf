@@ -11,14 +11,13 @@ fn sublist_writes_match_java25() {
             include_str!("fixtures/sublist_writes/demo/Probe.java"),
         )],
     );
-    let expected = [
-        (0, "[a, x, c, d]|[x, c]"),
-        (1, "[a, b, c, y, d]|[b, c, y]"),
-        (2, "[a, c, d]|[c]"),
-        (3, "[a, d]|[]"),
-        (6, "java.util.ConcurrentModificationException"),
-    ];
-    for (op, expected) in expected {
+    for (op, expected) in include_str!("fixtures/sublist_writes/java25.txt")
+        .lines()
+        .filter_map(|line| {
+            line.split_once('=')
+                .map(|(op, expected)| (op.parse::<i32>().unwrap(), expected))
+        })
+    {
         let mut host = f.jar.seed_host(StdHost::new());
         let got = f.jar.invoke_method_with_args(
             "demo/Probe",
