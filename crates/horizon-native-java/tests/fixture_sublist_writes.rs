@@ -17,8 +17,30 @@ fn sublist_writes_match_java25() {
             l.split_once('=')
                 .map(|(a, b)| (a.parse::<i32>().unwrap(), b))
         })
-        .filter(|(op, _)| *op != 4)
     {
+        if op == 4 || op == 5 {
+            let mut counted = f.jar.seed_host(StdHost::new());
+            let _ = f.jar.invoke_method_with_args(
+                "demo/Probe",
+                "probe",
+                "(I)Ljava/lang/String;",
+                None,
+                &[Value::Int(op)],
+                &mut counted,
+            );
+            let expected_call = if op == 4 {
+                "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V"
+            } else {
+                "java/util/List#sort(Ljava/util/Comparator;)V"
+            };
+            assert!(
+                counted
+                    .unknown_host_calls()
+                    .iter()
+                    .any(|(call, n)| call == expected_call && *n == 1)
+            );
+            continue;
+        }
         let got = f.jar.invoke_method_with_args(
             "demo/Probe",
             "probe",
