@@ -6,7 +6,7 @@ const PROBE: &str = include_str!("fixtures/string_marker_shapes/demo/Probe.java"
 const JAVA25: &str = include_str!("fixtures/string_marker_shapes/java25.txt");
 const CASES: &[(&str, bool)] = &[
     ("hello", true),
-    ("callback", false),
+    ("callback", true),
     ("stream", true),
     ("textures", true),
     ("models", true),
