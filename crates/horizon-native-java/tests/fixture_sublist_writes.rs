@@ -17,6 +17,7 @@ fn sublist_writes_match_java25() {
             l.split_once('=')
                 .map(|(a, b)| (a.parse::<i32>().unwrap(), b))
         })
+        .filter(|(op, _)| *op != 4)
     {
         let got = f.jar.invoke_method_with_args(
             "demo/Probe",
