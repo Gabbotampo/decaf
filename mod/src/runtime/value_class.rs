@@ -140,6 +140,9 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
         || marker.starts_with("registry/")
         || marker.starts_with("payload/")
         || marker.starts_with("payload-context/")
+        || marker.contains("/hcb:")
+        || marker.contains("/hopt:")
+        || marker.contains("/hment:")
     {
         return Shape::Undecidable;
     }

@@ -15,7 +15,7 @@ public final class Probe {
  public static String game(){return castRow(built("game/","x"));}
  public static String list(){return castRow(built("list/hobj:","x"));}
  public static String particle(){return castRow(built("particle/","x"));}
- public static String callback(){return row(built("abc/hcb:","x"));}
+ public static String callback(){return castRow(built("abc/hcb:","x"));}
  public static String stream(){return row(built("stream/","x"));}
  public static String textures(){return row(built("textures/gui/","a.png"));}
  public static String models(){return row(built("models/item/","x"));}
