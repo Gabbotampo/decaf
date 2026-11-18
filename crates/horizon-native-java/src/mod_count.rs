@@ -701,6 +701,9 @@ impl<H: Host> Runtime<'_, H> {
             let Some(mut link) = self.host.sub_list_link(&view) else {
                 return;
             };
+            if self.host.is_detached_sub_list(&view) {
+                return;
+            }
             let parent = crate::jar_object::stored_value(&link.parent);
             let copy = crate::jar_object::stored_value(&view);
             let (Ok(content), Ok(mut elements)) = (

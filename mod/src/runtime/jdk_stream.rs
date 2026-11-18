@@ -473,6 +473,21 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         let Some(list) = list else {
             return Ok(None);
         };
+        let key = match &list {
+            Value::Host(handle) => Some(handle.key().to_owned()),
+            Value::Ref(Some(marker)) => Some(marker.clone()),
+            _ => None,
+        };
+        if key
+            .as_deref()
+            .is_some_and(|marker| self.host.is_detached_sub_list(marker))
+            || key
+                .as_deref()
+                .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
+        {
+            self.host.unknown_operand_call(r)?;
+            return Ok(Some(Value::Void));
+        }
         let Some(items) = self.host.mutable_collection_values(&list) else {
             return Ok(None);
         };
