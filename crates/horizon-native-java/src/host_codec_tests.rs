@@ -18,9 +18,8 @@ fn oracle_row(name: &str) -> &'static str {
     let oracle = JAVA25_ORACLE.get_or_init(|| {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let path = [
-            manifest.join("tests/fixtures/host_codecs/oracle/java25.txt"),
-            manifest
-                .join("../crates/horizon-native-java/tests/fixtures/host_codecs/oracle/java25.txt"),
+            manifest.join("tests/fixtures/host_codecs/java25.txt"),
+            manifest.join("../crates/horizon-native-java/tests/fixtures/host_codecs/java25.txt"),
         ]
         .into_iter()
         .find(|path| path.is_file())
