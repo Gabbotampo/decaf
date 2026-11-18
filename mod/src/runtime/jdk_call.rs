@@ -330,7 +330,7 @@ impl<H: Host> Runtime<'_, H> {
                     | ("toString", "()Ljava/lang/String;")
             )
         {
-            return self.host.unknown_host_call(&r);
+            return self.host.unknown_operand_call(&r);
         }
         if let Some(body) = self.jvm_selected_jar_body(&r, opcode, Some(receiver))? {
             return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
