@@ -12,7 +12,7 @@ const STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/entity/EntityType.java",
-        "package net.minecraft.world.entity; public class EntityType<T>{}",
+        "package net.minecraft.world.entity; public class EntityType<T>{ public static class Builder {} }",
     ),
     (
         "net/minecraft/core/Registry.java",
