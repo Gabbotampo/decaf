@@ -2607,6 +2607,10 @@ pub trait Host {
         false
     }
 
+    fn is_chm_set(&self, _value: &Value) -> bool {
+        false
+    }
+
     fn set_from_map_source(&self, _value: &Value) -> Option<Value> {
         None
     }
@@ -5932,6 +5936,17 @@ impl Host for StdHost {
             };
             self.registrations.push(entry);
         }
+    }
+
+    fn is_chm_set(&self, value: &Value) -> bool {
+        let Some(marker) = crate::jar_object::object_key(value) else {
+            return false;
+        };
+        let Some(map) = self.set_from_map_views.get(marker) else {
+            return false;
+        };
+        map.split_once('#')
+            .is_some_and(|(class, _)| class == "java/util/concurrent/ConcurrentHashMap")
     }
 
     fn is_set_from_map(&self, value: &Value) -> bool {

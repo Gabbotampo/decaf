@@ -318,6 +318,20 @@ impl<H: Host> Runtime<'_, H> {
             return Err(null_checks::invoke_on_null(&r));
         }
         let opcode = if kind == Site::Interface { 0xb9 } else { 0xb6 };
+        if self.host.is_chm_set(receiver)
+            && matches!(
+                (name, descriptor),
+                ("iterator", "()Ljava/util/Iterator;")
+                    | ("toArray", "()[Ljava/lang/Object;")
+                    | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+                    | ("stream", "()Ljava/util/stream/Stream;")
+                    | ("parallelStream", "()Ljava/util/stream/Stream;")
+                    | ("spliterator", "()Ljava/util/Spliterator;")
+                    | ("toString", "()Ljava/lang/String;")
+            )
+        {
+            return self.host.unknown_host_call(&r);
+        }
         if let Some(body) = self.jvm_selected_jar_body(&r, opcode, Some(receiver))? {
             return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
         }
