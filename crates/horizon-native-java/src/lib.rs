@@ -26988,6 +26988,23 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    fn io_reject_non_utf8_charset(
+        &mut self,
+        r: &MethodRef,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if descriptor.contains("Ljava/nio/charset/Charset;")
+            && !matches!(
+                args.get(1),
+                Some(Value::Ref(Some(charset))) if charset == "charset/UTF-8"
+            )
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(None)
+    }
+
     /// Open a reader marker over a virtual file, or report the exception Java
     /// raises for a file that does not exist. A config loader guards its read
     /// with `exists` or catches the `IOException` and writes defaults.
@@ -27369,6 +27386,9 @@ impl<H: Host> Runtime<'_, H> {
                     ("readAllLines", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
+                            return Ok(Some(value));
+                        }
                         if let Some(bytes) = self.io_file_bytes.get(&path)
                             && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
                         {
@@ -27412,6 +27432,9 @@ impl<H: Host> Runtime<'_, H> {
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
+                            return Ok(Some(value));
+                        }
                         if let Some(bytes) = self.io_file_bytes.get(&path)
                             && let Some(length) = Self::io_read_string_malformed_utf8_len(bytes)
                         {
@@ -27605,6 +27628,9 @@ impl<H: Host> Runtime<'_, H> {
                     ("newBufferedReader", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
+                            return Ok(Some(value));
+                        }
                         let value = self.new_object("java/io/BufferedReader");
                         if let Some(reader) = jar_object::object_key(&value) {
                             self.io_open_reader(r, reader, &path, false)?;
