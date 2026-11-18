@@ -293,9 +293,16 @@ fn members_the_host_counts_still_move_mod_count() {
     ];
     let mut host = fixture.jar.seed_host(StdHost::new());
     fixture.text_on(&mut host, "subListRemoveAndSort");
-    assert!(host.unknown_host_calls().iter().any(|(call, count)| call
-        == "java/util/List#sort(Ljava/util/Comparator;)V"
-        && *count == 1));
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![
+            (
+                "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                2,
+            ),
+            ("java/util/List#sort(Ljava/util/Comparator;)V".into(), 1),
+        ]
+    );
 
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
