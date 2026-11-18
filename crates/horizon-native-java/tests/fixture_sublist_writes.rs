@@ -35,15 +35,7 @@ fn sublist_writes_match_java25() {
             host.unknown_host_calls()
         );
     }
-    for (op, expected_call) in [
-        (
-            4,
-            "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V",
-        ),
-        (5, "java/util/List#sort(Ljava/util/Comparator;)V"),
-        (7, "java/util/Collections#sort(Ljava/util/List;)V"),
-        (8, "java/util/Collections#reverse(Ljava/util/List;)V"),
-    ] {
+    for op in [4, 5, 7, 8] {
         let mut counted = f.jar.seed_host(StdHost::new());
         let got = f.jar.invoke_method_with_args(
             "demo/Probe",
@@ -53,10 +45,48 @@ fn sublist_writes_match_java25() {
             &[Value::Int(op)],
             &mut counted,
         );
-        println!(
-            "review op {op}: result={got:?} calls={:?}",
-            counted.unknown_host_calls()
-        );
-        let _ = expected_call;
+        assert!(matches!(
+            got,
+            Ok(Value::Ref(Some(ref result))) if result == "null|null|null|null"
+        ));
+        let expected_calls = match op {
+            4 => vec![
+                (
+                    "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                    2,
+                ),
+                ("java/util/List#get(I)Ljava/lang/Object;".into(), 2),
+                (
+                    "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V".into(),
+                    1,
+                ),
+            ],
+            5 => vec![
+                (
+                    "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                    2,
+                ),
+                ("java/util/List#get(I)Ljava/lang/Object;".into(), 2),
+                ("java/util/List#sort(Ljava/util/Comparator;)V".into(), 1),
+            ],
+            7 => vec![
+                (
+                    "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                    2,
+                ),
+                ("java/util/Collections#sort(Ljava/util/List;)V".into(), 1),
+                ("java/util/List#get(I)Ljava/lang/Object;".into(), 2),
+            ],
+            8 => vec![
+                (
+                    "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                    2,
+                ),
+                ("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1),
+                ("java/util/List#get(I)Ljava/lang/Object;".into(), 2),
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(counted.unknown_host_calls(), expected_calls, "op {op}");
     }
 }
