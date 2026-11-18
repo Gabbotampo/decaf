@@ -300,6 +300,7 @@ fn members_the_host_counts_still_move_mod_count() {
                 "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
                 2,
             ),
+            ("java/util/List#add(ILjava/lang/Object;)V".into(), 1,),
             ("java/util/List#sort(Ljava/util/Comparator;)V".into(), 1),
         ]
     );
