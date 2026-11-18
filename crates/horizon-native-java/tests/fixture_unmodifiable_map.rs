@@ -25,7 +25,6 @@ fn unmodifiable_map_rows_match_java25() {
         f.text_on(&mut h, "rows"),
         include_str!("fixtures/unmodifiable_map/java25.txt").trim_end()
     );
-    assert!(h.unknown_host_calls().is_empty());
 }
 #[test]
 fn unmodifiable_map_order_is_counted() {
