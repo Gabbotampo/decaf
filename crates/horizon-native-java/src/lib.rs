@@ -27338,6 +27338,13 @@ impl<H: Host> Runtime<'_, H> {
                         frame: None,
                     });
                 }
+                if matches!(
+                    r.name.as_str(),
+                    "readAllLines" | "readString" | "newBufferedReader"
+                ) && let Some(value) = self.io_reject_non_utf8_charset(r, &r.descriptor, args)?
+                {
+                    return Ok(Some(value));
+                }
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
@@ -27386,9 +27393,6 @@ impl<H: Host> Runtime<'_, H> {
                     ("readAllLines", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
-                            return Ok(Some(value));
-                        }
                         if let Some(bytes) = self.io_file_bytes.get(&path)
                             && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
                         {
@@ -27432,9 +27436,6 @@ impl<H: Host> Runtime<'_, H> {
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
-                            return Ok(Some(value));
-                        }
                         if let Some(bytes) = self.io_file_bytes.get(&path)
                             && let Some(length) = Self::io_read_string_malformed_utf8_len(bytes)
                         {
@@ -27628,9 +27629,6 @@ impl<H: Host> Runtime<'_, H> {
                     ("newBufferedReader", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
-                        if let Some(value) = self.io_reject_non_utf8_charset(r, descriptor, args)? {
-                            return Ok(Some(value));
-                        }
                         let value = self.new_object("java/io/BufferedReader");
                         if let Some(reader) = jar_object::object_key(&value) {
                             self.io_open_reader(r, reader, &path, false)?;
