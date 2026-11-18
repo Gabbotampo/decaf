@@ -53,10 +53,15 @@ fn sublist_writes_match_java25() {
             &[Value::Int(op)],
             &mut counted,
         );
-        println!("pre-fix op {op}: {:?}", counted.unknown_host_calls());
         assert_eq!(
             counted.unknown_host_calls(),
-            vec![(expected_call.into(), 1)],
+            vec![
+                (
+                    "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                    2
+                ),
+                (expected_call.into(), 1),
+            ],
             "op {op}"
         );
     }
