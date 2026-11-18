@@ -90,7 +90,18 @@ fn concurrent_hash_map_order_dependent_operations_are_counted() {
     let fixture = fixture();
     for method in ["chmIterate", "chmToArray", "chmStream"] {
         let mut host = fixture.jar.seed_host(StdHost::new());
-        fixture.text_on(&mut host, method);
+        fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/Probe",
+                method,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .unwrap_or_else(|error| panic!("{method} failed: {error}"));
+        println!("{method}: {:?}", host.unknown_host_calls());
         assert_eq!(
             host.unknown_host_calls()
                 .iter()
