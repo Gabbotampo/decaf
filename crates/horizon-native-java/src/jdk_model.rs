@@ -1228,8 +1228,8 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         let unmodifiable = state.unmodifiable;
         match state.finish() {
             Ok(map) if unmodifiable => {
-                let entries = crate::runtime::host_collection_values(self, &map)?;
-                Ok(self.factory_unmodifiable("java/util/stream/Collectors", "toUnmodifiableMap", "map", entries))
+                let entries = crate::runtime::host_collection_values(self.host, &map)?;
+                Ok(self.host.factory_collection("java/util/stream/Collectors", "toUnmodifiableMap", "map", entries).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?)
             }
             Ok(map) => Ok(map),
             Err(entries) => self.factory_or_count(
