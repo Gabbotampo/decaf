@@ -414,7 +414,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         let root = self.mod_count_root(marker);
-        let root_is_uncertain = root == marker
+        let root_is_uncertain = root == *marker
             && !self.host.sub_lists_of(marker).is_empty()
             && self.host.mod_stamp(&root).uncertain > 0;
         if !sub_list && root_is_uncertain && is_collection_read(r) {
