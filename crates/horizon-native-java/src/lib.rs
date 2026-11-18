@@ -2624,6 +2624,7 @@ pub trait Host {
     /// is the only place a collection the interpreter mutated lasts, so a host
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
+    fn register_mutable_collection(&mut self, _value: &Value, _kind: &str) {}
 
     /// The collection an unmodifiable view (`Collections.unmodifiableList`)
     /// reads, by the view's marker.
@@ -5882,6 +5883,12 @@ impl Host for StdHost {
         }
         let marker = self.synchronized_target(expect_ref(value)?);
         self.mutable_collections.get(marker).cloned()
+    }
+
+    fn register_mutable_collection(&mut self, value: &Value, _kind: &str) {
+        if let Some(marker) = expect_ref(value) {
+            self.mutable_collections.insert(marker.clone(), Vec::new());
+        }
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {

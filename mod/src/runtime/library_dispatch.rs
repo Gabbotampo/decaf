@@ -300,6 +300,17 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.cloned() else {
             return Ok(None);
         };
+        if r.name == "<init>" {
+            if crate::runtime::expect_ref(&receiver).is_some() {
+                if kind == "map" {
+                    self.host.register_mutable_collection(&receiver, kind);
+                }
+            }
+            return Ok(Some(Value::Void));
+        }
+        if kind == "map" && !self.host.holds_collection(&receiver) {
+            self.host.register_mutable_collection(&receiver, kind);
+        }
         let parameters = descriptor_arguments(&r.descriptor);
         let result = return_desc(&r.descriptor).to_owned();
         if kind == "map"
@@ -360,14 +371,21 @@ impl<H: Host> Runtime<'_, H> {
         let answer = match (kind, base, parameters.len()) {
             ("map", "put", 2) => {
                 let call = boxed(self, false)?;
-                self.host.invoke_instance(
-                    &java(
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    ),
-                    &receiver,
-                    &call,
-                )?
+                if let Some(mut entries) = self.host.mutable_collection_entries(&receiver) {
+                    let old = entries.chunks(2).position(|p| p.first() == call.first());
+                    let previous = old
+                        .and_then(|i| entries.get(i * 2 + 1).cloned())
+                        .unwrap_or(Value::Ref(None));
+                    if let Some(i) = old {
+                        entries[i * 2 + 1] = call[1].clone();
+                    } else {
+                        entries.extend(call.clone());
+                    }
+                    self.host.replace_mutable_collection(&receiver, entries);
+                    previous
+                } else {
+                    return Ok(None);
+                }
             }
             ("map", "get" | "remove" | "containsKey" | "containsValue", 1) => {
                 let call = boxed(self, false)?;
