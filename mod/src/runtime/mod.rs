@@ -5937,22 +5937,6 @@ impl Host for StdHost {
         }
     }
 
-    fn jdk_new_set_from_map_ordered_read(&self, r: &MethodRef, receiver: &Value) -> bool {
-        if !self.is_chm_set(receiver) {
-            return false;
-        }
-        matches!(
-            (r.name.as_str(), r.descriptor.as_str()),
-            ("iterator", "()Ljava/util/Iterator;")
-                | ("toArray", "()[Ljava/lang/Object;")
-                | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
-                | ("stream", "()Ljava/util/stream/Stream;")
-                | ("parallelStream", "()Ljava/util/stream/Stream;")
-                | ("spliterator", "()Ljava/util/Spliterator;")
-                | ("toString", "()Ljava/lang/String;")
-        )
-    }
-
     fn is_set_from_map(&self, value: &Value) -> bool {
         let Value::Host(handle) = value else {
             return false;
@@ -13899,6 +13883,22 @@ impl host_ref::Nested for HostNested<'_> {
 }
 
 impl StdHost {
+    fn jdk_new_set_from_map_ordered_read(&self, r: &MethodRef, receiver: &Value) -> bool {
+        if !self.is_chm_set(receiver) {
+            return false;
+        }
+        matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("iterator", "()Ljava/util/Iterator;")
+                | ("toArray", "()[Ljava/lang/Object;")
+                | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+                | ("stream", "()Ljava/util/stream/Stream;")
+                | ("parallelStream", "()Ljava/util/stream/Stream;")
+                | ("spliterator", "()Ljava/util/Spliterator;")
+                | ("toString", "()Ljava/lang/String;")
+        )
+    }
+
     /// A handle's `toString`/`hashCode`/`equals` through its kind's row
     /// (`host_ref.rs`). One a held value leaves unknown (a held jar object's
     /// `hashCode`, which only the runtime can run) is counted.
