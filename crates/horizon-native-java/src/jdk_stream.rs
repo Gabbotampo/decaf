@@ -485,6 +485,13 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 .as_deref()
                 .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
         {
+            if key
+                .as_deref()
+                .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
+                && let Some(marker) = key.as_deref()
+            {
+                self.mark_sub_list_unknown(marker);
+            }
             self.host.unknown_operand_call(r)?;
             return Ok(Some(Value::Void));
         }
@@ -606,6 +613,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             .as_deref()
             .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
         {
+            if let Some(marker) = key.as_deref() {
+                self.mark_sub_list_unknown(marker);
+            }
             self.host.unknown_operand_call(r)?;
             return Ok(Some(Value::Void));
         }

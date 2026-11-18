@@ -480,7 +480,9 @@ impl<H: Host> Runtime<'_, H> {
         }
         let after = self.host.mod_stamp(&token.marker);
         self.host.entries_after_call(&token.marker);
-        if self.host.sub_list_link(&token.marker).is_some() {
+        let counted_sub_list_write = self.host.sub_list_link(&token.marker).is_some()
+            && matches!(token.name.as_str(), "replaceAll" | "sort");
+        if !counted_sub_list_write && self.host.sub_list_link(&token.marker).is_some() {
             let structural =
                 (after != token.stamp).then_some(after.uncertain != token.stamp.uncertain);
             self.write_back_sub_list(&token.marker, structural);
@@ -498,7 +500,9 @@ impl<H: Host> Runtime<'_, H> {
                 }),
             );
         }
-        self.refresh_sub_lists_of(&token.marker);
+        if !counted_sub_list_write {
+            self.refresh_sub_lists_of(&token.marker);
+        }
         // `keySet()`/`values()`/`entrySet()` kept from this map follow it
         // (`hash_collections.rs`).
         self.refresh_map_views(&token.marker);

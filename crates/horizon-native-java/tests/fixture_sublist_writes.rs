@@ -29,10 +29,18 @@ fn sublist_writes_match_java25() {
             &mut host,
         );
         assert!(matches!(got, Ok(Value::Ref(Some(ref x))) if x == expected));
-        assert_eq!(host.unknown_host_call_count(), 0, "op {op}: {:?}", host.unknown_host_calls());
+        assert_eq!(
+            host.unknown_host_call_count(),
+            0,
+            "op {op}: {:?}",
+            host.unknown_host_calls()
+        );
     }
     for (op, expected_call) in [
-        (4, "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V"),
+        (
+            4,
+            "java/util/List#replaceAll(Ljava/util/function/UnaryOperator;)V",
+        ),
         (5, "java/util/List#sort(Ljava/util/Comparator;)V"),
         (7, "java/util/Collections#sort(Ljava/util/List;)V"),
     ] {
