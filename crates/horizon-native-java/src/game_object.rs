@@ -87,7 +87,9 @@ fn server_kind(rest: &str) -> HostKind {
         "level" => HostKind::GameLevel,
         "server" | "player-list" | "commands" | "rules" | "registries" | "saved-data"
         | "world-border" => HostKind::GameSingleton,
-        "item" | "block" | "block-state" | "registry" => HostKind::GameRegistryObject,
+        "item" | "block" | "block-state" | "registry" | "entity_type" => {
+            HostKind::GameRegistryObject
+        }
         // `damage`, `stack`, `block-hit`, `connection`, `packet-sender`,
         // `unknown`, `<what>/0` placeholders, and any family a model adds
         // before it gets a row: their own objects (never one shared object).
@@ -490,11 +492,25 @@ fn identity_equals(
 /// adds incarnations); `hashCode` and `toString` counted until each family's
 /// producer answers vanilla's (P16b–e). A game object is the game's, the same
 /// object to every jar's runtime.
+fn identity_instance_of(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn crate::host_ref::ClassHierarchy,
+) -> Option<bool> {
+    if handle.key().starts_with("game/entity_type/") {
+        if wanted == "java/lang/Object" || wanted == "net/minecraft/world/entity/EntityType" {
+            return Some(true);
+        }
+        return hierarchy.is_instance("net/minecraft/world/entity/EntityType", wanted);
+    }
+    instance_of_class(handle, wanted, hierarchy)
+}
+
 pub(crate) const IDENTITY_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: identity_equals,
-    instance_of: instance_of_class,
+    instance_of: identity_instance_of,
     crosses_jars: |_, _| true,
     compare_to: None,
 };
@@ -590,6 +606,7 @@ pub(crate) fn value_canonical(key: &str) -> bool {
     crate::client_values::canonical(key)
         || crate::server_values::canonical(key)
         || key.starts_with("client/input-key/")
+        || key.starts_with("game/entity_type/")
         || key == "client/stack/empty"
 }
 

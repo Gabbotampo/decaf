@@ -444,6 +444,7 @@ impl StdHost {
         self.view_copies.retain(|key, _| keep(key));
         self.view_kinds.retain(|key, _| keep(key));
         self.sub_lists.retain(|key, _| keep(key));
+        self.detached_sub_lists.retain(|key| keep(key));
         self.iterator_sources.retain(|key, _| keep(key));
         self.list_iterators.retain(|key, _| keep(key));
         self.iterator_guards.retain(|key, _| keep(key));
@@ -1693,6 +1694,7 @@ mod tests {
             "iterator_guards",
             "mod_stamps",
             "sub_lists",
+            "detached_sub_lists",
             "list_iterators",
             "deque_layouts",
             "iterator_sources",
@@ -1738,6 +1740,7 @@ mod tests {
             "game_block_classes",
             "service_providers",
             "current_time_millis",
+            "nano_time_origin",
             "mods",
             "neoforge_mod_files",
             "run_loader",
@@ -1777,6 +1780,8 @@ mod tests {
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.
             "jar_registries",
             "registry_lifecycles",
+            "random_seed_uniquifier",
+            "random_time_origin",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
