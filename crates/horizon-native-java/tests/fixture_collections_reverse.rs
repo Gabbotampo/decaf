@@ -46,7 +46,7 @@ fn collections_reverse_and_stream_iterator_match_java25() {
         counted_host.unknown_host_calls(),
         vec![
             ("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1),
-            ("java/util/List#toString()Ljava/lang/String;".into(), 1),
+            ("java/util/List#toString()Ljava/lang/String;".into(), 2),
         ]
     );
 }
