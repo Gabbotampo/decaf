@@ -34,9 +34,9 @@ COMMONS_LANG="$SERVER_LIBS/org/apache/commons/commons-lang3/3.20.0/commons-lang3
 CP="$DATAFIXER:$GAME:$FASTUTIL:$GUAVA:$FAILUREACCESS:$NETTY_BUFFER:$NETTY_COMMON:$NETTY_CODEC_BASE:$BRIGADIER:$JOML:$AUTHLIB:$GSON:$COMMONS_LANG"
 ORACLE=/tmp/host-oracle-cov17
 rm -rf "$ORACLE/classes" && mkdir -p "$ORACLE/classes"
-"$JAVA_HOME/bin/javac" --release 25   -cp "$CP"   -d "$ORACLE/classes"   crates/horizon-native-java/tests/fixtures/host_codecs/demo/HostCodecs.java   crates/horizon-native-java/tests/fixtures/host_codecs/oracle/HostCodecsOracle.java
+"$JAVA_HOME/bin/javac" --release 25   -cp "$CP"   -d "$ORACLE/classes"   demo/HostCodecs.java   oracle/HostCodecsOracle.java
 "$JAVA_HOME/bin/java"   -cp "$ORACLE/classes:$CP"   HostCodecsOracle > "$ORACLE/java25-rerun.txt"
-cmp -s "$ORACLE/java25-rerun.txt" crates/horizon-native-java/tests/fixtures/host_codecs/oracle/java25.txt
+cmp -s "$ORACLE/java25-rerun.txt" java25.txt
 ```
 
 The jars used above are the 26.3 server libraries. Their SHA-256 values are:
