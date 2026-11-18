@@ -54,6 +54,24 @@ public final class Probe {
   public static String tree() { return ex(()->Collections.newSetFromMap(new TreeMap<>())); }
   public static String enumMap() { return ex(()->Collections.newSetFromMap(new EnumMap<Key,Boolean>(Key.class))); }
   public static String hashtable() { return ex(()->Collections.newSetFromMap(new Hashtable<>())); }
+  public static void main(String[] args) {
+    System.out.println("basic=" + basic());
+    System.out.println("hashMapDifferential=" + hashMapDifferential());
+    System.out.println("linkedMapDifferential=" + linkedMapDifferential());
+    System.out.println("duplicate=" + duplicate());
+    System.out.println("nullMap=" + nullMap());
+    System.out.println("chmExact=" + chmExact());
+    System.out.println("chmIterate=" + chmIterate());
+    System.out.println("chmToArray=" + chmToArray());
+    System.out.println("chmStream=" + chmStream());
+    System.out.println("identity=" + identity());
+    System.out.println("weak=" + weak());
+    System.out.println("concurrent=" + concurrent());
+    System.out.println("skipList=" + skipList());
+    System.out.println("tree=" + tree());
+    System.out.println("enumMap=" + enumMap());
+    System.out.println("hashtable=" + hashtable());
+  }
 }
 "#;
 
