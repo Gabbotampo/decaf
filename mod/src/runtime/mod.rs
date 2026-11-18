@@ -31000,7 +31000,7 @@ impl<H: Host> Runtime<'_, H> {
                     } else if matches!(r.name.as_str(), "replaceAll" | "sort")
                         && receiver
                             .as_ref()
-                            .and_then(|v| expect_ref(v).ok())
+                            .and_then(|v| expect_ref(v))
                             .is_some_and(|m| self.host.sub_list_link(m).is_some())
                     {
                         invoke_or_catch!(at, self.host.unknown_operand_call(&r))
