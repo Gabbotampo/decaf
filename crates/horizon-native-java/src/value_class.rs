@@ -140,6 +140,8 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
         || marker.starts_with("registry/")
         || marker.starts_with("payload/")
         || marker.starts_with("payload-context/")
+        || marker.starts_with("textures/")
+        || marker.starts_with("models/")
     {
         return Shape::Undecidable;
     }
