@@ -188,15 +188,6 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         const SIMPLE: &str = "java/util/AbstractMap$SimpleEntry";
         const IMMUTABLE: &str = "java/util/AbstractMap$SimpleImmutableEntry";
-        let Some(marker) = receiver
-            .and_then(crate::jar_object::instance_key)
-            .map(str::to_owned)
-        else {
-            return Ok(None);
-        };
-        let Some(class) = crate::jar_object::marker_class(&marker) else {
-            return Ok(None);
-        };
         if r.owner
             .starts_with("it/unimi/dsi/fastutil/objects/Object2Boolean")
             && matches!(r.name.as_str(), "getKey" | "getValue" | "getBooleanValue")
@@ -206,21 +197,32 @@ impl<H: Host> Runtime<'_, H> {
             } else {
                 "getValue"
             };
+            let entry_receiver = receiver.expect("entry receiver");
             let value = self.host.invoke_instance(
                 &MethodRef {
                     owner: "java/util/Map$Entry".into(),
                     name: method.into(),
                     descriptor: "()Ljava/lang/Object;".into(),
                 },
-                receiver.expect("entry receiver"),
+                entry_receiver,
                 args,
             )?;
-            return Ok(Some(if r.name == "getBooleanValue" {
+            let answer = if r.name == "getBooleanValue" {
                 unbox_primitive("Z", &value)
             } else {
-                value
-            }));
+                value.clone()
+            };
+            return Ok(Some(answer));
         }
+        let Some(marker) = receiver
+            .and_then(crate::jar_object::instance_key)
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let Some(class) = crate::jar_object::marker_class(&marker) else {
+            return Ok(None);
+        };
         if class != SIMPLE && class != IMMUTABLE {
             return Ok(None);
         }
@@ -552,6 +554,9 @@ impl<H: Host> Runtime<'_, H> {
         // A handle answers by its kind's row; an object's "yes" is its
         // class's chain (a Mixin-added interface, a JDK supertype), and any
         // other answer goes on to the object paths below.
+        if let Some(instance) = self.host.map_entry_is_instance_of(value, wanted) {
+            return instance;
+        }
         if let Value::Host(handle) = value {
             let row = handle.instance_of(wanted, self) == Some(true);
             if row || !crate::jar_object::is_object_handle(handle) {

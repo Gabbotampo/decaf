@@ -2541,6 +2541,11 @@ pub trait Host {
         None
     }
 
+    /// Whether a host map entry implements a fastutil primitive entry interface.
+    fn map_entry_is_instance_of(&self, _value: &Value, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// A host `Map.Entry`: a new holder or snapshot, or `map`'s node of `key`
     /// (`host_map_entry.rs`). A host that keeps no entries answers one whose contents are
     /// unknown.
@@ -6343,6 +6348,10 @@ impl Host for StdHost {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.map_entry_now(value)
+    }
+
+    fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
+        self.fastutil_entry_instance_of(value, wanted)
     }
 
     fn mint_map_entry(
