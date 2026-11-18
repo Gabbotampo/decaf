@@ -498,11 +498,10 @@ fn identity_instance_of(
     hierarchy: &dyn crate::runtime::host_ref::ClassHierarchy,
 ) -> Option<bool> {
     if handle.key().starts_with("game/entity_type/") {
-        return Some(
-            wanted == "net/minecraft/world/entity/EntityType"
-                || hierarchy.is_instance("net/minecraft/world/entity/EntityType", wanted)
-                    == Some(true),
-        );
+        if wanted == "java/lang/Object" || wanted == "net/minecraft/world/entity/EntityType" {
+            return Some(true);
+        }
+        return hierarchy.is_instance("net/minecraft/world/entity/EntityType", wanted);
     }
     instance_of_class(handle, wanted, hierarchy)
 }

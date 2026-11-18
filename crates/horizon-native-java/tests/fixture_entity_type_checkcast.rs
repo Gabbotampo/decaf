@@ -23,6 +23,10 @@ const STUBS: &[(&str, &str)] = &[
         "package net.minecraft.core; public interface DefaultedRegistry<T> extends Registry<T>{}",
     ),
     (
+        "demo/UnknownInterface.java",
+        "package demo; public interface UnknownInterface {}",
+    ),
+    (
         "net/minecraft/core/registries/BuiltInRegistries.java",
         "package net.minecraft.core.registries; import net.minecraft.core.DefaultedRegistry; import net.minecraft.world.entity.EntityType; public final class BuiltInRegistries { public static final DefaultedRegistry<EntityType<?>> ENTITY_TYPE=null; public static final DefaultedRegistry<Object> BLOCK=null; }",
     ),
@@ -39,6 +43,22 @@ fn rows_match_java25() {
         host.unknown_host_calls().is_empty(),
         "{:?}",
         host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn undecidable_instanceof_is_counted() {
+    let mut sources = STUBS.to_vec();
+    sources.push(("demo/Probe.java", PROBE));
+    let fixture = Fixture::build("entity-type-checkcast-counted", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    assert_eq!(fixture.text_on(&mut host, "undecidable"), "false");
+    assert_eq!(
+        host.unknown_host_calls(),
+        &[(
+            "demo/UnknownInterface#<instanceof>(Ljava/lang/Object;)Z".into(),
+            1
+        )]
     );
 }
 
