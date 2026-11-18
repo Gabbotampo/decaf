@@ -1,7 +1,0 @@
-0=[a, x, c, d]|[x, c]
-1=[a, b, c, y, d]|[b, c, y]
-2=[a, c, d]|[c]
-3=[a, d]|[]
-4=[a, B, C, d]|[B, C]
-5=[a, b, c, d]|[b, c]
-6=java.util.ConcurrentModificationException
