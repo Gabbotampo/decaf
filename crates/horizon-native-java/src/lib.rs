@@ -6123,7 +6123,7 @@ impl Host for StdHost {
     }
 
     fn is_detached_sub_list(&self, marker: &str) -> bool {
-        self.detached_sub_lists.contains(marker)
+        self.detached_sub_lists.contains(marker) && !self.sub_lists.contains_key(marker)
     }
 
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
