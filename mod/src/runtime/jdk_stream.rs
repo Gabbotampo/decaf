@@ -604,6 +604,13 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         }
         if key
             .as_deref()
+            .is_some_and(|marker| self.host.sub_list_link(marker).is_some())
+        {
+            self.host.unknown_operand_call(r)?;
+            return Ok(Some(Value::Void));
+        }
+        if key
+            .as_deref()
             .is_some_and(|marker| self.host.is_detached_sub_list(marker))
         {
             // Counted once, and answered as a no-op: returning `None` here would
