@@ -5881,10 +5881,10 @@ impl Host for StdHost {
     }
 
     fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
-        if jar_object::spells_key(value) {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        if jar_object::spells_key(value) && !self.mutable_collections.contains_key(marker) {
             return None;
         }
-        let marker = self.synchronized_target(expect_ref(value)?);
         self.mutable_collections.get(marker).cloned()
     }
 
