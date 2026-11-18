@@ -45,7 +45,7 @@ fn sublist_writes_match_java25() {
         (8, "java/util/Collections#reverse(Ljava/util/List;)V"),
     ] {
         let mut counted = f.jar.seed_host(StdHost::new());
-        let _ = f.jar.invoke_method_with_args(
+        let got = f.jar.invoke_method_with_args(
             "demo/Probe",
             "review",
             "(I)Ljava/lang/String;",
@@ -54,8 +54,7 @@ fn sublist_writes_match_java25() {
             &mut counted,
         );
         println!(
-            "review op {op}: output={:?} calls={:?}",
-            counted.take_stdout(),
+            "review op {op}: result={got:?} calls={:?}",
             counted.unknown_host_calls()
         );
         let _ = expected_call;
