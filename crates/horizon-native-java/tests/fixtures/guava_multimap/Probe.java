@@ -65,6 +65,35 @@ public final class Probe {
   public static String asMapRemoveArray() { return removed(ArrayListMultimap.create()); }
   public static String asMapRemoveHash() { return removed(HashMultimap.create()); }
   public static String asMapRemoveLinked() { return removed(LinkedHashMultimap.create()); }
+  private static String wrappers(Multimap<String,Integer> m) {
+    m.put("a", 1); m.put("a", 2);
+    Collection<Integer> direct = m.get("a");
+    Collection<Integer> asMap = m.asMap().get("a");
+    String classes = direct.getClass().getName() + "|" + asMap.getClass().getName()
+        + "|" + m.asMap().entrySet().iterator().next().getValue().getClass().getName();
+    if (direct instanceof java.util.List<?> list) {
+      java.util.List<?> sub = list.subList(0, 1);
+      return classes + "|" + list.get(1) + "|" + sub.size() + "|"
+          + list.listIterator(1).next();
+    }
+    @SuppressWarnings("unchecked") java.util.Set<Integer> set = (java.util.Set<Integer>) direct;
+    return classes + "|" + set.contains(2) + "|" + set.add(2) + "|" + set.remove(1);
+  }
+  public static String wrappersArray() { return wrappers(ArrayListMultimap.create()); }
+  public static String wrappersHash() { return wrappers(HashMultimap.create()); }
+  public static String wrappersLinked() { return wrappers(LinkedHashMultimap.create()); }
+  private static String entrySetHandles(Multimap<String,Integer> m) {
+    m.put("a", 1); m.put("a", 2);
+    java.util.Set<Map.Entry<String, Collection<Integer>>> entries = m.asMap().entrySet();
+    Map.Entry<String, Collection<Integer>> e = entries.iterator().next();
+    Map.Entry<String, Collection<Integer>> same = entries.iterator().next();
+    boolean contains = entries.contains(same);
+    boolean removed = entries.remove(same);
+    return contains + "|" + removed + "|" + entries.size() + "|" + entries.contains(e);
+  }
+  public static String entrySetHandlesArray() { return entrySetHandles(ArrayListMultimap.create()); }
+  public static String entrySetHandlesHash() { return entrySetHandles(HashMultimap.create()); }
+  public static String entrySetHandlesLinked() { return entrySetHandles(LinkedHashMultimap.create()); }
   private static String iteratorRemove(Multimap<String,Integer> m, int view) {
     m.put("a", 1); m.put("b", 2);
     Collection<Integer> held = m.get("a");

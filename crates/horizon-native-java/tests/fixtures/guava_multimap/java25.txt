@@ -8,3 +8,9 @@ true|2|0|false|1|true|true
 1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme
 1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme
 1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme
+com.google.common.collect.AbstractMapBasedMultimap$RandomAccessWrappedList|com.google.common.collect.AbstractMapBasedMultimap$RandomAccessWrappedList|com.google.common.collect.AbstractMapBasedMultimap$RandomAccessWrappedList|2|1|2
+com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|true|false|true
+com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|com.google.common.collect.AbstractMapBasedMultimap$WrappedSet|true|false|true
+true|true|0|false
+true|true|0|false
+true|true|0|false

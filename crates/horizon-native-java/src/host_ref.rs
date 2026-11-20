@@ -945,6 +945,23 @@ pub(crate) fn instance_of_class(
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
+    if handle.kind() == HostKind::GuavaMultimap {
+        let class = handle.class()?;
+        let list = class.ends_with("$WrappedList") || class.ends_with("$RandomAccessWrappedList");
+        let set = class.ends_with("$WrappedSet");
+        if wanted == "java/util/Collection" || wanted == "java/lang/Object" {
+            return Some(true);
+        }
+        if wanted == "java/util/List" {
+            return Some(list);
+        }
+        if wanted == "java/util/Set" {
+            return Some(set);
+        }
+        if wanted == "java/util/RandomAccess" {
+            return Some(class.ends_with("$RandomAccessWrappedList"));
+        }
+    }
     let declared = match handle.kind.info().class {
         ClassRule::Unknown { declared } => declared(handle.key()),
         _ => return hierarchy.is_instance(handle.class()?, wanted),

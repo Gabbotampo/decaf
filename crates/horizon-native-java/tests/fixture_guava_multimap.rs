@@ -71,6 +71,20 @@ fn real_guava_multimaps_match_java25() {
         );
     }
     for method in [
+        "wrappersArray",
+        "wrappersHash",
+        "wrappersLinked",
+        "entrySetHandlesArray",
+        "entrySetHandlesHash",
+        "entrySetHandlesLinked",
+    ] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            oracle.next().unwrap(),
+            "{method}"
+        );
+    }
+    for method in [
         "entries",
         "keys",
         "replaceValues",
