@@ -272,20 +272,6 @@ impl<H: Host> Runtime<'_, H> {
             // `throw new NoSuchElementException(e)`: `e` is the cause.
             Err(error) if self.catches(&error, IOOBE) => {
                 self.itr_check(itr)?;
-                if self
-                    .host_collection_class(&list)
-                    .is_some_and(|class| class == "java/util/Collections$CopiesList")
-                    || expect_ref(&list).is_some_and(|marker| {
-                        crate::jar_object::collection_class(marker)
-                            == "java/util/Collections$CopiesList"
-                    })
-                {
-                    return self.host.unknown_operand_call(&MethodRef {
-                        owner: "java/util/List".into(),
-                        name: "iterator.next".into(),
-                        descriptor: "()Ljava/lang/Object;".into(),
-                    });
-                }
                 Err(self.throw_caused(NSEE, error))
             }
             Err(error) => Err(error),

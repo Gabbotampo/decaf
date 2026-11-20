@@ -31610,23 +31610,6 @@ impl<H: Host> Runtime<'_, H> {
                             .map_or(Ok(None), |value| value.map(Some))
                     ) {
                         value
-                    } else if receiver.as_ref().is_some_and(|value| {
-                        crate::jar_object::object_class(value)
-                            .is_some_and(|class| class.contains("SubList"))
-                            && self
-                                .collection_elements(value)
-                                .is_ok_and(|elements| elements.is_empty())
-                    }) && matches!(r.name.as_str(), "set" | "remove")
-                        && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
-                    {
-                        invoke_or_catch!(
-                            at,
-                            Err(NativeError::UncaughtException {
-                                class: "java/lang/UnsupportedOperationException".into(),
-                                message: None,
-                                frame: None,
-                            })
-                        )
                     } else if let Some(marker) = receiver.as_ref().and_then(expect_ref)
                         && self.host.is_immutable_empty_sublist(marker)
                         && matches!(
@@ -31647,6 +31630,23 @@ impl<H: Host> Runtime<'_, H> {
                             Err(NativeError::UncaughtException {
                                 class: "java/lang/IndexOutOfBoundsException".into(),
                                 message: Some(format!("Index {index} out of bounds for length 0")),
+                                frame: None,
+                            })
+                        )
+                    } else if receiver.as_ref().is_some_and(|value| {
+                        crate::jar_object::object_class(value)
+                            .is_some_and(|class| class.contains("SubList"))
+                            && self
+                                .collection_elements(value)
+                                .is_ok_and(|elements| elements.is_empty())
+                    }) && matches!(r.name.as_str(), "set" | "remove")
+                        && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+                    {
+                        invoke_or_catch!(
+                            at,
+                            Err(NativeError::UncaughtException {
+                                class: "java/lang/UnsupportedOperationException".into(),
+                                message: None,
                                 frame: None,
                             })
                         )
