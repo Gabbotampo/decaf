@@ -493,13 +493,12 @@ pub(crate) mod tests {
     mod_api::impl_host_areas!(PlayerTickHost);
     impl ServerHost for PlayerTickHost {}
     mod_api::impl_server_host_areas!(PlayerTickHost);
-    impl mod_api::prelude::PlayersBackend for PlayerTickHost {
+    impl mod_api::prelude::PlayerModesBackend for PlayerTickHost {
         fn player_is_spectator(&self, player: PlayerRef) -> Option<bool> {
             self.spectator.get(&player.uuid()).copied().flatten()
         }
     }
-    impl mod_api::prelude::PlayersClientBackend for PlayerTickHost {}
-    mod_api::impl_backend_areas!(PlayerTickHost, except(players));
+    mod_api::impl_backend_areas!(PlayerTickHost, except(player_modes));
     impl Backend for PlayerTickHost {}
     use std::io::Write;
     use std::path::{Path, PathBuf};

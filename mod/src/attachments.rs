@@ -556,6 +556,14 @@ mod tests {
     fn a_player_the_store_cannot_reach_is_refused_by_name() {
         struct Gone;
         impl mod_api::AttachmentHost for Gone {
+            fn validate_attachment(
+                &self,
+                _: &str,
+                _: &str,
+                _: bool,
+            ) -> Result<(), AttachmentError> {
+                Ok(())
+            }
             fn attachments(
                 &mut self,
                 _: Holder,
@@ -583,6 +591,14 @@ mod tests {
             old: Attachments,
         }
         impl mod_api::AttachmentHost for Lent {
+            fn validate_attachment(
+                &self,
+                _: &str,
+                _: &str,
+                _: bool,
+            ) -> Result<(), AttachmentError> {
+                Ok(())
+            }
             fn attachments(
                 &mut self,
                 holder: Holder,

@@ -133,7 +133,7 @@ Minecraft/loader install skip when the corresponding files or environment variab
 `mod/` is a Horizon **native mod** (`docs/mod-plan.md`): the first way this runtime runs inside the
 game instead of in the probe. It implements the game's typed `Hooks` from the mod API on
 [sunrise-org/sunrise](https://github.com/sunrise-org/sunrise) (crate `sunrise-mod-api`, library
-`mod_api`), pinned to commit `a87e07f5f8bb584315a3915ae45503d94c713904` in `mod/sunrise-mod.toml`.
+`mod_api`), pinned to commit `7a489357de72e4db09f13a67a49882fcaf3c7197` in `mod/sunrise-mod.toml`.
 
 What it does today:
 
