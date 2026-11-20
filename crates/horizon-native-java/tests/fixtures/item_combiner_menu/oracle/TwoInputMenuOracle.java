@@ -31,6 +31,8 @@ public final class TwoInputMenuOracle {
 
     void trigger() { inputSlots.setItem(0, net.minecraft.world.item.ItemStack.EMPTY); }
     boolean resultSet() { return created; }
+    boolean inputsEmpty() { return inputSlots.isEmpty(); }
+    boolean resultEmpty() { return resultSlots.isEmpty(); }
   }
 
   private static void validation(String name, Runnable action) {
@@ -58,6 +60,9 @@ public final class TwoInputMenuOracle {
     System.out.println("inventoryEnd=" + (result + 1 + 27));
     System.out.println("useRowStart=" + (result + 1 + 27));
     System.out.println("useRowEnd=" + (result + 1 + 27 + 9));
+    System.out.println("stillValid=" + menu.stillValid(null));
+    System.out.println("inputEmpty=" + menu.inputsEmpty());
+    System.out.println("resultEmpty=" + menu.resultEmpty());
     menu.trigger();
     System.out.println("resultSet=" + menu.resultSet());
     System.out.println("mayPlace=" + menu.getSlot(0).mayPlace(net.minecraft.world.item.ItemStack.EMPTY));

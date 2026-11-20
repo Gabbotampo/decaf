@@ -230,6 +230,14 @@ pub(crate) fn call(
         {
             return Some(Ok(crate::empty_optional()));
         }
+        if r.name == "evaluate"
+            && r.descriptor
+                == "(Ljava/util/function/BiFunction;Ljava/lang/Object;)Ljava/lang/Object;"
+        {
+            // ContainerLevelAccess's default overload is `evaluate(f).orElse(default)`.
+            // NULL's Optional is empty, so the default is the exact answer.
+            return Some(Ok(args.get(1)?.clone()));
+        }
         return None;
     }
 
@@ -640,6 +648,14 @@ pub(crate) fn call(
             ("getUseRowEnd" | "getRowEnd", "()I") => {
                 Ok(Value::Int(state.definition.inputs.len() as i32 + 37))
             }
+            ("stillValid", "(Lnet/minecraft/world/entity/player/Player;)Z")
+                if expect_ref(&state.access)
+                    .is_some_and(|key| key == "container-level-access/null") =>
+            {
+                // ItemCombinerMenu passes Boolean.TRUE as the default to
+                // ContainerLevelAccess.evaluate(BiFunction, Object).
+                Ok(Value::Int(1))
+            }
             _ => return None,
         });
     }
@@ -688,10 +704,18 @@ pub(crate) fn call(
         let mut pending_action = None;
         let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
-            "isEmpty" => Ok(Value::Int(items.iter().all(|v| {
-                matches!(v, Value::Ref(None))
-                    || matches!(v, Value::Ref(Some(s)) if s == "stack/empty")
-            }) as i32)),
+            "isEmpty" => {
+                if items.iter().all(|v| {
+                    matches!(v, Value::Ref(None))
+                        || matches!(v, Value::Ref(Some(s)) if s == "stack/empty")
+                }) {
+                    Ok(Value::Int(1))
+                } else {
+                    // ItemStack.isEmpty is observable per element.  An arbitrary
+                    // marker does not tell us whether its count/item is empty.
+                    return None;
+                }
+            }
             "getItem" => {
                 let position = if *result { 0 } else { index };
                 let Some(item) = items.get(position).cloned() else {
@@ -704,6 +728,13 @@ pub(crate) fn call(
             }
             "setItem" => {
                 let value = args.get(1)?;
+                // SimpleContainer clamps through getMaxStackSize(stack) and
+                // ItemStack.limitSize(max).  Only EMPTY is fully known here;
+                // refuse to mutate for an unknown stack so Java's clamp cannot
+                // be silently skipped. ResultContainer has no clamp in 26.3.
+                if !*result && !matches!(value, Value::Ref(Some(s)) if s == "stack/empty") {
+                    return None;
+                }
                 let item = items.get_mut(index)?;
                 *item = value.clone();
                 if !*result && let Some(menu) = owner.as_ref() {
@@ -998,6 +1029,104 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(indexes, NativeError::UncaughtException { message: Some(message), .. } if message == "Expected input slots to have continous indexes")
+        );
+    }
+
+    #[test]
+    fn null_access_uses_the_evaluate_default_and_unknown_stacks_count() {
+        let mut states = States::new();
+        let access = Value::Ref(Some("container-level-access/null".into()));
+        let fallback = Value::Int(1);
+        assert_eq!(
+            call(
+                &mut states,
+                &method(
+                    "net/minecraft/world/inventory/ContainerLevelAccess",
+                    "evaluate",
+                    "(Ljava/util/function/BiFunction;Ljava/lang/Object;)Ljava/lang/Object;",
+                ),
+                &access,
+                &[Value::Ref(None), fallback.clone()],
+            )
+            .unwrap()
+            .unwrap(),
+            fallback
+        );
+
+        let simple = Value::Ref(Some("simple/test".into()));
+        call(
+            &mut states,
+            &method("net/minecraft/world/SimpleContainer", "<init>", "(I)V"),
+            &simple,
+            &[Value::Int(1)],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            call(
+                &mut states,
+                &method(
+                    "net/minecraft/world/SimpleContainer",
+                    "setItem",
+                    "(ILnet/minecraft/world/item/ItemStack;)V",
+                ),
+                &simple,
+                &[Value::Int(0), Value::Ref(Some("stack/unknown".into()))],
+            )
+            .is_none()
+        );
+        assert_eq!(
+            call(
+                &mut states,
+                &method("net/minecraft/world/SimpleContainer", "isEmpty", "()Z",),
+                &simple,
+                &[],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1)
+        );
+
+        let result = Value::Ref(Some("result/test".into()));
+        call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ResultContainer",
+                "<init>",
+                "()V",
+            ),
+            &result,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            call(
+                &mut states,
+                &method(
+                    "net/minecraft/world/inventory/ResultContainer",
+                    "setItem",
+                    "(ILnet/minecraft/world/item/ItemStack;)V",
+                ),
+                &result,
+                &[Value::Int(0), Value::Ref(Some("stack/unknown".into()))],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Void
+        );
+        assert!(
+            call(
+                &mut states,
+                &method(
+                    "net/minecraft/world/inventory/ResultContainer",
+                    "isEmpty",
+                    "()Z",
+                ),
+                &result,
+                &[],
+            )
+            .is_none()
         );
     }
 }
