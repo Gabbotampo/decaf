@@ -251,6 +251,9 @@ struct EntryState {
 #[derive(Clone, Debug, PartialEq)]
 struct Before {
     stamp: ModStamp,
+    /// Hashtable's map removal paths clear the node value for GC. Its
+    /// Enumerator.remove path unlinks without clearing it.
+    null_values: bool,
     /// The live nodes the call may remove, with the key and value each held (what a removed node
     /// keeps); `None` for a call that only reads, inserts or replaces values (`put`, `get`...),
     /// after which every node is still there.
@@ -421,6 +424,7 @@ fn may_remove(name: &str) -> bool {
             | "pollLast"
             | "removeFirst"
             | "removeLast"
+            | "iterator_remove"
     )
 }
 
@@ -1028,7 +1032,7 @@ impl StdHost {
         // `remove(key)`/`remove(key, value)` on a hash map runs no callback and can remove only
         // the node of `key`, found by the node index (a tree's `deleteEntry` may free its
         // successor's node instead, so a tree takes every node).
-        let one_key = name == "remove"
+        let one_key = matches!(name, "remove" | "iterator_remove")
             && matches!(args.len(), 1 | 2)
             && !self.red_black_trees.contains_key(map)
             && entry_mode(class_of_marker(map)).is_some_and(|(class, mode)| {
@@ -1064,9 +1068,19 @@ impl StdHost {
                     .collect(),
             )
         });
-        self.map_entries
-            .before
-            .insert(map.to_owned(), Before { stamp, taken });
+        // Only `Hashtable.remove` (and the entry-set removal routed through it) nulls the
+        // unlinked node's value (`e.value = null`). `clear` only empties the buckets, and
+        // `compute`, `computeIfPresent` and `merge` returning null unlink the node, leaving
+        // its value as it was (JDK 25 `Hashtable.java`), so a held entry keeps it.
+        let null_values = class_of_marker(map) == "java/util/Hashtable" && name == "remove";
+        self.map_entries.before.insert(
+            map.to_owned(),
+            Before {
+                stamp,
+                null_values,
+                taken,
+            },
+        );
     }
 
     /// After a call on `map`: follow its live nodes. Without a structural change they stay as
@@ -1100,7 +1114,11 @@ impl StdHost {
                 {
                     if let Some(state) = self.map_entries.states.get_mut(&entry_key) {
                         state.key = key.clone();
-                        state.value = value;
+                        state.value = if before.null_values {
+                            Value::Ref(None)
+                        } else {
+                            value
+                        };
                     }
                     self.map_entries.set_life(&entry_key, Life::Detached);
                     // Never handed out again: a later reading of its key is a new node.
@@ -1175,7 +1193,11 @@ impl StdHost {
                 && let Some(state) = self.map_entries.states.get_mut(&entry_key)
             {
                 state.key = key.clone();
-                state.value = value.clone();
+                state.value = if before.null_values {
+                    Value::Ref(None)
+                } else {
+                    value.clone()
+                };
             }
             self.map_entries.set_life(&entry_key, life);
         }
@@ -1201,6 +1223,15 @@ fn entry_text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String
     let Some((key, value)) = parts(handle, nested) else {
         return Ok(None);
     };
+    if entry_class(handle.key()) == "java/util/Hashtable$Entry" && value == Value::Ref(None) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/NullPointerException".into(),
+            message: Some(
+                "Cannot invoke \"Object.toString()\" because \"this.value\" is null".into(),
+            ),
+            frame: None,
+        });
+    }
     let (Some(key), Some(value)) = (nested.text(&key)?, nested.text(&value)?) else {
         return Ok(None);
     };
