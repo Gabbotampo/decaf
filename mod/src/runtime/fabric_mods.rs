@@ -140,56 +140,50 @@ fn cv_type(value: &serde_json::Value) -> &'static str {
 }
 
 impl StdHost {
-    /// Record a Fabric jar's own `fabric.mod.json` as its container's
-    /// metadata. The first jar that names an id keeps it.
-    pub(crate) fn record_fabric_metadata(&mut self, jar: &NativeJar) {
+    /// Record a Fabric jar's metadata, refusing a duplicate id or alias.
+    pub(crate) fn try_record_fabric_metadata(
+        &mut self,
+        jar: &NativeJar,
+    ) -> Result<(), NativeError> {
         let Some(document) = jar
             .resource_bytes
             .get("fabric.mod.json")
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
         else {
-            return;
+            return Ok(());
         };
         if let Some(id) = document
             .get("id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
         {
-            if self.fabric_metadata.contains_key(&id) {
-                self.fabric_metadata.remove(&id);
-                self.fabric_resolution_errors
-                    .push(format!("duplicate mod {id}"));
-            } else {
-                self.fabric_metadata.insert(id.clone(), document.clone());
+            if self.fabric_metadata.contains_key(&id) || self.fabric_aliases.contains_key(&id) {
+                return Err(NativeError::Metadata(format!("duplicate mod {id}")));
             }
-            // Fabric's mod map also indexes every provides alias to the same
-            // selected container, so isModLoaded/getModContainer answer aliases.
-            if let Some(aliases) = document
+            let aliases = document
                 .get("provides")
                 .and_then(serde_json::Value::as_array)
-            {
-                for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
-                    if alias == id {
-                        self.fabric_resolution_errors
-                            .push(format!("duplicate mod {alias}"));
-                        continue;
-                    }
-                    match self.fabric_aliases.get(alias) {
-                        Some(owner) if owner != &id => {
-                            self.fabric_aliases.remove(alias);
-                            self.fabric_resolution_errors
-                                .push(format!("duplicate mod {alias}"));
-                        }
-                        None if self.fabric_metadata.contains_key(alias) && alias != id => {
-                            self.fabric_resolution_errors
-                                .push(format!("duplicate mod {alias}"));
-                        }
-                        None => {
-                            self.fabric_aliases.insert(alias.to_owned(), id.clone());
-                        }
-                        _ => {}
-                    }
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for alias in &aliases {
+                if alias == &id
+                    || self.fabric_metadata.contains_key(alias)
+                    || self.fabric_aliases.contains_key(alias)
+                {
+                    return Err(NativeError::Metadata(format!("duplicate mod {alias}")));
                 }
+            }
+            self.fabric_metadata.insert(id.clone(), document.clone());
+            // Fabric's mod map also indexes every provides alias to the same
+            // selected container, so isModLoaded/getModContainer answer aliases.
+            for alias in aliases {
+                self.fabric_aliases.insert(alias, id.clone());
             }
             // Linked and nested Fabric jars contribute their declared
             // entrypoints to the same loader storage. Keep declaration order
@@ -207,6 +201,50 @@ impl StdHost {
                     self.fabric_entrypoint_containers.push(row);
                 }
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_fabric_metadata(&mut self, jar: &NativeJar) {
+        if let Err(error) = self.try_record_fabric_metadata(jar) {
+            let mut reasons = Vec::new();
+            if let Some(document) = jar
+                .resource_bytes
+                .get("fabric.mod.json")
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            {
+                let id = document.get("id").and_then(serde_json::Value::as_str);
+                if let Some(id) = id
+                    && (self.fabric_metadata.contains_key(id)
+                        || self.fabric_aliases.contains_key(id))
+                {
+                    reasons.push(id.to_owned());
+                }
+                if let Some(aliases) = document
+                    .get("provides")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
+                        if id == Some(alias)
+                            || self.fabric_metadata.contains_key(alias)
+                            || self.fabric_aliases.contains_key(alias)
+                        {
+                            reasons.push(alias.to_owned());
+                            self.fabric_aliases.remove(alias);
+                        }
+                    }
+                }
+            }
+            if reasons.is_empty() {
+                reasons.push(error.to_string());
+            }
+            reasons.sort();
+            reasons.dedup();
+            self.fabric_resolution_errors.extend(
+                reasons
+                    .into_iter()
+                    .map(|reason| format!("duplicate mod {reason}")),
+            );
         }
     }
 
@@ -296,11 +334,10 @@ impl StdHost {
     /// requires, which a real loader would have had to find) and the loaders
     /// it always reports as loaded.
     pub(crate) fn fabric_mod_present(&self, id: &str) -> bool {
-        if self
-            .fabric_resolution_errors
-            .iter()
-            .any(|error| error == &format!("duplicate mod {id}"))
-        {
+        if self.fabric_resolution_errors.iter().any(|error| {
+            error == &format!("duplicate mod {id}")
+                || error.contains(&format!("duplicate mod {id}"))
+        }) {
             return false;
         }
         self.mods.contains_key(id)
@@ -892,5 +929,15 @@ mod tests {
                 .iter()
                 .any(|error| error == "duplicate mod alias")
         );
+    }
+
+    #[test]
+    fn linked_duplicate_id_is_a_loader_refusal() {
+        let one = fabric("one", &[]);
+        let two = fabric("one", &[]);
+        let mut host = StdHost::new();
+        host.link_jar("one", &one).unwrap();
+        let error = host.link_jar("two", &two).unwrap_err();
+        assert!(error.to_string().contains("duplicate mod one"));
     }
 }

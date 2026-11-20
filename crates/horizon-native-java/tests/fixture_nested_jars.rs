@@ -311,3 +311,37 @@ fn unlisted_and_explicitly_empty_fabric_jars_do_not_leak_mods() {
     let plan = dependencies::plan(&[("dependent.jar", &dependent), ("outer.jar", &listed)]);
     assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
 }
+
+#[test]
+fn outer_resource_wins_over_a_nested_resource_with_the_same_name() {
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut bytes);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap();
+        bytes.into_inner()
+    }
+    let nested = zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"id":"nested-resource","version":"1"}"#,
+        ),
+        ("shared.txt", b"nested"),
+    ]);
+    let outer = NativeJar::from_bytes(&zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"id":"outer-resource","version":"1","jars":[{"file":"META-INF/jars/nested.jar"}]}"#,
+        ),
+        ("shared.txt", b"outer"),
+        ("META-INF/jars/nested.jar", &nested),
+    ]))
+    .unwrap();
+    let host = outer.seed_host(StdHost::new());
+    assert_eq!(host.resource("shared.txt"), Some("jar-resource/shared.txt"));
+}

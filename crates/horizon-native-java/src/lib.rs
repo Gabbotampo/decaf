@@ -4380,8 +4380,8 @@ impl StdHost {
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
         let id = id.into();
+        self.try_record_loaded_mod(jar)?;
         let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
-        self.record_loaded_mod(jar);
         // A real loader's class path also resolves resources and service
         // descriptors from the selected sibling. Merge each once in class
         // path order; unselected Jar-in-Jar copies never reach this method.
@@ -4416,7 +4416,7 @@ impl StdHost {
         for (entry, nested) in nested_jars::parsed(jar) {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
-            self.record_loaded_mod(&nested);
+            self.try_record_loaded_mod(&nested)?;
             if let Some(nested_id) = nested.fabric_id.as_deref() {
                 let parent = jar
                     .fabric_id
@@ -4435,8 +4435,8 @@ impl StdHost {
 
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
-    fn record_loaded_mod(&mut self, jar: &NativeJar) {
-        self.record_fabric_metadata(jar);
+    fn try_record_loaded_mod(&mut self, jar: &NativeJar) -> Result<(), NativeError> {
+        self.try_record_fabric_metadata(jar)?;
         if let Some(toml) = neoforge_loader::mods_toml(&jar.resource_bytes) {
             let entries = neoforge_loader::mod_file_entries(toml, jar.neoforge_version.as_deref());
             if let Some((first, first_version)) = entries.first().cloned() {
@@ -4465,6 +4465,7 @@ impl StdHost {
                 *known = version.unwrap_or("unknown").to_owned();
             }
         }
+        Ok(())
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -5495,7 +5496,10 @@ impl StdHost {
                 self.block_property_builders
                     .get(marker)
                     .map(|builder| RegistryDeclaration::Block {
-                        template: INFERRED_BLOCK_TEMPLATE.to_owned(),
+                        template: builder
+                            .get("__template")
+                            .cloned()
+                            .unwrap_or_else(|| INFERRED_BLOCK_TEMPLATE.to_owned()),
                         properties: block_declaration_properties(builder),
                         // A block built this way has the item vanilla gives
                         // every block; a mod that registers its own block item
@@ -8629,6 +8633,31 @@ impl Host for StdHost {
         }
         if let Some(value) = self.registry_register(r, Some(receiver), args) {
             return Ok(value);
+        }
+        if r.owner == "net/minecraft/world/level/block/CraftingTableBlock"
+            && r.name == "<init>"
+            && r.descriptor
+                == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+        {
+            let Some(builder) = args.first().and_then(expect_ref) else {
+                return Ok(Value::Void);
+            };
+            let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
+                return Ok(Value::Void);
+            };
+            let marker = jar_object::instance_key(receiver).unwrap_or_default();
+            if jar_object::key_class(marker)
+                == Some("net/minecraft/world/level/block/CraftingTableBlock")
+            {
+                properties.insert("__template".into(), "minecraft:crafting_table".into());
+            }
+            if self.block_property_builders.contains_key(marker)
+                || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+            {
+                self.block_property_builders
+                    .insert(marker.to_owned(), properties);
+            }
+            return Ok(Value::Void);
         }
         if let Some(value) = self.property_builder_call(r, receiver, args)? {
             return Ok(value);
@@ -13446,6 +13475,7 @@ fn block_builder_settings(
         }
     };
     match method {
+        "destroyTime" => push("destroyTime", number(first)),
         "strength" if descriptor.starts_with("(FF") => {
             push("destroyTime", number(first));
             push("explosionResistance", number(args.get(1)));

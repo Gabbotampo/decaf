@@ -202,38 +202,35 @@ fn fabric_version(value: Option<&str>) -> FabricVersion<'_> {
     let (numbers, prerelease) = without_build
         .split_once('-')
         .map_or((without_build, None), |(a, b)| (a, Some(b)));
+    // Version.parse(String) calls VersionParser.parse(..., false): X-ranges
+    // are accepted only by the resolver's private parser, and therefore are
+    // deliberately StringVersion values on the public API.
     let components = numbers.split('.').collect::<Vec<_>>();
     let valid_prerelease = prerelease.is_none_or(|v| {
-        !v.is_empty()
-            && v.split('.').all(|part| {
+        v.is_empty()
+            || v.split('.').all(|part| {
                 !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             })
     });
-    let mut wildcard = false;
     let mut parsed = Vec::with_capacity(components.len());
-    for (index, component) in components.iter().enumerate() {
-        if matches!(*component, "x" | "X" | "*") {
-            if prerelease.is_some() || (index == 0 && components.len() == 1) {
-                return FabricVersion::String(value);
-            }
-            if wildcard || index + 1 != components.len() {
-                return FabricVersion::String(value);
-            }
-            wildcard = true;
-            parsed.push(i64::MIN);
-            continue;
-        }
-        if component.is_empty() || component.parse::<i32>().is_err() {
+    for component in components {
+        if component.is_empty() || !component.chars().all(|c| c.is_ascii_digit()) {
             return FabricVersion::String(value);
         }
-        parsed.push(i64::from(component.parse::<i32>().unwrap()));
+        let Ok(component) = component.parse::<i32>() else {
+            return FabricVersion::String(value);
+        };
+        if component < 0 {
+            return FabricVersion::String(value);
+        }
+        parsed.push(i64::from(component));
     }
     if parsed.is_empty() || !valid_prerelease {
         FabricVersion::String(value)
     } else {
         FabricVersion::Semantic {
             components: parsed,
-            wildcard,
+            wildcard: false,
             prerelease,
         }
     }
@@ -315,12 +312,33 @@ pub(crate) fn version_cmp(left: Option<&str>, right: Option<&str>) -> Ordering {
         (FabricVersion::Semantic { .. }, FabricVersion::Semantic { .. }) => semantic_cmp(&av, &bv),
         (FabricVersion::String(a), FabricVersion::String(b)) => a.cmp(b),
         (FabricVersion::Semantic { .. }, FabricVersion::String(right)) => {
-            left.unwrap_or("0").cmp(right)
+            semantic_friendly(&av).as_str().cmp(right)
         }
         (FabricVersion::String(left), FabricVersion::Semantic { .. }) => {
-            (*left).cmp(right.unwrap_or("0"))
+            left.cmp(&semantic_friendly(&bv).as_str())
         }
     }
+}
+
+fn semantic_friendly(version: &FabricVersion<'_>) -> String {
+    let FabricVersion::Semantic {
+        components,
+        prerelease,
+        ..
+    } = version
+    else {
+        return String::new();
+    };
+    let mut result = components
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    if let Some(prerelease) = prerelease {
+        result.push('-');
+        result.push_str(prerelease);
+    }
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -332,70 +350,62 @@ struct MavenInterval {
 }
 
 fn maven_cmp(a: &str, b: &str) -> Ordering {
-    // ComparableVersion's token order for the versions used by JarJar: numeric
-    // components compare numerically; alpha/beta/milestone/rc/snapshot sort
-    // before release, and service-pack sorts after release.
+    // Maven ComparableVersion's Item tree, reduced to its observable ordering.
+    // Delimiters and digit/letter transitions split items; a missing item is
+    // the release (empty qualifier), while numeric items sort after strings.
     fn tokens(s: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut current = String::new();
-        let mut numeric = None;
+        let mut previous_digit = None;
         for c in s.chars() {
-            if c == '.'
-                || c == '-'
-                || c == '+'
-                || (numeric == Some(true) && c.is_ascii_alphabetic())
-                || (numeric == Some(false) && c.is_ascii_digit())
-            {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-                numeric = None;
-                if c != '.' && c != '-' && c != '+' {
-                    current.push(c);
-                    numeric = Some(c.is_ascii_digit());
-                }
-            } else {
-                if numeric.is_none() {
-                    numeric = Some(c.is_ascii_digit());
+            let delimiter = matches!(c, '.' | '-' | '_' | '+');
+            let transition = previous_digit.is_some_and(|digit| digit != c.is_ascii_digit());
+            if (delimiter || transition) && !current.is_empty() {
+                out.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+            if !delimiter {
+                if transition && previous_digit == Some(true) {
+                    current.push('@');
                 }
                 current.push(c);
             }
+            previous_digit = Some(c.is_ascii_digit());
         }
         if !current.is_empty() {
-            out.push(current);
+            out.push(current.to_ascii_lowercase());
         }
-        while out
-            .last()
-            .is_some_and(|part| part.parse::<u64>().ok() == Some(0))
-        {
+        while out.last().is_some_and(|part| {
+            !part.is_empty()
+                && part.chars().all(|c| c.is_ascii_digit())
+                && part.trim_start_matches('0').is_empty()
+        }) {
             out.pop();
         }
         out
     }
-    fn qualifier(s: &str) -> i32 {
-        match s.to_ascii_lowercase().as_str() {
-            "alpha" | "a" => -5,
-            "beta" | "b" => -4,
-            "milestone" | "m" => -3,
-            "rc" | "cr" => -2,
-            "snapshot" => -1,
-            "" => 0,
-            "sp" => 1,
-            _ => 2,
+    fn qualifier(s: &str) -> (&str, i32) {
+        if let Some(s) = s.strip_prefix('@') {
+            return (s, 9);
         }
+        let (canonical, rank) = match s {
+            "alpha" | "a" => ("alpha", 1),
+            "beta" | "b" => ("beta", 2),
+            "milestone" | "m" => ("milestone", 3),
+            "rc" | "cr" => ("rc", 4),
+            "snapshot" => ("snapshot", 5),
+            "" | "ga" | "final" | "release" => ("", 6),
+            "sp" => ("sp", 7),
+            other => (other, 8),
+        };
+        (canonical, rank)
     }
-    let at = tokens(a);
-    let bt = tokens(b);
-    for i in 0..at.len().max(bt.len()) {
-        let x = at.get(i).map(String::as_str).unwrap_or("");
-        let y = bt.get(i).map(String::as_str).unwrap_or("");
-        let x_is_numeric = !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
-        let y_is_numeric = !y.is_empty() && y.chars().all(|c| c.is_ascii_digit());
-        let x = if x.is_empty() && y_is_numeric { "0" } else { x };
-        let y = if y.is_empty() && x_is_numeric { "0" } else { y };
-        let x_is_numeric = !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
-        let y_is_numeric = !y.is_empty() && y.chars().all(|c| c.is_ascii_digit());
-        let cmp = match (x_is_numeric, y_is_numeric) {
+    fn item_cmp(x: Option<&str>, y: Option<&str>) -> Ordering {
+        let x = x.unwrap_or("");
+        let y = y.unwrap_or("");
+        let xn = !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
+        let yn = !y.is_empty() && y.chars().all(|c| c.is_ascii_digit());
+        match (xn, yn) {
             (true, true) => {
                 let x = x.trim_start_matches('0');
                 let y = y.trim_start_matches('0');
@@ -403,10 +413,31 @@ fn maven_cmp(a: &str, b: &str) -> Ordering {
                 let y = if y.is_empty() { "0" } else { y };
                 x.len().cmp(&y.len()).then_with(|| x.cmp(y))
             }
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            (false, false) => qualifier(x).cmp(&qualifier(y)).then_with(|| x.cmp(y)),
-        };
+            (true, false) => {
+                if y.is_empty() && x.trim_start_matches('0').is_empty() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if x.is_empty() && y.trim_start_matches('0').is_empty() {
+                    Ordering::Equal
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let (x, xr) = qualifier(x);
+                let (y, yr) = qualifier(y);
+                xr.cmp(&yr).then_with(|| x.cmp(y))
+            }
+        }
+    }
+    let at = tokens(a);
+    let bt = tokens(b);
+    for i in 0..at.len().max(bt.len()) {
+        let cmp = item_cmp(at.get(i).map(String::as_str), bt.get(i).map(String::as_str));
         if cmp != Ordering::Equal {
             return cmp;
         }
@@ -415,6 +446,20 @@ fn maven_cmp(a: &str, b: &str) -> Ordering {
 }
 
 fn maven_range(value: &str) -> Option<Vec<MavenInterval>> {
+    let value = value.trim();
+    // Maven's createFromVersionSpec accepts a bare version as a recommended
+    // version (an exact [v] restriction is not equivalent when selecting).
+    if !value.starts_with('[') && !value.starts_with('(') {
+        if value.is_empty() || value.contains(']') || value.contains(')') || value.contains(',') {
+            return None;
+        }
+        return Some(vec![MavenInterval {
+            low: None,
+            high: None,
+            low_inclusive: false,
+            high_inclusive: false,
+        }]);
+    }
     let mut ranges = Vec::new();
     let mut parts = Vec::new();
     let mut start = 0;
@@ -571,48 +616,57 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             selected.push(candidate)
         }
     }
-    for (_coordinate, mut group) in neoforge_groups {
+    for (_coordinate, group) in neoforge_groups {
         if group.len() == 1 {
             selected.extend(group);
             continue;
         }
-        let mut allowed = vec![MavenInterval {
-            low: None,
-            high: None,
-            low_inclusive: false,
-            high_inclusive: false,
-        }];
+        let mut allowed: Option<Vec<MavenInterval>> = None;
+        let mut recommended: Option<String> = None;
         for candidate in &group {
             let Some(range) = candidate
                 .neoforge_version_range
                 .as_deref()
                 .and_then(maven_range)
             else {
-                allowed.clear();
+                allowed = Some(Vec::new());
                 break;
             };
-            allowed = intersect(&allowed, &range);
-            if allowed.is_empty() {
+            if let Some(version) = candidate.neoforge_version_range.as_deref()
+                && !version.trim_start().starts_with(['[', '('])
+            {
+                recommended.get_or_insert_with(|| version.trim().to_owned());
+            }
+            allowed = Some(match allowed {
+                Some(ref current) => intersect(current, &range),
+                None => range,
+            });
+            if allowed.as_ref().is_some_and(Vec::is_empty) {
                 break;
             }
         }
+        let Some(allowed) = allowed else {
+            continue;
+        };
         if allowed.is_empty() {
             continue;
         }
-        group.retain(|candidate| {
+        let matches = |candidate: &NestedCandidate| {
             candidate
                 .neoforge_artifact_version
                 .as_deref()
                 .is_some_and(|v| maven_in_range(v, &allowed))
-        });
-        if let Some(best) = group.into_iter().max_by(|a, b| {
-            version_cmp(
-                a.neoforge_artifact_version.as_deref(),
-                b.neoforge_artifact_version.as_deref(),
-            )
-            .then_with(|| b.order.cmp(&a.order))
-        }) {
-            selected.push(best);
+        };
+        if let Some(recommended) = recommended {
+            if let Some(candidate) = group.iter().find(|candidate| {
+                candidate.neoforge_artifact_version.as_deref() == Some(recommended.as_str())
+            }) {
+                selected.push(candidate.clone());
+            }
+        } else if let Some(candidate) = group.into_iter().find(matches) {
+            // JarSelector uses Collection.stream().findFirst(), preserving
+            // metadata iteration order; it never chooses the maximum.
+            selected.push(candidate);
         }
     }
     selected.sort_by_key(|c| c.order);
@@ -715,7 +769,7 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(
             selected[0].neoforge_artifact_version.as_deref(),
-            Some("2.0")
+            Some("1.0")
         );
     }
 
@@ -751,6 +805,9 @@ mod tests {
             ("01.0", "1.0", Ordering::Equal),
             ("1.0.foo", "1.0", Ordering::Greater),
             ("1.0-X", "1.0", Ordering::Less),
+            ("1.x", "1.1.1", Ordering::Greater),
+            ("1.*", "1.1.1", Ordering::Less),
+            ("1.0-", "1.0", Ordering::Less),
         ];
         for (left, right, expected) in cases {
             assert_eq!(
@@ -769,6 +826,10 @@ mod tests {
         assert_eq!(maven_cmp("1.0-SNAPSHOT", "1.0"), Ordering::Less);
         assert_eq!(maven_cmp("1.0-sp", "1.0"), Ordering::Greater);
         assert_eq!(maven_cmp("1.0", "1.0+build"), Ordering::Less);
+        assert_eq!(maven_cmp("1.0-ga", "1.0"), Ordering::Equal);
+        assert_eq!(maven_cmp("1.0-final", "1.0"), Ordering::Equal);
+        assert_eq!(maven_cmp("1.0-cr", "1.0-rc"), Ordering::Equal);
+        assert_eq!(maven_cmp("1.0a", "1.0"), Ordering::Greater);
         assert_eq!(
             maven_cmp(
                 "1.0.27-26.3-neoforge-SNAPSHOT",
@@ -776,6 +837,24 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn maven_comparison_matches_the_jdk25_oracle() {
+        for line in include_str!("jarjar_version_java25.txt").lines() {
+            let mut fields = line.split('|');
+            if fields.next() != Some("cmp") {
+                continue;
+            }
+            let left = fields.next().unwrap();
+            let right = fields.next().unwrap();
+            let expected = fields.next().unwrap().parse::<i32>().unwrap();
+            assert_eq!(
+                maven_cmp(left, right).cmp(&Ordering::Equal) as i32,
+                expected.signum(),
+                "{line}"
+            );
+        }
     }
 
     #[test]

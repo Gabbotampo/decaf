@@ -12,6 +12,10 @@ public final class FabricVersionCompareOracle {
         {"x", "1.0"}, {"1.0-X", "1.0"},
         {"1.0-SNAPSHOT", "1.0-rc"}, {"1.0-a.2", "1.0-a.10"},
         {"2.0", "10.0"}, {"1.0.0+one", "1.0.0+two"},
+        {"1.x", "1.1.1"}, {"1.X", "1.1.1"}, {"1.*", "1.1.1"},
+        {"1.x", "1.x"}, {"1.0-final", "1.0"}, {"1.0-release", "1.0"},
+        {"1.0-ga", "1.0"}, {"1.0-cr", "1.0-rc"}, {"1.0a", "1.0"},
+        {"1.0-", "1.0"}, {"1.0..1", "1.0"}, {"1.0+build", "1.0"},
     };
 
     public static void main(String[] args) throws Exception {
