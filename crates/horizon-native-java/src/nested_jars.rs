@@ -135,7 +135,14 @@ fn declared_entries(jar: &NativeJar) -> Vec<(String, bool)> {
         )
         .collect()
 }
-pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
+/// Discover nested candidates for one Fabric physical environment.
+///
+/// Fabric's `ModDiscoverer` only scans a candidate's declared nested jars when
+/// that candidate loads in the active environment.  `client_side_only` is a
+/// property of the metadata, not a reason to skip the candidate on a client;
+/// the old unconditional gate dropped every nested class from client-only
+/// mods while probing the client role.
+fn candidates_for_side(jar: &NativeJar, side: &str) -> Vec<NestedCandidate> {
     let mut out = Vec::new();
     let mut by_hash = std::collections::BTreeMap::<u64, usize>::new();
     let mut ordinal = 0;
@@ -147,13 +154,14 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
         by_hash: &mut std::collections::BTreeMap<u64, usize>,
         ordinal: &mut usize,
         parent_chain: &[(String, Option<String>, usize)],
+        side: &str,
     ) {
         // ModDiscoverer.computeJarFile/computeJarStream returns a candidate
         // without scanning its declared jars when the parent metadata does
         // not load in the active environment (the branch at bytecode offsets
         // 110-149 and 82-118 respectively).  Its nested candidates therefore
         // never enter resolution on that side.
-        if jar.client_side_only {
+        if jar.client_side_only && side != "CLIENT" {
             return;
         }
         if depth >= MAX_NESTING || out.len() >= MAX_NESTED_JARS {
@@ -184,6 +192,21 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
             let Ok(nested) = NativeJar::from_bytes(bytes) else {
                 continue;
             };
+            // Fabric's ModDiscoverer only creates a nested candidate after
+            // ModMetadataParser finds fabric.mod.json.  A plain library in a
+            // Fabric `jars` declaration is therefore absent from both the
+            // resolver and Knot's selected candidate class path.  NeoForge
+            // JarJar libraries are different: JarSelector deliberately keeps
+            // them as class-path entries without mod metadata.
+            if fabric_entry && nested.fabric_id.is_none() {
+                continue;
+            }
+            // `computeJarStream` applies the same environment gate to the
+            // nested candidate itself.  It is absent from the server-side
+            // resolver and therefore cannot contribute classes there.
+            if nested.client_side_only && side != "CLIENT" {
+                continue;
+            }
             let jarjar = neoforge_declarations(jar);
             let (neoforge_coordinate, neoforge_artifact_version, neoforge_version_range) =
                 jarjar.get(&entry).cloned().unwrap_or_default();
@@ -216,11 +239,29 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
                 by_hash,
                 ordinal,
                 &child_chain,
+                side,
             );
         }
     }
-    walk("outer", jar, 0, &mut out, &mut by_hash, &mut ordinal, &[]);
+    walk(
+        "outer",
+        jar,
+        0,
+        &mut out,
+        &mut by_hash,
+        &mut ordinal,
+        &[],
+        side,
+    );
     out
+}
+
+/// Discover nested candidates using Fabric's server-side environment, which
+/// is retained for the resolver and fixture APIs that predate side-aware
+/// discovery.
+#[allow(dead_code)]
+pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
+    candidates_for_side(jar, "SERVER")
 }
 
 fn candidate_id(jar: &NativeJar) -> String {
@@ -1000,8 +1041,13 @@ fn candidate_keys(candidate: &NestedCandidate) -> Vec<String> {
 
 /// Select the nested jars, preserving JarSelector's refusal when a declared
 /// coordinate has no artifact in the restricted Maven range.
+#[allow(dead_code)]
 pub fn select_checked(jar: &NativeJar) -> Result<Vec<NestedCandidate>, String> {
-    let all = candidates(jar);
+    select_checked_for_side(jar, "SERVER")
+}
+
+fn select_checked_for_side(jar: &NativeJar, side: &str) -> Result<Vec<NestedCandidate>, String> {
+    let all = candidates_for_side(jar, side);
     let mut neoforge_groups: std::collections::BTreeMap<String, Vec<NestedCandidate>> =
         Default::default();
     let mut fabric = Vec::new();
@@ -1106,7 +1152,7 @@ fn neoforge_no_match_error(group: &[NestedCandidate]) -> String {
 }
 pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
     let mut out = Vec::new();
-    let selected = match select_checked(jar) {
+    let selected = match select_checked_for_side(jar, host.environment_type.as_str()) {
         Ok(selected) => selected,
         Err(error) => {
             return vec![NestedJar {
@@ -1217,7 +1263,27 @@ mod tests {
             ("fabric.mod.json", br#"{"schemaVersion":1,"id":"x","version":"1","jars":[{"file":"META-INF/jars/child.jar"}]}"#),
             ("META-INF/jars/child.jar", &nested),
         ]);
-        assert_eq!(candidates(&listed).len(), 1);
+        assert!(candidates(&listed).is_empty());
+    }
+
+    #[test]
+    fn client_side_nested_candidates_follow_the_active_environment() {
+        let child = zip_bytes(&jar(&[(
+            "fabric.mod.json",
+            br#"{"schemaVersion":1,"id":"client-lib","version":"1"}"#,
+        )]));
+        let outer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"client-carrier","version":"1","environment":"client","jars":[{"file":"META-INF/jars/client.jar"}]}"#,
+            ),
+            ("META-INF/jars/client.jar", &child),
+        ]);
+
+        assert!(candidates_for_side(&outer, "SERVER").is_empty());
+        let client = candidates_for_side(&outer, "CLIENT");
+        assert_eq!(client.len(), 1);
+        assert_eq!(client[0].jar.fabric_id.as_deref(), Some("client-lib"));
     }
 
     #[test]
@@ -1382,6 +1448,87 @@ mod tests {
     }
 
     #[test]
+    fn client_nested_selection_matches_captured_fabric_rows() {
+        let Some(corpus) = std::env::var_os("HORIZON_CORPUS") else {
+            println!("skipped real client-jar oracle: HORIZON_CORPUS is unset");
+            return;
+        };
+        let corpus = std::path::PathBuf::from(corpus);
+        let oracle_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles");
+        let Ok(cases) = std::fs::read_to_string(oracle_dir.join("mod_prio_client_real_cases.txt"))
+        else {
+            println!("skipped real client-jar oracle: case list is absent");
+            return;
+        };
+        let Ok(oracle) =
+            std::fs::read_to_string(oracle_dir.join("mod_prio_client_real_java25.txt"))
+        else {
+            println!("skipped real client-jar oracle: captured rows are absent");
+            return;
+        };
+        let mut checked = 0;
+        for line in cases
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let (name, paths) = line.split_once('|').unwrap();
+            let paths = paths
+                .strip_prefix("jar=")
+                .unwrap()
+                .split('|')
+                .map(|path| corpus.join(path))
+                .collect::<Vec<_>>();
+            if paths.iter().any(|path| !path.is_file()) {
+                println!("skipped captured client case {name}: a corpus jar is missing");
+                continue;
+            }
+            let Some(row) = oracle
+                .lines()
+                .find(|row| row.starts_with(&format!("{name}|")))
+            else {
+                panic!("missing captured Fabric client row {name}");
+            };
+            assert!(
+                row.contains("|OK|"),
+                "captured client row {name} refused: {row}"
+            );
+            let expected = row
+                .split_once("|OK|")
+                .map(|(_, value)| value)
+                .unwrap_or_default()
+                .split(',')
+                .filter(|field| field.contains("@nested@"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut all_candidates = Vec::new();
+            for path in &paths {
+                let root = NativeJar::from_path(path).unwrap();
+                all_candidates.extend(candidates_for_side(&root, "CLIENT"));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            all_candidates.retain(|candidate| seen.insert(identity(&candidate.jar)));
+            let mut actual = select_fabric_candidates(all_candidates)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    format!(
+                        "{}@{}@nested@{}",
+                        candidate_id(&candidate.jar),
+                        candidate_version(&candidate.jar).unwrap_or_default(),
+                        candidate.depth + 1
+                    )
+                })
+                .collect::<Vec<_>>();
+            actual.sort();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(actual, expected, "real Fabric client row {name}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no complete real client-jar oracle cases");
+    }
+
+    #[test]
     fn generated_nested_candidates_match_real_discoverer_rows() {
         // Captured with ModPrioSorterOracle on Fabric Loader 0.19.5 / JDK 25
         // from the same synthetic carrier jars. Loom's generated metadata is
@@ -1460,6 +1607,10 @@ mod tests {
             .collect::<Vec<_>>();
         pair.sort();
         assert_eq!(pair, expected_nested("generated-two"));
+
+        let plain = carrier("plain-carrier", &jar(&[]));
+        assert!(candidates_for_side(&plain, "CLIENT").is_empty());
+        assert!(expected_nested("plain-library").is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ import net.fabricmc.loader.api.Version;
 
 /** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
 public final class ModPrioSorterOracle {
+  static String environment = "SERVER";
   record Dep(String id, String range) {}
   record Spec(String label, String id, String version, boolean root, List<String> provides, String parent,
               List<Dep> dependencies) {}
@@ -140,7 +141,7 @@ public final class ModPrioSorterOracle {
       if (!launcherReady) {
         Object launcherProxy = Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] {launcher},
             (proxy, method, args) -> switch (method.getName()) {
-              case "getEnvironmentType" -> Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), "SERVER");
+              case "getEnvironmentType" -> Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), environment);
               case "isDevelopment" -> false;
               case "getClassPath" -> List.of();
               default -> method.getReturnType().isPrimitive() ? false : null;
@@ -230,6 +231,16 @@ public final class ModPrioSorterOracle {
 
   static List<Path> syntheticGenerated(String name, Path root) throws IOException {
     Files.createDirectories(root);
+    if (name.equals("plain-library")) {
+      Path plain = root.resolve("plain.jar");
+      zip(plain, Map.of("plain/Library.class", new byte[] {0}));
+      Path carrier = root.resolve("plain-carrier.jar");
+      String metadata = "{\"schemaVersion\":1,\"id\":\"plain-carrier\",\"version\":\"1\","
+          + "\"environment\":\"client\",\"jars\":[{\"file\":\"META-INF/jars/plain.jar\"}]}";
+      zip(carrier, Map.of("fabric.mod.json", metadata.getBytes(),
+          "META-INF/jars/plain.jar", Files.readAllBytes(plain)));
+      return List.of(carrier);
+    }
     byte[] childOne = ("{\"schemaVersion\":1,\"id\":\"generated-lib\","
         + "\"version\":\"1.0\",\"custom\":{\"fabric-loom:generated\":true}}")
         .getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -271,7 +282,6 @@ public final class ModPrioSorterOracle {
     Method resolve = Class.forName("net.fabricmc.loader.impl.discovery.ModResolver")
         .getMethod("resolve", Collection.class, Class.forName("net.fabricmc.api.EnvType"), Map.class);
     Class<?> envType = Class.forName("net.fabricmc.api.EnvType");
-    Object server = Enum.valueOf((Class) envType, "SERVER");
     // Fabric's resolver logs diagnostics for an unsatisfied SAT result. This
     // inert handler keeps those diagnostics off the oracle data stream.
     Class<?> log = Class.forName("net.fabricmc.loader.impl.util.log.Log");
@@ -281,6 +291,8 @@ public final class ModPrioSorterOracle {
         (proxy, method, args1) -> method.getName().equals("shouldLog") ? false : null);
     log.getMethod("init", handlerType).invoke(null, silentHandler);
 
+    if (args.length > 1) environment = args[1].toUpperCase(Locale.ROOT);
+    Object activeEnvironment = Enum.valueOf((Class) envType, environment);
     for (String line : Files.readAllLines(Path.of(args[0]))) {
       if (line.isBlank() || line.startsWith("#")) continue;
       String[] split = line.split("\\|", 2);
@@ -294,7 +306,7 @@ public final class ModPrioSorterOracle {
           }
           RealDiscovery real = new RealDiscovery();
           List<?> discovered = real.find(mods);
-          List<?> selected = (List<?>) resolve.invoke(null, discovered, server, new HashMap<>());
+          List<?> selected = (List<?>) resolve.invoke(null, discovered, activeEnvironment, new HashMap<>());
           System.out.println(split[0] + "|OK|" + real.row(selected));
         } catch (InvocationTargetException error) {
           Throwable cause = error.getCause();
@@ -316,7 +328,7 @@ public final class ModPrioSorterOracle {
           }
           RealDiscovery real = new RealDiscovery();
           List<?> discovered = real.find(mods);
-          List<?> selected = (List<?>) resolve.invoke(null, discovered, server, new HashMap<>());
+          List<?> selected = (List<?>) resolve.invoke(null, discovered, activeEnvironment, new HashMap<>());
           System.out.println(split[0] + "|OK|" + real.row(selected));
         } catch (InvocationTargetException error) {
           Throwable cause = error.getCause();
@@ -336,7 +348,7 @@ public final class ModPrioSorterOracle {
         }
       }
       try {
-        List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
+        List<?> selected = (List<?>) resolve.invoke(null, candidates, activeEnvironment, new HashMap<>());
         StringJoiner row = new StringJoiner(",");
         for (Object candidate : selected) {
           row.add(id.invoke(candidate) + "@" + version.invoke(candidate) + "@"
