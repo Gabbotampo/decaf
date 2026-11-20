@@ -482,10 +482,17 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         // (`ImmutableCollections`' and `UnmodifiableList`'s own `sort`), and
         // `Collections.sort` calls it: a sub-list of one is just as
         // unmodifiable (#558 review).
-        if key
-            .as_deref()
-            .is_some_and(|marker| self.host.is_unmodifiable_collection(marker))
-        {
+        if key.as_deref().is_some_and(|marker| {
+            self.host.is_unmodifiable_collection(marker)
+                || self.host_collection_class(&list).is_some_and(|class| {
+                    matches!(
+                        class.as_str(),
+                        "java/util/ImmutableCollections$List12"
+                            | "java/util/ImmutableCollections$ListN"
+                            | "java/util/ImmutableCollections$SubList"
+                    )
+                })
+        }) {
             return Err(NativeError::UncaughtException {
                 class: "java/lang/UnsupportedOperationException".into(),
                 message: None,
