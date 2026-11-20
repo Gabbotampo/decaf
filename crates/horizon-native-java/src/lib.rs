@@ -20681,6 +20681,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -20907,6 +20908,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -21089,6 +21091,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -23305,6 +23308,8 @@ struct Runtime<'a, H> {
     string_builders: BTreeMap<String, String>,
     /// Allocation keys of constructors whose String text is not modelled exactly.
     counted_strings: std::collections::BTreeSet<String>,
+    /// Known identity provenance for keys in identity-based collections.
+    identity_collection_keys: std::collections::BTreeMap<String, Vec<Option<String>>>,
     /// Allocation keys (or I/O sink keys) whose held text was written from a
     /// counted value. Reads of these objects must remain counted as well.
     counted_text_objects: std::collections::BTreeSet<String>,
@@ -32568,6 +32573,30 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         Some(pop(&mut stack, class, method, at)?)
                     };
+                    let identity_args = if args.iter().any(|value| {
+                        matches!(value, Value::Ref(Some(text)) if value_class::is_plain_string(text))
+                    }) {
+                        args.iter()
+                            .enumerate()
+                            .map(|(index, value)| match value {
+                                Value::Ref(Some(text)) if value_class::is_plain_string(text) => {
+                                    reference_identity::call_identity(
+                                        file,
+                                        method,
+                                        desc,
+                                        target.is_static(),
+                                        code,
+                                        at,
+                                        index,
+                                        text,
+                                    )
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
                     // `@ModifyArg` replaces one argument before the call runs;
                     // a redirect that replaces the whole call sees (and then
                     // discards) the modified value, deterministically.
@@ -33211,7 +33240,13 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_immutable_collection(&r, op, receiver.as_ref(), &args)
+                            self.invoke_immutable_collection(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
+                                &identity_args,
+                            )
                         )
                     {
                         dispatched = Some({
@@ -38828,6 +38863,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -38911,6 +38947,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46074,6 +46111,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46299,6 +46337,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46499,6 +46538,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46875,6 +46915,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -47195,6 +47236,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -52473,6 +52515,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -52543,6 +52586,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            identity_collection_keys: std::collections::BTreeMap::new(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),

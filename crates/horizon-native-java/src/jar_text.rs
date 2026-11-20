@@ -95,7 +95,8 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(text) = self.host.modelled_to_string_checked(value)? {
                 return Ok(Some(text));
             }
-            if matches!(value, Value::Ref(Some(text)) if crate::value_class::is_plain_string(text))
+            if desc == "Ljava/lang/String;"
+                || matches!(value, Value::Ref(Some(text)) if crate::value_class::is_plain_string(text))
             {
                 return Ok(Some(crate::value_text(value)));
             }

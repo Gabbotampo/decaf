@@ -266,6 +266,47 @@ struct Operand {
 #[derive(Debug, Default)]
 struct Flow {
     compares: BTreeMap<u32, (Operand, Operand)>,
+    calls: BTreeMap<u32, Vec<Operand>>,
+}
+
+/// Provenance of a reference argument at a call site. `None` means the
+/// value's allocation identity is not retained and an identity operation
+/// must be counted.
+pub(crate) type CallIdentity = Option<String>;
+
+/// Return identity provenance for the argument at `index` of an invocation at
+/// `at`. This uses the same method-local dataflow as `==` comparisons, so a
+/// copied `new String` remains distinct after its text is materialised.
+pub(crate) fn call_identity(
+    file: &ClassFile,
+    method: &str,
+    desc: &str,
+    is_static: bool,
+    code: &[u8],
+    at: usize,
+    index: usize,
+    text: &str,
+) -> CallIdentity {
+    let flow = flow(file, method, desc, is_static, code)?;
+    let operand = flow.calls.get(&(at as u32))?.get(index).copied()?;
+    if operand.repeats {
+        return None;
+    }
+    let key = match operand.kind {
+        Kind::Fresh | Kind::BuilderText if !text.is_empty() => {
+            format!(
+                "fresh:{method}:{}",
+                operand.source.map_or(0, |source| match source {
+                    Source::At(pc) => pc,
+                    Source::Param(_) => 0,
+                })
+            )
+        }
+        Kind::Interned => format!("interned:{text}"),
+        Kind::BuilderText if text.is_empty() => format!("interned:{text}"),
+        _ => return None,
+    };
+    Some(key)
 }
 
 /// The answer for one comparison.
@@ -693,6 +734,7 @@ fn analyse(
     queued[0] = true;
     let mut edges: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
     let mut compares = BTreeMap::new();
+    let mut call_slots = BTreeMap::new();
     let mut done = 0usize;
     let merge = |entry: &mut Vec<Option<State>>,
                  work: &mut Vec<usize>,
@@ -748,6 +790,27 @@ fn analyse(
                 let lhs = *state.stack.get(n.checked_sub(2)?)?;
                 compares.insert(pc as u32, (lhs, rhs));
             }
+            if matches!(code[pc], 0xb6..=0xba) {
+                let descriptor = if code[pc] == 0xba {
+                    file.invoke_dynamic_descriptor(u16::from_be_bytes([
+                        *code.get(pc + 1)?,
+                        *code.get(pc + 2)?,
+                    ]))
+                    .ok()?
+                } else {
+                    file.method_ref(u16::from_be_bytes([*code.get(pc + 1)?, *code.get(pc + 2)?]))
+                        .ok()?
+                        .descriptor
+                };
+                let words: usize = descriptor_arguments(&descriptor)
+                    .iter()
+                    .map(|argument| words(argument))
+                    .sum();
+                let receiver = usize::from(matches!(code[pc], 0xb6 | 0xb7 | 0xb9));
+                let count = words + receiver;
+                let start = state.stack.len().checked_sub(count)?;
+                call_slots.insert(pc as u32, state.stack[start + receiver..].to_vec());
+            }
             step(file, code, pc, &mut state)?;
             let targets = successors(code, pc)?;
             let next = pc + instruction_length(code, pc)?;
@@ -785,11 +848,32 @@ fn analyse(
             _ => false,
         },
     };
+    let calls = call_slots
+        .into_iter()
+        .map(|(pc, slots)| {
+            let operands = slots
+                .into_iter()
+                .map(|slot| Operand {
+                    source: slot.source,
+                    ty: slot.ty,
+                    kind: slot
+                        .source
+                        .map_or(Kind::Opaque, |source| kind(file, code, source)),
+                    repeats: match slot.source {
+                        Some(Source::At(source_pc)) => cyclic[block_of[source_pc as usize]],
+                        _ => false,
+                    },
+                })
+                .collect();
+            (pc, operands)
+        })
+        .collect();
     Some(Flow {
         compares: compares
             .into_iter()
             .map(|(pc, (lhs, rhs))| (pc, (operand(lhs), operand(rhs))))
             .collect(),
+        calls,
     })
 }
 

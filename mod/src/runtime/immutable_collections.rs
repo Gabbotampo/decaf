@@ -450,6 +450,7 @@ impl<H: Host> Runtime<'_, H> {
         opcode: u8,
         receiver: Option<&Value>,
         args: &[Value],
+        identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
         if opcode == 0xb8 {
             if let Some(answer) = self.immutable_factory(r, args)? {
@@ -504,7 +505,7 @@ impl<H: Host> Runtime<'_, H> {
             )));
         }
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_MAP) {
-            return self.identity_map_member(r, receiver, args);
+            return self.identity_map_member(r, receiver, args, identity_args);
         }
         // Gson's `LinkedTreeMap` (a `fromJson` read's map) keeps `Map`'s
         // default `compute`/`merge` bodies too, which the host's map model
@@ -526,7 +527,7 @@ impl<H: Host> Runtime<'_, H> {
         if self.host_collection_class(receiver).as_deref() == Some(IDENTITY_SET)
             && !self.host.is_set_from_map(receiver)
         {
-            return self.identity_set_member(r, receiver, args);
+            return self.identity_set_member(r, receiver, args, identity_args);
         }
         if let Some(answer) = self.identity_view_member(r, receiver, args)? {
             return Ok(answer);
@@ -550,15 +551,31 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: &Value,
         args: &[Value],
+        identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
         let Some(value) = args.first() else {
             return Ok(None);
         };
         let mut values = self.collection_elements(receiver)?;
-        let position = values.iter().position(|stored| stored == value);
-        let ambiguous = values
-            .iter()
-            .any(|stored| self.identity_unknown(value, stored));
+        let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
+        let mut tokens = marker
+            .as_deref()
+            .and_then(|key| self.identity_collection_keys.get(key).cloned())
+            .unwrap_or_default();
+        tokens.resize(values.len(), None);
+        let wanted = identity_args.first().cloned().flatten();
+        let position = if wanted.is_some() {
+            tokens.iter().position(|token| token == &wanted)
+        } else {
+            values.iter().position(|stored| stored == value)
+        };
+        let ambiguous = values.iter().enumerate().any(|(index, stored)| {
+            if wanted.is_some() && values.get(index) == Some(value) {
+                tokens[index].is_none()
+            } else {
+                self.identity_unknown(value, stored)
+            }
+        });
         if ambiguous {
             return self.count_identity_call(r, receiver).map(Some);
         }
@@ -568,7 +585,11 @@ impl<H: Host> Runtime<'_, H> {
                     Ok(Some(Value::Int(0)))
                 } else {
                     values.push(value.clone());
+                    tokens.push(wanted);
                     self.host.replace_mutable_collection(receiver, values);
+                    if let Some(marker) = marker {
+                        self.identity_collection_keys.insert(marker, tokens);
+                    }
                     Ok(Some(Value::Int(1)))
                 }
             }
@@ -580,7 +601,11 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(Some(Value::Int(0)));
                 };
                 values.remove(index);
+                tokens.remove(index);
                 self.host.replace_mutable_collection(receiver, values);
+                if let Some(marker) = marker {
+                    self.identity_collection_keys.insert(marker, tokens);
+                }
                 Ok(Some(Value::Int(1)))
             }
             _ => Ok(None),
@@ -983,6 +1008,7 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: &Value,
         args: &[Value],
+        identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
         // The stored keys themselves: a handle's construction survives only
         // in the `Value`, not in its marker.
@@ -1008,16 +1034,138 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = args.first() else {
                 return Ok(None);
             };
-            let ambiguous = entries
-                .iter()
-                .step_by(2)
-                .any(|stored| self.identity_unknown(key, stored));
+            let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
+            let mut tokens = marker
+                .as_deref()
+                .and_then(|key| self.identity_collection_keys.get(key).cloned())
+                .unwrap_or_default();
+            let key_token = identity_args.first().cloned().flatten();
+            let interned_lookup = key_token
+                .as_deref()
+                .is_some_and(|token| token.starts_with("interned:"))
+                && r.name != "put";
+            let stored_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
+            tokens.resize(stored_keys.len(), None);
+            let position = if key_token.is_some() && !interned_lookup {
+                tokens.iter().position(|token| token == &key_token)
+            } else {
+                stored_keys.iter().position(|stored| stored == key)
+            };
+            let ambiguous = stored_keys.iter().enumerate().any(|(index, stored)| {
+                if interned_lookup && stored == key {
+                    true
+                } else if key_token.is_some() && stored == key {
+                    tokens[index].is_none()
+                } else {
+                    self.identity_unknown(key, stored)
+                }
+            });
             if ambiguous {
                 return self.count_identity_call(r, receiver).map(Some);
             }
-            // Every stored key equal to `key` is `key` itself, or none is:
-            // the identity lookup is the equality one, so the host answers,
-            // except where the host's model cannot run the function.
+            match r.name.as_str() {
+                "get" | "getOrDefault" | "containsKey" | "remove" | "put" | "putIfAbsent"
+                | "replace" => {
+                    let contains = position.is_some();
+                    if r.name == "containsKey" {
+                        return Ok(Some(Value::Int(contains as i32)));
+                    }
+                    if r.name == "get" {
+                        return Ok(Some(
+                            position
+                                .map_or(Value::Ref(None), |index| entries[index * 2 + 1].clone()),
+                        ));
+                    }
+                    if r.name == "getOrDefault" {
+                        return Ok(Some(position.map_or_else(
+                            || args.get(1).cloned().unwrap_or(Value::Ref(None)),
+                            |index| entries[index * 2 + 1].clone(),
+                        )));
+                    }
+                    let mut updated = entries.clone();
+                    let value = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                    match r.name.as_str() {
+                        "remove" => {
+                            if args.len() == 2 {
+                                let Some(index) = position else {
+                                    return Ok(Some(Value::Int(0)));
+                                };
+                                let matches = updated[index * 2 + 1] == value;
+                                if matches {
+                                    updated.drain(index * 2..index * 2 + 2);
+                                    tokens.remove(index);
+                                    self.host.replace_mutable_collection(receiver, updated);
+                                    if let Some(marker) = marker {
+                                        self.identity_collection_keys.insert(marker, tokens);
+                                    }
+                                }
+                                return Ok(Some(Value::Int(matches as i32)));
+                            }
+                            let Some(index) = position else {
+                                return Ok(Some(Value::Ref(None)));
+                            };
+                            let old = updated[index * 2 + 1].clone();
+                            updated.drain(index * 2..index * 2 + 2);
+                            tokens.remove(index);
+                            self.host.replace_mutable_collection(receiver, updated);
+                            if let Some(marker) = marker {
+                                self.identity_collection_keys.insert(marker, tokens);
+                            }
+                            return Ok(Some(old));
+                        }
+                        "put" => {
+                            if let Some(index) = position {
+                                let old = updated[index * 2 + 1].clone();
+                                updated[index * 2 + 1] = value;
+                                self.host.replace_mutable_collection(receiver, updated);
+                                return Ok(Some(old));
+                            }
+                            updated.extend([key.clone(), value]);
+                            tokens.push(key_token);
+                            self.host.replace_mutable_collection(receiver, updated);
+                            if let Some(marker) = marker {
+                                self.identity_collection_keys.insert(marker, tokens);
+                            }
+                            return Ok(Some(Value::Ref(None)));
+                        }
+                        "putIfAbsent" => {
+                            if contains {
+                                return Ok(Some(updated[position.unwrap() * 2 + 1].clone()));
+                            }
+                            updated.extend([key.clone(), value]);
+                            tokens.push(key_token);
+                            self.host.replace_mutable_collection(receiver, updated);
+                            if let Some(marker) = marker {
+                                self.identity_collection_keys.insert(marker, tokens);
+                            }
+                            return Ok(Some(Value::Ref(None)));
+                        }
+                        "replace" => {
+                            let Some(index) = position else {
+                                return Ok(Some(if args.len() == 3 {
+                                    Value::Int(0)
+                                } else {
+                                    Value::Ref(None)
+                                }));
+                            };
+                            let old = updated[index * 2 + 1].clone();
+                            if args.len() == 3 {
+                                let matches = old == value;
+                                if matches {
+                                    updated[index * 2 + 1] = args[2].clone();
+                                    self.host.replace_mutable_collection(receiver, updated);
+                                }
+                                return Ok(Some(Value::Int(matches as i32)));
+                            }
+                            updated[index * 2 + 1] = value;
+                            self.host.replace_mutable_collection(receiver, updated);
+                            return Ok(Some(old));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
             return self.identity_compute(r, receiver, &entries, args);
         }
         // `putAll(map)`/`new IdentityHashMap<>(map)`: each of the source's
