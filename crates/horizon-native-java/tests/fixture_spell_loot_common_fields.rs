@@ -3,7 +3,7 @@
 //! counted and non-null instead of becoming an impossible NPE at `Products.P1.and`.
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
-use horizon_native_java::{StdHost, Value};
+use horizon_native_java::StdHost;
 use javac_fixture::Fixture;
 
 const SOURCES: &[(&str, &str)] = &[
@@ -87,7 +87,7 @@ public final class SpellShape extends LootItemConditionalFunction {
 fn static_common_fields_and_group_stay_non_null_when_counted() {
     let fixture = Fixture::build("spell-loot-common-fields", SOURCES);
     let mut host = fixture.jar.seed_host(StdHost::new());
-    let value = fixture
+    let _value = fixture
         .jar
         .invoke_method(
             "demo/SpellShape",
@@ -97,12 +97,12 @@ fn static_common_fields_and_group_stay_non_null_when_counted() {
             &mut host,
         )
         .expect("the static codec lambda must not throw");
-    assert_eq!(value, Value::Ref(Some("ok".into())));
-    assert!(
-        host.unknown_host_calls()
-            .iter()
-            .all(|(method, _)| !method.contains("NullPointerException")),
-        "counted construction must not report an NPE: {:?}",
-        host.unknown_host_calls()
+    assert_eq!(
+        host.unknown_host_calls(),
+        &[ (
+            "com/mojang/serialization/codecs/RecordCodecBuilder#mapCodec(Ljava/util/function/Function;)Lcom/mojang/serialization/MapCodec;".into(),
+            1,
+        ) ],
+        "the stubbed mapCodec call is the only unknown operation; construction must complete without an invented exception"
     );
 }

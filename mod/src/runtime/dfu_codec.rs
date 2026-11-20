@@ -133,6 +133,23 @@ fn map_receiver(value: &Value) -> bool {
     map_codec(value) && !matches!(tag(value).as_deref(), Some(GETTER))
 }
 
+fn opaque_codec_result(descriptor: &str) -> Option<Value> {
+    let declared = if descriptor.ends_with("Lcom/mojang/serialization/MapCodec;") {
+        MAP_CODEC
+    } else if descriptor.ends_with("Lcom/mojang/serialization/Codec;") {
+        CODEC
+    } else if descriptor.ends_with("Lcom/mojang/serialization/codecs/RecordCodecBuilder;") {
+        RECORD_BUILDER
+    } else {
+        return None;
+    };
+    Some(crate::runtime::host_codec::opaque_codec(declared))
+}
+
+fn is_opaque_product(value: &Value) -> bool {
+    product_arity(value).is_some() && product_parts(value).is_none()
+}
+
 #[derive(Default)]
 struct GraphStats {
     nodes: usize,
@@ -662,6 +679,14 @@ fn product_arity(value: &Value) -> Option<usize> {
 }
 
 fn product_and_values(receiver: &Value, argument: &Value) -> Option<Vec<Value>> {
+    // An opaque product carries only its arity.  Treating it as one component
+    // would let an exact product meet the descriptor's arity and fabricate a
+    // precise result after a counted refusal.
+    if (product_arity(receiver).is_some() && product_parts(receiver).is_none())
+        || (product_arity(argument).is_some() && product_parts(argument).is_none())
+    {
+        return None;
+    }
     let (_, receiver_parts) = product_parts(receiver)?;
     let mut values = receiver_parts;
     if let Some((_, argument_parts)) = product_parts(argument) {
@@ -812,7 +837,7 @@ pub(crate) fn runtime_instance_call<H: Host>(
             return Ok(None);
         };
         let Some((_, parts)) = product_parts(receiver) else {
-            return Ok(None);
+            return runtime.host.unknown_operand_call(r).map(Some);
         };
         return match parts.get(index).cloned() {
             Some(value) => Ok(Some(value)),
@@ -825,6 +850,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
         if matches!(r.name.as_str(), "stable" | "point")
             && r.descriptor.starts_with("(Ljava/lang/Object;")
         {
+            if args.iter().any(is_opaque_product) {
+                runtime.host.unknown_operand_call(r)?;
+                return Ok(Some(opaque_app()));
+            }
             let Some(value) = args.first().cloned() else {
                 return Ok(None);
             };
@@ -845,6 +874,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
                     r,
                     format!("RecordCodecBuilder group arity {} is outside 1..16", arity),
                 );
+            }
+            if args.iter().any(is_opaque_product) {
+                runtime.host.unknown_operand_call(r)?;
+                return Ok(Some(opaque_product(arity)));
             }
             let mut values = vec![Value::Int(arity as i32)];
             values.extend_from_slice(args);
@@ -872,7 +905,7 @@ pub(crate) fn runtime_instance_call<H: Host>(
             return Ok(None);
         }
         let Some(parts) = product_and_values(receiver, argument) else {
-            if product_arity(receiver).is_some() && product_arity(argument).is_some() {
+            if is_opaque_product(receiver) || is_opaque_product(argument) {
                 runtime.host.unknown_operand_call(r)?;
                 return Ok(Some(opaque_product(arity)));
             }
@@ -898,6 +931,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
         && r.owner.starts_with("com/mojang/datafixers/Products$P")
         && r.name == "apply"
     {
+        if is_opaque_product(receiver) || args.iter().any(is_opaque_product) {
+            runtime.host.unknown_operand_call(r)?;
+            return Ok(Some(opaque_app()));
+        }
         let Some(constructor) = args.get(1).filter(|value| is_callback(value)) else {
             runtime.host.unknown_operand_call(r)?;
             return Ok(Some(opaque_app()));
@@ -1033,6 +1070,11 @@ pub(crate) fn invoke(
             }
         };
     }
+    if receiver.is_some_and(|value| crate::runtime::host_codec::opaque_codec_type(value).is_some()) {
+        let result = opaque_codec_result(&r.descriptor)?;
+        host.unknown_operand_call(r).ok()?;
+        return Some(result);
+    }
     if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
         let receiver = receiver?.clone();
         let argument = args.first()?.clone();
@@ -1041,7 +1083,7 @@ pub(crate) fn invoke(
             return None;
         }
         let Some(parts) = product_and_values(&receiver, &argument) else {
-            if product_arity(&receiver).is_some() && product_arity(&argument).is_some() {
+            if is_opaque_product(&receiver) || is_opaque_product(&argument) {
                 host.unknown_operand_call(r).ok()?;
                 return Some(opaque_product(arity));
             }
@@ -1052,6 +1094,13 @@ pub(crate) fn invoke(
             values.extend(parts);
             build(host, r, PRODUCT, values)
         })?;
+    }
+    if r.owner.starts_with("com/mojang/datafixers/Products$P")
+        && r.name == "apply"
+        && receiver.is_some_and(is_opaque_product)
+    {
+        host.unknown_operand_call(r).ok()?;
+        return Some(opaque_app());
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (MAP_CODEC, "unit", "(Ljava/lang/Object;)Lcom/mojang/serialization/MapCodec;")
@@ -1336,6 +1385,43 @@ mod tests {
         assert_eq!(tag(&common).as_deref(), Some(PRODUCT));
         assert_eq!(tag(&combined).as_deref(), Some(PRODUCT));
         assert!(host.unknown_host_calls().is_empty());
+    }
+
+    #[test]
+    fn opaque_products_never_become_exact_products_or_apps() {
+        let and = method(
+            "com/mojang/datafixers/Products$P1",
+            "and",
+            "(Lcom/mojang/datafixers/Products$P1;)Lcom/mojang/datafixers/Products$P2;",
+        );
+        let apply = method(
+            "com/mojang/datafixers/Products$P1",
+            "apply",
+            "(Ljava/util/function/Function;)Lcom/mojang/datafixers/kinds/App;",
+        );
+        for (receiver_opaque, argument_opaque) in [(false, true), (true, false), (true, true)] {
+            let mut host = crate::runtime::StdHost::new();
+            let receiver = if receiver_opaque {
+                opaque_product(1)
+            } else {
+                node(&mut host, PRODUCT, vec![Value::Int(1), Value::Void]).unwrap()
+            };
+            let argument = if argument_opaque {
+                opaque_product(1)
+            } else {
+                node(&mut host, PRODUCT, vec![Value::Int(1), Value::Void]).unwrap()
+            };
+            let result = invoke(&mut host, &and, Some(&receiver), &[argument]).unwrap();
+            assert_eq!(tag(&result).as_deref(), Some(PRODUCT));
+            assert_eq!(held_values(&result).unwrap().len(), 3);
+            assert_eq!(host.unknown_host_call_count(), 1);
+        }
+
+        let mut host = crate::runtime::StdHost::new();
+        let opaque = opaque_product(1);
+        let result = invoke(&mut host, &apply, Some(&opaque), &[Value::Ref(None)]).unwrap();
+        assert_eq!(tag(&result).as_deref(), Some(APPLIED));
+        assert_eq!(host.unknown_host_call_count(), 1);
     }
 
     /// `Products.Pn` are records: a product equals itself, and the model counts `equals` between
