@@ -25,7 +25,12 @@ public class Probe {
     String all=err(()->in.readAllBytes());
     String positive=err(()->in.readNBytes(1));
     String negative=err(()->in.skip(-1));
-    return skip+"|"+all+"|"+positive+"|"+negative;
+    // Native failures whose text is the OS's: counted, never answered.
+    String transfer=err(()->in.transferTo(new ByteArrayOutputStream()));
+    InputStream live=open(p,false);
+    String openNegative=err(()->live.skip(-1));
+    live.close();
+    return skip+"|"+all+"|"+positive+"|"+negative+"|"+transfer+"|"+openNegative;
   }
   static String nbytes(Path p, boolean channel) throws Exception {
     try (InputStream in=open(p,channel)) {

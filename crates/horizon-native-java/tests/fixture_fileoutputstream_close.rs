@@ -38,11 +38,15 @@ fn fileoutputstream_close_matches_java25() {
         vec![
             ("java/io/InputStream#readAllBytes()[B".into(), 1),
             ("java/io/InputStream#readNBytes(I)[B".into(), 1),
-            ("java/io/InputStream#skip(J)J".into(), 2),
+            ("java/io/InputStream#skip(J)J".into(), 3),
+            (
+                "java/io/InputStream#transferTo(Ljava/io/OutputStream;)J".into(),
+                1
+            ),
         ]
     );
     assert_eq!(
         counted,
-        horizon_native_java::Value::Ref(Some("ok|ok|ok|ok".into()))
+        horizon_native_java::Value::Ref(Some("ok|ok|ok|ok|ok|ok".into()))
     );
 }

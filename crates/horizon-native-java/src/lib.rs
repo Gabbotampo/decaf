@@ -28736,24 +28736,10 @@ impl<H: Host> Runtime<'_, H> {
                             "java/io/IOException"
                         }
                         .into(),
-                        message: if channel_stream {
-                            None
-                        } else {
-                            let ordinary = (r.name == "read"
-                                && (r.descriptor == "()I"
-                                    || r.descriptor == "([B)I"
-                                    || r.descriptor == "([BII)I"))
-                                || r.name == "available"
-                                || (r.name == "readNBytes" && r.descriptor == "([BII)I");
-                            Some(
-                                if ordinary {
-                                    "Stream Closed"
-                                } else {
-                                    "Bad file descriptor"
-                                }
-                                .into(),
-                            )
-                        },
+                        // `FileInputStream`'s own Java text. Closed calls whose
+                        // failure text comes from the OS instead are counted
+                        // below (`closed_ordinary`), never answered.
+                        message: (!channel_stream).then(|| "Stream Closed".into()),
                         frame: None,
                     };
                     if r.name == "readNBytes" && r.descriptor == "(I)[B" {
@@ -28785,6 +28771,20 @@ impl<H: Host> Runtime<'_, H> {
                             && r.descriptor == "(I)[B"
                             && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? <= 0)
                     {
+                        // Only these closed `FileInputStream` calls fail in Java
+                        // code ("Stream Closed"). The rest (`transferTo`, ...)
+                        // fail in native code with the OS's `strerror` text,
+                        // which differs between Linux, macOS and Windows.
+                        let closed_ordinary = (r.name == "read"
+                            && (r.descriptor == "()I"
+                                || r.descriptor == "([B)I"
+                                || r.descriptor == "([BII)I"))
+                            || r.name == "available"
+                            || (r.name == "readNBytes"
+                                && (r.descriptor == "([BII)I" || r.descriptor == "(I)[B"));
+                        if !channel_stream && !closed_ordinary {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
                         return Err(closed_error());
                     }
                     return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
@@ -28892,12 +28892,11 @@ impl<H: Host> Runtime<'_, H> {
                                 *position = new as usize;
                                 Value::Long(new - old)
                             } else {
+                                // `FileInputStream.skip` is native `skip0`: a
+                                // negative skip's outcome and error text are the
+                                // OS's (`lseek`/`SetFilePointerEx`), so count it.
                                 if requested < 0 {
-                                    return Err(NativeError::UncaughtException {
-                                        class: "java/io/IOException".into(),
-                                        message: Some("Invalid argument".into()),
-                                        frame: None,
-                                    });
+                                    return self.host.unknown_operand_call(r).map(Some);
                                 }
                                 *position = (*position).saturating_add(requested as usize);
                                 Value::Long(requested)
