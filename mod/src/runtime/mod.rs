@@ -2655,6 +2655,13 @@ pub trait Host {
         false
     }
 
+    /// Whether every mutator of the collection `marker` throws
+    /// `UnsupportedOperationException`: an immutable or unmodifiable list,
+    /// and a sub-list of one (#558 review).
+    fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
+        false
+    }
+
     /// Whether the host keeps a collection row for `marker`.
     fn has_mutable_collection(&self, _marker: &str) -> bool {
         false
@@ -6010,6 +6017,10 @@ impl Host for StdHost {
 
     fn is_jdk_list_of(&self, marker: &str) -> bool {
         self.jdk_list_of.contains(marker)
+    }
+
+    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
+        self.unmodifiable_collections.contains_key(marker)
     }
 
     fn has_mutable_collection(&self, marker: &str) -> bool {

@@ -7,3 +7,7 @@
 11=java.lang.UnsupportedOperationException
 12=java.lang.UnsupportedOperationException
 13=java.lang.UnsupportedOperationException
+14=java.lang.UnsupportedOperationException
+15=java.lang.UnsupportedOperationException
+16=java.lang.UnsupportedOperationException
+17=1

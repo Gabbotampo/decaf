@@ -478,6 +478,20 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             Value::Ref(Some(marker)) => Some(marker.clone()),
             _ => None,
         };
+        // An immutable or unmodifiable list's `sort` throws whatever its size
+        // (`ImmutableCollections`' and `UnmodifiableList`'s own `sort`), and
+        // `Collections.sort` calls it: a sub-list of one is just as
+        // unmodifiable (#558 review).
+        if key
+            .as_deref()
+            .is_some_and(|marker| self.host.is_unmodifiable_collection(marker))
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/UnsupportedOperationException".into(),
+                message: None,
+                frame: None,
+            });
+        }
         if key
             .as_deref()
             .is_some_and(|marker| self.host.is_detached_sub_list(marker))
@@ -597,7 +611,10 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
                 .is_some_and(|marker| self.host.is_jdk_list_of(marker))
             || key
                 .as_deref()
-                .is_some_and(|marker| self.host.unmodifiable_view_source(marker).is_some());
+                .is_some_and(|marker| self.host.unmodifiable_view_source(marker).is_some())
+            || key
+                .as_deref()
+                .is_some_and(|marker| self.host.is_unmodifiable_collection(marker));
         if immutable {
             let size = crate::runtime_collection_values(self.host, list)?.len();
             if size >= 2 {

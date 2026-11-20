@@ -1622,6 +1622,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.is_jdk_list_of(marker)
     }
 
+    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
+        self.inner.is_unmodifiable_collection(marker)
+    }
+
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.inner.service_providers(service)
     }
