@@ -232,7 +232,10 @@ def content_items(game_dir: Path) -> dict[str, list[str]]:
                     names = sorted(archive.namelist())
                     for name in names:
                         parts = name.split("/")
-                        if (len(parts) != 5 or parts[0] != "data" or parts[2] != "horizon"
+                        # Sunrise reads declarations from `data/<ns>/sunrise/` (bake.py writes
+                        # them there); `horizon/` is the layout of packages baked for Horizon.
+                        if (len(parts) != 5 or parts[0] != "data"
+                                or parts[2] not in ("sunrise", "horizon")
                                 or not parts[4].endswith(".json")):
                             continue
                         item_id = f"{parts[1]}:{parts[4][:-len('.json')]}"
