@@ -11655,6 +11655,34 @@ impl Host for StdHost {
                     })?;
                 Ok(Value::Ref(Some(String::from_utf16_lossy(sliced))))
             }
+            ("java/lang/String", "codePointAt", "(I)I") => {
+                let index = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative code point index".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let first = *units.get(index).ok_or_else(|| {
+                    NativeError::Metadata("code point index out of bounds".into())
+                })?;
+                let code = if (0xD800..=0xDBFF).contains(&first)
+                    && let Some(second) = units.get(index + 1)
+                    && (0xDC00..=0xDFFF).contains(second)
+                {
+                    0x10000 + ((u32::from(first) - 0xD800) << 10) + u32::from(*second) - 0xDC00
+                } else {
+                    u32::from(first)
+                };
+                Ok(Value::Int(code as i32))
+            }
+            ("java/lang/String", "subSequence", "(II)Ljava/lang/CharSequence;") => {
+                let start = usize::try_from(expect_int(r, Self::argument(r, args, 0)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence start".into()))?;
+                let end = usize::try_from(expect_int(r, Self::argument(r, args, 1)?)?)
+                    .map_err(|_| NativeError::Metadata("negative subsequence end".into()))?;
+                let units = expect_string(receiver).encode_utf16().collect::<Vec<_>>();
+                let slice = units.get(start..end).ok_or_else(|| {
+                    NativeError::Metadata("subsequence range out of bounds".into())
+                })?;
+                Ok(Value::Ref(Some(String::from_utf16_lossy(slice))))
+            }
             ("java/lang/String", "charAt", "(I)C") => {
                 let index = expect_int(r, Self::argument(r, args, 0)?)?;
                 let index = usize::try_from(index).map_err(|_| {
@@ -20552,6 +20580,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -20771,6 +20800,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -20946,6 +20976,7 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -23154,6 +23185,8 @@ struct Runtime<'a, H> {
     /// so a later `toString` sees every earlier append — the JDK's contract,
     /// and what a value-chain marker would lose.
     string_builders: BTreeMap<String, String>,
+    /// Allocation keys of constructors whose String text is not modelled exactly.
+    counted_strings: std::collections::BTreeSet<String>,
     /// JsonWriter states keyed by their jar object marker.
     gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
@@ -24413,13 +24446,18 @@ impl<H: Host> Runtime<'_, H> {
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
                 // and `<init>` make it (`jdk_string_builder.rs`).
-                if self
-                    .invoke_string_builder(&callback.target, Some(&object), &values)?
-                    .is_none()
+                let builder =
+                    self.invoke_string_builder(&callback.target, Some(&object), &values)?;
+                if builder.is_none()
                     && string_constructors::count(self, &callback.target)?.is_none()
                 {
                     self.host
                         .invoke_instance(&callback.target, &object, &values)?;
+                } else if builder.is_none()
+                    && callback.target.owner == "java/lang/String"
+                    && let Some(key) = jar_object::object_key(&object)
+                {
+                    self.counted_strings.insert(key.to_owned());
                 }
                 return Ok(Some(object));
             }
@@ -24868,6 +24906,15 @@ impl<H: Host> Runtime<'_, H> {
         }
 
         Ok(())
+    }
+
+    fn is_counted_string(&self, value: &Value) -> bool {
+        jar_object::object_key(value).is_some_and(|key| self.counted_strings.contains(key))
+    }
+
+    fn contains_counted_string(&self, receiver: Option<&Value>, args: &[Value]) -> bool {
+        receiver.is_some_and(|value| self.is_counted_string(value))
+            || args.iter().any(|value| self.is_counted_string(value))
     }
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
@@ -31892,6 +31939,11 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         dispatched = Some(value);
                     }
+                    if dispatched.is_none()
+                        && self.contains_counted_string(receiver.as_ref(), &args)
+                    {
+                        dispatched = Some(invoke_or_catch!(at, self.host.unknown_operand_call(&r)));
+                    }
                     // `StateDefinition.Builder.add(Property...)` inside a jar block's
                     // `createBlockStateDefinition`: each property is recorded for the block's
                     // declaration (or the duplicate counted), and `add` returns the builder.
@@ -32227,10 +32279,14 @@ impl<H: Host> Runtime<'_, H> {
                         && let Some(value) =
                             invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
-                        dispatched = Some({
-                            // `new String(...)` builds no text yet: counted.
-                            value
-                        });
+                        if let Some(marker) = receiver
+                            .as_ref()
+                            .filter(|value| jar_object::is_object(value))
+                            .and_then(jar_object::object_key)
+                        {
+                            self.counted_strings.insert(marker.to_owned());
+                        }
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -32765,6 +32821,14 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     if dispatched.is_none()
                         && let Some(value) = self.invoke_array_clone(&r, receiver.as_ref())
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_string_content_equals(&r, receiver.as_ref(), &args)
+                        )
                     {
                         dispatched = Some(value);
                     }
@@ -37870,6 +37934,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -37946,6 +38011,7 @@ mod tests {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -45102,6 +45168,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -45320,6 +45387,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -45513,6 +45581,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -45882,6 +45951,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -46195,6 +46265,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -51466,6 +51537,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -51529,6 +51601,7 @@ mandatory = true
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 

@@ -411,7 +411,30 @@ impl<H: Host> Runtime<'_, H> {
                     name: "if_acmp".into(),
                     descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
                 })?;
-                Ok(equal)
+                // A fresh String is distinct from a literal that was loaded
+                // earlier in the same method. If the literal load occurs
+                // later, Java may let `intern()` install the fresh value in
+                // the pool before the ldc, so retain the counted fallback.
+                let fresh_precedes_literal = operands.is_some_and(|(left, right)| {
+                    let pair = [(left.kind, left.source), (right.kind, right.source)];
+                    let fresh = pair
+                        .iter()
+                        .filter_map(|(kind, source)| {
+                            (*kind == Kind::Fresh).then_some(*source).flatten()
+                        })
+                        .next();
+                    let literal = pair
+                        .iter()
+                        .filter_map(|(kind, source)| {
+                            (*kind == Kind::Interned).then_some(*source).flatten()
+                        })
+                        .next();
+                    match (fresh, literal) {
+                        (Some(Source::At(fresh)), Some(Source::At(literal))) => literal < fresh,
+                        _ => false,
+                    }
+                });
+                Ok(if fresh_precedes_literal { false } else { equal })
             }
         }
     }
@@ -887,7 +910,7 @@ fn kind(file: &ClassFile, code: &[u8], source: Source) -> Kind {
             },
             _ => Kind::Opaque,
         },
-        Some(op @ (0xb6 | 0xb8 | 0xb9)) => {
+        Some(op @ 0xb6..=0xb9) => {
             let Some(m) = index(true).and_then(|i| file.method_ref(i).ok()) else {
                 return Kind::Opaque;
             };
@@ -897,6 +920,10 @@ fn kind(file: &ClassFile, code: &[u8], source: Source) -> Kind {
                 == Some(m.owner.as_str());
             let no_args = m.descriptor.starts_with("()");
             match (op, m.owner.as_str(), m.name.as_str()) {
+                // The result of `new String(...)` is a fresh ordinary String.
+                // Its text is represented directly, while this producer keeps
+                // the allocation identity for `if_acmp`.
+                (0xb7, "java/lang/String", "<init>") => Kind::Fresh,
                 (0xb8, owner, "valueOf") if returns_own => {
                     if let Some(class) = CACHED_BOXES.iter().find(|c| **c == owner) {
                         Kind::Cached(class)
@@ -1029,20 +1056,38 @@ fn step(file: &ClassFile, code: &[u8], pc: usize, state: &mut State) -> Option<(
             }
         }
         0xb6..=0xba => {
+            let method = (op != 0xba).then(|| file.method_ref(u2(1)?).ok()).flatten();
             let descriptor = if op == 0xba {
                 file.invoke_dynamic_descriptor(u2(1)?).ok()?
             } else {
-                file.method_ref(u2(1)?).ok()?.descriptor
+                method.as_ref()?.descriptor.clone()
             };
             let arguments: usize = descriptor_arguments(&descriptor)
                 .iter()
                 .map(|a| words(a))
                 .sum();
+            let receiver = if matches!(op, 0xb6 | 0xb7 | 0xb9) {
+                stack.get(stack.len().checked_sub(arguments + 1)?).copied()
+            } else {
+                None
+            };
             pop(
                 stack,
                 arguments + usize::from(matches!(op, 0xb6 | 0xb7 | 0xb9)),
             )?;
-            push_result(stack, return_desc(&descriptor), produced);
+            // String#toString returns the receiver itself. Preserve its
+            // producer so `new String(x).toString() == new String(x)` is
+            // resolved as Java does without a counted fallback.
+            if method.as_ref().is_some_and(|m| {
+                m.owner == "java/lang/String"
+                    && m.name == "toString"
+                    && m.descriptor == "()Ljava/lang/String;"
+            }) {
+                let receiver = receiver?;
+                stack.push(receiver);
+            } else {
+                push_result(stack, return_desc(&descriptor), produced);
+            }
         }
         0xbb => {
             let ty = match class_ty(u2(1)?)? {

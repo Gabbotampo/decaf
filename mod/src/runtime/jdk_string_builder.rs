@@ -669,6 +669,41 @@ fn builder_class(owner: &str) -> bool {
 }
 
 impl<H: Host> Runtime<'_, H> {
+    /// `String.contentEquals` reads a builder's live text, the same value the
+    /// JDK's `AbstractStringBuilder` exposes. Keeping this at the Runtime
+    /// layer lets the String method consume a modelled builder without making
+    /// the generic host know about the builder table.
+    pub(crate) fn invoke_string_content_equals(
+        &self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if r.owner != "java/lang/String"
+            || r.name != "contentEquals"
+            || !matches!(
+                r.descriptor.as_str(),
+                "(Ljava/lang/CharSequence;)Z" | "(Ljava/lang/StringBuffer;)Z"
+            )
+        {
+            return Ok(None);
+        }
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let Some(other) = args.first() else {
+            return Ok(None);
+        };
+        let text = expect_string(receiver);
+        let Some(other) = self.builder_text(other) else {
+            // Plain CharSequence/String values remain on the host path; this
+            // model exists specifically to bridge a live StringBuilder or
+            // StringBuffer into String.contentEquals.
+            return Ok(None);
+        };
+        Ok(Some(Value::Int((text == other) as i32)))
+    }
+
     /// The text of the builder `value` is: a `StringBuilder`/`StringBuffer`
     /// the jar `new`ed, or a host builder marker. A `String` spelling a
     /// builder's key is no builder (`jar_object.rs`).
