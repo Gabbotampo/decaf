@@ -308,6 +308,15 @@ impl StdHost {
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
+        out.extend(self.block_state_properties.keys().map(String::as_str));
+        out.extend(self.state_definition_builders.keys().map(String::as_str));
+        out.extend(self.block_states.keys().map(String::as_str));
+        out.extend(self.block_default_states.keys().map(String::as_str));
+        out.extend(
+            self.unknown_block_state_definitions
+                .iter()
+                .map(String::as_str),
+        );
         // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
         // allocated mod objects. It is traced and pruned with the object
         // rather than becoming a lifetime root.
@@ -392,6 +401,10 @@ impl StdHost {
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
+        push(self.state_definition_builders.get(marker), out);
+        if let Some((block, _)) = self.block_states.get(marker) {
+            out.push(block.clone());
+        }
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -400,6 +413,9 @@ impl StdHost {
             out.push(marker.to_owned());
         }
         push(self.ranged_attributes.get(marker), out);
+        if let Some(text) = crate::runtime::menu_models::keyed_text(&self.menu_states, marker) {
+            out.push(text);
+        }
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -428,9 +444,15 @@ impl StdHost {
             .chain(self.constructed_items.iter())
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
+            .chain(self.block_state_properties.keys())
+            .chain(self.state_definition_builders.keys())
+            .chain(self.block_states.keys())
+            .chain(self.block_default_states.keys())
+            .chain(self.unknown_block_state_definitions.iter())
             .chain(self.array_view_markers())
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
+            .chain(self.menu_states.keys())
             .map(String::as_str)
     }
 
@@ -453,6 +475,11 @@ impl StdHost {
         self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
+        self.block_state_properties.retain(|key, _| keep(key));
+        self.state_definition_builders.retain(|key, _| keep(key));
+        self.block_states.retain(|key, _| keep(key));
+        self.block_default_states.retain(|key, _| keep(key));
+        self.unknown_block_state_definitions.retain(|key| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
         self.hash_tables.retain(|key, _| keep(key));
         self.red_black_trees.retain(|key, _| keep(key));
@@ -464,6 +491,7 @@ impl StdHost {
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
+        self.menu_states.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
     }
@@ -1644,11 +1672,17 @@ mod tests {
             "resource_streams",
             "calls",
             "invocations",
+            "menu_states",
             "posted_events",
             "registrations",
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "block_state_properties",
+            "state_definition_builders",
+            "block_states",
+            "block_default_states",
+            "unknown_block_state_definitions",
             "constructed_items",
             "constructed_blocks",
             "block_items",
@@ -1761,6 +1795,7 @@ mod tests {
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",
+            "next_block_state",
             "outgoing_payloads",
             "incoming_payloads",
             "level_resources",
@@ -1807,5 +1842,38 @@ mod tests {
             stale.is_empty(),
             "classified fields the host lacks: {stale:?}"
         );
+    }
+
+    #[test]
+    fn unrooted_menu_states_are_pruned() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        for i in 0..256 {
+            let key = format!("demo/Menu#{i}");
+            host.menu_states.insert(
+                key,
+                crate::runtime::menu_models::Object::Menu(crate::runtime::menu_models::MenuState {
+                    input: format!("input#{i}"),
+                    result: format!("result#{i}"),
+                    slots: format!("slots#{i}"),
+                    definition: crate::runtime::menu_models::Definition {
+                        inputs: Vec::new(),
+                        result: crate::runtime::menu_models::SlotDef {
+                            index: 0,
+                            x: 0,
+                            y: 0,
+                            may_place: Value::Ref(None),
+                            empty: false,
+                        },
+                    },
+                    container_id: i,
+                    access: Value::Ref(None),
+                    player: Value::Ref(None),
+                }),
+            );
+        }
+        heap.next_object = 256;
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.menu_states.is_empty());
     }
 }
