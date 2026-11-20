@@ -10694,7 +10694,11 @@ impl Host for StdHost {
                         return self.unknown_host_call(r);
                     };
                     if let Some(at) = values.chunks(2).position(|pair| pair.first() == Some(&key)) {
-                        self.entries_before_call(&map, "iterator_remove", &[key.clone()]);
+                        self.entries_before_call(
+                            &map,
+                            "iterator_remove",
+                            std::slice::from_ref(&key),
+                        );
                         values.drain(at * 2..at * 2 + 2);
                         self.mutable_collections.insert(map.clone(), values);
                         let stamp = self.mod_stamp(&map).bumped(false);
