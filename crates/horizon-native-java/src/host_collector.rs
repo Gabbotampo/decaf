@@ -54,7 +54,11 @@ pub(crate) enum Builtin {
     },
     /// `toMap(key, value[, merge[, supplier]])` and Guava's immutable-map collectors: the
     /// functions in that order (`jdk_model.rs`'s `ToMap`).
-    ToMap { guava: bool, functions: Vec<Value> },
+    ToMap {
+        guava: bool,
+        unmodifiable: bool,
+        functions: Vec<Value>,
+    },
     /// `toCollection(supplier)`: the supplier makes the mutable result and each
     /// stream element is added to it in encounter order.
     ToCollection { supplier: Value },
@@ -70,7 +74,16 @@ impl Builtin {
             Builtin::ImmutableList => "immutable-list",
             Builtin::OrderedSet => "ordered-set",
             Builtin::Joining { .. } => "joining",
-            Builtin::ToMap { guava: false, .. } => "to-map",
+            Builtin::ToMap {
+                guava: false,
+                unmodifiable: false,
+                ..
+            } => "to-map",
+            Builtin::ToMap {
+                guava: false,
+                unmodifiable: true,
+                ..
+            } => "unmodifiable-map",
             Builtin::ToMap { guava: true, .. } => "guava-to-map",
             Builtin::ToCollection { .. } => "to-collection",
         }
@@ -173,8 +186,9 @@ pub(crate) fn builtin(value: &Value) -> Option<Builtin> {
                 suffix,
             }
         }
-        ("to-map" | "guava-to-map", functions) => Builtin::ToMap {
+        ("to-map" | "unmodifiable-map" | "guava-to-map", functions) => Builtin::ToMap {
             guava: name == "guava-to-map",
+            unmodifiable: name == "unmodifiable-map",
             functions: functions.to_vec(),
         },
         ("to-collection", [supplier]) => Builtin::ToCollection {
