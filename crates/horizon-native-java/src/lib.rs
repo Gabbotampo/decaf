@@ -28768,11 +28768,22 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     if self.io_closed.contains(&marker)
                         && r.name != "close"
+                        && !channel_stream
+                        && ((r.name == "skip" && r.descriptor == "(J)J")
+                            || (r.name == "readAllBytes" && r.descriptor == "()[B")
+                            || (r.name == "readNBytes"
+                                && r.descriptor == "(I)[B"
+                                && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? > 0))
+                    {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    }
+                    if self.io_closed.contains(&marker)
+                        && r.name != "close"
                         && !((r.name == "read" || r.name == "readNBytes")
                             && (r.descriptor == "([B)I" || r.descriptor == "([BII)I"))
                         && !(r.name == "readNBytes"
                             && r.descriptor == "(I)[B"
-                            && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? < 0)
+                            && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? <= 0)
                     {
                         return Err(closed_error());
                     }
@@ -28805,7 +28816,9 @@ impl<H: Host> Runtime<'_, H> {
                             if matches!(args.first(), Some(Value::Ref(None))) {
                                 return Err(NativeError::UncaughtException {
                                     class: "java/lang/NullPointerException".into(),
-                                    message: None,
+                                    message: Some(
+                                        "Cannot read the array length because \"b\" is null".into(),
+                                    ),
                                     frame: None,
                                 });
                             }
@@ -28834,7 +28847,9 @@ impl<H: Host> Runtime<'_, H> {
                             } else {
                                 (0, array_len)
                             };
-                            if self.io_closed.contains(&marker) {
+                            if self.io_closed.contains(&marker)
+                                && !(r.name == "readNBytes" && length == 0)
+                            {
                                 return Err(closed_error());
                             }
                             if length == 0 {

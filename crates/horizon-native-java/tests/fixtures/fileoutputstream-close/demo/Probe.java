@@ -10,12 +10,22 @@ public class Probe {
     InputStream in=open(p,channel); in.close(); in.close();
     String a=err(()->in.read());
     String b=err(()->in.available());
-    String c=err(()->in.skip(1));
-    String d=err(()->in.readAllBytes());
-    String e=err(()->in.readNBytes(1));
+    String c=Arrays.toString(in.readNBytes(0));
+    String d=err(()->in.readNBytes(new byte[2],0,0));
+    String e=err(()->in.readNBytes((byte[])null,0,0));
+    String f=err(()->in.readNBytes(new byte[2],3,0));
+    String g=err(()->in.readNBytes(new byte[2],0,-1));
     byte[] buf=new byte[2];
-    String f=err(()->in.readNBytes(buf,0,1));
-    return a+"|"+b+"|"+c+"|"+d+"|"+e+"|"+f;
+    String h=err(()->in.readNBytes(buf,0,1));
+    return a+"|"+b+"|"+c+"|"+d+"|"+e+"|"+f+"|"+g+"|"+h;
+  }
+  static String counted(Path p) throws Exception {
+    InputStream in=open(p,false); in.close();
+    String skip=err(()->in.skip(1));
+    String all=err(()->in.readAllBytes());
+    String positive=err(()->in.readNBytes(1));
+    String negative=err(()->in.skip(-1));
+    return skip+"|"+all+"|"+positive+"|"+negative;
   }
   static String nbytes(Path p, boolean channel) throws Exception {
     try (InputStream in=open(p,channel)) {
@@ -42,7 +52,13 @@ public class Probe {
       Files.write(f,new byte[]{1,2,3});
       return "fis.closed="+closed(f,false)+";files.closed="+closed(f,true)
         +";fis.nbytes="+nbytes(f,false)+";files.nbytes="+nbytes(f,true)
-        +";fis.skip="+skipping(f,false)+";files.skip="+skipping(f,true);
+        +";files.skip="+skipping(f,true);
+    } catch(Exception x){return "ERR:"+x;}
+  }
+  public static String countedRows() {
+    try {
+      Path f=Path.of("fos-scratch").resolve("x.bin");
+      return counted(f);
     } catch(Exception x){return "ERR:"+x;}
   }
   public static void main(String[] a){System.out.println(rows());}
