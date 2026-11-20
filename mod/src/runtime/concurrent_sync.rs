@@ -100,10 +100,17 @@ fn invoke_atomic_integer<H: Host>(
         }
         ("get", "()I") => Ok(rt.fields.get(&key).cloned()),
         ("set", "(I)V") => {
-            rt.fields
-                .insert(key, args.first().cloned().unwrap_or(Value::Int(0)));
+            let value = expect_int(r, args.first().unwrap_or(&Value::Void))?;
+            rt.fields.insert(key, Value::Int(value));
             Ok(Some(Value::Void))
         }
+        // `AtomicInteger` overrides `Number`'s accessors with its current value; a call written
+        // against `Number` goes to the `Number` model, which counts a value it does not hold.
+        ("intValue", "()I") => Ok(rt.fields.get(&key).cloned()),
+        ("longValue", "()J") => Ok(match rt.fields.get(&key) {
+            Some(Value::Int(value)) => Some(Value::Long(i64::from(*value))),
+            _ => None,
+        }),
         _ => Ok(None),
     }
 }

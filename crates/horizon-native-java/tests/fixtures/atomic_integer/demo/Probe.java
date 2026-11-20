@@ -12,7 +12,8 @@ public class Probe {
     a.set(-5); s.append(a.get()).append('|');
     AtomicInteger max = new AtomicInteger(Integer.MAX_VALUE);
     s.append(max.getAndIncrement()).append(':').append(max.get()).append('|');
-    s.append(max.incrementAndGet());
+    s.append(max.incrementAndGet()).append('|');
+    s.append(b.intValue()).append(':').append(max.longValue());
     return s.toString();
   }
   public static void main(String[] args) { System.out.print(rows()); }
