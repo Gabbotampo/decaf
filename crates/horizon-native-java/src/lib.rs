@@ -5716,6 +5716,36 @@ impl StdHost {
                 }
                 Ok(None)
             }
+            "net/minecraft/world/level/block/CraftingTableBlock"
+                if r.name == "<init>"
+                    && r.descriptor
+                        == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V" =>
+            {
+                let Some(builder) = args.first().and_then(expect_ref) else {
+                    return Ok(None);
+                };
+                let Some(mut properties) = self.block_property_builders.get(builder).cloned()
+                else {
+                    return Ok(None);
+                };
+                // Only a vanilla `CraftingTableBlock` itself behaves as the crafting table (its
+                // `useWithoutItem` opens the 3x3 grid). This constructor is also the super call of
+                // a jar's subclass (Runes' altar), whose own `useWithoutItem` opens its own menu:
+                // giving it the crafting table's template would open the vanilla grid in game.
+                // Such a block keeps the inferred template; its behaviour is the jar's to bridge.
+                if crate::jar_object::key_class(marker)
+                    == Some("net/minecraft/world/level/block/CraftingTableBlock")
+                {
+                    properties.insert("__template".into(), "minecraft:crafting_table".into());
+                }
+                if self.block_property_builders.contains_key(marker)
+                    || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+                {
+                    self.block_property_builders
+                        .insert(marker.to_owned(), properties);
+                }
+                Ok(Some(Value::Void))
+            }
             // Vanilla subclass constructors carry class-specific arguments
             // (BlockSetType, TreeGrower, base state, ...). Until each argument
             // family is decoded exactly, keep the constructor counted.
