@@ -48,12 +48,14 @@ public final class Probe {
   public static String chmToArray() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(); return "counted"; }
   public static String chmToArrayGenerator() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.toArray(String[]::new); return "counted"; }
   public static String chmForEach() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); StringBuilder b=new StringBuilder(); s.forEach(b::append); return "counted"; }
+  public static String chmBulk() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("z"); s.add("a"); s.add("m"); boolean a1=s.addAll(List.of("a","b","c")); int n1=s.size(); boolean a2=s.addAll(List.of()); boolean r1=s.removeAll(List.of("z","q")); int n2=s.size(); boolean r2=s.removeAll(List.of("q")); return a1+"|"+n1+"|"+a2+"|"+r1+"|"+n2+"|"+r2+"|"+s.contains("b")+"|"+s.contains("z")+"|"+s.size(); }
+  public static String chmRemoveIf() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("z"); s.add("a"); s.removeIf(x -> x.equals("a")); return "counted"; }
   public static String chmStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.add("a"); s.stream(); return "counted"; }
   public static String chmParallelStream() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.parallelStream(); return "counted"; }
   public static String chmSpliterator() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); s.spliterator(); return "counted"; }
   public static String chmRemoveNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.remove(null)); }
   public static String chmContainsNull() { Set<String> s=Collections.newSetFromMap(new ConcurrentHashMap<>()); return ex(() -> s.contains(null)); }
-  public static String countedReads() { chmIterate(); chmToArray(); chmToArrayGenerator(); chmForEach(); chmStream(); chmParallelStream(); chmSpliterator(); return "counted"; }
+  public static String countedReads() { chmIterate(); chmToArray(); chmToArrayGenerator(); chmForEach(); chmRemoveIf(); chmStream(); chmParallelStream(); chmSpliterator(); return "counted"; }
   public static String identity() { return ex(()->Collections.newSetFromMap(new IdentityHashMap<>())); }
   public static String weak() { return ex(()->Collections.newSetFromMap(new WeakHashMap<>())); }
   public static String concurrent() { return ex(()->Collections.newSetFromMap(new ConcurrentHashMap<>())); }
@@ -70,6 +72,7 @@ public final class Probe {
     System.out.println("chmExact=" + chmExact());
     System.out.println("chmRemoveNull=" + chmRemoveNull());
     System.out.println("chmContainsNull=" + chmContainsNull());
+    System.out.println("chmBulk=" + chmBulk());
     System.out.println("identity=" + identity());
     System.out.println("weak=" + weak());
     System.out.println("concurrent=" + concurrent());
@@ -106,6 +109,7 @@ fn linked_map_view_is_live_and_matches_set_contracts() {
         "chmExact",
         "chmRemoveNull",
         "chmContainsNull",
+        "chmBulk",
     ] {
         assert_eq!(fixture.text(method), expected(method), "{method}");
     }
@@ -135,6 +139,10 @@ fn concurrent_hash_map_order_dependent_operations_are_counted() {
             ),
             (
                 "java/util/Set#parallelStream()Ljava/util/stream/Stream;".into(),
+                1
+            ),
+            (
+                "java/util/Set#removeIf(Ljava/util/function/Predicate;)Z".into(),
                 1
             ),
             (

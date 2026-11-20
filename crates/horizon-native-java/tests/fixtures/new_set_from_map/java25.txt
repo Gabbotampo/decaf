@@ -6,6 +6,7 @@ nullMap=NullPointerException|Cannot invoke "java.util.Map.isEmpty()" because "ma
 chmExact=true|false|true|true|false|0|true|NullPointerException|null
 chmRemoveNull=NullPointerException|Cannot invoke "Object.hashCode()" because "key" is null
 chmContainsNull=NullPointerException|Cannot invoke "Object.hashCode()" because "key" is null
+chmBulk=true|5|false|true|4|false|true|false|4
 identity=ok
 weak=ok
 concurrent=ok

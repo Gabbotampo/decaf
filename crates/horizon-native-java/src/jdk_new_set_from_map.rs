@@ -218,6 +218,44 @@ impl StdHost {
                 values.clear();
                 Some(Ok(Value::Void))
             }
+            // `AbstractCollection.addAll` / `AbstractSet.removeAll` on a
+            // `ConcurrentHashMap`-backed set: the result and the set after it
+            // do not depend on either collection's order. A null element
+            // throws part-way, at a point that does, so it stays counted;
+            // so does an argument the host holds no elements for.
+            ("addAll" | "removeAll", "(Ljava/util/Collection;)Z") if chm => {
+                let source = args.first()?.clone();
+                let Ok(others) = crate::runtime_collection_values(self, &source) else {
+                    return Some(self.unknown_host_call(r));
+                };
+                if matches!(source, Value::Ref(None))
+                    || others.iter().any(|value| matches!(value, Value::Ref(None)))
+                {
+                    return Some(self.unknown_host_call(r));
+                }
+                let values = self.mutable_collections.get_mut(&map)?;
+                let mut changed = false;
+                if r.name == "addAll" {
+                    for key in others {
+                        let present = values.as_chunks::<2>().0.iter().any(|pair| pair[0] == key);
+                        if !present {
+                            values.extend([key, Value::Boxed(Boxed::Boolean(true))]);
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let mut kept = Vec::with_capacity(values.len());
+                    for pair in values.as_chunks::<2>().0 {
+                        let drop = others.iter().any(|value| value == &pair[0]);
+                        changed |= drop;
+                        if !drop {
+                            kept.extend(pair.iter().cloned());
+                        }
+                    }
+                    *values = kept;
+                }
+                Some(Ok(Value::Int(i32::from(changed))))
+            }
             _ => None,
         }
     }
@@ -259,6 +297,9 @@ pub(crate) fn chm_set_ordered_read(name: &str, descriptor: &str) -> bool {
             | ("toArray", "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;")
             // Runs the action in iteration order (#548 review).
             | ("forEach", "(Ljava/util/function/Consumer;)V")
+            // Tests the predicate in iteration order: a predicate's side
+            // effects would show it (#548 re-review).
+            | ("removeIf", "(Ljava/util/function/Predicate;)Z")
             | ("stream", "()Ljava/util/stream/Stream;")
             | ("parallelStream", "()Ljava/util/stream/Stream;")
             | ("spliterator", "()Ljava/util/Spliterator;")
