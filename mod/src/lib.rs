@@ -2906,6 +2906,16 @@ mod tests {
         REPORT_BYTES.get_or_init(|| Mutex::new(None))
     }
 
+    /// The tests that read `REPORT_BYTES` back hold this for their whole run: each clears the
+    /// shared report first, so two running at once (cargo runs tests in parallel) clear each
+    /// other's report mid-test. Poison is ignored, so one failing test does not fail the next.
+    fn report_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static REPORT_TESTS: Mutex<()> = Mutex::new(());
+        REPORT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct ReportFiles;
     impl ConfigFiles for ReportFiles {
         fn read(&self, _file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
@@ -2998,6 +3008,7 @@ mod tests {
 
     #[test]
     fn client_setup_leave_rejoin_stop_and_second_setup_keep_one_listener() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
@@ -3033,6 +3044,7 @@ mod tests {
 
     #[test]
     fn client_stages_run_and_persist_success_failure_counters() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
