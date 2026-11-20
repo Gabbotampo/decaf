@@ -3482,6 +3482,10 @@ pub struct StdHost {
     fabric_aliases: BTreeMap<String, String>,
     /// Duplicate ids/aliases are loader resolution errors, never first-wins.
     fabric_resolution_errors: Vec<String>,
+    /// Hashes of nested jars already discovered through this host's class
+    /// path. Fabric's discovery map shares one candidate when the same
+    /// `(CRC-32, size)` nested entry is reached from several parents.
+    loaded_nested_hashes: BTreeSet<u64>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
     /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
     fabric_origins: BTreeMap<String, (String, String)>,
@@ -3821,6 +3825,7 @@ impl StdHost {
             fabric_metadata: BTreeMap::new(),
             fabric_aliases: BTreeMap::new(),
             fabric_resolution_errors: Vec::new(),
+            loaded_nested_hashes: BTreeSet::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
@@ -4502,6 +4507,12 @@ impl StdHost {
         // `libjf` keeps its classes there, and its dependents call them.
         // Fabric loads each of them as a mod of its own.
         for (entry, nested) in nested_jars::parsed(jar) {
+            if nested.fabric_id.is_some() {
+                let hash = nested_jars::identity(&nested);
+                if !self.loaded_nested_hashes.insert(hash) {
+                    continue;
+                }
+            }
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
             self.try_record_loaded_mod(&nested)?;
@@ -4519,6 +4530,24 @@ impl StdHost {
             }
         }
         Ok(added)
+    }
+
+    /// Link one Fabric/NeoForge nested candidate. Unlike [`Self::link_jar`],
+    /// this participates in the loader's global nested-candidate identity
+    /// map, so a shared library reached through multiple parents is recorded
+    /// and put on the class path once.
+    pub(crate) fn link_nested_jar(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+    ) -> Result<usize, NativeError> {
+        if jar.fabric_id.is_some() {
+            let hash = nested_jars::identity(jar);
+            if !self.loaded_nested_hashes.insert(hash) {
+                return Ok(0);
+            }
+        }
+        self.link_jar(id, jar)
     }
 
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
@@ -17623,6 +17652,10 @@ pub struct NativeJar {
     pub client_side_only: bool,
     pub fabric_entrypoints: BTreeMap<String, Vec<Entrypoint>>,
     pub neoforge_entrypoints: Vec<String>,
+    /// The exact `(CRC-32, size)` identity of bytes passed to `from_bytes`.
+    /// Fabric uses this key for nested Jar-in-Jar discovery; path-loaded roots
+    /// do not need it because only nested entries are deduplicated.
+    source_hash: Option<u64>,
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
@@ -19204,7 +19237,9 @@ impl NativeJar {
     /// from disk. A host that hands a mod its files as bytes (Horizon's `Host::config_files`)
     /// runs them without staging a copy on the file system first.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeError> {
-        Self::read(std::io::Cursor::new(bytes), true)
+        let mut jar = Self::read(std::io::Cursor::new(bytes), true)?;
+        jar.source_hash = Some((u64::from(crc32fast::hash(bytes)) << 32) | bytes.len() as u64);
+        Ok(jar)
     }
 
     fn read<R: std::io::Read + std::io::Seek>(

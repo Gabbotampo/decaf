@@ -1790,6 +1790,7 @@ mod tests {
             "fabric_aliases",
             "fabric_origins",
             "fabric_resolution_errors",
+            "loaded_nested_hashes",
             "environment_type",
             "game_version",
             "development_environment",

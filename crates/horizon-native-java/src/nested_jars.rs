@@ -3,6 +3,22 @@ use crate::{NativeJar, StdHost};
 use std::cmp::Ordering;
 const MAX_NESTING: usize = 8;
 const MAX_NESTED_JARS: usize = 256;
+
+/// The key Fabric uses in `ModDiscoverer.jijDedupMap`: the nested entry's
+/// CRC-32 in the high word and uncompressed byte length in the low word.
+pub(crate) fn identity(jar: &NativeJar) -> u64 {
+    if let Some(hash) = jar.source_hash {
+        return hash;
+    }
+    let mut bytes = Vec::new();
+    for (name, payload) in &jar.resource_bytes {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(payload);
+        bytes.push(0xff);
+    }
+    (u64::from(crc32fast::hash(&bytes)) << 32) | bytes.len() as u64
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NestedJar {
     pub entry: String,
@@ -20,6 +36,9 @@ pub struct NestedCandidate {
     /// non-root candidates to Fabric's resolver.
     is_root: bool,
     pub order: usize,
+    /// Fabric's `ModCandidateImpl.hash(ZipEntry)`: CRC-32 of the nested jar
+    /// bytes in the high word and their uncompressed size in the low word.
+    pub hash: u64,
     /// Parent candidates, nearest first, for Fabric's recursive tie-break.
     parent_chain: Vec<(String, Option<String>, usize)>,
     /// NeoForge JarJar's `group:artifact` identity, when declared.
@@ -105,33 +124,55 @@ fn neoforge_declarations(
         })
         .collect()
 }
-fn declared_entries(jar: &NativeJar) -> Vec<String> {
+fn declared_entries(jar: &NativeJar) -> Vec<(String, bool)> {
     fabric_entries(jar)
         .into_iter()
-        .chain(neoforge_entries(jar))
+        .map(|entry| (entry, true))
+        .chain(
+            neoforge_entries(jar)
+                .into_iter()
+                .map(|entry| (entry, false)),
+        )
         .collect()
 }
 pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
     let mut out = Vec::new();
+    let mut by_hash = std::collections::BTreeMap::<u64, usize>::new();
     let mut ordinal = 0;
     fn walk(
         parent: &str,
         jar: &NativeJar,
         depth: usize,
         out: &mut Vec<NestedCandidate>,
+        by_hash: &mut std::collections::BTreeMap<u64, usize>,
         ordinal: &mut usize,
         parent_chain: &[(String, Option<String>, usize)],
     ) {
         if depth >= MAX_NESTING || out.len() >= MAX_NESTED_JARS {
             return;
         };
-        for entry in declared_entries(jar) {
+        for (entry, fabric_entry) in declared_entries(jar) {
             if out.len() >= MAX_NESTED_JARS {
                 break;
             };
             let Some(bytes) = jar.resource_bytes.get(&entry) else {
                 continue;
             };
+            let hash = (u64::from(crc32fast::hash(bytes)) << 32) | bytes.len() as u64;
+            if fabric_entry && let Some(&index) = by_hash.get(&hash) {
+                // ModDiscoverer keeps one ModScanTask for this hash and adds
+                // each new parent to that candidate. Its nested children are
+                // therefore scanned once, even when several parents bundle
+                // the same bytes.
+                let candidate = &mut out[index];
+                candidate.depth = candidate.depth.min(depth);
+                for parent in parent_chain {
+                    if !candidate.parent_chain.contains(parent) {
+                        candidate.parent_chain.push(parent.clone());
+                    }
+                }
+                continue;
+            }
             let Ok(nested) = NativeJar::from_bytes(bytes) else {
                 continue;
             };
@@ -146,12 +187,16 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
                 depth,
                 is_root: false,
                 order: *ordinal,
+                hash,
                 parent_chain: parent_chain.to_vec(),
                 neoforge_coordinate,
                 neoforge_artifact_version,
                 neoforge_version_range,
                 neoforge_declared: !neoforge_entries(jar).is_empty(),
             });
+            if fabric_entry {
+                by_hash.insert(hash, out.len() - 1);
+            }
             *ordinal += 1;
             let mut child_chain = parent_chain.to_vec();
             child_chain.insert(0, (candidate_id(jar), candidate_version(jar), depth));
@@ -160,12 +205,13 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
                 &nested,
                 depth + 1,
                 out,
+                by_hash,
                 ordinal,
                 &child_chain,
             );
         }
     }
-    walk("outer", jar, 0, &mut out, &mut ordinal, &[]);
+    walk("outer", jar, 0, &mut out, &mut by_hash, &mut ordinal, &[]);
     out
 }
 
@@ -1004,7 +1050,9 @@ pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
     };
     for candidate in selected {
         let id = format!("{}!{}", candidate.parent, candidate.entry);
-        let result = host.link_jar(id, &candidate.jar).map_err(|e| e.to_string());
+        let result = host
+            .link_nested_jar(id, &candidate.jar)
+            .map_err(|e| e.to_string());
         if result.is_ok() {
             let parent = jar
                 .fabric_id
@@ -1103,6 +1151,25 @@ mod tests {
             ("META-INF/jars/child.jar", &nested),
         ]);
         assert_eq!(candidates(&listed).len(), 1);
+    }
+
+    #[test]
+    fn identical_fabric_nested_bytes_merge_across_parents() {
+        let child = zip_bytes(&jar(&[(
+            "fabric.mod.json",
+            br#"{"schemaVersion":1,"id":"shared-lib","version":"1"}"#,
+        )]));
+        let outer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"outer","version":"1","jars":[{"file":"a.jar"},{"file":"b.jar"}]}"#,
+            ),
+            ("a.jar", &child),
+            ("b.jar", &child),
+        ]);
+        let selected = select_checked(&outer).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].jar.fabric_id.as_deref(), Some("shared-lib"));
     }
 
     #[test]
@@ -1219,6 +1286,7 @@ mod tests {
                         depth,
                         is_root: *root,
                         order: *order,
+                        hash: 0,
                         parent_chain,
                         neoforge_coordinate: None,
                         neoforge_artifact_version: None,

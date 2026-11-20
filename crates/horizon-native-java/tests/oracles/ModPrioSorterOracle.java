@@ -1,6 +1,8 @@
 import java.lang.reflect.*;
+import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.zip.*;
 import net.fabricmc.loader.api.Version;
 
 /** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
@@ -77,9 +79,135 @@ public final class ModPrioSorterOracle {
     return out;
   }
 
+  /**
+   * Read real Fabric metadata and nested entries. The paths used by the
+   * captured rows below are third-party corpus jars and are deliberately not
+   * copied into this repository.
+   */
+  static final class RealCandidates {
+    final Class<?> type;
+    final Method createPlain, createNested, addParent, nestedMods;
+    final Method parseMetadata;
+    final Object versionOverrides, dependencyOverrides;
+    final Map<Long, Object> byHash = new HashMap<>();
+
+    RealCandidates(Class<?> type) throws Exception {
+      this.type = type;
+      createPlain = type.getDeclaredMethod("createPlain", List.class,
+          Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"),
+          boolean.class, Collection.class);
+      createNested = type.getDeclaredMethod("createNested", String.class, long.class,
+          Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"),
+          boolean.class, Collection.class);
+      addParent = type.getDeclaredMethod("addParent", type);
+      nestedMods = type.getMethod("getNestedMods");
+      createPlain.setAccessible(true);
+      createNested.setAccessible(true);
+      addParent.setAccessible(true);
+      parseMetadata = Class.forName("net.fabricmc.loader.impl.metadata.ModMetadataParser")
+          .getMethod("parseMetadata", InputStream.class, String.class, List.class,
+              Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides"),
+              Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"),
+              boolean.class);
+      versionOverrides = Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides")
+          .getConstructor().newInstance();
+      dependencyOverrides = Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides")
+          .getConstructor(Path.class).newInstance(Path.of("oracle-no-overrides"));
+    }
+
+    Object metadata(InputStream stream, String path) throws Exception {
+      return parseMetadata.invoke(null, stream, path, List.of(), versionOverrides,
+          dependencyOverrides, false);
+    }
+
+    static Object call(Object receiver, String name, Class<?>... parameters) throws Exception {
+      Method method = receiver.getClass().getMethod(name, parameters);
+      method.setAccessible(true);
+      return method.invoke(receiver);
+    }
+
+    Object nested(Path owner, ZipFile zip, ZipEntry entry, Object parent) throws Exception {
+      byte[] bytes;
+      try (InputStream in = zip.getInputStream(entry)) {
+        bytes = in.readAllBytes();
+      }
+      long hash = (entry.getCrc() << 32) | (entry.getSize() & 0xffffffffL);
+      Object candidate = byHash.get(hash);
+      if (candidate == null) {
+        try (InputStream in = new ByteArrayInputStream(bytes);
+             ZipInputStream nestedZip = new ZipInputStream(in)) {
+          ZipEntry metadataEntry;
+          while ((metadataEntry = nestedZip.getNextEntry()) != null
+              && !metadataEntry.getName().equals("fabric.mod.json")) {}
+          if (metadataEntry == null) return null;
+          Object metadata = metadata(nestedZip, owner + "!" + entry.getName());
+          Collection<Object> children = new ArrayList<>();
+          candidate = createNested.invoke(null, entry.getName(), hash, metadata, false, children);
+          byHash.put(hash, candidate);
+          scanNested(owner + "!" + entry.getName(), bytes, candidate, children);
+        }
+      }
+      ((Collection<Object>) nestedMods.invoke(parent)).add(candidate);
+      addParent.invoke(candidate, parent);
+      return candidate;
+    }
+
+    void scanNested(String label, byte[] bytes, Object parent, Collection<Object> children)
+        throws Exception {
+      try (ZipFile zip = new ZipFile(writeScratchJar(label, bytes).toFile())) {
+        Object metadata = call(parent, "getMetadata");
+        Collection<?> jars = (Collection<?>) call(metadata, "getJars");
+        for (Object nestedEntry : jars) {
+          String file = (String) call(nestedEntry, "getFile");
+          ZipEntry entry = zip.getEntry(file);
+          if (entry != null && !entry.isDirectory() && file.endsWith(".jar")) {
+            nested(Path.of(label), zip, entry, parent);
+          }
+        }
+      }
+    }
+
+    // ZipFile is used so CRC and size are the same fields ModDiscoverer hashes.
+    // Keep temporary copies inside the oracle's scratch directory only.
+    Path writeScratchJar(String label, byte[] bytes) throws IOException {
+      Path dir = Path.of("oracle-real-scratch");
+      Files.createDirectories(dir);
+      Path path = dir.resolve(Integer.toUnsignedString(label.hashCode()) + ".jar");
+      Files.write(path, bytes);
+      return path;
+    }
+
+    Object root(Path path) throws Exception {
+      try (ZipFile zip = new ZipFile(path.toFile())) {
+        ZipEntry metadataEntry = zip.getEntry("fabric.mod.json");
+        if (metadataEntry == null) return null;
+        Object metadata = metadata(zip.getInputStream(metadataEntry), path.toString());
+        Collection<Object> children = new ArrayList<>();
+        Object candidate = createPlain.invoke(null, List.of(path), metadata, false, children);
+        Collection<?> jars = (Collection<?>) call(metadata, "getJars");
+        for (Object nestedEntry : jars) {
+          String file = (String) call(nestedEntry, "getFile");
+          ZipEntry entry = zip.getEntry(file);
+          if (entry != null && !entry.isDirectory() && file.endsWith(".jar")) {
+            nested(path, zip, entry, candidate);
+          }
+        }
+        return candidate;
+      }
+    }
+  }
+
   static String escaped(String value) {
     return value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
   }
+
+  // Real-jar capture inputs (read-only third-party corpus paths):
+  // /home/solenopsisbot/horizon-corpus/corpus-xl/DayCount-1.6.0-Fabric-mc26.3.jar
+  // /home/solenopsisbot/horizon-corpus/mega/b1b136006d-clientcommands-2.16.3.jar
+  // /home/solenopsisbot/horizon-corpus/deps-pool/fabric-api-0.166.2+26.3.jar
+  // /home/solenopsisbot/horizon-corpus/corpus-xl/1283899-8898481.jar
+  // /home/solenopsisbot/horizon-corpus/mega/2363766a77-tweakeroo-fabric-26.3-0.30.1.jar
+  // /home/solenopsisbot/horizon-corpus/neoforge/DistantHorizons-3.3.4-26.3-fabric-neoforge.jar
 
   public static void main(String[] args) throws Exception {
     Class<?> type = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
@@ -105,6 +233,26 @@ public final class ModPrioSorterOracle {
     for (String line : Files.readAllLines(Path.of(args[0]))) {
       if (line.isBlank()) continue;
       String[] split = line.split("\\|", 2);
+      if (split[1].startsWith("jar=")) {
+        List<Object> candidates = new ArrayList<>();
+        RealCandidates real = new RealCandidates(type);
+        for (String raw : split[1].substring(4).split("\\|")) {
+          Object candidate = real.root(Path.of(raw));
+          if (candidate != null) candidates.add(candidate);
+        }
+        try {
+          List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
+          StringJoiner row = new StringJoiner(",");
+          for (Object candidate : selected) {
+            row.add(id.invoke(candidate) + "@" + (isRoot.invoke(candidate).equals(Boolean.TRUE) ? "r" : "n") + "@" + level.invoke(candidate));
+          }
+          System.out.println(split[0] + "|OK|" + row);
+        } catch (InvocationTargetException error) {
+          Throwable cause = error.getCause();
+          System.out.println(split[0] + "|ERROR|" + cause.getClass().getName() + "|" + escaped(cause.getMessage()));
+        }
+        continue;
+      }
       List<Spec> specs = parse(split[1]);
       Map<String, Object> byLabel = new HashMap<>();
       List<Object> candidates = new ArrayList<>();
