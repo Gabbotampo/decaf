@@ -28772,14 +28772,14 @@ impl<H: Host> Runtime<'_, H> {
                             && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? <= 0)
                     {
                         // Only these closed `FileInputStream` calls fail in Java
-                        // code ("Stream Closed"). The rest (`available`, whose
-                        // `available0` is native, `transferTo`, ...)
+                        // code ("Stream Closed"). The rest (`transferTo`, ...)
                         // fail in native code with the OS's `strerror` text,
                         // which differs between Linux, macOS and Windows.
                         let closed_ordinary = (r.name == "read"
                             && (r.descriptor == "()I"
                                 || r.descriptor == "([B)I"
                                 || r.descriptor == "([BII)I"))
+                            || r.name == "available"
                             || (r.name == "readNBytes"
                                 && (r.descriptor == "([BII)I" || r.descriptor == "(I)[B"));
                         if !channel_stream && !closed_ordinary {
