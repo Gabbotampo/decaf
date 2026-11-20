@@ -388,6 +388,7 @@ impl StdHost {
         push(self.view_copies.get(marker), out);
         push(self.sub_lists.get(marker), out);
         push(self.iterator_sources.get(marker), out);
+        push(self.iterator_last.get(marker), out);
         push(self.list_iterators.get(marker), out);
         push(self.iterator_guards.get(marker), out);
         push(self.collection_comparators.get(marker), out);
@@ -468,6 +469,7 @@ impl StdHost {
         self.sub_lists.retain(|key, _| keep(key));
         self.detached_sub_lists.retain(|key| keep(key));
         self.iterator_sources.retain(|key, _| keep(key));
+        self.iterator_last.retain(|key, _| keep(key));
         self.list_iterators.retain(|key, _| keep(key));
         self.iterator_guards.retain(|key, _| keep(key));
         self.collection_comparators.retain(|key, _| keep(key));
@@ -993,6 +995,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .get(&marker)
             .into_iter()
             .flat_map(|(elements, _)| elements);
+        let iterator_last = host.iterator_last.get(&marker);
         // An enumeration's iterator or vector (`host_iterator.rs`).
         let enumerations = host
             .enumerations
@@ -1014,6 +1017,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .chain(arrays)
             .chain(collections)
             .chain(iterators)
+            .chain(iterator_last)
             .chain(enumerations)
             .chain(components)
             .chain(entries)
@@ -1099,6 +1103,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     heap.enum_constants.retain(|key, _| keep(key));
     host.mutable_collections.retain_markers(|key| keep(key));
     host.iterators.retain(|key, _| keep(key));
+    host.iterator_last.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
@@ -1724,6 +1729,7 @@ mod tests {
             "levels",
             "references",
             "iterators",
+            "iterator_last",
             "enumerations",
             "iterator_guards",
             "mod_stamps",
