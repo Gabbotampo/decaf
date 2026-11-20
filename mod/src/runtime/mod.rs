@@ -30785,6 +30785,7 @@ impl<H: Host> Runtime<'_, H> {
     /// [`Self::invoke_stream_calls`], recording which stream interface a
     /// new stream is (its call's declared result: `IntStream.range` answers an
     /// `IntStream`), for `instanceof` and casts (`stream_pipeline.rs`).
+    #[inline(never)]
     fn invoke_stream(
         &mut self,
         r: &MethodRef,
@@ -31050,6 +31051,7 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(result))
     }
 
+    #[inline(never)]
     fn invoke_enum_set_text(
         &mut self,
         r: &MethodRef,
@@ -31260,6 +31262,218 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         Ok(Some(self.new_array_value("[Ljava/lang/Throwable;", values)))
+    }
+
+    /// The immutable collection bulk mutators need a temporary snapshot and a
+    /// predicate walk. Keep those locals out of `invoke_frame`, whose frame is
+    /// repeated for every recursive jar call.
+    #[inline(never)]
+    fn invoke_immutable_bulk_mutator(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let marker = expect_ref(receiver)?;
+        if !matches!(
+            jar_object::collection_class(marker),
+            "java/util/Collections$SingletonList" | "java/util/Collections$CopiesList"
+        ) || !matches!(r.name.as_str(), "removeAll" | "retainAll" | "removeIf")
+            || (r.name == "removeIf"
+                && jar_object::collection_class(marker) != "java/util/Collections$CopiesList")
+            || is_map_owner(&r.owner)
+        {
+            return None;
+        }
+        Some((|| -> Result<Value, NativeError> {
+            let values = self.collection_elements(receiver)?;
+            let would_remove = match r.name.as_str() {
+                "removeIf" => {
+                    let predicate = args.first().cloned().unwrap_or(Value::Ref(None));
+                    if matches!(predicate, Value::Ref(None)) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    let mut matched = false;
+                    for value in &values {
+                        if self.predicate_holds(&predicate, value)? {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                }
+                "removeAll" | "retainAll" => {
+                    let source = args.first().cloned().unwrap_or(Value::Ref(None));
+                    if matches!(source, Value::Ref(None)) {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    let source = self.collection_elements(&source)?;
+                    values.iter().any(|value| {
+                        let contained = source.iter().any(|candidate| candidate == value);
+                        if r.name == "removeAll" {
+                            contained
+                        } else {
+                            !contained
+                        }
+                    })
+                }
+                _ => false,
+            };
+            if would_remove {
+                Err(NativeError::UncaughtException {
+                    class: "java/lang/UnsupportedOperationException".into(),
+                    message: None,
+                    frame: None,
+                })
+            } else {
+                Ok(Value::Int(0))
+            }
+        })())
+    }
+
+    #[inline(never)]
+    fn invoke_set_from_map_equals(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if r.name != "equals"
+            || r.descriptor != "(Ljava/lang/Object;)Z"
+            || !receiver.is_some_and(|value| self.host.is_set_from_map(value))
+        {
+            return None;
+        }
+        let receiver = receiver.expect("checked above");
+        let other = args.first().unwrap_or(&Value::Ref(None));
+        Some(
+            self.abstract_set_equals(receiver, other)
+                .map(|equal| Value::Int(i32::from(equal))),
+        )
+    }
+
+    #[inline(never)]
+    fn invoke_empty_sub_list_mutation(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let marker = receiver.and_then(expect_ref)?;
+        if self.host.is_immutable_empty_sublist(marker)
+            && matches!(
+                (r.name.as_str(), r.descriptor.as_str()),
+                ("set", "(ILjava/lang/Object;)Ljava/lang/Object;")
+                    | ("remove", "(I)Ljava/lang/Object;")
+            )
+        {
+            let index = args
+                .first()
+                .and_then(|value| match value {
+                    Value::Int(index) => Some(*index),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return Some(Err(NativeError::UncaughtException {
+                class: "java/lang/IndexOutOfBoundsException".into(),
+                message: Some(format!("Index {index} out of bounds for length 0")),
+                frame: None,
+            }));
+        }
+        if receiver.is_some_and(|value| {
+            crate::runtime::jar_object::object_class(value).is_some_and(|class| class.contains("SubList"))
+                && self
+                    .collection_elements(value)
+                    .is_ok_and(|elements| elements.is_empty())
+        }) && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return Some(Err(NativeError::UncaughtException {
+                class: "java/lang/UnsupportedOperationException".into(),
+                message: None,
+                frame: None,
+            }));
+        }
+        None
+    }
+
+    #[inline(never)]
+    fn invoke_singleton_sort(
+        &self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Option<Value> {
+        if r.name != "sort" || !(r.owner == "java/util/List" || r.owner == "java/util/Collections")
+        {
+            return None;
+        }
+        let marker = receiver.or_else(|| args.first()).and_then(expect_ref)?;
+        (jar_object::collection_class(marker) == "java/util/Collections$SingletonList")
+            .then_some(Value::Void)
+    }
+
+    #[inline(never)]
+    fn invoke_sub_list_bulk_mutation(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Option<Result<Value, NativeError>> {
+        if !matches!(r.name.as_str(), "replaceAll" | "sort") {
+            return None;
+        }
+        let marker = receiver.and_then(expect_ref)?;
+        self.host.sub_list_link(marker)?;
+        self.mark_sub_list_unknown(marker);
+        Some(self.host.unknown_operand_call(r))
+    }
+
+    /// Dispatch the collection/library models as one out-of-line stage. Each
+    /// model is tried in the same order as the flat dispatcher; propagating an
+    /// error lets the caller deliver it through the current jar frame.
+    #[inline(never)]
+    fn invoke_collection_dispatch(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: Option<&Value>,
+        args: &mut [Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_enum_set_text(r, receiver)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_host_object_method(r, op, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_joiner_iterator(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_library_model(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_stream(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.count_unmodelled_jar_operand(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_guava(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_immutable_collection(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
+        self.invoke_hash_collection(r, op, receiver, args)
     }
 
     fn prepare_entity_data_hierarchy(&mut self, args: &[Value]) {
@@ -32798,18 +33012,11 @@ impl<H: Host> Runtime<'_, H> {
                     // the runtime boundary so an argument whose class is a
                     // jar implementation of Set is checked through its own
                     // size/iterator methods before the host view shortcut.
-                    if r.name == "equals"
-                        && r.descriptor == "(Ljava/lang/Object;)Z"
-                        && let Some(receiver) = receiver.as_ref()
-                        && self.host.is_set_from_map(receiver)
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            self.invoke_set_from_map_equals(&r, receiver.as_ref(), &args)
                     {
-                        let other = args.first().unwrap_or(&Value::Ref(None));
-                        let equal = invoke_or_catch!(
-                            at,
-                            self.abstract_set_equals(receiver, other)
-                                .map(|equal| Value::Int(i32::from(equal)))
-                        );
-                        dispatched = Some(equal);
+                        dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
                         && let Some(value) = mod_answer
@@ -32986,23 +33193,10 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && (r.name == "sort"
-                            && (r.owner == "java/util/List" || r.owner == "java/util/Collections")
-                            && receiver
-                                .as_ref()
-                                .or_else(|| args.first())
-                                .and_then(expect_ref)
-                                .is_some_and(|marker| {
-                                    jar_object::collection_class(marker)
-                                        == "java/util/Collections$SingletonList"
-                                }))
+                        && let Some(value) =
+                            self.invoke_singleton_sort(&r, receiver.as_ref(), &args)
                     {
-                        dispatched = Some({
-                            // SingletonList.sort is an explicit no-op in JDK 25;
-                            // its inherited AbstractList implementation would
-                            // otherwise call set and throw.
-                            Value::Void
-                        });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -33026,18 +33220,10 @@ impl<H: Host> Runtime<'_, H> {
                         });
                     }
                     if dispatched.is_none()
-                        && (matches!(r.name.as_str(), "replaceAll" | "sort")
-                            && receiver
-                                .as_ref()
-                                .and_then(|v| expect_ref(v))
-                                .is_some_and(|m| self.host.sub_list_link(m).is_some()))
+                        && let Some(value) =
+                            self.invoke_sub_list_bulk_mutation(&r, receiver.as_ref())
                     {
-                        dispatched = Some({
-                            if let Some(marker) = receiver.as_ref().and_then(expect_ref) {
-                                self.mark_sub_list_unknown(marker);
-                            }
-                            invoke_or_catch!(at, self.host.unknown_operand_call(&r))
-                        });
+                        dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
                         && let Some(owner) = invoke_or_catch!(
@@ -33192,54 +33378,10 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && let Some(marker) = receiver.as_ref().and_then(expect_ref)
-                        && self.host.is_immutable_empty_sublist(marker)
-                        && matches!(
-                            (r.name.as_str(), r.descriptor.as_str()),
-                            ("set", "(ILjava/lang/Object;)Ljava/lang/Object;")
-                                | ("remove", "(I)Ljava/lang/Object;")
-                        )
+                        && let Some(value) =
+                            self.invoke_empty_sub_list_mutation(&r, receiver.as_ref(), &args)
                     {
-                        dispatched = Some({
-                            let index = args
-                                .first()
-                                .and_then(|value| match value {
-                                    Value::Int(index) => Some(*index),
-                                    _ => None,
-                                })
-                                .unwrap_or(0);
-                            invoke_or_catch!(
-                                at,
-                                Err(NativeError::UncaughtException {
-                                    class: "java/lang/IndexOutOfBoundsException".into(),
-                                    message: Some(format!(
-                                        "Index {index} out of bounds for length 0"
-                                    )),
-                                    frame: None,
-                                })
-                            )
-                        });
-                    }
-                    if dispatched.is_none()
-                        && (receiver.as_ref().is_some_and(|value| {
-                            crate::runtime::jar_object::object_class(value)
-                                .is_some_and(|class| class.contains("SubList"))
-                                && self
-                                    .collection_elements(value)
-                                    .is_ok_and(|elements| elements.is_empty())
-                        }) && matches!(r.name.as_str(), "set" | "remove")
-                            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;"))
-                    {
-                        dispatched = Some({
-                            invoke_or_catch!(
-                                at,
-                                Err(NativeError::UncaughtException {
-                                    class: "java/lang/UnsupportedOperationException".into(),
-                                    message: None,
-                                    frame: None,
-                                })
-                            )
-                        });
+                        dispatched = Some(invoke_or_catch!(at, value));
                     }
                     // `SingletonList`/`CopiesList` inherit (or override with
                     // the same iterator semantics as) the collection bulk
@@ -33250,76 +33392,9 @@ impl<H: Host> Runtime<'_, H> {
                     // intentional fallthrough and the mutable collection arm.
                     if dispatched.is_none()
                         && let Some(receiver) = receiver.as_ref()
-                        && let Some(marker) = expect_ref(receiver)
-                        && matches!(
-                            jar_object::collection_class(marker),
-                            "java/util/Collections$SingletonList"
-                                | "java/util/Collections$CopiesList"
-                        )
-                        && matches!(r.name.as_str(), "removeAll" | "retainAll" | "removeIf")
-                        && (r.name != "removeIf"
-                            || jar_object::collection_class(marker)
-                                == "java/util/Collections$CopiesList")
-                        && !is_map_owner(&r.owner)
+                        && let Some(value) = self.invoke_immutable_bulk_mutator(&r, receiver, &args)
                     {
-                        dispatched = Some(invoke_or_catch!(
-                            at,
-                            (|| -> Result<Value, NativeError> {
-                                let values = self.collection_elements(receiver)?;
-                                let would_remove = match r.name.as_str() {
-                                    "removeIf" => {
-                                        let predicate =
-                                            args.first().cloned().unwrap_or(Value::Ref(None));
-                                        if matches!(predicate, Value::Ref(None)) {
-                                            return Err(NativeError::UncaughtException {
-                                                class: "java/lang/NullPointerException".into(),
-                                                message: None,
-                                                frame: None,
-                                            });
-                                        }
-                                        let mut matched = false;
-                                        for value in &values {
-                                            if self.predicate_holds(&predicate, value)? {
-                                                matched = true;
-                                                break;
-                                            }
-                                        }
-                                        matched
-                                    }
-                                    "removeAll" | "retainAll" => {
-                                        let source =
-                                            args.first().cloned().unwrap_or(Value::Ref(None));
-                                        if matches!(source, Value::Ref(None)) {
-                                            return Err(NativeError::UncaughtException {
-                                                class: "java/lang/NullPointerException".into(),
-                                                message: None,
-                                                frame: None,
-                                            });
-                                        }
-                                        let source = self.collection_elements(&source)?;
-                                        values.iter().any(|value| {
-                                            let contained =
-                                                source.iter().any(|candidate| candidate == value);
-                                            if r.name == "removeAll" {
-                                                contained
-                                            } else {
-                                                !contained
-                                            }
-                                        })
-                                    }
-                                    _ => false,
-                                };
-                                if would_remove {
-                                    Err(NativeError::UncaughtException {
-                                        class: "java/lang/UnsupportedOperationException".into(),
-                                        message: None,
-                                        frame: None,
-                                    })
-                                } else {
-                                    Ok(Value::Int(0))
-                                }
-                            })()
-                        ));
+                        dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
                         && let Some(value) =
@@ -33425,113 +33500,19 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && let Some(value) =
-                            invoke_or_catch!(at, self.invoke_enum_set_text(&r, receiver.as_ref()))
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_host_object_method(
+                            self.invoke_collection_dispatch(
                                 &r,
                                 op,
                                 receiver.as_ref(),
-                                &args,
+                                &mut args,
                                 class,
                                 method
                             )
                         )
                     {
-                        dispatched = Some({
-                            // A host handle's `toString`/`hashCode`/`equals`: its
-                            // kind's row, held jar objects run here (`host_ref.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_joiner_iterator(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // `Joiner.join(Iterator)` walks the iterator, a jar's own too, through
-                            // its own `hasNext`/`next` (`host_iterator.rs`), before a jar operand
-                            // would be counted.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_library_model(&r, receiver.as_ref(), &args, class, method)
-                        )
-                    {
-                        dispatched = Some({
-                            // A linked library's call site may carry a host-modelled receiver.
-                            // Let the library/JDK model answer before the opaque jar-operand
-                            // counter; an unmodelled jar receiver still falls through and counts.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
-                        )
-                    {
-                        dispatched = Some({
-                            // Every native stream model uses the same live marker, regardless of
-                            // which library caller created it, so it gets model dispatch first.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // A model handed a jar object it has no state for
-                            // counts it instead of answering (`jar_operands.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) =
-                            invoke_or_catch!(at, self.invoke_guava(&r, receiver.as_ref(), &args))
-                    {
-                        dispatched = Some({
-                            // Guava bimap views must run before the generic map-view
-                            // copy path, which otherwise detaches key/value/entry sets.
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_immutable_collection(&r, op, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // `Set.of`/`Map.of` and `IdentityHashMap`
-                            // (`immutable_collections.rs`).
-                            value
-                        });
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_hash_collection(&r, op, receiver.as_ref(), &mut args)
-                        )
-                    {
-                        dispatched = Some({
-                            // `HashMap`/`HashSet` order and lookups
-                            // (`hash_collections.rs`).
-                            value
-                        });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
