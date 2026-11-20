@@ -3672,6 +3672,8 @@ pub struct StdHost {
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
     iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    /// The last value returned by each generic iterator, for Iterator.remove.
+    iterator_last: BTreeMap<String, Value>,
     /// The enumerations `Collections.enumeration`/`Vector.elements()` made, by key
     /// (`host_iterator.rs`).
     enumerations: BTreeMap<String, host_iterator::EnumerationOver>,
@@ -3909,6 +3911,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            iterator_last: BTreeMap::new(),
             enumerations: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
             mod_stamps: BTreeMap::new(),
@@ -10777,6 +10780,13 @@ impl Host for StdHost {
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
+            if let Some(view) = expect_ref(receiver)
+                && self.view_copy_kind(view).as_deref() == Some("entrySet")
+                && let Some(source) = self.view_copy_source(view)
+            {
+                self.iterator_sources
+                    .insert(marker.clone(), format!("map-entry/{source}"));
+            }
             if r.owner == "java/util/stream/Stream" {
                 self.iterator_sources
                     .insert(marker.clone(), "java/util/stream/Stream".into());
@@ -10825,8 +10835,8 @@ impl Host for StdHost {
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
             if r.name == "remove" && r.descriptor == "()V" {
-                let source = self.iterator_sources.get(marker).map(String::as_str);
-                if source.is_some_and(|source| {
+                let source = self.iterator_sources.get(marker).cloned();
+                if source.as_deref().is_some_and(|source| {
                     source.starts_with("java/util/Collections$Unmodifiable")
                         || source == "java/util/Collections$SingletonList"
                         || source.starts_with("java/util/stream/")
@@ -10835,11 +10845,48 @@ impl Host for StdHost {
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/UnsupportedOperationException".into(),
                         message: source
+                            .as_deref()
                             .filter(|source| source.starts_with("java/util/stream/"))
                             .map(|_| "remove".into()),
                         frame: None,
                     });
                 }
+                let Some(last) = self.iterator_last.remove(marker) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalStateException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                };
+                let fallback_map = match &last {
+                    Value::Host(handle) => self.map_entries.map_of(handle.key()).map(str::to_owned),
+                    _ => None,
+                };
+                if let Some(map) = source
+                    .as_deref()
+                    .and_then(|source| source.strip_prefix("map-entry/"))
+                    .and_then(|source| self.view_copy_source(source))
+                    .or(fallback_map)
+                    && let Some((key, _)) = self.map_entry_now(&last)
+                {
+                    let Some(mut values) = self.mutable_collections.get(&map).cloned() else {
+                        return self.unknown_host_call(r);
+                    };
+                    if let Some(at) = values.chunks(2).position(|pair| pair.first() == Some(&key)) {
+                        self.entries_before_call(
+                            &map,
+                            "iterator_remove",
+                            std::slice::from_ref(&key),
+                        );
+                        values.drain(at * 2..at * 2 + 2);
+                        self.mutable_collections.insert(map.clone(), values);
+                        let stamp = self.mod_stamp(&map).bumped(false);
+                        self.store_mod_stamp(&map, stamp);
+                        self.entries_after_call(&map);
+                        return Ok(Value::Void);
+                    }
+                }
+                return self.unknown_host_call(r);
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
@@ -10854,6 +10901,7 @@ impl Host for StdHost {
                         }
                     })?;
                     *index += 1;
+                    self.iterator_last.insert(marker.to_owned(), value.clone());
                     return Ok(value);
                 }
                 _ => {}
