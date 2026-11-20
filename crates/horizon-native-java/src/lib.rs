@@ -24605,7 +24605,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `invokestatic` names the subclass. Answered only when the jar's chain from `r.owner` reaches
     /// the vanilla class without any jar class declaring a `commonFields` of its own (whose body the
     /// interpreter runs instead).
-    fn vanilla_loot_common_fields(&mut self, r: &MethodRef) -> Option<Value> {
+    fn vanilla_loot_common_fields(&mut self, r: &MethodRef, args: &[Value]) -> Option<Value> {
         const LOOT_FUNCTION: &str =
             "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction";
         let mut current = r.owner.clone();
@@ -24615,7 +24615,7 @@ impl<H: Host> Runtime<'_, H> {
                     owner: LOOT_FUNCTION.into(),
                     ..r.clone()
                 };
-                return dfu_codec::invoke(self.host, &vanilla, None, &[]);
+                return dfu_codec::invoke(self.host, &vanilla, None, args);
             }
             let file = self.class(&current)?;
             if file.method(&r.name, &r.descriptor).is_some() {
@@ -31400,7 +31400,26 @@ impl<H: Host> Runtime<'_, H> {
                         // they are answered before any jar body would be looked up.
                         value
                     } else if r.name == "commonFields"
-                        && let Some(value) = self.vanilla_loot_common_fields(&r)
+                        && args.first() == Some(&Value::Ref(None))
+                        && (r.owner
+                            == "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction"
+                            || (self.jar_extends(
+                                &r.owner,
+                                "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction",
+                            ) && self
+                                .jar_method_owner(&r.owner, &r.name, &r.descriptor)
+                                .is_none()))
+                    {
+                        invoke_or_catch!(
+                            at,
+                            Err(null_checks::invoke_on_null(&MethodRef {
+                                owner: "com/mojang/serialization/codecs/RecordCodecBuilder$Instance".into(),
+                                name: "group".into(),
+                                descriptor: "(Lcom/mojang/datafixers/kinds/App;)Lcom/mojang/datafixers/Products$P1;".into(),
+                            }))
+                        )
+                    } else if r.name == "commonFields"
+                        && let Some(value) = self.vanilla_loot_common_fields(&r, &args)
                     {
                         // `LootItemConditionalFunction.commonFields`, which a subclass calls
                         // unqualified, so the call names the jar's own class: answered only

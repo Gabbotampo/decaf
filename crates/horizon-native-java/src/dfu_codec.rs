@@ -342,7 +342,7 @@ fn dfu_equals(
     other: &Value,
     nested: &mut dyn Nested,
 ) -> Result<Option<bool>, NativeError> {
-    if tag(&Value::Host(handle.clone())).as_deref() == Some(PRODUCT) {
+    if handle.kind() == HostKind::DfuCodec {
         return Ok(match other {
             Value::Host(other) if handle.same_object(other) == Some(true) => Some(true),
             _ => None,
@@ -589,6 +589,30 @@ fn product_arity_from_descriptor(descriptor: &str) -> Option<usize> {
         .ok()
 }
 
+fn product_parts(value: &Value) -> Option<(usize, Vec<Value>)> {
+    let values = held_values(value)?;
+    if tag(value).as_deref() != Some(PRODUCT) {
+        return None;
+    }
+    let Value::Int(arity) = values.get(2)? else {
+        return None;
+    };
+    let arity = usize::try_from(*arity).ok()?;
+    let parts = values.get(3..3 + arity)?.to_vec();
+    (parts.len() == arity).then_some((arity, parts))
+}
+
+fn product_and_values(receiver: &Value, argument: &Value) -> Option<Vec<Value>> {
+    let (_, receiver_parts) = product_parts(receiver)?;
+    let mut values = receiver_parts;
+    if let Some((_, argument_parts)) = product_parts(argument) {
+        values.extend(argument_parts);
+    } else {
+        values.push(argument.clone());
+    }
+    Some(values)
+}
+
 fn runtime_refuse<H: Host>(
     runtime: &mut Runtime<'_, H>,
     r: &MethodRef,
@@ -715,6 +739,24 @@ pub(crate) fn runtime_instance_call<H: Host>(
         return Ok(None);
     };
     let receiver_tag = tag(receiver);
+    if receiver_tag.as_deref() == Some(PRODUCT)
+        && r.owner.starts_with("com/mojang/datafixers/Products$P")
+        && r.name.starts_with('t')
+        && r.descriptor
+            .starts_with("()Lcom/mojang/datafixers/kinds/App;")
+    {
+        let Some(index) = r.name[1..]
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+        else {
+            return Ok(None);
+        };
+        let Some((_, parts)) = product_parts(receiver) else {
+            return Ok(None);
+        };
+        return Ok(Some(parts.get(index).cloned().unwrap_or(Value::Ref(None))));
+    }
     if receiver_tag.as_deref() == Some(INSTANCE)
         && r.owner == "com/mojang/serialization/codecs/RecordCodecBuilder$Instance"
     {
@@ -761,7 +803,14 @@ pub(crate) fn runtime_instance_call<H: Host>(
         if !(1..=16).contains(&arity) {
             return Ok(None);
         }
-        let values = vec![Value::Int(arity as i32), receiver.clone(), argument.clone()];
+        let Some(parts) = product_and_values(receiver, argument) else {
+            return Ok(None);
+        };
+        if parts.len() != arity {
+            return Ok(None);
+        }
+        let mut values = vec![Value::Int(arity as i32)];
+        values.extend(parts);
         return match node(runtime.host, PRODUCT, values) {
             Ok(value) => Ok(Some(value)),
             Err(reason) => runtime_refuse(runtime, r, reason),
@@ -832,24 +881,57 @@ pub(crate) fn invoke(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Option<Value> {
-    // Mojang's loot base class is a tiny DFU helper: its body is exactly one
-    // optional field followed by `Instance.group(...).` The game class itself
-    // is outside the modeled surface, so preserve the real P1 shape here
-    // rather than returning Java's null and making the caller's `and` throw.
+    // Mojang's loot base class is a tiny DFU helper. Mirror its bytecode's
+    // optionalFieldOf -> forGetter -> group sequence, including the callback
+    // captured by the method reference in the real class.
     if r.owner == "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction"
         && r.name == "commonFields"
         && r.descriptor
             == "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;"
     {
-        return build(
-            host,
-            r,
-            PRODUCT,
-            vec![
-                Value::Int(1),
-                constant(MAP_CODEC, r.owner.as_str(), "commonFields.condition"),
-            ],
+        let instance = args.first()?;
+        if matches!(instance, Value::Ref(None)) {
+            return None;
+        }
+        let codec = constant(
+            CODEC,
+            "net/minecraft/world/level/storage/loot/predicates/LootItemCondition",
+            "CODEC",
         );
+        let optional = invoke(
+            host,
+            &MethodRef {
+                owner: CODEC.into(),
+                name: "optionalFieldOf".into(),
+                descriptor: "(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;".into(),
+            },
+            Some(&codec),
+            &[Value::Ref(Some("condition".into()))],
+        )?;
+        let callback = crate::callback_marker::lambda(
+            r.owner.as_str(),
+            11,
+            "java/util/function/Function",
+            Some(MethodRef {
+                owner: r.owner.clone(),
+                name: "lambda$commonFields$0".into(),
+                descriptor: "(Lnet/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction;)Ljava/util/Optional;".into(),
+            }),
+            Some(6),
+            Vec::new(),
+            false,
+        );
+        let getter = invoke(
+            host,
+            &MethodRef {
+                owner: MAP_CODEC.into(),
+                name: "forGetter".into(),
+                descriptor: "(Ljava/util/function/Function;)Lcom/mojang/serialization/codecs/RecordCodecBuilder;".into(),
+            },
+            Some(&optional),
+            &[callback],
+        )?;
+        return build(host, r, PRODUCT, vec![Value::Int(1), getter]);
     }
     if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
         let receiver = receiver?.clone();
@@ -858,12 +940,12 @@ pub(crate) fn invoke(
         if !(1..=16).contains(&arity) {
             return None;
         }
-        return build(
-            host,
-            r,
-            PRODUCT,
-            vec![Value::Int(arity as i32), receiver, argument],
-        );
+        let parts = product_and_values(&receiver, &argument)?;
+        return (parts.len() == arity).then(|| {
+            let mut values = vec![Value::Int(arity as i32)];
+            values.extend(parts);
+            build(host, r, PRODUCT, values)
+        })?;
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (MAP_CODEC, "unit", "(Ljava/lang/Object;)Lcom/mojang/serialization/MapCodec;")
@@ -927,15 +1009,21 @@ pub(crate) fn invoke(
             let getter = args.first().filter(|value| is_callback(value))?.clone();
             build(host, r, GETTER, vec![inner, getter])
         }
-        (MAP_CODEC, "orElse", descriptor)
-            if descriptor.ends_with(")Lcom/mojang/serialization/MapCodec;") =>
+        (MAP_CODEC, name, descriptor)
+            if matches!(name, "orElse" | "orElseGet")
+                && descriptor.ends_with(")Lcom/mojang/serialization/MapCodec;") =>
         {
             let inner = receiver.filter(|value| map_receiver(value))?.clone();
+            let fallback = if args.len() >= 2 {
+                args.get(1).cloned()
+            } else {
+                args.first().cloned()
+            };
             build(
                 host,
                 r,
                 OR_ELSE,
-                vec![inner, args.first().cloned().unwrap_or(Value::Void)],
+                vec![inner, fallback.unwrap_or(Value::Void)],
             )
         }
         (MAP_CODEC, "codec", "()Lcom/mojang/serialization/Codec;") => {
@@ -1105,6 +1193,7 @@ mod tests {
     #[test]
     fn common_fields_and_products_and_keep_builder_construction_non_null() {
         let mut host = crate::StdHost::new();
+        let instance = node(&mut host, INSTANCE, Vec::new()).unwrap();
         let common = invoke(
             &mut host,
             &method(
@@ -1113,10 +1202,20 @@ mod tests {
                 "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;",
             ),
             None,
-            &[],
+            std::slice::from_ref(&instance),
         )
         .unwrap();
-        let extra = constant(MAP_CODEC, MAP_CODEC, "extra");
+        let extra = node(
+            &mut host,
+            PRODUCT,
+            vec![
+                Value::Int(3),
+                constant(MAP_CODEC, MAP_CODEC, "extra-1"),
+                constant(MAP_CODEC, MAP_CODEC, "extra-2"),
+                constant(MAP_CODEC, MAP_CODEC, "extra-3"),
+            ],
+        )
+        .unwrap();
         let combined = invoke(
             &mut host,
             &method(
@@ -1139,6 +1238,7 @@ mod tests {
     fn product_equals_is_identity_for_itself_and_counted_otherwise() {
         use crate::Host;
         let mut host = crate::StdHost::new();
+        let instance = node(&mut host, INSTANCE, Vec::new()).unwrap();
         let common = |host: &mut crate::StdHost| {
             invoke(
                 host,
@@ -1148,7 +1248,7 @@ mod tests {
                     "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;",
                 ),
                 None,
-                &[],
+                std::slice::from_ref(&instance),
             )
             .unwrap()
         };

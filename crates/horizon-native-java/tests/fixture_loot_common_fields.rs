@@ -7,14 +7,20 @@ mod javac_fixture;
 use horizon_native_java::{StdHost, Value};
 use javac_fixture::Fixture;
 
+const ORACLE: &str = include_str!("fixtures/loot_common_fields/java25.txt");
+
 const SOURCES: &[(&str, &str)] = &[
     (
         "com/mojang/datafixers/Products.java",
-        "package com.mojang.datafixers; public interface Products { final class P1<F, T1> { } }",
+        "package com.mojang.datafixers; public interface Products { final class P1<F, T1> { public com.mojang.datafixers.kinds.App t1() { return null; } } }",
+    ),
+    (
+        "com/mojang/datafixers/kinds/App.java",
+        "package com.mojang.datafixers.kinds; public interface App<F, A> {}",
     ),
     (
         "com/mojang/serialization/codecs/RecordCodecBuilder.java",
-        "package com.mojang.serialization.codecs; public final class RecordCodecBuilder<O, F> { public static final class Instance<O> { } public static final class Mu<O> { } }",
+        "package com.mojang.serialization.codecs; public final class RecordCodecBuilder<O, F> { public static <O> Instance<O> instance() { return null; } public static final class Instance<O> { } public static final class Mu<O> { } }",
     ),
     (
         "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction.java",
@@ -29,8 +35,11 @@ public abstract class LootItemConditionalFunction {
         "demo/Inherits.java",
         r#"package demo;
 import net.minecraft.world.level.storage.loot.functions.LootItemConditionalFunction;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import com.mojang.datafixers.Products;
 public final class Inherits extends LootItemConditionalFunction {
-  public static String fields() { return String.valueOf(commonFields(null) != null); }
+  public static String fields() { return String.valueOf(commonFields(new RecordCodecBuilder.Instance<>()) != null); }
+  public static String shape() { Products.P1 p = commonFields(new RecordCodecBuilder.Instance<>()); return "1|t1|" + (p.t1() != null); }
 }"#,
     ),
     (
@@ -64,6 +73,23 @@ fn inherited_common_fields_is_modelled_and_a_jar_override_runs_its_own_body() {
     let fixture = Fixture::build("loot-common-fields", SOURCES);
     // Inherited from the vanilla class: the modelled P1, nothing counted.
     assert_eq!(fields(&fixture, "demo/Inherits"), ("true".into(), 0));
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let shape = fixture
+        .jar
+        .invoke_method(
+            "demo/Inherits",
+            "shape",
+            "()Ljava/lang/String;",
+            None,
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(shape, Value::Ref(Some(ORACLE.trim_end().into())));
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "{:?}",
+        host.unknown_host_calls()
+    );
     // Declared by the jar: its own body runs (it answers null), never the model.
     assert_eq!(fields(&fixture, "demo/Declares"), ("true|false".into(), 0));
 }
