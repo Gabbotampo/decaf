@@ -778,35 +778,90 @@ impl<H: Host> Runtime<'_, H> {
         if mine != theirs {
             return Ok(false);
         }
-        let iterator = self.call_virtual(
+        if self.host_collection_kind(b).is_some() {
+            // Host-backed JDK/Guava collections already expose their exact
+            // iteration order and contents.  Walking those values directly
+            // avoids turning an otherwise modelled `iterator()` into a
+            // counted call.  A jar Set takes the interpreter path below.
+            for element in self.collection_elements(b)? {
+                let found = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Set",
+                    "contains",
+                    "(Ljava/lang/Object;)Z",
+                    a,
+                    std::slice::from_ref(&element),
+                );
+                match found {
+                    Ok(Value::Int(0)) => return Ok(false),
+                    Ok(_) => {}
+                    Err(NativeError::UncaughtException { class, .. })
+                        if class == "java/lang/ClassCastException"
+                            || class == "java/lang/NullPointerException" =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(true);
+        }
+        let iterator = match self.call_virtual(
             crate::jdk_call::Site::Interface,
             "java/util/Set",
             "iterator",
             "()Ljava/util/Iterator;",
             b,
             &[],
-        )?;
+        ) {
+            Ok(iterator) => iterator,
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/ClassCastException"
+                    || class == "java/lang/NullPointerException" =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
         let iterator = iterator;
         loop {
-            let has_next = self.call_virtual(
+            let has_next = match self.call_virtual(
                 crate::jdk_call::Site::Interface,
                 "java/util/Iterator",
                 "hasNext",
                 "()Z",
                 &iterator,
                 &[],
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
             if !matches!(has_next, Value::Int(flag) if flag != 0) {
                 break;
             }
-            let element = self.call_virtual(
+            let element = match self.call_virtual(
                 crate::jdk_call::Site::Interface,
                 "java/util/Iterator",
                 "next",
                 "()Ljava/lang/Object;",
                 &iterator,
                 &[],
-            )?;
+            ) {
+                Ok(value) => value,
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
             let found = self.call_virtual(
                 crate::jdk_call::Site::Interface,
                 "java/util/Set",

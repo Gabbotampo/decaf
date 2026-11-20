@@ -264,12 +264,72 @@ impl<H: Host> Runtime<'_, H> {
         if this == other {
             return Ok(true);
         }
-        if self.host_collection_kind(other) != Some(CollectionKind::List) {
-            return Ok(false);
-        }
         let mine = self.collection_elements(this)?;
-        let theirs = self.collection_elements(other)?;
         let rules = list.rules;
+        let other_is_host_list = self.host_collection_kind(other) == Some(CollectionKind::List);
+        if !other_is_host_list {
+            // `AbstractList.equals` walks both list iterators.  ArrayList's
+            // non-ArrayList path uses `other.iterator()`, which an
+            // AbstractList subclass inherits from its own `listIterator()`.
+            // Let the interpreter run those jar methods so their exceptions
+            // and side effects remain observable.
+            if self.known_instance_of(other, "java/util/List") != Some(true) {
+                return Ok(false);
+            }
+            let iterator = if rules.array_list {
+                self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/Collection",
+                    "iterator",
+                    "()Ljava/util/Iterator;",
+                    other,
+                    &[],
+                )?
+            } else {
+                self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/List",
+                    "listIterator",
+                    "()Ljava/util/ListIterator;",
+                    other,
+                    &[],
+                )?
+            };
+            for left in &mine {
+                let has_next = self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "hasNext",
+                    "()Z",
+                    &iterator,
+                    &[],
+                )?;
+                if !matches!(has_next, Value::Int(flag) if flag != 0) {
+                    return Ok(false);
+                }
+                let right = self.call_virtual(
+                    crate::runtime::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "next",
+                    "()Ljava/lang/Object;",
+                    &iterator,
+                    &[],
+                )?;
+                if !self.objects_equals(left, &right)? {
+                    return Ok(false);
+                }
+            }
+            let has_next = self.call_virtual(
+                crate::runtime::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &iterator,
+                &[],
+            )?;
+            return Ok(!matches!(has_next, Value::Int(flag) if flag != 0));
+        }
+        let theirs = self.collection_elements(other)?;
         // `ArrayList.equalsArrayList` (the other's class is exactly
         // `ArrayList`) checks the sizes before any element.
         let exactly_array_list = crate::runtime::jar_object::value_marker_class(other)

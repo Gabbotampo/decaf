@@ -2718,13 +2718,6 @@ pub trait Host {
         false
     }
 
-    /// Whether every mutator of the collection `marker` throws
-    /// `UnsupportedOperationException`: an immutable or unmodifiable list,
-    /// and a sub-list of one (#558 review).
-    fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
-        false
-    }
-
     /// A JDK default method that an unmodifiable collection overrides. The
     /// runtime asks this before running an inherited `Collection` default.
     fn unmodifiable_member(
@@ -6459,10 +6452,6 @@ impl Host for StdHost {
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
-    }
-
-    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
-        self.unmodifiable_collections.contains_key(marker)
     }
 
     fn mark_unmodifiable_collection(&mut self, marker: &str) {

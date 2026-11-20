@@ -1278,3 +1278,9 @@
 0,61=R=java.util.Collections$UnmodifiableList
 0,62=R=java.util.ReverseOrderListView
 0,63=R=java.util.ReverseOrderListView
+0,64=R=true
+0,65=R=true
+0,66=R=false
+0,67=R=false
+0,68=E=java.lang.IllegalStateException:ise|L=[1, 2, 3, 4]
+0,69=R=true

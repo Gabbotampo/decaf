@@ -8,6 +8,24 @@ public class Probe {
     public Iterator<Integer> iterator() { return values.iterator(); }
     public int size() { return values.size(); }
   }
+  static final class UserList extends AbstractList<Integer> {
+    final List<Integer> values;
+    UserList(Integer... values) { this.values = Arrays.asList(values); }
+    public Integer get(int index) { return values.get(index); }
+    public int size() { return values.size(); }
+  }
+  static final class ThrowingList extends AbstractList<Integer> {
+    public Integer get(int index) { return 1; }
+    public int size() { return 1; }
+    public ListIterator<Integer> listIterator() { throw new IllegalStateException("listIterator"); }
+    public ListIterator<Integer> listIterator(int index) { throw new IllegalStateException("listIterator"); }
+  }
+  static final class ThrowingSet extends AbstractSet<Integer> {
+    final RuntimeException failure;
+    ThrowingSet(RuntimeException failure) { this.failure = failure; }
+    public Iterator<Integer> iterator() { throw failure; }
+    public int size() { return 1; }
+  }
   static List<Integer> make(int r) {
     int family = r / 3, depth = r % 3;
     List<Integer> x;
@@ -112,6 +130,12 @@ public class Probe {
         case 61: { List<Integer> n=Collections.unmodifiableList(new LinkedList<>(List.of(1,2,3,4))); return "R="+n.subList(1,3).getClass().getName(); }
         case 62: { List<Integer> n=new ArrayList<>(List.of(1,2,3,4)).reversed(); return "R="+n.subList(1,3).getClass().getName(); }
         case 63: { List<Integer> n=new LinkedList<>(List.of(1,2,3,4)).reversed(); return "R="+n.subList(1,3).getClass().getName(); }
+        case 64: return "R="+new ArrayList<>(List.of(1)).equals(new UserList(1));
+        case 65: return "R="+new UserList(1).equals(new ArrayList<>(List.of(1)));
+        case 66: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new ThrowingSet(new ClassCastException("cce"))); }
+        case 67: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new ThrowingSet(new NullPointerException("npe"))); }
+        case 68: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new ThrowingSet(new IllegalStateException("ise"))); }
+        case 69: return "R="+new ArrayList<>(List.of(1)).equals(new ThrowingList());
         default: throw new AssertionError(op);
       }
     } catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
@@ -135,6 +159,6 @@ public class Probe {
   public static String probe(int r, int op) { return run(r,op); }
   public static void main(String[] a) {
     for (int r=0;r<39;r++) for (int op=0;op<32;op++) System.out.println(r+","+op+"="+run(r,op));
-    for (int op=32;op<=63;op++) System.out.println("0,"+op+"="+run(0,op));
+    for (int op=32;op<=69;op++) System.out.println("0,"+op+"="+run(0,op));
   }
 }
