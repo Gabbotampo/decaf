@@ -125,11 +125,16 @@ impl<H: Host> Runtime<'_, H> {
             // `Collections.emptyList().contains(null)` is `false` on JDK 25.
             "java/util/ImmutableCollections$ListN"
             | "java/util/ImmutableCollections$List12"
+            | "java/util/ImmutableCollections$SubList"
             | "java/util/Collections$EmptyList"
             | "java/util/Collections$SingletonList"
+            | "java/util/Collections$CopiesList"
             | "com/google/common/collect/RegularImmutableList"
-            | "com/google/common/collect/SingletonImmutableList" => {
-                let rules = if !self.host.is_jdk_list_of(marker) {
+            | "com/google/common/collect/SingletonImmutableList"
+            | "com/google/common/collect/ImmutableList$SubList" => {
+                let rules = if class == "java/util/ImmutableCollections$SubList" {
+                    LIST_N
+                } else if !self.host.is_jdk_list_of(marker) {
                     ABSTRACT_LIST
                 } else if class == "java/util/ImmutableCollections$List12" {
                     LIST_12

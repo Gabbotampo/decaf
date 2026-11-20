@@ -755,14 +755,33 @@ impl crate::StdHost {
             });
         }
         let range = values[from as usize..to as usize].to_vec();
-        let made = self.new_collection(super::stand_in_class("list"), range);
+        let parent_class = crate::jar_object::collection_class(marker).to_owned();
+        let immutable_jdk = self.jdk_list_of.contains(marker);
+        let immutable_owned = matches!(
+            parent_class.as_str(),
+            "java/util/Collections$EmptyList"
+                | "java/util/Collections$SingletonList"
+                | "java/util/Collections$CopiesList"
+                | "java/util/AbstractList$RandomAccessSubList"
+                | "com/google/common/collect/RegularImmutableList"
+                | "com/google/common/collect/SingletonImmutableList"
+                | "com/google/common/collect/ImmutableList$SubList"
+        );
+        let made_class = if immutable_jdk {
+            "java/util/ImmutableCollections$SubList"
+        } else if immutable_owned {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else {
+            super::stand_in_class("list")
+        };
+        let made = self.new_collection(made_class, range);
         // A sub-list of `List.of`/`List.copyOf` is an `ImmutableCollections`
         // sub-list, and one of an unmodifiable view an `UnmodifiableList`:
         // every mutator throws `UnsupportedOperationException` whatever the
         // range, and the immutable one rejects null searches as its parent
         // does (#558 review). `emptyList`/`singletonList`/`nCopies` sub-lists
-        // are left as they were: their mutators depend on the range.
-        let immutable_parent = self.jdk_list_of.contains(marker);
+        // use AbstractList's range-sensitive mutator behavior.
+        let immutable_parent = immutable_jdk || immutable_owned;
         let view_parent = matches!(self.unmodifiable_collections.get(marker), Some(Some(_)));
         if immutable_parent || view_parent {
             let key = match &made {
@@ -772,7 +791,7 @@ impl crate::StdHost {
             };
             if let Some(key) = key {
                 self.unmodifiable_collections.insert(key.clone(), None);
-                if immutable_parent {
+                if immutable_jdk {
                     self.jdk_list_of.insert(key);
                 }
             }

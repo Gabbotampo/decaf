@@ -10505,7 +10505,25 @@ impl Host for StdHost {
                 host_collection_values(self, receiver)?.is_empty() as i32,
             )),
             (owner, "contains", "(Ljava/lang/Object;)Z") if is_collection_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let raw = Self::argument(r, args, 0)?;
+                if matches!(raw, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(raw);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -10526,7 +10544,25 @@ impl Host for StdHost {
                 ))
             }
             (owner, "indexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let raw = Self::argument(r, args, 0)?;
+                if matches!(raw, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(raw);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -10535,7 +10571,25 @@ impl Host for StdHost {
                 ))
             }
             (owner, "lastIndexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let raw = Self::argument(r, args, 0)?;
+                if matches!(raw, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(raw);
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -31029,6 +31083,21 @@ impl<H: Host> Runtime<'_, H> {
                         self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
                     ) {
                         value
+                    } else if r.name == "sort"
+                        && (r.owner == "java/util/List" || r.owner == "java/util/Collections")
+                        && receiver
+                            .as_ref()
+                            .or_else(|| args.first())
+                            .and_then(expect_ref)
+                            .is_some_and(|marker| {
+                                jar_object::collection_class(marker)
+                                    == "java/util/Collections$SingletonList"
+                            })
+                    {
+                        // SingletonList.sort is an explicit no-op in JDK 25;
+                        // its inherited AbstractList implementation would
+                        // otherwise call set and throw.
+                        Value::Void
                     } else if let Some(value) =
                         invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
                     {

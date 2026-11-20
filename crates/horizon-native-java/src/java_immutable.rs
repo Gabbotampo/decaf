@@ -680,6 +680,23 @@ impl StdHost {
         {
             return Some(Ok(arg.clone()));
         }
+        if r.owner == "java/util/Collections"
+            && r.name == "nCopies"
+            && r.descriptor == "(ILjava/lang/Object;)Ljava/util/List;"
+        {
+            let count = crate::expect_int(r, args.first()?).ok()?;
+            if count < 0 {
+                return Some(Err(throw(
+                    "java/lang/IllegalArgumentException",
+                    Some(count.to_string()),
+                )));
+            }
+            let value = args.get(1)?.clone();
+            return Some(Ok(self.unmodifiable_as(
+                "java/util/Collections$CopiesList",
+                vec![value; count as usize],
+            )));
+        }
         let kind = match (r.owner.as_str(), r.name.as_str()) {
             ("java/util/List", "of") | ("com/google/common/collect/ImmutableList", "of")
                 if !varargs =>
@@ -805,6 +822,49 @@ impl StdHost {
         marker: &str,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        let class = crate::jar_object::collection_class(marker);
+        // SingletonList overrides sort as a no-op.  CopiesList has the same
+        // result when empty because its iterator has no elements to set.
+        if r.name == "sort"
+            && (class == "java/util/Collections$SingletonList"
+                || (class == "java/util/Collections$CopiesList"
+                    && self
+                        .mutable_collections
+                        .get(marker)
+                        .is_some_and(Vec::is_empty)))
+        {
+            return Some(Ok(Value::Void));
+        }
+        // Empty AbstractList sub-lists inherit the root's range behavior:
+        // adding is refused, while searches/removal/clear/sort do no work.
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+        {
+            let null_argument = matches!(args.first(), Some(Value::Ref(None)));
+            return match r.name.as_str() {
+                "add" | "addAll" => {
+                    Some(Err(throw("java/lang/UnsupportedOperationException", None)))
+                }
+                "remove" if r.descriptor.starts_with("(Ljava/lang/Object;") => {
+                    Some(Ok(Value::Int(0)))
+                }
+                "clear" | "sort" => Some(Ok(Value::Void)),
+                "removeAll" | "retainAll" | "removeIf" | "replaceAll" if null_argument => {
+                    Some(Err(throw("java/lang/NullPointerException", None)))
+                }
+                "removeAll" | "retainAll" | "removeIf" | "replaceAll" => {
+                    Some(Ok(if r.descriptor.ends_with(")Z") {
+                        Value::Int(0)
+                    } else {
+                        Value::Void
+                    }))
+                }
+                _ => None,
+            };
+        }
         if MUTATORS.contains(&r.name.as_str())
             && self.empty_collections.contains(marker)
             && let Some(answer) = empty_collection_member(r, args)
