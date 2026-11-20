@@ -226,6 +226,7 @@ mod scanner_model;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
+mod vanilla_registry_captures;
 mod vec2;
 /// A live callback token for tests that hand a host a listener without a jar
 /// (`callback_marker.rs`).
