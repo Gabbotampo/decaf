@@ -334,10 +334,27 @@ fn crosses(handle: &HostRef, f: &dyn Fn(&Value) -> bool) -> bool {
     handle.held().iter().all(f)
 }
 
+/// `Products.P1`..`P16` are Java records: equal when their components are. The same handle is
+/// equal to itself; two distinct product handles may hold equal components, which this model does
+/// not compare, so that `equals` is counted (#410 review). Codec handles keep identity equality.
+fn dfu_equals(
+    handle: &HostRef,
+    other: &Value,
+    nested: &mut dyn Nested,
+) -> Result<Option<bool>, NativeError> {
+    if tag(&Value::Host(handle.clone())).as_deref() == Some(PRODUCT) {
+        return Ok(match other {
+            Value::Host(other) if handle.same_object(other) == Some(true) => Some(true),
+            _ => None,
+        });
+    }
+    (crate::runtime::host_events::DECLARED_TYPE_METHODS.equals)(handle, other, nested)
+}
+
 pub(crate) const DFU_CODEC_METHODS: Methods = Methods {
     to_string: text,
     hash_code: crate::runtime::host_events::DECLARED_TYPE_METHODS.hash_code,
-    equals: crate::runtime::host_events::DECLARED_TYPE_METHODS.equals,
+    equals: dfu_equals,
     instance_of,
     crosses_jars: crosses,
     compare_to: None,
@@ -737,7 +754,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
         let Some(argument) = args.first() else {
             return Ok(None);
         };
-        let arity = product_arity_from_descriptor(&r.descriptor).unwrap_or(2);
+        // An `and` whose result arity the descriptor does not name is counted, never guessed.
+        let Some(arity) = product_arity_from_descriptor(&r.descriptor) else {
+            return Ok(None);
+        };
         if !(1..=16).contains(&arity) {
             return Ok(None);
         }
@@ -834,7 +854,7 @@ pub(crate) fn invoke(
     if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
         let receiver = receiver?.clone();
         let argument = args.first()?.clone();
-        let arity = product_arity_from_descriptor(&r.descriptor).unwrap_or(2);
+        let arity = product_arity_from_descriptor(&r.descriptor)?;
         if !(1..=16).contains(&arity) {
             return None;
         }
@@ -1111,6 +1131,37 @@ mod tests {
         assert_eq!(tag(&common).as_deref(), Some(PRODUCT));
         assert_eq!(tag(&combined).as_deref(), Some(PRODUCT));
         assert!(host.unknown_host_calls().is_empty());
+    }
+
+    /// `Products.Pn` are records: a product equals itself, and the model counts `equals` between
+    /// two distinct products rather than answering identity (their components may be equal).
+    #[test]
+    fn product_equals_is_identity_for_itself_and_counted_otherwise() {
+        use crate::runtime::Host;
+        let mut host = crate::runtime::StdHost::new();
+        let common = |host: &mut crate::runtime::StdHost| {
+            invoke(
+                host,
+                &method(
+                    "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction",
+                    "commonFields",
+                    "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;",
+                ),
+                None,
+                &[],
+            )
+            .unwrap()
+        };
+        let first = common(&mut host);
+        let second = common(&mut host);
+        let equals = method("com/mojang/datafixers/Products$P1", "equals", "(Ljava/lang/Object;)Z");
+        let itself = host
+            .invoke_instance(&equals, &first, std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(itself, Value::Int(1));
+        assert!(host.unknown_host_calls().is_empty());
+        let _ = host.invoke_instance(&equals, &first, &[second]);
+        assert_eq!(host.unknown_host_call_count(), 1, "{:?}", host.unknown_host_calls());
     }
 
     #[test]
