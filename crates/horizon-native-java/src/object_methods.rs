@@ -379,7 +379,6 @@ impl<H: Host> Runtime<'_, H> {
         // `hashCode` run here (`host_ref.rs`).
         if let Value::Host(handle) = value
             && !crate::jar_object::is_object_handle(handle)
-            && self.host_collection_kind(value).is_none()
         {
             return handle.hash_code(&mut RuntimeNested::new(self));
         }

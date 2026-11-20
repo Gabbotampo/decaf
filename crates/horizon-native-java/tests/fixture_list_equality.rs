@@ -35,6 +35,27 @@ public final class Probe {
     record Key(int id) { }
     record Named(String name, List<String> tags) { }
 
+    static final class MutatingList extends AbstractList<Object> {
+        final List<Object> values; List<Object> target; boolean once;
+        MutatingList(List<Object> values, List<Object> target) {
+            this.values = values; this.target = target; this.once = true;
+        }
+        @Override public Object get(int i) {
+            if (once) { once = false; target.add("mutation"); }
+            return values.get(i);
+        }
+        @Override public int size() { return values.size(); }
+        @Override public boolean add(Object value) { modCount++; return values.add(value); }
+    }
+    static final class MutatingEquals {
+        final List<Object> target; boolean once = true;
+        MutatingEquals(List<Object> target) { this.target = target; }
+        @Override public boolean equals(Object o) {
+            if (once) { once = false; target.add("mutation"); }
+            return o instanceof MutatingEquals;
+        }
+    }
+
     static String run(java.util.function.Supplier<Object> op) {
         try { return String.valueOf(op.get()); }
         catch (RuntimeException e) { return "!" + e.getClass().getSimpleName(); }
@@ -99,6 +120,25 @@ public final class Probe {
     public static String listHashes() {
         return List.of("x", "y").hashCode() + "|" + new ArrayList<>(List.of("x", "y")).hashCode()
             + "|" + List.of(new Key(2), new Key(3)).hashCode();
+    }
+
+    public static String listEqualityModCounts() {
+        List<Object> receiver = new ArrayList<>(List.of("x", "y"));
+        List<Object> jarArgument = new MutatingList(new ArrayList<>(List.of("x", "y")), receiver);
+        String a = run(() -> receiver.equals(jarArgument));
+        MutatingList argument = new MutatingList(new ArrayList<>(List.of("x", "y")), null);
+        argument.target = argument;
+        String b = run(() -> new ArrayList<>(List.of("x", "y")).equals(argument));
+        List<Object> left = new ArrayList<>();
+        List<Object> right = new ArrayList<>();
+        left.add(new MutatingEquals(left)); right.add(new MutatingEquals(right));
+        String c = run(() -> left.equals(right));
+        MutatingList abstractReceiver = new MutatingList(new ArrayList<>(List.of("x", "y")), null);
+        abstractReceiver.target = abstractReceiver;
+        String d = run(() -> abstractReceiver.equals(new ArrayList<>(List.of("x", "y"))));
+        List<Object> abstractArgument = new MutatingList(new ArrayList<>(List.of("x", "y")), receiver);
+        String e = run(() -> new ArrayList<>(List.of("x", "y")).equals(abstractArgument));
+        return a + "|" + b + "|" + c + "|" + d + "|" + e;
     }
 
     /// A list of a class keeping `Object.hashCode` hashes by identity.
@@ -521,5 +561,24 @@ fn a_list_hash_over_an_identity_hash_is_counted() {
     assert_eq!(
         host.unknown_host_calls(),
         [("java/util/List#hashCode()I".to_owned(), 1)]
+    );
+}
+
+/// JDK 25's equality checks catch structural writes made by jar iterators and
+/// element bodies at their receiver/argument-specific check points.
+#[test]
+fn list_equality_checks_mod_count_during_jar_walks() {
+    let fixture = fixture("list-equality-mod-counts");
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let text = fixture.text_on(&mut host, "listEqualityModCounts");
+    assert_eq!(
+        text,
+        include_str!("fixtures/list-equality-java25.txt").trim()
+    );
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "{:?}",
+        host.unknown_host_calls()
     );
 }

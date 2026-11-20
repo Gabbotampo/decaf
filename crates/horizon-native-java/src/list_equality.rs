@@ -267,6 +267,144 @@ impl<H: Host> Runtime<'_, H> {
         let mine = self.collection_elements(this)?;
         let rules = list.rules;
         let other_is_host_list = self.host_collection_kind(other) == Some(CollectionKind::List);
+        let equals_call = |owner: &str| MethodRef {
+            owner: owner.into(),
+            name: "equals".into(),
+            descriptor: "(Ljava/lang/Object;)Z".into(),
+        };
+        let check =
+            |runtime: &mut Self, value: &Value, expected: mod_count::ModStamp, owner: &str| {
+                runtime
+                    .check_mod_count(&equals_call(owner), value, expected)
+                    .map(drop)
+            };
+
+        // AbstractList.equals creates iterators for both lists.  In
+        // particular, its receiver iterator checks the receiver before each
+        // next(), while the final hasNext() calls do not check either list.
+        if !rules.array_list {
+            if other_is_host_list {
+                let expected_this = self
+                    .has_mod_count(this)
+                    .then(|| self.capture_mod_count(this));
+                let expected_other = self
+                    .has_mod_count(other)
+                    .then(|| self.capture_mod_count(other));
+                let theirs = self.collection_elements(other)?;
+                for (index, left) in mine.iter().enumerate() {
+                    if let Some(expected) = expected_this {
+                        check(self, this, expected, "java/util/AbstractList")?;
+                    }
+                    let Some(right) = theirs.get(index) else {
+                        return Ok(false);
+                    };
+                    if let Some(expected) = expected_other {
+                        check(self, other, expected, "java/util/AbstractList")?;
+                    }
+                    let equal = if rules.equals_shortcut {
+                        self.objects_equals(left, right)?
+                    } else if *left == Value::Ref(None) {
+                        *right == Value::Ref(None)
+                    } else {
+                        self.java_equals(left, right)?
+                    };
+                    if !equal {
+                        return Ok(false);
+                    }
+                }
+                return Ok(mine.len() == theirs.len());
+            }
+            if self.known_instance_of(other, "java/util/List") != Some(true) {
+                return Ok(false);
+            }
+            let left_iterator = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/List",
+                "listIterator",
+                "()Ljava/util/ListIterator;",
+                this,
+                &[],
+            )?;
+            let right_iterator = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/List",
+                "listIterator",
+                "()Ljava/util/ListIterator;",
+                other,
+                &[],
+            )?;
+            loop {
+                let left_next = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "hasNext",
+                    "()Z",
+                    &left_iterator,
+                    &[],
+                )?;
+                let right_next = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "hasNext",
+                    "()Z",
+                    &right_iterator,
+                    &[],
+                )?;
+                if !matches!(left_next, Value::Int(flag) if flag != 0)
+                    || !matches!(right_next, Value::Int(flag) if flag != 0)
+                {
+                    return Ok(matches!(left_next, Value::Int(flag) if flag == 0)
+                        && matches!(right_next, Value::Int(flag) if flag == 0));
+                }
+                let left = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "next",
+                    "()Ljava/lang/Object;",
+                    &left_iterator,
+                    &[],
+                )?;
+                let right = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "next",
+                    "()Ljava/lang/Object;",
+                    &right_iterator,
+                    &[],
+                )?;
+                if !self.java_equals(&left, &right)? {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // ArrayList.equals reads its receiver's modCount before either
+        // equalsRange/equalsArrayList path and checks it after that path.
+        let expected_this = self.capture_mod_count(this);
+        let exactly_array_list = crate::jar_object::value_marker_class(other)
+            .is_some_and(|class| class == "java/util/ArrayList");
+        if other_is_host_list && !exactly_array_list {
+            let expected_other = self
+                .has_mod_count(other)
+                .then(|| self.capture_mod_count(other));
+            let theirs = self.collection_elements(other)?;
+            for (index, left) in mine.iter().enumerate() {
+                let Some(right) = theirs.get(index) else {
+                    check(self, this, expected_this, "java/util/ArrayList")?;
+                    return Ok(false);
+                };
+                if let Some(expected) = expected_other {
+                    check(self, other, expected, "java/util/ArrayList")?;
+                }
+                if !self.objects_equals(left, right)? {
+                    check(self, this, expected_this, "java/util/ArrayList")?;
+                    return Ok(false);
+                }
+            }
+            let equal = mine.len() == theirs.len();
+            check(self, this, expected_this, "java/util/ArrayList")?;
+            return Ok(equal);
+        }
         if !other_is_host_list {
             // `AbstractList.equals` walks both list iterators.  ArrayList's
             // non-ArrayList path uses `other.iterator()`, which an
@@ -327,14 +465,19 @@ impl<H: Host> Runtime<'_, H> {
                 &iterator,
                 &[],
             )?;
-            return Ok(!matches!(has_next, Value::Int(flag) if flag != 0));
+            let equal = !matches!(has_next, Value::Int(flag) if flag != 0);
+            check(self, this, expected_this, "java/util/ArrayList")?;
+            return Ok(equal);
         }
+        let expected_other = exactly_array_list.then(|| self.capture_mod_count(other));
         let theirs = self.collection_elements(other)?;
         // `ArrayList.equalsArrayList` (the other's class is exactly
         // `ArrayList`) checks the sizes before any element.
-        let exactly_array_list = crate::jar_object::value_marker_class(other)
-            .is_some_and(|class| class == "java/util/ArrayList");
         if rules.array_list && exactly_array_list && mine.len() != theirs.len() {
+            if let Some(expected) = expected_other {
+                check(self, other, expected, "java/util/ArrayList")?;
+            }
+            check(self, this, expected_this, "java/util/ArrayList")?;
             return Ok(false);
         }
         for (index, left) in mine.iter().enumerate() {
@@ -349,10 +492,19 @@ impl<H: Host> Runtime<'_, H> {
                 self.java_equals(left, right)?
             };
             if !equal {
+                if let Some(expected) = expected_other {
+                    check(self, other, expected, "java/util/ArrayList")?;
+                }
+                check(self, this, expected_this, "java/util/ArrayList")?;
                 return Ok(false);
             }
         }
-        Ok(theirs.len() == mine.len())
+        let equal = theirs.len() == mine.len();
+        if let Some(expected) = expected_other {
+            check(self, other, expected, "java/util/ArrayList")?;
+        }
+        check(self, this, expected_this, "java/util/ArrayList")?;
+        Ok(equal)
     }
 
     /// `c.contains(e)` for the argument of `removeAll`/`retainAll`: a list by
