@@ -199,17 +199,17 @@ class ContentItemsTest(unittest.TestCase):
         self.survey = load_survey()
 
     def write_bake(self, game_dir, packages):
-        mods = game_dir / "horizon-mods"
+        mods = game_dir / "sunrise-mods"
         mods.mkdir(parents=True)
         rows = []
         for jar, namespace, entries, declared in packages:
-            path = mods / f"{namespace}.hmod"
+            path = mods / f"{namespace}.smod"
             with zipfile.ZipFile(path, "w") as archive:
                 for name, body in entries.items():
                     archive.writestr(name, body)
             rows.append({"jar": jar, "namespaces": [namespace], "error": None, "skipped": [],
                          "packages": [{"id": namespace, "namespace": namespace,
-                                       "path": f"horizon-mods/{namespace}.hmod",
+                                       "path": f"sunrise-mods/{namespace}.smod",
                                        "files": len(entries), "bytes": 1,
                                        "declarations": declared}]})
         report = game_dir / "config" / "horizon_java" / "bake-report.json"
@@ -221,10 +221,10 @@ class ContentItemsTest(unittest.TestCase):
             game_dir = Path(directory)
             self.write_bake(game_dir, [
                 ("ruby.jar", "ruby", {
-                    "data/ruby/horizon/item/gem.json": '{"template":"minecraft:stick"}',
-                    "data/ruby/horizon/block/gem_block.json":
+                    "data/ruby/sunrise/item/gem.json": '{"template":"minecraft:stick"}',
+                    "data/ruby/sunrise/block/gem_block.json":
                         '{"item":true,"template":"minecraft:stone"}',
-                    "data/ruby/horizon/block/ghost.json":
+                    "data/ruby/sunrise/block/ghost.json":
                         '{"item":false,"template":"minecraft:stone"}',
                     "assets/ruby/lang/en_us.json": "{}",
                     "data/ruby/loot_table/blocks/gem_block.json": "{}",

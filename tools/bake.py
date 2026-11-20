@@ -6,9 +6,9 @@ and the generated declaration fence in the fork), so a jar's own models, texture
 blockstates, loot, blocks and items never reach the game by themselves. This tool closes that gap at
 install time: it runs each jar's server entrypoints through the offline runtime
 (``horizon-native-java --json <jar>``, the code the mod vendors), reads the typed blocks and items
-it recorded, keeps the resource kinds a content package accepts, and writes one ``.hmod`` per
-namespace into ``<game-dir>/horizon-mods/``. The package declares its own blocks and items
-(``data/<ns>/horizon/{block,item}/*.json``) next to the jar's assets, and the game loads it as an
+it recorded, keeps the resource kinds a content package accepts, and writes one ``.smod`` per
+namespace into ``<game-dir>/sunrise-mods/``. The package declares its own blocks and items
+(``data/<ns>/sunrise/{block,item}/*.json``) next to the jar's assets, and the game loads it as an
 ordinary content mod; the mod's runtime declaration for that namespace is skipped.
 
     python3 tools/bake.py --probe target/debug/horizon-native-java --game-dir /tmp/m3b-env/game-dir
@@ -37,15 +37,15 @@ from pathlib import Path
 
 # The folder the game reads content packages from, beside `options.txt`
 # (sunrise-mod-package `mod_list::DIR`), and the file that turns one on (`FILE`).
-MODS_DIR = "horizon-mods"
-MODS_FILE = "horizon-mods.txt"
+MODS_DIR = "sunrise-mods"
+MODS_FILE = "sunrise-mods.txt"
 REPORT = Path("config") / "horizon_java" / "bake-report.json"
 
 # The content fence's path rule: `assets/` or `data/`, then `/`-separated parts of
 # `[a-z0-9_.-]`, none of them `.` or `..` (sunrise-mod-package `content::check_path`).
 PLAIN_PART = re.compile(r"^[a-z0-9_.-]+$")
 NAMESPACE = re.compile(r"^[a-z0-9_.-]{1,64}$")
-# A `.hmod` manifest id is narrower than a namespace: `[a-z0-9_]{1,64}` and not a Windows
+# A `.smod` manifest id is narrower than a namespace: `[a-z0-9_]{1,64}` and not a Windows
 # device name (sunrise-mod-package `manifest::valid_mod_id`).
 PACKAGE_ID = re.compile(r"^[a-z0-9_]{1,64}$")
 RESERVED_IDS = {"con", "prn", "aux", "nul"} | {
@@ -62,7 +62,7 @@ ASSET_KINDS = set(
 )
 ASSET_FILES = {"sounds.json"}
 
-# `data/<namespace>/` kinds the fork reads (vanilla 26.3's data folders, minus `horizon/`: those
+# `data/<namespace>/` kinds the fork reads (vanilla 26.3's data folders, minus `sunrise/`: those
 # are content declarations, which the runtime already supplies for this jar).
 DATA_KINDS = set(
     """
@@ -293,7 +293,9 @@ def _allowed(top: str, namespace: str, rest: str, path: str, bake: JarBake) -> b
             return True
         bake.skip("unsupported asset kind", path)
         return False
-    if kind == "horizon":
+    # Sunrise reads declarations from `data/<ns>/sunrise/`; a jar written for Horizon may still
+    # carry `data/<ns>/horizon/`. Neither is copied: the runtime's declarations are the package's.
+    if kind in ("sunrise", "horizon"):
         bake.skip("content declarations: the runtime declares this jar's blocks and items", path)
         return False
     if kind in DATA_KINDS:
@@ -372,7 +374,7 @@ def probe_declarations(probe: Path, jar: Path) -> list[tuple[str, str, dict]]:
 
 
 def write_package(path: Path, namespace: str, jar: str, files: list[tuple[str, bytes]]) -> int:
-    """Writes a deterministic `.hmod` (a zip: `sunrise-mod.toml` then the sorted files)."""
+    """Writes a deterministic `.smod` (a zip: `sunrise-mod.toml` then the sorted files)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -437,7 +439,7 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
             by_namespace.setdefault(namespace, []).append((name, data))
 
     # The runtime's typed registrations become the package's own declarations
-    # (`data/<namespace>/horizon/{block,item}/<path>.json`), which the content loader reads without
+    # (`data/<namespace>/sunrise/{block,item}/<path>.json`), which the content loader reads without
     # the native ownership fence. A block with `item: true` declares its own item; an item file for
     # the same id would refuse the namespace.
     block_items = {
@@ -473,7 +475,7 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
             bake.skip("declared more than once in the jar", declaration_id)
             continue
         declared.add(declaration_id)
-        target = f"data/{namespace}/horizon/{kind}/{path}.json"
+        target = f"data/{namespace}/sunrise/{kind}/{path}.json"
         by_namespace.setdefault(namespace, []).append(
             (target, _declaration_bytes(file))
         )
@@ -505,9 +507,9 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
         files = by_namespace[namespace]
         if namespace == bake.namespaces[0]:
             files = files + shared
-        target = out / f"{namespace}.hmod"
+        target = out / f"{namespace}.smod"
         size = write_package(target, namespace, jar.name, files)
-        prefix = f"data/{namespace}/horizon/"
+        prefix = f"data/{namespace}/sunrise/"
         package = Package(
             id=namespace,
             namespace=namespace,
@@ -525,7 +527,7 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
 
 
 def enable(game_dir: Path, ids: list[str]) -> list[str]:
-    """Turns the packages on in `horizon-mods.txt`; returns the ids it wrote."""
+    """Turns the packages on in `sunrise-mods.txt`; returns the ids it wrote."""
     if not ids:
         return []
     path = game_dir / MODS_FILE
@@ -556,7 +558,7 @@ def bake_directory(
     turn_on: bool = True,
     probe: Path | None = None,
 ) -> BakeReport:
-    """Bakes every `*.jar` under `java_mods` into `out` (default `<game_dir>/horizon-mods`)."""
+    """Bakes every `*.jar` under `java_mods` into `out` (default `<game_dir>/sunrise-mods`)."""
     out = out if out is not None else game_dir / MODS_DIR
     report = BakeReport(java_mods=java_mods, game_dir=game_dir, out=out)
     jars = sorted(java_mods.glob("*.jar")) if java_mods.is_dir() else []
@@ -582,7 +584,7 @@ def main(argv: list[str]) -> int:
         "--game-dir",
         type=Path,
         default=Path("."),
-        help="the game folder: packages go in its horizon-mods/ (default: .)",
+        help="the game folder: packages go in its sunrise-mods/ (default: .)",
     )
     parser.add_argument(
         "--java-mods",
@@ -590,12 +592,12 @@ def main(argv: list[str]) -> int:
         help="the jars to bake (default: <game-dir>/config/horizon_java/java-mods)",
     )
     parser.add_argument(
-        "--out", type=Path, help="where the .hmod files go (default: <game-dir>/horizon-mods)"
+        "--out", type=Path, help="where the .smod files go (default: <game-dir>/sunrise-mods)"
     )
     parser.add_argument(
         "--no-enable",
         action="store_true",
-        help="do not add mod.<id>:true lines to horizon-mods.txt",
+        help="do not add mod.<id>:true lines to sunrise-mods.txt",
     )
     parser.add_argument(
         "--report",

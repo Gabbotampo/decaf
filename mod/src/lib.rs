@@ -84,8 +84,8 @@ use mod_api::{
     ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
     CommandSource, ConfigFileError, ConfigPath, DimensionKey, EntityInteractEvent,
     EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    HitHost, Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
     LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
     LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
     PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
@@ -1140,11 +1140,7 @@ impl Hooks for HorizonJava {
     /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
     /// is fired with its real amounts rather than dropped on a guess: the departure is named in
     /// the mod's report documentation.
-    fn living_damage_post(
-        &self,
-        _level: &mut dyn LevelRandomHost,
-        event: &mut LivingDamagePostEvent<'_>,
-    ) {
+    fn living_damage_post(&self, _level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
         let context = living_damage_context(event);
         self.fire_event(
             GameEvent::LivingAfterDamage,
@@ -1475,7 +1471,7 @@ impl Hooks for HorizonJava {
     /// NeoForge's `LivingIncomingDamageEvent`).
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn LevelRandomHost,
+        _level: &mut dyn HitHost,
         event: &mut LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         let context = EventContext {
@@ -2934,6 +2930,9 @@ mod tests {
         fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
             Ok(None)
         }
+        fn remove(&self, _file: &ConfigPath) -> Result<bool, ConfigFileError> {
+            Ok(report_bytes().lock().unwrap().take().is_some())
+        }
     }
 
     static REPORT_FILES: ReportFiles = ReportFiles;
@@ -3766,7 +3765,7 @@ mod tests {
             player: 7,
             name: "Alex",
             was_death: true,
-            // The hook-scoped view of the old player (Sunrise pin `a87e07f5f8`); the context
+            // The hook-scoped view of the old player (the pinned Sunrise commit); the context
             // takes the facts read from it, so any token does.
             original: mod_api::__private::game::original_player_ref(1),
         };
