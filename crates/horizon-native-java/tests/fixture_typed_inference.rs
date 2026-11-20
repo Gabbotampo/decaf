@@ -538,3 +538,63 @@ fn metadata_declaration_keeps_that_row_opaque_to_inference() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// A vanilla `CraftingTableBlock` the jar `new`s is declared with the crafting table's template, so
+/// the game gives it the 3x3 grid. A jar's own subclass (Runes' crafting altar) reaches the same
+/// constructor through `super(...)`, but its own `useWithoutItem` opens its own menu: it keeps the
+/// inferred template rather than borrowing the vanilla grid.
+#[test]
+fn only_a_vanilla_crafting_table_gets_the_crafting_table_template() {
+    let mut stubs = game_stubs();
+    stubs.insert(
+        "net/minecraft/world/level/block/CraftingTableBlock.java",
+        r#"package net.minecraft.world.level.block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public class CraftingTableBlock extends Block {
+    public CraftingTableBlock(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+    );
+    let mod_sources = sources! {
+        "demo/Altar.java" => r#"package demo;
+import net.minecraft.world.level.block.CraftingTableBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Altar extends CraftingTableBlock {
+    public Altar(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+        "demo/TableMod.java" => r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.CraftingTableBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class TableMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "table"),
+                new CraftingTableBlock(BlockBehaviour.Properties.of().strength(2.5F)));
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "altar"),
+                new Altar(BlockBehaviour.Properties.of().strength(2.0F)));
+    }
+}"#,
+    };
+    let (root, jar_path) = build_jar(
+        "typed-inference-crafting-table",
+        &stubs,
+        &mod_sources,
+        br#"{"id":"fixture-table","version":"1.0","entrypoints":{"main":"demo.TableMod"}}"#,
+        None,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("main").unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+    let template = |index: usize| match &host.registrations()[index].declaration {
+        Some(RegistryDeclaration::Block { template, .. }) => template.clone(),
+        other => panic!("row {index} is not a typed block: {other:?}"),
+    };
+    assert_eq!(template(0), "minecraft:crafting_table");
+    assert_eq!(template(1), "minecraft:stone");
+    let _ = fs::remove_dir_all(root);
+}
