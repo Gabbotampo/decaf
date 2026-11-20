@@ -14371,7 +14371,9 @@ fn game_builder_value(r: &MethodRef) -> Option<Value> {
 }
 
 /// The game's codec value types: a call or constant declared to answer one
-/// never answers null in the game.
+/// never answers null in the game. Only the game's and DataFixerUpper's own
+/// classes: a mod's `FooCodec` may well answer null, so its unmodelled
+/// result keeps the neutral null (#410 review).
 fn is_codec_type(name: &str) -> bool {
     matches!(
         name,
@@ -14380,7 +14382,8 @@ fn is_codec_type(name: &str) -> bool {
             | "com/mojang/serialization/MapCodec"
             | "com/mojang/serialization/codecs/PrimitiveCodec"
             | "com/mojang/serialization/codecs/RecordCodecBuilder"
-    ) || name.ends_with("Codec")
+    ) || (name.ends_with("Codec")
+        && (name.starts_with("net/minecraft/") || name.starts_with("com/mojang/")))
 }
 
 fn empty_collection_kind(descriptor: &str) -> Option<&'static str> {
