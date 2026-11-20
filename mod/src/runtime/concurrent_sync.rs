@@ -40,6 +40,7 @@ use super::*;
 
 const LATCH: &str = "java/util/concurrent/CountDownLatch";
 const ATOMIC_BOOLEAN: &str = "java/util/concurrent/atomic/AtomicBoolean";
+const ATOMIC_INTEGER: &str = "java/util/concurrent/atomic/AtomicInteger";
 const POOL: &str = "java/util/concurrent/ThreadPoolExecutor";
 /// The synthetic fields a latch and a pool keep their state under.
 const LATCH_COUNT: &str = "#latchCount";
@@ -56,7 +57,53 @@ pub(super) fn invoke<H: Host>(
     match r.owner.as_str() {
         LATCH => invoke_latch(rt, r, receiver, args),
         ATOMIC_BOOLEAN => invoke_atomic_boolean(rt, r, receiver, args),
+        ATOMIC_INTEGER => invoke_atomic_integer(rt, r, receiver, args),
         POOL => invoke_pool(rt, r, receiver, args),
+        _ => Ok(None),
+    }
+}
+
+fn invoke_atomic_integer<H: Host>(
+    rt: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: Option<&Value>,
+    args: &[Value],
+) -> Result<Option<Value>, NativeError> {
+    let Some(marker) = receiver.and_then(expect_ref) else {
+        return Ok(None);
+    };
+    let key = state_key(marker, "#atomicInteger");
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("<init>", "()V") => {
+            rt.fields.insert(key, Value::Int(0));
+            Ok(Some(Value::Void))
+        }
+        ("<init>", "(I)V") => {
+            let value = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+            rt.fields.insert(key, Value::Int(value));
+            Ok(Some(Value::Void))
+        }
+        ("getAndIncrement", "()I") => {
+            let Some(Value::Int(current)) = rt.fields.get(&key).cloned() else {
+                return Ok(None);
+            };
+            rt.fields.insert(key, Value::Int(current.wrapping_add(1)));
+            Ok(Some(Value::Int(current)))
+        }
+        ("incrementAndGet", "()I") => {
+            let Some(Value::Int(current)) = rt.fields.get(&key).cloned() else {
+                return Ok(None);
+            };
+            let next = current.wrapping_add(1);
+            rt.fields.insert(key, Value::Int(next));
+            Ok(Some(Value::Int(next)))
+        }
+        ("get", "()I") => Ok(rt.fields.get(&key).cloned()),
+        ("set", "(I)V") => {
+            rt.fields
+                .insert(key, args.first().cloned().unwrap_or(Value::Int(0)));
+            Ok(Some(Value::Void))
+        }
         _ => Ok(None),
     }
 }
