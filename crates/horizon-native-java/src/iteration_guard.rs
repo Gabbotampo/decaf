@@ -81,9 +81,9 @@ enum FailFast {
 fn fail_fast(class: &str) -> Option<FailFast> {
     Some(match class {
         "java/util/ArrayList" | "java/util/Vector" | "java/util/Stack" => FailFast::ArrayList,
-        "java/util/LinkedList"
-        | "java/util/PriorityQueue"
-        | "java/util/Collections$CopiesList" => FailFast::Cursor,
+        "java/util/LinkedList" | "java/util/PriorityQueue" | "java/util/Collections$CopiesList" => {
+            FailFast::Cursor
+        }
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
         | "java/util/TreeMap"

@@ -6,7 +6,6 @@ mod javac_fixture;
 use horizon_native_java::{StdHost, Value};
 
 #[test]
-#[ignore = "full JDK matrix is the explicit review oracle"]
 fn collection_matrix_matches_jdk_25_for_modelled_calls() {
     let fixture = javac_fixture::Fixture::build(
         "collection-differential",
