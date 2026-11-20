@@ -3,3 +3,7 @@
 2=[a, c, d]|[c]
 3=[a, d]|[]
 6=java.util.ConcurrentModificationException
+10=java.lang.UnsupportedOperationException
+11=java.lang.UnsupportedOperationException
+12=java.lang.UnsupportedOperationException
+13=java.lang.UnsupportedOperationException

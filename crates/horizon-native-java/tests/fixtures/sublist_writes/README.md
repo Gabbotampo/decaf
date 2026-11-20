@@ -1,9 +1,10 @@
 # `List.subList` writes (#549)
 
-Capture on arcweld with Java 25:
+`java25.txt` is the output of `demo.Probe` on OpenJDK 25.0.5. To recapture, from this folder with
+`JAVA_HOME` pointing at a JDK 25.0.5:
 
 ```sh
-J=~/ava/jdk/jdk-25.0.5+8/Contents/Home/bin
-$J/javac -d out demo/Probe.java
-$J/java -cp out demo.Probe
+mkdir out
+"$JAVA_HOME/bin/javac" -d out demo/Probe.java
+"$JAVA_HOME/bin/java" -cp out demo.Probe > java25.txt
 ```

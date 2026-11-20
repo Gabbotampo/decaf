@@ -756,6 +756,19 @@ impl crate::runtime::StdHost {
         }
         let range = values[from as usize..to as usize].to_vec();
         let made = self.new_collection(super::stand_in_class("list"), range);
+        // A sub-list of an unmodifiable or immutable list (`List.of`,
+        // `Collections.unmodifiableList`) is just as unmodifiable: every
+        // mutator throws `UnsupportedOperationException` (#558 review).
+        if self.unmodifiable_collections.contains_key(marker) {
+            let key = match &made {
+                Value::Host(handle) => Some(handle.key().to_owned()),
+                Value::Ref(Some(made)) => Some(made.clone()),
+                _ => None,
+            };
+            if let Some(key) = key {
+                self.unmodifiable_collections.insert(key, None);
+            }
+        }
         // A detached copy: remember it, so `Collections.reverse` on it is counted
         // (a write through it would not reach the parent, #496).
         match &made {
