@@ -78,5 +78,11 @@ public class Probe {
     String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
     return String.valueOf((s + "!").length());
   }
+  /** A copy of a counted String is itself counted: `outer.toString()` must count. */
+  public static String countedCopy() {
+    String inner = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    String outer = new String(inner);
+    return outer.toString();
+  }
   public static void main(String[] args) { System.out.print(rows()); }
 }

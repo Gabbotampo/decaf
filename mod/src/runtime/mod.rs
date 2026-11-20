@@ -32555,7 +32555,18 @@ impl<H: Host> Runtime<'_, H> {
                                 "append" | "insert"
                             )
                         );
-                        if builder_result
+                        // A text object constructed from a counted String
+                        // (`new String(counted)`, `new StringBuilder(counted)`)
+                        // has opaque text too. A constructor returns nothing,
+                        // so its receiver is what must be tracked.
+                        let text_constructor = r.name == "<init>"
+                            && matches!(
+                                r.owner.as_str(),
+                                "java/lang/String"
+                                    | "java/lang/StringBuilder"
+                                    | "java/lang/StringBuffer"
+                            );
+                        if (builder_result || text_constructor)
                             && let Some(key) = receiver.as_ref().and_then(jar_object::object_key)
                         {
                             self.counted_strings.insert(key.to_owned());

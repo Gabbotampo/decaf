@@ -99,3 +99,33 @@ fn counted_strings_never_become_marker_text() {
         );
     }
 }
+
+/// `new String(counted)` builds a String whose text is as opaque as its
+/// argument's, so `outer.toString()` counts and never answers text.
+#[test]
+fn copy_of_a_counted_string_is_counted() {
+    let fixture = Fixture::build("issue-423-copy", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let got = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "countedCopy",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .expect("countedCopy runs");
+    assert!(
+        !matches!(&got, horizon_native_java::Value::Ref(Some(text)) if text == "null" || text.contains("java/lang/String#")),
+        "{got:?}"
+    );
+    let calls = host.unknown_host_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call.starts_with("java/lang/String#toString")),
+        "{calls:?}"
+    );
+}
