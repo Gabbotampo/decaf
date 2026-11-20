@@ -36,6 +36,7 @@ fn fileoutputstream_close_matches_java25() {
     assert_eq!(
         h.unknown_host_calls(),
         vec![
+            ("java/io/InputStream#available()I".into(), 1),
             ("java/io/InputStream#readAllBytes()[B".into(), 1),
             ("java/io/InputStream#readNBytes(I)[B".into(), 1),
             ("java/io/InputStream#skip(J)J".into(), 3),
@@ -47,6 +48,6 @@ fn fileoutputstream_close_matches_java25() {
     );
     assert_eq!(
         counted,
-        horizon_native_java::Value::Ref(Some("ok|ok|ok|ok|ok|ok".into()))
+        horizon_native_java::Value::Ref(Some("ok|ok|ok|ok|ok|ok|ok".into()))
     );
 }

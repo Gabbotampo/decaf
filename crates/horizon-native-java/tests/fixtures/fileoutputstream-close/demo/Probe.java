@@ -9,7 +9,8 @@ public class Probe {
   static String closed(Path p, boolean channel) throws Exception {
     InputStream in=open(p,channel); in.close(); in.close();
     String a=err(()->in.read());
-    String b=err(()->in.available());
+    // A closed FileInputStream's available() fails in native code: counted (see counted()).
+    String b=channel?err(()->in.available()):"native";
     String c=Arrays.toString(in.readNBytes(0));
     String d=err(()->in.readNBytes(new byte[2],0,0));
     String e=err(()->in.readNBytes((byte[])null,0,0));
@@ -27,10 +28,11 @@ public class Probe {
     String negative=err(()->in.skip(-1));
     // Native failures whose text is the OS's: counted, never answered.
     String transfer=err(()->in.transferTo(new ByteArrayOutputStream()));
+    String available=err(()->in.available());
     InputStream live=open(p,false);
     String openNegative=err(()->live.skip(-1));
     live.close();
-    return skip+"|"+all+"|"+positive+"|"+negative+"|"+transfer+"|"+openNegative;
+    return skip+"|"+all+"|"+positive+"|"+negative+"|"+transfer+"|"+openNegative+"|"+available;
   }
   static String nbytes(Path p, boolean channel) throws Exception {
     try (InputStream in=open(p,channel)) {
