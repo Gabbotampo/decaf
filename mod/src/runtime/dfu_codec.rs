@@ -1154,14 +1154,23 @@ mod tests {
         };
         let first = common(&mut host);
         let second = common(&mut host);
-        let equals = method("com/mojang/datafixers/Products$P1", "equals", "(Ljava/lang/Object;)Z");
+        let equals = method(
+            "com/mojang/datafixers/Products$P1",
+            "equals",
+            "(Ljava/lang/Object;)Z",
+        );
         let itself = host
             .invoke_instance(&equals, &first, std::slice::from_ref(&first))
             .unwrap();
         assert_eq!(itself, Value::Int(1));
         assert!(host.unknown_host_calls().is_empty());
         let _ = host.invoke_instance(&equals, &first, &[second]);
-        assert_eq!(host.unknown_host_call_count(), 1, "{:?}", host.unknown_host_calls());
+        assert_eq!(
+            host.unknown_host_call_count(),
+            1,
+            "{:?}",
+            host.unknown_host_calls()
+        );
     }
 
     #[test]
