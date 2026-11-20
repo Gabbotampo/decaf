@@ -6017,7 +6017,12 @@ impl Host for StdHost {
     }
 
     fn is_unmodifiable_collection(&self, marker: &str) -> bool {
-        self.unmodifiable_collections.contains_key(marker)
+        // `List.of`/`List.copyOf` (and their sub-lists) and unmodifiable views:
+        // their `sort` throws whatever their size. `Collections.emptyList`,
+        // `singletonList` and `nCopies` are unmodifiable too, but their `sort`
+        // is a no-op where there is nothing to set (JDK 25).
+        self.jdk_list_of.contains(marker)
+            || matches!(self.unmodifiable_collections.get(marker), Some(Some(_)))
     }
 
     fn has_mutable_collection(&self, marker: &str) -> bool {

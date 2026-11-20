@@ -756,17 +756,25 @@ impl crate::runtime::StdHost {
         }
         let range = values[from as usize..to as usize].to_vec();
         let made = self.new_collection(super::stand_in_class("list"), range);
-        // A sub-list of an unmodifiable or immutable list (`List.of`,
-        // `Collections.unmodifiableList`) is just as unmodifiable: every
-        // mutator throws `UnsupportedOperationException` (#558 review).
-        if self.unmodifiable_collections.contains_key(marker) {
+        // A sub-list of `List.of`/`List.copyOf` is an `ImmutableCollections`
+        // sub-list, and one of an unmodifiable view an `UnmodifiableList`:
+        // every mutator throws `UnsupportedOperationException` whatever the
+        // range, and the immutable one rejects null searches as its parent
+        // does (#558 review). `emptyList`/`singletonList`/`nCopies` sub-lists
+        // are left as they were: their mutators depend on the range.
+        let immutable_parent = self.jdk_list_of.contains(marker);
+        let view_parent = matches!(self.unmodifiable_collections.get(marker), Some(Some(_)));
+        if immutable_parent || view_parent {
             let key = match &made {
                 Value::Host(handle) => Some(handle.key().to_owned()),
                 Value::Ref(Some(made)) => Some(made.clone()),
                 _ => None,
             };
             if let Some(key) = key {
-                self.unmodifiable_collections.insert(key, None);
+                self.unmodifiable_collections.insert(key.clone(), None);
+                if immutable_parent {
+                    self.jdk_list_of.insert(key);
+                }
             }
         }
         // A detached copy: remember it, so `Collections.reverse` on it is counted
