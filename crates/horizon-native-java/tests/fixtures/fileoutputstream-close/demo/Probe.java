@@ -6,7 +6,7 @@ public class Probe {
   public static String rows() {
     try {
       Path d=Path.of("fos-scratch"); Files.createDirectories(d); Path f=d.resolve("x.bin"); Files.deleteIfExists(f);
-      FileOutputStream o=new FileOutputStream(f.toFile()); byte[] b={9,8,7,6}; o.write(b,1,2); o.write(b,0,0); o.close(); o.close();
+      FileOutputStream o=new FileOutputStream(f.toFile()); byte[] b={9,8,7,6}; o.write(b,1,2); o.write(b,0,0); o.write(257); o.close(); o.close();
       String bytes=java.util.Arrays.toString(Files.readAllBytes(f));
       String after=err(()->{o.write(b,0,1);});
       String negOff=err(()->{new FileOutputStream(d.resolve("n").toFile()).write(b,-1,1);});

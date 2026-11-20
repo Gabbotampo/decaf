@@ -27854,10 +27854,35 @@ impl<H: Host> Runtime<'_, H> {
                 if r.owner == "java/io/FileInputStream" {
                     self.io_open_reader(r, &marker, &path, true)?;
                 } else {
+                    // UnixFileSystemProvider reports a FileNotFoundException when the
+                    // parent directory does not exist. The virtual model keeps created
+                    // directories, so this case is exact instead of silently creating a
+                    // file below an absent parent.
+                    let canonical = host_path::sandbox_canonical(&path);
+                    if let Some((parent, _)) = canonical.rsplit_once('/')
+                        && !parent.is_empty()
+                        && self.file_kind(parent) != file_attributes::FileKind::Directory
+                    {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/io/FileNotFoundException".into(),
+                            message: Some(format!(
+                                "{} (No such file or directory)",
+                                host_path::sandbox_display(&path)
+                            )),
+                            frame: None,
+                        });
+                    }
                     let appending = r.descriptor.ends_with("Z)V")
                         && args
                             .get(1)
                             .is_some_and(|value| expect_int(r, value).unwrap_or(0) != 0);
+                    // The model has no symlink table. Java redirects an append
+                    // stream through a symlink to its target, so answering from
+                    // the lexical path would invent the target's contents.
+                    if appending {
+                        self.host.unknown_operand_call(r)?;
+                        return Ok(Some(Value::Void));
+                    }
                     self.io_open_writer(&marker, Some(path), !appending)?;
                 }
                 Ok(Some(Value::Void))
@@ -27915,7 +27940,9 @@ impl<H: Host> Runtime<'_, H> {
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
-            "java/io/Writer"
+            "java/io/OutputStream"
+            | "java/io/FileOutputStream"
+            | "java/io/Writer"
             | "java/io/BufferedWriter"
             | "java/io/FileWriter"
             | "java/io/OutputStreamWriter"
@@ -27928,6 +27955,14 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(_) = self.io_sink_key(&marker) else {
                     return Ok(None);
                 };
+                let is_closed = self.io_closed.contains(&marker);
+                if is_closed && r.name != "close" && r.name != "flush" {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/io/IOException".into(),
+                        message: Some("Stream Closed".into()),
+                        frame: None,
+                    });
+                }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("write", "(Ljava/lang/String;)V") => {
                         let text = args.first().map(expect_string).unwrap_or_default();
@@ -27952,8 +27987,15 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("write", "([BII)V") => {
                         let Some(array) = args.first() else {
-                            return self.host.unknown_operand_call(r);
+                            return self.host.unknown_operand_call(r).map(Some);
                         };
+                        if matches!(array, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: None,
+                                frame: None,
+                            });
+                        }
                         let values = self.array(array).map(std::borrow::Cow::into_owned)?;
                         let off = expect_int(r, StdHost::argument(r, args, 1)?)? as i64;
                         let len = expect_int(r, StdHost::argument(r, args, 2)?)? as i64;
@@ -27967,6 +28009,31 @@ impl<H: Host> Runtime<'_, H> {
                         let bytes = values[off as usize..(off + len) as usize]
                             .iter()
                             .map(|v| match v {
+                                Value::Int(n) => *n as u8,
+                                _ => 0,
+                            })
+                            .collect::<Vec<_>>();
+                        self.io_writer_bytes
+                            .entry(self.io_sink_key(&marker).unwrap_or_default())
+                            .or_default()
+                            .extend(bytes);
+                        Value::Void
+                    }
+                    ("write", "([B)V") if r.owner == "java/io/FileOutputStream" => {
+                        let Some(array) = args.first() else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        if matches!(array, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: None,
+                                frame: None,
+                            });
+                        }
+                        let values = self.array(array).map(std::borrow::Cow::into_owned)?;
+                        let bytes = values
+                            .iter()
+                            .map(|value| match value {
                                 Value::Int(n) => *n as u8,
                                 _ => 0,
                             })
@@ -28017,6 +28084,18 @@ impl<H: Host> Runtime<'_, H> {
                             }
                             None => self.host.unknown_operand_call(r)?,
                         }
+                    }
+                    ("write", "(I)V") if r.owner == "java/io/FileOutputStream" => {
+                        let code = args
+                            .first()
+                            .map(|v| expect_int(r, v))
+                            .transpose()?
+                            .unwrap_or(0);
+                        self.io_writer_bytes
+                            .entry(self.io_sink_key(&marker).unwrap_or_default())
+                            .or_default()
+                            .push(code as u8);
+                        Value::Void
                     }
                     ("write", "(I)V") => {
                         let code = args
@@ -28101,8 +28180,15 @@ impl<H: Host> Runtime<'_, H> {
                         self.io_write(&marker, &text)?;
                         receiver.cloned().unwrap_or(Value::Void)
                     }
-                    ("flush", "()V") | ("close", "()V") => {
+                    ("flush", "()V") => {
                         self.io_commit(&marker);
+                        Value::Void
+                    }
+                    ("close", "()V") => {
+                        if !self.io_closed.contains(&marker) {
+                            self.io_commit(&marker);
+                            self.io_closed.insert(marker.clone());
+                        }
                         Value::Void
                     }
                     ("checkError", "()Z") => Value::Int(0),

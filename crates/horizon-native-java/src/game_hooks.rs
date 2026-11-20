@@ -2033,6 +2033,8 @@ impl NativeJar {
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
