@@ -1173,6 +1173,84 @@ mod tests {
     }
 
     #[test]
+    fn real_jar_selection_matches_captured_fabric_rows() {
+        let Some(corpus) = std::env::var_os("HORIZON_CORPUS") else {
+            println!("skipped real-jar oracle: HORIZON_CORPUS is unset");
+            return;
+        };
+        let corpus = std::path::PathBuf::from(corpus);
+        let oracle_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles");
+        let Ok(cases) = std::fs::read_to_string(oracle_dir.join("mod_prio_real_cases.txt")) else {
+            println!("skipped real-jar oracle: case list is absent");
+            return;
+        };
+        let Ok(oracle) = std::fs::read_to_string(oracle_dir.join("mod_prio_real_java25.txt"))
+        else {
+            println!("skipped real-jar oracle: captured rows are absent");
+            return;
+        };
+        let mut checked = 0;
+        for line in cases
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let (name, paths) = line.split_once('|').unwrap();
+            let paths = paths
+                .strip_prefix("jar=")
+                .unwrap()
+                .split('|')
+                .map(|path| corpus.join(path))
+                .collect::<Vec<_>>();
+            if paths.iter().any(|path| !path.is_file()) {
+                println!("skipped real-jar oracle case {name}: a corpus jar is missing");
+                continue;
+            }
+            let Some(row) = oracle
+                .lines()
+                .find(|row| row.starts_with(&format!("{name}|")))
+            else {
+                panic!("missing captured Fabric row {name}");
+            };
+            if !row.contains("|OK|") {
+                println!("skipped real-jar oracle case {name}: Fabric captured a refusal");
+                continue;
+            }
+            let expected = row
+                .split_once("|OK|")
+                .unwrap()
+                .1
+                .split(',')
+                .filter(|field| field.contains("@nested@"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for path in paths {
+                let root = NativeJar::from_path(&path).unwrap();
+                for candidate in select_checked(&root).unwrap() {
+                    let key = identity(&candidate.jar);
+                    if seen.insert(key) {
+                        actual.push(format!(
+                            "{}@{}@nested@{}",
+                            candidate_id(&candidate.jar),
+                            candidate_version(&candidate.jar).unwrap_or_default(),
+                            candidate.depth + 1
+                        ));
+                    }
+                }
+            }
+            actual.sort();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(actual, expected, "real Fabric row {name}");
+            checked += 1;
+        }
+        if checked == 0 {
+            println!("skipped real-jar oracle: no complete captured cases");
+        }
+    }
+
+    #[test]
     fn overlapping_fabric_aliases_are_refused_without_sat_imitation() {
         let one = jar(&[
             (

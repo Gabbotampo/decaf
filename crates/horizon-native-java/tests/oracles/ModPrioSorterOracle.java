@@ -2,7 +2,6 @@ import java.lang.reflect.*;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
-import java.util.zip.*;
 import net.fabricmc.loader.api.Version;
 
 /** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
@@ -79,174 +78,112 @@ public final class ModPrioSorterOracle {
     return out;
   }
 
-  /**
-   * Read real Fabric metadata and nested entries. The paths used by the
-   * captured rows below are third-party corpus jars and are deliberately not
-   * copied into this repository.
-   */
-  static final class RealCandidates {
-    final Class<?> type;
-    final Method createBuiltin, createPlain, createNested, addParent, nestedMods;
-    final Constructor<?> builtinConstructor, metadataBuilderConstructor;
-    final Method metadataBuild;
-    final Method parseMetadata;
-    final Object versionOverrides, dependencyOverrides;
-    final Map<Long, Object> byHash = new HashMap<>();
+  /** Run Fabric's own candidate finders and discovery graph. */
+  static final class RealDiscovery {
+    static boolean launcherReady;
+    final Class<?> candidateType = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
+    final Method id = candidateType.getMethod("getId");
+    final Method version = candidateType.getMethod("getVersion");
+    final Method root = candidateType.getMethod("isRoot");
+    final Method level = candidateType.getMethod("getMinNestLevel");
+    final Method discover;
+    final Object loader;
+    final Object versionOverrides = Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides")
+        .getConstructor().newInstance();
+    final Object dependencyOverrides = Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides")
+        .getConstructor(Path.class).newInstance(Path.of("oracle-no-overrides"));
+    final Method createBuiltin = candidateType.getDeclaredMethod("createBuiltin",
+        Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod"),
+        Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides"),
+        Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"));
+    final Constructor<?> builtinConstructor = Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod")
+        .getConstructor(List.class, Class.forName("net.fabricmc.loader.api.metadata.ModMetadata"));
+    final Constructor<?> metadataBuilder = Class.forName("net.fabricmc.loader.impl.metadata.BuiltinModMetadata$Builder")
+        .getConstructor(String.class, String.class);
+    final Method metadataBuild = metadataBuilder.getDeclaringClass().getMethod("build");
 
-    RealCandidates(Class<?> type) throws Exception {
-      this.type = type;
-      createBuiltin = type.getDeclaredMethod("createBuiltin",
-          Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod"),
+    RealDiscovery() throws Exception {
+      Class<?> launcher = Class.forName("net.fabricmc.loader.impl.launch.FabricLauncher");
+      if (!launcherReady) {
+        Object launcherProxy = Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] {launcher},
+            (proxy, method, args) -> switch (method.getName()) {
+              case "getEnvironmentType" -> Enum.valueOf((Class) Class.forName("net.fabricmc.api.EnvType"), "SERVER");
+              case "isDevelopment" -> false;
+              case "getClassPath" -> List.of();
+              default -> method.getReturnType().isPrimitive() ? false : null;
+            });
+        Class.forName("net.fabricmc.loader.impl.launch.FabricLauncherBase")
+            .getMethod("setLauncher", launcher).invoke(null, launcherProxy);
+        launcherReady = true;
+      }
+      loader = Class.forName("net.fabricmc.loader.impl.FabricLoaderImpl")
+          .getField("INSTANCE").get(null);
+      Class<?> providerType = Class.forName("net.fabricmc.loader.impl.game.GameProvider");
+      Object provider = Proxy.newProxyInstance(getClass().getClassLoader(), new Class<?>[] {providerType},
+          (proxy, method, args) -> switch (method.getName()) {
+            case "getLaunchDirectory" -> Path.of("oracle-real-scratch").toAbsolutePath();
+            case "getRawGameVersion", "getNormalizedGameVersion" -> "26.3";
+            case "getArguments" -> new net.fabricmc.loader.impl.util.Arguments();
+            case "isDevelopmentEnvironment" -> false;
+            case "getBuiltinMods" -> List.of(builtinMod("minecraft", "26.3"), builtinMod("fabricloader", "0.19.5"));
+            default -> method.getReturnType().isPrimitive() ? false : null;
+          });
+      loader.getClass().getMethod("setGameProvider", providerType).invoke(loader, provider);
+      Class<?> discovererType = Class.forName("net.fabricmc.loader.impl.discovery.ModDiscoverer");
+      Object discoverer = discovererType.getConstructor(
           Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides"),
-          Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"));
-      createPlain = type.getDeclaredMethod("createPlain", List.class,
-          Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"),
-          boolean.class, Collection.class);
-      createNested = type.getDeclaredMethod("createNested", String.class, long.class,
-          Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"),
-          boolean.class, Collection.class);
-      addParent = type.getDeclaredMethod("addParent", type);
-      nestedMods = type.getMethod("getNestedMods");
-      createPlain.setAccessible(true);
-      createNested.setAccessible(true);
-      createBuiltin.setAccessible(true);
-      addParent.setAccessible(true);
-      parseMetadata = Class.forName("net.fabricmc.loader.impl.metadata.ModMetadataParser")
-          .getMethod("parseMetadata", InputStream.class, String.class, List.class,
-              Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides"),
-              Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"),
-              boolean.class);
-      versionOverrides = Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides")
-          .getConstructor().newInstance();
-      dependencyOverrides = Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides")
-          .getConstructor(Path.class).newInstance(Path.of("oracle-no-overrides"));
-      Class<?> builder = Class.forName("net.fabricmc.loader.impl.metadata.BuiltinModMetadata$Builder");
-      metadataBuilderConstructor = builder.getConstructor(String.class, String.class);
-      metadataBuild = builder.getMethod("build");
-      builtinConstructor = Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod")
-          .getConstructor(List.class, Class.forName("net.fabricmc.loader.api.metadata.ModMetadata"));
+          Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"))
+          .newInstance(versionOverrides, dependencyOverrides);
+      discovererType.getMethod("addCandidateFinder", Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateFinder"))
+          .invoke(discoverer, newFinder("net.fabricmc.loader.impl.discovery.ArgumentModCandidateFinder"));
+      discover = discovererType.getMethod("discoverMods", loader.getClass(), Map.class);
+      this.discoverer = discoverer;
     }
 
-    Object builtin(String id, String version) throws Exception {
-      Object builder = metadataBuilderConstructor.newInstance(id, version);
-      Object metadata = metadataBuild.invoke(builder);
-      Object gameMod = builtinConstructor.newInstance(List.of(), metadata);
+    final Object discoverer;
+
+    Object builtinMod(String id, String value) throws Exception {
+      Object metadata = metadataBuild.invoke(metadataBuilder.newInstance(id, value));
+      return builtinConstructor.newInstance(List.of(), metadata);
+    }
+
+    Object builtin(String id, String value) throws Exception {
+      Object gameMod = builtinMod(id, value);
+      createBuiltin.setAccessible(true);
       return createBuiltin.invoke(null, gameMod, versionOverrides, dependencyOverrides);
     }
 
-    // `javap -p` on Fabric Loader 0.19.5 shows this package-private factory:
-    // ModCandidateImpl.createBuiltin(GameProvider.BuiltinMod, VersionOverrides,
-    // DependencyOverrides). Use that same factory, rather than a plain
-    // candidate, so the resolver sees the candidates as real built-ins.
-    List<Object> builtinMods() throws Exception {
-      return List.of(builtin("minecraft", "26.3"), builtin("java", "25"),
-          builtin("fabricloader", "0.19.5"));
-    }
-
-    Object metadata(InputStream stream, String path) throws Exception {
-      return parseMetadata.invoke(null, stream, path, List.of(), versionOverrides,
-          dependencyOverrides, false);
-    }
-
-    static Object call(Object receiver, String name, Class<?>... parameters) throws Exception {
-      Method method = receiver.getClass().getMethod(name, parameters);
-      method.setAccessible(true);
-      return method.invoke(receiver);
-    }
-
-    Object nested(Path owner, ZipFile zip, ZipEntry entry, Object parent) throws Exception {
-      byte[] bytes;
-      try (InputStream in = zip.getInputStream(entry)) {
-        bytes = in.readAllBytes();
+    Object newFinder(String name) throws Exception {
+      Class<?> type = Class.forName(name);
+      Object finder = type.getConstructor(boolean.class).newInstance(false);
+      if (name.endsWith("ArgumentModCandidateFinder")) {
+        System.setProperty("fabric.addMods", "");
       }
-      long hash = (entry.getCrc() << 32) | (entry.getSize() & 0xffffffffL);
-      Object candidate = byHash.get(hash);
-      if (candidate == null) {
-        try (InputStream in = new ByteArrayInputStream(bytes);
-             ZipInputStream nestedZip = new ZipInputStream(in)) {
-          ZipEntry metadataEntry;
-          while ((metadataEntry = nestedZip.getNextEntry()) != null
-              && !metadataEntry.getName().equals("fabric.mod.json")) {}
-          if (metadataEntry == null) return null;
-          Object metadata = metadata(nestedZip, owner + "!" + entry.getName());
-          Collection<Object> children = new ArrayList<>();
-          candidate = createNested.invoke(null, entry.getName(), hash, metadata, false, children);
-          byHash.put(hash, candidate);
-          scanNested(owner + "!" + entry.getName(), bytes, candidate, children);
-        }
-      }
-      ((Collection<Object>) nestedMods.invoke(parent)).add(candidate);
-      addParent.invoke(candidate, parent);
-      return candidate;
+      return finder;
     }
 
-    void scanNested(String label, byte[] bytes, Object parent, Collection<Object> children)
-        throws Exception {
-      try (ZipFile zip = new ZipFile(writeScratchJar(label, bytes).toFile())) {
-        Object metadata = call(parent, "getMetadata");
-        Collection<?> jars = (Collection<?>) call(metadata, "getJars");
-        for (Object nestedEntry : jars) {
-          String file = (String) call(nestedEntry, "getFile");
-          ZipEntry entry = zip.getEntry(file);
-          if (entry != null && !entry.isDirectory() && file.endsWith(".jar")) {
-            nested(Path.of(label), zip, entry, parent);
-          }
-        }
-      }
+    List<?> find(Path mods) throws Exception {
+      Class<?> directory = Class.forName("net.fabricmc.loader.impl.discovery.DirectoryModCandidateFinder");
+      Object finder = directory.getConstructor(Path.class, boolean.class).newInstance(mods, false);
+      Class<?> finderType = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateFinder");
+      Class<?> discovererType = discoverer.getClass();
+      discovererType.getMethod("addCandidateFinder", finderType).invoke(discoverer, finder);
+      return (List<?>) discover.invoke(discoverer, loader, new HashMap<>());
     }
 
-    // ZipFile is used so CRC and size are the same fields ModDiscoverer hashes.
-    // Keep temporary copies inside the oracle's scratch directory only.
-    Path writeScratchJar(String label, byte[] bytes) throws IOException {
-      Path dir = Path.of("oracle-real-scratch");
-      Files.createDirectories(dir);
-      Path path = dir.resolve(Integer.toUnsignedString(label.hashCode()) + ".jar");
-      Files.write(path, bytes);
-      return path;
-    }
-
-    Object root(Path path) throws Exception {
-      try (ZipFile zip = new ZipFile(path.toFile())) {
-        ZipEntry metadataEntry = zip.getEntry("fabric.mod.json");
-        if (metadataEntry == null) return null;
-        Object metadata = metadata(zip.getInputStream(metadataEntry), path.toString());
-        Collection<Object> children = new ArrayList<>();
-        Object candidate = createPlain.invoke(null, List.of(path), metadata, false, children);
-        Collection<?> jars = (Collection<?>) call(metadata, "getJars");
-        for (Object nestedEntry : jars) {
-          String file = (String) call(nestedEntry, "getFile");
-          ZipEntry entry = zip.getEntry(file);
-          if (entry != null && !entry.isDirectory() && file.endsWith(".jar")) {
-            nested(path, zip, entry, candidate);
-          }
-        }
-        return candidate;
+    String row(List<?> selected) throws Exception {
+      StringJoiner row = new StringJoiner(",");
+      for (Object candidate : selected) {
+        row.add(id.invoke(candidate) + "@" + version.invoke(candidate) + "@"
+            + (root.invoke(candidate).equals(Boolean.TRUE) ? "root" : "nested") + "@" + level.invoke(candidate));
       }
-    }
-
-    void addAll(Object candidate, Collection<Object> out, Set<Object> seen) throws Exception {
-      if (!seen.add(candidate)) return;
-      out.add(candidate);
-      for (Object nested : (Collection<?>) nestedMods.invoke(candidate)) {
-        addAll(nested, out, seen);
-      }
+      return row.toString();
     }
   }
 
   static String escaped(String value) {
     return value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
   }
-
-  // Real-jar capture inputs (read-only third-party corpus paths):
-  // /home/solenopsisbot/horizon-corpus/corpus-xl/DayCount-1.6.0-Fabric-mc26.3.jar
-  // /home/solenopsisbot/horizon-corpus/mega/b1b136006d-clientcommands-2.16.3.jar
-  // /home/solenopsisbot/horizon-corpus/deps-pool/fabric-api-0.166.2+26.3.jar
-  // /home/solenopsisbot/horizon-corpus/corpus-xl/1283899-8898481.jar
-  // /home/solenopsisbot/horizon-corpus/mega/5c80b582b9-WorldEditCUI-26.3+01.jar
-  // /home/solenopsisbot/horizon-corpus/mega/8f7962199e-worldedit-mod-7.4.6.jar
-  // /home/solenopsisbot/horizon-corpus/mega/2363766a77-tweakeroo-fabric-26.3-0.30.1.jar
-  // /home/solenopsisbot/horizon-corpus/mega/832a00c0d6-malilib-fabric-26.3-0.30.2.jar
-  // /home/solenopsisbot/horizon-corpus/neoforge/DistantHorizons-3.3.4-26.3-fabric-neoforge.jar
 
   public static void main(String[] args) throws Exception {
     Class<?> type = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
@@ -270,24 +207,24 @@ public final class ModPrioSorterOracle {
     log.getMethod("init", handlerType).invoke(null, silentHandler);
 
     for (String line : Files.readAllLines(Path.of(args[0]))) {
-      if (line.isBlank()) continue;
+      if (line.isBlank() || line.startsWith("#")) continue;
       String[] split = line.split("\\|", 2);
       if (split[1].startsWith("jar=")) {
-        List<Object> candidates = new ArrayList<>();
-        RealCandidates real = new RealCandidates(type);
-        candidates.addAll(real.builtinMods());
-        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (String raw : split[1].substring(4).split("\\|")) {
-          Object candidate = real.root(Path.of(raw));
-          if (candidate != null) real.addAll(candidate, candidates, seen);
-        }
         try {
-          List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
-          StringJoiner row = new StringJoiner(",");
-          for (Object candidate : selected) {
-            row.add(id.invoke(candidate) + "@" + (isRoot.invoke(candidate).equals(Boolean.TRUE) ? "r" : "n") + "@" + level.invoke(candidate));
+          Path mods = Path.of("oracle-real-scratch").resolve(split[0]).resolve("mods");
+          Files.createDirectories(mods);
+          for (String raw : split[1].substring(4).split("\\|")) {
+            Path source = Path.of(raw);
+            if (!source.isAbsolute() && !Files.isRegularFile(source)) {
+              String corpus = System.getenv("HORIZON_CORPUS");
+              if (corpus != null) source = Path.of(corpus).resolve(source);
+            }
+            Files.copy(source, mods.resolve(source.getFileName()), StandardCopyOption.REPLACE_EXISTING);
           }
-          System.out.println(split[0] + "|OK|" + row);
+          RealDiscovery real = new RealDiscovery();
+          List<?> discovered = real.find(mods);
+          List<?> selected = (List<?>) resolve.invoke(null, discovered, server, new HashMap<>());
+          System.out.println(split[0] + "|OK|" + real.row(selected));
         } catch (InvocationTargetException error) {
           Throwable cause = error.getCause();
           System.out.println(split[0] + "|ERROR|" + cause.getClass().getName() + "|" + escaped(cause.getMessage()));

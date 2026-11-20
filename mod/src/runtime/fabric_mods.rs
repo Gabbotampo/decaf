@@ -140,10 +140,29 @@ fn cv_type(value: &serde_json::Value) -> &'static str {
 }
 
 impl StdHost {
+    fn nested_candidate_is_newer(&self, owner: &str, document: &serde_json::Value) -> bool {
+        let incoming = document.get("version").and_then(serde_json::Value::as_str);
+        let existing = self
+            .fabric_metadata
+            .get(owner)
+            .and_then(|metadata| metadata.get("version"))
+            .and_then(serde_json::Value::as_str);
+        crate::runtime::nested_jars::version_cmp(incoming, existing).is_gt()
+    }
+
+    fn remove_fabric_container(&mut self, id: &str) {
+        self.fabric_metadata.remove(id);
+        self.fabric_aliases.retain(|_, owner| owner != id);
+        self.fabric_entrypoint_containers
+            .retain(|entry| entry.provider != id);
+        self.fabric_origins.retain(|key, _| key != id);
+    }
+
     /// Record a Fabric jar's metadata, refusing a duplicate id or alias.
     pub(crate) fn try_record_fabric_metadata(
         &mut self,
         jar: &NativeJar,
+        nested: bool,
     ) -> Result<(), NativeError> {
         let Some(document) = jar
             .resource_bytes
@@ -157,8 +176,25 @@ impl StdHost {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
         {
-            if self.fabric_metadata.contains_key(&id) || self.fabric_aliases.contains_key(&id) {
-                return Err(NativeError::Metadata(format!("duplicate mod {id}")));
+            let mut replace_nested = Vec::new();
+            if let Some(owner) = self
+                .fabric_aliases
+                .get(&id)
+                .cloned()
+                .or_else(|| self.fabric_metadata.contains_key(&id).then(|| id.clone()))
+            {
+                let is_nested = self
+                    .fabric_origins
+                    .get(&owner)
+                    .is_some_and(|(kind, _)| kind == "nested");
+                if is_nested {
+                    if nested && !self.nested_candidate_is_newer(&owner, &document) {
+                        return Ok(());
+                    }
+                    replace_nested.push(owner);
+                } else {
+                    return Err(NativeError::Metadata(format!("duplicate mod {id}")));
+                }
             }
             let aliases = document
                 .get("provides")
@@ -173,13 +209,32 @@ impl StdHost {
                 .unwrap_or_default();
             let mut seen_keys = std::collections::BTreeSet::from([id.clone()]);
             for alias in &aliases {
-                if alias == &id
-                    || !seen_keys.insert(alias.clone())
-                    || self.fabric_metadata.contains_key(alias)
-                    || self.fabric_aliases.contains_key(alias)
-                {
+                if alias == &id || !seen_keys.insert(alias.clone()) {
                     return Err(NativeError::Metadata(format!("duplicate mod {alias}")));
                 }
+                if let Some(owner) = self.fabric_aliases.get(alias).cloned().or_else(|| {
+                    self.fabric_metadata
+                        .contains_key(alias)
+                        .then(|| alias.clone())
+                }) {
+                    let is_nested = self
+                        .fabric_origins
+                        .get(&owner)
+                        .is_some_and(|(kind, _)| kind == "nested");
+                    if is_nested {
+                        if nested && !self.nested_candidate_is_newer(&owner, &document) {
+                            return Ok(());
+                        }
+                        replace_nested.push(owner);
+                    } else {
+                        return Err(NativeError::Metadata(format!("duplicate mod {alias}")));
+                    }
+                }
+            }
+            replace_nested.sort();
+            replace_nested.dedup();
+            for owner in replace_nested {
+                self.remove_fabric_container(&owner);
             }
             self.fabric_metadata.insert(id.clone(), document.clone());
             // Fabric's mod map also indexes every provides alias to the same
@@ -209,7 +264,7 @@ impl StdHost {
 
     #[allow(dead_code)]
     pub(crate) fn record_fabric_metadata(&mut self, jar: &NativeJar) {
-        if let Err(error) = self.try_record_fabric_metadata(jar) {
+        if let Err(error) = self.try_record_fabric_metadata(jar, false) {
             let message = match error {
                 NativeError::Metadata(message) => message,
                 other => other.to_string(),
@@ -865,13 +920,18 @@ mod tests {
     use super::*;
 
     fn fabric(id: &str, provides: &[&str]) -> NativeJar {
+        fabric_version(id, "1", provides)
+    }
+
+    fn fabric_version(id: &str, version: &str, provides: &[&str]) -> NativeJar {
         let aliases = provides
             .iter()
             .map(|alias| format!(r#""{alias}""#))
             .collect::<Vec<_>>()
             .join(",");
-        let json =
-            format!(r#"{{"schemaVersion":1,"id":"{id}","version":"1","provides":[{aliases}]}}"#);
+        let json = format!(
+            r#"{{"schemaVersion":1,"id":"{id}","version":"{version}","provides":[{aliases}]}}"#
+        );
         NativeJar {
             resource_bytes: BTreeMap::from([(String::from("fabric.mod.json"), json.into_bytes())]),
             ..NativeJar::default()
@@ -909,5 +969,33 @@ mod tests {
         host.link_jar("one", &one).unwrap();
         let error = host.link_jar("two", &two).unwrap_err();
         assert!(error.to_string().contains("duplicate mod one"));
+    }
+
+    #[test]
+    fn a_root_replaces_a_nested_candidate_with_the_same_id() {
+        let mut host = StdHost::new();
+        host.fabric_origins.insert(
+            "module".into(),
+            ("nested".into(), "carrier|module.jar".into()),
+        );
+        host.record_fabric_metadata(&fabric("module", &["nested-alias"]));
+        host.record_fabric_metadata(&fabric("module", &[]));
+        assert!(host.fabric_resolution_errors.is_empty());
+        assert!(host.fabric_aliases.is_empty());
+        assert!(host.fabric_metadata.contains_key("module"));
+    }
+
+    #[test]
+    fn an_older_nested_candidate_is_merged_into_the_newer_id() {
+        let mut host = StdHost::new();
+        host.fabric_origins.insert(
+            "module".into(),
+            ("nested".into(), "carrier|module.jar".into()),
+        );
+        host.try_record_fabric_metadata(&fabric_version("module", "2", &[]), true)
+            .unwrap();
+        host.try_record_fabric_metadata(&fabric_version("module", "1", &[]), true)
+            .unwrap();
+        assert_eq!(host.fabric_version("module").as_deref(), Some("2"));
     }
 }

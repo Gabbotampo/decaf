@@ -4469,8 +4469,17 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
+        self.link_jar_with_nesting(id, jar, false)
+    }
+
+    fn link_jar_with_nesting(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+        nested: bool,
+    ) -> Result<usize, NativeError> {
         let id = id.into();
-        self.try_record_loaded_mod(jar)?;
+        self.try_record_loaded_mod(jar, nested)?;
         let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
         // A real loader's class path also resolves resources and service
         // descriptors from the selected sibling. Merge each once in class
@@ -4510,21 +4519,20 @@ impl StdHost {
                     continue;
                 }
             }
-            let _ =
-                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
-            self.try_record_loaded_mod(&nested)?;
             if let Some(nested_id) = nested.fabric_id.as_deref() {
                 let parent = jar
                     .fabric_id
                     .as_deref()
                     .or(jar.neoforge_id.as_deref())
                     .unwrap_or("jar");
-                let sublocation = entry.clone();
                 self.fabric_origins.insert(
                     nested_id.to_owned(),
-                    ("nested".into(), format!("{parent}|{sublocation}")),
+                    ("nested".into(), format!("{parent}|{entry}")),
                 );
             }
+            let _ =
+                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
+            self.try_record_loaded_mod(&nested, true)?;
         }
         Ok(added)
     }
@@ -4538,19 +4546,24 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
+        let id = id.into();
         if jar.fabric_id.is_some() {
             let hash = nested_jars::identity(jar);
             if !self.loaded_nested_hashes.insert(hash) {
                 return Ok(0);
             }
         }
-        self.link_jar(id, jar)
+        if let Some(nested_id) = jar.fabric_id.as_deref() {
+            self.fabric_origins
+                .insert(nested_id.to_owned(), ("nested".into(), id.clone()));
+        }
+        self.link_jar_with_nesting(id, jar, true)
     }
 
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
-    fn try_record_loaded_mod(&mut self, jar: &NativeJar) -> Result<(), NativeError> {
-        self.try_record_fabric_metadata(jar)?;
+    fn try_record_loaded_mod(&mut self, jar: &NativeJar, nested: bool) -> Result<(), NativeError> {
+        self.try_record_fabric_metadata(jar, nested)?;
         if let Some(toml) = neoforge_loader::mods_toml(&jar.resource_bytes) {
             let entries = neoforge_loader::mod_file_entries(toml, jar.neoforge_version.as_deref());
             if let Some((first, first_version)) = entries.first().cloned() {
@@ -20577,7 +20590,7 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
-        if let Err(error) = host.try_record_fabric_metadata(self) {
+        if let Err(error) = host.try_record_fabric_metadata(self, false) {
             // Keep the compatibility wrapper usable by existing probes, but
             // retain the loader's exact refusal so the checked load path below
             // can return Fabric's resolution message instead of first-wins.
