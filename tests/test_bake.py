@@ -1,7 +1,7 @@
 """The bake turns a Java jar's own assets, data and declarations into a content package.
 
 Milestone 3b: a native mod may not own another namespace's files or declarations, so the jar's
-models, textures, names, blockstates, loot and its blocks/items go into a content `.hmod` of their
+models, textures, names, blockstates, loot and its blocks/items go into a content `.smod` of their
 own (docs/m3-content-design.md, recommendation 3). The declarations come from the offline runtime
 probe, like the mod's own run; these tests drive the tool with synthetic jars and a fake probe and
 check the observable result: the package tree, its manifest, what the report says was left out, and
@@ -122,19 +122,19 @@ class BakeTests(unittest.TestCase):
         report = self.bake()
 
         self.assertEqual(report["enabled"], ["ruby_mod"])
-        package = self.game / "horizon-mods" / "ruby_mod.hmod"
+        package = self.game / "sunrise-mods" / "ruby_mod.smod"
         self.assertTrue(package.is_file())
         with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
             manifest = archive.read("sunrise-mod.toml").decode()
             declaration = json.loads(
-                archive.read("data/ruby_mod/horizon/item/ruby.json")
+                archive.read("data/ruby_mod/sunrise/item/ruby.json")
             )
         # The package is the jar's content tree, its declarations and the manifest: no classes,
         # no Fabric metadata, no arbitrary files.
         expected = {
-            "data/ruby_mod/horizon/item/ruby.json",
-            "data/ruby_mod/horizon/block/ruby_block.json",
+            "data/ruby_mod/sunrise/item/ruby.json",
+            "data/ruby_mod/sunrise/block/ruby_block.json",
         } | {name for name in ruby_jar() if name.startswith(("assets/", "data/"))}
         self.assertEqual(names[0], "sunrise-mod.toml")
         self.assertEqual(names[1:], sorted(expected))
@@ -147,7 +147,7 @@ class BakeTests(unittest.TestCase):
         # byte for byte at the 26.3 path.
         with zipfile.ZipFile(package) as archive:
             self.assertEqual(
-                json.loads(archive.read("data/ruby_mod/horizon/block/ruby_block.json")), BLOCK
+                json.loads(archive.read("data/ruby_mod/sunrise/block/ruby_block.json")), BLOCK
             )
             self.assertEqual(
                 archive.read("data/ruby_mod/loot_table/blocks/ruby_block.json"), b'{"pools":[]}'
@@ -164,8 +164,8 @@ class BakeTests(unittest.TestCase):
         before = package.read_bytes()
         self.bake()
         self.assertEqual(package.read_bytes(), before)
-        # `horizon-mods.txt` turns it on without disturbing other lines.
-        self.assertEqual((self.game / "horizon-mods.txt").read_text(), "mod.ruby_mod:true\n")
+        # `sunrise-mods.txt` turns it on without disturbing other lines.
+        self.assertEqual((self.game / "sunrise-mods.txt").read_text(), "mod.ruby_mod:true\n")
 
     def test_the_block_item_is_not_declared_twice(self):
         make_jar(self.mods / "ruby_mod.jar", ruby_jar())
@@ -179,11 +179,11 @@ class BakeTests(unittest.TestCase):
             ),
         )
         report = self.bake()
-        with zipfile.ZipFile(self.game / "horizon-mods" / "ruby_mod.hmod") as archive:
+        with zipfile.ZipFile(self.game / "sunrise-mods" / "ruby_mod.smod") as archive:
             names = archive.namelist()
-        self.assertIn("data/ruby_mod/horizon/block/ruby_block.json", names)
-        self.assertIn("data/ruby_mod/horizon/item/ruby.json", names)
-        self.assertNotIn("data/ruby_mod/horizon/item/ruby_block.json", names)
+        self.assertIn("data/ruby_mod/sunrise/block/ruby_block.json", names)
+        self.assertIn("data/ruby_mod/sunrise/item/ruby.json", names)
+        self.assertNotIn("data/ruby_mod/sunrise/item/ruby_block.json", names)
         reasons = {entry["reason"] for entry in report["jars"][0]["skipped"]}
         self.assertIn("the block's own item (its block declares it)", reasons)
 
@@ -203,7 +203,7 @@ class BakeTests(unittest.TestCase):
                 self.assertIsNotNone(row["error"])
                 self.assertIn("unsafe entry path", row["error"])
                 self.assertEqual(row["packages"], [])
-                self.assertFalse((self.game / "horizon-mods" / "evil.hmod").exists())
+                self.assertFalse((self.game / "sunrise-mods" / "evil.smod").exists())
                 self.assertFalse((self.root / "escape.json").exists())
 
     def test_unsupported_kinds_are_skipped_and_reported(self):
@@ -213,22 +213,22 @@ class BakeTests(unittest.TestCase):
                 {
                     "assets/ruby_mod/classes/Ruby.class": b"\xca\xfe\xba\xbe",
                     "assets/ruby_mod/nonsense/thing.bin": b"x",
-                    "data/ruby_mod/horizon/block/other.json": b"{}",
+                    "data/ruby_mod/sunrise/block/other.json": b"{}",
                     "assets/minecraft/models/item/stone.json": b"{}",
                     "assets/ruby_mod/sounds.json": b"{}",
                 }
             ),
         )
         report = self.bake()
-        with zipfile.ZipFile(self.game / "horizon-mods" / "ruby_mod.hmod") as archive:
+        with zipfile.ZipFile(self.game / "sunrise-mods" / "ruby_mod.smod") as archive:
             names = set(archive.namelist())
 
         self.assertIn("assets/ruby_mod/sounds.json", names)
         self.assertNotIn("assets/ruby_mod/classes/Ruby.class", names)
         self.assertNotIn("assets/ruby_mod/nonsense/thing.bin", names)
-        # The jar's own `horizon/` declarations are not copied; the runtime's are.
-        self.assertNotIn("data/ruby_mod/horizon/block/other.json", names)
-        self.assertIn("data/ruby_mod/horizon/block/ruby_block.json", names)
+        # The jar's own `sunrise/` declarations are not copied; the runtime's are.
+        self.assertNotIn("data/ruby_mod/sunrise/block/other.json", names)
+        self.assertIn("data/ruby_mod/sunrise/block/ruby_block.json", names)
         self.assertNotIn("assets/minecraft/models/item/stone.json", names)
 
         reasons = {entry["reason"] for entry in report["jars"][0]["skipped"]}
@@ -255,7 +255,7 @@ class BakeTests(unittest.TestCase):
         row = report["jars"][0]
         self.assertEqual(row["packages"], [])
         self.assertIn("not a content package id", row["error"])
-        self.assertFalse((self.game / "horizon-mods" / "ruby-mod.hmod").exists())
+        self.assertFalse((self.game / "sunrise-mods" / "ruby-mod.smod").exists())
 
     def test_a_probe_that_cannot_run_the_jar_refuses_it(self):
         make_jar(self.mods / "ruby_mod.jar", ruby_jar())
@@ -264,7 +264,7 @@ class BakeTests(unittest.TestCase):
         row = report["jars"][0]
         self.assertIn("could not run the jar's entrypoints", row["error"])
         self.assertEqual(row["packages"], [])
-        self.assertFalse((self.game / "horizon-mods" / "ruby_mod.hmod").exists())
+        self.assertFalse((self.game / "sunrise-mods" / "ruby_mod.smod").exists())
 
     def test_class_files_are_never_copied_even_under_an_allowed_kind(self):
         make_jar(
@@ -277,7 +277,7 @@ class BakeTests(unittest.TestCase):
             ),
         )
         self.bake()
-        with zipfile.ZipFile(self.game / "horizon-mods" / "ruby_mod.hmod") as archive:
+        with zipfile.ZipFile(self.game / "sunrise-mods" / "ruby_mod.smod") as archive:
             names = archive.namelist()
         self.assertNotIn("assets/ruby_mod/textures/item/Ruby.class", names)
         self.assertNotIn("assets/ruby_mod/models/item/ruby.jar", names)

@@ -6,7 +6,7 @@
 //! `Item.Properties` chain, a block's `BlockBehaviour.Properties` chain — as typed
 //! [`RegistryDeclaration`]s with the property strings the host understood. This module turns
 //! those into the narrow vocabulary a content package declares
-//! (`data/<namespace>/horizon/{block,item}/<path>.json`): the template plus the property keys the
+//! (`data/<namespace>/sunrise/{block,item}/<path>.json`): the template plus the property keys the
 //! fork reads. Anything else stays in the jar's row and is mapped in `docs/m3-content-design.md`,
 //! never guessed into content.
 
@@ -103,7 +103,7 @@ impl ContentDeclaration {
         matches!(self, Self::Block(_))
     }
 
-    /// The `data/<namespace>/horizon/{block,item}/<path>.json` value the content loader reads
+    /// The `data/<namespace>/sunrise/{block,item}/<path>.json` value the content loader reads
     /// (`sunrise-mod-package/src/content.rs`, `BlockFile`/`ItemFile`).
     pub fn file_json(&self) -> Value {
         match self {
