@@ -17,8 +17,28 @@ mod jdk_differential;
 
 use horizon_native_java::StdHost;
 
+/// Runs the cases on a roomy thread. `collectionStreamForEach` nests about eight jar frames; a
+/// debug build's interpreter frame is large, and the runtime's frame bound (`frame_bound.rs`)
+/// refused it at depth 7 on CI's default 2 MiB test thread (`CallDepthExceeded { limit: 7 }`,
+/// where `limit` is the depth reached: #573), though not locally. Same remedy as
+/// `fixture_callbacks_rc261c` (#572).
 fn check(cases: &[(&str, &str)]) {
-    jdk_differential::check("stream-spliterators", PROBE, cases);
+    let owned: Vec<(String, String)> = cases
+        .iter()
+        .map(|(method, want)| ((*method).to_owned(), (*want).to_owned()))
+        .collect();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let cases: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(method, want)| (method.as_str(), want.as_str()))
+                .collect();
+            jdk_differential::check("stream-spliterators", PROBE, &cases);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 const PROBE: &str = r#"package demo;

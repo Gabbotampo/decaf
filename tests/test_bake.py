@@ -206,6 +206,38 @@ class BakeTests(unittest.TestCase):
                 self.assertFalse((self.game / "sunrise-mods" / "evil.smod").exists())
                 self.assertFalse((self.root / "escape.json").exists())
 
+    def test_recipes_of_a_mods_own_type_stay_out(self):
+        # Sunrise refuses to start on a recipe whose serializer is not registered, and it registers
+        # none for any mod's type: a recipe of the jar's own type, or of another mod's (a jar that
+        # adds recipes for a library's serializer), stays out. Vanilla's (namespaced or not) stay in.
+        make_jar(
+            self.mods / "ruby_mod.jar",
+            ruby_jar(
+                {
+                    "data/ruby_mod/recipe/altar.json": b'{"type": "ruby_mod:altar", "base": "x"}',
+                    "data/ruby_mod/recipe/hand.json": b'{"type": "minecraft:crafting_shapeless"}',
+                    "data/ruby_mod/recipe/bare.json": b'{"type": "crafting_shaped"}',
+                    "data/ruby_mod/recipe/lib.json": b'{"type": "other_lib:infuse"}',
+                }
+            ),
+        )
+        report = self.bake()
+        with zipfile.ZipFile(self.game / "sunrise-mods" / "ruby_mod.smod") as archive:
+            names = set(archive.namelist())
+        self.assertNotIn("data/ruby_mod/recipe/altar.json", names)
+        self.assertIn("data/ruby_mod/recipe/hand.json", names)
+        self.assertIn("data/ruby_mod/recipe/bare.json", names)
+        reasons = {entry["reason"]: entry["paths"] for entry in report["jars"][0]["skipped"]}
+        self.assertEqual(
+            reasons["recipe of a mod's own type ruby_mod:altar: no serializer for it in the game yet"],
+            ["data/ruby_mod/recipe/altar.json"],
+        )
+        self.assertNotIn("data/ruby_mod/recipe/lib.json", names)
+        self.assertEqual(
+            reasons["recipe of a mod's own type other_lib:infuse: no serializer for it in the game yet"],
+            ["data/ruby_mod/recipe/lib.json"],
+        )
+
     def test_unsupported_kinds_are_skipped_and_reported(self):
         make_jar(
             self.mods / "ruby_mod.jar",

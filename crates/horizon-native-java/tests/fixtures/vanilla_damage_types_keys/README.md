@@ -12,5 +12,5 @@ javac -d out -cp "$CP" $F/demo/Probe.java
 java -cp "out:$CP" demo.Probe > $F/java25.txt
 ```
 
-The table `src/vanilla_damage_types_capture.txt` (`NAME|location`, declaration order) was checked
+The table `DAMAGE_TYPES` in `src/vanilla_registry_captures.rs` (`NAME|location`, declaration order) was checked
 against the same jar by reflecting over `DamageTypes`' static fields: all 51 match, in order.
