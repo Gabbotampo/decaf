@@ -137,6 +137,28 @@ fn taint<H: Host>(this: &mut Runtime<'_, H>, source: &str) {
     put_field(this, source, "tainted", Value::Int(1));
 }
 
+/// Whether an unknown call can change a multimap or one of its live views.
+///
+/// `Collection.iterator()` only creates an iterator; the iterator's optional
+/// `remove` operation is a later call.  Guava `Multimap.get` likewise creates a
+/// live view without changing the map; mutations through that view are later
+/// calls.  Both operations are read-only at the point where their unknown
+/// answers are counted.
+pub(crate) fn counted_call_may_mutate(r: &MethodRef) -> bool {
+    let read_only = matches!(
+        (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()),
+        ("java/util/Collection", "iterator", "()Ljava/util/Iterator;")
+    ) || (r.owner.starts_with("com/google/common/collect/")
+        && r.name == "get"
+        && matches!(
+            r.descriptor.as_str(),
+            "(Ljava/lang/Object;)Ljava/util/Collection;"
+                | "(Ljava/lang/Object;)Ljava/util/List;"
+                | "(Ljava/lang/Object;)Ljava/util/Set;"
+        ));
+    !read_only
+}
+
 fn counted_unknown<H: Host>(
     this: &mut Runtime<'_, H>,
     r: &MethodRef,
@@ -146,13 +168,15 @@ fn counted_unknown<H: Host>(
     // Object-method allow-list neutral: these methods cannot mutate a
     // multimap, and their identity/hash text is already counted by the host
     // boundary itself.  Every other counted call makes future reads unsafe.
-    if !matches!(
-        (r.name.as_str(), r.descriptor.as_str()),
-        ("toString", "()Ljava/lang/String;")
-            | ("hashCode", "()I")
-            | ("equals", "(Ljava/lang/Object;)Z")
-            | ("getClass", "()Ljava/lang/Class;")
-    ) {
+    if counted_call_may_mutate(r)
+        && !matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("toString", "()Ljava/lang/String;")
+                | ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("getClass", "()Ljava/lang/Class;")
+        )
+    {
         taint(this, source);
     }
     this.host.unknown_operand_call(r).map(Some)
@@ -815,13 +839,16 @@ fn invoke_multimap<H: Host>(
                 }
                 Value::Void
             }
-            ("iterator", "()Ljava/util/Iterator;")
-            | ("subList", "(II)Ljava/util/List;")
+            ("iterator", "()Ljava/util/Iterator;") => {
+                // Obtaining the iterator does not mutate the multimap. Any later iterator
+                // mutation is a separate call and is counted at that boundary.
+                return counted_unknown(this, r, &source);
+            }
+            ("subList", "(II)Ljava/util/List;")
             | ("listIterator", "()Ljava/util/ListIterator;")
             | ("listIterator", "(I)Ljava/util/ListIterator;") => {
-                // Guava's WrappedIterator and WrappedListIterator are live and check the
-                // multimap generation. A host snapshot cannot answer those semantics safely;
-                // count the operation and taint later multimap reads instead of guessing.
+                // These live views support mutations through their returned handles, so keep
+                // their later multimap reads conservative until the view semantics are modeled.
                 taint(this, &source);
                 return counted_unknown(this, r, &source);
             }

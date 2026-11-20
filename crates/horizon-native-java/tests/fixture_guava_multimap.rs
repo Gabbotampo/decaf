@@ -210,4 +210,16 @@ fn real_guava_multimaps_match_java25() {
         "read-only counted call did not taint later size: {:?}",
         host.unknown_host_calls()
     );
+    let before_iterator = host.unknown_host_calls();
+    let before_iterator_size = count(&before_iterator, "#size()I");
+    assert_eq!(
+        fixture.text_on(&mut host, "iteratorReadPreservesMultimap"),
+        "done"
+    );
+    let after_iterator = host.unknown_host_calls();
+    assert_eq!(
+        count(&after_iterator, "#size()I"),
+        before_iterator_size,
+        "read-only iterator call tainted later size: {after_iterator:?}"
+    );
 }

@@ -178,6 +178,13 @@ public final class Probe {
     try { m.size(); } catch (RuntimeException ignored) {}
     return "done";
   }
+  public static String iteratorReadPreservesMultimap() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    try { m.asMap().keySet().iterator(); } catch (RuntimeException ignored) {}
+    m.size();
+    return "done";
+  }
   public static String countedEntryTaintsMultimap() {
     ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
     m.put("a", 1);
