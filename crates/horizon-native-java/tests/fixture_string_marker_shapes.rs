@@ -13,7 +13,7 @@ const CASES: &[(&str, bool)] = &[
     ("client", true),
     ("blockPos", true),
     ("typed", false),
-    ("registry", false),
+    ("registry", true),
     ("payload", false),
     ("payloadContext", false),
     ("iterator", true),

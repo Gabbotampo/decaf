@@ -1,10 +1,10 @@
 # Java 25 capture
 
-Run from this fixture folder:
+`java25.txt` is the output of `demo.Probe` on OpenJDK 25.0.5. To recapture, from this folder with
+`JAVA_HOME` pointing at a JDK 25.0.5:
 
 ```sh
-J=$HOME/ava/jdk/jdk-25.0.5+8/Contents/Home/bin
-rm -rf classes && mkdir classes
-$J/javac -d classes demo/Probe.java
-$J/java -cp classes demo.Probe
+mkdir classes
+"$JAVA_HOME/bin/javac" -d classes demo/Probe.java
+"$JAVA_HOME/bin/java" -cp classes demo.Probe > java25.txt
 ```

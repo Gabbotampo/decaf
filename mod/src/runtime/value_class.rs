@@ -119,7 +119,6 @@ fn collection_class(class: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Shape {
     String,
-    Marker,
     Undecidable,
 }
 
@@ -127,17 +126,15 @@ pub(crate) fn string_shape(marker: &str) -> Shape {
     if is_plain_string(marker) {
         return Shape::String;
     }
-    // Unregistered text-marker families: a runtime-built spelling may be a
-    // marker or a jar String (#156 P17), so String checks are counted.
+    // Text-marker families the runtime still builds as text (`enum/…`,
+    // `typed/…`, `payload/…`, `payload-context/…`), and resource-path shapes
+    // (`textures/…`, `models/…`) the generic `word/rest` rule above reads as a
+    // marker: a runtime-built spelling may be a marker or a jar String
+    // (#156 P17), so String checks are counted. Retired families
+    // (`RETIRED_PREFIXES`, `host_registry`'s `registry/…`) were answered as
+    // Strings by `is_plain_string` above.
     if marker.starts_with("enum/")
-        || marker.starts_with("game/")
-        || marker.starts_with("list/")
-        || marker.starts_with("particle/")
-        || marker.starts_with("iterator/")
-        || marker.starts_with("client/")
-        || marker.starts_with("block-pos/")
         || marker.starts_with("typed/")
-        || marker.starts_with("registry/")
         || marker.starts_with("payload/")
         || marker.starts_with("payload-context/")
         || marker.starts_with("textures/")
@@ -160,6 +157,11 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
         .iter()
         .any(|prefix| marker.starts_with(prefix))
     {
+        return true;
+    }
+    // The registry family's objects are handles (`host_registry.rs`, #177):
+    // a text spelled like their old markers (`registry/…`, `holder/…`) is a `String`.
+    if crate::runtime::host_registry::spells_retired_marker(marker) {
         return true;
     }
     // The last separator-free markers (`guava-cache-builder`,
@@ -451,6 +453,10 @@ mod tests {
             "@fn:identity/function",
             "@cmp:natural",
             "@cmp:reverse:r@cmp:natural",
+            // Registries, holders and registers are handles (#177,
+            // `host_registry.rs`): text spelled like their old markers is a String.
+            "registry/minecraft:item",
+            "holder/deferred-register/registry/minecraft:item/demo/x",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -462,7 +468,6 @@ mod tests {
             "",
         )));
         for marker in [
-            "registry/minecraft:item",
             "string-builder/2",
             // A marker kind ahead of a capitalized segment is no class name.
             "component/Hello",
