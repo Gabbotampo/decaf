@@ -11052,34 +11052,42 @@ impl Host for StdHost {
             // type. Keep the conversion rules in one bounded path so a value
             // written as (for example) a Long can be read through Number.
             ("java/lang/Number", "intValue", "()I") => {
-                Ok(Value::Int(number_int_value(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                // A `Number` whose value this model does not hold (an `AtomicInteger`, a
+                // `BigDecimal` it did not make, a jar subclass) is counted, not refused.
+                let Some(value) = number_int_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "longValue", "()J") => {
-                Ok(long_value(number_long_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_long_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(long_value(value))
             }
             ("java/lang/Number", "shortValue", "()S") => {
-                Ok(Value::Int(number_short_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_short_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "byteValue", "()B") => {
-                Ok(Value::Int(number_byte_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_byte_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "floatValue", "()F") => {
-                Ok(float_value(boxed_number(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                let Some(value) = boxed_number(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(float_value(value))
             }
             ("java/lang/Number", "doubleValue", "()D") => {
-                Ok(double_value(boxed_number(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                let Some(value) = boxed_number(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(double_value(value))
             }
             ("java/lang/Integer", "intValue", "()I") => {
                 Ok(Value::Int(boxed_integer(receiver).ok_or_else(|| {
