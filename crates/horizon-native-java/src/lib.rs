@@ -20186,6 +20186,7 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -20408,6 +20409,7 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -20586,6 +20588,7 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -22804,6 +22807,7 @@ struct Runtime<'a, H> {
     io_reader_errors: BTreeMap<String, usize>,
     scanners: BTreeMap<String, scanner_model::ScannerState>,
     io_stream_paths: BTreeMap<String, String>,
+    io_channel_streams: BTreeSet<String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
@@ -27829,6 +27833,7 @@ impl<H: Host> Runtime<'_, H> {
                         let value = self.new_object("java/io/FileInputStream");
                         if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_reader(r, stream, &path, false)?;
+                            self.io_channel_streams.insert(stream.to_owned());
                         }
                         value
                     }
@@ -28297,15 +28302,72 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     let position = self.io_stream_positions.entry(marker.clone()).or_default();
                     let remaining = file_bytes.len().saturating_sub(*position);
+                    let channel_stream = self.io_channel_streams.contains(&marker);
+                    let closed_error = || NativeError::UncaughtException {
+                        class: if channel_stream {
+                            "java/nio/channels/ClosedChannelException"
+                        } else {
+                            "java/io/IOException"
+                        }
+                        .into(),
+                        message: if channel_stream {
+                            None
+                        } else {
+                            let ordinary = (r.name == "read"
+                                && (r.descriptor == "()I"
+                                    || r.descriptor == "([B)I"
+                                    || r.descriptor == "([BII)I"))
+                                || r.name == "available"
+                                || (r.name == "readNBytes" && r.descriptor == "([BII)I");
+                            Some(
+                                if ordinary {
+                                    "Stream Closed"
+                                } else {
+                                    "Bad file descriptor"
+                                }
+                                .into(),
+                            )
+                        },
+                        frame: None,
+                    };
+                    if r.name == "readNBytes" && r.descriptor == "(I)[B" {
+                        let len = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+                        if len < 0 {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalArgumentException".into(),
+                                message: Some("len < 0".into()),
+                                frame: None,
+                            });
+                        }
+                    }
+                    if self.io_closed.contains(&marker)
+                        && r.name != "close"
+                        && !((r.name == "read" || r.name == "readNBytes")
+                            && (r.descriptor == "([B)I" || r.descriptor == "([BII)I"))
+                        && !(r.name == "readNBytes"
+                            && r.descriptor == "(I)[B"
+                            && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? < 0)
+                    {
+                        return Err(closed_error());
+                    }
                     return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                         ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
-                            let bytes = file_bytes[*position..].to_vec();
+                            let bytes = file_bytes.get(*position..).unwrap_or_default().to_vec();
                             *position = file_bytes.len();
                             self.string_readers.insert(marker.clone(), String::new());
                             self.io_bytes_array(bytes)
                         }
+                        ("readNBytes", "(I)[B") => {
+                            let len =
+                                expect_int(r, args.first().unwrap_or(&Value::Int(0)))? as usize;
+                            let end = (*position).saturating_add(len).min(file_bytes.len());
+                            let bytes = file_bytes.get(*position..end).unwrap_or_default().to_vec();
+                            *position = end;
+                            self.string_readers.insert(marker.clone(), String::new());
+                            self.io_bytes_array(bytes)
+                        }
                         ("read", "()I") => {
-                            if *position == file_bytes.len() {
+                            if *position >= file_bytes.len() {
                                 Value::Int(-1)
                             } else {
                                 let byte = file_bytes[*position];
@@ -28336,7 +28398,9 @@ impl<H: Host> Runtime<'_, H> {
                                 {
                                     return Err(NativeError::UncaughtException {
                                         class: "java/lang/IndexOutOfBoundsException".into(),
-                                        message: None,
+                                        message: Some(format!(
+                                            "Range [{offset}, {offset} + {length}) out of bounds for length {array_len}"
+                                        )),
                                         frame: None,
                                     });
                                 }
@@ -28344,10 +28408,17 @@ impl<H: Host> Runtime<'_, H> {
                             } else {
                                 (0, array_len)
                             };
+                            if self.io_closed.contains(&marker) {
+                                return Err(closed_error());
+                            }
                             if length == 0 {
                                 Value::Int(0)
                             } else if remaining == 0 {
-                                Value::Int(-1)
+                                if r.name == "readNBytes" {
+                                    Value::Int(0)
+                                } else {
+                                    Value::Int(-1)
+                                }
                             } else {
                                 let count = length.min(remaining);
                                 if let Some(data) = self.arrays.get_mut(array) {
@@ -28370,12 +28441,31 @@ impl<H: Host> Runtime<'_, H> {
                                 Some(Value::Long(value)) => *value,
                                 _ => return Ok(None),
                             };
-                            let count = requested.max(0) as usize;
-                            let skipped = count.min(remaining);
-                            *position += skipped;
-                            Value::Long(skipped as i64)
+                            if channel_stream {
+                                let old = *position as i64;
+                                let new = if requested > 0 {
+                                    old.saturating_add(requested).min(file_bytes.len() as i64)
+                                } else {
+                                    old.saturating_add(requested).max(0)
+                                };
+                                *position = new as usize;
+                                Value::Long(new - old)
+                            } else {
+                                if requested < 0 {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/io/IOException".into(),
+                                        message: Some("Invalid argument".into()),
+                                        frame: None,
+                                    });
+                                }
+                                *position = (*position).saturating_add(requested as usize);
+                                Value::Long(requested)
+                            }
                         }
-                        ("close", "()V") => Value::Void,
+                        ("close", "()V") => {
+                            self.io_closed.insert(marker.clone());
+                            Value::Void
+                        }
                         _ => {
                             // Keep close and any future stream methods on the
                             // existing bounded dispatch.
@@ -37445,6 +37535,7 @@ mod tests {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -37524,6 +37615,7 @@ mod tests {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -44683,6 +44775,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -44904,6 +44997,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -45100,6 +45194,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -45472,6 +45567,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -45788,6 +45884,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -51062,6 +51159,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
@@ -51128,6 +51226,7 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),

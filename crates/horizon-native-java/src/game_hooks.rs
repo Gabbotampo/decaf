@@ -2032,6 +2032,7 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
