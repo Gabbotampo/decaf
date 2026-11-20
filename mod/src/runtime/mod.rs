@@ -31299,6 +31299,15 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                    } else if let Some(value) =
+                        dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
+                    {
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                    ) {
+                        value
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"
                         && (r.descriptor

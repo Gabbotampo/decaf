@@ -29,6 +29,7 @@ const OPTIONAL: &str = "dfu-optional";
 const XMAP: &str = "dfu-xmap";
 const MAP_XMAP: &str = "dfu-map-xmap";
 const GETTER: &str = "dfu-builder-getter";
+const OR_ELSE: &str = "dfu-or-else";
 const UNIT: &str = "dfu-unit";
 const UNIT_CODEC: &str = "dfu-unit-codec";
 const LIST: &str = "dfu-list";
@@ -104,7 +105,7 @@ fn map_codec(value: &Value) -> bool {
     };
     if matches!(
         tag.as_str(),
-        FIELD | OPTIONAL | MAP_XMAP | GETTER | UNIT | RECORD_MAP
+        FIELD | OPTIONAL | MAP_XMAP | GETTER | UNIT | OR_ELSE | RECORD_MAP
     ) {
         return tag != GETTER;
     }
@@ -279,6 +280,12 @@ fn text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String>, Nat
                 }
             }
             Ok(Some(text))
+        }
+        OR_ELSE => {
+            let Some(inner) = values.get(2) else {
+                return Ok(None);
+            };
+            Ok(nested.text(inner)?.map(|text| format!("{text}[orElse]")))
         }
         UNIT | UNIT_CODEC => {
             let Some(value) = values.get(2) else {
@@ -729,6 +736,20 @@ pub(crate) fn runtime_instance_call<H: Host>(
             };
         }
     }
+    if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
+        let Some(argument) = args.first() else {
+            return Ok(None);
+        };
+        let arity = product_arity_from_descriptor(&r.descriptor).unwrap_or(2);
+        if !(1..=16).contains(&arity) {
+            return Ok(None);
+        }
+        let values = vec![Value::Int(arity as i32), receiver.clone(), argument.clone()];
+        return match node(runtime.host, PRODUCT, values) {
+            Ok(value) => Ok(Some(value)),
+            Err(reason) => runtime_refuse(runtime, r, reason),
+        };
+    }
     if receiver_tag.as_deref() == Some(PRODUCT)
         && r.owner.starts_with("com/mojang/datafixers/Products$P")
         && r.name == "apply"
@@ -794,6 +815,35 @@ pub(crate) fn invoke(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Option<Value> {
+    // Mojang's loot base class is a tiny DFU helper: its body is exactly one
+    // optional field followed by `Instance.group(...).` The game class itself
+    // is outside the modeled surface, so preserve the real P1 shape here
+    // rather than returning Java's null and making the caller's `and` throw.
+    if r.name == "commonFields" && r.descriptor.contains("Products$P1") {
+        return build(
+            host,
+            r,
+            PRODUCT,
+            vec![
+                Value::Int(1),
+                constant(MAP_CODEC, r.owner.as_str(), "commonFields.condition"),
+            ],
+        );
+    }
+    if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
+        let receiver = receiver?.clone();
+        let argument = args.first()?.clone();
+        let arity = product_arity_from_descriptor(&r.descriptor).unwrap_or(2);
+        if !(1..=16).contains(&arity) {
+            return None;
+        }
+        return build(
+            host,
+            r,
+            PRODUCT,
+            vec![Value::Int(arity as i32), receiver, argument],
+        );
+    }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
         (MAP_CODEC, "unit", "(Ljava/lang/Object;)Lcom/mojang/serialization/MapCodec;")
         | (
@@ -855,6 +905,17 @@ pub(crate) fn invoke(
             let inner = receiver.filter(|value| map_receiver(value))?.clone();
             let getter = args.first().filter(|value| is_callback(value))?.clone();
             build(host, r, GETTER, vec![inner, getter])
+        }
+        (MAP_CODEC, "orElse", descriptor)
+            if descriptor.ends_with(")Lcom/mojang/serialization/MapCodec;") =>
+        {
+            let inner = receiver.filter(|value| map_receiver(value))?.clone();
+            build(
+                host,
+                r,
+                OR_ELSE,
+                vec![inner, args.first().cloned().unwrap_or(Value::Void)],
+            )
         }
         (MAP_CODEC, "codec", "()Lcom/mojang/serialization/Codec;") => {
             let receiver = receiver.filter(|value| map_receiver(value))?;
@@ -1018,6 +1079,37 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn common_fields_and_products_and_keep_builder_construction_non_null() {
+        let mut host = crate::runtime::StdHost::new();
+        let common = invoke(
+            &mut host,
+            &method(
+                "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction",
+                "commonFields",
+                "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;",
+            ),
+            None,
+            &[],
+        )
+        .unwrap();
+        let extra = constant(MAP_CODEC, MAP_CODEC, "extra");
+        let combined = invoke(
+            &mut host,
+            &method(
+                "com/mojang/datafixers/Products$P1",
+                "and",
+                "(Lcom/mojang/datafixers/Products$P3;)Lcom/mojang/datafixers/Products$P4;",
+            ),
+            Some(&common),
+            &[extra],
+        )
+        .unwrap();
+        assert_eq!(tag(&common).as_deref(), Some(PRODUCT));
+        assert_eq!(tag(&combined).as_deref(), Some(PRODUCT));
+        assert!(host.unknown_host_calls().is_empty());
     }
 
     #[test]
