@@ -271,6 +271,7 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_state_properties;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -3287,7 +3288,6 @@ const BLOCK_PROPERTIES_DESC: &str =
     "Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;";
 const STATE_BUILDER_CLASS: &str = "net/minecraft/world/level/block/state/StateDefinition$Builder";
 const STATE_BUILDER_DESC: &str = "Lnet/minecraft/world/level/block/state/StateDefinition$Builder;";
-const PROPERTY_CLASS: &str = "net/minecraft/world/level/block/state/properties/Property";
 /// The template an inferred item declaration names. A content plan resolves
 /// templates against vanilla's own tables, so an item whose only declared
 /// behaviour is its property chain inherits the plain vanilla item model and
@@ -4994,7 +4994,7 @@ impl StdHost {
     }
 
     fn captured_property(field: &str) -> Option<StatePropertyInfo> {
-        include_str!("vanilla_block_state_properties_capture.txt")
+        crate::runtime::vanilla_block_state_properties::TABLE
             .lines()
             .find_map(|line| {
                 let mut parts = line.split('|');
@@ -5013,8 +5013,19 @@ impl StdHost {
             })
     }
 
+    /// The declared class of a captured `BlockStateProperties` field (`EnumProperty`,
+    /// `IntegerProperty`, `BooleanProperty`): a `getstatic` names the field by it.
+    fn captured_property_type(field: &str) -> Option<&'static str> {
+        crate::runtime::vanilla_block_state_properties::TABLE
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('|');
+                (parts.next()? == field).then(|| parts.nth(3)).flatten()
+            })
+    }
+
     fn captured_property_name(field: &str) -> Option<String> {
-        include_str!("vanilla_block_state_properties_capture.txt")
+        crate::runtime::vanilla_block_state_properties::TABLE
             .lines()
             .find_map(|line| {
                 let mut parts = line.split('|');
@@ -5924,7 +5935,7 @@ impl Host for StdHost {
                 .or_default() += 1;
             return;
         };
-        let name = include_str!("vanilla_block_state_properties_capture.txt")
+        let name = crate::runtime::vanilla_block_state_properties::TABLE
             .lines()
             .find_map(|line| {
                 let mut parts = line.split('|');
@@ -6848,8 +6859,8 @@ impl Host for StdHost {
             return Ok(value);
         }
         if r.owner == "net/minecraft/world/level/block/state/properties/BlockStateProperties"
-            && r.descriptor == format!("L{PROPERTY_CLASS};")
-            && Self::captured_property(&r.name).is_some()
+            && Self::captured_property_type(&r.name)
+                .is_some_and(|class| r.descriptor == format!("L{class};"))
         {
             return Ok(Value::Ref(Some(format!(
                 "property/BlockStateProperties.{}",
@@ -36191,6 +36202,47 @@ mod tests {
     }
 
     #[test]
+    fn digit_named_properties_come_from_the_capture() {
+        // `AGE_7`, `ROTATION_16`, `SLOT_0_OCCUPIED`: fields whose names hold digits are in the
+        // captured table like any other (an earlier capture dropped them). Values from the real
+        // 26.3 `BlockStateProperties` (tests/fixtures/block_state_properties/oracle).
+        let mut host = StdHost::new();
+        let block = Value::Ref(Some("crops/AgeBlock#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        host.begin_block_state_definition(&block, &builder);
+        for (field, descriptor) in [
+            (
+                "AGE_7",
+                "Lnet/minecraft/world/level/block/state/properties/IntegerProperty;",
+            ),
+            (
+                "SLOT_0_OCCUPIED",
+                "Lnet/minecraft/world/level/block/state/properties/BooleanProperty;",
+            ),
+        ] {
+            let property = host
+                .get_static(&MethodRef {
+                    owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                        .into(),
+                    name: field.into(),
+                    descriptor: descriptor.into(),
+                })
+                .unwrap();
+            host.block_state_builder_add(&builder, &property);
+        }
+        host.finish_block_state_definition(&block, &builder);
+        let captured = host.block_state_properties.get("crops/AgeBlock#1").unwrap();
+        assert_eq!(captured["age"].kind, "integer");
+        assert_eq!(
+            captured["age"].values,
+            ["0", "1", "2", "3", "4", "5", "6", "7"]
+        );
+        assert_eq!(captured["slot_0_occupied"].kind, "boolean");
+    }
+
+    #[test]
     fn horizontal_facing_captures_real_property_values_in_order() {
         let mut host = StdHost::new();
         let property = host
@@ -36198,7 +36250,9 @@ mod tests {
                 owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
                     .into(),
                 name: "HORIZONTAL_FACING".into(),
-                descriptor: "Lnet/minecraft/world/level/block/state/properties/Property;".into(),
+                // The field's declared type, as Runes' `RuneCraftingBlock` reads it.
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/EnumProperty;"
+                    .into(),
             })
             .unwrap();
         let block = Value::Ref(Some("runes/RuneCraftingBlock#1".into()));
