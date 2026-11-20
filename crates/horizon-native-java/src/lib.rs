@@ -20681,6 +20681,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -20695,6 +20696,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -20905,6 +20907,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -20919,6 +20922,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -21085,6 +21089,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -21099,6 +21104,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -23299,6 +23305,9 @@ struct Runtime<'a, H> {
     string_builders: BTreeMap<String, String>,
     /// Allocation keys of constructors whose String text is not modelled exactly.
     counted_strings: std::collections::BTreeSet<String>,
+    /// Allocation keys (or I/O sink keys) whose held text was written from a
+    /// counted value. Reads of these objects must remain counted as well.
+    counted_text_objects: std::collections::BTreeSet<String>,
     /// JsonWriter states keyed by their jar object marker.
     gson_writers: BTreeMap<String, gson_writer::State>,
     /// The current backing capacity of each modelled StringBuilder. Its
@@ -23326,6 +23335,9 @@ struct Runtime<'a, H> {
     io_stream_positions: BTreeMap<String, usize>,
     /// Charset selected by each writer sink; UTF-8 is Java 25's default.
     io_writer_charsets: BTreeMap<String, String>,
+    /// Writer wrappers share the sink of the object they wrap (for example a
+    /// PrintWriter over a StringWriter or a PrintStream over a byte array).
+    io_writer_sinks: BTreeMap<String, String>,
     /// Charset-independent bytes committed for each virtual file. Text is
     /// retained separately for the reader model; File.length() uses these
     /// bytes, as the JDK does.
@@ -27539,6 +27551,9 @@ impl<H: Host> Runtime<'_, H> {
 
     /// The sink a modelled writer marker appends into.
     fn io_sink_key(&self, marker: &str) -> Option<String> {
+        if let Some(key) = self.io_writer_sinks.get(marker) {
+            return Some(key.clone());
+        }
         if let Some(path) = self.io_paths.get(marker) {
             return Some(format!("file:{path}"));
         }
@@ -27550,6 +27565,23 @@ impl<H: Host> Runtime<'_, H> {
         }
         let key = format!("mem:{marker}");
         self.io_writers.contains_key(&key).then_some(key)
+    }
+
+    fn mark_counted_text_object(&mut self, value: &Value) {
+        if let Some(key) = jar_object::object_key(value) {
+            self.counted_text_objects.insert(key.to_owned());
+        }
+    }
+
+    fn mark_counted_io_sink(&mut self, marker: &str) {
+        if let Some(key) = self.io_sink_key(marker) {
+            self.counted_text_objects.insert(key);
+        }
+    }
+
+    fn counted_io_sink(&self, marker: &str) -> bool {
+        self.io_sink_key(marker)
+            .is_some_and(|key| self.counted_text_objects.contains(&key))
     }
 
     /// Open a writer marker over `path`, or in memory when the writer wraps a
@@ -27627,6 +27659,37 @@ impl<H: Host> Runtime<'_, H> {
             self.watch_writer_opened(path, false);
         }
         Ok(())
+    }
+
+    fn io_bind_writer(&mut self, marker: &str, wrapped: &Value) -> bool {
+        let Some(wrapped) = jar_object::object_key(wrapped) else {
+            return false;
+        };
+        if !matches!(
+            jar_object::key_class(wrapped),
+            Some(
+                "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream"
+                    | "java/io/FileOutputStream"
+                    | "java/io/ByteArrayOutputStream"
+            )
+        ) {
+            return false;
+        }
+        let Some(key) = self.io_sink_key(wrapped) else {
+            return false;
+        };
+        if let Some(path) = self.io_paths.get(wrapped).cloned() {
+            self.io_paths.insert(marker.to_owned(), path);
+        }
+        self.io_writer_sinks.insert(marker.to_owned(), key.clone());
+        self.io_writers.entry(key).or_default();
+        true
     }
 
     /// Append text to a modelled writer's sink.
@@ -28541,11 +28604,14 @@ impl<H: Host> Runtime<'_, H> {
                 // `PrintWriter(Writer)` and `PrintWriter(OutputStream)` wrap one
                 // of ours; a `File`/`String` argument is a file the constructor
                 // itself opens.
-                if let Some(wrapped) = args.first().filter(|value| {
-                    expect_ref(value).is_some_and(|marker| self.io_paths.contains_key(marker))
-                }) {
+                if let Some(wrapped) = args
+                    .first()
+                    .filter(|value| self.io_bind_writer(&marker, value))
+                {
                     let path = self.io_path_of(wrapped);
-                    self.io_open_writer(&marker, path, false)?;
+                    if path.is_some() {
+                        self.io_open_writer(&marker, path, false)?;
+                    }
                 } else {
                     let path = args.first().and_then(|value| self.io_path_of(value));
                     self.io_open_writer(&marker, path, !appending)?;
@@ -28557,8 +28623,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -28566,8 +28637,13 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
-                let path = args.first().and_then(|value| self.io_path_of(value));
-                self.io_open_writer(&marker, path, false)?;
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    let path = args.first().and_then(|value| self.io_path_of(value));
+                    self.io_open_writer(&marker, path, false)?;
+                }
                 self.io_set_writer_charset(&marker, args);
                 Ok(Some(Value::Void))
             }
@@ -28576,6 +28652,25 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/ByteArrayOutputStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                self.io_open_writer(&marker, None, true)?;
+                Ok(Some(Value::Void))
+            }
+            "java/io/PrintStream" if r.name == "<init>" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                if !args
+                    .first()
+                    .is_some_and(|value| self.io_bind_writer(&marker, value))
+                {
+                    return Ok(None);
+                }
                 Ok(Some(Value::Void))
             }
             "java/io/FileOutputStream" | "java/io/FileInputStream" if r.name == "<init>" => {
@@ -28690,7 +28785,8 @@ impl<H: Host> Runtime<'_, H> {
             | "java/io/OutputStreamWriter"
             | "java/io/StringWriter"
             | "java/io/PrintWriter"
-            | "java/io/PrintStream" => {
+            | "java/io/PrintStream"
+            | "java/io/ByteArrayOutputStream" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
@@ -28964,10 +29060,28 @@ impl<H: Host> Runtime<'_, H> {
                     }
                     ("checkError", "()Z") => Value::Int(0),
                     ("toString", "()Ljava/lang/String;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
                     }
                     ("getBuffer", "()Ljava/lang/StringBuffer;") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
                         Value::Ref(Some(self.io_sink_text(&marker)))
+                    }
+                    ("toByteArray", "()[B") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        self.io_bytes_array(self.io_sink_text(&marker).into_bytes())
+                    }
+                    ("size", "()I") => {
+                        if self.counted_io_sink(&marker) {
+                            return self.counted_unknown(r).map(Some);
+                        }
+                        Value::Int(self.io_sink_text(&marker).len() as i32)
                     }
                     _ => return Ok(None),
                 }))
@@ -32541,6 +32655,38 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && self.contains_counted_string(receiver.as_ref(), &args)
                     {
+                        let counted_write = matches!(
+                            (r.owner.as_str(), r.name.as_str()),
+                            (
+                                "java/io/Writer"
+                                    | "java/io/BufferedWriter"
+                                    | "java/io/FileWriter"
+                                    | "java/io/OutputStreamWriter"
+                                    | "java/io/StringWriter"
+                                    | "java/io/PrintWriter"
+                                    | "java/io/PrintStream"
+                                    | "java/io/OutputStream",
+                                "append" | "write" | "print" | "println" | "printf" | "format"
+                            )
+                        );
+                        if counted_write
+                            && let Some(receiver) = receiver.as_ref()
+                            && let Some(marker) = jar_object::object_key(receiver)
+                        {
+                            self.mark_counted_io_sink(marker);
+                        }
+                        if r.owner == "java/util/StringJoiner"
+                            && matches!(r.name.as_str(), "add" | "merge")
+                            && let Some(receiver) = receiver.as_ref()
+                        {
+                            self.mark_counted_text_object(receiver);
+                        }
+                        if r.owner == "java/util/Formatter"
+                            && r.name == "format"
+                            && let Some(receiver) = receiver.as_ref()
+                        {
+                            self.mark_counted_text_object(receiver);
+                        }
                         let counted = invoke_or_catch!(at, self.counted_unknown(&r));
                         // `append`/`insert` return their builder. The host's
                         // neutral result may be null, but Java still returns
@@ -38682,6 +38828,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -38696,6 +38843,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -38763,6 +38911,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -38777,6 +38926,7 @@ mod tests {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -45924,6 +46074,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -45938,6 +46089,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -46147,6 +46299,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -46161,6 +46314,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -46345,6 +46499,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -46359,6 +46514,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -46719,6 +46875,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -46733,6 +46890,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -47037,6 +47195,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -47051,6 +47210,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -52313,6 +52473,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -52327,6 +52488,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),
@@ -52381,6 +52543,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -52395,6 +52558,7 @@ mandatory = true
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
             io_files: BTreeMap::new(),

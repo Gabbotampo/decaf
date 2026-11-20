@@ -2025,6 +2025,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -2039,6 +2040,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,

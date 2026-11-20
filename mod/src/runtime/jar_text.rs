@@ -346,6 +346,11 @@ impl<H: Host> Runtime<'_, H> {
             && matches!(opcode, 0xb6 | 0xb9)
             && let Some(receiver) = receiver
         {
+            if let Some(key) = crate::runtime::jar_object::object_key(receiver)
+                && self.counted_text_objects.contains(key)
+            {
+                return self.counted_unknown(r).map(Some);
+            }
             if self.is_counted_string(receiver) {
                 return self.counted_unknown(r).map(Some);
             }
