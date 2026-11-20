@@ -414,6 +414,12 @@ public final class Probe {
         return take((sub instanceof RandomAccess) + "," + (new Row("a").subList(0, 1) instanceof RandomAccess));
     }
 
+    public static String subListInterfaces() {
+        List<String> sub = new Row("a", "b").subList(0, 1);
+        return take((sub instanceof List) + "," + (sub instanceof java.util.Collection) + ","
+                + (sub instanceof Iterable) + "," + (sub instanceof RandomAccess));
+    }
+
     // ---- List defaults ----
 
     public static String sort() {
@@ -498,7 +504,7 @@ public final class Probe {
             "listIterator", "listIteratorBadIndex", "listIteratorSetWithoutNext", "previousPastStart", "clear",
             "addAllAtIndex", "addAllAtBadIndex", "addAllAppends", "equalsLists", "hashCodeList", "printed",
             "toArray", "subList", "subListWrites", "subListClear", "subListOfSubList", "subListRanges",
-            "subListComodification", "subListIterate", "subListRandomAccess", "replaceAll", "firstLast",
+            "subListComodification", "subListIterate", "subListRandomAccess", "subListInterfaces", "replaceAll", "firstLast",
             "firstOfEmpty", "streamRandomAccess", "streamSequential", "sequentialGetSet", "sequentialAddRemove",
             "sequentialBadIndex", "sequentialAddAll", "sequentialIterate",
         };
@@ -532,6 +538,7 @@ fn sub_list_runs_as_jdk_25_does() {
         ),
         ("subListIterate", "size size get1 get2 => bc"),
         ("subListRandomAccess", "size size => true,false"),
+        ("subListInterfaces", "size => true,true,true,false"),
     ]);
 }
 

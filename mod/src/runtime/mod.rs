@@ -2646,6 +2646,12 @@ pub trait Host {
         None
     }
 
+    /// The concrete class recorded for a sub-list, or `Some(None)` when the
+    /// parent list's class was unknown and only the list interfaces are known.
+    fn sub_list_class(&self, _value: &Value) -> Option<Option<String>> {
+        None
+    }
+
     fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
         None
     }
@@ -6370,6 +6376,13 @@ impl Host for StdHost {
 
     fn mutable_collection_values(&self, value: &Value) -> Option<Vec<Value>> {
         self.mutable_values(value)
+    }
+
+    fn sub_list_class(&self, value: &Value) -> Option<Option<String>> {
+        let marker = crate::runtime::jar_object::object_key(value)?;
+        self.sub_list_class_names
+            .get(marker)
+            .map(|class| (!class.is_empty()).then(|| class.clone()))
     }
 
     fn repeated_collection(&self, value: &Value) -> Option<(usize, Value)> {
