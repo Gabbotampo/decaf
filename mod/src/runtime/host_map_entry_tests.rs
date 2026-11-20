@@ -180,6 +180,21 @@ fn map_entries_answer_as_java_25_or_count() {
                 r#"java.util.Hashtable$Entry,truetrue,5,5,7,a=7,java.lang.NullPointerException: null,7"#,
             ),
         ),
+        ("hashtableReput", Exact(r#"null,false,a=7,{a=7},false"#)),
+        ("hashtableClear", Exact(r#"1|a=1|{}"#)),
+        ("hashtableLivePut", Exact(r#"5|a=5|5|{a=6}"#)),
+        // Java: `computeIfPresent:1:a=1:{};merge:1:a=1:{};` (JDK 25). The map model counts
+        // the remapping function's `apply` rather than running it (#598), so this stays counted.
+        ("hashtableComputeRemove", Counted),
+        (
+            "hashtableDetachedMethods",
+            Exact(
+                r#"null|java.lang.NullPointerException: Cannot invoke "Object.toString()" because "this.value" is null|97|false|null"#,
+            ),
+        ),
+        ("hashtableIteratorRemove", Exact(r#"1|a=1|{}"#)),
+        ("hashtableEnumerators", Counted),
+        ("propertiesEntry", Counted),
         // `IdentityHashMap`: a new entry per `next()` reading and writing the map (its own
         // `get`/`put` of `String` keys, whose identity is unknown, are counted).
         ("identityEntries", Counted),
