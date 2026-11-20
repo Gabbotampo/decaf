@@ -312,6 +312,14 @@ impl StdHost {
         ) {
             return Some(self.random_positional_call(key, state, r, args));
         }
+        // java.util.Random shares the 48-bit LCG with LegacyRandomSource, but not
+        // every method: the nextInt(origin, bound) it inherits from RandomGenerator
+        // draws differently for power-of-two and wide ranges (checked against a
+        // real JDK), and its messages differ. Answer only the methods Random
+        // implements itself on the LCG; leave every other call counted.
+        if matches!(state, State::Java { .. }) && !java_random_answers(r) {
+            return None;
+        }
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             ("setSeed", "(J)V") => {
                 let seed = as_long(args.first()?)?;
@@ -519,6 +527,20 @@ fn iae(message: &str) -> NativeError {
         frame: None,
     }
 }
+/// The java.util.Random methods answered on its LCG state. The rest (nextInt(II),
+/// nextLong(J), nextGaussian, streams...) stay counted.
+fn java_random_answers(r: &MethodRef) -> bool {
+    matches!(
+        (r.name.as_str(), r.descriptor.as_str()),
+        ("setSeed", "(J)V")
+            | ("nextInt", "()I")
+            | ("nextInt", "(I)I")
+            | ("nextLong", "()J")
+            | ("nextBoolean", "()Z")
+            | ("nextFloat", "()F")
+            | ("nextDouble", "()D")
+    )
+}
 fn scramble_legacy(seed: i64) -> u64 {
     ((seed as u64) ^ 0x5deece66d) & ((1u64 << 48) - 1)
 }
@@ -557,7 +579,11 @@ fn next_int(state: &mut State) -> i32 {
 }
 fn next_int_bound(state: &mut State, bound: i32) -> Result<Value, NativeError> {
     if bound <= 0 {
-        return Err(iae("Bound must be positive"));
+        // Minecraft's RandomSource capitalises its message; java.util.Random does not.
+        return Err(iae(match state {
+            State::Java { .. } => "bound must be positive",
+            _ => "Bound must be positive",
+        }));
     }
     let v = match state {
         State::Legacy { seed, .. } | State::Java { seed, .. } | State::Single { seed, .. } => {

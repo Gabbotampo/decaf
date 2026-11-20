@@ -27,7 +27,7 @@ fn row(m: &str) -> &str {
 }
 #[test]
 fn normal_rows() {
-    for m in ["objectsRows", "seededRandomRows"] {
+    for m in ["objectsRows", "seededRandomRows", "badBound"] {
         let (a, u) = invoke(&fixture(), m);
         assert_eq!(a, row(m));
         assert!(u.is_empty(), "{u:?}");
@@ -38,6 +38,15 @@ fn unseeded_is_counted() {
     let (a, u) = invoke(&fixture(), "unseededRandom");
     assert_eq!(a, "0");
     assert_eq!(u, vec![("java/util/Random#nextInt(I)I".into(), 1)]);
+}
+#[test]
+fn ranged_random_is_counted() {
+    // Java 25 answers 3: RandomGenerator's nextInt(origin, bound) draws
+    // differently from Minecraft's RandomSource for power-of-two ranges, so the
+    // call is counted, not answered with the Minecraft algorithm.
+    let (a, u) = invoke(&fixture(), "rangedRandom");
+    assert_eq!(a, "0");
+    assert_eq!(u, vec![("java/util/Random#nextInt(II)I".into(), 1)]);
 }
 #[test]
 fn unknown_hash_is_counted() {
