@@ -43,7 +43,7 @@ registry is already immutable.
 
 | # | Way | Declared at | Read at | Assets |
 |---|---|---|---|---|
-| 1 | Content declaration files `data/<id>/horizon/{block,item}/<path>.json` in a `.hmod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo sunrise-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`sunrise-mod-content.stamp`) | The same `.hmod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
+| 1 | Content declaration files `data/<id>/sunrise/{block,item}/<path>.json` in a `.hmod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo sunrise-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`sunrise-mod-content.stamp`) | The same `.hmod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
 | 2 | Native code declarations: `Hooks::blocks` (`native_blocks`) and `Hooks::items` (`native_items`), NeoForge's `RegisterEvent` drained from `DeferredRegister.Blocks`/`.Items` | at the game's **Registration** phase, by `mods::freeze_declarations` (`crates/horizon-client/src/game.rs`), once per process | immediately, into the same content root that reads (1); together with a content mod of the same id when one is on, else as a synthetic mod with no files ("the template's look") | None of its own. A native mod's package may carry `assets/<its own id>/`, but the content fence (`Content::check_namespace`) refuses another namespace |
 | 3 | A native mod's own `assets/`/`data/` in its `.hmod` | package time | every resource/data load as a pack layer | Its own namespaces only, plus vanilla/convention tags and vanilla atlases |
 | 4 | World/game-load registration | — | — | There is none. The item/block name↔id tables are immutable once built; world load only maps saved names to numeric ids, `/reload` reloads resources and data, not content. Content selection is frozen while a world is open, and a mod installed then is read on the next start |
@@ -55,7 +55,7 @@ standalone models, block entity types). They take a `RegistrationContext`, which
 config-file service and no game-directed read; the config service first exists in `Config`.
 
 The two declaration routes are the same content vocabulary: `content::Block`/`content::Item` are
-what a `data/<id>/horizon/block|item/*.json` file deserialises to. A native declaration is checked
+what a `data/<id>/sunrise/block|item/*.json` file deserialises to. A native declaration is checked
 exactly like a file (`Content::declare`: the id belongs to the declaring namespace, the template is
 a vanilla id, the item is declared once, a crafting remainder exists), and a refused namespace is
 left out whole.
@@ -90,7 +90,7 @@ once with `StdHost` exactly as M1 does, read `host.registrations()`, translate e
 An offline tool (or a launcher step) runs the same entrypoints with `NativeJar`/`StdHost`, reads
 `registrations()`, and writes a `.hmod` for the jar:
 
-- `data/<jar id>/horizon/block/<path>.json` and `.../item/<path>.json` from the typed declarations,
+- `data/<jar id>/sunrise/block/<path>.json` and `.../item/<path>.json` from the typed declarations,
   in the same vocabulary as (1);
 - the jar's `assets/` and `data/` copied verbatim: blockstates, models, item definitions, textures,
   lang, loot tables, recipes, tags;
