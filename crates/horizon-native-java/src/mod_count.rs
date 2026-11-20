@@ -83,7 +83,7 @@ impl ModStamp {
         }
     }
 
-    fn bumped(self, uncertain: bool) -> Self {
+    pub(crate) fn bumped(self, uncertain: bool) -> Self {
         if self == Self::UNKEPT {
             return self;
         }
@@ -131,6 +131,7 @@ fn tracked(class: &str) -> bool {
             | "java/util/TreeMap"
             | "java/util/IdentityHashMap"
             | "java/util/WeakHashMap"
+            | "java/util/Hashtable"
             | "java/util/HashSet"
             | "java/util/LinkedHashSet"
             | "java/util/TreeSet"
