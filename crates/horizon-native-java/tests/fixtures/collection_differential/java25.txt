@@ -1246,3 +1246,20 @@
 38,29=R=[3]|L=[3]
 38,30=R=2147483647|L=1
 38,31=E=java.lang.IllegalArgumentException:List length = -1|L=[3]
+0,32=E=java.lang.UnsupportedOperationException:null|L=[1]
+0,33=R=false|L=[1]
+0,34=R=false|L=[1]
+0,35=E=java.lang.UnsupportedOperationException:null|L=[1]
+0,36=E=java.lang.UnsupportedOperationException:null|L=[1, 1, 1, 1]
+0,37=R=false|L=[1, 1, 1, 1]
+0,38=E=java.lang.UnsupportedOperationException:null|L=[1, 1, 1, 1]
+0,39=R=false|L=[1, 1, 1, 1]
+0,40=R=false|L=[1, 1, 1, 1]
+0,41=E=java.lang.UnsupportedOperationException:null|L=[1, 1, 1, 1]
+0,42=R=java.util.ArrayList$SubList
+0,43=R=java.util.AbstractList$SubList
+0,44=R=java.util.Collections$SynchronizedRandomAccessList
+0,45=R=java.util.AbstractList$RandomAccessSubList
+0,46=R=java.util.ImmutableCollections$SubList
+0,47=R=java.util.Collections$UnmodifiableRandomAccessList
+0,48=R=java.util.Collections$SynchronizedRandomAccessList

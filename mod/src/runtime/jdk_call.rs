@@ -409,23 +409,6 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return error;
         };
-        if class == "java/util/NoSuchElementException"
-            && caught == "java/lang/IndexOutOfBoundsException"
-        {
-            let probe = MethodRef {
-                owner: "java/util/List".into(),
-                name: "iterator.next.cause".into(),
-                descriptor: "()Ljava/lang/Object;".into(),
-            };
-            return match self.host.unknown_operand_call(&probe) {
-                Ok(_) => NativeError::UncaughtException {
-                    class: class.into(),
-                    message: None,
-                    frame: None,
-                },
-                Err(error) => error,
-            };
-        }
         let cause_text = Some(match message.as_deref() {
             Some(message) => format!("{}: {message}", caught.replace('/', ".")),
             None => caught.replace('/', "."),

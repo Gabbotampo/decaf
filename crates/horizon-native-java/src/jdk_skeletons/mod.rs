@@ -345,6 +345,20 @@ impl<H: Host> Runtime<'_, H> {
             if handle.kind() == crate::host_ref::HostKind::Collection);
         if host_made
             && crate::expect_ref(this).is_some_and(|marker| {
+                matches!(
+                    crate::jar_object::collection_class(marker),
+                    list::SUB_LIST | list::RANDOM_ACCESS_SUB_LIST
+                )
+            })
+        {
+            // The host keeps sub-list elements in its collection table.  The
+            // JDK skeleton's fields belong only to jar-owned AbstractList
+            // objects; running it on a host marker would read default fields
+            // and discard otherwise successful host mutations.
+            return Ok(None);
+        }
+        if host_made
+            && crate::expect_ref(this).is_some_and(|marker| {
                 crate::jar_object::collection_class(marker) == list::RANDOM_ACCESS_SUB_LIST
             })
             && self

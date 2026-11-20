@@ -69,12 +69,47 @@ public class Probe {
         case 30: { List<Integer> n=Collections.nCopies(Integer.MAX_VALUE, 1); return "R="+n.size()+"|L="+n.get(Integer.MAX_VALUE-1); }
         case 31: try { Collections.nCopies(-1, 1); return "R=bad|L="+safeList(x); }
           catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
+        // Immutable bulk mutators: AbstractCollection/Collection only reach
+        // Iterator.remove when an element actually matches.
+        case 32: x=Collections.singletonList(1); return result("R="+x.removeAll(List.of(1)), x);
+        case 33: x=Collections.singletonList(1); return result("R="+x.removeAll(List.of(2)), x);
+        case 34: x=Collections.singletonList(1); return result("R="+x.retainAll(List.of(1)), x);
+        case 35: x=Collections.singletonList(1); return result("R="+x.retainAll(List.of(2)), x);
+        case 36: x=Collections.nCopies(4, 1); return result("R="+x.removeIf(v -> v == 1), x);
+        case 37: x=Collections.nCopies(4, 1); return result("R="+x.removeIf(v -> v == 2), x);
+        case 38: x=Collections.nCopies(4, 1); return result("R="+x.removeAll(List.of(1)), x);
+        case 39: x=Collections.nCopies(4, 1); return result("R="+x.removeAll(List.of(2)), x);
+        case 40: x=Collections.nCopies(4, 1); return result("R="+x.retainAll(List.of(1)), x);
+        case 41: x=Collections.nCopies(4, 1); return result("R="+x.retainAll(List.of(2)), x);
+        // The concrete class returned by each JDK parent's subList method.
+        case 42: return "R="+subListClass(0);
+        case 43: return "R="+subListClass(1);
+        case 44: return "R="+subListClass(2);
+        case 45: return "R="+subListClass(3);
+        case 46: return "R="+subListClass(4);
+        case 47: return "R="+subListClass(5);
+        case 48: return "R="+subListClass(6);
         default: throw new AssertionError(op);
       }
     } catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
   }
+  static String subListClass(int which) {
+    List<Integer> parent;
+    switch (which) {
+      case 0: parent = new ArrayList<>(List.of(1,2,3,4)); break;
+      case 1: parent = new LinkedList<>(List.of(1,2,3,4)); break;
+      case 2: parent = new Vector<>(List.of(1,2,3,4)); break;
+      case 3: parent = Arrays.asList(1,2,3,4); break;
+      case 4: parent = List.of(1,2,3,4); break;
+      case 5: parent = Collections.unmodifiableList(new ArrayList<>(List.of(1,2,3,4))); break;
+      case 6: parent = Collections.synchronizedList(new ArrayList<>(List.of(1,2,3,4))); break;
+      default: throw new AssertionError(which);
+    }
+    return parent.subList(1,3).getClass().getName();
+  }
   public static String probe(int r, int op) { return run(r,op); }
   public static void main(String[] a) {
     for (int r=0;r<39;r++) for (int op=0;op<32;op++) System.out.println(r+","+op+"="+run(r,op));
+    for (int op=32;op<=48;op++) System.out.println("0,"+op+"="+run(0,op));
   }
 }

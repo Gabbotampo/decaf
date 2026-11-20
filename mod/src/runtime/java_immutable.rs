@@ -210,11 +210,18 @@ pub(crate) fn member_class_names(name: &str) -> Option<(String, String)> {
         "java.util.Collections$SingletonMap",
         "java.util.Collections$UnmodifiableList",
         "java.util.Collections$UnmodifiableRandomAccessList",
+        "java.util.Collections$SynchronizedList",
+        "java.util.Collections$SynchronizedRandomAccessList",
         "java.util.Collections$UnmodifiableCollection",
         "java.util.Collections$UnmodifiableSet",
         "java.util.Collections$UnmodifiableMap",
         "java.util.ReverseOrderListView$Rand",
         "java.util.LinkedList$ReverseOrderLinkedListView",
+        "java.util.ArrayList$SubList",
+        "java.util.AbstractList$SubList",
+        "java.util.AbstractList$RandomAccessSubList",
+        "java.util.ImmutableCollections$SubList",
+        "java.util.Collections$CopiesList",
     ];
     MEMBERS.contains(&name).then(|| {
         let simple = name.rsplit('$').next().unwrap_or(name).to_owned();

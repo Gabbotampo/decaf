@@ -1709,6 +1709,7 @@ mod tests {
             "iterator_guards",
             "mod_stamps",
             "sub_lists",
+            "sub_list_class_names",
             "detached_sub_lists",
             "list_iterators",
             "deque_layouts",

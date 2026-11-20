@@ -3543,6 +3543,7 @@ pub struct StdHost {
     repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
     detached_sub_lists: BTreeSet<String>,
+    sub_list_class_names: BTreeMap<String, String>,
     /// Live SetFromMap marker -> backing map marker.
     set_from_map_views: BTreeMap<String, String>,
     next_set_from_map: u64,
@@ -3812,6 +3813,7 @@ impl StdHost {
             mutable_collections: collection_store::CollectionStore::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
+            sub_list_class_names: BTreeMap::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
             component_states: BTreeMap::new(),
@@ -8612,6 +8614,12 @@ impl Host for StdHost {
         // A synchronized view runs every call on what it wraps
         // (`synchronized_views.rs`).
         if let Some(wrapped) = self.synchronized_receiver(receiver) {
+            if r.name == "subList"
+                && r.descriptor == "(II)Ljava/util/List;"
+                && let Some(marker) = expect_ref(receiver)
+            {
+                return self.sub_list(r, marker, args);
+            }
             return self.invoke_instance(r, &wrapped, args);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
@@ -8684,6 +8692,11 @@ impl Host for StdHost {
             // is still an object of *some* class: the neutral `null` is a
             // guess, so it is counted, not answered silently.
             // A text `instanceof String` accepts is a `String` here too.
+            if let Some(marker) = expect_ref(receiver)
+                && let Some(class) = self.sub_list_class_names.get(marker)
+            {
+                return Ok(host_class::class_value(class));
+            }
             return match class_of_value(receiver) {
                 Some(class) => Ok(host_class::class_value(&class)),
                 None if expect_ref(receiver)
@@ -14689,10 +14702,16 @@ fn is_list_owner(owner: &str) -> bool {
             "java/util/List"
                 | "java/util/AbstractList"
                 | "java/util/AbstractSequentialList"
+                | "java/util/AbstractList$SubList"
+                | "java/util/AbstractList$RandomAccessSubList"
+                | "java/util/LinkedList$SubList"
                 | "java/util/ArrayList"
+                | "java/util/ArrayList$SubList"
                 | "java/util/LinkedList"
                 | "java/util/Vector"
                 | "java/util/Stack"
+                | "java/util/Collections$SynchronizedList"
+                | "java/util/Collections$SynchronizedRandomAccessList"
                 | "java/util/concurrent/CopyOnWriteArrayList"
                 | "com/google/common/collect/ImmutableList"
         )
@@ -31492,7 +31511,11 @@ impl<H: Host> Runtime<'_, H> {
                     // wraps (`synchronized_views.rs`): the collection models
                     // below answer for that collection, in its own order.
                     let receiver = match receiver {
-                        Some(view) if op != 0xb7 => {
+                        Some(view)
+                            if op != 0xb7
+                                && !(r.name == "subList"
+                                    && r.descriptor == "(II)Ljava/util/List;") =>
+                        {
                             Some(self.host.synchronized_wrapped(&view).unwrap_or(view))
                         }
                         receiver => receiver,
@@ -31838,6 +31861,86 @@ impl<H: Host> Runtime<'_, H> {
                                 })
                             )
                         });
+                    }
+                    // `SingletonList`/`CopiesList` inherit (or override with
+                    // the same iterator semantics as) the collection bulk
+                    // mutators.  Their iterator's `remove` throws UOE only
+                    // after a matching element is found; an absent match
+                    // returns false without touching the immutable list.
+                    // Keep this decision ahead of both the immutable model's
+                    // intentional fallthrough and the mutable collection arm.
+                    if dispatched.is_none()
+                        && let Some(receiver) = receiver.as_ref()
+                        && let Some(marker) = expect_ref(receiver)
+                        && matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/Collections$SingletonList"
+                                | "java/util/Collections$CopiesList"
+                        )
+                        && matches!(r.name.as_str(), "removeAll" | "retainAll" | "removeIf")
+                        && (r.name != "removeIf"
+                            || jar_object::collection_class(marker)
+                                == "java/util/Collections$CopiesList")
+                        && !is_map_owner(&r.owner)
+                    {
+                        dispatched = Some(invoke_or_catch!(
+                            at,
+                            (|| -> Result<Value, NativeError> {
+                                let values = self.collection_elements(receiver)?;
+                                let would_remove = match r.name.as_str() {
+                                    "removeIf" => {
+                                        let predicate =
+                                            args.first().cloned().unwrap_or(Value::Ref(None));
+                                        if matches!(predicate, Value::Ref(None)) {
+                                            return Err(NativeError::UncaughtException {
+                                                class: "java/lang/NullPointerException".into(),
+                                                message: None,
+                                                frame: None,
+                                            });
+                                        }
+                                        let mut matched = false;
+                                        for value in &values {
+                                            if self.predicate_holds(&predicate, value)? {
+                                                matched = true;
+                                                break;
+                                            }
+                                        }
+                                        matched
+                                    }
+                                    "removeAll" | "retainAll" => {
+                                        let source =
+                                            args.first().cloned().unwrap_or(Value::Ref(None));
+                                        if matches!(source, Value::Ref(None)) {
+                                            return Err(NativeError::UncaughtException {
+                                                class: "java/lang/NullPointerException".into(),
+                                                message: None,
+                                                frame: None,
+                                            });
+                                        }
+                                        let source = self.collection_elements(&source)?;
+                                        values.iter().any(|value| {
+                                            let contained =
+                                                source.iter().any(|candidate| candidate == value);
+                                            if r.name == "removeAll" {
+                                                contained
+                                            } else {
+                                                !contained
+                                            }
+                                        })
+                                    }
+                                    _ => false,
+                                };
+                                if would_remove {
+                                    Err(NativeError::UncaughtException {
+                                        class: "java/lang/UnsupportedOperationException".into(),
+                                        message: None,
+                                        frame: None,
+                                    })
+                                } else {
+                                    Ok(Value::Int(0))
+                                }
+                            })()
+                        ));
                     }
                     if dispatched.is_none()
                         && let Some(value) =

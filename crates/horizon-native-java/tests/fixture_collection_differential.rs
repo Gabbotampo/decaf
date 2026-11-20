@@ -17,7 +17,8 @@ fn collection_matrix_matches_jdk_25_for_modelled_calls() {
     let mut exact = 0usize;
     let mut counted = 0usize;
     let mut mismatches = Vec::new();
-    for line in include_str!("fixtures/collection_differential/java25.txt").lines() {
+    let oracle = include_str!("fixtures/collection_differential/java25.txt");
+    for line in oracle.lines() {
         let Some((case, expected)) = line.split_once('=') else {
             continue;
         };
@@ -50,5 +51,8 @@ fn collection_matrix_matches_jdk_25_for_modelled_calls() {
         mismatches.len(),
         mismatches.join("\n")
     );
-    assert_eq!(exact + counted, 39 * 32);
+    assert_eq!(
+        exact + counted,
+        oracle.lines().filter(|line| line.contains('=')).count()
+    );
 }
