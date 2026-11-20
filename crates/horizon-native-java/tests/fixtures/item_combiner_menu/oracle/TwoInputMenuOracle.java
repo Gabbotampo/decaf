@@ -10,25 +10,36 @@ import net.minecraft.world.inventory.Slot;
 /** Independent Java 25 oracle for a mod-owned two-input ItemCombinerMenu. */
 public final class TwoInputMenuOracle {
   private static final class TwoInputMenu extends ItemCombinerMenu {
+    boolean created;
+
     TwoInputMenu() {
       super((MenuType<?>) null, 17, new Inventory(null, null), ContainerLevelAccess.NULL, definition());
     }
 
     private static ItemCombinerMenuSlotDefinition definition() {
       return ItemCombinerMenuSlotDefinition.create()
-          .withSlot(0, 17, 29, stack -> true)
+          .withSlot(0, 17, 29, stack -> stack != net.minecraft.world.item.ItemStack.EMPTY)
           .withSlot(1, 73, 29, stack -> true)
           .withResultSlot(2, 121, 29)
           .build();
     }
 
-    @Override public void createResult() { resultSlots.setItem(0, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.STONE)); }
+    @Override public void createResult() { created = true; resultSlots.setItem(0, net.minecraft.world.item.ItemStack.EMPTY); }
     @Override protected void onTake(net.minecraft.world.entity.player.Player player,
                                     net.minecraft.world.item.ItemStack stack) { }
     @Override protected boolean isValidBlock(net.minecraft.world.level.block.state.BlockState state) { return true; }
 
-    void trigger() { inputSlots.setItem(0, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.STONE)); }
-    boolean resultSet() { return resultSlots.getItem(0) != net.minecraft.world.item.ItemStack.EMPTY; }
+    void trigger() { inputSlots.setItem(0, net.minecraft.world.item.ItemStack.EMPTY); }
+    boolean resultSet() { return created; }
+  }
+
+  private static void validation(String name, Runnable action) {
+    try {
+      action.run();
+      System.out.println(name + "=ok");
+    } catch (Throwable error) {
+      System.out.println(name + "=" + error.getClass().getName() + ":" + error.getMessage());
+    }
   }
 
   public static void main(String[] args) {
@@ -50,5 +61,12 @@ public final class TwoInputMenuOracle {
     menu.trigger();
     System.out.println("resultSet=" + menu.resultSet());
     System.out.println("mayPlace=" + menu.getSlot(0).mayPlace(net.minecraft.world.item.ItemStack.EMPTY));
+    validation("builderEmpty", () -> ItemCombinerMenuSlotDefinition.create().build());
+    validation("builderUnsetResult", () -> ItemCombinerMenuSlotDefinition.create()
+        .withSlot(0, 0, 0, stack -> true).build());
+    validation("builderBadInputIndex", () -> ItemCombinerMenuSlotDefinition.create()
+        .withSlot(1, 0, 0, stack -> true).withResultSlot(2, 0, 0).build());
+    validation("builderBadResultIndex", () -> ItemCombinerMenuSlotDefinition.create()
+        .withSlot(0, 0, 0, stack -> true).withResultSlot(2, 0, 0).build());
   }
 }

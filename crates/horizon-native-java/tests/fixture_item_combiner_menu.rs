@@ -132,17 +132,22 @@ import net.minecraft.world.inventory.*; import net.minecraft.world.item.ItemStac
 public final class TwoInputMenu extends ItemCombinerMenu {
   public TwoInputMenu() { super(null, 17, null, ContainerLevelAccess.NULL, createDefinition()); }
   private static ItemCombinerMenuSlotDefinition createDefinition() {
-    return ItemCombinerMenuSlotDefinition.create().withSlot(0, 17, 29, stack -> true).withSlot(1, 73, 29, stack -> true).withResultSlot(2, 121, 29).build();
+    return ItemCombinerMenuSlotDefinition.create().withSlot(0, 17, 29, stack -> stack != ItemStack.EMPTY).withSlot(1, 73, 29, stack -> true).withResultSlot(2, 121, 29).build();
   }
-  @Override public void createResult() { resultSlots.setItem(0, new ItemStack()); }
+  boolean created;
+  @Override public void createResult() { created = true; resultSlots.setItem(0, ItemStack.EMPTY); }
   @Override protected void onTake(Player p, ItemStack s) { }
   @Override protected boolean isValidBlock(BlockState s) { return true; }
-  public void trigger() { inputSlots.setItem(0, new ItemStack()); }
-  public boolean resultSet() { return resultSlots.getItem(0) != ItemStack.EMPTY; }
+  public void trigger() { inputSlots.setItem(0, ItemStack.EMPTY); }
+  public boolean resultSet() { return created; }
 }
 "#,
         "demo/Main.java" => r#"package demo;
 public final class Main {
+  private static void validation(String name, Runnable action) {
+    try { action.run(); System.out.println(name + "=ok"); }
+    catch (Throwable error) { System.out.println(name + "=" + error.getClass().getName() + ":" + error.getMessage()); }
+  }
   public static void onInitialize() {
     TwoInputMenu menu = new TwoInputMenu();
     new net.minecraft.world.item.crafting.RecipeManager().getRecipeFor();
@@ -160,6 +165,10 @@ public final class Main {
     menu.trigger();
     System.out.println("resultSet=" + menu.resultSet());
     System.out.println("mayPlace=" + menu.getSlot(0).mayPlace(net.minecraft.world.item.ItemStack.EMPTY));
+    validation("builderEmpty", () -> net.minecraft.world.inventory.ItemCombinerMenuSlotDefinition.create().build());
+    validation("builderUnsetResult", () -> net.minecraft.world.inventory.ItemCombinerMenuSlotDefinition.create().withSlot(0, 0, 0, stack -> true).build());
+    validation("builderBadInputIndex", () -> net.minecraft.world.inventory.ItemCombinerMenuSlotDefinition.create().withSlot(1, 0, 0, stack -> true).withResultSlot(2, 0, 0).build());
+    validation("builderBadResultIndex", () -> net.minecraft.world.inventory.ItemCombinerMenuSlotDefinition.create().withSlot(0, 0, 0, stack -> true).withResultSlot(2, 0, 0).build());
   }
 }
 "#,

@@ -337,14 +337,6 @@ pub(crate) fn call(
                 let Some(Object::Builder { inputs, result }) = states.get(&key).cloned() else {
                     return None;
                 };
-                if inputs.is_empty() || result.as_ref().is_none_or(|slot| slot.empty) {
-                    return Some(Err(NativeError::UncaughtException {
-                        class: "java/lang/IllegalArgumentException".into(),
-                        message: Some("Need to define both inputSlots and resultSlot".into()),
-                        frame: None,
-                    }));
-                }
-                let result = result.unwrap();
                 if inputs
                     .iter()
                     .enumerate()
@@ -356,12 +348,20 @@ pub(crate) fn call(
                         frame: None,
                     }));
                 }
+                let result = result?;
                 if result.index != inputs.len() as i32 {
                     return Some(Err(NativeError::UncaughtException {
                         class: "java/lang/IllegalArgumentException".into(),
                         message: Some(
                             "Expected result slot index to follow last input slot".into(),
                         ),
+                        frame: None,
+                    }));
+                }
+                if inputs.is_empty() || result.empty {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Need to define both inputSlots and resultSlot".into()),
                         frame: None,
                     }));
                 }
