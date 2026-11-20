@@ -281,12 +281,9 @@ fn text(handle: &HostRef, nested: &mut dyn Nested) -> Result<Option<String>, Nat
             }
             Ok(Some(text))
         }
-        OR_ELSE => {
-            let Some(inner) = values.get(2) else {
-                return Ok(None);
-            };
-            Ok(nested.text(inner)?.map(|text| format!("{text}[orElse]")))
-        }
+        // DFU's `orElse` is `mapResult(OrElse[...])`, whose text includes the fallback's own
+        // `toString`: not modelled, so the text stays counted rather than invented.
+        OR_ELSE => Ok(None),
         UNIT | UNIT_CODEC => {
             let Some(value) = values.get(2) else {
                 return Ok(None);
@@ -819,7 +816,11 @@ pub(crate) fn invoke(
     // optional field followed by `Instance.group(...).` The game class itself
     // is outside the modeled surface, so preserve the real P1 shape here
     // rather than returning Java's null and making the caller's `and` throw.
-    if r.name == "commonFields" && r.descriptor.contains("Products$P1") {
+    if r.owner == "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction"
+        && r.name == "commonFields"
+        && r.descriptor
+            == "(Lcom/mojang/serialization/codecs/RecordCodecBuilder$Instance;)Lcom/mojang/datafixers/Products$P1;"
+    {
         return build(
             host,
             r,

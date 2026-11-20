@@ -24555,6 +24555,34 @@ impl<H: Host> Runtime<'_, H> {
             .and_then(|(owner, jar)| jar.then_some(owner))
     }
 
+    /// `LootItemConditionalFunction.commonFields(instance)` as a jar subclass calls it: its
+    /// `invokestatic` names the subclass. Answered only when the jar's chain from `r.owner` reaches
+    /// the vanilla class without any jar class declaring a `commonFields` of its own (whose body the
+    /// interpreter runs instead).
+    fn vanilla_loot_common_fields(&mut self, r: &MethodRef) -> Option<Value> {
+        const LOOT_FUNCTION: &str =
+            "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction";
+        let mut current = r.owner.clone();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            if current == LOOT_FUNCTION {
+                let vanilla = MethodRef {
+                    owner: LOOT_FUNCTION.into(),
+                    ..r.clone()
+                };
+                return dfu_codec::invoke(self.host, &vanilla, None, &[]);
+            }
+            let file = self.class(&current)?;
+            if file.method(&r.name, &r.descriptor).is_some() {
+                return None;
+            }
+            if file.super_name.is_empty() || file.super_name == current {
+                return None;
+            }
+            current = file.super_name.clone();
+        }
+        None
+    }
+
     pub(crate) fn jar_extends(&self, class: &str, wanted: &str) -> bool {
         let mut current = class.to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
@@ -31296,14 +31324,28 @@ impl<H: Host> Runtime<'_, H> {
                         // anything is dispatched. An `@Redirect` or a cancelling
                         // hook above replaced the call, so it never ran.
                         invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
-                    } else if let Some(value) =
-                        dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
+                    } else if let Some(value) = r
+                        .owner
+                        .starts_with("com/mojang/datafixers/Products$P")
+                        .then(|| dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args))
+                        .flatten()
                     {
+                        // DFU's own product classes (`Products.P1.and`): never a jar's class, so
+                        // they are answered before any jar body would be looked up.
                         value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
-                    ) {
+                    } else if r.name == "commonFields"
+                        && let Some(value) = self.vanilla_loot_common_fields(&r)
+                    {
+                        // `LootItemConditionalFunction.commonFields`, which a subclass calls
+                        // unqualified, so the call names the jar's own class: answered only
+                        // when that class inherits it from the vanilla one (#410 review).
+                        value
+                    } else if r.owner.starts_with("com/mojang/datafixers/Products$P")
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
                         value
                     } else if r.owner == "java/lang/String"
                         && r.name == "format"
