@@ -648,6 +648,15 @@ public class CraftingTableBlock extends Block {
 }"#,
     );
     stubs.insert(
+        "net/minecraft/world/level/block/piston/PistonBaseBlock.java",
+        r#"package net.minecraft.world.level.block.piston;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public class PistonBaseBlock extends Block {
+    public PistonBaseBlock(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+    );
+    stubs.insert(
         "net/minecraft/world/level/block/FurnaceBlock.java",
         r#"package net.minecraft.world.level.block;
 import net.minecraft.world.level.block.state.BlockBehaviour;
@@ -739,6 +748,14 @@ public final class Inherited extends CraftingTableBlock {
 }"#,
         // No jar override, but 26.3's `FurnaceBlock` inherits `AbstractFurnaceBlock`'s definition
         // (FACING, LIT), which the runtime does not run: counted, and no state set is claimed.
+        // A vanilla block class in a subpackage (`block/piston/`) that declares its own
+        // definition (FACING, EXTENDED in 26.3): counted the same way.
+        "demo/Pusher.java" => r#"package demo;
+import net.minecraft.world.level.block.piston.PistonBaseBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Pusher extends PistonBaseBlock {
+    public Pusher(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
         "demo/Smelter.java" => r#"package demo;
 import net.minecraft.world.level.block.FurnaceBlock;
 import net.minecraft.world.level.block.state.BlockBehaviour;
@@ -762,6 +779,8 @@ public final class StateMod implements ModInitializer {
                 new Inherited(BlockBehaviour.Properties.of()));
         Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "smelter"),
                 new Smelter(BlockBehaviour.Properties.of()));
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "pusher"),
+                new Pusher(BlockBehaviour.Properties.of()));
     }
 }"#,
     };
@@ -817,9 +836,10 @@ public final class StateMod implements ModInitializer {
     assert_eq!(
         counted,
         [
-            "net/minecraft/world/level/block/FurnaceBlock#createBlockStateDefinition(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V"
+            "net/minecraft/world/level/block/FurnaceBlock#createBlockStateDefinition(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V",
+            "net/minecraft/world/level/block/piston/PistonBaseBlock#createBlockStateDefinition(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V",
         ],
-        "only the FurnaceBlock chain adds properties the runtime does not run"
+        "only the FurnaceBlock and PistonBaseBlock chains add properties the runtime does not run"
     );
     let _ = fs::remove_dir_all(root);
 }

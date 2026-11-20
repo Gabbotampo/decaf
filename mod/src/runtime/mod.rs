@@ -13206,13 +13206,10 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
-/// `Block` itself or a vanilla block class directly in its package
-/// (`FenceBlock`, `FireBlock`), whose constructor a mod's block reaches
-/// through `super(...)`.
+/// `Block` or a vanilla subclass of it (`FenceBlock`, `piston/PistonBaseBlock`), exactly, from the
+/// captured 26.3 class table, whose constructor a mod's block reaches through `super(...)`.
 fn is_vanilla_block_class(owner: &str) -> bool {
-    owner
-        .strip_prefix("net/minecraft/world/level/block/")
-        .is_some_and(|name| !name.contains('/') && name.ends_with("Block"))
+    vanilla_block_state_definers::is_block_class(owner)
 }
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
@@ -24691,15 +24688,12 @@ impl<H: Host> Runtime<'_, H> {
         self.new_array_value(class, values)
     }
 
-    /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
-    /// fresh allocation number (`jar_object.rs`).
     /// A jar block's `super(...)` reaching the first vanilla constructor in its chain: `Block`
-    /// or a vanilla subclass (`CraftingTableBlock`, `FenceBlock`). Every chain ends in
-    /// `Block.<init>`, which calls the virtual `createBlockStateDefinition` before the
-    /// subclass constructor continues, so a jar override runs here whichever vanilla class the
-    /// jar extends. A constructor is never an interface's, and in 26.3 every class
-    /// `is_vanilla_block_class` names that is not an interface is a `Block`. Called from the
-    /// `invokespecial` site, where a vanilla constructor call is dispatched.
+    /// or a vanilla subclass (`CraftingTableBlock`, `FenceBlock`, `piston/PistonBaseBlock`; the
+    /// captured class table decides). Every chain ends in `Block.<init>`, which calls the virtual
+    /// `createBlockStateDefinition` before the subclass constructor continues, so a jar override
+    /// runs here whichever vanilla class the jar extends. Called from the `invokespecial` site,
+    /// where a vanilla constructor call is dispatched.
     #[inline(never)]
     fn run_vanilla_block_constructor_hooks(&mut self, receiver: &Value) -> Result<(), NativeError> {
         let Some(marker) = jar_object::object_key(receiver) else {
@@ -24769,6 +24763,8 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
+    /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
+    /// fresh allocation number (`jar_object.rs`).
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
         if render_math::is_class(class) {
