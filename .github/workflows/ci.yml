@@ -11,7 +11,7 @@ on:
 jobs:
   gates:
     runs-on: ubuntu-latest
-    # The full test suite now takes 35-43 minutes on hosted runners: 45 cancelled #585 twice while its
+    # The full test suite now takes up to 44 minutes on hosted runners: 45 cancelled #585 twice while its
     # last test files were running, with no failure. 75 leaves headroom without hiding a real hang.
     timeout-minutes: 75
     steps:
