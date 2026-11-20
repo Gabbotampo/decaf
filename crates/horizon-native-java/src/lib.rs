@@ -31364,8 +31364,12 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        let marker = receiver.and_then(expect_ref)?;
-        if self.host.is_immutable_empty_sublist(marker)
+        // Two independent checks, as the two original dispatch arms were: an
+        // immutable empty sub-list (a `Ref` marker) and, separately, any empty
+        // `SubList` including host-backed collections (`Value::Host`), which
+        // `expect_ref` doesn't accept, so it must not end the helper early.
+        if let Some(marker) = receiver.and_then(expect_ref)
+            && self.host.is_immutable_empty_sublist(marker)
             && matches!(
                 (r.name.as_str(), r.descriptor.as_str()),
                 ("set", "(ILjava/lang/Object;)Ljava/lang/Object;")
