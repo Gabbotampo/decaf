@@ -257,15 +257,14 @@ fn candidates_for_side(jar: &NativeJar, side: &str) -> Vec<NestedCandidate> {
 }
 
 /// The root component of a nested class-path id. Path-loaded roots use their
-/// own path, while in-memory fixtures retain a readable metadata label and
-/// finally fall back to the byte identity. This is stable for one discovery
-/// run and distinct for separate top-level jars.
+/// own path; in-memory roots use Fabric's byte identity before metadata labels,
+/// so same-id roots with different bytes cannot share a component.
 fn root_identity(jar: &NativeJar) -> String {
     jar.source_path
         .clone()
+        .or_else(|| jar.source_hash.map(|hash| format!("jar-{hash:016x}")))
         .or_else(|| jar.fabric_id.clone())
         .or_else(|| jar.neoforge_id.clone())
-        .or_else(|| jar.source_hash.map(|hash| format!("jar-{hash:016x}")))
         .unwrap_or_else(|| format!("jar-{:016x}", identity(jar)))
 }
 
@@ -1042,34 +1041,35 @@ fn constraint_blocks_forced_newest(
         else {
             continue;
         };
+        let newest_keys = candidate_keys_for_jar(&newest.jar);
         for kind in ["depends", "breaks", "conflicts"] {
             let Some(entries) = document.get(kind).and_then(serde_json::Value::as_object) else {
                 continue;
             };
-            let Some(raw_range) = entries.get(id).and_then(serde_json::Value::as_str) else {
-                if entries.contains_key(id) {
+            for (constraint_id, raw_range) in entries {
+                // Fabric resolves a dependency by every id a candidate owns,
+                // including `provides` aliases, rather than only its primary id.
+                if !newest_keys.iter().any(|key| key == constraint_id) {
+                    continue;
+                }
+                let Some(matches) = fabric_range_matches_value(
+                    raw_range,
+                    candidate_version(&newest.jar).as_deref(),
+                ) else {
                     return Some(format!(
-                        "Fabric's mod resolver would decide version constraints for {id}; Decaf cannot prove the range"
+                        "Fabric's mod resolver would decide version constraints for {constraint_id}; Decaf cannot prove the range"
+                    ));
+                };
+                let excludes_newest = match kind {
+                    "depends" => !matches,
+                    "breaks" | "conflicts" => matches,
+                    _ => false,
+                };
+                if excludes_newest {
+                    return Some(format!(
+                        "Fabric's mod resolver would decide version constraints for {constraint_id}; Decaf refuses the constrained newest copy"
                     ));
                 }
-                continue;
-            };
-            let Some(matches) =
-                fabric_range_matches(raw_range, candidate_version(&newest.jar).as_deref())
-            else {
-                return Some(format!(
-                    "Fabric's mod resolver would decide version constraints for {id}; Decaf cannot prove the range"
-                ));
-            };
-            let excludes_newest = match kind {
-                "depends" => !matches,
-                "breaks" | "conflicts" => matches,
-                _ => false,
-            };
-            if excludes_newest {
-                return Some(format!(
-                    "Fabric's mod resolver would decide version constraints for {id}; Decaf refuses the constrained newest copy"
-                ));
             }
         }
     }
@@ -1094,16 +1094,11 @@ fn constraint_blocks_forced_newest(
         {
             continue;
         }
-        let Some(raw_range) = raw_range.as_str() else {
-            return Some(format!(
-                "Fabric's mod resolver would decide dependencies of {id}; Decaf cannot prove dependency {dependency_id}"
-            ));
-        };
         let found = all_candidates.iter().any(|candidate| {
             candidate_keys_for_jar(candidate)
                 .iter()
                 .any(|key| key == dependency_id)
-                && fabric_range_matches(raw_range, candidate_version(candidate).as_deref())
+                && fabric_range_matches_value(raw_range, candidate_version(candidate).as_deref())
                     == Some(true)
         });
         if !found {
@@ -1121,47 +1116,278 @@ fn candidate_keys_for_jar(jar: &NativeJar) -> Vec<String> {
         .collect()
 }
 
-/// Evaluate the range subset needed for a safe forced-newest proof. Ranges
-/// outside this subset return `None`, which deliberately preserves a refusal.
-fn fabric_range_matches(range: &str, version: Option<&str>) -> Option<bool> {
-    let version = version?;
-    let range = range.trim();
-    if range.is_empty() || range == "*" {
-        return Some(true);
-    }
-    if range.contains("||") {
-        return None;
-    }
-    let mut matched = true;
-    for term in range.split([',', ' ']).filter(|term| !term.is_empty()) {
-        let (operator, expected) = [">=", "<=", ">", "<", "=", "^", "~"]
-            .iter()
-            .find_map(|operator| term.strip_prefix(operator).map(|value| (*operator, value)))
-            .unwrap_or(("=", term));
+#[derive(Clone, Copy)]
+enum FabricPredicateOperator {
+    GreaterEqual,
+    LessEqual,
+    Greater,
+    Less,
+    Equal,
+    SameToNextMinor,
+    SameToNextMajor,
+}
+
+#[derive(Clone)]
+struct FabricPredicateTerm {
+    operator: FabricPredicateOperator,
+    reference: String,
+    semantic: bool,
+    components: Vec<i64>,
+}
+
+/// Parse the exact bounded form of Fabric's VersionPredicateParser. Any
+/// syntax which cannot be represented here returns `None`, causing selection
+/// to refuse rather than inventing a SAT result.
+fn fabric_predicate_terms(range: &str) -> Option<Vec<FabricPredicateTerm>> {
+    let mut terms = Vec::new();
+    // Fabric's parser uses whitespace-separated terms. A comma remains part
+    // of a version token and therefore falls back to StringVersion exactly as
+    // the Java parser does.
+    for raw in range.split_whitespace() {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "*" {
+            continue;
+        }
+        let (operator, expected) = [
+            (">=", FabricPredicateOperator::GreaterEqual),
+            ("<=", FabricPredicateOperator::LessEqual),
+            (">", FabricPredicateOperator::Greater),
+            ("<", FabricPredicateOperator::Less),
+            ("=", FabricPredicateOperator::Equal),
+            ("~", FabricPredicateOperator::SameToNextMinor),
+            ("^", FabricPredicateOperator::SameToNextMajor),
+        ]
+        .into_iter()
+        .find_map(|(prefix, operator)| {
+            raw.strip_prefix(prefix)
+                .map(|expected| (operator, expected.trim()))
+        })
+        .unwrap_or((FabricPredicateOperator::Equal, raw));
         if expected.is_empty() {
             return None;
         }
-        let cmp = version_cmp(Some(version), Some(expected));
-        matched &= match operator {
-            ">=" => cmp != Ordering::Less,
-            "<=" => cmp != Ordering::Greater,
-            ">" => cmp == Ordering::Greater,
-            "<" => cmp == Ordering::Less,
-            "=" => cmp == Ordering::Equal,
-            "^" => {
-                cmp != Ordering::Less
-                    && version_cmp(Some(version), Some(&format!("{}.0", expected)))
-                        != Ordering::Greater
+
+        let parsed = predicate_semantic_parts(expected);
+        let Some((components, wildcard, prerelease)) = parsed else {
+            // VersionParser falls back to StringVersion. Inclusive operators
+            // (including ^/~) then match only the exact friendly string;
+            // exclusive operators are rejected by VersionPredicateParser.
+            if matches!(
+                operator,
+                FabricPredicateOperator::Greater | FabricPredicateOperator::Less
+            ) {
+                return None;
             }
-            "~" => {
-                cmp != Ordering::Less
-                    && version_cmp(Some(version), Some(&format!("{}.999999", expected)))
-                        != Ordering::Greater
-            }
-            _ => return None,
+            terms.push(FabricPredicateTerm {
+                operator,
+                reference: expected.to_owned(),
+                semantic: false,
+                components: Vec::new(),
+            });
+            continue;
         };
+        if let Some(wildcard) = wildcard {
+            if !matches!(operator, FabricPredicateOperator::Equal) || prerelease.is_some() {
+                if wildcard == 0
+                    && matches!(
+                        operator,
+                        FabricPredicateOperator::Equal
+                            | FabricPredicateOperator::GreaterEqual
+                            | FabricPredicateOperator::LessEqual
+                            | FabricPredicateOperator::SameToNextMinor
+                            | FabricPredicateOperator::SameToNextMajor
+                    )
+                {
+                    terms.push(FabricPredicateTerm {
+                        operator,
+                        reference: expected.to_owned(),
+                        semantic: false,
+                        components: Vec::new(),
+                    });
+                    continue;
+                }
+                return None;
+            }
+            if wildcard == 0 {
+                terms.push(FabricPredicateTerm {
+                    operator,
+                    reference: expected.to_owned(),
+                    semantic: false,
+                    components: Vec::new(),
+                });
+                continue;
+            }
+            let base = components[..wildcard].to_vec();
+            if wildcard == 1 {
+                terms.push(FabricPredicateTerm {
+                    operator: FabricPredicateOperator::SameToNextMajor,
+                    reference: semantic_string(&base, Some("")),
+                    semantic: true,
+                    components: base,
+                });
+            } else if wildcard == 2 {
+                terms.push(FabricPredicateTerm {
+                    operator: FabricPredicateOperator::SameToNextMinor,
+                    reference: semantic_string(&base, Some("")),
+                    semantic: true,
+                    components: base,
+                });
+            } else {
+                let mut upper = base.clone();
+                *upper.last_mut()? += 1;
+                terms.push(FabricPredicateTerm {
+                    operator: FabricPredicateOperator::GreaterEqual,
+                    reference: semantic_string(&base, Some("")),
+                    semantic: true,
+                    components: base,
+                });
+                terms.push(FabricPredicateTerm {
+                    operator: FabricPredicateOperator::Less,
+                    reference: semantic_string(&upper, None),
+                    semantic: true,
+                    components: upper,
+                });
+            }
+            continue;
+        }
+        if matches!(
+            operator,
+            FabricPredicateOperator::SameToNextMinor | FabricPredicateOperator::SameToNextMajor
+        ) && components.is_empty()
+        {
+            return None;
+        }
+        terms.push(FabricPredicateTerm {
+            operator,
+            reference: expected.to_owned(),
+            semantic: true,
+            components,
+        });
     }
-    Some(matched)
+    Some(terms)
+}
+
+fn predicate_semantic_parts(value: &str) -> Option<(Vec<i64>, Option<usize>, Option<&str>)> {
+    let (without_build, _) = value
+        .split_once('+')
+        .map_or((value, None), |(a, b)| (a, Some(b)));
+    let (numbers, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(a, b)| (a, Some(b)));
+    if prerelease.is_some_and(|v| {
+        !v.is_empty()
+            && !v.split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+    }) {
+        return None;
+    }
+    let mut components = Vec::new();
+    let mut wildcard = None;
+    for (index, component) in numbers.split('.').enumerate() {
+        if component == "x" || component == "X" || component == "*" {
+            if wildcard.is_some() || index + 1 != numbers.split('.').count() {
+                return None;
+            }
+            wildcard = Some(index);
+            components.push(0);
+        } else {
+            let value = component.parse::<i32>().ok()?;
+            if value < 0 || wildcard.is_some() {
+                return None;
+            }
+            components.push(i64::from(value));
+        }
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some((components, wildcard, prerelease))
+}
+
+fn semantic_string(components: &[i64], prerelease: Option<&str>) -> String {
+    let mut value = components
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    if let Some(prerelease) = prerelease {
+        value.push('-');
+        value.push_str(prerelease);
+    }
+    value
+}
+
+fn fabric_predicate_matches(range: &str, version: Option<&str>) -> Option<bool> {
+    let version = version?;
+    let terms = fabric_predicate_terms(range)?;
+    let candidate = fabric_version(Some(version));
+    Some(terms.iter().all(|term| {
+        let cmp = version_cmp(Some(version), Some(&term.reference));
+        match (&candidate, term.semantic, term.operator) {
+            (FabricVersion::Semantic { .. }, true, FabricPredicateOperator::GreaterEqual) => {
+                cmp != Ordering::Less
+            }
+            (FabricVersion::Semantic { .. }, true, FabricPredicateOperator::LessEqual) => {
+                cmp != Ordering::Greater
+            }
+            (FabricVersion::Semantic { .. }, true, FabricPredicateOperator::Greater) => {
+                cmp == Ordering::Greater
+            }
+            (FabricVersion::Semantic { .. }, true, FabricPredicateOperator::Less) => {
+                cmp == Ordering::Less
+            }
+            (FabricVersion::Semantic { .. }, true, FabricPredicateOperator::Equal) => {
+                cmp == Ordering::Equal
+            }
+            (
+                FabricVersion::Semantic { components, .. },
+                true,
+                FabricPredicateOperator::SameToNextMajor,
+            ) => cmp != Ordering::Less && components.first() == term.components.first(),
+            (
+                FabricVersion::Semantic { components, .. },
+                true,
+                FabricPredicateOperator::SameToNextMinor,
+            ) => {
+                cmp != Ordering::Less
+                    && components.first().copied().unwrap_or(0)
+                        == term.components.first().copied().unwrap_or(0)
+                    && components.get(1).copied().unwrap_or(0)
+                        == term.components.get(1).copied().unwrap_or(0)
+            }
+            (
+                _,
+                false,
+                FabricPredicateOperator::Equal
+                | FabricPredicateOperator::GreaterEqual
+                | FabricPredicateOperator::LessEqual
+                | FabricPredicateOperator::SameToNextMinor
+                | FabricPredicateOperator::SameToNextMajor,
+            ) => version == term.reference,
+            _ => false,
+        }
+    }))
+}
+
+fn fabric_range_matches_value(value: &serde_json::Value, version: Option<&str>) -> Option<bool> {
+    match value {
+        serde_json::Value::String(range) => fabric_predicate_matches(range, version),
+        serde_json::Value::Array(ranges) => {
+            if ranges.is_empty() {
+                return Some(false);
+            }
+            let mut matched = false;
+            for range in ranges {
+                let serde_json::Value::String(range) = range else {
+                    return None;
+                };
+                matched |= fabric_predicate_matches(range, version)?;
+            }
+            Some(matched)
+        }
+        _ => None,
+    }
 }
 
 fn candidate_keys(candidate: &NestedCandidate) -> Vec<String> {
@@ -1786,6 +2012,8 @@ mod tests {
         };
         let old = child("shared-lib", "1.0", None);
         let new = child("shared-lib", "2.0", None);
+        let alias_old = child("shared-lib", "1.0", Some(r#","provides":["shared-api"]"#));
+        let alias_new = child("shared-lib", "2.0", Some(r#","provides":["shared-api"]"#));
         let pinner = child(
             "pinner",
             "1.0",
@@ -1826,6 +2054,51 @@ mod tests {
                     ],
                 ),
             ),
+            (
+                "alias-constraint",
+                carrier(
+                    "carrier",
+                    r#","depends":{"shared-api":"<2.0.0"}"#,
+                    vec![
+                        ("shared-old.jar", alias_old.clone()),
+                        ("shared-new.jar", alias_new.clone()),
+                    ],
+                ),
+            ),
+            (
+                "caret-breaks",
+                carrier(
+                    "carrier",
+                    r#","breaks":{"shared-api":"^1.2"}"#,
+                    vec![
+                        (
+                            "shared-old.jar",
+                            child("shared-lib", "1.2", Some(r#","provides":["shared-api"]"#)),
+                        ),
+                        (
+                            "shared-new.jar",
+                            child("shared-lib", "1.3", Some(r#","provides":["shared-api"]"#)),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "tilde-breaks",
+                carrier(
+                    "carrier",
+                    r#","breaks":{"shared-api":"~1.2"}"#,
+                    vec![
+                        (
+                            "shared-old.jar",
+                            child("shared-lib", "1.1.9", Some(r#","provides":["shared-api"]"#)),
+                        ),
+                        (
+                            "shared-new.jar",
+                            child("shared-lib", "1.2.5", Some(r#","provides":["shared-api"]"#)),
+                        ),
+                    ],
+                ),
+            ),
         ];
         for (name, root) in constrained {
             let row = rows
@@ -1836,7 +2109,15 @@ mod tests {
                 select_fabric_candidates_with_roots(candidates(&root), std::slice::from_ref(&root));
             // Fabric's row is OK and names the older nested copy; Decaf
             // refuses rather than inventing the SAT choice.
-            assert!(row.contains("shared-lib@1.0@nested@1"));
+            if name == "alias-constraint" {
+                assert!(row.contains("shared-lib@1.0@nested@1"));
+            } else if name == "tilde-breaks" {
+                assert!(row.contains("shared-lib@1.1.9@nested@1"));
+            } else if name == "caret-breaks" {
+                assert!(!row.contains("shared-lib@"));
+            } else {
+                assert!(row.contains("shared-lib@1.0@nested@1"));
+            }
             assert!(
                 actual.is_err(),
                 "{name} unexpectedly selected a constrained newest copy"
@@ -1885,11 +2166,13 @@ mod tests {
         let ids = host.linked_classes().jar_ids().collect::<Vec<_>>();
         assert!(
             ids.iter()
-                .any(|id| id.contains("carrier-first!META-INF/jars/shared.jar"))
+                .any(|id| id.starts_with("jar-") && id.ends_with("!META-INF/jars/shared.jar"))
         );
         assert!(
             ids.iter()
-                .any(|id| id.contains("carrier-second!META-INF/jars/shared.jar"))
+                .filter(|id| id.starts_with("jar-") && id.ends_with("!META-INF/jars/shared.jar"))
+                .count()
+                == 2
         );
     }
 
@@ -2166,6 +2449,21 @@ mod tests {
                 expected,
                 "{left} vs {right}"
             );
+        }
+    }
+
+    #[test]
+    fn fabric_predicates_match_the_jdk25_oracle() {
+        for line in include_str!("nested_jars_predicate_java25.txt").lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            let predicate = row["predicate"].as_str().unwrap();
+            let version = row["version"].as_str().unwrap();
+            let actual = fabric_predicate_matches(predicate, Some(version));
+            if row.get("error").is_some() {
+                assert!(actual.is_none(), "{line}");
+            } else {
+                assert_eq!(actual, Some(row["ok"].as_bool().unwrap()), "{line}");
+            }
         }
     }
 

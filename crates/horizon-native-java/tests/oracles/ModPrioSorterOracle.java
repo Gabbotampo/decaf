@@ -232,9 +232,18 @@ public final class ModPrioSorterOracle {
   static List<Path> syntheticGenerated(String name, Path root) throws IOException {
     Files.createDirectories(root);
     if (name.equals("root-constraint") || name.equals("root-breaks")
-        || name.equals("nested-sibling-constraint") || name.equals("two-top-level-same-path")) {
-      byte[] oldBytes = ("{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"1.0\"}").getBytes();
-      byte[] newBytes = ("{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"2.0\"}").getBytes();
+        || name.equals("nested-sibling-constraint") || name.equals("two-top-level-same-path")
+        || name.equals("alias-constraint") || name.equals("caret-breaks")
+        || name.equals("tilde-breaks")) {
+      boolean alias = name.equals("alias-constraint") || name.equals("caret-breaks") || name.equals("tilde-breaks");
+      String oldVersion = name.equals("caret-breaks") ? "1.2" : name.equals("tilde-breaks") ? "1.1.9" : "1.0";
+      String newVersion = name.equals("caret-breaks") ? "1.3" : name.equals("tilde-breaks") ? "1.2.5" : "2.0";
+      String oldMetadata = "{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"" + oldVersion
+          + (alias ? "\",\"provides\":[\"shared-api\"]}" : "\"}");
+      String newMetadata = "{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"" + newVersion
+          + (alias ? "\",\"provides\":[\"shared-api\"]}" : "\"}");
+      byte[] oldBytes = oldMetadata.getBytes();
+      byte[] newBytes = newMetadata.getBytes();
       byte[] pinnerBytes = ("{\"schemaVersion\":1,\"id\":\"pinner\",\"version\":\"1.0\","
           + "\"depends\":{\"shared-lib\":\"<2.0.0\"}}").getBytes();
       Path oldJar = root.resolve("shared-old.jar");
@@ -256,6 +265,12 @@ public final class ModPrioSorterOracle {
       }
       String constraint = name.equals("root-breaks")
           ? "\"breaks\":{\"shared-lib\":\">=2.0.0\"},"
+          : name.equals("alias-constraint")
+              ? "\"depends\":{\"shared-api\":\"<2.0.0\"},"
+              : name.equals("caret-breaks")
+                  ? "\"breaks\":{\"shared-api\":\"^1.2\"},"
+                  : name.equals("tilde-breaks")
+                      ? "\"breaks\":{\"shared-api\":\"~1.2\"},"
           : name.equals("root-constraint")
               ? "\"depends\":{\"shared-lib\":\"<2.0.0\"},"
               : "";

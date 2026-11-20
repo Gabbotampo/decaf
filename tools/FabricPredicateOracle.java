@@ -3,7 +3,7 @@ import java.io.InputStreamReader;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import net.fabricmc.loader.api.SemanticVersion;
+import net.fabricmc.loader.api.Version;
 import net.fabricmc.loader.api.metadata.version.VersionPredicate;
 
 /** Batch oracle for Fabric Loader 0.19.5 dependency predicates. */
@@ -37,7 +37,7 @@ public final class FabricPredicateOracle {
                     continue;
                 }
                 try {
-                    boolean result = VersionPredicate.parse(predicate).test(SemanticVersion.parse(version));
+                    boolean result = VersionPredicate.parse(predicate).test(Version.parse(version));
                     System.out.println("{\"predicate\":" + quote(predicate)
                             + ",\"version\":" + quote(version)
                             + ",\"ok\":" + result + "}");
