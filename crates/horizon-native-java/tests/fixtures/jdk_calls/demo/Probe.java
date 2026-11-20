@@ -10,6 +10,7 @@ public final class Probe {
   public static String hashMap() { return lib.Calls.hashMap(); }
   public static String linkedMap() { return lib.Calls.linkedMap(); }
   public static String enumContracts() { return lib.Calls.enumContracts(); }
+  public static String enumOutsideClasses() { return lib.Calls.enumOutsideClasses(); }
   public static String jarCollectionStream() { return lib.Calls.jarCollectionStream(); }
   public static String toCollectionJarOverride() { return lib.Calls.toCollectionJarOverride(); }
 }

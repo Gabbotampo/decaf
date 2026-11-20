@@ -63,3 +63,29 @@ fn jdk_and_guava_calls_match_java25() {
         );
     }
 }
+
+#[test]
+fn unknown_jdk_enum_classes_are_counted() {
+    let Some(guava) = guava_jar() else {
+        eprintln!("Guava is unavailable; fixture skipped");
+        return;
+    };
+    let fixture = Fixture::build_with_lib_classpath(
+        "jdk-calls-outside-enum",
+        &[("demo/Probe.java", PROBE), ("lib/Calls.java", LIB)],
+        &guava,
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    host.link_jar("calls", fixture.lib.as_ref().unwrap())
+        .unwrap();
+    let guava_link = horizon_native_java::NativeJar::from_path(&guava).unwrap();
+    host.link_jar("guava", &guava_link).unwrap();
+    assert_eq!(fixture.text_on(&mut host, "enumOutsideClasses"), "[]|[]");
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![(
+            "java/util/EnumSet#allOf(Ljava/lang/Class;)Ljava/util/EnumSet;".into(),
+            2,
+        )]
+    );
+}

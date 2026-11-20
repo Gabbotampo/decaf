@@ -28,26 +28,38 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "allOf"
             && r.descriptor == "(Ljava/lang/Class;)Ljava/util/EnumSet;"
         {
-            let Some(enum_class) = args.first().and_then(host_class::class_name) else {
+            let Some(argument) = args.first() else {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
                     message: None,
                     frame: None,
                 });
             };
-            let Some(file) = self.class(enum_class).cloned() else {
-                // EnumSet.noneOf delegates to Class.getEnumConstantsShared.
-                // For a class outside the jar table the JDK still knows the
-                // class, and a non-enum class reaches the same
-                // ClassCastException as a jar class does.
+            if matches!(argument, Value::Ref(None)) {
                 return Err(NativeError::UncaughtException {
-                    class: "java/lang/ClassCastException".into(),
-                    message: Some(format!(
-                        "class {} not an enum",
-                        enum_class.replace('/', ".")
-                    )),
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
                     frame: None,
                 });
+            }
+            let Some(enum_class) = host_class::class_name(argument) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            let Some(file) = self.class(enum_class).cloned() else {
+                // The runtime has no JDK class files.  Only a skeleton chain
+                // that reaches Object/Record proves this is not an enum;
+                // every other platform class stays at the counted boundary.
+                if crate::jvm_dispatch::jdk_skeleton_proves_not_enum(enum_class) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!(
+                            "class {} not an enum",
+                            enum_class.replace('/', ".")
+                        )),
+                        frame: None,
+                    });
+                }
+                return self.host.unknown_operand_call(r).map(Some);
             };
             if file.super_name != "java/lang/Enum" {
                 return Err(NativeError::UncaughtException {

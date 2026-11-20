@@ -49,10 +49,17 @@ public final class Calls {
     String wrongAdd;
     try { ((Collection) EnumSet.allOf(Mode.class)).add(Other.ONLY); wrongAdd = "none"; }
     catch (ClassCastException e) { wrongAdd = "cce"; }
-    String nonEnum;
-    try { EnumSet.allOf((Class) String.class); nonEnum = "none"; }
-    catch (ClassCastException e) { nonEnum = e.getMessage(); }
-    return all + "|" + nullAdd + "|" + wrongAdd + "|" + nonEnum;
+    return all + "|" + nullAdd + "|" + wrongAdd;
+  }
+
+  public static String enumOutsideClasses() {
+    return enumOutside(String.class) + "|" + enumOutside(Thread.State.class);
+  }
+
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  private static String enumOutside(Class type) {
+    try { return String.valueOf(EnumSet.allOf(type)); }
+    catch (ClassCastException e) { return "cce:" + e.getMessage(); }
   }
 
   static final class Bag extends AbstractCollection<Integer> {
