@@ -1,5 +1,6 @@
 enumSet=2|ZETA,ALPHA,OMEGA,|[ZETA, OMEGA]|true|true|2
 streamArray=[Ljava.lang.String;|3|A,BB,C|java.lang.ArrayStoreException
+enumValuesStream=[ZETA, ALPHA, OMEGA]
 arrayMap=2/[1]/[a, b]|3/[1, 3]/[a, b, c]/true
 hashMap=2/[1]/[a, b]|3/[1, 3]/[a, b, c]/true
 linkedMap=2/[1]/[a, b]|3/[1, 3]/[a, b, c]/true

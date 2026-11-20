@@ -19,6 +19,33 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // Fabric's generic block-entity builder is a fluent library object.  Its
+        // factory is opaque to the runtime, but the object must survive until
+        // `build()` returns the game-side type; a neutral null would make the
+        // caller dereference it and fail before its later registry calls.
+        const BLOCK_ENTITY_BUILDER: &str =
+            "net/fabricmc/fabric/api/object/builder/v1/block/entity/FabricBlockEntityTypeBuilder";
+        if r.owner == BLOCK_ENTITY_BUILDER
+            && r.name == "create"
+            && r.descriptor.starts_with("(L")
+            && r.descriptor.ends_with(")Lnet/fabricmc/fabric/api/object/builder/v1/block/entity/FabricBlockEntityTypeBuilder;")
+            && receiver.is_none()
+        {
+            return Ok(Some(crate::runtime::jar_object::handle(
+                self.new_object_key(BLOCK_ENTITY_BUILDER),
+            )));
+        }
+        if r.owner == BLOCK_ENTITY_BUILDER
+            && r.name == "build"
+            && r.descriptor == "()Lnet/minecraft/world/level/block/entity/BlockEntityType;"
+            && receiver.is_some_and(|value| {
+                crate::runtime::jar_object::packaged_object_class(value) == Some(BLOCK_ENTITY_BUILDER)
+            })
+        {
+            return Ok(Some(crate::runtime::game_object::server_value(
+                "game/unknown/block-entity-type".into(),
+            )));
+        }
         // `EnumSet.allOf` is implemented by the JDK from the enum class's
         // declared constants.  Jar enums are available in the class table;
         // retain their declaration order in the mutable collection row so

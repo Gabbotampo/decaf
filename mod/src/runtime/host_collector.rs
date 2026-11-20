@@ -55,6 +55,9 @@ pub(crate) enum Builtin {
     /// `toMap(key, value[, merge[, supplier]])` and Guava's immutable-map collectors: the
     /// functions in that order (`jdk_model.rs`'s `ToMap`).
     ToMap { guava: bool, functions: Vec<Value> },
+    /// `toCollection(supplier)`: the supplier makes the mutable result and each
+    /// stream element is added to it in encounter order.
+    ToCollection { supplier: Value },
 }
 
 impl Builtin {
@@ -69,6 +72,7 @@ impl Builtin {
             Builtin::Joining { .. } => "joining",
             Builtin::ToMap { guava: false, .. } => "to-map",
             Builtin::ToMap { guava: true, .. } => "guava-to-map",
+            Builtin::ToCollection { .. } => "to-collection",
         }
     }
 }
@@ -117,6 +121,7 @@ pub(crate) fn collector(builtin: Builtin) -> Value {
             suffix,
         } => values.extend([text(&delimiter), text(&prefix), text(&suffix)]),
         Builtin::ToMap { functions, .. } => values.extend(functions),
+        Builtin::ToCollection { supplier } => values.push(supplier),
         _ => {}
     }
     Value::Host(HostRef::of_values(HostKind::Collector, &values))
@@ -171,6 +176,9 @@ pub(crate) fn builtin(value: &Value) -> Option<Builtin> {
         ("to-map" | "guava-to-map", functions) => Builtin::ToMap {
             guava: name == "guava-to-map",
             functions: functions.to_vec(),
+        },
+        ("to-collection", [supplier]) => Builtin::ToCollection {
+            supplier: supplier.clone(),
         },
         _ => return None,
     })

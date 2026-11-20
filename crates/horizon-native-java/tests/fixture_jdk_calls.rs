@@ -32,7 +32,14 @@ fn jdk_and_guava_calls_match_java25() {
         &[("demo/Probe.java", PROBE), ("lib/Calls.java", LIB)],
         &guava,
     );
-    for method in ["enumSet", "streamArray", "arrayMap", "hashMap", "linkedMap"] {
+    for method in [
+        "enumSet",
+        "streamArray",
+        "enumValuesStream",
+        "arrayMap",
+        "hashMap",
+        "linkedMap",
+    ] {
         let expected = ORACLE
             .lines()
             .find_map(|line| line.strip_prefix(method)?.strip_prefix('='))

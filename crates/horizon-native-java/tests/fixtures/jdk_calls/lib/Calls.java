@@ -5,6 +5,18 @@ import com.google.common.collect.*;
 
 public final class Calls {
   enum Mode { ZETA, ALPHA, OMEGA }
+  static class EnumField { static Mode mode; }
+  static final class EnumEntry<E extends Enum<E>> {
+    private final java.lang.reflect.Field field;
+    EnumEntry(java.lang.reflect.Field field) { this.field = field; }
+    protected String getValueString(E value) { return value.name(); }
+    Set<String> getAllValues() {
+      return Arrays.stream(field.getType().getEnumConstants())
+          .map(e -> (E)e)
+          .map(this::getValueString)
+          .collect(Collectors.toCollection(HashSet::new));
+    }
+  }
   public static String enumSet() {
     EnumSet<Mode> s = EnumSet.allOf(Mode.class);
     StringBuilder b = new StringBuilder();
@@ -18,6 +30,11 @@ public final class Calls {
     try { Stream.of("x").toArray(Integer[]::new); mismatch = "none"; }
     catch (ArrayStoreException e) { mismatch = e.getClass().getName(); }
     return a.getClass().getName()+"|"+a.length+"|"+String.join(",", a)+"|"+mismatch;
+  }
+  public static String enumValuesStream() {
+    try {
+      return new EnumEntry<Mode>(EnumField.class.getDeclaredField("mode")).getAllValues().toString();
+    } catch (ReflectiveOperationException e) { throw new AssertionError(e); }
   }
   public static String arrayMap() { return view(ArrayListMultimap.create()); }
   public static String hashMap() { return view(HashMultimap.create()); }

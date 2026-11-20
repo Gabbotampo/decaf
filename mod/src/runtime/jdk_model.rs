@@ -203,6 +203,16 @@ pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value,
     if let Some(collector) = to_map_collector(r, args) {
         return Some(Ok(collector));
     }
+    if r.owner == "java/util/stream/Collectors"
+        && r.name == "toCollection"
+        && r.descriptor == "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"
+    {
+        return args.first().cloned().map(|supplier| {
+            Ok(crate::runtime::host_collector::collector(
+                crate::runtime::host_collector::Builtin::ToCollection { supplier },
+            ))
+        });
+    }
     if let Some(comparator) = crate::runtime::jdk_stream::comparator_static(r, args) {
         return Some(comparator);
     }

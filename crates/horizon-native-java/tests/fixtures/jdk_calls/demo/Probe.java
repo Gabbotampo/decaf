@@ -5,6 +5,7 @@ import com.google.common.collect.*;
 public final class Probe {
   public static String enumSet() { return lib.Calls.enumSet(); }
   public static String streamArray() { return lib.Calls.streamArray(); }
+  public static String enumValuesStream() { return lib.Calls.enumValuesStream(); }
   public static String arrayMap() { return lib.Calls.arrayMap(); }
   public static String hashMap() { return lib.Calls.hashMap(); }
   public static String linkedMap() { return lib.Calls.linkedMap(); }

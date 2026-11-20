@@ -29735,6 +29735,19 @@ impl<H: Host> Runtime<'_, H> {
                     host_collector::Builtin::ToMap { .. } => {
                         return self.collect_to_map(&collector, &values);
                     }
+                    host_collector::Builtin::ToCollection { supplier } => {
+                        let collection =
+                            self.call_sam("java/util/function/Supplier", &supplier, &[])?;
+                        let add = MethodRef {
+                            owner: "java/util/Collection".into(),
+                            name: "add".into(),
+                            descriptor: "(Ljava/lang/Object;)Z".into(),
+                        };
+                        for value in values {
+                            self.host.invoke_instance(&add, &collection, &[value])?;
+                        }
+                        collection
+                    }
                 }
             }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
