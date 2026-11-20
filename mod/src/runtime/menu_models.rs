@@ -5,6 +5,16 @@
 //! particular mod or menu type.
 
 use crate::runtime::{MethodRef, NativeError, Value, expect_ref};
+
+/// `ItemStack.EMPTY`'s key, as the client surface answers the static (`client_surface.rs`).
+const EMPTY_STACK: &str = "client/stack/empty";
+
+/// `ItemStack.EMPTY`: the one typed host value every side answers the static with, so a menu's
+/// stacks and the client item model agree on it, and a jar `String` spelling the key never
+/// passes for it.
+pub(crate) fn empty_stack() -> Value {
+    crate::runtime::game_object::client_value(EMPTY_STACK.to_owned())
+}
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -407,7 +417,7 @@ pub(crate) fn call(
             result.clone(),
             Object::Container {
                 size: 1,
-                items: vec![marker("stack/empty")],
+                items: vec![empty_stack()],
                 result: true,
                 owner: Some(key.clone()),
                 recipe_used: None,
@@ -418,7 +428,7 @@ pub(crate) fn call(
             input.clone(),
             Object::Container {
                 size: definition.inputs.len() as i32,
-                items: vec![marker("stack/empty"); definition.inputs.len()],
+                items: vec![empty_stack(); definition.inputs.len()],
                 result: false,
                 owner: Some(key.clone()),
                 recipe_used: None,
@@ -517,7 +527,7 @@ pub(crate) fn call(
             input_key.clone(),
             Object::Container {
                 size,
-                items: vec![marker("stack/empty"); size as usize],
+                items: vec![empty_stack(); size as usize],
                 result: false,
                 owner: Some(key.clone()),
                 recipe_used: None,
@@ -598,7 +608,7 @@ pub(crate) fn call(
             key,
             Object::Container {
                 size,
-                items: vec![marker("stack/empty"); size as usize],
+                items: vec![empty_stack(); size as usize],
                 result: false,
                 owner: None,
                 recipe_used: None,
@@ -611,7 +621,7 @@ pub(crate) fn call(
             key,
             Object::Container {
                 size: 1,
-                items: vec![marker("stack/empty")],
+                items: vec![empty_stack()],
                 result: true,
                 owner: None,
                 recipe_used: None,
@@ -708,10 +718,7 @@ pub(crate) fn call(
                 // Only `ItemStack.EMPTY` is known to be empty. A Java `null` here (a mod's
                 // `setItem(i, null)`, which this model refuses below) would make
                 // `ItemStack.isEmpty()` throw, so it is never answered as empty.
-                if items
-                    .iter()
-                    .all(|v| matches!(v, Value::Ref(Some(s)) if s == "stack/empty"))
-                {
+                if items.iter().all(|v| *v == empty_stack()) {
                     Ok(Value::Int(1))
                 } else {
                     // ItemStack.isEmpty is observable per element.  An arbitrary
@@ -723,7 +730,7 @@ pub(crate) fn call(
                 let position = if *result { 0 } else { index };
                 let Some(item) = items.get(position).cloned() else {
                     if !*result && position >= *size as usize {
-                        return Some(Ok(marker("stack/empty")));
+                        return Some(Ok(empty_stack()));
                     }
                     return None;
                 };
@@ -741,7 +748,7 @@ pub(crate) fn call(
                 // ItemStack.limitSize(max).  Only EMPTY is fully known here;
                 // refuse to mutate for an unknown stack so Java's clamp cannot
                 // be silently skipped. ResultContainer has no clamp in 26.3.
-                if !*result && !matches!(value, Value::Ref(Some(s)) if s == "stack/empty") {
+                if !*result && *value != empty_stack() {
                     return None;
                 }
                 let item = items.get_mut(index)?;

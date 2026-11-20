@@ -6914,11 +6914,14 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        // `ItemStack.EMPTY` is one object on every side: the same typed value the client surface
+        // answers (`client_surface.rs`), so the client item model's `isEmpty` and the menu models
+        // agree on it, server side too.
         if r.owner == "net/minecraft/world/item/ItemStack"
             && r.name == "EMPTY"
             && r.descriptor == "Lnet/minecraft/world/item/ItemStack;"
         {
-            return Ok(Value::Ref(Some("stack/empty".into())));
+            return Ok(menu_models::empty_stack());
         }
         if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
             && r.name == "NULL"
