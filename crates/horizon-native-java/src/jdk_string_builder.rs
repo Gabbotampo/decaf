@@ -740,6 +740,17 @@ impl<H: Host> Runtime<'_, H> {
         if !(typed_as_builder || through_interface && !constructing) {
             return Ok(None);
         }
+        // Appending/inserting an opaque String makes the builder's resulting
+        // text opaque as well. Let the host count the call and retain that
+        // fact on the builder for its later toString/concat use.
+        if !constructing
+            && matches!(r.name.as_str(), "append" | "insert")
+            && args.iter().any(|value| self.is_counted_string(value))
+        {
+            self.string_builders.remove(&marker);
+            self.counted_strings.insert(marker.clone());
+            return Ok(None);
+        }
         let text = if constructing {
             if !typed_as_builder {
                 return Ok(None);
@@ -945,6 +956,9 @@ impl<H: Host> Runtime<'_, H> {
     /// parameter what `String.valueOf` gives a box or a host-modelled object.
     /// `None` for an object whose text only its own class knows.
     fn builder_argument_text(&mut self, param: &str, value: &Value) -> Option<String> {
+        if self.is_counted_string(value) {
+            return None;
+        }
         let marker = expect_ref(value)?;
         // A `String` spelling an object's key is that text (`jar_object.rs`).
         if crate::jar_object::spells_key(value) {

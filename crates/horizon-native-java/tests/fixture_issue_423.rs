@@ -63,3 +63,39 @@ fn counted_string_concat_is_counted() {
         "{calls:?}"
     );
 }
+
+#[test]
+fn counted_strings_never_become_marker_text() {
+    let methods = [
+        "countedObjectConcat",
+        "countedBuilderAppend",
+        "countedJoin",
+        "countedFormat",
+        "countedConcatLength",
+    ];
+    for method in methods {
+        let tag = format!("issue-423-{method}");
+        let fixture = Fixture::build(&tag, &[("demo/Probe.java", PROBE)]);
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        let got = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/Probe",
+                method,
+                "()Ljava/lang/String;",
+                None,
+                &[],
+                &mut host,
+            )
+            .expect("probe runs");
+        assert!(
+            !matches!(&got, horizon_native_java::Value::Ref(Some(text)) if text.contains("java/lang/String#")),
+            "{method} leaked marker: {got:?}"
+        );
+        assert!(
+            !host.unknown_host_calls().is_empty(),
+            "{method} did not count: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+}

@@ -14531,6 +14531,12 @@ fn format_java_string_call<H: Host>(
     };
     match text {
         Some(text) => Ok(Value::Ref(Some(text))),
+        None if args
+            .iter()
+            .any(|value| runtime.contains_counted_string_deep(value)) =>
+        {
+            runtime.counted_unknown(r)
+        }
         None => runtime.host.invoke(r, args),
     }
 }
@@ -24977,9 +24983,50 @@ impl<H: Host> Runtime<'_, H> {
         jar_object::object_key(value).is_some_and(|key| self.counted_strings.contains(key))
     }
 
+    /// Record an unknown result whose value was derived from an opaque String.
+    /// The result is opaque too: retaining its allocation key makes every later
+    /// attempt to turn it into text count rather than printing the key.
+    pub(crate) fn counted_unknown(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        let mut value = self.host.unknown_operand_call(r)?;
+        // Unknown reference-returning calls use null as the host's neutral
+        // answer. A derived String remains a live opaque object in Java, so
+        // give it a fresh allocation key for subsequent counted uses.
+        if value == Value::Ref(None) && return_desc(&r.descriptor) == "Ljava/lang/String;" {
+            value = self.new_object("java/lang/String");
+        }
+        if let Some(key) = jar_object::object_key(&value) {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn contains_counted_string_deep(&self, value: &Value) -> bool {
+        fn visit<H: Host>(
+            runtime: &Runtime<'_, H>,
+            value: &Value,
+            seen: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if runtime.is_counted_string(value) {
+                return true;
+            }
+            let Some(key) = host_array::array_key(value) else {
+                return false;
+            };
+            if !seen.insert(key.to_owned()) {
+                return false;
+            }
+            runtime
+                .owned_array(value)
+                .is_some_and(|values| values.iter().any(|value| visit(runtime, value, seen)))
+        }
+        visit(self, value, &mut std::collections::HashSet::new())
+    }
+
     fn contains_counted_string(&self, receiver: Option<&Value>, args: &[Value]) -> bool {
-        receiver.is_some_and(|value| self.is_counted_string(value))
-            || args.iter().any(|value| self.is_counted_string(value))
+        receiver.is_some_and(|value| self.contains_counted_string_deep(value))
+            || args
+                .iter()
+                .any(|value| self.contains_counted_string_deep(value))
     }
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
@@ -28799,7 +28846,15 @@ impl<H: Host> Runtime<'_, H> {
                             || descriptor.ends_with(")Ljava/io/StringWriter;") =>
                     {
                         let text = match args.first() {
-                            Some(value) => java_value_text(&mut *self.host, value, descriptor)?,
+                            Some(value) => {
+                                match self.java_text(value, descriptor, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
+                            }
                             None => String::new(),
                         };
                         self.io_write(&marker, &text)?;
@@ -28817,7 +28872,13 @@ impl<H: Host> Runtime<'_, H> {
                                     .first()
                                     .cloned()
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
-                                java_value_text(&mut *self.host, value, &argument)?
+                                match self.java_text(value, &argument, class, method)? {
+                                    Some(text) => text,
+                                    None if self.contains_counted_string_deep(value) => {
+                                        return self.counted_unknown(r).map(Some);
+                                    }
+                                    None => return Ok(None),
+                                }
                             }
                             None => String::new(),
                         };
@@ -32435,7 +32496,27 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && self.contains_counted_string(receiver.as_ref(), &args)
                     {
-                        dispatched = Some(invoke_or_catch!(at, self.host.unknown_operand_call(&r)));
+                        let counted = invoke_or_catch!(at, self.counted_unknown(&r));
+                        // `append`/`insert` return their builder. The host's
+                        // neutral result may be null, but Java still returns
+                        // the receiver whose text is now opaque.
+                        let builder_result = matches!(
+                            (r.owner.as_str(), r.name.as_str()),
+                            (
+                                "java/lang/StringBuilder" | "java/lang/StringBuffer",
+                                "append" | "insert"
+                            )
+                        );
+                        if builder_result
+                            && let Some(key) = receiver.as_ref().and_then(jar_object::object_key)
+                        {
+                            self.counted_strings.insert(key.to_owned());
+                        }
+                        dispatched = Some(if builder_result {
+                            receiver.clone().unwrap_or(counted)
+                        } else {
+                            counted
+                        });
                     }
                     // `StateDefinition.Builder.add(Property...)` inside a jar block's
                     // `createBlockStateDefinition`: each property is recorded for the block's
@@ -33099,10 +33180,18 @@ impl<H: Host> Runtime<'_, H> {
                             match invoke_or_catch!(at, self.java_format(None, &format, values)) {
                                 Some(text) => Value::Ref(Some(text)),
                                 None => {
-                                    invoke_or_catch!(
-                                        at,
-                                        self.host.invoke_instance(&r, &format, &args)
-                                    )
+                                    if self.contains_counted_string_deep(&format)
+                                        || args
+                                            .iter()
+                                            .any(|value| self.contains_counted_string_deep(value))
+                                    {
+                                        invoke_or_catch!(at, self.counted_unknown(&r))
+                                    } else {
+                                        invoke_or_catch!(
+                                            at,
+                                            self.host.invoke_instance(&r, &format, &args)
+                                        )
+                                    }
                                 }
                             }
                         });
@@ -33721,7 +33810,7 @@ impl<H: Host> Runtime<'_, H> {
                         if captured.iter().any(|value| self.is_counted_string(value)) {
                             let counted = invoke_or_catch!(
                                 at,
-                                self.host.unknown_operand_call(&MethodRef {
+                                self.counted_unknown(&MethodRef {
                                     owner: "java/lang/invoke/StringConcatFactory".into(),
                                     name: "makeConcatWithConstants".into(),
                                     descriptor: descriptor.clone(),
@@ -33737,10 +33826,22 @@ impl<H: Host> Runtime<'_, H> {
                         // A `subList` operand's `toString` checks its list
                         // (`mod_count.rs`).
                         invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
-                        invoke_or_catch!(
+                        let concat_counted = invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)
                         );
+                        if concat_counted {
+                            let counted = invoke_or_catch!(
+                                at,
+                                self.counted_unknown(&MethodRef {
+                                    owner: "java/lang/invoke/StringConcatFactory".into(),
+                                    name: "makeConcatWithConstants".into(),
+                                    descriptor: descriptor.clone(),
+                                })
+                            );
+                            stack.push(counted);
+                            continue;
+                        }
                         // A `StringBuilder` operand concatenates as its text
                         // (`String.valueOf` calls its `toString`), not as the
                         // builder's object marker.

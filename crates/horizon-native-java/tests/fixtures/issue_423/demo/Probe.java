@@ -56,5 +56,27 @@ public class Probe {
     String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
     return s + "!";
   }
+  static final class CountedText {
+    public String toString() {
+      return new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    }
+  }
+  public static String countedObjectConcat() { return new CountedText() + "!"; }
+  public static String countedBuilderAppend() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return new StringBuilder().append(s).toString();
+  }
+  public static String countedJoin() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return String.join(",", new String[] {s});
+  }
+  public static String countedFormat() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return String.format("%s", s);
+  }
+  public static String countedConcatLength() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return String.valueOf((s + "!").length());
+  }
   public static void main(String[] args) { System.out.print(rows()); }
 }
