@@ -84,8 +84,8 @@ use mod_api::{
     ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
     CommandSource, ConfigFileError, ConfigPath, DimensionKey, EntityInteractEvent,
     EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    HitHost, Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
     LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
     LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
     PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
@@ -1140,11 +1140,7 @@ impl Hooks for HorizonJava {
     /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
     /// is fired with its real amounts rather than dropped on a guess: the departure is named in
     /// the mod's report documentation.
-    fn living_damage_post(
-        &self,
-        _level: &mut dyn LevelRandomHost,
-        event: &mut LivingDamagePostEvent<'_>,
-    ) {
+    fn living_damage_post(&self, _level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
         let context = living_damage_context(event);
         self.fire_event(
             GameEvent::LivingAfterDamage,
@@ -1475,7 +1471,7 @@ impl Hooks for HorizonJava {
     /// NeoForge's `LivingIncomingDamageEvent`).
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn LevelRandomHost,
+        _level: &mut dyn HitHost,
         event: &mut LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         let context = EventContext {
@@ -2910,6 +2906,16 @@ mod tests {
         REPORT_BYTES.get_or_init(|| Mutex::new(None))
     }
 
+    /// The tests that read `REPORT_BYTES` back hold this for their whole run: each clears the
+    /// shared report first, so two running at once (cargo runs tests in parallel) clear each
+    /// other's report mid-test. Poison is ignored, so one failing test does not fail the next.
+    fn report_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static REPORT_TESTS: Mutex<()> = Mutex::new(());
+        REPORT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     struct ReportFiles;
     impl ConfigFiles for ReportFiles {
         fn read(&self, _file: &ConfigPath) -> Result<Vec<u8>, ConfigFileError> {
@@ -2933,6 +2939,9 @@ mod tests {
         }
         fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
             Ok(None)
+        }
+        fn remove(&self, _file: &ConfigPath) -> Result<bool, ConfigFileError> {
+            Ok(report_bytes().lock().unwrap().take().is_some())
         }
     }
 
@@ -2999,6 +3008,7 @@ mod tests {
 
     #[test]
     fn client_setup_leave_rejoin_stop_and_second_setup_keep_one_listener() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
@@ -3034,6 +3044,7 @@ mod tests {
 
     #[test]
     fn client_stages_run_and_persist_success_failure_counters() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
@@ -3766,7 +3777,7 @@ mod tests {
             player: 7,
             name: "Alex",
             was_death: true,
-            // The hook-scoped view of the old player (Sunrise pin `a87e07f5f8`); the context
+            // The hook-scoped view of the old player (the pinned Sunrise commit); the context
             // takes the facts read from it, so any token does.
             original: mod_api::__private::game::original_player_ref(1),
         };

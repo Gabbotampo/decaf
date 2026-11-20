@@ -15,8 +15,10 @@ capabilities = ["registries"]
 [native]
 # The game and the exact Sunrise source revision this mod is built against
 # (docs/modding/src/how-to/native-mods/005-native-mod-source-revisions.md).
+# Only builds with a published SDK (release `sdk-<commit>`, the Nightlies) can be pinned:
+# `cargo sunrise-mod update` moves the pin to the current Nightly.
 # The launcher rebuilds the game at this commit. The runtime in `src/runtime/` is
 # horizon-java's own, vendored by `tools/vendor.py` on the same commit.
 game = "26.3"
-sunrise = "a87e07f5f8bb584315a3915ae45503d94c713904"
+sunrise = "94256510f74e6843754e0a93fd9e4da7e45b1056"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"
