@@ -74,19 +74,25 @@ fn vanilla_static_hash_is_counted_on_fresh_host() {
         )]
     );
 }
-/// `Identifier.CODEC.fieldOf("id")` is a DFU codec handle now (#410), so the
-/// `!= null` check is answered: Java 25 prints `true` (README, `CaptureCounted`).
+/// `Identifier.CODEC` reaches the jar as an opaque host codec, so its
+/// `fieldOf("id")` is counted (#410's opaque-product rule: an opaque receiver
+/// never becomes an exact codec). The counted result is still a non-null
+/// opaque handle, so the `!= null` check prints `true`, as Java 25 does
+/// (README, `CaptureCounted`).
 #[test]
-fn vanilla_static_field_of_is_answered_on_fresh_host() {
+fn vanilla_static_field_of_is_counted_on_fresh_host() {
     let mut f = STUBS.to_vec();
     f.push(("demo/Probe.java", PROBE));
     let x = Fixture::build("vanilla-static-counted", &f);
     let mut h = x.jar.seed_host(StdHost::new());
     assert_eq!(x.text_on(&mut h, "counted"), "true");
-    assert!(
-        h.unknown_host_calls().is_empty(),
-        "{:?}",
-        h.unknown_host_calls()
+    assert_eq!(
+        h.unknown_host_calls(),
+        vec![(
+            "com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;"
+                .to_owned(),
+            1
+        )]
     );
 }
 
