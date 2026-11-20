@@ -398,20 +398,21 @@ fn invoke_wrapped_iterator_member<H: Host>(
     delegate: &Value,
     removed: bool,
 ) -> Result<Option<Value>, NativeError> {
-    let (cursor, _, _) = this
+    // The iterator walks its creation-time snapshot (taken in the delegate's Java
+    // iteration order). Only removals through this iterator are allowed without a
+    // ConcurrentModificationException (validated before this call), so the elements
+    // still to come are exactly the snapshot's rest: JDK 25 `ArrayList$Itr` (cursor =
+    // lastRet over a shifted array) and `HashMap$HashIterator` (its precomputed next
+    // node) both continue with the element that followed the removed one.
+    let (cursor, snapshot_len, _) = this
         .host
         .host_iterator(marker)
         .ok_or_else(|| NativeError::Metadata("unknown Guava wrapped iterator".into()))?;
     match (r.name.as_str(), r.descriptor.as_str()) {
-        ("hasNext", "()Z") => Ok(Some(Value::Int(
-            (cursor < runtime_collection_values(&*this.host, delegate)?.len()) as i32,
-        ))),
+        ("hasNext", "()Z") => Ok(Some(Value::Int((cursor < snapshot_len) as i32))),
         ("next", "()Ljava/lang/Object;") => {
-            let snapshot_value = this.host.host_iterator_next(marker)?;
-            let value = runtime_collection_values(&*this.host, delegate)?
-                .get(cursor)
-                .cloned()
-                .unwrap_or(snapshot_value);
+            // `NoSuchElementException` once the snapshot is exhausted, as in Java.
+            let value = this.host.host_iterator_next(marker)?;
             put_field(this, marker, "wrapped-removed", Value::Int(0));
             Ok(Some(value))
         }
@@ -424,23 +425,28 @@ fn invoke_wrapped_iterator_member<H: Host>(
                 });
             }
             let index = cursor - 1;
+            // How many earlier elements this iterator already removed: the live list
+            // lost them, so the element just returned sits that much earlier there.
+            let removals = match field(this, marker, "wrapped-removals") {
+                Some(Value::Int(count)) => count.max(0) as usize,
+                _ => 0,
+            };
             let class = this.host_collection_class(delegate).unwrap_or_default();
             if class == "java/util/ArrayList" {
                 invoke_instance(
                     this,
                     &collection_ref("remove", "(I)Ljava/lang/Object;"),
                     delegate,
-                    &[Value::Int(index as i32)],
+                    &[Value::Int(index.saturating_sub(removals) as i32)],
                 )?;
                 bump_collection_mod_count(this, delegate);
             } else {
-                // The cursor indexes the LIVE delegate (`hasNext`/`next` read it), so the
-                // element just returned is at `index` there; a creation-time snapshot drifts
-                // once an earlier `remove` has rewound the cursor.
-                let values = runtime_collection_values(&*this.host, delegate)?;
-                let Some(value) = values.get(index).cloned() else {
-                    return Ok(None);
-                };
+                // The element just returned is the snapshot's `index`; a set holds it once,
+                // so removing it by value is exact.
+                let values = this.host.host_iterator_values(marker).ok_or_else(|| {
+                    NativeError::Metadata("Guava wrapped iterator values missing".into())
+                })?;
+                let value = values[index].clone();
                 invoke_instance(
                     this,
                     &collection_ref("remove", "(Ljava/lang/Object;)Z"),
@@ -471,10 +477,12 @@ fn invoke_wrapped_iterator_member<H: Host>(
                 Value::Ref(Some(generation.encode())),
             );
             put_field(this, marker, "wrapped-removed", Value::Int(1));
-            // JDK 25 `ArrayList$Itr.remove` sets `cursor = lastRet`, and a hash iterator's
-            // `remove` leaves the next live element next: in both the element after the
-            // removed one now sits at `index`, so a following `hasNext`/`next` reads it.
-            this.host.set_host_iterator_cursor(marker, index);
+            put_field(
+                this,
+                marker,
+                "wrapped-removals",
+                Value::Int((removals + 1) as i32),
+            );
             Ok(Some(Value::Void))
         }
         _ => Ok(None),

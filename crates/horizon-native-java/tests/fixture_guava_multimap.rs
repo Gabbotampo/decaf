@@ -263,3 +263,35 @@ fn wrapped_iterator_remove_keeps_the_next_value() {
         assert_eq!(fixture.text_on(&mut host, method), "1|true|2|1", "{method}");
     }
 }
+
+/// The wrapped iterator walks its creation-time snapshot, so removing through
+/// it never skips or repeats an element and an exhausted walk throws.
+/// Java 25 + Guava 33.6.0: remove-all `123|NSEE|0|false`, remove-last
+/// `false|NSEE|1`, for every kind.
+#[test]
+fn wrapped_iterator_remove_walks_to_exhaustion() {
+    let Some(guava) = guava_jar() else {
+        eprintln!("GUAVA_JAR is unavailable; real-Guava fixture is arcweld-only");
+        return;
+    };
+    let fixture = Fixture::build_with_classpath(
+        "guava-multimap-exhaust",
+        &[("demo/Probe.java", PROBE)],
+        &guava,
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    for method in ["removeAllArray", "removeAllHash", "removeAllLinked"] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            "123|NSEE|0|false",
+            "{method}"
+        );
+    }
+    for method in ["removeLastArray", "removeLastHash", "removeLastLinked"] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            "false|NSEE|1",
+            "{method}"
+        );
+    }
+}

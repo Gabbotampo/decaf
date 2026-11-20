@@ -321,6 +321,31 @@ public final class Probe {
   public static String removeFirstArray() { return removeFirstOfTwo(ArrayListMultimap.create()); }
   public static String removeFirstHash() { return removeFirstOfTwo(HashMultimap.create()); }
   public static String removeFirstLinked() { return removeFirstOfTwo(LinkedHashMultimap.create()); }
+  /** Remove every value while walking, then call next() once more. */
+  static String removeAll3(Multimap<String, Integer> m) {
+    m.put("k", 1); m.put("k", 2); m.put("k", 3);
+    java.util.Iterator<Integer> it = m.get("k").iterator();
+    StringBuilder out = new StringBuilder();
+    while (it.hasNext()) { out.append(it.next()); it.remove(); }
+    String tail;
+    try { tail = "next=" + it.next(); } catch (java.util.NoSuchElementException e) { tail = "NSEE"; }
+    return out + "|" + tail + "|" + m.size() + "|" + m.containsKey("k");
+  }
+  public static String removeAllArray() { return removeAll3(ArrayListMultimap.create()); }
+  public static String removeAllHash() { return removeAll3(HashMultimap.create()); }
+  public static String removeAllLinked() { return removeAll3(LinkedHashMultimap.create()); }
+  /** Remove the last element, then hasNext/next. */
+  static String removeLast(Multimap<String, Integer> m) {
+    m.put("k", 1); m.put("k", 2);
+    java.util.Iterator<Integer> it = m.get("k").iterator();
+    it.next(); it.next(); it.remove();
+    String n;
+    try { n = "next=" + it.next(); } catch (java.util.NoSuchElementException e) { n = "NSEE"; }
+    return it.hasNext() + "|" + n + "|" + m.size();
+  }
+  public static String removeLastArray() { return removeLast(ArrayListMultimap.create()); }
+  public static String removeLastHash() { return removeLast(HashMultimap.create()); }
+  public static String removeLastLinked() { return removeLast(LinkedHashMultimap.create()); }
   public static String puzzleLoop() {
     ArrayListMultimap<String,Integer> m = ArrayListMultimap.create(); m.put("k", 1); m.put("k", 2);
     int sum = 0; for (Integer value : m.get("k")) sum += value;
