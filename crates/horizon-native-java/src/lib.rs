@@ -222,6 +222,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod scanner_model;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
@@ -268,11 +269,13 @@ mod type_switch;
 mod value_class;
 mod vanilla_block_items;
 mod vanilla_blocks;
+mod vanilla_entity_types;
 mod vanilla_holders;
 mod vanilla_holders_table;
 mod vanilla_items;
 mod vanilla_registries;
 mod vanilla_registry_keys;
+mod vanilla_static;
 mod vanilla_values;
 pub mod verdict;
 mod watch_service;
@@ -2542,6 +2545,11 @@ pub trait Host {
         None
     }
 
+    /// Whether a host map entry implements a fastutil primitive entry interface.
+    fn map_entry_is_instance_of(&self, _value: &Value, _wanted: &str) -> Option<bool> {
+        None
+    }
+
     /// A host `Map.Entry`: a new holder or snapshot, or `map`'s node of `key`
     /// (`host_map_entry.rs`). A host that keeps no entries answers one whose contents are
     /// unknown.
@@ -2628,6 +2636,7 @@ pub trait Host {
     /// is the only place a collection the interpreter mutated lasts, so a host
     /// that keeps no collection state has nothing to replace.
     fn replace_mutable_collection(&mut self, _value: &Value, _values: Vec<Value>) {}
+    fn register_mutable_collection(&mut self, _value: &Value, _kind: &str) {}
 
     /// The collection an unmodifiable view (`Collections.unmodifiableList`)
     /// reads, by the view's marker.
@@ -2767,6 +2776,13 @@ pub trait Host {
     /// Where a `subList` copy sits in its parent (`mod_count.rs`).
     fn sub_list_link(&self, _marker: &str) -> Option<mod_count::SubListLink> {
         None
+    }
+
+    /// Whether `marker` is a detached `subList` copy (`jdk_model.rs::sub_list`): a
+    /// write through it does not reach its parent list, so `Collections.reverse`
+    /// on it is counted rather than answered.
+    fn is_detached_sub_list(&self, _marker: &str) -> bool {
+        false
     }
 
     fn store_sub_list_link(&mut self, _marker: &str, _link: Option<mod_count::SubListLink>) {}
@@ -3495,6 +3511,8 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
+    detached_sub_lists: BTreeSet<String>,
     /// Live SetFromMap marker -> backing map marker.
     set_from_map_views: BTreeMap<String, String>,
     next_set_from_map: u64,
@@ -3762,6 +3780,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            detached_sub_lists: BTreeSet::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
             component_states: BTreeMap::new(),
@@ -5967,11 +5986,17 @@ impl Host for StdHost {
     }
 
     fn mutable_collection_entries(&self, value: &Value) -> Option<Vec<Value>> {
-        if jar_object::spells_key(value) {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        if jar_object::spells_key(value) && !self.mutable_collections.contains_key(marker) {
             return None;
         }
-        let marker = self.synchronized_target(expect_ref(value)?);
         self.mutable_collections.get(marker).cloned()
+    }
+
+    fn register_mutable_collection(&mut self, value: &Value, _kind: &str) {
+        if let Some(marker) = expect_ref(value) {
+            self.mutable_collections.insert(marker.clone(), Vec::new());
+        }
     }
 
     fn replace_mutable_collection(&mut self, value: &Value, values: Vec<Value>) {
@@ -6126,6 +6151,10 @@ impl Host for StdHost {
             return None;
         }
         self.sub_lists.get(marker).cloned()
+    }
+
+    fn is_detached_sub_list(&self, marker: &str) -> bool {
+        self.detached_sub_lists.contains(marker)
     }
 
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
@@ -6435,6 +6464,10 @@ impl Host for StdHost {
         self.map_entry_now(value)
     }
 
+    fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
+        self.fastutil_entry_instance_of(value, wanted)
+    }
+
     fn mint_map_entry(
         &mut self,
         map: Option<&Value>,
@@ -6557,6 +6590,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = vanilla_static::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = vanilla_values::static_field(r) {
             return Ok(value);
         }
@@ -10180,6 +10216,10 @@ impl Host for StdHost {
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
+            if r.owner == "java/util/stream/Stream" {
+                self.iterator_sources
+                    .insert(marker.clone(), "java/util/stream/Stream".into());
+            }
             // An `Arrays.asList` view's iterator reads its array live.
             if let Some(view) = expect_ref(receiver) {
                 let view = view.clone();
@@ -10223,18 +10263,22 @@ impl Host for StdHost {
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-            if r.name == "remove"
-                && r.descriptor == "()V"
-                && self.iterator_sources.get(marker).is_some_and(|source| {
+            if r.name == "remove" && r.descriptor == "()V" {
+                let source = self.iterator_sources.get(marker).map(String::as_str);
+                if source.is_some_and(|source| {
                     source.starts_with("java/util/Collections$Unmodifiable")
                         || source == "java/util/Collections$SingletonList"
-                })
-            {
-                return Err(NativeError::UncaughtException {
-                    class: "java/lang/UnsupportedOperationException".into(),
-                    message: None,
-                    frame: None,
-                });
+                        || source.starts_with("java/util/stream/")
+                        || source.starts_with("fabric/custom-value/")
+                }) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/UnsupportedOperationException".into(),
+                        message: source
+                            .filter(|source| source.starts_with("java/util/stream/"))
+                            .map(|_| "remove".into()),
+                        frame: None,
+                    });
+                }
             }
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasNext", "()Z") => return Ok(Value::Int((*index < values.len()) as i32)),
@@ -20103,6 +20147,9 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -20319,6 +20366,9 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -20491,6 +20541,9 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -22703,6 +22756,9 @@ struct Runtime<'a, H> {
     /// reader) this invocation built exposes to `Reader#read` and to
     /// `Gson.fromJson(Reader, Class)`, keyed by the reader's marker.
     string_readers: BTreeMap<String, String>,
+    reader_positions_unknown: BTreeSet<String>,
+    io_reader_errors: BTreeMap<String, usize>,
+    scanners: BTreeMap<String, scanner_model::ScannerState>,
     io_stream_paths: BTreeMap<String, String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
@@ -26489,7 +26545,8 @@ impl<H: Host> Runtime<'_, H> {
             return None;
         }
         // A loader enum whose constants are host handles (`ModConfig.Type`).
-        if let Some(values) = crate::host_neoforge_loader::enum_values(&r.owner)
+        if let Some(values) = crate::fabric_mods::enum_values(&r.owner)
+            .or_else(|| crate::host_neoforge_loader::enum_values(&r.owner))
             .or_else(|| crate::host_fabric_runtime::enum_values(&r.owner))
             && r.descriptor == format!("()[L{};", r.owner)
         {
@@ -26526,7 +26583,9 @@ impl<H: Host> Runtime<'_, H> {
         if r.name != "valueOf" || r.descriptor != format!("(Ljava/lang/String;)L{};", r.owner) {
             return Ok(None);
         }
-        let Some(constants) = game_enum_constants(&r.owner) else {
+        let Some(constants) =
+            game_enum_constants(&r.owner).or_else(|| crate::fabric_mods::enum_constants(&r.owner))
+        else {
             return Ok(None);
         };
         let name = match args.first() {
@@ -26689,7 +26748,7 @@ impl<H: Host> Runtime<'_, H> {
         path: String,
         bytes: Vec<u8>,
     ) -> Result<(), NativeError> {
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = Self::io_utf8_lossy(&bytes);
         self.ensure_io_capacity(&path, text.len() + bytes.len())?;
         self.io_file_bytes.insert(path.clone(), bytes);
         self.io_files.insert(path, text);
@@ -26877,6 +26936,158 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Java's UTF-8 decoder reports the malformed subsequence length, which differs from
+    /// `Utf8Error::error_len` for overlong and surrogate encodings.
+    fn io_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let mut index = 0;
+        while index < bytes.len() {
+            let first = bytes[index];
+            let needed = if first <= 0x7f {
+                1
+            } else if (0xc2..=0xdf).contains(&first) {
+                2
+            } else if (0xe0..=0xef).contains(&first) {
+                3
+            } else if (0xf0..=0xf4).contains(&first) {
+                4
+            } else {
+                return Some(1);
+            };
+            let available = bytes.len() - index;
+            let count = available.min(needed);
+            if count < needed {
+                if count == 1 {
+                    return Some(1);
+                }
+                if bytes[index + 1..index + count]
+                    .iter()
+                    .all(|byte| (0x80..=0xbf).contains(byte))
+                {
+                    return Some(count);
+                }
+                return Some(1);
+            }
+            let continuation = bytes[index + 1..index + needed]
+                .iter()
+                .all(|byte| (0x80..=0xbf).contains(byte));
+            let scalar_valid = match needed {
+                1 => true,
+                2 => true,
+                3 => {
+                    (first != 0xe0 || bytes[index + 1] >= 0xa0)
+                        && (first != 0xed || bytes[index + 1] <= 0x9f)
+                }
+                4 => {
+                    (first != 0xf0 || bytes[index + 1] >= 0x90)
+                        && (first != 0xf4 || bytes[index + 1] <= 0x8f)
+                }
+                _ => false,
+            };
+            if !continuation || !scalar_valid {
+                let malformed = if continuation {
+                    needed
+                } else {
+                    1 + bytes[index + 1..index + needed]
+                        .iter()
+                        .take_while(|byte| (0x80..=0xbf).contains(*byte))
+                        .count()
+                };
+                return Some(malformed);
+            }
+            index += needed;
+        }
+        None
+    }
+
+    fn io_read_string_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let length = Self::io_malformed_utf8_len(bytes)?;
+        if bytes.len() < 4
+            && bytes
+                .first()
+                .is_some_and(|byte| (0xf0..=0xf4).contains(byte))
+            && bytes[1..].iter().all(|byte| (0x80..=0xbf).contains(byte))
+        {
+            Some(1)
+        } else {
+            Some(length)
+        }
+    }
+
+    fn io_utf8_lossy(bytes: &[u8]) -> String {
+        let mut text = String::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            match std::str::from_utf8(&bytes[index..]) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    text.push_str(
+                        std::str::from_utf8(&bytes[index..index + valid]).unwrap_or_default(),
+                    );
+                    let remaining = &bytes[index + valid..];
+                    let first = remaining[0];
+                    let malformed = if first == 0xed
+                        && remaining.len() >= 3
+                        && (0x80..=0xbf).contains(&remaining[1])
+                        && (0x80..=0xbf).contains(&remaining[2])
+                    {
+                        3
+                    } else if remaining.len() < 2
+                        || ((0xf0..=0xf4).contains(&first) && remaining.len() < 4)
+                    {
+                        remaining.len()
+                    } else {
+                        1
+                    };
+                    text.push('\u{fffd}');
+                    index += valid + malformed;
+                }
+            }
+        }
+        text
+    }
+
+    fn io_reader_malformed_utf8_len(bytes: &[u8]) -> Option<usize> {
+        let length = Self::io_malformed_utf8_len(bytes)?;
+        if bytes.len() >= 3
+            && bytes[0] == 0xe0
+            && (0x80..=0xbf).contains(&bytes[1])
+            && (0x80..=0xbf).contains(&bytes[2])
+        {
+            Some(1)
+        } else {
+            Some(length)
+        }
+    }
+
+    fn io_malformed_error(length: usize) -> NativeError {
+        NativeError::UncaughtException {
+            class: "java/nio/charset/MalformedInputException".into(),
+            message: Some(format!("Input length = {length}")),
+            frame: None,
+        }
+    }
+
+    fn io_reject_non_utf8_charset(
+        &mut self,
+        r: &MethodRef,
+        descriptor: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if descriptor.contains("Ljava/nio/charset/Charset;")
+            && !matches!(
+                args.get(1),
+                Some(Value::Ref(Some(charset))) if charset == "charset/UTF-8"
+            )
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(None)
+    }
+
     /// Open a reader marker over a virtual file, or report the exception Java
     /// raises for a file that does not exist. A config loader guards its read
     /// with `exists` or catches the `IOException` and writes defaults.
@@ -26915,7 +27126,14 @@ impl<H: Host> Runtime<'_, H> {
                 frame: None,
             });
         };
+        self.io_paths.insert(marker.to_owned(), path.to_owned());
         self.string_readers.insert(marker.to_owned(), text);
+        if r.owner == "java/nio/file/Files"
+            && let Some(bytes) = self.io_file_bytes.get(path)
+            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+        {
+            self.io_reader_errors.insert(marker.to_owned(), length);
+        }
         self.io_stream_paths
             .insert(marker.to_owned(), path.to_owned());
         Ok(())
@@ -26946,6 +27164,102 @@ impl<H: Host> Runtime<'_, H> {
             })
             .cloned();
         match r.owner.as_str() {
+            "java/util/Scanner" => {
+                let Some(marker) = receiver_marker else {
+                    return Ok(None);
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("<init>", "(Ljava/io/File;)V") => {
+                        let Some(path) = args.first().and_then(|v| self.io_path_of(v)) else {
+                            return Ok(None);
+                        };
+                        let key = host_path::sandbox_canonical(&path);
+                        let Some(bytes) = self.io_file_bytes.get(&key) else {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/FileNotFoundException".into(),
+                                message: Some(format!("{} (No such file or directory)", path)),
+                                frame: None,
+                            });
+                        };
+                        // Java's strict decoder stops at malformed input and the scanner
+                        // ends there (`lastException`); how much of the valid prefix it
+                        // yields depends on StreamDecoder's buffering, so reads are counted.
+                        let Ok(text) = String::from_utf8(bytes.clone()) else {
+                            self.scanners.insert(
+                                marker,
+                                scanner_model::ScannerState {
+                                    text: String::new(),
+                                    pos: 0,
+                                    closed: false,
+                                    unknown: true,
+                                },
+                            );
+                            return Ok(Some(Value::Void));
+                        };
+                        self.scanners.insert(
+                            marker,
+                            scanner_model::ScannerState {
+                                text,
+                                pos: 0,
+                                closed: false,
+                                unknown: false,
+                            },
+                        );
+                        Ok(Some(Value::Void))
+                    }
+                    ("hasNextLine", "()Z") => {
+                        let Some(st) = self.scanners.get(&marker) else {
+                            return Ok(None);
+                        };
+                        // Java's `Scanner.ensureOpen()` runs first: a closed scanner throws
+                        // rather than answering `false`.
+                        if st.closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalStateException".into(),
+                                message: Some("Scanner closed".into()),
+                                frame: None,
+                            });
+                        }
+                        if st.unknown {
+                            return Ok(None);
+                        }
+                        Ok(Some(Value::Int(i32::from(
+                            scanner_model::next_line(&st.text, st.pos).is_some(),
+                        ))))
+                    }
+                    ("nextLine", "()Ljava/lang/String;") => {
+                        let Some(st) = self.scanners.get_mut(&marker) else {
+                            return Ok(None);
+                        };
+                        if st.closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalStateException".into(),
+                                message: Some("Scanner closed".into()),
+                                frame: None,
+                            });
+                        }
+                        if st.unknown {
+                            return Ok(None);
+                        }
+                        let Some((line, pos)) = scanner_model::next_line(&st.text, st.pos) else {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/util/NoSuchElementException".into(),
+                                message: Some("No line found".into()),
+                                frame: None,
+                            });
+                        };
+                        st.pos = pos;
+                        Ok(Some(Value::Ref(Some(line))))
+                    }
+                    ("close", "()V") => {
+                        if let Some(st) = self.scanners.get_mut(&marker) {
+                            st.closed = true;
+                        }
+                        Ok(Some(Value::Void))
+                    }
+                    _ => Ok(None),
+                }
+            }
             "java/io/File" => {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
@@ -27107,6 +27421,13 @@ impl<H: Host> Runtime<'_, H> {
                         frame: None,
                     });
                 }
+                if matches!(
+                    r.name.as_str(),
+                    "readAllLines" | "readString" | "newBufferedReader"
+                ) && let Some(value) = self.io_reject_non_utf8_charset(r, &r.descriptor, args)?
+                {
+                    return Ok(Some(value));
+                }
                 if let Some(value) = self.jar_root_files(r, &display_path, class, method)? {
                     return Ok(Some(value));
                 }
@@ -27144,9 +27465,65 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         Value::Int(i32::from(self.io_dirs.contains(&path)))
                     }
+                    ("readAllBytes", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        let Some(bytes) = self.io_file_bytes.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        self.io_bytes_array(bytes)
+                    }
+                    ("readAllLines", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;") =>
+                    {
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+                        {
+                            return Err(Self::io_malformed_error(length));
+                        }
+                        let Some(text) = self.io_files.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        let lines = text
+                            .split('\n')
+                            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                            .map(|line| Value::Ref(Some(line.to_owned())))
+                            .collect();
+                        self.new_array_list(lines)?
+                    }
+                    ("lines", descriptor)
+                        if descriptor.starts_with("(Ljava/nio/file/Path;")
+                            && descriptor.ends_with(")Ljava/util/stream/Stream;") =>
+                    {
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && let Some(length) = Self::io_reader_malformed_utf8_len(bytes)
+                        {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/UncheckedIOException".into(),
+                                message: Some(format!(
+                                    "java.nio.charset.MalformedInputException: Input length = {length}"
+                                )),
+                                frame: None,
+                            });
+                        }
+                        let Some(text) = self.io_files.get(&path).cloned() else {
+                            return Ok(None);
+                        };
+                        let lines = text
+                            .split('\n')
+                            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                            .map(|line| Value::Ref(Some(line.to_owned())))
+                            .collect();
+                        self.new_stream(class, method, lines)
+                    }
                     ("readString", descriptor)
                         if descriptor.starts_with("(Ljava/nio/file/Path;") =>
                     {
+                        if let Some(bytes) = self.io_file_bytes.get(&path)
+                            && let Some(length) = Self::io_read_string_malformed_utf8_len(bytes)
+                        {
+                            return Err(Self::io_malformed_error(length));
+                        }
                         match self.io_files.get(&path) {
                             Some(text) => Value::Ref(Some(text.clone())),
                             None => match seeded_text {
@@ -27231,30 +27608,37 @@ impl<H: Host> Runtime<'_, H> {
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("write", descriptor) if descriptor.starts_with("(Ljava/nio/file/Path;") => {
-                        let text = args
-                            .get(1)
-                            .and_then(|value| self.owned_array(value))
-                            .map(|bytes| {
-                                let bytes = bytes
-                                    .iter()
-                                    .map(|value| match value {
-                                        Value::Int(byte) => *byte as u8,
-                                        _ => 0,
-                                    })
-                                    .collect::<Vec<_>>();
-                                String::from_utf8_lossy(&bytes).into_owned()
-                            })
+                        let raw_bytes =
+                            args.get(1)
+                                .and_then(|value| self.owned_array(value))
+                                .map(|values| {
+                                    values
+                                        .iter()
+                                        .map(|value| match value {
+                                            Value::Int(byte) => *byte as u8,
+                                            _ => 0,
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
+                        let text = raw_bytes
+                            .as_deref()
+                            .map(String::from_utf8_lossy)
+                            .map(std::borrow::Cow::into_owned)
                             .unwrap_or_default();
-                        // Lines (`write(Path, Iterable)`) never reach the model's text.
-                        let bytes = args
-                            .get(1)
-                            .is_some_and(|value| self.owned_array(value).is_some());
-                        if bytes {
-                            self.watch_whole_write(&path, text.is_empty());
-                        } else {
-                            self.watch_change(&path, watch_service::Change::Unmodelled);
+                        match raw_bytes {
+                            // `write(Path, byte[])` writes the bytes as they are: keep them raw,
+                            // so a later reader (a strict Scanner decoder, `readAllBytes`) sees
+                            // malformed UTF-8 rather than its lossy re-encoding.
+                            Some(bytes) => {
+                                self.watch_whole_write(&path, bytes.is_empty());
+                                self.io_store_bytes(path, bytes)?;
+                            }
+                            // Lines (`write(Path, Iterable)`) never reach the model's text.
+                            None => {
+                                self.watch_change(&path, watch_service::Change::Unmodelled);
+                                self.io_store_file(path, text)?;
+                            }
                         }
-                        self.io_store_file(path, text)?;
                         args.first().cloned().unwrap_or(Value::Ref(None))
                     }
                     ("createFile", descriptor)
@@ -27478,6 +27862,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(text) = self.string_readers.remove(reader) else {
                     return Ok(None);
                 };
+                if let Some(length) = self.io_reader_errors.remove(reader) {
+                    self.io_reader_errors.insert(marker.clone(), length);
+                }
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
@@ -27658,6 +28045,9 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
+                if self.reader_positions_unknown.contains(&marker) {
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
                 }
@@ -27666,6 +28056,12 @@ impl<H: Host> Runtime<'_, H> {
                 // bounded reader surface consumes a file.
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
+                        if let Some(path) = self.io_paths.get(&marker)
+                            && let Some(bytes) = self.io_file_bytes.get(path).cloned()
+                        {
+                            self.string_readers.insert(marker.clone(), String::new());
+                            return Ok(Some(self.io_bytes_array(bytes)));
+                        }
                         let text = self.string_readers.remove(&marker).unwrap_or_default();
                         self.string_readers.insert(marker.clone(), String::new());
                         self.io_bytes_array(text.into_bytes())
@@ -27766,8 +28162,16 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(marker) = receiver_marker else {
                     return Ok(None);
                 };
+                if self.reader_positions_unknown.contains(&marker) && r.name != "close" {
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
+                }
+                if r.name != "close"
+                    && let Some(length) = self.io_reader_errors.get(&marker)
+                {
+                    return Err(Self::io_malformed_error(*length));
                 }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("read", "()I") => match self.string_readers.get_mut(&marker) {
@@ -36292,6 +36696,9 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -36365,6 +36772,9 @@ mod tests {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -43518,6 +43928,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -43733,6 +44146,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -43923,6 +44339,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -44289,6 +44708,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -44599,6 +45021,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -49867,6 +50292,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
@@ -49927,6 +50355,9 @@ mandatory = true
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),

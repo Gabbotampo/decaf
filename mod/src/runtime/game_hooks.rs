@@ -1263,6 +1263,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.sub_list_link(marker)
     }
 
+    fn is_detached_sub_list(&self, marker: &str) -> bool {
+        self.inner.is_detached_sub_list(marker)
+    }
+
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
         self.inner.store_sub_list_link(marker, link)
     }
@@ -1398,6 +1402,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.inner.map_entry_parts(value)
+    }
+
+    fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
+        self.inner.map_entry_is_instance_of(value, wanted)
     }
 
     fn mint_map_entry(
@@ -2020,6 +2028,9 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: Default::default(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
