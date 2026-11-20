@@ -264,6 +264,29 @@ public final class HostMapEntries {
     return String.valueOf(old.getValue()) + "," + (old == now) + "," + now + "," + h + "," + old.equals(now);
   }
 
+  /** A remapping function that always answers null (a class, not a lambda, so it runs in the interpreter). */
+  static final class ToNull<A, B> implements java.util.function.BiFunction<A, B, Integer> {
+    @Override public Integer apply(A a, B b) { return null; }
+  }
+
+  /**
+   * computeIfPresent/merge returning null unlink the node without nulling its value.
+   * (`compute` does the same in Java, but Decaf counts `Hashtable.compute`, so it is not here.)
+   */
+  public static String hashtableComputeRemove() {
+    StringBuilder out = new StringBuilder();
+    for (String how : new String[] {"computeIfPresent", "merge"}) {
+      Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+      Map.Entry<String, Integer> e = h.entrySet().iterator().next();
+      switch (how) {
+        case "computeIfPresent" -> h.computeIfPresent("a", new ToNull<String, Integer>());
+        default -> h.merge("a", 2, new ToNull<Integer, Integer>());
+      }
+      out.append(how).append(':').append(e.getValue()).append(':').append(e).append(':').append(h).append(';');
+    }
+    return out.toString();
+  }
+
   /** Hashtable put over a live key updates the same node. */
   public static String hashtableLivePut() {
     Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
