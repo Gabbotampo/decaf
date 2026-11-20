@@ -455,7 +455,7 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
             # recipes strictly, where vanilla logs and skips), and nothing bridges a jar's own
             # recipe serializer to the game yet, so such a recipe stays out of the package.
             bake.skip(
-                f"recipe of the jar's own type {recipe_type}: no serializer for it in the game yet",
+                f"recipe of a mod's own type {recipe_type}: no serializer for it in the game yet",
                 name,
             )
             continue
