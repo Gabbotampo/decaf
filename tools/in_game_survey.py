@@ -209,7 +209,7 @@ def table(rows: list[dict]) -> str:
 def content_items(game_dir: Path) -> dict[str, list[str]]:
     """The item ids each jar's baked packages declare, keyed by the jar's file name.
 
-    `tools/bake.py` writes one `.hmod` per namespace with the runtime's declarations as
+    `tools/bake.py` writes one `.smod` per namespace with the runtime's declarations as
     `data/<ns>/horizon/item/<path>.json` and `data/<ns>/horizon/block/<path>.json` (a block whose
     declaration says `"item": true` brings its block item). These are the ids a player can be
     given, so the survey gives one of them for every content jar. A jar with no declared items
@@ -232,7 +232,10 @@ def content_items(game_dir: Path) -> dict[str, list[str]]:
                     names = sorted(archive.namelist())
                     for name in names:
                         parts = name.split("/")
-                        if (len(parts) != 5 or parts[0] != "data" or parts[2] != "horizon"
+                        # Sunrise reads declarations from `data/<ns>/sunrise/` (bake.py writes
+                        # them there); `horizon/` is the layout of packages baked for Horizon.
+                        if (len(parts) != 5 or parts[0] != "data"
+                                or parts[2] not in ("sunrise", "horizon")
                                 or not parts[4].endswith(".json")):
                             continue
                         item_id = f"{parts[1]}:{parts[4][:-len('.json')]}"

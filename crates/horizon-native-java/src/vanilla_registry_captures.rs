@@ -1,4 +1,10 @@
-PROTECTION|minecraft:enchantment|minecraft:protection
+//! Captured vanilla 26.3 registry tables, as Rust source: a Sunrise native build stages only a
+//! mod's `.rs` and `.toml` files, so these can't be `include_str!`ed data files. The texts are the
+//! captures `vanilla_registry_keys.rs` reads (see its fixtures' READMEs for how they were taken).
+
+/// `Enchantments`' fields, one per line, in declaration order.
+#[rustfmt::skip]
+pub(crate) const ENCHANTMENTS: &str = r#"PROTECTION|minecraft:enchantment|minecraft:protection
 FIRE_PROTECTION|minecraft:enchantment|minecraft:fire_protection
 FEATHER_FALLING|minecraft:enchantment|minecraft:feather_falling
 BLAST_PROTECTION|minecraft:enchantment|minecraft:blast_protection
@@ -41,3 +47,59 @@ WIND_BURST|minecraft:enchantment|minecraft:wind_burst
 LUNGE|minecraft:enchantment|minecraft:lunge
 MENDING|minecraft:enchantment|minecraft:mending
 VANISHING_CURSE|minecraft:enchantment|minecraft:vanishing_curse
+"#;
+
+/// `DamageTypes`' fields as `NAME|location`, in declaration order.
+#[rustfmt::skip]
+pub(crate) const DAMAGE_TYPES: &str = r#"IN_FIRE|minecraft:in_fire
+CAMPFIRE|minecraft:campfire
+LIGHTNING_BOLT|minecraft:lightning_bolt
+ON_FIRE|minecraft:on_fire
+LAVA|minecraft:lava
+HOT_FLOOR|minecraft:hot_floor
+SULFUR_CUBE_HOT|minecraft:sulfur_cube_hot
+IN_WALL|minecraft:in_wall
+CRAMMING|minecraft:cramming
+DROWN|minecraft:drown
+STARVE|minecraft:starve
+CACTUS|minecraft:cactus
+FALL|minecraft:fall
+ENDER_PEARL|minecraft:ender_pearl
+FLY_INTO_WALL|minecraft:fly_into_wall
+FELL_OUT_OF_WORLD|minecraft:out_of_world
+GENERIC|minecraft:generic
+MAGIC|minecraft:magic
+WITHER|minecraft:wither
+DRAGON_BREATH|minecraft:dragon_breath
+DRY_OUT|minecraft:dry_out
+SWEET_BERRY_BUSH|minecraft:sweet_berry_bush
+FREEZE|minecraft:freeze
+STALAGMITE|minecraft:stalagmite
+FALLING_BLOCK|minecraft:falling_block
+FALLING_ANVIL|minecraft:falling_anvil
+FALLING_STALACTITE|minecraft:falling_stalactite
+STING|minecraft:sting
+MOB_ATTACK|minecraft:mob_attack
+MOB_ATTACK_NO_AGGRO|minecraft:mob_attack_no_aggro
+PLAYER_ATTACK|minecraft:player_attack
+SPEAR|minecraft:spear
+ARROW|minecraft:arrow
+TRIDENT|minecraft:trident
+MOB_PROJECTILE|minecraft:mob_projectile
+SPIT|minecraft:spit
+WIND_CHARGE|minecraft:wind_charge
+FIREWORKS|minecraft:fireworks
+FIREBALL|minecraft:fireball
+UNATTRIBUTED_FIREBALL|minecraft:unattributed_fireball
+WITHER_SKULL|minecraft:wither_skull
+THROWN|minecraft:thrown
+INDIRECT_MAGIC|minecraft:indirect_magic
+THORNS|minecraft:thorns
+EXPLOSION|minecraft:explosion
+PLAYER_EXPLOSION|minecraft:player_explosion
+SONIC_BOOM|minecraft:sonic_boom
+BAD_RESPAWN_POINT|minecraft:bad_respawn_point
+OUTSIDE_BORDER|minecraft:outside_border
+GENERIC_KILL|minecraft:generic_kill
+MACE_SMASH|minecraft:mace_smash
+"#;

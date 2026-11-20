@@ -1,0 +1,4 @@
+functional=minecraft:functional_blocks
+combat=minecraft:combat
+same=true
+different=false
