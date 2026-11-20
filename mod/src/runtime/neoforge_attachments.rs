@@ -1352,6 +1352,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),

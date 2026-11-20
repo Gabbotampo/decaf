@@ -20192,6 +20192,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -20413,6 +20414,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -20590,6 +20592,7 @@ impl NativeJar {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -22812,6 +22815,7 @@ struct Runtime<'a, H> {
     io_writers: BTreeMap<String, String>,
     io_closed: BTreeSet<String>,
     io_writer_bytes: BTreeMap<String, Vec<u8>>,
+    io_stream_positions: BTreeMap<String, usize>,
     /// Charset selected by each writer sink; UTF-8 is Java 25's default.
     io_writer_charsets: BTreeMap<String, String>,
     /// Charset-independent bytes committed for each virtual file. Text is
@@ -26916,6 +26920,10 @@ impl<H: Host> Runtime<'_, H> {
                     self.watch_writer_opened(&path, true);
                     self.io_files.insert(path.clone(), String::new());
                     self.io_file_bytes.insert(path.clone(), Vec::new());
+                    // A FileOutputStream's byte sink is per open stream.  The
+                    // next non-append open truncates the file and must not
+                    // inherit bytes accumulated by the previous stream.
+                    self.io_writer_bytes.remove(&format!("file:{path}"));
                     self.io_dirs.remove(&path);
                 }
                 format!("file:{path}")
@@ -26955,14 +26963,50 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
+    /// FileOutputStream writes are unbuffered and each stream has its own
+    /// file position.  Publish the bytes immediately so every reader sees
+    /// the same virtual file before close.
+    fn io_write_binary(&mut self, marker: &str, bytes: &[u8]) {
+        let Some(path) = self.io_paths.get(marker).cloned() else {
+            return;
+        };
+        let position = self
+            .io_stream_positions
+            .entry(marker.to_owned())
+            .or_default();
+        let file = self.io_file_bytes.entry(path.clone()).or_default();
+        if *position > file.len() {
+            file.resize(*position, 0);
+        }
+        let end = position.saturating_add(bytes.len());
+        if end > file.len() {
+            file.resize(end, 0);
+        }
+        file[*position..end].copy_from_slice(bytes);
+        *position = end;
+        self.io_files
+            .insert(path, String::from_utf8_lossy(file).into_owned());
+    }
+
     /// Copy a writer's sink into the virtual file it names. A close or flush
     /// repeats harmlessly because every wrapper shares one sink per file.
     fn io_commit(&mut self, marker: &str) {
         let Some(path) = self.io_paths.get(marker).cloned() else {
             return;
         };
+        // FileOutputStream writes are published at each write and therefore
+        // must not be replaced by the empty text sink on close.
+        if marker.contains("java/io/FileOutputStream/")
+            || self.io_stream_positions.contains_key(marker)
+        {
+            return;
+        }
         if let Some(raw) = self.io_writer_bytes.get(&format!("file:{path}")).cloned() {
             self.io_file_bytes.insert(path.clone(), raw);
+            if let Some(raw) = self.io_file_bytes.get(&path) {
+                self.io_files
+                    .insert(path.clone(), String::from_utf8_lossy(raw).into_owned());
+            }
             return;
         }
         if let Some(text) = self.io_writers.get(&format!("file:{path}")).cloned() {
@@ -27148,7 +27192,11 @@ impl<H: Host> Runtime<'_, H> {
         path: &str,
         required: bool,
     ) -> Result<(), NativeError> {
-        let Some(text) = self.io_files.get(path).cloned() else {
+        let Some(text) = self.io_files.get(path).cloned().or_else(|| {
+            self.io_file_bytes
+                .get(path)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        }) else {
             if !required {
                 // `Files.newBufferedReader` over a path the invocation never
                 // wrote reads the jar resource `Files.exists` already answers
@@ -27879,6 +27927,14 @@ impl<H: Host> Runtime<'_, H> {
                         && args
                             .get(1)
                             .is_some_and(|value| expect_int(r, value).unwrap_or(0) != 0);
+                    if self.io_paths.iter().any(|(other, other_path)| {
+                        other != &marker
+                            && other.contains("java/io/FileOutputStream/")
+                            && other_path == &path
+                            && !self.io_closed.contains(other)
+                    }) {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    }
                     // The model has no symlink table. Java redirects an append
                     // stream through a symlink to its target, so answering from
                     // the lexical path would invent the target's contents.
@@ -27886,7 +27942,13 @@ impl<H: Host> Runtime<'_, H> {
                         self.host.unknown_operand_call(r)?;
                         return Ok(Some(Value::Void));
                     }
-                    self.io_open_writer(&marker, Some(path), !appending)?;
+                    self.io_open_writer(&marker, Some(path.clone()), !appending)?;
+                    let position = if appending {
+                        self.io_file_bytes.get(&path).map_or(0, Vec::len)
+                    } else {
+                        0
+                    };
+                    self.io_stream_positions.insert(marker, position);
                 }
                 Ok(Some(Value::Void))
             }
@@ -27959,7 +28021,10 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(None);
                 };
                 let is_closed = self.io_closed.contains(&marker);
-                if is_closed && r.name != "close" && r.name != "flush" {
+                let file_output_byte_array = r.owner == "java/io/FileOutputStream"
+                    && r.name == "write"
+                    && matches!(r.descriptor.as_str(), "([B)V" | "([BII)V");
+                if is_closed && !file_output_byte_array && r.name != "close" && r.name != "flush" {
                     return Err(NativeError::UncaughtException {
                         class: "java/io/IOException".into(),
                         message: Some("Stream Closed".into()),
@@ -28009,6 +28074,13 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
                         let bytes = values[off as usize..(off + len) as usize]
                             .iter()
                             .map(|v| match v {
@@ -28016,10 +28088,7 @@ impl<H: Host> Runtime<'_, H> {
                                 _ => 0,
                             })
                             .collect::<Vec<_>>();
-                        self.io_writer_bytes
-                            .entry(self.io_sink_key(&marker).unwrap_or_default())
-                            .or_default()
-                            .extend(bytes);
+                        self.io_write_binary(&marker, &bytes);
                         Value::Void
                     }
                     ("write", "([B)V") if r.owner == "java/io/FileOutputStream" => {
@@ -28033,6 +28102,13 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             });
                         }
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
                         let values = self.array(array).map(std::borrow::Cow::into_owned)?;
                         let bytes = values
                             .iter()
@@ -28041,10 +28117,7 @@ impl<H: Host> Runtime<'_, H> {
                                 _ => 0,
                             })
                             .collect::<Vec<_>>();
-                        self.io_writer_bytes
-                            .entry(self.io_sink_key(&marker).unwrap_or_default())
-                            .or_default()
-                            .extend(bytes);
+                        self.io_write_binary(&marker, &bytes);
                         Value::Void
                     }
                     // `write(char[])` and `write(char[], off, len)`: the units in
@@ -28089,15 +28162,19 @@ impl<H: Host> Runtime<'_, H> {
                         }
                     }
                     ("write", "(I)V") if r.owner == "java/io/FileOutputStream" => {
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
                         let code = args
                             .first()
                             .map(|v| expect_int(r, v))
                             .transpose()?
                             .unwrap_or(0);
-                        self.io_writer_bytes
-                            .entry(self.io_sink_key(&marker).unwrap_or_default())
-                            .or_default()
-                            .push(code as u8);
+                        self.io_write_binary(&marker, &[code as u8]);
                         Value::Void
                     }
                     ("write", "(I)V") => {
@@ -37279,6 +37356,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -37357,6 +37435,7 @@ mod tests {
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -44515,6 +44594,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -44735,6 +44815,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -44930,6 +45011,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45301,6 +45383,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45616,6 +45699,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -50889,6 +50973,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -50954,6 +51039,7 @@ mandatory = true
             io_writers: BTreeMap::new(),
             io_closed: BTreeSet::new(),
             io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
