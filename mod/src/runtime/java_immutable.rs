@@ -467,10 +467,13 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         crate::runtime::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
+        | "java/util/Collections$SynchronizedRandomAccessList"
         | "java/util/Collections$UnmodifiableRandomAccessList"
         | "java/util/Collections$EmptyList"
         | "java/util/Collections$SingletonList" => LIST,
-        "java/util/Collections$UnmodifiableList" => SEQUENTIAL_LIST,
+        "java/util/Collections$SynchronizedList" | "java/util/Collections$UnmodifiableList" => {
+            SEQUENTIAL_LIST
+        }
         "java/util/Collections$UnmodifiableCollection" => COLLECTION,
         "java/util/ImmutableCollections$SetN"
         | "java/util/ImmutableCollections$Set12"
