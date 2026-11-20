@@ -74,6 +74,14 @@ fn cme() -> NativeError {
     }
 }
 
+fn iae(message: impl Into<String>) -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/IllegalArgumentException".into(),
+        message: Some(message.into()),
+        frame: None,
+    }
+}
+
 fn require(value: Option<&Value>) -> Result<&Value, NativeError> {
     let value = value.unwrap_or(&Value::Ref(None));
     if matches!(value, Value::Ref(None)) {
@@ -372,7 +380,60 @@ impl Store {
                         | "(Lcom/google/common/collect/Table;)Lcom/google/common/collect/HashBasedTable;"
                 )
             {
-                return Ok(Some(self.new_table()));
+                if r.descriptor == "(II)Lcom/google/common/collect/HashBasedTable;" {
+                    let rows = match args.first() {
+                        Some(Value::Int(value)) => *value,
+                        _ => 0,
+                    };
+                    let cells = match args.get(1) {
+                        Some(Value::Int(value)) => *value,
+                        _ => 0,
+                    };
+                    if rows < 0 {
+                        return Err(iae(format!(
+                            "expectedSize cannot be negative but was: {rows}"
+                        )));
+                    }
+                    if cells < 0 {
+                        return Err(iae(format!(
+                            "expectedCellsPerRow cannot be negative but was: {cells}"
+                        )));
+                    }
+                }
+                let copied_cells = if r.descriptor
+                    == "(Lcom/google/common/collect/Table;)Lcom/google/common/collect/HashBasedTable;"
+                {
+                    let Some(source) = args.first().and_then(table_key) else {
+                        return Ok(None);
+                    };
+                    let Some(root) = self.table_root(source) else {
+                        return Ok(None);
+                    };
+                    let Some(cells) = self.rows_for(&root) else {
+                        return Ok(None);
+                    };
+                    Some(cells)
+                } else {
+                    None
+                };
+                let table = self.new_table();
+                if r.descriptor
+                    == "(Lcom/google/common/collect/Table;)Lcom/google/common/collect/HashBasedTable;"
+                {
+                    let Some(target) = table_key(&table) else {
+                        return Ok(None);
+                    };
+                    for (row, column, value) in copied_cells.unwrap_or_default() {
+                        let Some((rows, _, mod_count)) = self.table_state_mut(target) else {
+                            return Ok(None);
+                        };
+                        let (_, structural) = Self::insert(rows, row, column, value);
+                        if structural {
+                            *mod_count = mod_count.saturating_add(1);
+                        }
+                    }
+                }
+                return Ok(Some(table));
             }
             if r.owner == "com/google/common/collect/Tables"
                 && r.name == "immutableCell"
@@ -389,10 +450,7 @@ impl Store {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
-        if let Some((table, row, column, cell_value)) = cell_parts(receiver) {
-            let Some(_table) = table_key(&table).map(str::to_owned) else {
-                return Ok(None);
-            };
+        if let Some((_table, row, column, cell_value)) = cell_parts(receiver) {
             return Ok(match (r.name.as_str(), r.descriptor.as_str()) {
                 ("getRowKey", "()Ljava/lang/Object;") => Some(row),
                 ("getColumnKey", "()Ljava/lang/Object;") => Some(column),
@@ -864,6 +922,11 @@ impl<H: Host> Runtime<'_, H> {
                 .guava_table_store()
                 .and_then(|store| store.cell_snapshot(other));
             let Some((_, other_row, other_column, other_value)) = other_snapshot else {
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/lang/Object".into(),
+                    name: "equals".into(),
+                    descriptor: "(Ljava/lang/Object;)Z".into(),
+                })?;
                 return Ok(Some(false));
             };
             return Ok(Some(
@@ -884,6 +947,11 @@ impl<H: Host> Runtime<'_, H> {
             .guava_table_store()
             .and_then(|store| store.cells_for(other));
         let Some(other_cells) = other_cells else {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "equals".into(),
+                descriptor: "(Ljava/lang/Object;)Z".into(),
+            })?;
             return Ok(Some(false));
         };
         if cells.len() != other_cells.len() {
@@ -915,6 +983,40 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // Store keys are persisted as Values and cannot call a jar object's
+        // equals/hashCode. Let the normal host path count any operation whose
+        // key equality is not known to be pure, as the JDK hash-table models do.
+        let key_args: &[Value] = match r.name.as_str() {
+            "put"
+                if r.descriptor
+                    .contains("Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;") =>
+            {
+                &args[..args.len().min(2)]
+            }
+            "put" => &args[..args.len().min(1)],
+            "get" | "remove" | "row" | "containsKey" => &args[..args.len().min(2)],
+            "contains" if args.len() == 1 => &[],
+            "contains" => &args[..args.len().min(2)],
+            _ => &[],
+        };
+        if key_args.iter().any(|key| !self.pure_equality(key)) {
+            return Ok(None);
+        }
+        if r.name == "contains"
+            && args.len() == 1
+            && match args.first().and_then(cell_parts) {
+                Some((_, row, column, value)) => {
+                    !self.pure_equality(&row)
+                        || !self.pure_equality(&column)
+                        || !self.pure_equality(&value)
+                }
+                None => receiver
+                    .and_then(table_key)
+                    .is_some_and(|_| args.first().is_some_and(|key| !self.pure_equality(key))),
+            }
+        {
+            return Ok(None);
+        }
         let Some(store) = self.host.guava_table_store() else {
             return Ok(None);
         };

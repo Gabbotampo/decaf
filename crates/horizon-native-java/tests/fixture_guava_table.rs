@@ -117,6 +117,45 @@ public class Probe {
     try { t.put(null, "c", 1); return "no-throw"; }
     catch (NullPointerException e) { return "npe"; }
   }
+  public static String copyAndCapacity() {
+    Table<String,String,Integer> source = HashBasedTable.create();
+    source.put("r", "c", 7); source.put("s", "d", 8);
+    Table<String,String,Integer> copy = HashBasedTable.create(source);
+    return copy + "/" + copy.equals(source) + "/" + (copy == source) + "|"
+      + capacity(0, 1) + "," + capacity(-1, 1) + "," + capacity(1, 0) + "," + capacity(1, -1);
+  }
+  private static String capacity(int rows, int cells) {
+    try { HashBasedTable.create(rows, cells); return "ok"; }
+    catch (Throwable t) { return t.getClass().getName() + ":" + t.getMessage(); }
+  }
+  public static String standaloneCell() {
+    Table.Cell<String,String,Integer> cell = Tables.immutableCell("r", "c", 7);
+    return cell.getRowKey() + "," + cell.getColumnKey() + "," + cell.getValue()
+      + "|" + cell + "|" + cell.hashCode() + "|" + cell.equals(Tables.immutableCell("r", "c", 7));
+  }
+  public static String customKey() {
+    class K { int x; K(int x) { this.x = x; }
+      public boolean equals(Object o) { return o instanceof K k && k.x == x; }
+      public int hashCode() { return x; }
+    }
+    K first = new K(1), second = new K(1);
+    Table<K,String,Integer> table = HashBasedTable.create(); table.put(first, "c", 1);
+    return table.get(second, "c") + "," + table.rowKeySet().contains(second);
+  }
+  public static String userCell() {
+    Table.Cell<String,String,Integer> cell = Tables.immutableCell("r", "c", 7);
+    Table.Cell<String,String,Integer> user = new Table.Cell<>() {
+      public String getRowKey() { return "r"; }
+      public String getColumnKey() { return "c"; }
+      public Integer getValue() { return 7; }
+      public boolean equals(Object o) { return o instanceof Table.Cell<?,?,?> c
+        && Objects.equals(getRowKey(), c.getRowKey()) && Objects.equals(getColumnKey(), c.getColumnKey())
+        && Objects.equals(getValue(), c.getValue()); }
+      public int hashCode() { return 142421; }
+      public String toString() { return "usercell"; }
+    };
+    return cell.equals(user) + "," + user.equals(cell) + "," + cell.equals(new Object());
+  }
 }
 "#;
 
@@ -147,6 +186,10 @@ fn table_surface_counts_unmodelled_members() {
     ));
     assert!(JAVA25.contains("liveAndFailFast=true,true"));
     assert!(JAVA25.contains("nulls=npe"));
+    assert!(JAVA25.contains("copyAndCapacity={r={c=7}, s={d=8}}/true/false|ok,java.lang.IllegalArgumentException:expectedSize cannot be negative but was: -1,ok,java.lang.IllegalArgumentException:expectedCellsPerRow cannot be negative but was: -1"));
+    assert!(JAVA25.contains("standaloneCell=r,c,7|(r,c)=7|142421|true"));
+    assert!(JAVA25.contains("customKey=1,true"));
+    assert!(JAVA25.contains("userCell=true,true,false"));
     let fixture = fixture();
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(
@@ -173,4 +216,25 @@ fn table_surface_counts_unmodelled_members() {
     );
     assert_eq!(fixture.text_on(&mut host, "liveAndFailFast"), "true,true");
     assert_eq!(fixture.text_on(&mut host, "nulls"), "npe");
+    assert_eq!(
+        fixture.text_on(&mut host, "copyAndCapacity"),
+        "{r={c=7}, s={d=8}}/true/false|ok,java.lang.IllegalArgumentException:expectedSize cannot be negative but was: -1,ok,java.lang.IllegalArgumentException:expectedCellsPerRow cannot be negative but was: -1"
+    );
+    assert_eq!(
+        fixture.text_on(&mut host, "standaloneCell"),
+        "r,c,7|(r,c)=7|142421|true"
+    );
+    assert_eq!(fixture.text_on(&mut host, "customKey"), "null,false");
+    assert_eq!(fixture.text_on(&mut host, "userCell"), "false,true,false");
+    let calls = host.unknown_host_calls();
+    assert!(
+        calls.iter().any(|(call, _)| call.contains("Table#get")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(call, _)| call == "java/lang/Object#equals(Ljava/lang/Object;)Z"),
+        "{calls:?}"
+    );
 }

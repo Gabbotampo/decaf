@@ -3,3 +3,7 @@ narrow=7,true,7,1,1,1,r,c,7
 equalityHashAndCell={r={c=7}}|true,false|true|(r,c)=7|true,false|142421,142421|true,false
 liveAndFailFast=true,true
 nulls=npe
+copyAndCapacity={r={c=7}, s={d=8}}/true/false|ok,java.lang.IllegalArgumentException:expectedSize cannot be negative but was: -1,ok,java.lang.IllegalArgumentException:expectedCellsPerRow cannot be negative but was: -1
+standaloneCell=r,c,7|(r,c)=7|142421|true
+customKey=1,true
+userCell=true,true,false
