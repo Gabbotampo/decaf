@@ -31617,6 +31617,21 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
+                        self.invoke_library_model(&r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // A linked library's call site may carry a host-modelled receiver.
+                        // Let the library/JDK model answer before the opaque jar-operand
+                        // counter; an unmodelled jar receiver still falls through and counts.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
+                        self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
+                    ) {
+                        // Every native stream model uses the same live marker, regardless of
+                        // which library caller created it, so it gets model dispatch first.
+                        value
+                    } else if let Some(value) = invoke_or_catch!(
+                        at,
                         self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
                     ) {
                         // A model handed a jar object it has no state for

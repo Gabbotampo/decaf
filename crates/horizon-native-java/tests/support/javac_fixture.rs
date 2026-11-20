@@ -115,6 +115,22 @@ impl Fixture {
         Self::build_jars(test, sources, extra, true)
     }
 
+    pub fn build_with_lib_classpath<P: AsRef<Path>>(
+        test: &str,
+        sources: &[(&str, &str)],
+        classpath: P,
+    ) -> Self {
+        Self::build_packed(
+            test,
+            sources,
+            &[],
+            true,
+            "demo",
+            None,
+            Some(classpath.as_ref()),
+        )
+    }
+
     /// [`Self::build`], packing every compiled class into the probe jar, not
     /// only `demo/`'s (a probe whose jar classes sit in other packages).
     pub fn build_every_package(test: &str, sources: &[(&str, &str)]) -> Self {
