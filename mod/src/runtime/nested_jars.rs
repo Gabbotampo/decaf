@@ -182,19 +182,6 @@ fn candidate_version(jar: &NativeJar) -> Option<String> {
         .or_else(|| jar.neoforge_version.clone())
 }
 
-fn parent_cmp(a: &NestedCandidate, b: &NestedCandidate) -> Ordering {
-    for ((aid, av, ad), (bid, bv, bd)) in a.parent_chain.iter().zip(&b.parent_chain) {
-        let cmp = aid
-            .cmp(bid)
-            .then_with(|| version_cmp(bv.as_deref(), av.as_deref()))
-            .then_with(|| ad.cmp(bd));
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    a.parent_chain.len().cmp(&b.parent_chain.len())
-}
-
 fn priority_is_root(candidate: &NestedCandidate) -> bool {
     // The per-jar nested selector receives direct children without the outer
     // candidate, so depth zero is the selector's root tier. The resolver
@@ -808,298 +795,78 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
 fn select_fabric_candidates(
     mut fabric: Vec<NestedCandidate>,
 ) -> Result<Vec<NestedCandidate>, String> {
+    // `net.fabricmc.loader.impl.discovery.ModPrioSorter.sort` first calls
+    // List.sort (bytecode offsets 0-4), then recognizes the first non-root at
+    // offsets 228-273 and removes a nested candidate that overlaps an earlier
+    // root at offsets 387-531. This is the only overlap decision Decaf can make
+    // without Fabric's SAT solver.
     let roots = fabric
         .iter()
-        .enumerate()
-        .filter_map(|(index, candidate)| candidate.is_root.then_some(index))
+        .filter(|candidate| priority_is_root(candidate))
+        .cloned()
         .collect::<Vec<_>>();
-    if let Some(plan) = fabric_resolution_plan(&fabric, &roots) {
-        match plan {
-            FabricResolutionPlan::Keep(keep) => {
-                let mut keep = keep.into_iter().collect::<std::collections::BTreeSet<_>>();
-                fabric = fabric
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, candidate)| keep.remove(&index).then_some(candidate))
-                    .collect();
-            }
-            FabricResolutionPlan::Reject(removed) => {
-                return Err(fabric_resolution_error(&fabric, &removed));
-            }
-            FabricResolutionPlan::Error(error) => return Err(error),
-        }
-    }
-    let mut selected: Vec<NestedCandidate> = Vec::new();
-    // ModPrioSorter first orders candidates by id, descending version, nest level,
-    // and parent precedence. It then resolves every duplicate id/alias graph. Its
-    // overlap comparator sums all shared id and alias comparisons; a zero score is
-    // deliberately a tie, so cycles of equal candidates remain intact.
-    fabric.sort_by(|a, b| {
-        (!priority_is_root(a))
-            .cmp(&(!priority_is_root(b)))
-            .then_with(|| candidate_id(&a.jar).cmp(&candidate_id(&b.jar)))
-            .then_with(|| {
-                version_cmp(
-                    candidate_version(&b.jar).as_deref(),
-                    candidate_version(&a.jar).as_deref(),
-                )
-            })
-            .then_with(|| a.depth.cmp(&b.depth))
-            .then_with(|| parent_cmp(a, b))
-            .then_with(|| a.order.cmp(&b.order))
-    });
-    let mut key_counts = std::collections::BTreeMap::<String, usize>::new();
-    let mut provided_keys = std::collections::BTreeSet::new();
-    for candidate in &fabric {
-        *key_counts.entry(candidate_id(&candidate.jar)).or_default() += 1;
-        for alias in &candidate.jar.fabric_provides {
-            *key_counts.entry(alias.clone()).or_default() += 1;
-            provided_keys.insert(alias.clone());
-        }
-    }
-    let duplicate_keys = key_counts
-        .into_iter()
-        .filter_map(|(key, count)| (count > 1 && provided_keys.contains(&key)).then_some(key))
+    let root_keys = roots
+        .iter()
+        .flat_map(candidate_keys)
         .collect::<std::collections::BTreeSet<_>>();
-    let sign = |ordering: Ordering| match ordering {
-        Ordering::Less => -1,
-        Ordering::Equal => 0,
-        Ordering::Greater => 1,
-    };
-    let mut first_nested_index = 0;
-    let mut seen_nested = false;
-    for candidate in fabric {
-        if !seen_nested && !priority_is_root(&candidate) {
-            seen_nested = true;
-            first_nested_index = selected.len();
-        }
-        let ids = std::iter::once(candidate.jar.fabric_id.as_deref())
-            .chain(
-                candidate
-                    .jar
-                    .fabric_provides
-                    .iter()
-                    .map(|s| Some(s.as_str())),
-            )
-            .flatten()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if !ids.iter().any(|id| duplicate_keys.contains(id)) {
-            selected.push(candidate);
-            continue;
-        }
-        let overlap_keys = ids
-            .iter()
-            .filter(|id| duplicate_keys.contains(*id))
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut replace = None;
-        let mut reject = false;
-        for previous_index in (first_nested_index..selected.len()).rev() {
-            let current = &selected[previous_index];
-            if candidate_id(&candidate.jar) == candidate_id(&current.jar) {
-                break;
-            }
-            if !overlap_keys.contains(&candidate_id(&current.jar))
-                && current
-                    .jar
-                    .fabric_provides
-                    .iter()
-                    .all(|alias| !overlap_keys.contains(alias))
-            {
-                continue;
-            }
-            let score = compare_overlapping_ids(&candidate, current, &sign);
-            if score < 0 {
-                replace = Some(previous_index);
-            } else if score > 0 {
-                reject = true;
-                break;
-            }
-        }
-        if let Some(previous_index) = replace {
-            selected.remove(previous_index);
-            selected.insert(previous_index, candidate);
-        } else if reject {
-            continue;
-        } else if !priority_is_root(&candidate)
-            && selected[..first_nested_index].iter().any(|current| {
-                overlap_keys.contains(&candidate_id(&current.jar))
-                    || current
-                        .jar
-                        .fabric_provides
-                        .iter()
-                        .any(|alias| overlap_keys.contains(alias))
-            })
-        {
-            // ModPrioSorter never compares a candidate after the first nested
-            // one with a root. The resolver consequently keeps the root and
-            // drops this lower-priority nested provider.
-        } else {
-            selected.push(candidate);
-        }
-    }
-    selected.sort_by_key(|left| candidate_id(&left.jar));
-    Ok(selected)
-}
+    fabric.retain(|candidate| {
+        priority_is_root(candidate)
+            || candidate_keys(candidate)
+                .iter()
+                .all(|key| !root_keys.contains(key))
+    });
 
-/// Find the candidates Fabric's SAT resolver can keep while still satisfying every
-/// root candidate's id. A root is force-loaded, but one selected candidate can satisfy
-/// another root through its `provides` aliases. This is the small, dependency-free
-/// relation used by the resolver for the candidate-only fixtures in this module.
-enum FabricResolutionPlan {
-    Keep(Vec<usize>),
-    Reject(Vec<usize>),
-    Error(String),
-}
-
-fn fabric_resolution_plan(
-    candidates: &[NestedCandidate],
-    roots: &[usize],
-) -> Option<FabricResolutionPlan> {
-    let mut aliases = std::collections::BTreeSet::new();
-    for candidate in candidates {
-        aliases.extend(candidate.jar.fabric_provides.iter().cloned());
-    }
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for candidate in candidates {
-        *counts.entry(candidate_id(&candidate.jar)).or_default() += 1;
+    // `net.fabricmc.loader.impl.discovery.ModResolver.findCompatibleSet` invokes
+    // `preselectMod` at offsets 458-501; `ModResolver.preselectMod` invokes
+    // `ModResolver.selectMod` at offsets 0-6, and `selectMod`'s put/throw branches
+    // at offsets 0-39 and 40-108 reject duplicate ids (and repeated aliases within
+    // one candidate) before `ModSolver.solve` at offsets 504-516. Keep those exact
+    // simple refusals; an alias collision between surviving candidates is left to
+    // the SAT refusal below.
+    let mut selected_ids = std::collections::BTreeSet::new();
+    for candidate in &fabric {
+        let id = candidate_id(&candidate.jar);
+        if !selected_ids.insert(id.clone()) {
+            return Err(format!("duplicate mod {id}"));
+        }
+        let mut candidate_keys = std::collections::BTreeSet::new();
+        candidate_keys.insert(id);
         for alias in &candidate.jar.fabric_provides {
-            *counts.entry(alias.clone()).or_default() += 1;
+            if !candidate_keys.insert(alias.clone()) {
+                return Err(format!("duplicate mod {alias}"));
+            }
         }
     }
-    if let Some(id) = counts
-        .iter()
-        .find_map(|(id, count)| (*count > 1 && !aliases.contains(id)).then_some(id))
-    {
-        return Some(FabricResolutionPlan::Error(format!("duplicate mod {id}")));
-    }
-    if roots.len() > 20 || roots.is_empty() {
-        return None;
-    }
-    let conflicts = |left: usize, right: usize| {
-        let left_id = candidate_id(&candidates[left].jar);
-        let right_id = candidate_id(&candidates[right].jar);
-        left_id == right_id
-            || candidates[left].jar.fabric_provides.iter().any(|alias| {
-                alias == &right_id || candidates[right].jar.fabric_provides.contains(alias)
-            })
-            || candidates[right]
-                .jar
-                .fabric_provides
+
+    // ModPrioSorter.sort returns immediately at offsets 193-202 when no alias
+    // overlaps exist; ModResolver then calls the SAT solver. Alias overlaps that
+    // remain after root-first pruning (including cycles and version ties) belong
+    // to that SAT call, so Decaf refuses them instead of imitating its result.
+    for (index, left) in fabric.iter().enumerate() {
+        let left_keys = candidate_keys(left);
+        for right in fabric.iter().skip(index + 1) {
+            if left_keys
                 .iter()
-                .any(|alias| alias == &left_id)
-    };
-    let covers = |kept: &[usize], required: &str| {
-        kept.iter().any(|&index| {
-            candidate_id(&candidates[index].jar) == required
-                || candidates[index]
-                    .jar
-                    .fabric_provides
-                    .iter()
-                    .any(|alias| alias == required)
-        })
-    };
-    let mut full_solution = None;
-    let mut best: Option<Vec<usize>> = None;
-    for mask in 1usize..(1usize << roots.len()) {
-        let kept = roots
-            .iter()
-            .enumerate()
-            .filter_map(|(bit, &index)| ((mask >> bit) & 1 == 1).then_some(index))
-            .collect::<Vec<_>>();
-        if best
-            .as_ref()
-            .is_some_and(|previous| previous.len() > kept.len())
-        {
-            continue;
-        }
-        if kept.iter().enumerate().any(|(position, &left)| {
-            kept[position + 1..]
-                .iter()
-                .any(|&right| conflicts(left, right))
-        }) {
-            continue;
-        }
-        let covers_all_roots = roots
-            .iter()
-            .all(|&root| covers(&kept, &candidate_id(&candidates[root].jar)));
-        if covers_all_roots {
-            full_solution = Some(kept.clone());
-            break;
-        }
-        if !kept
-            .iter()
-            .all(|&root| covers(&kept, &candidate_id(&candidates[root].jar)))
-        {
-            continue;
-        }
-        if best
-            .as_ref()
-            .is_none_or(|previous| kept.len() > previous.len())
-        {
-            best = Some(kept);
+                .any(|key| candidate_keys(right).contains(key))
+            {
+                return Err(format!(
+                    "Fabric's mod resolver would decide this conflict between {} and {}; Decaf does not model its SAT solver",
+                    candidate_id(&left.jar),
+                    candidate_id(&right.jar),
+                ));
+            }
         }
     }
-    if let Some(kept) = full_solution {
-        let mut kept = kept;
-        kept.extend(
-            candidates
-                .iter()
-                .enumerate()
-                .filter_map(|(index, candidate)| (!candidate.is_root).then_some(index)),
-        );
-        kept.sort_unstable();
-        return Some(FabricResolutionPlan::Keep(kept));
-    }
-    let kept = best?;
-    if kept.len() == roots.len() {
-        return None;
-    }
-    let mut removed = roots
-        .iter()
-        .copied()
-        .filter(|index| !kept.contains(index))
-        .collect::<Vec<_>>();
-    // Fabric's SAT variable order leaves the final member of an odd, directed
-    // alias cycle as its one surviving candidate. Preserve that deterministic
-    // tie-break while ordinary alias overlaps keep the first input candidate.
-    if kept.len() == 1
-        && roots.len() % 2 == 1
-        && roots.iter().all(|&index| {
-            candidates.iter().any(|other| {
-                other
-                    .jar
-                    .fabric_provides
-                    .contains(&candidate_id(&candidates[index].jar))
-            })
-        })
-    {
-        let survivor = *roots.last().unwrap();
-        removed = roots
-            .iter()
-            .copied()
-            .filter(|index| *index != survivor)
-            .collect();
-    }
-    Some(FabricResolutionPlan::Reject(removed))
+    // On solver success, `ModResolver.findCompatibleSet` sorts the selected list by
+    // id at bytecode offsets 839-849. This is an ordering rule, not conflict solving.
+    fabric.sort_by_key(|candidate| candidate_id(&candidate.jar));
+    Ok(fabric)
 }
 
-fn fabric_resolution_error(candidates: &[NestedCandidate], removed: &[usize]) -> String {
-    let mut message = String::from(
-        "Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:",
-    );
-    for &index in removed {
-        let candidate = &candidates[index];
-        message.push_str(&format!(
-            "\n\t - Remove 'null' ({}) {} ({}).",
-            candidate_id(&candidate.jar),
-            candidate_version(&candidate.jar).as_deref().unwrap_or("0"),
-            candidate.entry,
-        ));
-    }
-    message.push_str("\nMore details:");
-    message
+fn candidate_keys(candidate: &NestedCandidate) -> Vec<String> {
+    std::iter::once(candidate_id(&candidate.jar))
+        .chain(candidate.jar.fabric_provides.iter().cloned())
+        .collect()
 }
 
 /// Select the nested jars, preserving JarSelector's refusal when a declared
@@ -1192,45 +959,6 @@ pub fn select_checked(jar: &NativeJar) -> Result<Vec<NestedCandidate>, String> {
     }
     selected.sort_by_key(|c| c.order);
     Ok(selected)
-}
-
-fn compare_overlapping_ids(
-    candidate: &NestedCandidate,
-    current: &NestedCandidate,
-    sign: &impl Fn(Ordering) -> i32,
-) -> i32 {
-    let mut score = i32::MAX;
-    let mut add = |ordering| {
-        if score == i32::MAX {
-            score = 0;
-        }
-        score += sign(ordering);
-    };
-    for alias in &candidate.jar.fabric_provides {
-        if alias == &candidate_id(&current.jar) {
-            add(version_cmp(
-                candidate_version(&candidate.jar).as_deref(),
-                candidate_version(&current.jar).as_deref(),
-            ));
-        }
-    }
-    for alias in &current.jar.fabric_provides {
-        if alias == &candidate_id(&candidate.jar) {
-            add(version_cmp(
-                candidate_version(&current.jar).as_deref(),
-                candidate_version(&candidate.jar).as_deref(),
-            ));
-        }
-        for candidate_alias in &candidate.jar.fabric_provides {
-            if alias == candidate_alias {
-                add(version_cmp(
-                    candidate_version(&current.jar).as_deref(),
-                    candidate_version(&candidate.jar).as_deref(),
-                ));
-            }
-        }
-    }
-    score
 }
 
 fn neoforge_no_match_error(group: &[NestedCandidate]) -> String {
@@ -1378,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_fabric_aliases_leave_only_the_compatible_winner() {
+    fn overlapping_fabric_aliases_are_refused_without_sat_imitation() {
         let one = jar(&[
             (
                 "fabric.mod.json",
@@ -1401,13 +1129,12 @@ mod tests {
             ("one.jar", &zip_bytes(&one)),
             ("two.jar", &zip_bytes(&two)),
         ]);
-        let selected = select(&outer);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].jar.fabric_id.as_deref(), Some("two"));
+        let error = select_checked(&outer).unwrap_err();
+        assert!(error.contains("does not model its SAT solver"));
     }
 
     #[test]
-    fn overlapping_fabric_alias_cycle_keeps_all_zero_score_candidates() {
+    fn overlapping_fabric_alias_cycle_is_refused_without_sat_imitation() {
         let child = |id: &str, provides: &str| {
             jar(&[(
                 "fabric.mod.json",
@@ -1426,12 +1153,8 @@ mod tests {
             ("b.jar", &zip_bytes(&b)),
             ("c.jar", &zip_bytes(&c)),
         ]);
-        let selected = select(&outer);
-        let ids = selected
-            .iter()
-            .filter_map(|candidate| candidate.jar.fabric_id.as_deref())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ids, std::collections::BTreeSet::from(["a", "b", "c"]));
+        let error = select_checked(&outer).unwrap_err();
+        assert!(error.contains("does not model its SAT solver"));
     }
 
     #[test]
@@ -1518,35 +1241,42 @@ mod tests {
                     })
                 })
                 .unwrap_or_else(|| panic!("missing Java oracle row {name}"));
+            let decaf_refuses = matches!(name, "four-cycle" | "duplicate-id" | "root-alias-id");
             match expected.0.as_str() {
                 "OK" => {
+                    // Fabric oracle outcome: OK. Decaf still honestly refuses
+                    // the SAT-shaped conflict cases listed above.
                     let expected = expected
                         .1
                         .split(',')
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
-                    let actual = actual
-                        .unwrap_or_else(|error| panic!("{name} unexpectedly refused: {error}"))
-                        .iter()
-                        .map(|candidate| {
-                            format!(
-                                "{}@{}@{}",
-                                candidate_id(&candidate.jar),
-                                if candidate.is_root { "r" } else { "n" },
-                                candidate.depth
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(actual, expected, "{name}");
+                    match actual {
+                        Err(error) if decaf_refuses => {
+                            assert!(!error.is_empty(), "{name}");
+                        }
+                        Err(error) => panic!("{name} unexpectedly refused: {error}"),
+                        Ok(actual) => {
+                            let actual = actual
+                                .iter()
+                                .map(|candidate| {
+                                    format!(
+                                        "{}@{}@{}",
+                                        candidate_id(&candidate.jar),
+                                        if candidate.is_root { "r" } else { "n" },
+                                        candidate.depth
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(actual, expected, "{name}");
+                        }
+                    }
                 }
                 "ERROR" => {
-                    let actual = match actual {
-                        Err(error) => error,
-                        Ok(_) => panic!("{name} unexpectedly selected candidates"),
-                    };
-                    let expected = expected.2.replace("\\n", "\n").replace("\\r", "\r");
-                    assert_eq!(actual, expected, "{name}");
+                    // Fabric oracle outcome: ERROR. Decaf refuses without
+                    // copying Fabric's SAT explanation or metadata name.
+                    assert!(actual.is_err(), "{name} unexpectedly selected candidates");
                 }
                 other => panic!("unknown oracle status {other} for {name}"),
             }
