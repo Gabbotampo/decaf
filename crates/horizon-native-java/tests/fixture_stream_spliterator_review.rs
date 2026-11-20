@@ -244,7 +244,21 @@ fn spliterator_review_cases_run_as_jdk_25_does() {
 }
 
 /// Runs `method`: its answer and the unknown host calls it counted.
+///
+/// On a roomy thread: `deadSinks` nests its stream stages' jar frames deep enough that, in a
+/// debug build, the runtime's frame bound (`frame_bound.rs`) refuses it on the default 2 MiB
+/// test thread, as `fixture_callbacks_rc261c` does since #572.
 fn run(method: &str) -> (Option<String>, Vec<(String, usize)>) {
+    let method = method.to_owned();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || run_here(&method))
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn run_here(method: &str) -> (Option<String>, Vec<(String, usize)>) {
     let fixture = javac_fixture::Fixture::build(
         "stream-spliterator-review-counted",
         &[("demo/Probe.java", PROBE)],
