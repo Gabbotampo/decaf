@@ -395,6 +395,16 @@ fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Bloc
     block.properties.explosion_resistance = declaration.explosion_resistance;
     block.properties.friction = declaration.friction;
     block.properties.requires_tool = declaration.requires_tool;
+    block.properties.occludes = declaration.occludes;
+    block.state_properties = declaration.state_properties.iter().map(|(name, property)| {
+        let state = match property.kind.as_str() {
+            "boolean" => mod_api::StateProperty::Boolean,
+            "integer" | "enum" => mod_api::StateProperty::Enum { values: property.values.clone() },
+            _ => mod_api::StateProperty::Enum { values: property.values.clone() },
+        };
+        (name.clone(), state)
+    }).collect();
+    block.default_state = declaration.default_state.clone();
     block
 }
 

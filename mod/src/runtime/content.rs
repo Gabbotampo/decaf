@@ -58,6 +58,15 @@ pub struct Block {
     pub explosion_resistance: Option<f32>,
     pub friction: Option<f32>,
     pub requires_tool: Option<bool>,
+    pub state_properties: BTreeMap<String, StateProperty>,
+    pub default_state: BTreeMap<String, String>,
+    pub occludes: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateProperty {
+    pub kind: String,
+    pub values: Vec<String>,
 }
 
 /// An item a jar registered, in the content vocabulary.
@@ -121,9 +130,30 @@ impl ContentDeclaration {
                 if let Some(value) = block.requires_tool {
                     properties.insert("requires_tool".into(), json!(value));
                 }
+                if let Some(value) = block.occludes {
+                    properties.insert("occludes".into(), json!(value));
+                }
+                let state_properties = block
+                    .state_properties
+                    .iter()
+                    .map(|(name, property)| {
+                        let output_kind = if property.kind == "integer" {
+                            "enum"
+                        } else {
+                            property.kind.as_str()
+                        };
+                        let mut value = json!({"type": output_kind});
+                        if property.kind == "enum" || property.kind == "integer" {
+                            value["values"] = json!(property.values);
+                        }
+                        (name.clone(), value)
+                    })
+                    .collect::<Map<_, _>>();
                 json!({
                     "template": block.template,
                     "properties": Value::Object(properties),
+                    "state_properties": Value::Object(state_properties),
+                    "default_state": block.default_state,
                     "item": block.item,
                 })
             }
@@ -161,6 +191,11 @@ pub fn declarations(entries: &[RegistryEntry]) -> Vec<ContentDeclaration> {
                 explosion_resistance: number(properties, "explosion_resistance"),
                 friction: number(properties, "friction"),
                 requires_tool: properties.get("requires_tool").map(|value| value == "true"),
+                state_properties: state_properties(properties),
+                default_state: default_state(properties),
+                occludes: properties
+                    .get("occludes")
+                    .and_then(|value| value.parse().ok()),
             })),
             Some(RegistryDeclaration::Item {
                 template,
@@ -184,6 +219,39 @@ pub fn declarations(entries: &[RegistryEntry]) -> Vec<ContentDeclaration> {
 
 fn number(properties: &BTreeMap<String, String>, key: &str) -> Option<f32> {
     properties.get(key).and_then(|value| value.parse().ok())
+}
+
+fn state_properties(properties: &BTreeMap<String, String>) -> BTreeMap<String, StateProperty> {
+    properties
+        .iter()
+        .filter_map(|(key, value)| {
+            let name = key.strip_prefix("state_property:")?;
+            let (kind, values) = value.split_once('|')?;
+            Some((
+                name.to_owned(),
+                StateProperty {
+                    kind: kind.to_owned(),
+                    values: values
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn default_state(properties: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    properties
+        .iter()
+        .filter_map(|(key, value)| {
+            Some((
+                key.strip_prefix("default_state:")?.to_owned(),
+                value.clone(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
