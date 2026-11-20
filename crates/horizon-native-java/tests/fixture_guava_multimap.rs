@@ -129,13 +129,11 @@ fn real_guava_multimaps_match_java25() {
         let _ = fixture.text_on(&mut host, method);
     }
     for call in [
-        "#iterator()Ljava/util/Iterator;",
         "#listIterator()Ljava/util/ListIterator;",
         "#subList(II)Ljava/util/List;",
         "#toString()Ljava/lang/String;",
         "#contains(Ljava/lang/Object;)Z",
         "#remove(Ljava/lang/Object;)Z",
-        "#size()I",
     ] {
         assert!(
             host.unknown_host_calls()
@@ -172,8 +170,9 @@ fn real_guava_multimaps_match_java25() {
     let count = |calls: &[(String, usize)], needle: &str| {
         calls
             .iter()
-            .find(|(name, _)| name.contains(needle))
-            .map_or(0, |(_, count)| *count)
+            .filter(|(name, _)| name.contains(needle))
+            .map(|(_, count)| *count)
+            .sum::<usize>()
     };
     let before_identity_hash = count(&before, "java/lang/System#identityHashCode");
     let before_size = count(&before, "#size()I");
@@ -222,4 +221,25 @@ fn real_guava_multimaps_match_java25() {
         before_iterator_size,
         "read-only iterator call tainted later size: {after_iterator:?}"
     );
+    for method in [
+        "iterationArray",
+        "iterationHash",
+        "iterationLinked",
+        "cmePutArray",
+        "cmePutHash",
+        "cmePutLinked",
+        "cmeReplaceArray",
+        "cmeReplaceHash",
+        "cmeReplaceLinked",
+        "removeIteratorArray",
+        "removeIteratorHash",
+        "removeIteratorLinked",
+        "puzzleLoop",
+    ] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            oracle.next().unwrap(),
+            "{method}"
+        );
+    }
 }

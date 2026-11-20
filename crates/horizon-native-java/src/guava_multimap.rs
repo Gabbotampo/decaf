@@ -10,6 +10,7 @@ use crate::host_ref::{HostKind, HostRef};
 
 const STATE: &str = "|guava-multimap#";
 const MAP_ITERATOR: &str = "guava-as-map-iterator|";
+const WRAPPED_ITERATOR_SOURCE: &str = "guava-wrapped-iterator";
 
 fn state_key(key: &str, name: &str) -> String {
     format!("{key}{STATE}{name}")
@@ -198,6 +199,11 @@ fn source_for_receiver<H: Host>(this: &Runtime<'_, H>, receiver: &Value) -> Opti
     if let Some((source, _, _, _)) = map_iterator_source(this, receiver) {
         return Some(source);
     }
+    if let Some(marker) = crate::host_iterator::marker(receiver)
+        && let Some(Value::Ref(Some(source))) = field(this, marker, "wrapped-source")
+    {
+        return Some(source);
+    }
     let mut key = handle_key(receiver)?;
     for _ in 0..16 {
         if let Some(source) =
@@ -211,6 +217,261 @@ fn source_for_receiver<H: Host>(this: &Runtime<'_, H>, receiver: &Value) -> Opti
         key = target.key().to_owned();
     }
     None
+}
+
+fn wrapped_iterator_source<H: Host>(
+    this: &Runtime<'_, H>,
+    receiver: &Value,
+) -> Option<(String, Value, Value, mod_count::ModStamp, bool)> {
+    let marker = crate::host_iterator::marker(receiver)?;
+    if field(this, marker, "wrapped-iterator")
+        != Some(Value::Ref(Some(WRAPPED_ITERATOR_SOURCE.into())))
+    {
+        return None;
+    }
+    let source = ref_text(&field(this, marker, "wrapped-source")?)?.to_owned();
+    let key = field(this, marker, "wrapped-key")?;
+    let delegate = field(this, marker, "wrapped-delegate")?;
+    let generation =
+        mod_count::ModStamp::decode(ref_text(&field(this, marker, "wrapped-generation")?)?)?;
+    let removed = matches!(field(this, marker, "wrapped-removed"), Some(Value::Int(1)));
+    Some((source, key, delegate, generation, removed))
+}
+
+fn collection_marker(value: &Value) -> Option<String> {
+    match value {
+        Value::Host(handle) if handle.kind() == HostKind::Collection => {
+            Some(handle.key().to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn bump_collection_mod_count<H: Host>(this: &mut Runtime<'_, H>, collection: &Value) {
+    let Some(marker) = collection_marker(collection) else {
+        return;
+    };
+    let stamp = this.host.mod_stamp(&marker);
+    if stamp != mod_count::ModStamp::UNKEPT {
+        this.host.store_mod_stamp(&marker, stamp.bumped(false));
+    }
+}
+
+/// Read a delegate in the order its JDK collection's iterator exposes. Hash
+/// collections are reconciled with the Java 25 bucket table first; an
+/// unplaced identity hash or tree bin has no reproducible order and remains
+/// counted at iterator creation.
+fn iterator_values<H: Host>(
+    this: &mut Runtime<'_, H>,
+    delegate: &Value,
+) -> Result<Option<Vec<Value>>, NativeError> {
+    this.resync_hash_table(delegate)?;
+    if let Some(kind) = this.hash_table_kind(delegate)
+        && let Some(marker) = expect_ref(delegate).cloned()
+    {
+        let table = this.take_table(&marker, kind);
+        let unknown = table.order_unknown();
+        let values = if table.linked {
+            runtime_collection_values(&*this.host, delegate)?
+        } else {
+            table.keys()
+        };
+        this.host.store_hash_table(&marker, table);
+        return Ok((!unknown).then_some(values));
+    }
+    Ok(Some(runtime_collection_values(&*this.host, delegate)?))
+}
+
+fn new_wrapped_iterator<H: Host>(
+    this: &mut Runtime<'_, H>,
+    source: &str,
+    key: &Value,
+    delegate: &Value,
+    values: Vec<Value>,
+) -> Result<Option<Value>, NativeError> {
+    let Some(iterator) = this.host.new_host_iterator(values, None) else {
+        return Ok(None);
+    };
+    let Some(marker) = crate::host_iterator::marker(&iterator).cloned() else {
+        return Ok(None);
+    };
+    let generation = collection_marker(delegate).map_or(mod_count::ModStamp::UNKEPT, |marker| {
+        this.host.mod_stamp(&marker)
+    });
+    put_field(
+        this,
+        &marker,
+        "wrapped-iterator",
+        Value::Ref(Some(WRAPPED_ITERATOR_SOURCE.into())),
+    );
+    put_field(
+        this,
+        &marker,
+        "wrapped-source",
+        Value::Ref(Some(source.into())),
+    );
+    put_field(this, &marker, "wrapped-key", key.clone());
+    put_field(this, &marker, "wrapped-delegate", delegate.clone());
+    put_field(
+        this,
+        &marker,
+        "wrapped-generation",
+        Value::Ref(Some(generation.encode())),
+    );
+    Ok(Some(iterator))
+}
+
+fn invoke_wrapped_iterator<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: &Value,
+) -> Result<Option<Value>, NativeError> {
+    let Some(marker) = crate::host_iterator::marker(receiver).cloned() else {
+        return Ok(None);
+    };
+    let Some((source, key, delegate, expected, removed)) = wrapped_iterator_source(this, receiver)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        r.owner.as_str(),
+        "java/util/Iterator" | "java/util/ListIterator"
+    ) {
+        return Ok(None);
+    }
+    let Some(current) = values_for_key(this, &source, &key, false)? else {
+        // refreshIfEmpty leaves the old delegate in place when the map no
+        // longer contains the key, so only a replacement delegate is a CME.
+        return match (r.name.as_str(), r.descriptor.as_str()) {
+            ("hasNext", "()Z") | ("next", "()Ljava/lang/Object;") | ("remove", "()V") => {
+                let generation = collection_marker(&delegate)
+                    .map_or(mod_count::ModStamp::UNKEPT, |marker| {
+                        this.host.mod_stamp(&marker)
+                    });
+                match generation.verdict(expected) {
+                    mod_count::ModVerdict::Unknown => return counted_unknown(this, r, &source),
+                    mod_count::ModVerdict::Changed if r.name != "hasNext" => {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/util/ConcurrentModificationException".into(),
+                            message: None,
+                            frame: None,
+                        });
+                    }
+                    mod_count::ModVerdict::Same | mod_count::ModVerdict::Changed => {}
+                }
+                invoke_wrapped_iterator_member(this, r, &marker, &source, &key, &delegate, removed)
+            }
+            _ => Ok(None),
+        };
+    };
+    if crate::host_map_entry::same_reference(&current, &delegate) != Some(true) {
+        return Err(NativeError::UncaughtException {
+            class: "java/util/ConcurrentModificationException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    let current_generation = collection_marker(&delegate)
+        .map_or(mod_count::ModStamp::UNKEPT, |marker| {
+            this.host.mod_stamp(&marker)
+        });
+    match current_generation.verdict(expected) {
+        mod_count::ModVerdict::Unknown => return counted_unknown(this, r, &source),
+        mod_count::ModVerdict::Changed if r.name != "hasNext" => {
+            return Err(NativeError::UncaughtException {
+                class: "java/util/ConcurrentModificationException".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        mod_count::ModVerdict::Same | mod_count::ModVerdict::Changed => {}
+    }
+    invoke_wrapped_iterator_member(this, r, &marker, &source, &key, &delegate, removed)
+}
+
+fn invoke_wrapped_iterator_member<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    marker: &str,
+    source: &str,
+    key: &Value,
+    delegate: &Value,
+    removed: bool,
+) -> Result<Option<Value>, NativeError> {
+    let (cursor, _, _) = this
+        .host
+        .host_iterator(marker)
+        .ok_or_else(|| NativeError::Metadata("unknown Guava wrapped iterator".into()))?;
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("hasNext", "()Z") => Ok(Some(Value::Int(
+            (cursor < runtime_collection_values(&*this.host, delegate)?.len()) as i32,
+        ))),
+        ("next", "()Ljava/lang/Object;") => {
+            let snapshot_value = this.host.host_iterator_next(marker)?;
+            let value = runtime_collection_values(&*this.host, delegate)?
+                .get(cursor)
+                .cloned()
+                .unwrap_or(snapshot_value);
+            put_field(this, marker, "wrapped-removed", Value::Int(0));
+            Ok(Some(value))
+        }
+        ("remove", "()V") => {
+            if cursor == 0 || removed {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalStateException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let index = cursor - 1;
+            let class = this.host_collection_class(delegate).unwrap_or_default();
+            if class == "java/util/ArrayList" {
+                invoke_instance(
+                    this,
+                    &collection_ref("remove", "(I)Ljava/lang/Object;"),
+                    delegate,
+                    &[Value::Int(index as i32)],
+                )?;
+                bump_collection_mod_count(this, delegate);
+            } else {
+                let values = this.host.host_iterator_values(marker).ok_or_else(|| {
+                    NativeError::Metadata("Guava wrapped iterator values missing".into())
+                })?;
+                let value = values[index].clone();
+                invoke_instance(
+                    this,
+                    &collection_ref("remove", "(Ljava/lang/Object;)Z"),
+                    delegate,
+                    &[value],
+                )?;
+                bump_collection_mod_count(this, delegate);
+            }
+            if invoke_instance(this, &collection_ref("isEmpty", "()Z"), delegate, &[])?
+                == Value::Int(1)
+                && let Some(map) = backing(this, source)
+            {
+                invoke_instance(
+                    this,
+                    &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    &map,
+                    std::slice::from_ref(key),
+                )?;
+            }
+            let generation = collection_marker(delegate)
+                .map_or(mod_count::ModStamp::UNKEPT, |marker| {
+                    this.host.mod_stamp(&marker)
+                });
+            put_field(
+                this,
+                marker,
+                "wrapped-generation",
+                Value::Ref(Some(generation.encode())),
+            );
+            put_field(this, marker, "wrapped-removed", Value::Int(1));
+            Ok(Some(Value::Void))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Return the source multimap carried by any value produced by this model.
@@ -348,6 +609,7 @@ fn remove_key<H: Host>(
     // AbstractMapBasedMultimap clears the original collection after copying it;
     // handles returned by get(key) therefore remain live, but become empty.
     invoke_instance(this, &collection_ref("clear", "()V"), &values, &[])?;
+    bump_collection_mod_count(this, &values);
     Ok(Some(detached))
 }
 
@@ -573,6 +835,10 @@ fn values_for_key<H: Host>(
         .host
         .empty_mutable_collection(value_collection_class(&map_kind))
         .ok_or_else(|| NativeError::Metadata("Guava value collection is unavailable".into()))?;
+    if let Some(marker) = collection_marker(&values) {
+        this.host
+            .store_mod_stamp(&marker, mod_count::ModStamp::default());
+    }
     invoke_instance(
         this,
         &map_ref(
@@ -669,6 +935,9 @@ fn put_one<H: Host>(
         &values,
         std::slice::from_ref(value),
     )?;
+    if added == Value::Int(1) {
+        bump_collection_mod_count(this, &values);
+    }
     if kind == "hash" {
         this.resync_hash_table(&values)?;
     }
@@ -690,6 +959,9 @@ fn remove_one<H: Host>(
         &values,
         std::slice::from_ref(value),
     )?;
+    if out == Value::Int(1) {
+        bump_collection_mod_count(this, &values);
+    }
     if out == Value::Int(1)
         && invoke_instance(this, &collection_ref("isEmpty", "()Z"), &values, &[])? == Value::Int(1)
         && let Some(map) = backing(this, source)
@@ -729,6 +1001,18 @@ pub(crate) fn invoke<H: Host>(
             return counted;
         }
         return match invoke_map_iterator(this, r, receiver)? {
+            Some(value) => Ok(Some(value)),
+            None => counted_unknown(this, r, &source),
+        };
+    }
+    if let Some(receiver) = receiver
+        && wrapped_iterator_source(this, receiver).is_some()
+    {
+        let source = source_for_receiver(this, receiver).expect("wrapped iterator source");
+        if let Some(counted) = count_tainted_read(this, r, &source) {
+            return counted;
+        }
+        return match invoke_wrapped_iterator(this, r, receiver)? {
             Some(value) => Ok(Some(value)),
             None => counted_unknown(this, r, &source),
         };
@@ -840,9 +1124,13 @@ fn invoke_multimap<H: Host>(
                 Value::Void
             }
             ("iterator", "()Ljava/util/Iterator;") => {
-                // Obtaining the iterator does not mutate the multimap. Any later iterator
-                // mutation is a separate call and is counted at that boundary.
-                return counted_unknown(this, r, &source);
+                let Some(delegate) = current else {
+                    return counted_unknown(this, r, &source);
+                };
+                let Some(values) = iterator_values(this, &delegate)? else {
+                    return counted_unknown(this, r, &source);
+                };
+                return new_wrapped_iterator(this, &source, &map_key, &delegate, values);
             }
             ("subList", "(II)Ljava/util/List;")
             | ("listIterator", "()Ljava/util/ListIterator;")

@@ -20,3 +20,16 @@ true
 false,true,false,false;true,true,false,true;true,false;true,true,false,true;true,false;true,true;true,false;false,false
 false,false,true,false;true,false,true,false;true,false;true,false,true,false;true,false;true,true;true,false;false,false
 false,false,true,false;true,false,true,false;true,false;true,false,true,false;true,false;true,true;true,false;false,false
+pear,b,apple,a
+apple,a,pear,b
+pear,b,apple,a
+cme
+cme
+cme
+cme
+cme
+cme
+1|true|true
+1|true|true
+1|true|true
+3|2|true

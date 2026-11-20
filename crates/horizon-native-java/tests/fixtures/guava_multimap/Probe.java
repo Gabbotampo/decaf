@@ -278,6 +278,42 @@ public final class Probe {
         + iteratorRemove(LinkedHashMultimap.create(), 2);
   }
   public static String sync(){ ListMultimap<String,Integer> base=ArrayListMultimap.create(); return Boolean.toString(Multimaps.synchronizedListMultimap(base) != base); }
+  private static String iterationOrder(Multimap<String,String> m) {
+    for (String value : new String[] {"pear", "b", "apple", "a"}) m.put("k", value);
+    StringBuilder out = new StringBuilder();
+    for (String value : m.get("k")) { if (out.length() != 0) out.append(','); out.append(value); }
+    return out.toString();
+  }
+  public static String iterationArray() { return iterationOrder(ArrayListMultimap.create()); }
+  public static String iterationHash() { return iterationOrder(HashMultimap.create()); }
+  public static String iterationLinked() { return iterationOrder(LinkedHashMultimap.create()); }
+  private static String cmePut(Multimap<String,Integer> m) {
+    m.put("k", 1); java.util.Iterator<Integer> it = m.get("k").iterator(); m.put("k", 2);
+    try { it.next(); return "no"; } catch (java.util.ConcurrentModificationException e) { return "cme"; }
+  }
+  public static String cmePutArray() { return cmePut(ArrayListMultimap.create()); }
+  public static String cmePutHash() { return cmePut(HashMultimap.create()); }
+  public static String cmePutLinked() { return cmePut(LinkedHashMultimap.create()); }
+  private static String cmeReplace(Multimap<String,Integer> m) {
+    m.put("k", 1); java.util.Iterator<Integer> it = m.get("k").iterator();
+    m.removeAll("k"); m.put("k", 2);
+    try { it.next(); return "no"; } catch (java.util.ConcurrentModificationException e) { return "cme"; }
+  }
+  public static String cmeReplaceArray() { return cmeReplace(ArrayListMultimap.create()); }
+  public static String cmeReplaceHash() { return cmeReplace(HashMultimap.create()); }
+  public static String cmeReplaceLinked() { return cmeReplace(LinkedHashMultimap.create()); }
+  private static String removeThroughIterator(Multimap<String,Integer> m) {
+    m.put("k", 1); m.put("k", 2); java.util.Iterator<Integer> it = m.get("k").iterator();
+    it.next(); it.remove(); return m.size() + "|" + m.containsKey("k") + "|" + m.get("k").contains(2);
+  }
+  public static String removeIteratorArray() { return removeThroughIterator(ArrayListMultimap.create()); }
+  public static String removeIteratorHash() { return removeThroughIterator(HashMultimap.create()); }
+  public static String removeIteratorLinked() { return removeThroughIterator(LinkedHashMultimap.create()); }
+  public static String puzzleLoop() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create(); m.put("k", 1); m.put("k", 2);
+    int sum = 0; for (Integer value : m.get("k")) sum += value;
+    return sum + "|" + m.size() + "|" + m.containsKey("k");
+  }
   public static String excluded(){
     Multimap<String,Integer> m=ArrayListMultimap.create(); m.put("a",1);
     m.asMap(); m.entries(); m.keySet(); m.keys(); m.values();
