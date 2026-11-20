@@ -31413,6 +31413,10 @@ impl<H: Host> Runtime<'_, H> {
                                 .jar_method_owner(&r.owner, &r.name, &r.descriptor)
                                 .is_none()))
                     {
+                        // The exception class is known, but invoke_on_null cannot recover
+                        // vanilla's `because "i" is null` suffix. Count this call rather
+                        // than presenting its shortened message as Java's answer.
+                        invoke_or_catch!(at, self.host.unknown_operand_call(&r));
                         invoke_or_catch!(
                             at,
                             Err(null_checks::invoke_on_null(&MethodRef {

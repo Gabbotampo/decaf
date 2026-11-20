@@ -188,7 +188,8 @@ fn node(host: &mut dyn Host, tag: &str, values: Vec<Value>) -> Result<Value, Str
     held.push(Value::Ref(Some(tag.to_owned())));
     held.push(Value::Long(NEXT_NODE.fetch_add(1, Ordering::Relaxed) as i64));
     held.extend(values);
-    Ok(Value::Host(HostRef::of_values(HostKind::DfuCodec, &held)))
+    let value = Value::Host(HostRef::of_values(HostKind::DfuCodec, &held));
+    Ok(value)
 }
 
 fn constant(declared: &str, owner: &str, name: &str) -> Value {
@@ -342,7 +343,7 @@ fn dfu_equals(
     other: &Value,
     nested: &mut dyn Nested,
 ) -> Result<Option<bool>, NativeError> {
-    if handle.kind() == HostKind::DfuCodec {
+    if tag(&Value::Host(handle.clone())).as_deref() == Some(PRODUCT) {
         return Ok(match other {
             Value::Host(other) if handle.same_object(other) == Some(true) => Some(true),
             _ => None,
@@ -755,7 +756,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
         let Some((_, parts)) = product_parts(receiver) else {
             return Ok(None);
         };
-        return Ok(Some(parts.get(index).cloned().unwrap_or(Value::Ref(None))));
+        return match parts.get(index).cloned() {
+            Some(value) => Ok(Some(value)),
+            None => runtime.host.unknown_operand_call(r).map(Some),
+        };
     }
     if receiver_tag.as_deref() == Some(INSTANCE)
         && r.owner == "com/mojang/serialization/codecs/RecordCodecBuilder$Instance"
