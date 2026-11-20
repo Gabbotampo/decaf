@@ -168,4 +168,46 @@ fn real_guava_multimaps_match_java25() {
             );
         }
     }
+    let before = host.unknown_host_calls();
+    let count = |calls: &[(String, usize)], needle: &str| {
+        calls
+            .iter()
+            .find(|(name, _)| name.contains(needle))
+            .map_or(0, |(_, count)| *count)
+    };
+    let before_identity_hash = count(&before, "java/lang/System#identityHashCode");
+    let before_size = count(&before, "#size()I");
+    assert_eq!(
+        fixture.text_on(&mut host, "countedEntryTaintsMultimap"),
+        "done"
+    );
+    let after = host.unknown_host_calls();
+    assert!(
+        count(&after, "java/lang/System#identityHashCode") > before_identity_hash,
+        "entry counted call missing: {after:?}"
+    );
+    assert!(
+        count(&after, "#size()I") > before_size,
+        "entry-tainted size was not counted: {after:?}"
+    );
+    let before_entry_key = count(&after, "java/util/Map$Entry#getKey()Ljava/lang/Object;");
+    assert_eq!(fixture.text_on(&mut host, "entryAfterTaintCounts"), "done");
+    assert!(
+        count(
+            &host.unknown_host_calls(),
+            "java/util/Map$Entry#getKey()Ljava/lang/Object;",
+        ) > before_entry_key,
+        "entry after taint was not counted: {:?}",
+        host.unknown_host_calls()
+    );
+    let before_read_size = count(&host.unknown_host_calls(), "#size()I");
+    assert_eq!(
+        fixture.text_on(&mut host, "countedReadTaintsMultimap"),
+        "done"
+    );
+    assert!(
+        count(&host.unknown_host_calls(), "#size()I") > before_read_size,
+        "read-only counted call did not taint later size: {:?}",
+        host.unknown_host_calls()
+    );
 }

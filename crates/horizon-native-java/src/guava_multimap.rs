@@ -17,7 +17,12 @@ fn state_key(key: &str, name: &str) -> String {
 
 fn handle_key(value: &Value) -> Option<String> {
     match value {
-        Value::Host(handle) if handle.kind() == HostKind::GuavaMultimap => {
+        Value::Host(handle)
+            if matches!(
+                handle.kind(),
+                HostKind::GuavaMultimap | HostKind::MapEntry | HostKind::OpaqueMapEntry
+            ) =>
+        {
             Some(handle.key().to_owned())
         }
         _ => None,

@@ -178,6 +178,29 @@ public final class Probe {
     try { m.size(); } catch (RuntimeException ignored) {}
     return "done";
   }
+  public static String countedEntryTaintsMultimap() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    Map.Entry<String, Collection<Integer>> e = m.asMap().entrySet().iterator().next();
+    System.identityHashCode(e);
+    try { m.size(); } catch (RuntimeException ignored) {}
+    return "done";
+  }
+  public static String entryAfterTaintCounts() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    Map.Entry<String, Collection<Integer>> e = m.asMap().entrySet().iterator().next();
+    try { m.entries(); } catch (RuntimeException ignored) {}
+    try { e.getKey(); } catch (RuntimeException ignored) {}
+    return "done";
+  }
+  public static String countedReadTaintsMultimap() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    m.entries();
+    try { m.size(); } catch (RuntimeException ignored) {}
+    return "done";
+  }
   private static void laterReads(Multimap<String,Integer> m) {
     try { m.size(); } catch (RuntimeException ignored) {}
     try { m.get("a").size(); } catch (RuntimeException ignored) {}

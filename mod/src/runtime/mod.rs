@@ -33724,6 +33724,11 @@ impl<H: Host> Runtime<'_, H> {
                             )));
                         }
                     };
+                    // This boundary conservatively taints a multimap whenever a counted call
+                    // receives it, even for read-only operations such as String.valueOf: the
+                    // callee's behavior is unknown, so preserving an exact later read is unsafe.
+                    // Nested reach through arrays, collections, fields, or lambda captures is a
+                    // known gap tracked separately for every host collection.
                     if self.host.counted_unknown_calls() > unknown_before {
                         crate::runtime::guava_multimap::taint_operands(self, taint_receiver.as_ref(), &args);
                     }
