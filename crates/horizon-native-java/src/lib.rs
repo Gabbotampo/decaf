@@ -31498,7 +31498,7 @@ impl<H: Host> Runtime<'_, H> {
                             dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
                         )
                     {
-                        dispatched = Some({ value });
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && (r.owner == "java/lang/String"
