@@ -9,5 +9,5 @@ mixed-versions|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|S
 nested-depths|OK|four@n@4,one@n@1,root@r@0,three@n@3,two@n@2
 no-conflict|OK|aa@r@0,bb@r@0,cc@n@1
 duplicate-id|OK|aa@r@0
-duplicate-alias|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n\t - Remove 'null' (aa) 1 (aa).\nMore details:
+duplicate-alias|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (aa) 1 (aa).\nMore details:
 root-alias-id|OK|owner@r@0
