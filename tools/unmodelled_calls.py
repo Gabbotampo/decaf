@@ -430,15 +430,12 @@ def row_verdict(result: dict) -> str:
 
 
 def probe_one(probe: Path, jar: Path, kind: str, deps: list[Path],
-              game_version: str, game_block_classes: Path | None,
-              client_role: bool = False) -> dict:
+              game_version: str, game_block_classes: Path | None) -> dict:
     command = [str(probe), "--json", "--game-version", game_version]
     if game_block_classes is not None:
         command += ["--game-block-classes", str(game_block_classes)]
     for dep in deps:
         command += ["--link", str(dep)]
-    if client_role:
-        command.append("--client-role")
     command += [str(jar), kind]
     try:
         result = subprocess.run(command, capture_output=True, text=True,
@@ -706,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = probe_one(
                     probe, exec_jar, kind, deps, args.game_version,
-                    game_block_classes, args.role == "client",
+                    game_block_classes,
                 )
             row = result_row(jar, kind, result, deps, missing, requirements, mode, jar_role)
             if via:
@@ -717,7 +714,7 @@ def main(argv: list[str] | None = None) -> int:
                     row["via_candidates"] = via_candidates
                 if result.get("status") == "ok":
                     baseline = probe_one(probe, exec_jar, kind, baseline_deps, args.game_version,
-                                         game_block_classes, args.role == "client")
+                                         game_block_classes)
                     row["baseline_unknown"] = baseline.get("unknown_host_call_count")
                     row["unknown_delta"] = (result.get("unknown_host_call_count", 0)
                                             - baseline.get("unknown_host_call_count", 0))
