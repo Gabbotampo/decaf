@@ -435,10 +435,10 @@ fn a_string_spelled_like_an_old_marker_is_not_a_registry_or_holder() {
 }
 
 /// What only a JVM knows is counted, never answered: a holder's and a
-/// registry's identity hashes, a registry's lifecycle in its `toString`, its
-/// implementation class, and (until P17 classifies `word/rest` text) the cast
-/// of the String `"registry/minecraft:item"` to `ResourceKey`, which Java 25
-/// refuses with a `ClassCastException` and the host no longer lets through.
+/// registry's identity hashes, a registry's lifecycle in its `toString` and
+/// its implementation class. The String `"registry/minecraft:item"` is no
+/// marker (the registry family's markers are retired, `host_registry.rs`), so
+/// its cast to `ResourceKey` throws Java 25's `ClassCastException`.
 #[test]
 fn what_only_a_jvm_knows_is_counted() {
     let fixture = fixture("host-registries-counted");
@@ -461,10 +461,6 @@ fn what_only_a_jvm_knows_is_counted() {
         ("holderHash", "#hashCode()I"),
         ("registryHash", "#hashCode()I"),
         ("registryClass", "#getClass()Ljava/lang/Class;"),
-        (
-            "stringCast",
-            "net/minecraft/resources/ResourceKey#<checkcast>(Ljava/lang/Object;)Lnet/minecraft/resources/ResourceKey;",
-        ),
     ] {
         let (_, unknown) = run(&fixture, method);
         assert!(
@@ -472,4 +468,7 @@ fn what_only_a_jvm_knows_is_counted() {
             "{method}: {unknown:?}"
         );
     }
+    let (text, unknown) = run(&fixture, "stringCast");
+    assert_eq!(text, expected("stringCast"));
+    assert!(unknown.is_empty(), "stringCast: {unknown:?}");
 }

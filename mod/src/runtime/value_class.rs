@@ -29,6 +29,7 @@ pub(crate) const STRING_TYPES: &[&str] = &[
 /// The prefixes of marker families that are host handles now (#156): no
 /// runtime value is text spelled so, so such a text is a `String`.
 const RETIRED_PREFIXES: &[&str] = &[
+    "particle/",
     "array/",
     "brigadier/",
     "config-holder/",
@@ -115,6 +116,37 @@ fn collection_class(class: &str) -> bool {
     crate::runtime::is_collection_owner(class) || !crate::runtime::java_immutable::supertypes(class).is_empty()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shape {
+    String,
+    Undecidable,
+}
+
+pub(crate) fn string_shape(marker: &str) -> Shape {
+    if is_plain_string(marker) {
+        return Shape::String;
+    }
+    // Text-marker families the runtime still builds as text (`enum/…`,
+    // `typed/…`, `payload/…`, `payload-context/…`), and resource-path shapes
+    // (`textures/…`, `models/…`) the generic `word/rest` rule above reads as a
+    // marker: a runtime-built spelling may be a marker or a jar String
+    // (#156 P17), so String checks are counted. Retired families
+    // (`RETIRED_PREFIXES`, `host_registry`'s `registry/…`) were answered as
+    // Strings by `is_plain_string` above.
+    if marker.starts_with("enum/")
+        || marker.starts_with("typed/")
+        || marker.starts_with("payload/")
+        || marker.starts_with("payload-context/")
+        || marker.starts_with("textures/")
+        || marker.starts_with("models/")
+    {
+        return Shape::Undecidable;
+    }
+    // Callback/object/stream families have registries; absent an entry, text
+    // is exact String data.
+    Shape::String
+}
+
 pub(crate) fn is_plain_string(marker: &str) -> bool {
     // Only the process-local random-tagged stream marker is a runtime object.
     // A jar String with the same public shape but another tag is still a String.
@@ -125,6 +157,11 @@ pub(crate) fn is_plain_string(marker: &str) -> bool {
         .iter()
         .any(|prefix| marker.starts_with(prefix))
     {
+        return true;
+    }
+    // The registry family's objects are handles (`host_registry.rs`, #177):
+    // a text spelled like their old markers (`registry/…`, `holder/…`) is a `String`.
+    if crate::runtime::host_registry::spells_retired_marker(marker) {
         return true;
     }
     // The last separator-free markers (`guava-cache-builder`,
@@ -416,6 +453,10 @@ mod tests {
             "@fn:identity/function",
             "@cmp:natural",
             "@cmp:reverse:r@cmp:natural",
+            // Registries, holders and registers are handles (#177,
+            // `host_registry.rs`): text spelled like their old markers is a String.
+            "registry/minecraft:item",
+            "holder/deferred-register/registry/minecraft:item/demo/x",
         ] {
             assert!(is_plain_string(text), "{text:?} should be a string");
         }
@@ -427,7 +468,6 @@ mod tests {
             "",
         )));
         for marker in [
-            "registry/minecraft:item",
             "string-builder/2",
             // A marker kind ahead of a capitalized segment is no class name.
             "component/Hello",

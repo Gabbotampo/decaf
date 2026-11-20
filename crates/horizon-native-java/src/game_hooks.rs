@@ -1404,6 +1404,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.map_entry_parts(value)
     }
 
+    fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
+        self.inner.map_entry_is_instance_of(value, wanted)
+    }
+
     fn mint_map_entry(
         &mut self,
         map: Option<&Value>,
@@ -2029,6 +2033,7 @@ impl NativeJar {
 
             string_readers: BTreeMap::new(),
             reader_positions_unknown: Default::default(),
+            io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
             io_writers: BTreeMap::new(),
