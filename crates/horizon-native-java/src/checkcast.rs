@@ -685,8 +685,8 @@ impl<H: Host> Runtime<'_, H> {
             .as_ref()
             .and_then(Option::as_deref)
             .unwrap_or_else(|| crate::jar_object::collection_class(key));
-        let list =
-            unknown_sublist || crate::java_immutable::supertypes(class).contains(&"java/util/List");
+        let list = unknown_sublist
+            || crate::java_immutable::cast_supertypes(class).contains(&"java/util/List");
         if !list {
             return None;
         }
@@ -697,7 +697,7 @@ impl<H: Host> Runtime<'_, H> {
             | "java/util/SequencedCollection" => Some(Some(true)),
             "java/util/RandomAccess" if unknown_sublist => Some(None),
             "java/util/RandomAccess" => Some(Some(
-                crate::java_immutable::supertypes(class).contains(&target),
+                crate::java_immutable::cast_supertypes(class).contains(&target),
             )),
             _ => None,
         }

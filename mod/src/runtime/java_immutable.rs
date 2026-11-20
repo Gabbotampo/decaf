@@ -467,13 +467,10 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         crate::runtime::array_views::WINDOW_CLASS => SUB_LIST,
         "java/util/ImmutableCollections$ListN"
         | "java/util/ImmutableCollections$List12"
-        | "java/util/Collections$SynchronizedRandomAccessList"
         | "java/util/Collections$UnmodifiableRandomAccessList"
         | "java/util/Collections$EmptyList"
         | "java/util/Collections$SingletonList" => LIST,
-        "java/util/Collections$SynchronizedList" | "java/util/Collections$UnmodifiableList" => {
-            SEQUENTIAL_LIST
-        }
+        "java/util/Collections$UnmodifiableList" => SEQUENTIAL_LIST,
         "java/util/Collections$UnmodifiableCollection" => COLLECTION,
         "java/util/ImmutableCollections$SetN"
         | "java/util/ImmutableCollections$Set12"
@@ -494,6 +491,22 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
         "com/google/common/collect/SingletonImmutableBiMap"
         | "com/google/common/collect/RegularImmutableBiMap" => GUAVA_BI_MAP,
         _ => crate::runtime::sequenced::supertypes(class),
+    }
+}
+
+/// The synchronized list wrappers implement these interfaces for casts and
+/// `instanceof`. Keep them out of [`supertypes`]: that table also drives host
+/// collection dispatch, and the wrappers' methods must retain their existing
+/// dispatch paths.
+pub(crate) fn cast_supertypes(class: &str) -> &'static [&'static str] {
+    match class {
+        "java/util/Collections$SynchronizedRandomAccessList" => {
+            supertypes("java/util/ImmutableCollections$ListN")
+        }
+        "java/util/Collections$SynchronizedList" => {
+            supertypes("java/util/Collections$UnmodifiableList")
+        }
+        _ => supertypes(class),
     }
 }
 
