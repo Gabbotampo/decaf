@@ -1284,3 +1284,18 @@
 0,67=R=false
 0,68=E=java.lang.IllegalStateException:ise|L=[1, 2, 3, 4]
 0,69=R=true
+0,70=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,71=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,72=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,73=R=false
+0,74=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,75=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,76=R=false
+0,77=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,78=E=java.util.ConcurrentModificationException:null|L=[1, 2, 3, 4]
+0,79=R=false
+0,80=R=true
+0,81=R=true
+0,82=E=java.lang.NullPointerException:null|L=[1, 2, 3, 4]
+0,83=E=java.lang.NullPointerException:null|L=[1, 2, 3, 4]
+0,84=E=java.lang.NullPointerException:null|L=[1, 2, 3, 4]

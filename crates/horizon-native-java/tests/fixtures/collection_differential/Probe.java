@@ -26,6 +26,35 @@ public class Probe {
     public Iterator<Integer> iterator() { throw failure; }
     public int size() { return 1; }
   }
+  static final class MutableAbstractList extends AbstractList<Object> {
+    final ArrayList<Object> values = new ArrayList<>();
+    MutableAbstractList(Object... values) { this.values.addAll(Arrays.asList(values)); }
+    public Object get(int index) { return values.get(index); }
+    public int size() { return values.size(); }
+    public void add(int index, Object value) { values.add(index, value); modCount++; }
+    public Object remove(int index) { Object value=values.remove(index); modCount++; return value; }
+  }
+  static final class MutatingEquals {
+    final List<Object> target; final boolean answer, restore; boolean once = true;
+    MutatingEquals(List<Object> target, boolean answer, boolean restore) {
+      this.target=target; this.answer=answer; this.restore=restore;
+    }
+    public boolean equals(Object other) {
+      if (once) {
+        once=false;
+        try {
+          if (target instanceof ArrayList || target instanceof MutableAbstractList || target instanceof Vector) {
+            target.add("mutation");
+            if (restore) target.remove(target.size()-1);
+          } else {
+            target.set(0, "mutation");
+            if (restore) target.set(0, this);
+          }
+        } catch (RuntimeException ignored) { }
+      }
+      return answer;
+    }
+  }
   static List<Integer> make(int r) {
     int family = r / 3, depth = r % 3;
     List<Integer> x;
@@ -136,9 +165,41 @@ public class Probe {
         case 67: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new ThrowingSet(new NullPointerException("npe"))); }
         case 68: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new ThrowingSet(new IllegalStateException("ise"))); }
         case 69: return "R="+new ArrayList<>(List.of(1)).equals(new ThrowingList());
+        case 70: return "R="+subListEquality(0, 0);
+        case 71: return "R="+subListEquality(0, 1);
+        case 72: return "R="+subListEquality(0, 2);
+        case 73: return "R="+subListEquality(1, 0);
+        case 74: return "R="+subListEquality(1, 1);
+        case 75: return "R="+subListEquality(1, 2);
+        case 76: return "R="+subListEquality(2, 0);
+        case 77: return "R="+subListEquality(2, 1);
+        case 78: return "R="+subListEquality(2, 2);
+        case 79: return "R="+subListEquality(3, 0);
+        case 80: return "R="+subListEquality(3, 1);
+        case 81: return "R="+subListEquality(3, 2);
+        case 82: return "R="+subListEquality(4, 0);
+        case 83: return "R="+subListEquality(4, 1);
+        case 84: return "R="+subListEquality(4, 2);
         default: throw new AssertionError(op);
       }
     } catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
+  }
+  static boolean subListEquality(int which, int mode) {
+    List<Object> parent;
+    switch (which) {
+      case 0: parent = new ArrayList<>(); break;
+      case 1: parent = new MutableAbstractList(); break;
+      case 2: parent = new Vector<>(); break;
+      case 3: parent = Arrays.asList(null, 2); break;
+      case 4: parent = new ArrayList<>(); break;
+      default: throw new AssertionError(which);
+    }
+    List<Object> target = which == 4 ? new ArrayList<>(List.of(null, 2)) : parent;
+    MutatingEquals first = new MutatingEquals(target, mode != 0, mode == 2);
+    if (which == 4) parent = List.of(first, 2);
+    else if (which == 3) parent.set(0, first);
+    else { parent.add(first); parent.add(2); }
+    return parent.subList(0, 2).equals(List.of(new Object(), 2));
   }
   static String subListClass(int which) {
     List<Integer> parent;
@@ -159,6 +220,6 @@ public class Probe {
   public static String probe(int r, int op) { return run(r,op); }
   public static void main(String[] a) {
     for (int r=0;r<39;r++) for (int op=0;op<32;op++) System.out.println(r+","+op+"="+run(r,op));
-    for (int op=32;op<=69;op++) System.out.println("0,"+op+"="+run(0,op));
+    for (int op=32;op<=84;op++) System.out.println("0,"+op+"="+run(0,op));
   }
 }

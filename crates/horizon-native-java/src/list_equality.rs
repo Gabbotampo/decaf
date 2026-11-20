@@ -279,6 +279,82 @@ impl<H: Host> Runtime<'_, H> {
                     .map(drop)
             };
 
+        // ArrayList.SubList overrides AbstractList.equals.  It reads the
+        // root's range directly, walks the argument iterator, and checks its
+        // own modCount only after equalsRange returns (including a false
+        // element comparison).  Keep this separate from AbstractList's
+        // receiver-iterator checks.
+        if self.host_collection_class(this).as_deref() == Some("java/util/ArrayList$SubList") {
+            let Some(mut marker) = expect_ref(this).cloned() else {
+                return Ok(false);
+            };
+            let mut offset = 0usize;
+            let mut size = self.host.collection_len(this).unwrap_or(0);
+            while let Some(link) = self.host.sub_list_link(&marker) {
+                offset = offset.saturating_add(link.offset());
+                size = link.size();
+                marker = link.parent().to_owned();
+            }
+            let root = crate::jar_object::stored_value(&marker);
+            let elements = self.collection_elements(&root)?;
+            let range = elements
+                .get(offset..offset.saturating_add(size))
+                .ok_or_else(|| NativeError::UncaughtException {
+                    class: "java/util/ConcurrentModificationException".into(),
+                    message: None,
+                    frame: None,
+                })?;
+            let expected_this = self.capture_mod_count(this);
+            if self.known_instance_of(other, "java/util/List") != Some(true) {
+                return Ok(false);
+            }
+            let iterator = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Collection",
+                "iterator",
+                "()Ljava/util/Iterator;",
+                other,
+                &[],
+            )?;
+            for left in range {
+                let has_next = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "hasNext",
+                    "()Z",
+                    &iterator,
+                    &[],
+                )?;
+                if !matches!(has_next, Value::Int(flag) if flag != 0) {
+                    check(self, this, expected_this, "java/util/ArrayList")?;
+                    return Ok(false);
+                }
+                let right = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Iterator",
+                    "next",
+                    "()Ljava/lang/Object;",
+                    &iterator,
+                    &[],
+                )?;
+                if !self.objects_equals(left, &right)? {
+                    check(self, this, expected_this, "java/util/ArrayList")?;
+                    return Ok(false);
+                }
+            }
+            let has_next = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &iterator,
+                &[],
+            )?;
+            let equal = !matches!(has_next, Value::Int(flag) if flag != 0);
+            check(self, this, expected_this, "java/util/ArrayList")?;
+            return Ok(equal);
+        }
+
         // AbstractList.equals creates iterators for both lists.  In
         // particular, its receiver iterator checks the receiver before each
         // next(), while the final hasNext() calls do not check either list.
@@ -372,7 +448,12 @@ impl<H: Host> Runtime<'_, H> {
                     &right_iterator,
                     &[],
                 )?;
-                if !self.java_equals(&left, &right)? {
+                let equal = if rules.equals_shortcut {
+                    self.objects_equals(&left, &right)?
+                } else {
+                    self.java_equals(&left, &right)?
+                };
+                if !equal {
                     return Ok(false);
                 }
             }
