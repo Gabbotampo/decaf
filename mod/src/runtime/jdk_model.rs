@@ -724,17 +724,19 @@ impl crate::runtime::StdHost {
     ) -> Result<Value, NativeError> {
         let from = super::expect_int(r, Self::argument(r, args, 0)?)?;
         let to = super::expect_int(r, Self::argument(r, args, 1)?)?;
+        let repeated = self.repeated_collections.get(marker).cloned();
         let values = self
             .mutable_collections
             .get(marker)
             .cloned()
             .unwrap_or_default();
+        let logical_len = repeated.as_ref().map_or(values.len(), |(count, _)| *count);
         let failure = if from < 0 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("fromIndex = {from}"),
             ))
-        } else if to as i64 > values.len() as i64 {
+        } else if to as i64 > logical_len as i64 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("toIndex = {to}"),
@@ -753,6 +755,21 @@ impl crate::runtime::StdHost {
                 message: Some(message),
                 frame: None,
             });
+        }
+        // Large `Collections.nCopies` rows stay compressed.  CopiesList's
+        // override returns another compressed CopiesList, so never expand a
+        // range that may contain billions of repeated elements.
+        if let Some((_, value)) = repeated {
+            let marker = crate::runtime::jar_object::collection_key_for(
+                "java/util/Collections$CopiesList",
+                crate::runtime::jar_object::CollectionFamily::Immutable,
+                self.next_unmodifiable_collection,
+            );
+            self.next_unmodifiable_collection += 1;
+            self.repeated_collections
+                .insert(marker.clone(), ((to - from) as usize, value));
+            self.unmodifiable_collections.insert(marker.clone(), None);
+            return Ok(crate::runtime::jar_object::collection(marker));
         }
         let range = values[from as usize..to as usize].to_vec();
         let parent_class = crate::runtime::jar_object::collection_class(marker).to_owned();
@@ -791,11 +808,17 @@ impl crate::runtime::StdHost {
             || parent_class == "java/util/ArrayList$SubList"
         {
             "java/util/ArrayList$SubList"
-        } else if parent_class == "java/util/Vector" {
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Vector" | "java/util/Stack"
+        ) {
             // Vector overrides AbstractList.subList and synchronizes the
             // resulting RandomAccess view.
             "java/util/Collections$SynchronizedRandomAccessList"
-        } else if parent_class == "java/util/LinkedList"
+        } else if parent_class == "java/util/concurrent/CopyOnWriteArrayList" {
+            "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
+        } else if parent_class == "java/util/Arrays$ArrayList"
+            || parent_class == "java/util/LinkedList"
             || parent_class == "java/util/AbstractList"
             || parent_class == "java/util/AbstractList$SubList"
         {
@@ -807,7 +830,9 @@ impl crate::runtime::StdHost {
         };
         let storage_class = if matches!(
             made_class,
-            "java/util/ArrayList$SubList" | "java/util/AbstractList$SubList"
+            "java/util/ArrayList$SubList"
+                | "java/util/AbstractList$SubList"
+                | "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
         ) {
             "java/util/ArrayList"
         } else {

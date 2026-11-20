@@ -842,6 +842,8 @@ impl StdHost {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         let class = crate::runtime::jar_object::collection_class(marker);
+        let repeated = self.repeated_collections.get(marker).cloned();
+        let repeated_size = repeated.as_ref().map(|(size, _)| *size);
         let owned_by_this_model = matches!(
             class,
             "java/util/ImmutableCollections$List12"
@@ -874,10 +876,8 @@ impl StdHost {
             return None;
         }
         if class.contains("SubList")
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
             && matches!(r.name.as_str(), "set" | "remove")
             && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
         {
@@ -894,10 +894,8 @@ impl StdHost {
             )));
         }
         if class == "java/util/AbstractList$RandomAccessSubList"
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
             && matches!(r.name.as_str(), "set" | "remove")
             && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
         {
@@ -928,15 +926,17 @@ impl StdHost {
             && r.descriptor == "(Ljava/lang/Object;)Z"
         {
             let wanted = args.first()?;
-            let values = self
-                .mutable_collections
-                .get(marker)
-                .cloned()
-                .unwrap_or_default();
             let wanted = crate::runtime::value_marker(wanted);
-            let present = values
-                .iter()
-                .any(|value| crate::runtime::value_marker(value) == wanted);
+            let present = repeated.as_ref().map_or_else(
+                || {
+                    self.mutable_collections.get(marker).is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| crate::runtime::value_marker(value) == wanted)
+                    })
+                },
+                |(_, value)| crate::runtime::value_marker(value) == wanted,
+            );
             return Some(if present {
                 Err(throw("java/lang/UnsupportedOperationException", None))
             } else {
@@ -948,20 +948,17 @@ impl StdHost {
         if r.name == "sort"
             && (class == "java/util/Collections$SingletonList"
                 || (class == "java/util/Collections$CopiesList"
-                    && self
-                        .mutable_collections
-                        .get(marker)
-                        .is_some_and(Vec::is_empty)))
+                    && repeated_size
+                        .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                        == Some(0)))
         {
             return Some(Ok(Value::Void));
         }
         // `nCopies(0, x)` inherits the empty-list default operations.  The
         // iterator has no elements to set or replace, so these are no-ops.
         if class == "java/util/Collections$CopiesList"
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
             && matches!(
                 r.name.as_str(),
                 "clear" | "replaceAll" | "removeIf" | "removeAll" | "retainAll"
@@ -980,7 +977,9 @@ impl StdHost {
                 Some(Value::Int(index)) => *index,
                 _ => 0,
             };
-            let size = self.mutable_collections.get(marker).map_or(0, Vec::len);
+            let size = repeated_size
+                .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                .unwrap_or(0);
             if index < 0 || index >= size as i32 {
                 let (class, message) = match class {
                     "java/util/ImmutableCollections$ListN" => (
@@ -1009,10 +1008,8 @@ impl StdHost {
         // Empty AbstractList sub-lists inherit the root's range behavior:
         // adding is refused, while searches/removal/clear/sort do no work.
         if class == "java/util/AbstractList$RandomAccessSubList"
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
         {
             let null_argument = matches!(args.first(), Some(Value::Ref(None)));
             return match r.name.as_str() {
@@ -1043,20 +1040,16 @@ impl StdHost {
         if (class == "java/util/ImmutableCollections$SubList"
             || class == "java/util/Collections$CopiesList")
             && self.unmodifiable_collections.contains_key(marker)
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
             && matches!(r.name.as_str(), "set" | "add" | "remove")
             && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
         {
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
         }
         if class == "java/util/AbstractList$RandomAccessSubList"
-            && self
-                .mutable_collections
-                .get(marker)
-                .is_some_and(Vec::is_empty)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
             && matches!(r.name.as_str(), "set" | "remove")
             && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
         {
@@ -1080,10 +1073,8 @@ impl StdHost {
         if MUTATORS.contains(&r.name.as_str()) && self.unmodifiable_collections.contains_key(marker)
         {
             if class.contains("SubList")
-                && self
-                    .mutable_collections
-                    .get(marker)
-                    .is_some_and(Vec::is_empty)
+                && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                    == Some(0)
                 && matches!(r.name.as_str(), "set" | "remove")
             {
                 return Some(self.unknown_host_call(r));

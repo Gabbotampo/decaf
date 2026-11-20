@@ -1263,3 +1263,10 @@
 0,46=R=java.util.ImmutableCollections$SubList
 0,47=R=java.util.Collections$UnmodifiableRandomAccessList
 0,48=R=java.util.Collections$SynchronizedRandomAccessList
+0,49=R=true,0,2147483646|L=2147483647
+0,50=R=java.util.Collections$CopiesList:1:1
+0,51=R=java.util.Collections$CopiesList:1:1
+0,52=E=java.lang.IllegalArgumentException:fromIndex(0) > toIndex(-1)|L=[1, 2, 3, 4]
+0,53=E=java.lang.IllegalArgumentException:fromIndex(1) > toIndex(0)|L=[1, 2, 3, 4]
+0,54=R=java.util.Collections$SynchronizedRandomAccessList
+0,55=R=java.util.concurrent.CopyOnWriteArrayList$COWSubList

@@ -11041,6 +11041,11 @@ impl Host for StdHost {
                     });
                 }
                 let needle = collection_item_marker(argument);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        (count != 0 && collection_item_marker(&value) == needle) as i32,
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -11080,6 +11085,15 @@ impl Host for StdHost {
                     });
                 }
                 let needle = collection_item_marker(raw);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        if count != 0 && collection_item_marker(&value) == needle {
+                            0
+                        } else {
+                            -1
+                        },
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -11107,6 +11121,15 @@ impl Host for StdHost {
                     });
                 }
                 let needle = collection_item_marker(raw);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        if count != 0 && collection_item_marker(&value) == needle {
+                            (count - 1) as i32
+                        } else {
+                            -1
+                        },
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
