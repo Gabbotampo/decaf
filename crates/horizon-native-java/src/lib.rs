@@ -5458,7 +5458,10 @@ impl StdHost {
                 self.block_property_builders
                     .get(marker)
                     .map(|builder| RegistryDeclaration::Block {
-                        template: INFERRED_BLOCK_TEMPLATE.to_owned(),
+                        template: builder
+                            .get("__template")
+                            .cloned()
+                            .unwrap_or_else(|| INFERRED_BLOCK_TEMPLATE.to_owned()),
                         properties: block_declaration_properties(builder),
                         // A block built this way has the item vanilla gives
                         // every block; a mod that registers its own block item
@@ -5674,6 +5677,27 @@ impl StdHost {
                     return Ok(Some(receiver.clone()));
                 }
                 Ok(None)
+            }
+            "net/minecraft/world/level/block/CraftingTableBlock"
+                if r.name == "<init>"
+                    && r.descriptor
+                        == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V" =>
+            {
+                let Some(builder) = args.first().and_then(expect_ref) else {
+                    return Ok(None);
+                };
+                let Some(mut properties) = self.block_property_builders.get(builder).cloned()
+                else {
+                    return Ok(None);
+                };
+                properties.insert("__template".into(), "minecraft:crafting_table".into());
+                if self.block_property_builders.contains_key(marker)
+                    || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+                {
+                    self.block_property_builders
+                        .insert(marker.to_owned(), properties);
+                }
+                Ok(Some(Value::Void))
             }
             // Vanilla subclass constructors carry class-specific arguments
             // (BlockSetType, TreeGrower, base state, ...). Until each argument
@@ -13374,6 +13398,7 @@ fn block_builder_settings(
         }
     };
     match method {
+        "destroyTime" => push("destroyTime", number(first)),
         "strength" if descriptor.starts_with("(FF") => {
             push("destroyTime", number(first));
             push("explosionResistance", number(args.get(1)));

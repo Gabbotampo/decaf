@@ -1,6 +1,7 @@
 //! Vanilla registry `ResourceKey` constants used by 26.3 mod bootstrap.
 use crate::runtime::{MethodRef, Value};
 const ENCHANTMENTS: &str = "net/minecraft/world/item/enchantment/Enchantments";
+const CREATIVE_MODE_TABS: &str = "net/minecraft/world/item/CreativeModeTabs";
 const DAMAGE_TYPES: &str = "net/minecraft/world/damagesource/DamageTypes";
 const KEY: &str = "Lnet/minecraft/resources/ResourceKey;";
 fn captured(name: &str) -> Option<&'static str> {
@@ -25,6 +26,17 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         return Some(crate::runtime::host_ids::resource_key_named(
             "minecraft:damage_type",
             location,
+        ));
+    }
+    if r.owner == CREATIVE_MODE_TABS {
+        let location = match r.name.as_str() {
+            "FUNCTIONAL_BLOCKS" => "functional_blocks",
+            "COMBAT" => "combat",
+            _ => return None,
+        };
+        return Some(crate::runtime::host_ids::resource_key_named(
+            "minecraft:creative_mode_tab",
+            &format!("minecraft:{location}"),
         ));
     }
     if r.owner != ENCHANTMENTS {
