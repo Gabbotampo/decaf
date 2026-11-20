@@ -9,6 +9,7 @@ use super::*;
 use crate::host_ref::{HostKind, HostRef};
 
 const STATE: &str = "|guava-multimap#";
+const MAP_ITERATOR: &str = "guava-as-map-iterator|";
 
 fn state_key(key: &str, name: &str) -> String {
     format!("{key}{STATE}{name}")
@@ -125,6 +126,160 @@ fn value_collection_class(kind: &str) -> &'static str {
         "hash" => "java/util/HashSet",
         "linked" => "java/util/LinkedHashSet",
         _ => "java/util/ArrayList",
+    }
+}
+
+fn backing_generation<H: Host>(this: &Runtime<'_, H>, source: &str) -> Option<u64> {
+    let Value::Host(map) = backing(this, source)? else {
+        return None;
+    };
+    this.host.collection_generation(map.key_text())
+}
+
+fn clone_values<H: Host>(
+    this: &mut Runtime<'_, H>,
+    source: &str,
+    values: &Value,
+) -> Result<Value, NativeError> {
+    let kind = source_kind(this, source).unwrap_or_else(|| "array".into());
+    let copy = this
+        .host
+        .empty_mutable_collection(value_collection_class(&kind))
+        .ok_or_else(|| NativeError::Metadata("Guava detached collection unavailable".into()))?;
+    for value in runtime_collection_values(&*this.host, values)? {
+        invoke_instance(
+            this,
+            &collection_ref("add", "(Ljava/lang/Object;)Z"),
+            &copy,
+            &[value],
+        )?;
+    }
+    Ok(copy)
+}
+
+fn remove_key<H: Host>(
+    this: &mut Runtime<'_, H>,
+    source: &str,
+    key: &Value,
+) -> Result<Option<Value>, NativeError> {
+    let Some(values) = values_for_key(this, source, key, false)? else {
+        return Ok(None);
+    };
+    let detached = clone_values(this, source, &values)?;
+    if let Some(map) = backing(this, source) {
+        invoke_instance(
+            this,
+            &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+            &map,
+            std::slice::from_ref(key),
+        )?;
+    }
+    // AbstractMapBasedMultimap clears the original collection after copying it;
+    // handles returned by get(key) therefore remain live, but become empty.
+    invoke_instance(this, &collection_ref("clear", "()V"), &values, &[])?;
+    Ok(Some(detached))
+}
+
+fn map_iterator_source<H: Host>(
+    this: &Runtime<'_, H>,
+    receiver: &Value,
+) -> Option<(String, String, u64, bool)> {
+    let marker = crate::host_iterator::marker(receiver)?;
+    let source = this.host.host_iterator(marker)?.2?;
+    let rest = source.strip_prefix(MAP_ITERATOR)?;
+    let (source, rest) = rest.split_once("|view=")?;
+    let (view, generation) = rest.rsplit_once("|generation=")?;
+    let removed = generation.strip_suffix("|removed").is_some();
+    let generation = generation
+        .strip_suffix("|removed")
+        .unwrap_or(generation)
+        .parse()
+        .ok()?;
+    Some((source.to_owned(), view.to_owned(), generation, removed))
+}
+
+fn invoke_map_iterator<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: &Value,
+) -> Result<Option<Value>, NativeError> {
+    let Some(marker) = crate::host_iterator::marker(receiver).cloned() else {
+        return Ok(None);
+    };
+    let Some((source, view, expected, removed)) = map_iterator_source(this, receiver) else {
+        return Ok(None);
+    };
+    if !matches!(
+        r.owner.as_str(),
+        "java/util/Iterator" | "java/util/ListIterator"
+    ) {
+        return Ok(None);
+    }
+    let (cursor, length, _) = this
+        .host
+        .host_iterator(&marker)
+        .ok_or_else(|| NativeError::Metadata("unknown Guava asMap iterator".into()))?;
+    let current = backing_generation(this, &source).unwrap_or(expected);
+    if current != expected && matches!(r.name.as_str(), "hasNext" | "next" | "remove") {
+        return Err(NativeError::UncaughtException {
+            class: "java/util/ConcurrentModificationException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("hasNext", "()Z") => Ok(Some(Value::Int((cursor < length) as i32))),
+        ("next", "()Ljava/lang/Object;") => {
+            let value = this.host.host_iterator_next(&marker)?;
+            let generation = backing_generation(this, &source).unwrap_or(current);
+            this.host.set_host_iterator_source(
+                &marker,
+                format!("{MAP_ITERATOR}{source}|view={view}|generation={generation}"),
+            );
+            Ok(Some(value))
+        }
+        ("remove", "()V") => {
+            if cursor == 0 || removed {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalStateException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let values = this.host.host_iterator_values(&marker).ok_or_else(|| {
+                NativeError::Metadata("Guava asMap iterator values missing".into())
+            })?;
+            let last = values[cursor - 1].clone();
+            let map_key = match view.as_str() {
+                "keySet" => Some(last),
+                "entrySet" => this.host.map_entry_parts(&last).map(|(key, _)| key),
+                "values" => {
+                    let mut found = None;
+                    for key in map_keys(this, &source)? {
+                        if let Some(collection) = values_for_key(this, &source, &key, false)?
+                            && crate::host_map_entry::same_reference(&collection, &last)
+                                == Some(true)
+                        {
+                            found = Some(key);
+                            break;
+                        }
+                    }
+                    found
+                }
+                _ => None,
+            };
+            let Some(map_key) = map_key else {
+                return this.host.unknown_operand_call(r).map(Some);
+            };
+            remove_key(this, &source, &map_key)?;
+            let generation = backing_generation(this, &source).unwrap_or(current);
+            this.host.set_host_iterator_source(
+                &marker,
+                format!("{MAP_ITERATOR}{source}|view={view}|generation={generation}|removed"),
+            );
+            Ok(Some(Value::Void))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -329,6 +484,11 @@ pub(crate) fn invoke<H: Host>(
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
     if let Some(receiver) = receiver
+        && map_iterator_source(this, receiver).is_some()
+    {
+        return invoke_map_iterator(this, r, receiver);
+    }
+    if let Some(receiver) = receiver
         && let Some(key) = handle_key(receiver)
         && (is_view(this, &key) || kind(this, &key).is_some())
     {
@@ -502,7 +662,14 @@ fn invoke_multimap<H: Host>(
             ("iterator", "()Ljava/util/Iterator;") => {
                 return this
                     .host
-                    .new_host_iterator(values, Some("guava-as-map-view".into()))
+                    .new_host_iterator(
+                        values,
+                        Some(format!(
+                            "{MAP_ITERATOR}{source}|view={}|generation={}",
+                            view.as_deref().unwrap().strip_prefix("asMap.").unwrap(),
+                            backing_generation(this, &source).unwrap_or(0)
+                        )),
+                    )
                     .map_or_else(
                         || this.host.unknown_operand_call(r).map(Some),
                         |iterator| Ok(Some(iterator)),
@@ -513,13 +680,8 @@ fn invoke_multimap<H: Host>(
                     return Ok(Some(Value::Int(0)));
                 };
                 let present = values_for_key(this, &source, candidate, false)?.is_some();
-                if present && let Some(map) = backing(this, &source) {
-                    invoke_instance(
-                        this,
-                        &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-                        &map,
-                        std::slice::from_ref(candidate),
-                    )?;
+                if present {
+                    remove_key(this, &source, candidate)?;
                 }
                 Value::Int(i32::from(present))
             }
@@ -543,14 +705,7 @@ fn invoke_multimap<H: Host>(
                         this.java_equals(&collection, candidate).unwrap_or(false)
                     };
                     if matches {
-                        if let Some(map) = backing(this, &source) {
-                            invoke_instance(
-                                this,
-                                &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
-                                &map,
-                                std::slice::from_ref(&map_key),
-                            )?;
-                        }
+                        remove_key(this, &source, &map_key)?;
                         removed = true;
                         break;
                     }
@@ -599,6 +754,12 @@ fn invoke_multimap<H: Host>(
                         .map(|_| fresh_as_map_value(this, &source, candidate))
                 })
                 .unwrap_or(Value::Ref(None)),
+            ("remove", "(Ljava/lang/Object;)Ljava/lang/Object;") => {
+                let Some(candidate) = args.first() else {
+                    return Ok(Some(Value::Ref(None)));
+                };
+                remove_key(this, &source, candidate)?.unwrap_or(Value::Ref(None))
+            }
             ("entrySet", "()Ljava/util/Set;") => fresh_as_map_view(this, &source, "asMap.entrySet"),
             ("keySet", "()Ljava/util/Set;") => fresh_as_map_view(this, &source, "asMap.keySet"),
             ("values", "()Ljava/util/Collection;") => {

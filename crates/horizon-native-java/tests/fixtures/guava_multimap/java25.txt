@@ -1,1 +1,7 @@
 true|true|true|true|true
+true|2|0|false|1|true|true
+true|2|0|false|1|true|true
+true|2|0|false|1|true|true
+1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme
+1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme
+1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme|1:false:0:true:ise:ise:cme

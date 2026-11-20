@@ -34,6 +34,50 @@ public final class Probe {
     map.entrySet().clear();
     return distinct + "|" + live + "|" + keyWrite + "|" + keyLive + "|" + (m.size() == 0);
   }
+  private static String removed(Multimap<String,Integer> m) {
+    m.put("a", 1); m.put("a", 2); m.put("b", 3);
+    Map<String, Collection<Integer>> map = m.asMap();
+    Collection<Integer> held = m.get("a");
+    Collection<Integer> detached = map.remove("a");
+    return (detached != held) + "|" + detached.size() + "|" + held.size() + "|"
+        + m.containsKey("a") + "|" + m.size() + "|" + (map.remove("missing") == null)
+        + "|" + (map.remove(Integer.valueOf(7)) == null);
+  }
+  public static String asMapRemoveArray() { return removed(ArrayListMultimap.create()); }
+  public static String asMapRemoveHash() { return removed(HashMultimap.create()); }
+  public static String asMapRemoveLinked() { return removed(LinkedHashMultimap.create()); }
+  private static String iteratorRemove(Multimap<String,Integer> m, int view) {
+    m.put("a", 1); m.put("b", 2);
+    Collection<Integer> held = m.get("a");
+    java.util.Iterator<?> it = view == 0 ? m.asMap().entrySet().iterator()
+        : view == 1 ? m.asMap().keySet().iterator() : m.asMap().values().iterator();
+    it.next(); it.remove();
+    String out = m.size() + ":" + m.containsKey("a") + ":" + held.size() + ":" + it.hasNext();
+    try { it.remove(); out += ":no"; } catch (IllegalStateException e) { out += ":ise"; }
+    java.util.Iterator<?> before = view == 0 ? m.asMap().entrySet().iterator()
+        : view == 1 ? m.asMap().keySet().iterator() : m.asMap().values().iterator();
+    try { before.remove(); out += ":no"; } catch (IllegalStateException e) { out += ":ise"; }
+    java.util.Iterator<?> cme = view == 0 ? m.asMap().entrySet().iterator()
+        : view == 1 ? m.asMap().keySet().iterator() : m.asMap().values().iterator();
+    m.put("c", 3);
+    try { cme.next(); out += ":no"; } catch (java.util.ConcurrentModificationException e) { out += ":cme"; }
+    return out;
+  }
+  public static String iteratorRemoveArray() {
+    return iteratorRemove(ArrayListMultimap.create(), 0) + "|"
+        + iteratorRemove(ArrayListMultimap.create(), 1) + "|"
+        + iteratorRemove(ArrayListMultimap.create(), 2);
+  }
+  public static String iteratorRemoveHash() {
+    return iteratorRemove(HashMultimap.create(), 0) + "|"
+        + iteratorRemove(HashMultimap.create(), 1) + "|"
+        + iteratorRemove(HashMultimap.create(), 2);
+  }
+  public static String iteratorRemoveLinked() {
+    return iteratorRemove(LinkedHashMultimap.create(), 0) + "|"
+        + iteratorRemove(LinkedHashMultimap.create(), 1) + "|"
+        + iteratorRemove(LinkedHashMultimap.create(), 2);
+  }
   public static String sync(){ ListMultimap<String,Integer> base=ArrayListMultimap.create(); return Boolean.toString(Multimaps.synchronizedListMultimap(base) != base); }
   public static String excluded(){
     Multimap<String,Integer> m=ArrayListMultimap.create(); m.put("a",1);

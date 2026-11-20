@@ -47,10 +47,22 @@ fn real_guava_multimaps_match_java25() {
         "{:?}",
         host.unknown_host_calls()
     );
-    assert_eq!(
-        fixture.text_on(&mut host, "asMapIdentity"),
-        AS_MAP_ORACLE.trim()
-    );
+    let mut oracle = AS_MAP_ORACLE.lines();
+    for method in [
+        "asMapIdentity",
+        "asMapRemoveArray",
+        "asMapRemoveHash",
+        "asMapRemoveLinked",
+        "iteratorRemoveArray",
+        "iteratorRemoveHash",
+        "iteratorRemoveLinked",
+    ] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            oracle.next().unwrap(),
+            "{method}"
+        );
+    }
     for method in [
         "entries",
         "keys",
