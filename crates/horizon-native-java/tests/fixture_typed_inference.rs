@@ -598,3 +598,153 @@ public final class TableMod implements ModInitializer {
     assert_eq!(template(1), "minecraft:stone");
     let _ = fs::remove_dir_all(root);
 }
+
+/// A jar block's `createBlockStateDefinition` runs when its `super(...)` reaches any vanilla
+/// block constructor, as `Block.<init>` calls it in the JVM. The properties it adds become the
+/// declaration's state properties, with the values of the real 26.3 `BlockStateProperties`
+/// (captured in `src/vanilla_block_state_properties.rs`), and the default is every property's
+/// first value (`stateDefinition.any()`), `true` for a `BooleanProperty`. The stubs' fields are
+/// declared with their real types, so the `getstatic` descriptors are the ones a real jar uses.
+#[test]
+fn a_jar_blocks_state_definition_runs_through_any_vanilla_constructor() {
+    let mut stubs = game_stubs();
+    stubs.insert(
+        "net/minecraft/world/level/block/Block.java",
+        r#"package net.minecraft.world.level.block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+public class Block {
+    public Block(BlockBehaviour.Properties properties) { }
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) { }
+}"#,
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/CraftingTableBlock.java",
+        r#"package net.minecraft.world.level.block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public class CraftingTableBlock extends Block {
+    public CraftingTableBlock(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/BlockState.java",
+        "package net.minecraft.world.level.block.state; public class BlockState { }",
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/StateDefinition.java",
+        r#"package net.minecraft.world.level.block.state;
+import net.minecraft.world.level.block.state.properties.Property;
+public class StateDefinition<O, S> {
+    public static class Builder<O, S> {
+        public Builder<O, S> add(Property<?>... properties) { return this; }
+    }
+}"#,
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/properties/Property.java",
+        "package net.minecraft.world.level.block.state.properties; public abstract class Property<T> { }",
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/properties/EnumProperty.java",
+        "package net.minecraft.world.level.block.state.properties; public final class EnumProperty<T> extends Property<T> { }",
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/properties/BooleanProperty.java",
+        "package net.minecraft.world.level.block.state.properties; public final class BooleanProperty extends Property<Boolean> { }",
+    );
+    stubs.insert(
+        "net/minecraft/world/level/block/state/properties/BlockStateProperties.java",
+        r#"package net.minecraft.world.level.block.state.properties;
+public class BlockStateProperties {
+    public static final EnumProperty<Object> HORIZONTAL_FACING = null;
+    public static final BooleanProperty LIT = null;
+}"#,
+    );
+    let mod_sources = sources! {
+        // Runes' shape: a vanilla `CraftingTableBlock` subclass that adds `facing`.
+        "demo/Altar.java" => r#"package demo;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.CraftingTableBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class Altar extends CraftingTableBlock {
+    public Altar(BlockBehaviour.Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.HORIZONTAL_FACING);
+    }
+}"#,
+        // An override a jar subclass inherits from its jar superclass.
+        "demo/LampBase.java" => r#"package demo;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public class LampBase extends Block {
+    public LampBase(BlockBehaviour.Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.LIT);
+    }
+}"#,
+        "demo/Lamp.java" => r#"package demo;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Lamp extends LampBase {
+    public Lamp(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+        "demo/StateMod.java" => r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class StateMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "altar"),
+                new Altar(BlockBehaviour.Properties.of().strength(2.0F)));
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "lamp"),
+                new Lamp(BlockBehaviour.Properties.of()));
+    }
+}"#,
+    };
+    let (root, jar_path) = build_jar(
+        "typed-inference-block-states",
+        &stubs,
+        &mod_sources,
+        br#"{"id":"fixture-states","version":"1.0","entrypoints":{"main":"demo.StateMod"}}"#,
+        None,
+    );
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("main").unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+    jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+    let properties = |index: usize| match &host.registrations()[index].declaration {
+        Some(RegistryDeclaration::Block { properties, .. }) => properties.clone(),
+        other => panic!("row {index} is not a typed block: {other:?}"),
+    };
+    let altar = properties(0);
+    assert_eq!(
+        altar.get("state_property:facing").map(String::as_str),
+        Some("enum|north,south,west,east")
+    );
+    assert_eq!(
+        altar.get("default_state:facing").map(String::as_str),
+        Some("north")
+    );
+    let lamp = properties(1);
+    assert_eq!(
+        lamp.get("state_property:lit").map(String::as_str),
+        Some("boolean|true,false")
+    );
+    assert_eq!(
+        lamp.get("default_state:lit").map(String::as_str),
+        Some("true")
+    );
+    let _ = fs::remove_dir_all(root);
+}

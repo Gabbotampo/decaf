@@ -24631,6 +24631,70 @@ impl<H: Host> Runtime<'_, H> {
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
     /// fresh allocation number (`jar_object.rs`).
+    /// A jar block's `super(...)` reaching the first vanilla constructor in its chain: `Block`
+    /// or a vanilla subclass (`CraftingTableBlock`, `FenceBlock`). Every chain ends in
+    /// `Block.<init>`, which calls the virtual `createBlockStateDefinition` before the
+    /// subclass constructor continues, so a jar override runs here whichever vanilla class the
+    /// jar extends. A constructor is never an interface's, and in 26.3 every class
+    /// `is_vanilla_block_class` names that is not an interface is a `Block`. Called from the
+    /// `invokespecial` site, where a vanilla constructor call is dispatched.
+    fn run_vanilla_block_constructor_hooks(&mut self, receiver: &Value) -> Result<(), NativeError> {
+        let Some(marker) = jar_object::object_key(receiver) else {
+            return Ok(());
+        };
+        let class = marker.split('#').next().unwrap_or_default();
+        let descriptor = format!("({STATE_BUILDER_DESC})V");
+        // Virtual dispatch: the nearest jar class in the receiver's chain that declares
+        // the override (a jar superclass's override counts too).
+        let mut declaring = None;
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(file) = self.class(&current) else {
+                break;
+            };
+            if file
+                .method("createBlockStateDefinition", &descriptor)
+                .is_some()
+            {
+                declaring = Some(current.clone());
+                break;
+            }
+            current = file.super_name.clone();
+        }
+        if let Some(owner) = declaring {
+            let hook = MethodRef {
+                owner,
+                name: "createBlockStateDefinition".into(),
+                descriptor,
+            };
+            let builder = self.new_object(STATE_BUILDER_CLASS);
+            self.host.begin_block_state_definition(receiver, &builder);
+            let result = self.invoke(
+                &hook.owner,
+                &hook.name,
+                &hook.descriptor,
+                Some(receiver.clone()),
+                std::slice::from_ref(&builder),
+            );
+            self.host.finish_block_state_definition(receiver, &builder);
+            result?;
+        }
+        let placement = MethodRef {
+            owner: class.to_owned(),
+            name: "getStateForPlacement".into(),
+            descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
+        };
+        if self
+            .class(&placement.owner)
+            .and_then(|file| file.method(&placement.name, &placement.descriptor))
+            .is_some()
+        {
+            self.host.block_placement_unknown();
+        }
+
+        Ok(())
+    }
+
     fn new_object(&mut self, class: &str) -> Value {
         let key = self.new_object_key(class);
         if render_math::is_class(class) {
@@ -30237,59 +30301,6 @@ impl<H: Host> Runtime<'_, H> {
             {
                 return value;
             }
-            if r.owner == STATE_BUILDER_CLASS
-                && r.name == "add"
-                && let Some(receiver) = receiver.as_ref()
-                && let Some(values) = args
-                    .first()
-                    .and_then(|value| self.owned_array(value).map(|v| v.into_owned()))
-            {
-                for property in values.iter() {
-                    self.host.block_state_builder_add(receiver, property);
-                }
-                return Ok(receiver.clone());
-            }
-            if r.owner == BLOCK_CLASS
-                && r.name == "<init>"
-                && let Some(receiver) = receiver.as_ref()
-                && let Some(marker) = jar_object::object_key(receiver)
-            {
-                let class = marker.split('#').next().unwrap_or_default();
-                let hook = MethodRef {
-                    owner: class.to_owned(),
-                    name: "createBlockStateDefinition".into(),
-                    descriptor: format!("({STATE_BUILDER_DESC})V"),
-                };
-                if self
-                    .class(&hook.owner)
-                    .and_then(|file| file.method(&hook.name, &hook.descriptor))
-                    .is_some()
-                {
-                    let builder = self.new_object(STATE_BUILDER_CLASS);
-                    self.host.begin_block_state_definition(receiver, &builder);
-                    let result = self.invoke(
-                        &hook.owner,
-                        &hook.name,
-                        &hook.descriptor,
-                        Some(receiver.clone()),
-                        std::slice::from_ref(&builder),
-                    );
-                    self.host.finish_block_state_definition(receiver, &builder);
-                    result?;
-                }
-                let placement = MethodRef {
-                    owner: class.to_owned(),
-                    name: "getStateForPlacement".into(),
-                    descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
-                };
-                if self
-                    .class(&placement.owner)
-                    .and_then(|file| file.method(&placement.name, &placement.descriptor))
-                    .is_some()
-                {
-                    self.host.block_placement_unknown();
-                }
-            }
             return match receiver.as_ref() {
                 Some(receiver) => self.host.invoke_instance(&r, receiver, args),
                 None => {
@@ -31571,6 +31582,14 @@ impl<H: Host> Runtime<'_, H> {
                         self.pending_skipped_new.pop();
                         continue;
                     }
+                    if op == 0xb7
+                        && r.name == "<init>"
+                        && is_vanilla_block_class(&r.owner)
+                        && self.class(&r.owner).is_none()
+                        && let Some(receiver) = receiver.as_ref()
+                    {
+                        invoke_or_catch!(at, self.run_vanilla_block_constructor_hooks(receiver));
+                    }
                     self.calls += 1;
                     // An anchor `@Redirect` replaces the call; otherwise an
                     // `@At("INVOKE")` callback runs just before it and a
@@ -31609,6 +31628,20 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
                         value
+                    } else if r.owner == STATE_BUILDER_CLASS
+                        && r.name == "add"
+                        && let Some(builder) = receiver.as_ref()
+                        && let Some(values) = args
+                            .first()
+                            .and_then(|value| self.owned_array(value).map(|v| v.into_owned()))
+                    {
+                        // `StateDefinition.Builder.add(Property...)` inside a jar block's
+                        // `createBlockStateDefinition`: each property is recorded for the
+                        // block's declaration, and `add` returns the builder.
+                        for property in values.iter() {
+                            self.host.block_state_builder_add(builder, property);
+                        }
+                        builder.clone()
                     } else if receiver == Some(Value::Ref(None)) {
                         // JVMS §6.5: an instance call on `null` throws before
                         // anything is dispatched. An `@Redirect` or a cancelling
