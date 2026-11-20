@@ -127,3 +127,51 @@ fn immutable_sub_lists_match_java_25() {
     assert!(matches!(got, Value::Ref(Some(ref text)) if text == IMMUTABLE_SUBLIST_ORACLE));
     assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
 }
+
+const IMMUTABLE_EDGE_ORACLE: &str = "singletonAbsent=OK:false|singletonPresent=UnsupportedOperationException|copiesAbsent=OK:false|emptyClear=OK|emptySort=OK|emptyCollectionsSort=OK|emptyReplaceAll=OK|emptySet=UnsupportedOperationException|emptyAdd=UnsupportedOperationException|emptyRemove=UnsupportedOperationException|of0=java.lang.ArrayIndexOutOfBoundsException:Index 0 out of bounds for length 0|of1=OK:a|of2=OK:a|of3=OK:a";
+const IMMUTABLE_EDGE_PROBE: &str = r#"package demo;
+import java.util.*;
+public class EdgeProbe {
+ static String x(Runnable r){try{r.run();return "OK";}catch(Throwable t){return t.getClass().getSimpleName();}}
+ static String y(java.util.function.Supplier<?> r){try{return "OK:"+r.get();}catch(Throwable t){return t.getClass().getName()+":"+t.getMessage();}}
+ public static String run(){
+  List<String> n0=Collections.nCopies(0,"x");
+  List<String> ne=Collections.nCopies(2,"a").subList(0,0);
+  return "singletonAbsent="+y(()->Collections.singletonList("a").remove("b"))
+   +"|singletonPresent="+x(()->Collections.singletonList("a").remove("a"))
+   +"|copiesAbsent="+y(()->Collections.nCopies(2,"a").remove("b"))
+   +"|emptyClear="+x(n0::clear)
+   +"|emptySort="+x(()->n0.sort(null))
+   +"|emptyCollectionsSort="+x(()->Collections.sort(n0))
+   +"|emptyReplaceAll="+x(()->n0.replaceAll(v->"y"))
+   +"|emptySet="+x(()->ne.set(0,"z"))
+   +"|emptyAdd="+x(()->ne.add(0,"z"))
+   +"|emptyRemove="+x(()->ne.remove(0))
+   +"|of0="+y(()->List.of().get(0))
+   +"|of1="+y(()->List.of("a").get(0))
+   +"|of2="+y(()->List.of("a","b").get(0))
+   +"|of3="+y(()->List.of("a","b","c").get(0));
+ }
+}"#;
+
+#[test]
+fn immutable_collection_edges_match_java_25() {
+    let fixture = javac_fixture::Fixture::build(
+        "sublist-immutable-edges",
+        &[("demo/EdgeProbe.java", IMMUTABLE_EDGE_PROBE)],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let got = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/EdgeProbe",
+            "run",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert!(matches!(got, Value::Ref(Some(ref text)) if text == IMMUTABLE_EDGE_ORACLE));
+    assert_eq!(host.unknown_host_calls(), Vec::<(String, usize)>::new());
+}

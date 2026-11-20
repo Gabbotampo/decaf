@@ -823,6 +823,32 @@ impl StdHost {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         let class = crate::runtime::jar_object::collection_class(marker);
+        // `SingletonList.remove(Object)` and `CopiesList.remove(Object)` are
+        // inherited from `AbstractCollection`: an absent element is reported
+        // as false before the immutable list's mutator refusal is reached.
+        // A present element still attempts the write and throws UOE.
+        if matches!(
+            class,
+            "java/util/Collections$SingletonList" | "java/util/Collections$CopiesList"
+        ) && r.name == "remove"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+        {
+            let wanted = args.first()?;
+            let values = self
+                .mutable_collections
+                .get(marker)
+                .cloned()
+                .unwrap_or_default();
+            let wanted = crate::runtime::value_marker(wanted);
+            let present = values
+                .iter()
+                .any(|value| crate::runtime::value_marker(value) == wanted);
+            return Some(if present {
+                Err(throw("java/lang/UnsupportedOperationException", None))
+            } else {
+                Ok(Value::Int(0))
+            });
+        }
         // SingletonList overrides sort as a no-op.  CopiesList has the same
         // result when empty because its iterator has no elements to set.
         if r.name == "sort"
@@ -832,6 +858,17 @@ impl StdHost {
                         .mutable_collections
                         .get(marker)
                         .is_some_and(Vec::is_empty)))
+        {
+            return Some(Ok(Value::Void));
+        }
+        // `nCopies(0, x)` inherits the empty-list default operations.  The
+        // iterator has no elements to set or replace, so these are no-ops.
+        if class == "java/util/Collections$CopiesList"
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+            && matches!(r.name.as_str(), "clear" | "replaceAll")
         {
             return Some(Ok(Value::Void));
         }
@@ -865,6 +902,20 @@ impl StdHost {
                 _ => None,
             };
         }
+        // An empty sub-list of `nCopies` is still immutable.  Its indexed
+        // mutators check the root's unsupported operation before applying the
+        // sub-list's range check, so index 0 gets UOE rather than IOOBE.
+        if class.contains("SubList")
+            && self.unmodifiable_collections.contains_key(marker)
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+            && matches!(r.name.as_str(), "set" | "add" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
+        }
         if MUTATORS.contains(&r.name.as_str())
             && self.empty_collections.contains(marker)
             && let Some(answer) = empty_collection_member(r, args)
@@ -876,6 +927,26 @@ impl StdHost {
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
         }
         if (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z") {
+            // `ImmutableCollections.ListN.get` indexes its backing array
+            // directly.  Java 25 therefore exposes AIOOBE for the empty
+            // `List.of()` instance, with the array's standard message.
+            if class == "java/util/ImmutableCollections$ListN"
+                && r.name == "get"
+                && r.descriptor == "(I)Ljava/lang/Object;"
+                && self
+                    .mutable_collections
+                    .get(marker)
+                    .is_some_and(Vec::is_empty)
+            {
+                let index = match args.first() {
+                    Some(Value::Int(index)) => *index,
+                    _ => 0,
+                };
+                return Some(Err(throw(
+                    "java/lang/ArrayIndexOutOfBoundsException",
+                    Some(format!("Index {index} out of bounds for length 0")),
+                )));
+            }
             return None;
         }
         // Fabric's metadata uses `Collections.unmodifiableCollection`, whose
