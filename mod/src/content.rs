@@ -396,14 +396,23 @@ fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Bloc
     block.properties.friction = declaration.friction;
     block.properties.requires_tool = declaration.requires_tool;
     block.properties.occludes = declaration.occludes;
-    block.state_properties = declaration.state_properties.iter().map(|(name, property)| {
-        let state = match property.kind.as_str() {
-            "boolean" => mod_api::StateProperty::Boolean,
-            "integer" | "enum" => mod_api::StateProperty::Enum { values: property.values.clone() },
-            _ => mod_api::StateProperty::Enum { values: property.values.clone() },
-        };
-        (name.clone(), state)
-    }).collect();
+    // The vocabulary has `Boolean` and `Enum`: an integer property is an enum of the same value
+    // strings, in its `getPossibleValues()` order (as blockstate JSON spells `age=3`). The runtime
+    // records only these three kinds; any other is left out rather than guessed.
+    block.state_properties = declaration
+        .state_properties
+        .iter()
+        .filter_map(|(name, property)| {
+            let state = match property.kind.as_str() {
+                "boolean" => mod_api::BlockStateProperty::Boolean,
+                "integer" | "enum" => mod_api::BlockStateProperty::Enum {
+                    values: property.values.clone(),
+                },
+                _ => return None,
+            };
+            Some((name.clone(), state))
+        })
+        .collect();
     block.default_state = declaration.default_state.clone();
     block
 }
