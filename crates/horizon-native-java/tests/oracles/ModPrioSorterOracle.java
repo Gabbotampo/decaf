@@ -6,7 +6,9 @@ import net.fabricmc.loader.api.Version;
 
 /** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
 public final class ModPrioSorterOracle {
-  record Spec(String label, String id, String version, boolean root, List<String> provides, String parent) {}
+  record Dep(String id, String range) {}
+  record Spec(String label, String id, String version, boolean root, List<String> provides, String parent,
+              List<Dep> dependencies) {}
 
   /*
    * These are inert LoaderModMetadata proxies. The resolver only needs the
@@ -24,7 +26,7 @@ public final class ModPrioSorterOracle {
               case "getVersion" -> Version.parse(spec.version());
               case "getProvides" -> spec.provides();
               case "getType" -> "normal";
-              case "getDependencies" -> List.of();
+              case "getDependencies" -> spec.dependencies().stream().map(ModPrioSorterOracle::dependency).toList();
               case "getEnvironment" -> Enum.valueOf((Class) Class.forName("net.fabricmc.loader.api.metadata.ModEnvironment"), "UNIVERSAL");
               case "getSchemaVersion" -> 1;
               case "getMixinConfigs", "getOldInitializers", "getEntrypointKeys", "getJars", "getEntrypoints" -> List.of();
@@ -42,6 +44,31 @@ public final class ModPrioSorterOracle {
     } catch (ReflectiveOperationException e) {
       throw new RuntimeException(e);
     }
+  }
+
+  static Object dependency(Dep dep) {
+    try {
+      Class<?> type = Class.forName("net.fabricmc.loader.api.metadata.ModDependency");
+      Class<?> kind = Class.forName("net.fabricmc.loader.api.metadata.ModDependency$Kind");
+      Object depends = Enum.valueOf((Class) kind, "DEPENDS");
+      return Proxy.newProxyInstance(ModPrioSorterOracle.class.getClassLoader(), new Class<?>[] {type},
+          (proxy, method, args) -> switch (method.getName()) {
+            case "getModId" -> dep.id();
+            case "getKind" -> depends;
+            case "matches" -> matches(dep.range(), (Version) args[0]);
+            case "toString" -> dep.id() + " " + dep.range();
+            default -> method.getReturnType().isPrimitive() ? false : null;
+          });
+    } catch (ReflectiveOperationException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  static boolean matches(String range, Version version) throws Exception {
+    String value = version.getFriendlyString();
+    if (range.startsWith("<")) return Version.parse(value).compareTo(Version.parse(range.substring(1))) < 0;
+    if (range.startsWith(">=")) return Version.parse(value).compareTo(Version.parse(range.substring(2))) >= 0;
+    return Version.parse(value).compareTo(Version.parse(range)) == 0;
   }
 
   static Object candidate(Spec spec, Map<String, Object> byLabel, Class<?> type) throws Exception {
@@ -73,7 +100,12 @@ public final class ModPrioSorterOracle {
       out.add(new Spec(
           fields[0], fields[1], fields[2], fields[3].equals("1"),
           fields[4].equals("-") ? List.of() : List.of(fields[4].split("/")),
-          fields.length < 6 || fields[5].isBlank() || fields[5].equals("-") ? null : fields[5]));
+          fields.length < 6 || fields[5].isBlank() || fields[5].equals("-") ? null : fields[5],
+          fields.length < 7 || fields[6].isBlank() || fields[6].equals("-") ? List.of()
+              : Arrays.stream(fields[6].split("/")).map(value -> {
+                  String[] dep = value.split(":", 2);
+                  return new Dep(dep[0], dep.length == 1 ? ">=0" : dep[1]);
+                }).toList()));
     }
     return out;
   }
@@ -190,6 +222,7 @@ public final class ModPrioSorterOracle {
     Method addParent = type.getDeclaredMethod("addParent", type);
     addParent.setAccessible(true);
     Method id = type.getMethod("getId");
+    Method version = type.getMethod("getVersion");
     Method isRoot = type.getMethod("isRoot");
     Method level = type.getMethod("getMinNestLevel");
     Method nestedMods = type.getMethod("getNestedMods");
@@ -246,7 +279,8 @@ public final class ModPrioSorterOracle {
         List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
         StringJoiner row = new StringJoiner(",");
         for (Object candidate : selected) {
-          row.add(id.invoke(candidate) + "@" + (isRoot.invoke(candidate).equals(Boolean.TRUE) ? "r" : "n") + "@" + level.invoke(candidate));
+          row.add(id.invoke(candidate) + "@" + version.invoke(candidate) + "@"
+              + (isRoot.invoke(candidate).equals(Boolean.TRUE) ? "root" : "nested") + "@" + level.invoke(candidate));
         }
         System.out.println(split[0] + "|OK|" + row);
       } catch (InvocationTargetException error) {

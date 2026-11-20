@@ -1,13 +1,16 @@
-root-vs-nested|OK|aa@r@0,carrier@r@0
+root-vs-nested|OK|aa@2@root@0,carrier@1@root@0
 three-cycle|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (a) 1 (a).\n	 - Remove 'null' (b) 1 (b).\nMore details:
 overlap|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (bb) 2 (bb).\nMore details:
 version-tie|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (bb) 1 (bb).\n	 - Remove 'null' (cc) 1 (cc).\nMore details:
-nest-levels|OK|base@r@0,carrier@r@0
-aliases|OK|owner-a@r@0,owner-b@r@0
-four-cycle|OK|a@r@0,c@r@0
+nest-levels|OK|base@1@root@0,carrier@1@root@0
+aliases|OK|owner-a@2@root@0,owner-b@1@root@0
+four-cycle|OK|a@1@root@0,c@1@root@0
 mixed-versions|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (bb) 10 (bb).\n	 - Remove 'null' (cc) 1.0-alpha (cc).\n	 - Remove 'null' (dd) 1.0 (dd).\nMore details:
-nested-depths|OK|four@n@4,one@n@1,root@r@0,three@n@3,two@n@2
-no-conflict|OK|aa@r@0,bb@r@0,cc@n@1
-duplicate-id|OK|aa@r@0
+nested-depths|OK|four@1@nested@4,one@1@nested@1,root@1@root@0,three@1@nested@3,two@1@nested@2
+no-conflict|OK|aa@1@root@0,bb@2@root@0,cc@1@nested@1
+duplicate-id|OK|aa@2@root@0
 duplicate-alias|ERROR|net.fabricmc.loader.impl.discovery.ModResolutionException|Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:\n	 - Remove 'null' (aa) 1 (aa).\nMore details:
-root-alias-id|OK|owner@r@0
+root-alias-id|OK|owner@1@root@0
+newer-missing-dependency|OK|shared-lib@1.0@root@0
+pinned-upper-bound|OK|pinner@1.0@root@0,shared-lib@1.0@root@0
+equal-version-bytes|OK|shared-lib@1.0@root@0

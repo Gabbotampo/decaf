@@ -4469,7 +4469,13 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        self.link_jar_with_nesting(id, jar, false)
+        let added = self.link_jar_with_nesting(id, jar, false)?;
+        for nested in nested_jars::link_nested_jars(self, jar) {
+            if let Err(error) = nested.result {
+                return Err(NativeError::Metadata(error));
+            }
+        }
+        Ok(added)
     }
 
     fn link_jar_with_nesting(
@@ -4507,32 +4513,6 @@ impl StdHost {
                     }
                 }
             }
-        }
-        // A loader also puts the linked jar's bundled jars
-        // (`META-INF/jars/*.jar`) on the class path: a dependency such as
-        // `libjf` keeps its classes there, and its dependents call them.
-        // Fabric loads each of them as a mod of its own.
-        for (entry, nested) in nested_jars::parsed(jar) {
-            if nested.fabric_id.is_some() {
-                let hash = nested_jars::identity(&nested);
-                if !self.loaded_nested_hashes.insert(hash) {
-                    continue;
-                }
-            }
-            if let Some(nested_id) = nested.fabric_id.as_deref() {
-                let parent = jar
-                    .fabric_id
-                    .as_deref()
-                    .or(jar.neoforge_id.as_deref())
-                    .unwrap_or("jar");
-                self.fabric_origins.insert(
-                    nested_id.to_owned(),
-                    ("nested".into(), format!("{parent}|{entry}")),
-                );
-            }
-            let _ =
-                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
-            self.try_record_loaded_mod(&nested, true)?;
         }
         Ok(added)
     }

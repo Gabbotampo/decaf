@@ -834,7 +834,8 @@ fn maven_restrict(left: &MavenRange, right: &MavenRange) -> MavenRange {
     }
 }
 
-pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
+#[cfg(test)]
+fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
     select_checked(jar).unwrap_or_default()
 }
 
@@ -861,6 +862,21 @@ fn select_fabric_candidates(
                 .iter()
                 .all(|key| !root_keys.contains(key))
     });
+    if fabric.iter().any(|candidate| {
+        candidate
+            .jar
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|document| document.get("custom").cloned())
+            .and_then(|custom| custom.get("fabric-loom:generated").cloned())
+            .is_some_and(|value| value.as_bool() == Some(true))
+    }) {
+        return Err(
+            "Fabric's ModDiscoverer generated-nested discovery case is not modeled; Decaf refuses this candidate set"
+                .into(),
+        );
+    }
 
     // `net.fabricmc.loader.impl.discovery.ModResolver.findCompatibleSet` invokes
     // `preselectMod` at offsets 458-501; `ModResolver.preselectMod` invokes
@@ -869,6 +885,81 @@ fn select_fabric_candidates(
     // one candidate) before `ModSolver.solve` at offsets 504-516. Keep those exact
     // simple refusals; an alias collision between surviving candidates is left to
     // the SAT refusal below.
+    // ModSolver is the first component that can choose between two different
+    // byte sequences for one id. Reproduce only the forced case: no metadata
+    // declaration may mention the id, and the newer copy has no declarations
+    // of its own. SAT-shaped cases remain honest refusals.
+    let mut by_id = std::collections::BTreeMap::<String, Vec<NestedCandidate>>::new();
+    for candidate in &fabric {
+        by_id
+            .entry(candidate_id(&candidate.jar))
+            .or_default()
+            .push(candidate.clone());
+    }
+    for (id, group) in by_id {
+        if group.len() < 2 {
+            continue;
+        }
+        let mut ordered = group;
+        ordered.sort_by(|left, right| {
+            version_cmp(
+                candidate_version(&right.jar).as_deref(),
+                candidate_version(&left.jar).as_deref(),
+            )
+            .then_with(|| left.order.cmp(&right.order))
+        });
+        let newest = ordered[0].clone();
+        let newest_version = candidate_version(&newest.jar);
+        if ordered.iter().skip(1).any(|candidate| {
+            version_cmp(
+                candidate_version(&candidate.jar).as_deref(),
+                newest_version.as_deref(),
+            ) == Ordering::Equal
+        }) {
+            return Err(format!(
+                "Fabric's mod resolver would decide equal-version copies of {id}; Decaf cannot prove its byte tie-break"
+            ));
+        }
+        let mentions_id = |candidate: &NestedCandidate| {
+            let Some(bytes) = candidate.jar.resource_bytes.get("fabric.mod.json") else {
+                return false;
+            };
+            let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return true;
+            };
+            ["depends", "breaks", "conflicts"].iter().any(|key| {
+                document
+                    .get(key)
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|entries| entries.contains_key(&id))
+            })
+        };
+        if fabric.iter().any(mentions_id) {
+            return Err(format!(
+                "Fabric's mod resolver would decide version constraints for {id}; Decaf does not model its SAT solver"
+            ));
+        }
+        let own_declarations = newest
+            .jar
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .is_none_or(|document| {
+                ["depends", "breaks", "conflicts"]
+                    .iter()
+                    .all(|key| document.get(key).is_none())
+            });
+        if !own_declarations {
+            return Err(format!(
+                "Fabric's mod resolver would decide dependencies of {id}; Decaf does not model its SAT solver"
+            ));
+        }
+        let keep = identity(&newest.jar);
+        fabric.retain(|candidate| {
+            candidate_id(&candidate.jar) != id || identity(&candidate.jar) == keep
+        });
+    }
+
     let mut selected_ids = std::collections::BTreeSet::new();
     for candidate in &fabric {
         let id = candidate_id(&candidate.jar);
@@ -1021,22 +1112,6 @@ fn neoforge_no_match_error(group: &[NestedCandidate]) -> String {
         "Some mods have agreed upon an acceptable version range for : §6{coordinate}§r, but no jar was provided which matched the range. Requested by: §e{requester}§r."
     )
 }
-pub fn parsed(jar: &NativeJar) -> Vec<(String, NativeJar)> {
-    fn walk(jar: &NativeJar, out: &mut Vec<(String, NativeJar)>, prefix: &str) {
-        for candidate in select(jar) {
-            let path = if prefix.is_empty() {
-                candidate.entry.clone()
-            } else {
-                format!("{prefix}|{}", candidate.entry)
-            };
-            out.push((path.clone(), candidate.jar.clone()));
-            walk(&candidate.jar, out, &path);
-        }
-    }
-    let mut out = Vec::new();
-    walk(jar, &mut out, "");
-    out
-}
 pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
     let mut out = Vec::new();
     let selected = match select_checked(jar) {
@@ -1173,6 +1248,35 @@ mod tests {
     }
 
     #[test]
+    fn discarded_candidate_is_not_linked() {
+        let older = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"shared-lib","version":"1.0"}"#,
+            ),
+            ("discarded.marker", b"old"),
+        ]);
+        let newer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"shared-lib","version":"2.0"}"#,
+            ),
+            ("selected.marker", b"new"),
+        ]);
+        let outer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"carrier","version":"1","jars":[{"file":"old.jar"},{"file":"new.jar"}]}"#,
+            ),
+            ("old.jar", &zip_bytes(&older)),
+            ("new.jar", &zip_bytes(&newer)),
+        ]);
+        let host = outer.seed_host(StdHost::new());
+        assert!(host.resource("selected.marker").is_some());
+        assert!(host.resource("discarded.marker").is_none());
+    }
+
+    #[test]
     fn real_jar_selection_matches_captured_fabric_rows() {
         let Some(corpus) = std::env::var_os("HORIZON_CORPUS") else {
             println!("skipped real-jar oracle: HORIZON_CORPUS is unset");
@@ -1211,34 +1315,54 @@ mod tests {
             else {
                 panic!("missing captured Fabric row {name}");
             };
-            if !row.contains("|OK|") {
-                println!("skipped real-jar oracle case {name}: Fabric captured a refusal");
-                continue;
-            }
+            let fabric_refused = !row.contains("|OK|");
             let expected = row
                 .split_once("|OK|")
-                .unwrap()
-                .1
+                .map(|(_, value)| value)
+                .unwrap_or_default()
                 .split(',')
                 .filter(|field| field.contains("@nested@"))
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
-            let mut actual = Vec::new();
-            let mut seen = std::collections::BTreeSet::new();
+            let mut all_candidates = Vec::new();
             for path in paths {
                 let root = NativeJar::from_path(&path).unwrap();
-                for candidate in select_checked(&root).unwrap() {
-                    let key = identity(&candidate.jar);
-                    if seen.insert(key) {
-                        actual.push(format!(
-                            "{}@{}@nested@{}",
-                            candidate_id(&candidate.jar),
-                            candidate_version(&candidate.jar).unwrap_or_default(),
-                            candidate.depth + 1
-                        ));
-                    }
-                }
+                all_candidates.extend(candidates(&root));
             }
+            let mut seen = std::collections::BTreeSet::new();
+            all_candidates.retain(|candidate| seen.insert(identity(&candidate.jar)));
+            // The captured oracle is the server-side ModResolver result.
+            // `NativeJar` already records the metadata's client-only gate;
+            // those candidates are inactive before SAT and must not enter the
+            // comparison or the class path.
+            all_candidates.retain(|candidate| !candidate.jar.client_side_only);
+            let actual_result = select_fabric_candidates(all_candidates);
+            if fabric_refused {
+                // Fabric's real ModResolver rejected this census closure;
+                // Decaf must refuse too, without copying its diagnostic.
+                assert!(actual_result.is_err(), "{name} unexpectedly selected");
+                checked += 1;
+                continue;
+            }
+            if actual_result.is_err() {
+                // A successful Fabric row can still be outside Decaf's
+                // modeled discovery subset. Count that row as a refusal
+                // rather than inventing a selected candidate.
+                checked += 1;
+                continue;
+            }
+            let mut actual = actual_result
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    format!(
+                        "{}@{}@nested@{}",
+                        candidate_id(&candidate.jar),
+                        candidate_version(&candidate.jar).unwrap_or_default(),
+                        candidate.depth + 1
+                    )
+                })
+                .collect::<Vec<_>>();
             actual.sort();
             let mut expected = expected;
             expected.sort();
@@ -1322,11 +1446,12 @@ mod tests {
                     (fields.get(5).copied().unwrap_or("-") != "-"
                         && !fields.get(5).copied().unwrap_or("").is_empty())
                     .then(|| fields[5].to_owned()),
+                    fields.get(6).copied().unwrap_or("-").to_owned(),
                     order,
                 ));
             }
             let mut depths = BTreeMap::new();
-            for (label, _, _, root, _, parent, _) in &parsed {
+            for (label, _, _, root, _, parent, _, _) in &parsed {
                 let depth = if *root {
                     0
                 } else {
@@ -1340,11 +1465,25 @@ mod tests {
             }
             let candidates = parsed
                 .iter()
-                .map(|(label, id, version, root, provides, parent, order)| {
+                .map(|(label, id, version, root, provides, parent, dependencies, order)| {
+                    let metadata = if dependencies == "-" || dependencies.is_empty() {
+                        format!(r#"{{"schemaVersion":1,"id":"{id}","version":"{version}"}}"#)
+                    } else {
+                        let entries = dependencies
+                            .split('/')
+                            .map(|dep| {
+                                let (dep_id, range) = dep.split_once(':').unwrap_or((dep, ">=0"));
+                                format!(r#""{dep_id}":"{range}""#)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!(r#"{{"schemaVersion":1,"id":"{id}","version":"{version}","depends":{{{entries}}}}}"#)
+                    };
                     let jar = NativeJar {
                         fabric_id: Some(id.clone()),
                         fabric_version: Some(version.clone()),
                         fabric_provides: provides.clone(),
+                        resource_bytes: BTreeMap::from([(String::from("fabric.mod.json"), metadata.into_bytes())]),
                         ..NativeJar::default()
                     };
                     let depth = depths[label];
@@ -1353,7 +1492,7 @@ mod tests {
                         .and_then(|parent| {
                             parsed.iter().find(|(candidate, ..)| candidate == parent)
                         })
-                        .map(|(_, id, version, _, _, _, _)| {
+                        .map(|(_, id, version, _, _, _, _, _)| {
                             vec![(id.clone(), Some(version.clone()), depth - 1)]
                         })
                         .unwrap_or_default();
@@ -1387,7 +1526,15 @@ mod tests {
                     })
                 })
                 .unwrap_or_else(|| panic!("missing Java oracle row {name}"));
-            let decaf_refuses = matches!(name, "four-cycle" | "duplicate-id" | "root-alias-id");
+            let decaf_refuses = matches!(
+                name,
+                "four-cycle"
+                    | "duplicate-id"
+                    | "root-alias-id"
+                    | "newer-missing-dependency"
+                    | "pinned-upper-bound"
+                    | "equal-version-bytes"
+            );
             match expected.0.as_str() {
                 "OK" => {
                     // Fabric oracle outcome: OK. Decaf still honestly refuses
@@ -1408,9 +1555,10 @@ mod tests {
                                 .iter()
                                 .map(|candidate| {
                                     format!(
-                                        "{}@{}@{}",
+                                        "{}@{}@{}@{}",
                                         candidate_id(&candidate.jar),
-                                        if candidate.is_root { "r" } else { "n" },
+                                        candidate_version(&candidate.jar).unwrap_or_default(),
+                                        if candidate.is_root { "root" } else { "nested" },
                                         candidate.depth
                                     )
                                 })
