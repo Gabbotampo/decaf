@@ -721,6 +721,9 @@ mod tests {
             explosion_resistance: Some(6.0),
             friction: None,
             requires_tool: Some(true),
+            state_properties: BTreeMap::new(),
+            default_state: BTreeMap::new(),
+            occludes: None,
         };
         let block = block_entry(&declaration, &declaration.id);
         assert!(!block.item);

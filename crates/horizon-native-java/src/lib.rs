@@ -2384,8 +2384,17 @@ pub trait Host {
     /// Record one property added to a `StateDefinition.Builder` while a block
     /// constructor's virtual `createBlockStateDefinition` runs.
     fn block_state_builder_add(&mut self, _builder: &Value, _property: &Value) {}
+    fn block_state_builder_add_checked(
+        &mut self,
+        builder: &Value,
+        property: &Value,
+    ) -> Result<(), NativeError> {
+        self.block_state_builder_add(builder, property);
+        Ok(())
+    }
     fn begin_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
     fn finish_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
+    fn block_state_definition_unknown(&mut self, _block: &Value, _method: &MethodRef) {}
     fn block_placement_unknown(&mut self) {}
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
@@ -3474,6 +3483,7 @@ pub struct StdHost {
     state_definition_builders: BTreeMap<String, String>,
     block_states: BTreeMap<String, (String, BTreeMap<String, String>)>,
     block_default_states: BTreeMap<String, BTreeMap<String, String>>,
+    unknown_block_state_definitions: BTreeSet<String>,
     next_block_state: usize,
     /// Marker counter for a property builder made by a static factory
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
@@ -3782,6 +3792,7 @@ impl StdHost {
             state_definition_builders: BTreeMap::new(),
             block_states: BTreeMap::new(),
             block_default_states: BTreeMap::new(),
+            unknown_block_state_definitions: BTreeSet::new(),
             next_block_state: 0,
             next_property_builder: 0,
             payload_registrations: Vec::new(),
@@ -5528,7 +5539,9 @@ impl StdHost {
             "minecraft:block" => {
                 self.block_property_builders.get(marker).map(|builder| {
                     let mut properties = block_declaration_properties(builder);
-                    if let Some(state) = self.block_state_properties.get(marker) {
+                    if !self.unknown_block_state_definitions.contains(marker)
+                        && let Some(state) = self.block_state_properties.get(marker)
+                    {
                         for (name, property) in state {
                             properties.insert(
                                 format!("state_property:{name}"),
@@ -5767,6 +5780,8 @@ impl StdHost {
                 Some(Value::Int(value)) => (*value != 0)
                     .then_some("true".to_owned())
                     .or_else(|| Some("false".to_owned())),
+                Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
+                Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
                 Some(Value::Ref(Some(value))) => value
                     .rsplit('/')
                     .next()
@@ -5944,25 +5959,35 @@ impl Host for StdHost {
     }
 
     fn block_state_builder_add(&mut self, builder: &Value, property: &Value) {
+        let _ = self.block_state_builder_add_checked(builder, property);
+    }
+
+    fn block_state_builder_add_checked(
+        &mut self,
+        builder: &Value,
+        property: &Value,
+    ) -> Result<(), NativeError> {
         let (Some(builder), Some(property)) = (expect_ref(builder), expect_ref(property)) else {
-            return;
+            return Ok(());
         };
         let Some(block) = self.state_definition_builders.get(builder).cloned() else {
-            return;
+            return Ok(());
         };
         let Some(field) = property.strip_prefix("property/BlockStateProperties.") else {
+            self.unknown_block_state_definitions.insert(block.clone());
             *self
                 .unknown_host_calls
                 .entry("BlockStateProperties custom Property".into())
                 .or_default() += 1;
-            return;
+            return Ok(());
         };
         let Some(info) = Self::captured_property(field) else {
+            self.unknown_block_state_definitions.insert(block.clone());
             *self
                 .unknown_host_calls
                 .entry(format!("unknown BlockStateProperties.{field}"))
                 .or_default() += 1;
-            return;
+            return Ok(());
         };
         let name = crate::vanilla_block_state_properties::TABLE
             .lines()
@@ -5973,11 +5998,40 @@ impl Host for StdHost {
                     .flatten()
             });
         if let Some(name) = name {
+            if self
+                .block_state_properties
+                .get(&block)
+                .is_some_and(|properties| properties.contains_key(&name))
+            {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "{} has duplicate property: {name}",
+                        value_text(&Value::Ref(Some(block.clone())))
+                    )),
+                    frame: None,
+                });
+            }
             self.block_state_properties
                 .entry(block)
                 .or_default()
                 .insert(name, info);
         }
+        Ok(())
+    }
+
+    fn block_state_definition_unknown(&mut self, block: &Value, method: &MethodRef) {
+        if let Some(block) = expect_ref(block) {
+            self.unknown_block_state_definitions
+                .insert(block.to_owned());
+        }
+        *self
+            .unknown_host_calls
+            .entry(format!(
+                "{}#{}{}",
+                method.owner, method.name, method.descriptor
+            ))
+            .or_default() += 1;
     }
 
     fn finish_block_state_definition(&mut self, block: &Value, builder: &Value) {
@@ -24638,6 +24692,7 @@ impl<H: Host> Runtime<'_, H> {
     /// jar extends. A constructor is never an interface's, and in 26.3 every class
     /// `is_vanilla_block_class` names that is not an interface is a `Block`. Called from the
     /// `invokespecial` site, where a vanilla constructor call is dispatched.
+    #[inline(never)]
     fn run_vanilla_block_constructor_hooks(&mut self, receiver: &Value) -> Result<(), NativeError> {
         let Some(marker) = jar_object::object_key(receiver) else {
             return Ok(());
@@ -24678,6 +24733,15 @@ impl<H: Host> Runtime<'_, H> {
             );
             self.host.finish_block_state_definition(receiver, &builder);
             result?;
+        } else if is_vanilla_block_class(&current) {
+            self.host.block_state_definition_unknown(
+                receiver,
+                &MethodRef {
+                    owner: current,
+                    name: "createBlockStateDefinition".into(),
+                    descriptor,
+                },
+            );
         }
         let placement = MethodRef {
             owner: class.to_owned(),
@@ -31590,6 +31654,13 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         invoke_or_catch!(at, self.run_vanilla_block_constructor_hooks(receiver));
                     }
+                    if op == 0xb7
+                        && r.name == "createBlockStateDefinition"
+                        && is_vanilla_block_class(&r.owner)
+                        && let Some(receiver) = receiver.as_ref()
+                    {
+                        self.host.block_state_definition_unknown(receiver, &r);
+                    }
                     self.calls += 1;
                     // An anchor `@Redirect` replaces the call; otherwise an
                     // `@At("INVOKE")` callback runs just before it and a
@@ -31639,7 +31710,10 @@ impl<H: Host> Runtime<'_, H> {
                         // `createBlockStateDefinition`: each property is recorded for the
                         // block's declaration, and `add` returns the builder.
                         for property in values.iter() {
-                            self.host.block_state_builder_add(builder, property);
+                            invoke_or_catch!(
+                                at,
+                                self.host.block_state_builder_add_checked(builder, property)
+                            );
                         }
                         builder.clone()
                     } else if receiver == Some(Value::Ref(None)) {
@@ -36353,6 +36427,39 @@ mod tests {
             serde_json::json!(["north", "south", "west", "east"])
         );
         assert_eq!(file["default_state"]["facing"], "north");
+    }
+
+    #[test]
+    fn state_definition_builder_rejects_duplicate_property_names() {
+        let mut host = StdHost::new();
+        let block = Value::Ref(Some("demo/Block#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        let property = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                    .into(),
+                name: "FACING".into(),
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/DirectionProperty;"
+                    .into(),
+            })
+            .unwrap();
+        host.begin_block_state_definition(&block, &builder);
+        host.block_state_builder_add_checked(&builder, &property)
+            .unwrap();
+        let error = host
+            .block_state_builder_add_checked(&builder, &property)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            NativeError::UncaughtException {
+                class,
+                message: Some(message),
+                ..
+            } if class == "java/lang/IllegalArgumentException"
+                && message == "demo/Block#1 has duplicate property: facing"
+        ));
     }
 
     #[test]

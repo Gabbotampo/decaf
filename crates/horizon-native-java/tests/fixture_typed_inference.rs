@@ -59,6 +59,16 @@ fn scratch_root(name: &str) -> scratch::Scratch {
     scratch::Scratch::new(&format!("typed-inference-{name}"))
 }
 
+fn run_on_large_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name("typed-inference".into())
+        .stack_size(8 << 20)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 fn write_sources(root: &Path, tree: &BTreeMap<&str, &str>) -> Vec<PathBuf> {
     tree.iter()
         .map(|(relative, body)| {
@@ -545,6 +555,10 @@ fn metadata_declaration_keeps_that_row_opaque_to_inference() {
 /// inferred template rather than borrowing the vanilla grid.
 #[test]
 fn only_a_vanilla_crafting_table_gets_the_crafting_table_template() {
+    run_on_large_stack(only_a_vanilla_crafting_table_gets_the_crafting_table_template_body);
+}
+
+fn only_a_vanilla_crafting_table_gets_the_crafting_table_template_body() {
     let mut stubs = game_stubs();
     stubs.insert(
         "net/minecraft/world/level/block/CraftingTableBlock.java",
@@ -607,6 +621,10 @@ public final class TableMod implements ModInitializer {
 /// declared with their real types, so the `getstatic` descriptors are the ones a real jar uses.
 #[test]
 fn a_jar_blocks_state_definition_runs_through_any_vanilla_constructor() {
+    run_on_large_stack(a_jar_blocks_state_definition_runs_through_any_vanilla_constructor_body);
+}
+
+fn a_jar_blocks_state_definition_runs_through_any_vanilla_constructor_body() {
     let mut stubs = game_stubs();
     stubs.insert(
         "net/minecraft/world/level/block/Block.java",
@@ -617,6 +635,8 @@ import net.minecraft.world.level.block.state.StateDefinition;
 public class Block {
     public Block(BlockBehaviour.Properties properties) { }
     protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) { }
+    protected BlockState defaultBlockState() { return new BlockState(); }
+    protected void registerDefaultState(BlockState state) { }
 }"#,
     );
     stubs.insert(
@@ -629,7 +649,11 @@ public class CraftingTableBlock extends Block {
     );
     stubs.insert(
         "net/minecraft/world/level/block/state/BlockState.java",
-        "package net.minecraft.world.level.block.state; public class BlockState { }",
+        r#"package net.minecraft.world.level.block.state;
+import net.minecraft.world.level.block.state.properties.Property;
+public class BlockState {
+    public <T> BlockState setValue(Property<T> property, T value) { return this; }
+}"#,
     );
     stubs.insert(
         "net/minecraft/world/level/block/state/StateDefinition.java",
@@ -690,11 +714,20 @@ public class LampBase extends Block {
     protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
         builder.add(BlockStateProperties.LIT);
     }
+    { registerDefaultState(defaultBlockState().setValue(BlockStateProperties.LIT, Boolean.valueOf(false))); }
 }"#,
         "demo/Lamp.java" => r#"package demo;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 public final class Lamp extends LampBase {
     public Lamp(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+        // No jar override: the inherited vanilla state-definition method is counted, so this
+        // declaration must not claim an incomplete state set.
+        "demo/Inherited.java" => r#"package demo;
+import net.minecraft.world.level.block.CraftingTableBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Inherited extends CraftingTableBlock {
+    public Inherited(BlockBehaviour.Properties properties) { super(properties); }
 }"#,
         "demo/StateMod.java" => r#"package demo;
 import net.fabricmc.api.ModInitializer;
@@ -709,6 +742,8 @@ public final class StateMod implements ModInitializer {
                 new Altar(BlockBehaviour.Properties.of().strength(2.0F)));
         Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "lamp"),
                 new Lamp(BlockBehaviour.Properties.of()));
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "inherited"),
+                new Inherited(BlockBehaviour.Properties.of()));
     }
 }"#,
     };
@@ -744,7 +779,100 @@ public final class StateMod implements ModInitializer {
     );
     assert_eq!(
         lamp.get("default_state:lit").map(String::as_str),
-        Some("true")
+        Some("false")
+    );
+    let inherited = properties(2);
+    assert!(
+        !inherited
+            .keys()
+            .any(|key| key.starts_with("state_property:"))
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(key, _)| key.contains("createBlockStateDefinition"))
     );
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn state_definition_builder_duplicate_is_the_vanilla_illegal_argument() {
+    run_on_large_stack(|| {
+        let mut stubs = game_stubs();
+        stubs.insert(
+            "net/minecraft/world/level/block/Block.java",
+            r#"package net.minecraft.world.level.block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+public class Block {
+    public Block(BlockBehaviour.Properties properties) { }
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) { }
+}"#,
+        );
+        stubs.insert(
+            "net/minecraft/world/level/block/state/BlockState.java",
+            "package net.minecraft.world.level.block.state; public class BlockState { }",
+        );
+        stubs.insert(
+            "net/minecraft/world/level/block/state/StateDefinition.java",
+            r#"package net.minecraft.world.level.block.state;
+import net.minecraft.world.level.block.state.properties.Property;
+public class StateDefinition<O, S> {
+    public static class Builder<O, S> {
+        public Builder<O, S> add(Property<?>... properties) { return this; }
+    }
+}"#,
+        );
+        stubs.insert(
+            "net/minecraft/world/level/block/state/properties/Property.java",
+            "package net.minecraft.world.level.block.state.properties; public abstract class Property<T> { }",
+        );
+        stubs.insert(
+            "net/minecraft/world/level/block/state/properties/BooleanProperty.java",
+            "package net.minecraft.world.level.block.state.properties; public final class BooleanProperty extends Property<Boolean> { }",
+        );
+        stubs.insert(
+            "net/minecraft/world/level/block/state/properties/BlockStateProperties.java",
+            r#"package net.minecraft.world.level.block.state.properties;
+public class BlockStateProperties { public static final BooleanProperty LIT = null; }"#,
+        );
+        let mod_sources = sources! {
+            "demo/Bad.java" => r#"package demo;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class Bad extends Block {
+    public Bad(BlockBehaviour.Properties properties) { super(properties); }
+    @Override protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.LIT, BlockStateProperties.LIT);
+    }
+}"#,
+            "demo/BadMod.java" => r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class BadMod implements ModInitializer {
+    @Override public void onInitialize() {
+        try { new Bad(BlockBehaviour.Properties.of()); }
+        catch (IllegalArgumentException error) { System.out.println(error.getMessage()); }
+    }
+}"#,
+        };
+        let (root, jar_path) = build_jar(
+            "typed-inference-builder-validation",
+            &stubs,
+            &mod_sources,
+            br#"{"id":"fixture-builder","version":"1.0","entrypoints":{"main":"demo.BadMod"}}"#,
+            None,
+        );
+        let jar = NativeJar::from_path(&jar_path).unwrap();
+        let entry = jar.discover_entrypoint("main").unwrap();
+        let mut host = jar.seed_host(StdHost::new());
+        jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+            .unwrap();
+        assert!(host.take_stdout().contains("has duplicate property: lit"));
+        let _ = fs::remove_dir_all(root);
+    });
 }
