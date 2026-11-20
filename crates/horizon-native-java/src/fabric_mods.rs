@@ -171,8 +171,10 @@ impl StdHost {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let mut seen_keys = std::collections::BTreeSet::from([id.clone()]);
             for alias in &aliases {
                 if alias == &id
+                    || !seen_keys.insert(alias.clone())
                     || self.fabric_metadata.contains_key(alias)
                     || self.fabric_aliases.contains_key(alias)
                 {
@@ -205,46 +207,14 @@ impl StdHost {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn record_fabric_metadata(&mut self, jar: &NativeJar) {
         if let Err(error) = self.try_record_fabric_metadata(jar) {
-            let mut reasons = Vec::new();
-            if let Some(document) = jar
-                .resource_bytes
-                .get("fabric.mod.json")
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-            {
-                let id = document.get("id").and_then(serde_json::Value::as_str);
-                if let Some(id) = id
-                    && (self.fabric_metadata.contains_key(id)
-                        || self.fabric_aliases.contains_key(id))
-                {
-                    reasons.push(id.to_owned());
-                }
-                if let Some(aliases) = document
-                    .get("provides")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
-                        if id == Some(alias)
-                            || self.fabric_metadata.contains_key(alias)
-                            || self.fabric_aliases.contains_key(alias)
-                        {
-                            reasons.push(alias.to_owned());
-                            self.fabric_aliases.remove(alias);
-                        }
-                    }
-                }
-            }
-            if reasons.is_empty() {
-                reasons.push(error.to_string());
-            }
-            reasons.sort();
-            reasons.dedup();
-            self.fabric_resolution_errors.extend(
-                reasons
-                    .into_iter()
-                    .map(|reason| format!("duplicate mod {reason}")),
-            );
+            let message = match error {
+                NativeError::Metadata(message) => message,
+                other => other.to_string(),
+            };
+            self.fabric_resolution_errors.push(message);
         }
     }
 

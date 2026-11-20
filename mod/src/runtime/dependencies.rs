@@ -284,7 +284,22 @@ fn is_host_provided(id: &str) -> bool {
 pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
     let mut candidates: BTreeMap<String, Vec<(usize, bool, Option<String>, bool)>> =
         BTreeMap::new();
+    let mut resolution_errors = Vec::new();
     for (index, (_, jar)) in jars.iter().enumerate() {
+        // Fabric inserts the root id and each provides alias into one map in
+        // sequence. This means duplicates within one metadata document are
+        // refusals too (including a repeated alias and an alias equal to id).
+        let mut own_keys = BTreeSet::new();
+        for id in [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .chain(jar.fabric_provides.iter().map(String::as_str))
+        {
+            let key = id.to_ascii_lowercase();
+            if !own_keys.insert(key.clone()) {
+                resolution_errors.push(format!("duplicate mod {id}"));
+            }
+        }
         for id in [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
             .into_iter()
             .flatten()
@@ -318,7 +333,6 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
         }
     }
     let mut provided = BTreeMap::new();
-    let mut resolution_errors = Vec::new();
     for (id, mut rows) in candidates {
         rows.sort_by(|a, b| {
             b.1.cmp(&a.1)
@@ -326,13 +340,13 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
                 .then_with(|| a.0.cmp(&b.0))
         });
         let distinct: BTreeSet<_> = rows.iter().map(|row| row.0).collect();
-        let alias_collision = distinct.len() > 1 && rows.iter().any(|row| row.3);
-        if alias_collision {
+        let duplicate_key = distinct.len() > 1;
+        if duplicate_key {
             // `ModResolver.selectMod` reports this as a duplicate id/alias
-            // instead of letting insertion order choose a provider.
+            // instead of letting version ordering choose a provider.
             resolution_errors.push(format!("duplicate mod {id}"));
         }
-        if !alias_collision && let Some((index, _, _, _)) = rows.first() {
+        if !duplicate_key && let Some((index, _, _, _)) = rows.first() {
             provided.insert(id, *index);
         }
     }
@@ -466,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_roots_choose_the_higher_fabric_version_and_report_collisions() {
+    fn duplicate_roots_are_resolution_errors() {
         let old = NativeJar {
             fabric_id: Some("dep".into()),
             fabric_version: Some("1.0".into()),
@@ -483,8 +497,7 @@ mod tests {
             ("new.jar", &new),
             ("consumer.jar", &consumer),
         ]);
-        assert!(plan.resolution_errors.is_empty());
-        assert_eq!(plan.links_for(2), [1]);
+        assert_eq!(plan.resolution_errors, ["duplicate mod dep"]);
     }
 
     #[test]

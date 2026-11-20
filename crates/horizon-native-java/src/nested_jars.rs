@@ -42,7 +42,10 @@ fn fabric_entries(jar: &NativeJar) -> Vec<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .filter(|p| p.ends_with(".jar") && !p.starts_with('/') && !p.contains(".."))
+        // Fabric checks only ZipEntry.isDirectory and the .jar suffix. The
+        // entry is read by exact name from the in-memory ZIP, so `..` is not a
+        // filesystem traversal and is harmless here.
+        .filter(|p| p.ends_with(".jar"))
         .collect()
 }
 fn neoforge_entries(jar: &NativeJar) -> Vec<String> {
@@ -60,7 +63,9 @@ fn neoforge_entries(jar: &NativeJar) -> Vec<String> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         })
-        .filter(|p| p.ends_with(".jar") && !p.starts_with('/') && !p.contains(".."))
+        // JarJar also reads the named entry from the in-memory ZIP by its
+        // exact name; `..` cannot escape to the filesystem.
+        .filter(|p| p.ends_with(".jar"))
         .collect()
 }
 fn neoforge_declarations(
@@ -358,16 +363,23 @@ fn maven_cmp(a: &str, b: &str) -> Ordering {
         let mut current = String::new();
         let mut previous_digit = None;
         for c in s.chars() {
-            let delimiter = matches!(c, '.' | '-' | '_' | '+');
+            // ComparableVersion's parser has only these two delimiters. A
+            // plus (or any other punctuation) stays in its string item.
+            let delimiter = matches!(c, '.' | '-');
             let transition = previous_digit.is_some_and(|digit| digit != c.is_ascii_digit());
             if (delimiter || transition) && !current.is_empty() {
+                if transition && c.is_ascii_digit() && matches!(current.as_str(), "a" | "b" | "m") {
+                    current = match current.as_str() {
+                        "a" => "alpha",
+                        "b" => "beta",
+                        _ => "milestone",
+                    }
+                    .to_owned();
+                }
                 out.push(current.to_ascii_lowercase());
                 current.clear();
             }
             if !delimiter {
-                if transition && previous_digit == Some(true) {
-                    current.push('@');
-                }
                 current.push(c);
             }
             previous_digit = Some(c.is_ascii_digit());
@@ -389,9 +401,9 @@ fn maven_cmp(a: &str, b: &str) -> Ordering {
             return (s, 9);
         }
         let (canonical, rank) = match s {
-            "alpha" | "a" => ("alpha", 1),
-            "beta" | "b" => ("beta", 2),
-            "milestone" | "m" => ("milestone", 3),
+            "alpha" => ("alpha", 1),
+            "beta" => ("beta", 2),
+            "milestone" => ("milestone", 3),
             "rc" | "cr" => ("rc", 4),
             "snapshot" => ("snapshot", 5),
             "" | "ga" | "final" | "release" => ("", 6),
@@ -477,6 +489,7 @@ fn maven_range(value: &str) -> Option<Vec<MavenInterval>> {
     }
     parts.push(&value[start..]);
     for part in parts {
+        let part = part.trim();
         let bytes = part.as_bytes();
         if bytes.len() < 2 {
             return None;
@@ -486,15 +499,15 @@ fn maven_range(value: &str) -> Option<Vec<MavenInterval>> {
         let body = &part[1..part.len() - 1];
         if let Some((low, high)) = body.split_once(',') {
             ranges.push(MavenInterval {
-                low: (!low.is_empty()).then(|| low.to_owned()),
-                high: (!high.is_empty()).then(|| high.to_owned()),
+                low: (!low.trim().is_empty()).then(|| low.trim().to_owned()),
+                high: (!high.trim().is_empty()).then(|| high.trim().to_owned()),
                 low_inclusive,
                 high_inclusive,
             });
         } else if low_inclusive && high_inclusive {
             ranges.push(MavenInterval {
-                low: Some(body.to_owned()),
-                high: Some(body.to_owned()),
+                low: Some(body.trim().to_owned()),
+                high: Some(body.trim().to_owned()),
                 low_inclusive: true,
                 high_inclusive: true,
             });
@@ -585,31 +598,55 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             .flatten()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let mut replace = None;
-        for id in ids {
-            if let Some(index) = selected.iter().position(|c| {
-                c.jar.fabric_id.as_deref() == Some(id.as_str())
-                    || c.jar.fabric_provides.iter().any(|a| a == &id)
-            }) {
-                let current = &selected[index];
-                let cmp = version_cmp(
-                    candidate.jar.fabric_version.as_deref(),
-                    current.jar.fabric_version.as_deref(),
-                );
-                if cmp == Ordering::Greater
-                    || (cmp == Ordering::Equal
-                        && (parent_cmp(&candidate, current) == Ordering::Less
-                            || (parent_cmp(&candidate, current) == Ordering::Equal
-                                && candidate.order < current.order)))
-                {
-                    replace = Some(index)
-                }
+        // ModPrioSorter compares every id/alias shared by two candidates. A
+        // candidate that wins one key but loses another cannot remain beside
+        // the incompatible winner; it is discarded until the resolver has a
+        // single candidate for every overlapping key.
+        let overlaps = selected
+            .iter()
+            .enumerate()
+            .filter_map(|(index, current)| {
+                let current_ids = std::iter::once(current.jar.fabric_id.as_deref())
+                    .chain(
+                        current
+                            .jar
+                            .fabric_provides
+                            .iter()
+                            .map(|alias| Some(alias.as_str())),
+                    )
+                    .flatten();
+                ids.iter()
+                    .any(|id| current_ids.clone().any(|other| other == id))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let had_overlaps = !overlaps.is_empty();
+        let mut replace = Vec::new();
+        let mut loses = false;
+        for index in overlaps {
+            let current = &selected[index];
+            let cmp = version_cmp(
+                candidate.jar.fabric_version.as_deref(),
+                current.jar.fabric_version.as_deref(),
+            );
+            let cmp = if cmp == Ordering::Equal {
+                parent_cmp(&candidate, current).then_with(|| candidate.order.cmp(&current.order))
+            } else {
+                cmp
+            };
+            if cmp == Ordering::Greater {
+                replace.push(index);
+            } else if cmp == Ordering::Less {
+                loses = true;
                 break;
             }
         }
-        if let Some(index) = replace {
-            selected[index] = candidate
-        } else {
+        if !loses && !replace.is_empty() {
+            for index in replace.into_iter().rev() {
+                selected.remove(index);
+            }
+            selected.push(candidate);
+        } else if !had_overlaps {
             // A declared Fabric Jar-in-Jar library need not carry
             // `fabric.mod.json`.  It is still on the outer loader's class
             // path; only its absence from the mod-id graph is significant.
@@ -791,6 +828,46 @@ mod tests {
             ("META-INF/jars/child.jar", &nested),
         ]);
         assert_eq!(candidates(&listed).len(), 1);
+    }
+
+    #[test]
+    fn overlapping_fabric_aliases_leave_only_the_compatible_winner() {
+        let one = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"one","version":"1","provides":["shared"]}"#,
+            ),
+            ("one.txt", b"one"),
+        ]);
+        let two = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"two","version":"2","provides":["shared"]}"#,
+            ),
+            ("two.txt", b"two"),
+        ]);
+        let outer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"schemaVersion":1,"id":"outer","version":"1","jars":[{"file":"one.jar"},{"file":"two.jar"}]}"#,
+            ),
+            ("one.jar", &zip_bytes(&one)),
+            ("two.jar", &zip_bytes(&two)),
+        ]);
+        let selected = select(&outer);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].jar.fabric_id.as_deref(), Some("two"));
+    }
+
+    fn zip_bytes(jar: &NativeJar) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut bytes);
+        for (name, payload) in &jar.resource_bytes {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(payload).unwrap();
+        }
+        zip.finish().unwrap();
+        bytes.into_inner()
     }
 
     #[test]

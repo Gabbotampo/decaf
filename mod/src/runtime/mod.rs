@@ -20124,8 +20124,22 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
-        host.record_fabric_metadata(self);
-        let _nested = nested_jars::link_nested_jars(&mut host, self);
+        if let Err(error) = host.try_record_fabric_metadata(self) {
+            // Keep the compatibility wrapper usable by existing probes, but
+            // retain the loader's exact refusal so the checked load path below
+            // can return Fabric's resolution message instead of first-wins.
+            let message = match error {
+                NativeError::Metadata(message) => message,
+                other => other.to_string(),
+            };
+            host.fabric_resolution_errors.push(message);
+        }
+        let nested = nested_jars::link_nested_jars(&mut host, self);
+        for nested in nested {
+            if let Err(error) = nested.result {
+                host.fabric_resolution_errors.push(error);
+            }
+        }
         host = host.with_run_loader(self.run_loader());
         host.own_loader_classes = self.loader_namespace_classes();
         host.own_mod_id = self.fabric_id.clone().or_else(|| self.neoforge_id.clone());
@@ -20161,6 +20175,16 @@ impl NativeJar {
         host
     }
 
+    /// The native load path: unlike the legacy probe wrapper, a metadata or
+    /// nested-jar resolution failure refuses the load with Fabric's message.
+    pub fn try_seed_host(&self, host: StdHost) -> Result<StdHost, String> {
+        let host = self.seed_host(host);
+        host.fabric_resolution_errors
+            .first()
+            .cloned()
+            .map_or(Ok(host), Err)
+    }
+
     /// Seed a game host from the same prepared 26.3 resource root used by the
     /// Horizon game. This keeps the game and census paths on one exact table;
     /// callers that do not have prepared resources retain the counted default.
@@ -20170,7 +20194,7 @@ impl NativeJar {
         root: impl AsRef<Path>,
     ) -> Result<StdHost, String> {
         let host = host.with_prepared_game_block_classes(root)?;
-        Ok(self.seed_host(host))
+        self.try_seed_host(host)
     }
 
     /// Return the resource paths discovered in the jar in deterministic order.

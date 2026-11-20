@@ -65,6 +65,16 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn metadata_jar(metadata: &str) -> NativeJar {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut bytes);
+    zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(metadata.as_bytes()).unwrap();
+    zip.finish().unwrap();
+    NativeJar::from_bytes(&bytes.into_inner()).unwrap()
+}
+
 /// Compile `sources` under `root/src` into `root/classes`.
 fn compile(root: &Path, classpath: Option<&Path>, sources: &[(&str, &str)]) {
     let classes = root.join("classes");
@@ -267,6 +277,27 @@ fn a_bundle_provides_the_mod_ids_of_its_bundled_jars() {
 fn a_neoforge_jarjar_library_is_on_the_outer_jar_s_class_path() {
     let fixture = Fixture::build_jarjar("jarjar-classpath");
     assert_eq!(fixture.printed_jarjar().trim(), "from-inner");
+}
+
+#[test]
+fn fabric_accepts_a_dotdot_nested_entry_name() {
+    let fixture = Fixture::build_with_layout("dotdot", "../");
+    assert_eq!(fixture.printed().trim(), "from-inner");
+}
+
+#[test]
+fn duplicate_fabric_ids_and_aliases_refuse_with_fabric_message() {
+    let first = metadata_jar(r#"{"schemaVersion":1,"id":"duplicate","version":"1"}"#);
+    let second = metadata_jar(r#"{"schemaVersion":1,"id":"duplicate","version":"2"}"#);
+    let host = first.try_seed_host(StdHost::new()).unwrap();
+    let error = second.try_seed_host(host).unwrap_err();
+    assert_eq!(error.to_string(), "duplicate mod duplicate");
+
+    let repeated_alias = metadata_jar(
+        r#"{"schemaVersion":1,"id":"alias-owner","version":"1","provides":["alias","alias"]}"#,
+    );
+    let error = repeated_alias.try_seed_host(StdHost::new()).unwrap_err();
+    assert_eq!(error.to_string(), "duplicate mod alias");
 }
 
 #[test]
