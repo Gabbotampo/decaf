@@ -30,7 +30,9 @@ public class Probe {
     InputStream live=open(p,false);
     String openNegative=err(()->live.skip(-1));
     live.close();
-    return skip+"|"+all+"|"+positive+"|"+negative+"|"+transfer+"|"+openNegative;
+    // Opening below a missing directory: the FileNotFoundException's text is the OS's.
+    String missingParent=err(()->new FileOutputStream(p.resolveSibling("no-such-dir").resolve("x.bin").toFile()).close());
+    return skip+"|"+all+"|"+positive+"|"+negative+"|"+transfer+"|"+openNegative+"|"+missingParent;
   }
   static String nbytes(Path p, boolean channel) throws Exception {
     try (InputStream in=open(p,channel)) {

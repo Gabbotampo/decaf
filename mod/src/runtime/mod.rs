@@ -28336,23 +28336,17 @@ impl<H: Host> Runtime<'_, H> {
                 if r.owner == "java/io/FileInputStream" {
                     self.io_open_reader(r, &marker, &path, true)?;
                 } else {
-                    // UnixFileSystemProvider reports a FileNotFoundException when the
-                    // parent directory does not exist. The virtual model keeps created
-                    // directories, so this case is exact instead of silently creating a
-                    // file below an absent parent.
+                    // Opening below a parent that isn't a directory fails with a
+                    // FileNotFoundException whose text is the OS's (`strerror` on Unix,
+                    // a Windows system message there), so the call is counted rather
+                    // than answered with Linux's wording. The check still keeps the
+                    // model from silently creating a file below an absent parent.
                     let canonical = host_path::sandbox_canonical(&path);
                     if let Some((parent, _)) = canonical.rsplit_once('/')
                         && !parent.is_empty()
                         && self.file_kind(parent) != file_attributes::FileKind::Directory
                     {
-                        return Err(NativeError::UncaughtException {
-                            class: "java/io/FileNotFoundException".into(),
-                            message: Some(format!(
-                                "{} (No such file or directory)",
-                                host_path::sandbox_display(&path)
-                            )),
-                            frame: None,
-                        });
+                        return self.host.unknown_operand_call(r).map(Some);
                     }
                     let appending = r.descriptor.ends_with("Z)V")
                         && args
