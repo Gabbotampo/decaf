@@ -76,6 +76,21 @@ fn no_jar_string_becomes_a_callback_at_any_escape_depth() {
 /// nested composites run whole. Exact, nothing counted.
 #[test]
 fn a_callback_read_back_is_the_callback_itself() {
+    // The 4093- to 5000-link captures nest interpreter frames as deep as the
+    // test below: a debug build's frames are large, and the runtime's #260
+    // guard throws `StackOverflowError` once the native stack left runs out.
+    // On the default 2 MiB test thread this sat within bytes of that bound
+    // (it failed at 2,000,000 bytes on main too), so it runs on the same
+    // roomy thread as `captures_deeper_than_64_links_survive_collections`.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(read_back_whole)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn read_back_whole() {
     let fixture =
         javac_fixture::Fixture::build("callbacks-rc261c-read", &[("demo/Esc.java", PROBE)]);
     for method in [
