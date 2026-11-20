@@ -19,6 +19,65 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `EnumSet.allOf` is implemented by the JDK from the enum class's
+        // declared constants.  Jar enums are available in the class table;
+        // retain their declaration order in the mutable collection row so
+        // the ordinary collection/iterator/toString paths expose ordinal
+        // order just as `RegularEnumSet` does.
+        if r.owner == "java/util/EnumSet"
+            && r.name == "allOf"
+            && r.descriptor == "(Ljava/lang/Class;)Ljava/util/EnumSet;"
+        {
+            let Some(enum_class) = args.first().and_then(host_class::class_name) else {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            };
+            let Some(file) = self.class(enum_class).cloned() else {
+                return Ok(None);
+            };
+            if file.super_name != "java/lang/Enum" {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "{} is not an enum type",
+                        enum_class.replace('/', ".")
+                    )),
+                    frame: None,
+                });
+            }
+            let values = self
+                .invoke(
+                    enum_class,
+                    "values",
+                    &format!("()[L{enum_class};"),
+                    None,
+                    &[],
+                )
+                .ok()
+                .and_then(|array| self.array(&array).ok().map(|values| values.into_owned()))
+                .filter(|values| !values.is_empty())
+                .unwrap_or_else(|| {
+                    file.fields
+                        .iter()
+                        .filter(|field| {
+                            field.is_static() && field.descriptor == format!("L{enum_class};")
+                        })
+                        .enumerate()
+                        .map(|(ordinal, field)| {
+                            self.static_fields
+                                .get(&format!("{enum_class}#{}{}", field.name, field.descriptor))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    crate::runtime::jar_object::handle(format!("{enum_class}#{ordinal}"))
+                                })
+                        })
+                        .collect()
+                });
+            return Ok(self.host.make_collection("java/util/EnumSet", values));
+        }
         if let Some(receiver) = receiver
             && let Some(value) = crate::runtime::kotlin_stdlib::instance(self, r, receiver, args)
         {

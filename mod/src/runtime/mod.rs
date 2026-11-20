@@ -29743,6 +29743,47 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(result))
     }
 
+    fn invoke_enum_set_text(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+    ) -> Result<Option<Value>, NativeError> {
+        if r.name != "toString" || r.descriptor != "()Ljava/lang/String;" {
+            return Ok(None);
+        }
+        let Some(receiver) = receiver else {
+            return Ok(None);
+        };
+        let class = match receiver {
+            Value::Host(handle) if handle.kind() == HostKind::Collection => {
+                handle.key().split_once('#').map(|(class, _)| class)
+            }
+            Value::Ref(Some(marker)) => marker.split_once('#').map(|(class, _)| class),
+            _ => None,
+        };
+        if class != Some("java/util/EnumSet") {
+            return Ok(None);
+        }
+        let values = runtime_collection_values(self.host, receiver)?;
+        let mut names = Vec::with_capacity(values.len());
+        for value in values {
+            let name = self
+                .invoke_enum_member(
+                    &MethodRef {
+                        owner: "java/lang/Enum".into(),
+                        name: "toString".into(),
+                        descriptor: "()Ljava/lang/String;".into(),
+                    },
+                    Some(&value),
+                    &[],
+                )?
+                .and_then(|value| expect_ref(&value).cloned())
+                .ok_or_else(|| NativeError::Metadata("EnumSet element is not a jar enum".into()))?;
+            names.push(name);
+        }
+        Ok(Some(Value::Ref(Some(format!("[{}]", names.join(", "))))))
+    }
+
     /// Enter one jar frame under the execution's recursion and time bounds.
     ///
     /// The bound is checked here rather than in [`Self::invoke_frame`] so every
@@ -31547,6 +31588,10 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
                     ) {
+                        value
+                    } else if let Some(value) =
+                        invoke_or_catch!(at, self.invoke_enum_set_text(&r, receiver.as_ref()))
+                    {
                         value
                     } else if let Some(value) = invoke_or_catch!(
                         at,
