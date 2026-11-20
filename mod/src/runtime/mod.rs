@@ -33715,6 +33715,21 @@ impl<H: Host> Runtime<'_, H> {
                     // build keys, ids and exception messages through these
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
+                        // A String from a constructor Decaf counted counts on every
+                        // later use (#423); its text is not known, so the whole
+                        // concatenation is counted, never joined from its marker.
+                        if captured.iter().any(|value| self.is_counted_string(value)) {
+                            let counted = invoke_or_catch!(
+                                at,
+                                self.host.unknown_operand_call(&MethodRef {
+                                    owner: "java/lang/invoke/StringConcatFactory".into(),
+                                    name: "makeConcatWithConstants".into(),
+                                    descriptor: descriptor.clone(),
+                                })
+                            );
+                            stack.push(counted);
+                            continue;
+                        }
                         let mut arguments = descriptor_arguments(&descriptor);
                         // An object operand concatenates as its own
                         // `toString` (`jar_text.rs`), then reads as a `String`.

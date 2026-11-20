@@ -32,3 +32,34 @@ fn counted_string_identity_is_counted() {
         "{calls:?}"
     );
 }
+
+/// Concatenating a counted constructor's String counts the concatenation
+/// instead of joining the object's internal key into the text.
+#[test]
+fn counted_string_concat_is_counted() {
+    let fixture = Fixture::build("issue-423-concat", &[("demo/Probe.java", PROBE)]);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    // The counted concatenation answers the counted call's placeholder, never
+    // a text joined from the counted String's internal key.
+    let got = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "countedConcat",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .expect("countedConcat runs");
+    assert!(
+        !matches!(&got, horizon_native_java::Value::Ref(Some(text)) if text.contains("java/lang/String#")),
+        "{got:?}"
+    );
+    let calls = host.unknown_host_calls();
+    assert!(
+        calls.iter().any(|(call, _)| call
+            .starts_with("java/lang/invoke/StringConcatFactory#makeConcatWithConstants")),
+        "{calls:?}"
+    );
+}

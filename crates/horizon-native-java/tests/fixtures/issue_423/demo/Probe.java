@@ -51,5 +51,10 @@ public class Probe {
     String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
     return String.valueOf(s == s);
   }
+  /** Concatenating a String from a counted constructor counts the concatenation. */
+  public static String countedConcat() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return s + "!";
+  }
   public static void main(String[] args) { System.out.print(rows()); }
 }
