@@ -29654,6 +29654,14 @@ impl<H: Host> Runtime<'_, H> {
         if !stream_pipeline::takes_output(&r.name) {
             return Ok(None);
         }
+        if !stream_pipeline::value_list_terminal_modelled(r, args) {
+            return Ok(None);
+        }
+        // Commit to the value-list model only after the exact call shape has
+        // been accepted.  An unmodelled terminal must remain unused so the
+        // outer dispatcher can count the original call without a retry seeing
+        // Java's single-use stream as already consumed.
+        self.consume_stream(receiver)?;
         let values = self.stream_output(receiver, &r.name)?;
         let result = match (r.name.as_str(), r.descriptor.as_str()) {
             // `Stream.toList()`: an unmodifiable `ListN` that allows `null`.

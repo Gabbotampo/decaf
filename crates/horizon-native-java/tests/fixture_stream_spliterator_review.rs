@@ -70,6 +70,17 @@ public final class Probe {
         @Override public boolean add(Object x) { log("add"); modCount++; return items.add(x); }
     }
 
+    /// A jar collector is a valid Java terminal, but its arbitrary collector
+    /// protocol is outside the value-list fallback.  OpenJDK 25 returns
+    /// `[1, 2]`; Decaf must leave the stream unused and count this call.
+    static final class UnknownCollector implements Collector<Integer, List<Integer>, List<Integer>> {
+        @Override public Supplier<List<Integer>> supplier() { return ArrayList::new; }
+        @Override public BiConsumer<List<Integer>, Integer> accumulator() { return List::add; }
+        @Override public BinaryOperator<List<Integer>> combiner() { return (a, b) -> { a.addAll(b); return a; }; }
+        @Override public Function<List<Integer>, List<Integer>> finisher() { return x -> x; }
+        @Override public Set<Characteristics> characteristics() { return Set.of(Characteristics.IDENTITY_FINISH); }
+    }
+
     /// A list's elements through their own `toString`.
     static String ids(List<?> list) {
         StringBuilder out = new StringBuilder("[");
@@ -194,6 +205,14 @@ public final class Probe {
         boolean java = SAVED.getClass().getName().startsWith("java.util.stream.");
         return take(l + "," + java);
     }
+
+    public static String unmodelledCollector() {
+        try {
+            return take(Stream.of(1, 2).collect(new UnknownCollector()));
+        } catch (IllegalStateException e) {
+            return take("ISE");
+        }
+    }
 }
 "#;
 
@@ -310,6 +329,22 @@ fn a_sink_kept_past_its_push_is_counted() {
         unknown
             .iter()
             .any(|(call, _)| call.starts_with("java/util/stream/Sink#accept")),
+        "{unknown:?}"
+    );
+}
+
+/// OpenJDK 25 answers `Stream.of(1, 2).collect(new UnknownCollector())` as
+/// `[1, 2]`.  The arbitrary collector is intentionally counted here; the
+/// stream must not be consumed before the fallback declines, or the retry
+/// would fabricate an `IllegalStateException`.
+#[test]
+fn an_unmodelled_terminal_is_counted_without_consuming_the_stream() {
+    let (text, unknown) = run("unmodelledCollector");
+    assert_ne!(text.as_deref(), Some(" => ISE"), "{unknown:?}");
+    assert!(
+        unknown.iter().any(|(call, _)| call.contains(
+            "java/util/stream/Stream#collect(Ljava/util/stream/Collector;)Ljava/lang/Object;"
+        )),
         "{unknown:?}"
     );
 }
