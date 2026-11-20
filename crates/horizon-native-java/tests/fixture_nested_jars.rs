@@ -268,3 +268,46 @@ fn a_neoforge_jarjar_library_is_on_the_outer_jar_s_class_path() {
     let fixture = Fixture::build_jarjar("jarjar-classpath");
     assert_eq!(fixture.printed_jarjar().trim(), "from-inner");
 }
+
+#[test]
+fn unlisted_and_explicitly_empty_fabric_jars_do_not_leak_mods() {
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut bytes);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap();
+        bytes.into_inner()
+    }
+    let child = zip(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"child","version":"1"}"#,
+    )]);
+    let outer = |jars: &str| {
+        NativeJar::from_bytes(&zip(&[
+            ("fabric.mod.json", jars.as_bytes()),
+            ("META-INF/jars/child.jar", &child),
+        ]))
+        .unwrap()
+    };
+    let dependent = NativeJar::from_bytes(&zip(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"dependent","version":"1","depends":{"child":">=1"}}"#,
+    )]))
+    .unwrap();
+    let unlisted = outer(r#"{"schemaVersion":1,"id":"outer","version":"1"}"#);
+    let explicit_empty = outer(r#"{"schemaVersion":1,"id":"outer","version":"1","jars":[]}"#);
+    for outer in [&unlisted, &explicit_empty] {
+        let plan = dependencies::plan(&[("dependent.jar", &dependent), ("outer.jar", outer)]);
+        assert_eq!(plan.missing.get(&0), Some(&vec!["child".to_owned()]));
+    }
+    let listed = outer(
+        r#"{"schemaVersion":1,"id":"outer","version":"1","jars":[{"file":"META-INF/jars/child.jar"}]}"#,
+    );
+    let plan = dependencies::plan(&[("dependent.jar", &dependent), ("outer.jar", &listed)]);
+    assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+}

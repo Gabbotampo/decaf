@@ -3415,6 +3415,8 @@ pub struct StdHost {
     fabric_metadata: BTreeMap<String, serde_json::Value>,
     /// Fabric provides aliases resolve to a container but are not separate containers.
     fabric_aliases: BTreeMap<String, String>,
+    /// Duplicate ids/aliases are loader resolution errors, never first-wins.
+    fabric_resolution_errors: Vec<String>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
     /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
     fabric_origins: BTreeMap<String, (String, String)>,
@@ -3742,6 +3744,7 @@ impl StdHost {
             own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
             fabric_aliases: BTreeMap::new(),
+            fabric_resolution_errors: Vec::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
@@ -4379,6 +4382,33 @@ impl StdHost {
         let id = id.into();
         let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
         self.record_loaded_mod(jar);
+        // A real loader's class path also resolves resources and service
+        // descriptors from the selected sibling. Merge each once in class
+        // path order; unselected Jar-in-Jar copies never reach this method.
+        for (name, marker) in &jar.resources {
+            self.resources
+                .entry(name.clone())
+                .or_insert_with(|| marker.clone());
+        }
+        for (name, bytes) in &jar.resource_bytes {
+            self.resource_bytes
+                .entry(name.clone())
+                .or_insert_with(|| bytes.clone());
+            if let Some(service) = name.strip_prefix("META-INF/services/")
+                && !service.is_empty()
+                && !service.contains('/')
+            {
+                for line in String::from_utf8_lossy(bytes).lines() {
+                    let provider = line.split_once('#').map_or(line, |(line, _)| line).trim();
+                    if !provider.is_empty() {
+                        self.service_providers
+                            .entry(service.replace('.', "/"))
+                            .or_default()
+                            .push(provider.replace('.', "/"));
+                    }
+                }
+            }
+        }
         // A loader also puts the linked jar's bundled jars
         // (`META-INF/jars/*.jar`) on the class path: a dependency such as
         // `libjf` keeps its classes there, and its dependents call them.

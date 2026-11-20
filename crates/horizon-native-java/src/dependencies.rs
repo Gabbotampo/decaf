@@ -59,6 +59,9 @@ pub struct LoadPlan {
     /// the transitive closure, because a dependency's own dependencies are on
     /// the class path of a real loader too.
     pub links: Vec<Vec<usize>>,
+    /// Fabric's resolver refuses a set with an occupied id or alias key. The
+    /// caller must refuse the run rather than silently choosing first-wins.
+    pub resolution_errors: Vec<String>,
 }
 
 impl LoadPlan {
@@ -279,22 +282,58 @@ fn is_host_provided(id: &str) -> bool {
 
 /// Build the run order, link closure and missing-dependency rows for `jars`.
 pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
-    let mut provided: BTreeMap<String, usize> = BTreeMap::new();
-    // Fabric resolves top-level candidates before nested candidates. This is
-    // observable when a pack contains an old bundled copy and a newer root.
+    let mut candidates: BTreeMap<String, Vec<(usize, bool, Option<String>, bool)>> =
+        BTreeMap::new();
     for (index, (_, jar)) in jars.iter().enumerate() {
-        let own = [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+        for id in [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
             .into_iter()
             .flatten()
-            .map(str::to_owned)
-            .chain(jar.fabric_provides.iter().cloned());
-        for id in own {
-            provided.entry(id.to_ascii_lowercase()).or_insert(index);
+        {
+            candidates
+                .entry(id.to_ascii_lowercase())
+                .or_default()
+                .push((
+                    index,
+                    true,
+                    jar.fabric_version.clone().or(jar.neoforge_version.clone()),
+                    false,
+                ));
+        }
+        for id in &jar.fabric_provides {
+            candidates
+                .entry(id.to_ascii_lowercase())
+                .or_default()
+                .push((
+                    index,
+                    true,
+                    jar.fabric_version.clone().or(jar.neoforge_version.clone()),
+                    true,
+                ));
+        }
+        for id in mod_ids(jar) {
+            candidates
+                .entry(id)
+                .or_default()
+                .push((index, false, None, false));
         }
     }
-    for (index, (_, jar)) in jars.iter().enumerate() {
-        for id in mod_ids(jar) {
-            provided.entry(id).or_insert(index);
+    let mut provided = BTreeMap::new();
+    let mut resolution_errors = Vec::new();
+    for (id, mut rows) in candidates {
+        rows.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| crate::nested_jars::version_cmp(b.2.as_deref(), a.2.as_deref()))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let distinct: BTreeSet<_> = rows.iter().map(|row| row.0).collect();
+        let alias_collision = distinct.len() > 1 && rows.iter().any(|row| row.3);
+        if alias_collision {
+            // `ModResolver.selectMod` reports this as a duplicate id/alias
+            // instead of letting insertion order choose a provider.
+            resolution_errors.push(format!("duplicate mod {id}"));
+        }
+        if !alias_collision && let Some((index, _, _, _)) = rows.first() {
+            provided.insert(id, *index);
         }
     }
 
@@ -357,6 +396,7 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
         order,
         missing,
         links,
+        resolution_errors,
     }
 }
 
@@ -423,6 +463,28 @@ mod tests {
         assert_eq!(plan.links_for(0), [1]);
         assert!(plan.links_for(1).is_empty());
         assert!(plan.missing.is_empty());
+    }
+
+    #[test]
+    fn duplicate_roots_choose_the_higher_fabric_version_and_report_collisions() {
+        let old = NativeJar {
+            fabric_id: Some("dep".into()),
+            fabric_version: Some("1.0".into()),
+            ..NativeJar::default()
+        };
+        let new = NativeJar {
+            fabric_id: Some("dep".into()),
+            fabric_version: Some("2.0".into()),
+            ..NativeJar::default()
+        };
+        let consumer = jar("consumer", &["dep"]);
+        let plan = plan(&[
+            ("old.jar", &old),
+            ("new.jar", &new),
+            ("consumer.jar", &consumer),
+        ]);
+        assert!(plan.resolution_errors.is_empty());
+        assert_eq!(plan.links_for(2), [1]);
     }
 
     #[test]
