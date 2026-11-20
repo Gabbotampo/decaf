@@ -9,15 +9,17 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SlotDef {
-    index: i32,
-    x: i32,
-    y: i32,
+    pub(crate) index: i32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) may_place: Value,
+    pub(crate) empty: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Definition {
-    inputs: Vec<SlotDef>,
-    result: SlotDef,
+    pub(crate) inputs: Vec<SlotDef>,
+    pub(crate) result: SlotDef,
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,7 @@ pub(crate) struct Slot {
     container: Value,
     x: i32,
     y: i32,
+    may_place: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,10 +37,17 @@ pub(crate) struct MenuState {
     pub input: String,
     pub result: String,
     pub slots: String,
-    definition: Definition,
-    container_id: i32,
-    access: Value,
-    player: Value,
+    pub(crate) definition: Definition,
+    pub(crate) container_id: i32,
+    pub(crate) access: Value,
+    pub(crate) player: Value,
+}
+
+#[derive(Clone, Debug)]
+pub enum MenuAction {
+    SlotsChanged { menu: Value, container: Value },
+    CreateResult { menu: Value },
+    Predicate { predicate: Value, stack: Value },
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +70,11 @@ pub(crate) enum Object {
         size: i32,
         items: Vec<Value>,
         result: bool,
+        owner: Option<String>,
+        recipe_used: Option<Value>,
     },
+    Predicate(bool),
+    Pending(MenuAction),
 }
 
 pub(crate) type States = BTreeMap<String, Object>;
@@ -75,9 +89,11 @@ pub(crate) fn is_menu_class(owner: &str) -> bool {
             | "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$SlotDefinition"
             | "net/minecraft/world/SimpleContainer"
             | "net/minecraft/world/inventory/ResultContainer"
+            | "net/minecraft/world/inventory/RecipeCraftingHolder"
             | "net/minecraft/world/Container"
             | "net/minecraft/world/inventory/Slot"
             | "net/minecraft/world/inventory/ContainerLevelAccess"
+            | "java/util/function/Predicate"
     )
 }
 
@@ -163,12 +179,36 @@ pub(crate) fn static_call(
             key.clone(),
             Object::Builder {
                 inputs: Vec::new(),
-                result: None,
+                result: Some(SlotDef {
+                    index: 0,
+                    x: 0,
+                    y: 0,
+                    may_place: marker("menu/predicate/empty-result"),
+                    empty: true,
+                }),
             },
+        );
+        states.insert(
+            "menu/predicate/empty-result".into(),
+            Object::Predicate(true),
         );
         return Some(Ok(marker(key)));
     }
     None
+}
+
+pub(crate) fn take_action(states: &mut States) -> Option<MenuAction> {
+    let key = states
+        .iter()
+        .find_map(|(key, object)| matches!(object, Object::Pending(_)).then_some(key.clone()))?;
+    match states.remove(&key) {
+        Some(Object::Pending(action)) => Some(action),
+        _ => None,
+    }
+}
+
+pub(crate) fn keyed_text(states: &States, key: &str) -> Option<String> {
+    states.get(key).map(|object| format!("{object:?}"))
 }
 
 pub(crate) fn call(
@@ -179,30 +219,18 @@ pub(crate) fn call(
 ) -> Option<Result<Value, NativeError>> {
     let key = expect_ref(receiver)?.to_owned();
 
-    if r.owner == "net/minecraft/world/item/ItemStack" {
-        return Some(match (r.name.as_str(), r.descriptor.as_str()) {
-            ("isEmpty", "()Z") => Ok(Value::Int(
-                (key == "stack/empty" || key.ends_with("@0")) as i32,
-            )),
-            ("getCount", "()I") => Ok(Value::Int(
-                key.rsplit_once('@')
-                    .and_then(|(_, n)| n.parse().ok())
-                    .unwrap_or(1),
-            )),
-            ("copy", "()Lnet/minecraft/world/item/ItemStack;") => Ok(receiver.clone()),
-            ("shrink", "(I)V") | ("onCraftedBy", _) => Ok(Value::Void),
-            _ => return None,
-        });
-    }
-
     if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
         && key == "container-level-access/null"
     {
-        return Some(match r.name.as_str() {
-            "execute" => Ok(Value::Void),
-            "evaluate" => Ok(args.get(1).cloned().unwrap_or(Value::Int(1))),
-            _ => return None,
-        });
+        if r.name == "execute" && r.descriptor == "(Ljava/util/function/BiConsumer;)V" {
+            return Some(Ok(Value::Void));
+        }
+        if r.name == "evaluate"
+            && r.descriptor == "(Ljava/util/function/BiFunction;)Ljava/util/Optional;"
+        {
+            return Some(Ok(crate::runtime::empty_optional()));
+        }
+        return None;
     }
 
     // The builder and immutable definition are ordinary objects in vanilla.
@@ -245,7 +273,7 @@ pub(crate) fn call(
             "slotIndex" => Ok(Value::Int(slot.index)),
             "x" => Ok(Value::Int(slot.x)),
             "y" => Ok(Value::Int(slot.y)),
-            "mayPlace" => Ok(Value::Ref(None)),
+            "mayPlace" => Ok(slot.may_place.clone()),
             _ => return None,
         });
     }
@@ -254,10 +282,20 @@ pub(crate) fn call(
         match r.name.as_str() {
             "<init>" => {
                 states.insert(
+                    "menu/predicate/empty-result".into(),
+                    Object::Predicate(true),
+                );
+                states.insert(
                     key,
                     Object::Builder {
                         inputs: Vec::new(),
-                        result: None,
+                        result: Some(SlotDef {
+                            index: 0,
+                            x: 0,
+                            y: 0,
+                            may_place: marker("menu/predicate/empty-result"),
+                            empty: true,
+                        }),
                     },
                 );
                 return Some(Ok(Value::Void));
@@ -273,6 +311,8 @@ pub(crate) fn call(
                     index: *index,
                     x: *x,
                     y: *y,
+                    may_place: args[3].clone(),
+                    empty: false,
                 });
                 return Some(Ok(receiver.clone()));
             }
@@ -287,23 +327,41 @@ pub(crate) fn call(
                     index: *index,
                     x: *x,
                     y: *y,
+                    may_place: marker("menu/predicate/result"),
+                    empty: false,
                 });
+                states.insert("menu/predicate/result".into(), Object::Predicate(false));
                 return Some(Ok(receiver.clone()));
             }
             "build" => {
-                let Some(Object::Builder { inputs, result }) = states.remove(&key) else {
+                let Some(Object::Builder { inputs, result }) = states.get(&key).cloned() else {
                     return None;
                 };
-                let result = result?;
+                if inputs.is_empty() || result.as_ref().is_none_or(|slot| slot.empty) {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some("Need to define both inputSlots and resultSlot".into()),
+                        frame: None,
+                    }));
+                }
+                let result = result.unwrap();
                 if inputs
                     .iter()
                     .enumerate()
                     .any(|(i, slot)| slot.index != i as i32)
-                    || result.index != inputs.len() as i32
                 {
                     return Some(Err(NativeError::UncaughtException {
                         class: "java/lang/IllegalArgumentException".into(),
-                        message: Some("Expected continuous input and result slot indexes".into()),
+                        message: Some("Expected input slots to have continous indexes".into()),
+                        frame: None,
+                    }));
+                }
+                if result.index != inputs.len() as i32 {
+                    return Some(Err(NativeError::UncaughtException {
+                        class: "java/lang/IllegalArgumentException".into(),
+                        message: Some(
+                            "Expected result slot index to follow last input slot".into(),
+                        ),
                         frame: None,
                     }));
                 }
@@ -343,6 +401,8 @@ pub(crate) fn call(
                 size: 1,
                 items: vec![marker("stack/empty")],
                 result: true,
+                owner: Some(key.clone()),
+                recipe_used: None,
             },
         );
         let input = next_key(states, "net/minecraft/world/inventory/ItemCombinerMenu$4");
@@ -352,6 +412,8 @@ pub(crate) fn call(
                 size: definition.inputs.len() as i32,
                 items: vec![marker("stack/empty"); definition.inputs.len()],
                 result: false,
+                owner: Some(key.clone()),
+                recipe_used: None,
             },
         );
         let mut layout = definition
@@ -363,6 +425,7 @@ pub(crate) fn call(
                 container: marker(input.clone()),
                 x: slot.x,
                 y: slot.y,
+                may_place: Some(slot.may_place.clone()),
             })
             .collect::<Vec<_>>();
         layout.push(Slot {
@@ -371,6 +434,7 @@ pub(crate) fn call(
             container: marker(result.clone()),
             x: definition.result.x,
             y: definition.result.y,
+            may_place: Some(definition.result.may_place.clone()),
         });
         for row in 0..3 {
             for column in 0..9 {
@@ -380,6 +444,7 @@ pub(crate) fn call(
                     container: inventory.clone(),
                     x: 8 + 18 * column,
                     y: 84 + 18 * row,
+                    may_place: None,
                 });
             }
         }
@@ -390,6 +455,7 @@ pub(crate) fn call(
                 container: inventory.clone(),
                 x: 8 + 18 * column,
                 y: 142,
+                may_place: None,
             });
         }
         let mut slot_keys = Vec::new();
@@ -445,6 +511,8 @@ pub(crate) fn call(
                 size,
                 items: vec![marker("stack/empty"); size as usize],
                 result: false,
+                owner: Some(key.clone()),
+                recipe_used: None,
             },
         );
         return Some(Ok(marker(input_key)));
@@ -469,6 +537,26 @@ pub(crate) fn call(
     {
         return Some(Ok(Value::Int(slot.container_slot)));
     }
+    if let Some(Object::Slot(slot)) = states.get(&key)
+        && (r.owner == "net/minecraft/world/inventory/Slot"
+            || r.owner == "net/minecraft/world/inventory/ItemCombinerMenu$2"
+            || r.owner == "net/minecraft/world/inventory/ItemCombinerMenu$3")
+        && r.name == "mayPlace"
+        && r.descriptor == "(Lnet/minecraft/world/item/ItemStack;)Z"
+    {
+        if let Some(predicate) = &slot.may_place {
+            let pending = next_key(states, "menu/action");
+            states.insert(
+                pending,
+                Object::Pending(MenuAction::Predicate {
+                    predicate: predicate.clone(),
+                    stack: args.first().cloned().unwrap_or(Value::Ref(None)),
+                }),
+            );
+            return Some(Ok(Value::Int(0)));
+        }
+        return Some(Ok(Value::Int(1)));
+    }
     if r.owner == "net/minecraft/world/inventory/Slot" && r.name == "<init>" {
         let [container, Value::Int(index), Value::Int(x), Value::Int(y)] = args else {
             return None;
@@ -481,6 +569,7 @@ pub(crate) fn call(
                 container: container.clone(),
                 x: *x,
                 y: *y,
+                may_place: None,
             }),
         );
         return Some(Ok(Value::Void));
@@ -503,6 +592,8 @@ pub(crate) fn call(
                 size,
                 items: vec![marker("stack/empty"); size as usize],
                 result: false,
+                owner: None,
+                recipe_used: None,
             },
         );
         return Some(Ok(Value::Void));
@@ -514,6 +605,8 @@ pub(crate) fn call(
                 size: 1,
                 items: vec![marker("stack/empty")],
                 result: true,
+                owner: None,
+                recipe_used: None,
             },
         );
         return Some(Ok(Value::Void));
@@ -574,10 +667,13 @@ pub(crate) fn call(
         size,
         items,
         result,
+        owner,
+        recipe_used,
     }) = states.get_mut(&key)
         && (r.owner == "net/minecraft/world/Container"
             || r.owner == "net/minecraft/world/SimpleContainer"
-            || r.owner == "net/minecraft/world/inventory/ResultContainer")
+            || r.owner == "net/minecraft/world/inventory/ResultContainer"
+            || r.owner == "net/minecraft/world/inventory/RecipeCraftingHolder")
     {
         let index = args
             .first()
@@ -589,31 +685,93 @@ pub(crate) fn call(
                 }
             })
             .unwrap_or(0);
-        return Some(match r.name.as_str() {
+        let mut pending_action = None;
+        let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
             "isEmpty" => Ok(Value::Int(items.iter().all(|v| {
                 matches!(v, Value::Ref(None))
                     || matches!(v, Value::Ref(Some(s)) if s == "stack/empty")
             }) as i32)),
-            "getItem" => Ok(items
-                .get(index)
-                .cloned()
-                .unwrap_or_else(|| marker("stack/empty"))),
+            "getItem" => {
+                let position = if *result { 0 } else { index };
+                let Some(item) = items.get(position).cloned() else {
+                    if !*result && position >= *size as usize {
+                        return Some(Ok(marker("stack/empty")));
+                    }
+                    return None;
+                };
+                Ok(item)
+            }
             "setItem" => {
-                if let Some(value) = args.get(1)
-                    && let Some(item) = items.get_mut(index)
-                {
-                    *item = value.clone();
+                let value = args.get(1)?;
+                let item = items.get_mut(index)?;
+                *item = value.clone();
+                if !*result && let Some(menu) = owner.as_ref() {
+                    pending_action = Some(MenuAction::SlotsChanged {
+                        menu: marker(menu.clone()),
+                        container: marker(key.clone()),
+                    });
                 }
                 Ok(Value::Void)
             }
-            "setChanged" | "clearContent" | "setRecipeUsed" | "awardUsedRecipes" => Ok(Value::Void),
-            "getRecipeUsed" => Ok(Value::Ref(None)),
+            "setChanged" => {
+                if !*result && let Some(menu) = owner.as_ref() {
+                    pending_action = Some(MenuAction::SlotsChanged {
+                        menu: marker(menu.clone()),
+                        container: marker(key.clone()),
+                    });
+                }
+                Ok(Value::Void)
+            }
+            "clearContent" => {
+                items.clear();
+                if !*result && let Some(menu) = owner.as_ref() {
+                    pending_action = Some(MenuAction::SlotsChanged {
+                        menu: marker(menu.clone()),
+                        container: marker(key.clone()),
+                    });
+                }
+                Ok(Value::Void)
+            }
+            "setRecipeUsed" => {
+                *recipe_used = args.first().cloned();
+                Ok(Value::Void)
+            }
+            "getRecipeUsed" => Ok(recipe_used.clone().unwrap_or(Value::Ref(None))),
             _ => {
-                let _ = result;
                 return None;
             }
-        });
+        };
+        if let Some(action) = pending_action {
+            let pending = next_key(states, "menu/action");
+            states.insert(pending, Object::Pending(action));
+        }
+        return Some(answer);
+    }
+    if let Some(Object::Predicate(answer)) = states.get(&key)
+        && r.owner == "java/util/function/Predicate"
+        && r.name == "test"
+        && r.descriptor == "(Ljava/lang/Object;)Z"
+    {
+        return Some(Ok(Value::Int(i32::from(*answer))));
+    }
+    if let Some(Object::Menu(state)) = states.get(&key)
+        && r.owner == "net/minecraft/world/inventory/ItemCombinerMenu"
+        && r.name == "slotsChanged"
+        && r.descriptor == "(Lnet/minecraft/world/Container;)V"
+        && args
+            .first()
+            .and_then(expect_ref)
+            .is_some_and(|input| input == &state.input)
+    {
+        let pending = next_key(states, "menu/action");
+        states.insert(
+            pending,
+            Object::Pending(MenuAction::CreateResult {
+                menu: marker(key.clone()),
+            }),
+        );
+        return Some(Ok(Value::Void));
     }
     None
 }
@@ -770,5 +928,76 @@ mod tests {
             writeln!(observed, "{name}={value}").unwrap();
         }
         assert_eq!(observed, include_str!("menu_models_oracle.txt"));
+    }
+
+    #[test]
+    fn builder_reproduces_vanilla_validation_messages() {
+        let mut states = States::new();
+        let builder = static_call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition",
+                "create",
+                "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;",
+            ),
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let empty = call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder",
+                "build",
+                "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition;",
+            ),
+            &builder,
+            &[],
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(empty, NativeError::UncaughtException { message: Some(message), .. } if message == "Need to define both inputSlots and resultSlot")
+        );
+
+        call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder",
+                "withSlot",
+                "(IIILjava/util/function/Predicate;)Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;",
+            ),
+            &builder,
+            &[Value::Int(2), Value::Int(0), Value::Int(0), Value::Ref(None)],
+        )
+        .unwrap()
+        .unwrap();
+        call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder",
+                "withResultSlot",
+                "(III)Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;",
+            ),
+            &builder,
+            &[Value::Int(1), Value::Int(0), Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap();
+        let indexes = call(
+            &mut states,
+            &method(
+                "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder",
+                "build",
+                "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition;",
+            ),
+            &builder,
+            &[],
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(indexes, NativeError::UncaughtException { message: Some(message), .. } if message == "Expected input slots to have continous indexes")
+        );
     }
 }

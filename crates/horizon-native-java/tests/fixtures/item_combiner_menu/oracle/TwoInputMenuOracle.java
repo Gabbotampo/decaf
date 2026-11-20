@@ -22,10 +22,13 @@ public final class TwoInputMenuOracle {
           .build();
     }
 
-    @Override public void createResult() { }
+    @Override public void createResult() { resultSlots.setItem(0, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.STONE)); }
     @Override protected void onTake(net.minecraft.world.entity.player.Player player,
                                     net.minecraft.world.item.ItemStack stack) { }
     @Override protected boolean isValidBlock(net.minecraft.world.level.block.state.BlockState state) { return true; }
+
+    void trigger() { inputSlots.setItem(0, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.STONE)); }
+    boolean resultSet() { return resultSlots.getItem(0) != net.minecraft.world.item.ItemStack.EMPTY; }
   }
 
   public static void main(String[] args) {
@@ -44,5 +47,8 @@ public final class TwoInputMenuOracle {
     System.out.println("inventoryEnd=" + (result + 1 + 27));
     System.out.println("useRowStart=" + (result + 1 + 27));
     System.out.println("useRowEnd=" + (result + 1 + 27 + 9));
+    menu.trigger();
+    System.out.println("resultSet=" + menu.resultSet());
+    System.out.println("mayPlace=" + menu.getSlot(0).mayPlace(net.minecraft.world.item.ItemStack.EMPTY));
   }
 }

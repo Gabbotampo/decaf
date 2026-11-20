@@ -8,3 +8,5 @@ inventoryStart=4
 inventoryEnd=31
 useRowStart=31
 useRowEnd=40
+resultSet=true
+mayPlace=true

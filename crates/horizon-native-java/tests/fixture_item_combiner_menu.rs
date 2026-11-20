@@ -72,7 +72,7 @@ fn build_jar() -> (scratch::Scratch, PathBuf) {
 import java.util.ArrayList;
 public class NonNullList<T> extends ArrayList<T> { }
 "#,
-        "net/minecraft/world/item/ItemStack.java" => "package net.minecraft.world.item; public class ItemStack { }",
+        "net/minecraft/world/item/ItemStack.java" => "package net.minecraft.world.item; public class ItemStack { public static final ItemStack EMPTY = new ItemStack(); }",
         "net/minecraft/world/level/block/state/BlockState.java" => "package net.minecraft.world.level.block.state; public class BlockState { }",
         "net/minecraft/world/entity/player/Player.java" => "package net.minecraft.world.entity.player; public class Player { }",
         "net/minecraft/world/entity/player/Inventory.java" => r#"package net.minecraft.world.entity.player;
@@ -81,15 +81,15 @@ public class Inventory { public final Player player; public Inventory(Player p, 
 "#,
         "net/minecraft/world/entity/EntityEquipment.java" => "package net.minecraft.world.entity; public class EntityEquipment { }",
         "net/minecraft/world/Container.java" => r#"package net.minecraft.world; import net.minecraft.world.item.ItemStack;
-public interface Container { int getContainerSize(); ItemStack getItem(int index); }
+public interface Container { int getContainerSize(); ItemStack getItem(int index); void setItem(int index, ItemStack stack); void setChanged(); }
 "#,
-        "net/minecraft/world/SimpleContainer.java" => "package net.minecraft.world; public class SimpleContainer implements Container { public SimpleContainer(int size) {} public int getContainerSize() { return 0; } public net.minecraft.world.item.ItemStack getItem(int i) { return null; } }",
-        "net/minecraft/world/inventory/ResultContainer.java" => "package net.minecraft.world.inventory; public class ResultContainer implements net.minecraft.world.Container { public ResultContainer() {} public int getContainerSize() { return 1; } public net.minecraft.world.item.ItemStack getItem(int i) { return null; } }",
+        "net/minecraft/world/SimpleContainer.java" => "package net.minecraft.world; public class SimpleContainer implements Container { public SimpleContainer(int size) {} public int getContainerSize() { return 0; } public net.minecraft.world.item.ItemStack getItem(int i) { return null; } public void setItem(int i, net.minecraft.world.item.ItemStack s) { setChanged(); } public void setChanged() {} }",
+        "net/minecraft/world/inventory/ResultContainer.java" => "package net.minecraft.world.inventory; public class ResultContainer implements net.minecraft.world.Container { public ResultContainer() {} public int getContainerSize() { return 1; } public net.minecraft.world.item.ItemStack getItem(int i) { return null; } public void setItem(int i, net.minecraft.world.item.ItemStack s) {} public void setChanged() {} }",
         "net/minecraft/world/inventory/MenuType.java" => "package net.minecraft.world.inventory; public class MenuType<T> { }",
         "net/minecraft/world/inventory/ContainerLevelAccess.java" => "package net.minecraft.world.inventory; public class ContainerLevelAccess { public static final ContainerLevelAccess NULL = new ContainerLevelAccess(); }",
         "net/minecraft/world/inventory/Slot.java" => r#"package net.minecraft.world.inventory;
 import net.minecraft.world.Container;
-public class Slot { public final Container container; public int index; public final int x, y; public Slot(Container c, int i, int x, int y) { container=c; index=i; this.x=x; this.y=y; } public int getContainerSlot() { return index; } }
+public class Slot { public final Container container; public int index; public final int x, y; public Slot(Container c, int i, int x, int y) { container=c; index=i; this.x=x; this.y=y; } public int getContainerSlot() { return index; } public boolean mayPlace(net.minecraft.world.item.ItemStack stack) { return true; } }
 "#,
         "net/minecraft/world/inventory/AbstractContainerMenu.java" => r#"package net.minecraft.world.inventory;
 import net.minecraft.core.NonNullList;
@@ -132,11 +132,13 @@ import net.minecraft.world.inventory.*; import net.minecraft.world.item.ItemStac
 public final class TwoInputMenu extends ItemCombinerMenu {
   public TwoInputMenu() { super(null, 17, null, ContainerLevelAccess.NULL, createDefinition()); }
   private static ItemCombinerMenuSlotDefinition createDefinition() {
-    return ItemCombinerMenuSlotDefinition.create().withSlot(0, 17, 29, null).withSlot(1, 73, 29, null).withResultSlot(2, 121, 29).build();
+    return ItemCombinerMenuSlotDefinition.create().withSlot(0, 17, 29, stack -> true).withSlot(1, 73, 29, stack -> true).withResultSlot(2, 121, 29).build();
   }
-  @Override public void createResult() { }
+  @Override public void createResult() { resultSlots.setItem(0, new ItemStack()); }
   @Override protected void onTake(Player p, ItemStack s) { }
   @Override protected boolean isValidBlock(BlockState s) { return true; }
+  public void trigger() { inputSlots.setItem(0, new ItemStack()); }
+  public boolean resultSet() { return resultSlots.getItem(0) != ItemStack.EMPTY; }
 }
 "#,
         "demo/Main.java" => r#"package demo;
@@ -155,6 +157,9 @@ public final class Main {
     System.out.println("inventoryEnd=" + (result + 1 + 27));
     System.out.println("useRowStart=" + (result + 1 + 27));
     System.out.println("useRowEnd=" + (result + 1 + 27 + 9));
+    menu.trigger();
+    System.out.println("resultSet=" + menu.resultSet());
+    System.out.println("mayPlace=" + menu.getSlot(0).mayPlace(net.minecraft.world.item.ItemStack.EMPTY));
   }
 }
 "#,

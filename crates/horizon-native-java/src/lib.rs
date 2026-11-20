@@ -2392,6 +2392,13 @@ pub trait Host {
         None
     }
 
+    /// A menu model may need the interpreter to run a virtual subclass method
+    /// (for example `ItemCombinerMenu$4.setChanged` reaching `createResult`).
+    /// The default host has no pending action.
+    fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
+        None
+    }
+
     fn menu_field(&mut self, _receiver: &Value, _r: &MethodRef) -> Option<Value> {
         None
     }
@@ -3707,10 +3714,6 @@ impl Default for StdHost {
 }
 
 impl StdHost {
-    pub(crate) fn menu_states_debug(&self) -> String {
-        format!("{:?}", self.menu_states)
-    }
-
     pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
         self.registry_lifecycles
             .get(id)
@@ -5788,6 +5791,10 @@ impl Host for StdHost {
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
         menu_models::field(&self.menu_states, receiver, r)
+    }
+
+    fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
+        menu_models::take_action(&mut self.menu_states)
     }
 
     fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
@@ -29769,6 +29776,59 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(result))
     }
 
+    fn invoke_menu_model(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(result) = self.host.menu_instance_call(r, receiver, args) else {
+            return Ok(None);
+        };
+        let mut value = result?;
+        while let Some(action) = self.host.take_menu_action() {
+            value = match action {
+                menu_models::MenuAction::SlotsChanged { menu, container } => {
+                    if let Some(value) = self.invoke_menu_model(
+                        &MethodRef {
+                            owner: "net/minecraft/world/inventory/ItemCombinerMenu".into(),
+                            name: "slotsChanged".into(),
+                            descriptor: "(Lnet/minecraft/world/Container;)V".into(),
+                        },
+                        &menu,
+                        &[container],
+                    )? {
+                        value
+                    } else {
+                        let class = crate::expect_ref(&menu)
+                            .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                            .ok_or_else(|| {
+                                NativeError::Metadata("menu receiver is not a jar object".into())
+                            })?;
+                        self.invoke(&class, "createResult", "()V", Some(menu), &[])?
+                    }
+                }
+                menu_models::MenuAction::CreateResult { menu } => {
+                    let class = crate::expect_ref(&menu)
+                        .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                        .ok_or_else(|| {
+                            NativeError::Metadata("menu receiver is not a jar object".into())
+                        })?;
+                    self.invoke(&class, "createResult", "()V", Some(menu), &[])?
+                }
+                menu_models::MenuAction::Predicate { predicate, stack } => self.call_virtual(
+                    jdk_call::Site::Interface,
+                    "java/util/function/Predicate",
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &predicate,
+                    &[stack],
+                )?,
+            };
+        }
+        Ok(Some(value))
+    }
+
     /// Enter one jar frame under the execution's recursion and time bounds.
     ///
     /// The bound is checked here rather than in [`Self::invoke_frame`] so every
@@ -31388,12 +31448,8 @@ impl<H: Host> Runtime<'_, H> {
                         value
                     } else if menu_models::is_menu_class(&r.owner)
                         && let Some(receiver) = receiver.as_ref()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.host
-                                .menu_instance_call(&r, receiver, &args)
-                                .transpose()
-                        )
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_menu_model(&r, receiver, &args))
                     {
                         value
                     } else if receiver == Some(Value::Ref(None)) {
