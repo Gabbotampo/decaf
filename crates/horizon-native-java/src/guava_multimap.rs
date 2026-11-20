@@ -119,15 +119,33 @@ fn fresh_as_map_value<H: Host>(this: &mut Runtime<'_, H>, source: &str, key: &Va
     fresh_wrapped_value(this, source, key, "asMap.get", wrapped_value_class(&kind))
 }
 
-fn cached_get_value<H: Host>(this: &mut Runtime<'_, H>, source: &str, key: &Value) -> Value {
-    let slot = format!("get#{}", value_text(key));
-    if let Some(value) = field(this, source, &slot) {
-        return value;
-    }
+fn fresh_get_value<H: Host>(this: &mut Runtime<'_, H>, source: &str, key: &Value) -> Value {
     let kind = source_kind(this, source).unwrap_or_else(|| "array".into());
-    let value = fresh_wrapped_value(this, source, key, "get", wrapped_value_class(&kind));
-    put_field(this, source, &slot, value.clone());
-    value
+    fresh_wrapped_value(this, source, key, "get", wrapped_value_class(&kind))
+}
+
+fn tainted<H: Host>(this: &Runtime<'_, H>, source: &str) -> bool {
+    matches!(field(this, source, "tainted"), Some(Value::Int(1)))
+}
+
+fn taint<H: Host>(this: &mut Runtime<'_, H>, source: &str) {
+    put_field(this, source, "tainted", Value::Int(1));
+}
+
+fn is_multimap_write(r: &MethodRef) -> bool {
+    matches!(
+        r.name.as_str(),
+        "add" | "clear" | "put" | "remove" | "replaceValues"
+    )
+}
+
+fn count_tainted_read<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    source: &str,
+) -> Option<Result<Option<Value>, NativeError>> {
+    (tainted(this, source) && !is_multimap_write(r))
+        .then(|| this.host.unknown_operand_call(r).map(Some))
 }
 
 fn fresh_as_map_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &str) -> Value {
@@ -617,6 +635,9 @@ fn invoke_multimap<H: Host>(
 ) -> Result<Option<Value>, NativeError> {
     let source = target_key(this, key);
     let view = view_name(this, key);
+    if let Some(counted) = count_tainted_read(this, r, &source) {
+        return counted;
+    }
     if matches!(view.as_deref(), Some("asMap.get" | "get")) {
         let Some(map_key) = field(this, key, "map-key") else {
             return this.host.unknown_operand_call(r).map(Some);
@@ -672,23 +693,17 @@ fn invoke_multimap<H: Host>(
                 }
                 Value::Void
             }
-            ("iterator", "()Ljava/util/Iterator;") => {
-                let values = current
-                    .map(|value| runtime_collection_values(&*this.host, &value))
-                    .transpose()?
-                    .unwrap_or_default();
-                return this
-                    .host
-                    .new_host_iterator(values, Some("guava-as-map-value".into()))
-                    .map_or_else(
-                        || this.host.unknown_operand_call(r).map(Some),
-                        |iterator| Ok(Some(iterator)),
-                    );
-            }
-            ("get", "(I)Ljava/lang/Object;")
+            ("iterator", "()Ljava/util/Iterator;")
             | ("subList", "(II)Ljava/util/List;")
             | ("listIterator", "()Ljava/util/ListIterator;")
             | ("listIterator", "(I)Ljava/util/ListIterator;") => {
+                // Guava's WrappedIterator and WrappedListIterator are live and check the
+                // multimap generation. A host snapshot cannot answer those semantics safely;
+                // count the operation and taint later multimap reads instead of guessing.
+                taint(this, &source);
+                return this.host.unknown_operand_call(r).map(Some);
+            }
+            ("get", "(I)Ljava/lang/Object;") => {
                 let Some(values) = current else {
                     return this.host.unknown_operand_call(r).map(Some);
                 };
@@ -764,6 +779,16 @@ fn invoke_multimap<H: Host>(
             }
         };
         let value = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toString", "()Ljava/lang/String;")
+                if matches!(view.as_deref(), Some("asMap.values" | "asMap.entrySet")) =>
+            {
+                return this.host.unknown_operand_call(r).map(Some);
+            }
+            ("contains", "(Ljava/lang/Object;)Z") | ("remove", "(Ljava/lang/Object;)Z")
+                if view.as_deref() == Some("asMap.values") =>
+            {
+                return this.host.unknown_operand_call(r).map(Some);
+            }
             ("size", "()I") => Value::Int(values.len() as i32),
             ("isEmpty", "()Z") => Value::Int(i32::from(values.is_empty())),
             ("contains", "(Ljava/lang/Object;)Z") => {
@@ -923,7 +948,7 @@ fn invoke_multimap<H: Host>(
         | ("get", "(Ljava/lang/Object;)Ljava/util/List;")
         | ("get", "(Ljava/lang/Object;)Ljava/util/Set;") => {
             let _ = values_for_key(this, &source, &args[0], true)?;
-            Ok(Some(cached_get_value(this, &source, &args[0])))
+            Ok(Some(fresh_get_value(this, &source, &args[0])))
         }
         ("containsKey", "(Ljava/lang/Object;)Z") => Ok(Some(Value::Int(
             values_for_key(this, &source, &args[0], false)?.is_some_and(|v| {

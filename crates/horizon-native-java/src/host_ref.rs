@@ -948,15 +948,37 @@ pub(crate) fn instance_of_class(
     if handle.kind() == HostKind::GuavaMultimap {
         let class = handle.class()?;
         let list = class.ends_with("$WrappedList") || class.ends_with("$RandomAccessWrappedList");
-        let set = class.ends_with("$WrappedSet");
-        if wanted == "java/util/Collection" || wanted == "java/lang/Object" {
+        let set = class.ends_with("$WrappedSet")
+            || class.ends_with("$KeySet")
+            || class.ends_with("$EntrySet");
+        let collection = list
+            || set
+            || class.ends_with("$Values")
+            || class == "com/google/common/collect/AbstractMultimap$Values";
+        let map = class.ends_with("$AsMap");
+        let multimap = (class.ends_with("Multimap") && !class.contains("$"))
+            || matches!(
+                class,
+                "com/google/common/collect/Synchronized$SynchronizedMultimap"
+                    | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+            );
+        if wanted == "java/lang/Object" {
             return Some(true);
+        }
+        if wanted == "java/util/Collection" {
+            return Some(collection);
         }
         if wanted == "java/util/List" {
             return Some(list);
         }
         if wanted == "java/util/Set" {
             return Some(set);
+        }
+        if wanted == "java/util/Map" {
+            return Some(map);
+        }
+        if wanted == "com/google/common/collect/Multimap" {
+            return Some(multimap);
         }
         if wanted == "java/util/RandomAccess" {
             return Some(class.ends_with("$RandomAccessWrappedList"));

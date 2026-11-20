@@ -71,17 +71,80 @@ public final class Probe {
     Collection<Integer> asMap = m.asMap().get("a");
     String classes = direct.getClass().getName() + "|" + asMap.getClass().getName()
         + "|" + m.asMap().entrySet().iterator().next().getValue().getClass().getName();
-    if (direct instanceof java.util.List<?> list) {
-      java.util.List<?> sub = list.subList(0, 1);
-      return classes + "|" + list.get(1) + "|" + sub.size() + "|"
-          + list.listIterator(1).next();
-    }
+    if (direct instanceof java.util.List<?> list)
+      return classes + "|" + list.get(1);
     @SuppressWarnings("unchecked") java.util.Set<Integer> set = (java.util.Set<Integer>) direct;
     return classes + "|" + set.contains(2) + "|" + set.add(2) + "|" + set.remove(1);
   }
   public static String wrappersArray() { return wrappers(ArrayListMultimap.create()); }
   public static String wrappersHash() { return wrappers(HashMultimap.create()); }
   public static String wrappersLinked() { return wrappers(LinkedHashMultimap.create()); }
+  private static String countedWrapperCalls(Multimap<String,Integer> m) {
+    m.put("a", 1); m.put("a", 2);
+    Collection<Integer> direct = m.get("a");
+    StringBuilder out = new StringBuilder();
+    try { direct.iterator(); out.append("iterator-ok"); }
+    catch (RuntimeException e) { out.append("iterator-").append(e.getClass().getSimpleName()); }
+    if (direct instanceof java.util.List<?> list) {
+      try { list.listIterator(); out.append("|listIterator-ok"); }
+      catch (RuntimeException e) { out.append("|listIterator-").append(e.getClass().getSimpleName()); }
+      try { list.subList(0, 1); out.append("|subList-ok"); }
+      catch (RuntimeException e) { out.append("|subList-").append(e.getClass().getSimpleName()); }
+    }
+    return out.toString();
+  }
+  public static String countedWrappersArray() { return countedWrapperCalls(ArrayListMultimap.create()); }
+  public static String countedWrappersHash() { return countedWrapperCalls(HashMultimap.create()); }
+  public static String countedWrappersLinked() { return countedWrapperCalls(LinkedHashMultimap.create()); }
+  public static String instanceofKinds() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    Object direct = m.get("a");
+    Object asMap = m.asMap();
+    Object asValue = m.asMap().get("a");
+    Object values = m.asMap().values();
+    Object keys = m.asMap().keySet();
+    Object entry = m.asMap().entrySet().iterator().next();
+    return ((Object)m instanceof java.util.Collection) + "|" + ((Object)m instanceof java.util.Map) + "|"
+        + (direct instanceof java.util.Collection) + "|" + (direct instanceof java.util.List)
+        + "|" + (asMap instanceof java.util.Collection) + "|" + (asMap instanceof java.util.Map)
+        + "|" + (asValue instanceof java.util.Collection) + "|" + (values instanceof java.util.Collection)
+        + "|" + (keys instanceof java.util.Collection) + "|" + (keys instanceof java.util.Set)
+        + "|" + (entry instanceof java.util.Map.Entry);
+  }
+  public static String freshGet() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    return Boolean.toString(m.get("a") != m.get("a"));
+  }
+  private static String countedValuesCalls() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    Collection<Collection<Integer>> values = m.asMap().values();
+    StringBuilder out = new StringBuilder();
+    try { values.toString(); out.append("toString-ok"); }
+    catch (RuntimeException e) { out.append("toString-").append(e.getClass().getSimpleName()); }
+    try { values.contains(java.util.List.of(1)); out.append("|contains-ok"); }
+    catch (RuntimeException e) { out.append("|contains-").append(e.getClass().getSimpleName()); }
+    try { values.remove(java.util.List.of(1)); out.append("|remove-ok"); }
+    catch (RuntimeException e) { out.append("|remove-").append(e.getClass().getSimpleName()); }
+    return out.toString();
+  }
+  public static String countedValues() { return countedValuesCalls(); }
+  public static String countedEntrySetToString() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    try { m.asMap().entrySet().toString(); }
+    catch (RuntimeException ignored) {}
+    return "done";
+  }
+  public static String taintedRead() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    try { m.get("a").iterator(); } catch (RuntimeException ignored) {}
+    try { m.size(); } catch (RuntimeException ignored) {}
+    return "done";
+  }
   private static String entrySetHandles(Multimap<String,Integer> m) {
     m.put("a", 1); m.put("a", 2);
     java.util.Set<Map.Entry<String, Collection<Integer>>> entries = m.asMap().entrySet();

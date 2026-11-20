@@ -77,6 +77,8 @@ fn real_guava_multimaps_match_java25() {
         "entrySetHandlesArray",
         "entrySetHandlesHash",
         "entrySetHandlesLinked",
+        "instanceofKinds",
+        "freshGet",
     ] {
         assert_eq!(
             fixture.text_on(&mut host, method),
@@ -101,6 +103,33 @@ fn real_guava_multimaps_match_java25() {
                 .iter()
                 .any(|(call, _)| call.contains(&format!("#{method}"))),
             "excluded method {method} was not counted: {:?}",
+            host.unknown_host_calls()
+        );
+    }
+    for method in [
+        "countedWrappersArray",
+        "countedWrappersHash",
+        "countedWrappersLinked",
+        "countedValues",
+        "countedEntrySetToString",
+        "taintedRead",
+    ] {
+        let _ = fixture.text_on(&mut host, method);
+    }
+    for call in [
+        "#iterator()Ljava/util/Iterator;",
+        "#listIterator()Ljava/util/ListIterator;",
+        "#subList(II)Ljava/util/List;",
+        "#toString()Ljava/lang/String;",
+        "#contains(Ljava/lang/Object;)Z",
+        "#remove(Ljava/lang/Object;)Z",
+        "#size()I",
+    ] {
+        assert!(
+            host.unknown_host_calls()
+                .iter()
+                .any(|(name, _)| name.contains(call)),
+            "reviewer case was not counted: {call}; calls: {:?}",
             host.unknown_host_calls()
         );
     }
