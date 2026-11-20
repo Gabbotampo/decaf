@@ -197,6 +197,7 @@ mod library_dispatch;
 mod linked_resources;
 mod list_equality;
 mod map_compute;
+mod menu_models;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -2383,6 +2384,21 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    /// Structural vanilla menu/container call. `None` leaves the call on the
+    /// ordinary host path; a returned error is a counted refusal.
+    fn menu_instance_call(
+        &mut self,
+        _r: &MethodRef,
+        _receiver: &Value,
+        _args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        None
+    }
+
+    fn menu_field(&mut self, _receiver: &Value, _r: &MethodRef) -> Option<Value> {
+        None
+    }
+
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -3684,6 +3700,7 @@ pub struct StdHost {
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
     vec2: vec2::State,
+    menu_states: BTreeMap<String, menu_models::MenuState>,
 }
 
 impl Default for StdHost {
@@ -3858,6 +3875,7 @@ impl StdHost {
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
             vec2: vec2::State::default(),
+            menu_states: BTreeMap::new(),
         }
     }
 
@@ -5758,6 +5776,31 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn menu_instance_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if menu_models::is_menu_class(&r.owner)
+            || (r.owner == "net/minecraft/world/item/ItemStack"
+                && matches!(
+                    r.name.as_str(),
+                    "isEmpty" | "getCount" | "shrink" | "copy" | "onCraftedBy"
+                ))
+        {
+            return menu_models::call(&mut self.menu_states, r, receiver, args);
+        }
+        None
+    }
+
+    fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
+        let key = crate::runtime::expect_ref(receiver)?;
+        self.menu_states
+            .get(key)
+            .and_then(|state| menu_models::field(state, r))
+    }
+
     fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
         self.properties_put_all(marker, entries);
         true
@@ -5876,6 +5919,9 @@ impl Host for StdHost {
     }
 
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = self.menu_field(receiver, r) {
+            return Ok(value);
+        }
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
             return value;
         }
@@ -6577,6 +6623,18 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "EMPTY"
+            && r.descriptor == "Lnet/minecraft/world/item/ItemStack;"
+        {
+            return Ok(Value::Ref(Some("stack/empty".into())));
+        }
+        if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
+            && r.name == "NULL"
+            && r.descriptor == "Lnet/minecraft/world/inventory/ContainerLevelAccess;"
+        {
+            return Ok(Value::Ref(Some("container-level-access/null".into())));
+        }
         if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
             return value;
         }
@@ -8290,6 +8348,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = self.menu_instance_call(r, receiver, args) {
+            return value;
+        }
         if let Some(value) =
             host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
         {
@@ -29890,6 +29951,17 @@ impl<H: Host> Runtime<'_, H> {
             (None, None) if !host_models => linked
                 .get(class)
                 .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?,
+            (None, None) if host_models => {
+                let r = MethodRef {
+                    owner: class.to_owned(),
+                    name: method.to_owned(),
+                    descriptor: desc.to_owned(),
+                };
+                return match receiver.as_ref() {
+                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    None => self.host.invoke(&r, args),
+                };
+            }
             (None, None) => {
                 return Err(NativeError::MissingMethod(format!(
                     "{class}#{method}{desc}"
@@ -31182,7 +31254,11 @@ impl<H: Host> Runtime<'_, H> {
                                 }
                                 None => {
                                     self.refuse_collected(&receiver, &r)?;
-                                    self.host.get_field(&receiver, &r)?
+                                    if let Some(value) = self.host.menu_field(&receiver, &r) {
+                                        value
+                                    } else {
+                                        self.host.get_field(&receiver, &r)?
+                                    }
                                 }
                             }
                         }
