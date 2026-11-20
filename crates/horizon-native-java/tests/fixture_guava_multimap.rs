@@ -8,6 +8,7 @@ mod javac_fixture;
 use javac_fixture::Fixture;
 use std::path::PathBuf;
 
+const AS_MAP_ORACLE: &str = include_str!("fixtures/guava_multimap/java25.txt");
 const PROBE: &str = include_str!("fixtures/guava_multimap/Probe.java");
 
 fn guava_jar() -> Option<PathBuf> {
@@ -42,16 +43,17 @@ fn real_guava_multimaps_match_java25() {
     assert_eq!(fixture.text_on(&mut host, "excluded"), "done");
     assert_eq!(
         host.unknown_host_call_count(),
-        17,
+        14,
         "{:?}",
         host.unknown_host_calls()
     );
+    assert_eq!(
+        fixture.text_on(&mut host, "asMapIdentity"),
+        AS_MAP_ORACLE.trim()
+    );
     for method in [
-        "asMap",
         "entries",
-        "keySet",
         "keys",
-        "values",
         "replaceValues",
         "removeAll",
         "equals",

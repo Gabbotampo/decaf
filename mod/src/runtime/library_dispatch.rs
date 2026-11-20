@@ -36,13 +36,24 @@ impl<H: Host> Runtime<'_, H> {
                 });
             };
             let Some(file) = self.class(enum_class).cloned() else {
-                return Ok(None);
+                // EnumSet.noneOf delegates to Class.getEnumConstantsShared.
+                // For a class outside the jar table the JDK still knows the
+                // class, and a non-enum class reaches the same
+                // ClassCastException as a jar class does.
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: Some(format!(
+                        "class {} not an enum",
+                        enum_class.replace('/', ".")
+                    )),
+                    frame: None,
+                });
             };
             if file.super_name != "java/lang/Enum" {
                 return Err(NativeError::UncaughtException {
-                    class: "java/lang/IllegalArgumentException".into(),
+                    class: "java/lang/ClassCastException".into(),
                     message: Some(format!(
-                        "{} is not an enum type",
+                        "class {} not an enum",
                         enum_class.replace('/', ".")
                     )),
                     frame: None,
@@ -76,7 +87,69 @@ impl<H: Host> Runtime<'_, H> {
                         })
                         .collect()
                 });
-            return Ok(self.host.make_collection("java/util/EnumSet", values));
+            let set = self.host.make_collection("java/util/EnumSet", values);
+            if let Some(set) = &set
+                && let Some(marker) = crate::runtime::jar_object::object_key(set)
+            {
+                self.fields.insert(
+                    format!("{marker}|enum-set-type"),
+                    Value::Ref(Some(enum_class.to_owned())),
+                );
+            }
+            return Ok(set);
+        }
+        // RegularEnumSet/JumboEnumSet.typeCheck is part of the public
+        // Collection contract: null is NPE and a constant from another enum
+        // is CCE. The host's generic collection row cannot enforce that
+        // element type, so enforce it at the model boundary before add.
+        if let Some(receiver) = receiver
+            && let Some(marker) = crate::runtime::jar_object::object_key(receiver)
+            && let Some(Value::Ref(Some(enum_class))) =
+                self.fields.get(&format!("{marker}|enum-set-type"))
+        {
+            // The bulk mutators need the exact Regular/Jumbo bit-vector
+            // paths to enforce their element type. Keep them COUNTED until
+            // those paths are modelled; never let the generic host list
+            // silently accept a foreign enum.
+            if matches!(
+                r.name.as_str(),
+                "addAll" | "retainAll" | "removeAll" | "removeIf"
+            ) {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
+            if r.name == "add" && r.descriptor == "(Ljava/lang/Object;)Z" {
+                let element = args.first().unwrap_or(&Value::Ref(None));
+                if matches!(element, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let Some(element_class) = crate::runtime::jar_object::object_class(element) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!("class java.lang.Object != class {enum_class}")),
+                        frame: None,
+                    });
+                };
+                let valid = element_class == enum_class
+                    || self
+                        .class(element_class)
+                        .is_some_and(|file| file.super_name == *enum_class);
+                if !valid {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!(
+                            "class {} != class {}",
+                            element_class.replace('/', "."),
+                            enum_class.replace('/', ".")
+                        )),
+                        frame: None,
+                    });
+                }
+                return Ok(Some(self.host.invoke_instance(r, receiver, args)?));
+            }
         }
         if let Some(receiver) = receiver
             && let Some(value) = crate::runtime::kotlin_stdlib::instance(self, r, receiver, args)

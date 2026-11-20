@@ -39,6 +39,9 @@ fn jdk_and_guava_calls_match_java25() {
         "arrayMap",
         "hashMap",
         "linkedMap",
+        "enumContracts",
+        "jarCollectionStream",
+        "toCollectionJarOverride",
     ] {
         let expected = ORACLE
             .lines()

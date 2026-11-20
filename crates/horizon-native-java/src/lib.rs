@@ -29567,6 +29567,36 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // The stream model owns JDK/host collection rows and live stream
+        // markers. A jar object that merely inherits Collection.stream must
+        // still dispatch through its own bytecode (and its iterator override)
+        // before any host model is considered.
+        if (r.name == "stream" || r.name == "parallelStream")
+            && r.descriptor == "()Ljava/util/stream/Stream;"
+            && is_collection_owner(&r.owner)
+            && receiver.is_some_and(|value| {
+                match value {
+                    Value::Host(handle)
+                        if matches!(
+                            handle.kind(),
+                            HostKind::Collection | HostKind::GuavaMultimap
+                        ) =>
+                    {
+                        false
+                    }
+                    // `new ArrayList()` is allocated as a JarObject marker,
+                    // but its class is still a host/JDK class. A jar-owned
+                    // subclass (such as Bag) remains on its bytecode path.
+                    Value::Host(handle) if handle.kind() == HostKind::JarObject => {
+                        let class = crate::jar_object::class_of_key(handle.key());
+                        !(self.class(class).is_none() && is_collection_owner(class))
+                    }
+                    _ => true,
+                }
+            })
+        {
+            return Ok(None);
+        }
         // Stages, `concat`, builders and the per-element terminals run
         // lazily (`stream_pipeline.rs`).
         if let Some(value) = self.invoke_lazy_stream(r, receiver, args, class, method)? {
@@ -29749,7 +29779,18 @@ impl<H: Host> Runtime<'_, H> {
                             descriptor: "(Ljava/lang/Object;)Z".into(),
                         };
                         for value in values {
-                            self.host.invoke_instance(&add, &collection, &[value])?;
+                            // Collection.add is virtual. A supplier may have
+                            // constructed a jar subclass of ArrayList whose
+                            // override is observable; dispatch it through the
+                            // interpreter exactly as the JVM does.
+                            self.call_virtual(
+                                crate::jdk_call::Site::Interface,
+                                &add.owner,
+                                &add.name,
+                                &add.descriptor,
+                                &collection,
+                                &[value],
+                            )?;
                         }
                         collection
                     }

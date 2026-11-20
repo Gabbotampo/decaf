@@ -34,6 +34,14 @@ fn ref_text(value: &Value) -> Option<&str> {
     }
 }
 
+fn null_argument() -> NativeError {
+    NativeError::UncaughtException {
+        class: "java/lang/NullPointerException".into(),
+        message: None,
+        frame: None,
+    }
+}
+
 fn put_field<H: Host>(this: &mut Runtime<'_, H>, key: &str, name: &str, value: Value) {
     this.fields.insert(state_key(key, name), value);
 }
@@ -77,6 +85,38 @@ fn cached_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &str, cla
     put_field(this, &view_key, "view", Value::Ref(Some(name.to_owned())));
     put_field(this, &view_key, "target", handle(source.to_owned()));
     put_field(this, source, name, view.clone());
+    view
+}
+
+/// `Multimap.asMap().get(key)` is a fresh WrappedCollection/WrappedList on
+/// every call. It is a live view over one key, rather than the collection
+/// returned by `multimap.get(key)`.
+fn fresh_as_map_value<H: Host>(this: &mut Runtime<'_, H>, source: &str, key: &Value) -> Value {
+    let view = handle(
+        this.new_object_key("com/google/common/collect/AbstractMapBasedMultimap$WrappedCollection"),
+    );
+    let view_key = handle_key(&view).expect("Guava asMap value view is a handle");
+    put_field(
+        this,
+        &view_key,
+        "view",
+        Value::Ref(Some("asMap.get".into())),
+    );
+    put_field(this, &view_key, "target", handle(source.to_owned()));
+    put_field(this, &view_key, "map-key", key.clone());
+    view
+}
+
+fn fresh_as_map_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &str) -> Value {
+    let class = match name {
+        "asMap.entrySet" => "java/util/AbstractMap$SimpleEntrySet",
+        "asMap.keySet" => "java/util/AbstractMap$KeySet",
+        _ => "java/util/AbstractMap$Values",
+    };
+    let view = handle(this.new_object_key(class));
+    let view_key = handle_key(&view).expect("Guava asMap view is a handle");
+    put_field(this, &view_key, "view", Value::Ref(Some(name.into())));
+    put_field(this, &view_key, "target", handle(source.to_owned()));
     view
 }
 
@@ -194,10 +234,12 @@ fn make_multimap<H: Host>(
     let value = handle(this.new_object_key(class));
     let key = handle_key(&value).unwrap();
     put_field(this, &key, "kind", Value::Ref(Some(kind.into())));
-    let map_class = if kind == "hash" {
-        "java/util/HashMap"
-    } else {
+    // ArrayListMultimap uses a HashMap for keys; only the linked variant
+    // preserves insertion order.
+    let map_class = if kind == "linked" {
         "java/util/LinkedHashMap"
+    } else {
+        "java/util/HashMap"
     };
     let map = this
         .host
@@ -290,9 +332,7 @@ pub(crate) fn invoke<H: Host>(
         && let Some(key) = handle_key(receiver)
         && (is_view(this, &key) || kind(this, &key).is_some())
     {
-        if kind(this, &key).as_deref() == Some("sync")
-            || (is_view(this, &key) && view_name(this, &key).as_deref() != Some("asMap"))
-        {
+        if kind(this, &key).as_deref() == Some("sync") {
             return this.host.unknown_operand_call(r).map(Some);
         }
         return invoke_multimap(this, r, receiver, args, &key);
@@ -331,7 +371,210 @@ fn invoke_multimap<H: Host>(
     key: &str,
 ) -> Result<Option<Value>, NativeError> {
     let source = target_key(this, key);
-    if view_name(this, key).as_deref() == Some("asMap") {
+    let view = view_name(this, key);
+    if view.as_deref() == Some("asMap.get") {
+        let Some(map_key) = field(this, key, "map-key") else {
+            return this.host.unknown_operand_call(r).map(Some);
+        };
+        let current = values_for_key(this, &source, &map_key, false)?;
+        let value = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("size", "()I") => Value::Int(
+                current
+                    .as_ref()
+                    .map(|values| {
+                        invoke_instance(this, &collection_ref("size", "()I"), values, &[])
+                    })
+                    .transpose()?
+                    .and_then(|value| match value {
+                        Value::Int(size) => Some(size),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            ),
+            ("isEmpty", "()Z") => Value::Int(i32::from(current.as_ref().is_none_or(|values| {
+                invoke_instance(this, &collection_ref("isEmpty", "()Z"), values, &[])
+                    .is_ok_and(|value| value == Value::Int(1))
+            }))),
+            ("contains", "(Ljava/lang/Object;)Z") => {
+                Value::Int(i32::from(current.as_ref().is_some_and(|values| {
+                    args.first().is_some_and(|needle| {
+                        invoke_instance(
+                            this,
+                            &collection_ref("contains", "(Ljava/lang/Object;)Z"),
+                            values,
+                            std::slice::from_ref(needle),
+                        )
+                        .is_ok_and(|value| value == Value::Int(1))
+                    })
+                })))
+            }
+            ("add", "(Ljava/lang/Object;)Z") => {
+                let value = args.first().ok_or_else(null_argument)?;
+                put_one(this, &source, &map_key, value)?
+            }
+            ("remove", "(Ljava/lang/Object;)Z") => {
+                let value = args.first().ok_or_else(null_argument)?;
+                remove_one(this, &source, &map_key, value)?
+            }
+            ("clear", "()V") => {
+                if let Some(map) = backing(this, &source) {
+                    invoke_instance(
+                        this,
+                        &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                        &map,
+                        std::slice::from_ref(&map_key),
+                    )?;
+                }
+                Value::Void
+            }
+            ("iterator", "()Ljava/util/Iterator;") => {
+                let values = current
+                    .map(|value| runtime_collection_values(&*this.host, &value))
+                    .transpose()?
+                    .unwrap_or_default();
+                return this
+                    .host
+                    .new_host_iterator(values, Some("guava-as-map-value".into()))
+                    .map_or_else(
+                        || this.host.unknown_operand_call(r).map(Some),
+                        |iterator| Ok(Some(iterator)),
+                    );
+            }
+            ("toString", "()Ljava/lang/String;") => {
+                let values = current
+                    .map(|value| runtime_collection_values(&*this.host, &value))
+                    .transpose()?
+                    .unwrap_or_default();
+                Value::Ref(Some(format!(
+                    "[{}]",
+                    values.iter().map(value_text).collect::<Vec<_>>().join(", ")
+                )))
+            }
+            _ => return this.host.unknown_operand_call(r).map(Some),
+        };
+        return Ok(Some(value));
+    }
+    if matches!(
+        view.as_deref(),
+        Some("asMap.entrySet" | "asMap.keySet" | "asMap.values")
+    ) {
+        let keys = map_keys(this, &source)?;
+        let values = match view.as_deref() {
+            Some("asMap.keySet") => keys.clone(),
+            Some("asMap.values") => keys
+                .iter()
+                .filter_map(|candidate| {
+                    values_for_key(this, &source, candidate, false)
+                        .ok()
+                        .flatten()
+                })
+                .collect(),
+            _ => {
+                let map_view = handle(key.to_owned());
+                let mut entries = Vec::new();
+                for candidate in keys {
+                    if let Some(collection) = values_for_key(this, &source, &candidate, false)? {
+                        entries.push(this.host.mint_map_entry(
+                            Some(&map_view),
+                            &candidate,
+                            &collection,
+                            crate::host_map_entry::EntryMade::Node,
+                        ));
+                    }
+                }
+                entries
+            }
+        };
+        let value = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("size", "()I") => Value::Int(values.len() as i32),
+            ("isEmpty", "()Z") => Value::Int(i32::from(values.is_empty())),
+            ("contains", "(Ljava/lang/Object;)Z") => {
+                Value::Int(i32::from(args.first().is_some_and(|needle| {
+                    values
+                        .iter()
+                        .any(|value| this.java_equals(value, needle).unwrap_or(false))
+                })))
+            }
+            ("toString", "()Ljava/lang/String;") => Value::Ref(Some(format!(
+                "[{}]",
+                values.iter().map(value_text).collect::<Vec<_>>().join(", ")
+            ))),
+            ("iterator", "()Ljava/util/Iterator;") => {
+                return this
+                    .host
+                    .new_host_iterator(values, Some("guava-as-map-view".into()))
+                    .map_or_else(
+                        || this.host.unknown_operand_call(r).map(Some),
+                        |iterator| Ok(Some(iterator)),
+                    );
+            }
+            ("remove", "(Ljava/lang/Object;)Z") if view.as_deref() == Some("asMap.keySet") => {
+                let Some(candidate) = args.first() else {
+                    return Ok(Some(Value::Int(0)));
+                };
+                let present = values_for_key(this, &source, candidate, false)?.is_some();
+                if present && let Some(map) = backing(this, &source) {
+                    invoke_instance(
+                        this,
+                        &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                        &map,
+                        std::slice::from_ref(candidate),
+                    )?;
+                }
+                Value::Int(i32::from(present))
+            }
+            ("remove", "(Ljava/lang/Object;)Z") => {
+                let Some(candidate) = args.first() else {
+                    return Ok(Some(Value::Int(0)));
+                };
+                let mut removed = false;
+                for map_key in map_keys(this, &source)? {
+                    let Some(collection) = values_for_key(this, &source, &map_key, false)? else {
+                        continue;
+                    };
+                    let matches = if view.as_deref() == Some("asMap.entrySet") {
+                        this.host.map_entry_parts(candidate).is_some_and(
+                            |(entry_key, entry_value)| {
+                                this.java_equals(&map_key, &entry_key).unwrap_or(false)
+                                    && this.java_equals(&collection, &entry_value).unwrap_or(false)
+                            },
+                        )
+                    } else {
+                        this.java_equals(&collection, candidate).unwrap_or(false)
+                    };
+                    if matches {
+                        if let Some(map) = backing(this, &source) {
+                            invoke_instance(
+                                this,
+                                &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                                &map,
+                                std::slice::from_ref(&map_key),
+                            )?;
+                        }
+                        removed = true;
+                        break;
+                    }
+                }
+                Value::Int(i32::from(removed))
+            }
+            ("clear", "()V") => {
+                if let Some(map) = backing(this, &source) {
+                    for candidate in map_keys(this, &source)? {
+                        invoke_instance(
+                            this,
+                            &map_ref("remove", "(Ljava/lang/Object;)Ljava/lang/Object;"),
+                            &map,
+                            std::slice::from_ref(&candidate),
+                        )?;
+                    }
+                }
+                Value::Void
+            }
+            _ => return this.host.unknown_operand_call(r).map(Some),
+        };
+        return Ok(Some(value));
+    }
+    if view.as_deref() == Some("asMap") {
         let keys = map_keys(this, &source)?;
         let mut present = |candidate: &Value| {
             values_for_key(this, &source, candidate, false)
@@ -353,41 +596,11 @@ fn invoke_multimap<H: Host>(
                     values_for_key(this, &source, candidate, false)
                         .ok()
                         .flatten()
+                        .map(|_| fresh_as_map_value(this, &source, candidate))
                 })
                 .unwrap_or(Value::Ref(None)),
-            ("entrySet", "()Ljava/util/Set;") => {
-                let mut entries = Vec::new();
-                let map_view = Value::Host(HostRef::new(HostKind::GuavaMultimap, key.to_owned()));
-                for candidate in keys {
-                    if let Some(values) = values_for_key(this, &source, &candidate, false)? {
-                        entries.push(this.host.mint_map_entry(
-                            Some(&map_view),
-                            &candidate,
-                            &values,
-                            crate::host_map_entry::EntryMade::Node,
-                        ));
-                    }
-                }
-                this.host
-                    .owned_collection(
-                        &map_view,
-                        "asMap.entrySet",
-                        "java/util/LinkedHashSet",
-                        true,
-                        entries,
-                    )
-                    .ok_or_else(|| NativeError::Metadata("Guava map view unavailable".into()))?
-            }
-            ("keySet", "()Ljava/util/Set;") => this
-                .host
-                .owned_collection(
-                    &Value::Host(HostRef::new(HostKind::GuavaMultimap, key.to_owned())),
-                    "asMap.keySet",
-                    "java/util/LinkedHashSet",
-                    true,
-                    keys,
-                )
-                .ok_or_else(|| NativeError::Metadata("Guava map view unavailable".into()))?,
+            ("entrySet", "()Ljava/util/Set;") => fresh_as_map_view(this, &source, "asMap.entrySet"),
+            ("keySet", "()Ljava/util/Set;") => fresh_as_map_view(this, &source, "asMap.keySet"),
             ("values", "()Ljava/util/Collection;") => {
                 let mut all = Vec::new();
                 for candidate in keys {
@@ -395,15 +608,7 @@ fn invoke_multimap<H: Host>(
                         all.push(collection);
                     }
                 }
-                this.host
-                    .owned_collection(
-                        &Value::Host(HostRef::new(HostKind::GuavaMultimap, key.to_owned())),
-                        "asMap.values",
-                        "java/util/ArrayList",
-                        true,
-                        all,
-                    )
-                    .ok_or_else(|| NativeError::Metadata("Guava map view unavailable".into()))?
+                fresh_as_map_view(this, &source, "asMap.values")
             }
             _ => return this.host.unknown_operand_call(r).map(Some),
         };
