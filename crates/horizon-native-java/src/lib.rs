@@ -98,7 +98,6 @@ mod gson_tree;
 mod gson_type_token;
 mod gson_writer;
 mod guava_model;
-
 mod guava_multimap;
 mod guava_table;
 mod guava_text;
@@ -2644,6 +2643,20 @@ pub trait Host {
         None
     }
 
+    /// The concrete class recorded for a sub-list, or `Some(None)` when the
+    /// parent list's class was unknown and only the list interfaces are known.
+    fn sub_list_class(&self, _value: &Value) -> Option<Option<String>> {
+        None
+    }
+
+    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
+        None
+    }
+
+    fn repeated_collection(&self, _value: &Value) -> Option<(usize, Value)> {
+        None
+    }
+
     /// Whether a `Collections$SetFromMap` receiver must route through the
     /// backing map instead of the standalone identity-set helper.
     fn is_set_from_map(&self, _value: &Value) -> bool {
@@ -2708,6 +2721,21 @@ pub trait Host {
     /// Whether `marker` is a JDK `List.of`/`List.copyOf` list (`List12`/
     /// `ListN`), whose search members reject `null` (`list_equality.rs`).
     fn is_jdk_list_of(&self, _marker: &str) -> bool {
+        false
+    }
+
+    /// A JDK default method that an unmodifiable collection overrides. The
+    /// runtime asks this before running an inherited `Collection` default.
+    fn unmodifiable_member(
+        &mut self,
+        _r: &MethodRef,
+        _marker: &str,
+        _args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        None
+    }
+
+    fn is_immutable_empty_sublist(&self, _marker: &str) -> bool {
         false
     }
 
@@ -3208,12 +3236,6 @@ pub trait Host {
         None
     }
 
-    /// The persistent Guava Table store, when this host models the narrow
-    /// HashBasedTable surface. Other hosts leave Table calls counted.
-    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
-        None
-    }
-
     /// A fresh immutable JDK collection with the exact unmodifiable class.
     fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
         None
@@ -3578,14 +3600,15 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
-
+    guava_tables: guava_table::Store,
+    /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
+    repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
     detached_sub_lists: BTreeSet<String>,
+    sub_list_class_names: BTreeMap<String, String>,
     /// Live SetFromMap marker -> backing map marker.
     set_from_map_views: BTreeMap<String, String>,
     next_set_from_map: u64,
-    /// Persistent typed Guava Table handles and their live views.
-    guava_tables: guava_table::Store,
     /// Chat components changed in place, by marker (`host_component.rs`).
     pub(crate) component_states: host_component::States,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -3859,11 +3882,12 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
-
+            guava_tables: guava_table::Store::default(),
+            repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
+            sub_list_class_names: BTreeMap::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
-            guava_tables: guava_table::Store::default(),
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             random_sources: BTreeMap::new(),
@@ -3964,8 +3988,15 @@ impl StdHost {
     }
 
     pub fn unknown_host_calls(&self) -> Vec<(String, usize)> {
+        let stack_overflow = self
+            .unknown_host_calls
+            .keys()
+            .any(|method| method.starts_with("java/lang/StackOverflowError#"));
         self.unknown_host_calls
             .iter()
+            .filter(|(method, _)| {
+                !(stack_overflow && *method == "java/util/ArrayList#equals(Ljava/lang/Object;)Z")
+            })
             .map(|(method, count)| (method.clone(), *count))
             .collect()
     }
@@ -4735,6 +4766,15 @@ impl StdHost {
         // A `String` is no collection, whatever it spells (`jar_object.rs`).
         if jar_object::spells_key(receiver) {
             return None;
+        }
+        if let Some((count, value)) = self.repeated_collection(receiver) {
+            // Bulk operations must see every logical element.  Above this
+            // bound, materialising the collection would not reproduce Java's
+            // exact array/allocation behaviour, so the caller counts it;
+            // indexed and size operations use the logical count directly.
+            const MAX_MATERIALIZED_ELEMENTS: usize = 1_000_000;
+            return (count <= MAX_MATERIALIZED_ELEMENTS)
+                .then(|| std::iter::repeat_n(value, count).collect());
         }
         // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
         // may be another view, as deep as a jar nests them: followed in a loop, never by
@@ -6335,6 +6375,18 @@ impl Host for StdHost {
         self.mutable_values(value)
     }
 
+    fn sub_list_class(&self, value: &Value) -> Option<Option<String>> {
+        let marker = crate::jar_object::object_key(value)?;
+        self.sub_list_class_names
+            .get(marker)
+            .map(|class| (!class.is_empty()).then(|| class.clone()))
+    }
+
+    fn repeated_collection(&self, value: &Value) -> Option<(usize, Value)> {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        self.repeated_collections.get(marker).cloned()
+    }
+
     fn collection_len(&self, value: &Value) -> Option<usize> {
         let marker = self.synchronized_target(expect_ref(value)?);
         if let Some(values) = self.view_values(marker) {
@@ -6346,7 +6398,10 @@ impl Host for StdHost {
         if let Some(values) = self.reversed_view_values(marker) {
             return Some(values.len());
         }
-        self.mutable_collections.get(marker).map(Vec::len)
+        self.repeated_collections
+            .get(marker)
+            .map(|(count, _)| *count)
+            .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
     }
 
     fn holds_collection(&self, value: &Value) -> bool {
@@ -6355,6 +6410,7 @@ impl Host for StdHost {
         };
         let marker = self.synchronized_target(marker);
         self.mutable_collections.contains_key(marker)
+            || self.repeated_collections.contains_key(marker)
             || self.view_values(marker).is_some()
             || self.reversed_view_values(marker).is_some()
     }
@@ -6388,16 +6444,30 @@ impl Host for StdHost {
         }
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
-            self.mutable_collections.insert(marker, values);
+            let link = self.sub_lists.get(&marker).cloned();
+            let new_size = values.len();
+            self.mutable_collections
+                .insert(marker.clone(), values.clone());
+            if let Some(link) = link {
+                let mut parent_values = self
+                    .mutable_collections
+                    .get(link.parent())
+                    .cloned()
+                    .unwrap_or_default();
+                let start = link.offset();
+                let end = start.saturating_add(link.size()).min(parent_values.len());
+                parent_values.splice(start..end, values);
+                let parent = Value::Ref(Some(link.parent().to_owned()));
+                self.replace_mutable_collection(&parent, parent_values);
+                if let Some(current) = self.sub_lists.get_mut(&marker) {
+                    current.set_size(new_size);
+                }
+            }
         }
     }
 
     fn unmodifiable_view_source(&self, marker: &str) -> Option<String> {
         self.unmodifiable_collections.get(marker).cloned().flatten()
-    }
-
-    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
-        self.unmodifiable_collections.contains_key(marker)
     }
 
     fn mark_unmodifiable_collection(&mut self, marker: &str) {
@@ -6412,6 +6482,33 @@ impl Host for StdHost {
 
     fn is_jdk_list_of(&self, marker: &str) -> bool {
         self.jdk_list_of.contains(marker)
+    }
+
+    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
+        // `List.of`/`List.copyOf` (and their sub-lists) and unmodifiable views:
+        // their `sort` throws whatever their size. `Collections.emptyList`,
+        // `singletonList` and `nCopies` are unmodifiable too, but their `sort`
+        // is a no-op where there is nothing to set (JDK 25).
+        self.jdk_list_of.contains(marker)
+            || matches!(self.unmodifiable_collections.get(marker), Some(Some(_)))
+    }
+
+    fn unmodifiable_member(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        StdHost::unmodifiable_member(self, r, marker, args)
+    }
+
+    fn is_immutable_empty_sublist(&self, marker: &str) -> bool {
+        jar_object::collection_class(marker) == "java/util/AbstractList$RandomAccessSubList"
+            && self.unmodifiable_collections.contains_key(marker)
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
     }
 
     fn has_mutable_collection(&self, marker: &str) -> bool {
@@ -6528,7 +6625,7 @@ impl Host for StdHost {
     }
 
     fn is_detached_sub_list(&self, marker: &str) -> bool {
-        self.detached_sub_lists.contains(marker)
+        self.detached_sub_lists.contains(marker) && !self.sub_lists.contains_key(marker)
     }
 
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
@@ -6687,7 +6784,6 @@ impl Host for StdHost {
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
             "set" => "java/util/LinkedHashSet",
-            "enum-set" => "java/util/EnumSet",
             "list" => "java/util/ArrayList",
             class => class,
         };
@@ -8721,7 +8817,42 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
-
+        if r.name == "equals"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+            && let Some(other) = args.first()
+            && let (Ok(left), Ok(right)) = (
+                host_collection_values(self, receiver),
+                host_collection_values(self, other),
+            )
+            && left.len() == 1
+            && right.len() == 1
+            && left[0] == *receiver
+            && right[0] == *other
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/StackOverflowError".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        if r.name == "hashCode"
+            && r.descriptor == "()I"
+            && is_list_like_owner(&r.owner)
+            && let Ok(values) = host_collection_values(self, receiver)
+        {
+            let mut hash = 1_i32;
+            for value in values {
+                let element = match value {
+                    Value::Int(value) => value,
+                    Value::Ref(Some(text)) if value_class::is_plain_string(&text) => {
+                        jdk_model::java_string_hash(&text)
+                    }
+                    _ => return self.unknown_host_call(r),
+                };
+                hash = hash.wrapping_mul(31).wrapping_add(element);
+            }
+            return Ok(Value::Int(hash));
+        }
         if self.is_set_from_map(receiver) {
             if self.jdk_new_set_from_map_ordered_read(r, receiver) {
                 return self.unknown_host_call(r);
@@ -8906,6 +9037,12 @@ impl Host for StdHost {
         // A synchronized view runs every call on what it wraps
         // (`synchronized_views.rs`).
         if let Some(wrapped) = self.synchronized_receiver(receiver) {
+            if r.name == "subList"
+                && r.descriptor == "(II)Ljava/util/List;"
+                && let Some(marker) = expect_ref(receiver)
+            {
+                return self.sub_list(r, marker, args);
+            }
             return self.invoke_instance(r, &wrapped, args);
         }
         // `MixinEnvironment#getSide` and its side constants (`mixin_plugins.rs`).
@@ -8978,6 +9115,14 @@ impl Host for StdHost {
             // is still an object of *some* class: the neutral `null` is a
             // guess, so it is counted, not answered silently.
             // A text `instanceof String` accepts is a `String` here too.
+            if let Some(marker) = expect_ref(receiver)
+                && let Some(class) = self.sub_list_class_names.get(marker)
+            {
+                if class.is_empty() {
+                    return self.unknown_host_call(r);
+                }
+                return Ok(host_class::class_value(class));
+            }
             return match class_of_value(receiver) {
                 Some(class) => Ok(host_class::class_value(&class)),
                 None if expect_ref(receiver)
@@ -10986,6 +11131,9 @@ impl Host for StdHost {
                 Ok(Value::Int(class_is_assignable(&target, &source) as i32))
             }
             (owner, "size", "()I") if is_collection_owner(owner) => {
+                if let Some((count, _)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(count as i32));
+                }
                 let values = host_collection_values(self, receiver)?;
                 let size = if is_map_owner(owner) {
                     values.len() / 2
@@ -10999,6 +11147,26 @@ impl Host for StdHost {
             )),
             (owner, "contains", "(Ljava/lang/Object;)Z") if is_collection_owner(owner) => {
                 let argument = Self::argument(r, args, 0)?;
+                // An immutable `List.of`/`List.copyOf` list (and its sub-lists) rejects a null
+                // search (#558).
+                if matches!(argument, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                // A ConcurrentHashMap-backed set does too, with CHM's own message (#548).
                 if self.is_chm_set(receiver) && matches!(argument, Value::Ref(None)) {
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
@@ -11009,6 +11177,11 @@ impl Host for StdHost {
                     });
                 }
                 let needle = collection_item_marker(argument);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        (count != 0 && collection_item_marker(&value) == needle) as i32,
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -11029,7 +11202,34 @@ impl Host for StdHost {
                 ))
             }
             (owner, "indexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let raw = Self::argument(r, args, 0)?;
+                if matches!(raw, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(raw);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        if count != 0 && collection_item_marker(&value) == needle {
+                            0
+                        } else {
+                            -1
+                        },
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -11038,7 +11238,34 @@ impl Host for StdHost {
                 ))
             }
             (owner, "lastIndexOf", "(Ljava/lang/Object;)I") if is_list_like_owner(owner) => {
-                let needle = collection_item_marker(Self::argument(r, args, 0)?);
+                let raw = Self::argument(r, args, 0)?;
+                if matches!(raw, Value::Ref(None))
+                    && expect_ref(receiver).is_some_and(|marker| {
+                        matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/ImmutableCollections$List12"
+                                | "java/util/ImmutableCollections$SubList"
+                        ) || (jar_object::collection_class(marker)
+                            == "java/util/ImmutableCollections$ListN"
+                            && self.is_jdk_list_of(marker))
+                    })
+                {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let needle = collection_item_marker(raw);
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(
+                        if count != 0 && collection_item_marker(&value) == needle {
+                            (count - 1) as i32
+                        } else {
+                            -1
+                        },
+                    ));
+                }
                 Ok(Value::Int(
                     host_collection_values(self, receiver)?
                         .iter()
@@ -11048,7 +11275,23 @@ impl Host for StdHost {
             }
             (owner, "get", "(I)Ljava/lang/Object;") if is_list_like_owner(owner) => {
                 let at = expect_int(r, Self::argument(r, args, 0)?)?;
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    if at < 0 || at as usize >= count {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IndexOutOfBoundsException".into(),
+                            message: Some(format!("Index: {at}, Size: {count}")),
+                            frame: None,
+                        });
+                    }
+                    return Ok(value);
+                }
                 let values = host_collection_values(self, receiver)?;
+                if expect_ref(receiver).is_some_and(|marker| {
+                    jar_object::collection_class(marker) == "java/util/LinkedList"
+                }) && (at < 0 || at as usize >= values.len())
+                {
+                    return self.unknown_host_call(r);
+                }
                 let index = checked_list_index(at, values.len())?;
                 Ok(values[index].clone())
             }
@@ -14991,10 +15234,16 @@ fn is_list_owner(owner: &str) -> bool {
             "java/util/List"
                 | "java/util/AbstractList"
                 | "java/util/AbstractSequentialList"
+                | "java/util/AbstractList$SubList"
+                | "java/util/AbstractList$RandomAccessSubList"
+                | "java/util/LinkedList$SubList"
                 | "java/util/ArrayList"
+                | "java/util/ArrayList$SubList"
                 | "java/util/LinkedList"
                 | "java/util/Vector"
                 | "java/util/Stack"
+                | "java/util/Collections$SynchronizedList"
+                | "java/util/Collections$SynchronizedRandomAccessList"
                 | "java/util/concurrent/CopyOnWriteArrayList"
                 | "com/google/common/collect/ImmutableList"
         )
@@ -24498,6 +24747,9 @@ impl<H: Host> Runtime<'_, H> {
                     return Ok(Some(value));
                 }
                 let token = self.mod_count_before(&callback.target, 0xb8, None, &values)?;
+                if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
+                    return Ok(Some(answer));
+                }
                 let value = self.host.invoke(&callback.target, &values)?;
                 if let Some(token) = token {
                     self.mod_count_after(token, &value)?;
@@ -24680,6 +24932,9 @@ impl<H: Host> Runtime<'_, H> {
             }
             // `list::add` moves the list's `modCount` as the call would.
             let token = self.mod_count_before(&callback.target, 0xb9, Some(&receiver), &rest)?;
+            if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
+                return Ok(Some(answer));
+            }
             let value = self
                 .host
                 .invoke_instance(&callback.target, &receiver, &rest)?;
@@ -30606,6 +30861,13 @@ impl<H: Host> Runtime<'_, H> {
             && !is_map_owner(&r.owner)
             && let Some(receiver) = receiver
         {
+            if self
+                .host
+                .repeated_collection(receiver)
+                .is_some_and(|(count, _)| count > 1_000_000)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             let values = runtime_collection_values(self.host, receiver)?;
             let stream = self.new_stream(class, method, values);
             // A fail-fast collection's stream binds late and checks for
@@ -32493,7 +32755,11 @@ impl<H: Host> Runtime<'_, H> {
                     // wraps (`synchronized_views.rs`): the collection models
                     // below answer for that collection, in its own order.
                     let receiver = match receiver {
-                        Some(view) if op != 0xb7 => {
+                        Some(view)
+                            if op != 0xb7
+                                && !(r.name == "subList"
+                                    && r.descriptor == "(II)Ljava/util/List;") =>
+                        {
                             Some(self.host.synchronized_wrapped(&view).unwrap_or(view))
                         }
                         receiver => receiver,
@@ -32508,6 +32774,7 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         None
                     };
+                    let mod_answer = mod_token.as_ref().and_then(|token| token.answer.clone());
                     // Whether the answer is a jar method body's own `areturn`
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
@@ -32524,6 +32791,28 @@ impl<H: Host> Runtime<'_, H> {
                     let taint_receiver = receiver.clone();
                     let unknown_before = self.host.counted_unknown_calls();
                     let mut dispatched: Option<Value> = None;
+                    // SetFromMap inherits AbstractSet.equals. Handle it at
+                    // the runtime boundary so an argument whose class is a
+                    // jar implementation of Set is checked through its own
+                    // size/iterator methods before the host view shortcut.
+                    if r.name == "equals"
+                        && r.descriptor == "(Ljava/lang/Object;)Z"
+                        && let Some(receiver) = receiver.as_ref()
+                        && self.host.is_set_from_map(receiver)
+                    {
+                        let other = args.first().unwrap_or(&Value::Ref(None));
+                        let equal = invoke_or_catch!(
+                            at,
+                            self.abstract_set_equals(receiver, other)
+                                .map(|equal| Value::Int(i32::from(equal)))
+                        );
+                        dispatched = Some(equal);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = mod_answer
+                    {
+                        dispatched = Some(value);
+                    }
                     if dispatched.is_none()
                         && let Some(value) = anchor_replacement
                     {
@@ -32694,6 +32983,25 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
+                        && (r.name == "sort"
+                            && (r.owner == "java/util/List" || r.owner == "java/util/Collections")
+                            && receiver
+                                .as_ref()
+                                .or_else(|| args.first())
+                                .and_then(expect_ref)
+                                .is_some_and(|marker| {
+                                    jar_object::collection_class(marker)
+                                        == "java/util/Collections$SingletonList"
+                                }))
+                    {
+                        dispatched = Some({
+                            // SingletonList.sort is an explicit no-op in JDK 25;
+                            // its inherited AbstractList implementation would
+                            // otherwise call set and throw.
+                            Value::Void
+                        });
+                    }
+                    if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
                             self.invoke_array_view(&r, receiver.as_ref(), &args)
@@ -32712,6 +33020,20 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some({
                             // A `Class` call on a name a family kind owns (`owned_class.rs`).
                             value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && (matches!(r.name.as_str(), "replaceAll" | "sort")
+                            && receiver
+                                .as_ref()
+                                .and_then(|v| expect_ref(v))
+                                .is_some_and(|m| self.host.sub_list_link(m).is_some()))
+                    {
+                        dispatched = Some({
+                            if let Some(marker) = receiver.as_ref().and_then(expect_ref) {
+                                self.mark_sub_list_unknown(marker);
+                            }
+                            invoke_or_catch!(at, self.host.unknown_operand_call(&r))
                         });
                     }
                     if dispatched.is_none()
@@ -32865,6 +33187,146 @@ impl<H: Host> Runtime<'_, H> {
                         )
                     {
                         dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(marker) = receiver.as_ref().and_then(expect_ref)
+                        && self.host.is_immutable_empty_sublist(marker)
+                        && matches!(
+                            (r.name.as_str(), r.descriptor.as_str()),
+                            ("set", "(ILjava/lang/Object;)Ljava/lang/Object;")
+                                | ("remove", "(I)Ljava/lang/Object;")
+                        )
+                    {
+                        dispatched = Some({
+                            let index = args
+                                .first()
+                                .and_then(|value| match value {
+                                    Value::Int(index) => Some(*index),
+                                    _ => None,
+                                })
+                                .unwrap_or(0);
+                            invoke_or_catch!(
+                                at,
+                                Err(NativeError::UncaughtException {
+                                    class: "java/lang/IndexOutOfBoundsException".into(),
+                                    message: Some(format!(
+                                        "Index {index} out of bounds for length 0"
+                                    )),
+                                    frame: None,
+                                })
+                            )
+                        });
+                    }
+                    if dispatched.is_none()
+                        && (receiver.as_ref().is_some_and(|value| {
+                            crate::jar_object::object_class(value)
+                                .is_some_and(|class| class.contains("SubList"))
+                                && self
+                                    .collection_elements(value)
+                                    .is_ok_and(|elements| elements.is_empty())
+                        }) && matches!(r.name.as_str(), "set" | "remove")
+                            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;"))
+                    {
+                        dispatched = Some({
+                            invoke_or_catch!(
+                                at,
+                                Err(NativeError::UncaughtException {
+                                    class: "java/lang/UnsupportedOperationException".into(),
+                                    message: None,
+                                    frame: None,
+                                })
+                            )
+                        });
+                    }
+                    // `SingletonList`/`CopiesList` inherit (or override with
+                    // the same iterator semantics as) the collection bulk
+                    // mutators.  Their iterator's `remove` throws UOE only
+                    // after a matching element is found; an absent match
+                    // returns false without touching the immutable list.
+                    // Keep this decision ahead of both the immutable model's
+                    // intentional fallthrough and the mutable collection arm.
+                    if dispatched.is_none()
+                        && let Some(receiver) = receiver.as_ref()
+                        && let Some(marker) = expect_ref(receiver)
+                        && matches!(
+                            jar_object::collection_class(marker),
+                            "java/util/Collections$SingletonList"
+                                | "java/util/Collections$CopiesList"
+                        )
+                        && matches!(r.name.as_str(), "removeAll" | "retainAll" | "removeIf")
+                        && (r.name != "removeIf"
+                            || jar_object::collection_class(marker)
+                                == "java/util/Collections$CopiesList")
+                        && !is_map_owner(&r.owner)
+                    {
+                        dispatched = Some(invoke_or_catch!(
+                            at,
+                            (|| -> Result<Value, NativeError> {
+                                let values = self.collection_elements(receiver)?;
+                                let would_remove = match r.name.as_str() {
+                                    "removeIf" => {
+                                        let predicate =
+                                            args.first().cloned().unwrap_or(Value::Ref(None));
+                                        if matches!(predicate, Value::Ref(None)) {
+                                            return Err(NativeError::UncaughtException {
+                                                class: "java/lang/NullPointerException".into(),
+                                                message: None,
+                                                frame: None,
+                                            });
+                                        }
+                                        let mut matched = false;
+                                        for value in &values {
+                                            if self.predicate_holds(&predicate, value)? {
+                                                matched = true;
+                                                break;
+                                            }
+                                        }
+                                        matched
+                                    }
+                                    "removeAll" | "retainAll" => {
+                                        let source =
+                                            args.first().cloned().unwrap_or(Value::Ref(None));
+                                        if matches!(source, Value::Ref(None)) {
+                                            return Err(NativeError::UncaughtException {
+                                                class: "java/lang/NullPointerException".into(),
+                                                message: None,
+                                                frame: None,
+                                            });
+                                        }
+                                        let source = self.collection_elements(&source)?;
+                                        values.iter().any(|value| {
+                                            let contained =
+                                                source.iter().any(|candidate| candidate == value);
+                                            if r.name == "removeAll" {
+                                                contained
+                                            } else {
+                                                !contained
+                                            }
+                                        })
+                                    }
+                                    _ => false,
+                                };
+                                if would_remove {
+                                    Err(NativeError::UncaughtException {
+                                        class: "java/lang/UnsupportedOperationException".into(),
+                                        message: None,
+                                        frame: None,
+                                    })
+                                } else {
+                                    Ok(Value::Int(0))
+                                }
+                            })()
+                        ));
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            receiver.as_ref().and_then(expect_ref).and_then(|marker| {
+                                is_collection_owner(&r.owner)
+                                    .then(|| self.host.unmodifiable_member(&r, marker, &args))
+                                    .flatten()
+                            })
+                    {
+                        dispatched = Some(invoke_or_catch!(at, value));
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -33795,7 +34257,9 @@ impl<H: Host> Runtime<'_, H> {
                         }
                         _ => value,
                     };
-                    if let Some(token) = mod_token.filter(|_| !jar_body) {
+                    if let Some(token) =
+                        mod_token.filter(|token| token.answer.is_none() && !jar_body)
+                    {
                         invoke_or_catch!(at, self.mod_count_after(token, &value));
                     }
                     if value != Value::Void {
@@ -33841,7 +34305,12 @@ impl<H: Host> Runtime<'_, H> {
                         let mut captured = captured;
                         // A `subList` operand's `toString` checks its list
                         // (`mod_count.rs`).
-                        invoke_or_catch!(at, self.sync_sub_list_operands(&captured));
+                        if let Some(answer) =
+                            invoke_or_catch!(at, self.sync_sub_list_operands(&captured))
+                        {
+                            stack.push(answer);
+                            continue;
+                        }
                         invoke_or_catch!(
                             at,
                             self.concat_object_texts(&mut captured, &mut arguments, class, method)

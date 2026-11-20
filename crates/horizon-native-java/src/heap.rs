@@ -574,6 +574,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.repeated_collections.len()
         + host.set_from_map_views.len()
         + host.random_sources.len()
         + host.iterators.len()
@@ -744,6 +745,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .map(|(key, elements)| key.len() + values(elements)),
         )
         .chain(
+            host.repeated_collections
+                .iter()
+                .map(|(key, (_, value))| key.len() + value_bytes(value)),
+        )
+        .chain(
             host.set_from_map_views
                 .iter()
                 .map(|(key, source)| key.len() + source.len()),
@@ -824,6 +830,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.repeated_collections.keys().map(String::as_str))
             .chain(host.set_from_map_views.keys().map(String::as_str))
             .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
@@ -995,6 +1002,11 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .into_iter()
             .flat_map(crate::array_data::ArrayData::references);
         let collections = host.mutable_collections.get(&marker).into_iter().flatten();
+        let repeated = host
+            .repeated_collections
+            .get(&marker)
+            .into_iter()
+            .map(|(_, value)| value);
         let iterators = host
             .iterators
             .get(&marker)
@@ -1021,6 +1033,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         for value in fields
             .chain(arrays)
             .chain(collections)
+            .chain(repeated)
             .chain(iterators)
             .chain(iterator_last)
             .chain(enumerations)
@@ -1107,6 +1120,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
     host.mutable_collections.retain_markers(|key| keep(key));
+    host.repeated_collections.retain(|key, _| keep(key));
     host.iterators.retain(|key, _| keep(key));
     host.iterator_last.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
@@ -1712,6 +1726,7 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "repeated_collections",
             "set_from_map_views",
             "random_sources",
             "guava_tables",
@@ -1740,6 +1755,7 @@ mod tests {
             "iterator_guards",
             "mod_stamps",
             "sub_lists",
+            "sub_list_class_names",
             "detached_sub_lists",
             "list_iterators",
             "deque_layouts",

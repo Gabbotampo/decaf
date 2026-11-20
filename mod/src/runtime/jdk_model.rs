@@ -741,17 +741,20 @@ impl crate::runtime::StdHost {
     ) -> Result<Value, NativeError> {
         let from = super::expect_int(r, Self::argument(r, args, 0)?)?;
         let to = super::expect_int(r, Self::argument(r, args, 1)?)?;
+        let repeated = self.repeated_collections.get(marker).cloned();
         let values = self
             .mutable_collections
             .get(marker)
             .cloned()
+            .or_else(|| self.reversed_view_values(marker))
             .unwrap_or_default();
+        let logical_len = repeated.as_ref().map_or(values.len(), |(count, _)| *count);
         let failure = if from < 0 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("fromIndex = {from}"),
             ))
-        } else if to as i64 > values.len() as i64 {
+        } else if to as i64 > logical_len as i64 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("toIndex = {to}"),
@@ -771,18 +774,156 @@ impl crate::runtime::StdHost {
                 frame: None,
             });
         }
+        // Large `Collections.nCopies` rows stay compressed.  CopiesList's
+        // override returns another compressed CopiesList, so never expand a
+        // range that may contain billions of repeated elements.
+        if let Some((_, value)) = repeated {
+            let marker = crate::runtime::jar_object::collection_key_for(
+                "java/util/Collections$CopiesList",
+                crate::runtime::jar_object::CollectionFamily::Immutable,
+                self.next_unmodifiable_collection,
+            );
+            self.next_unmodifiable_collection += 1;
+            self.repeated_collections
+                .insert(marker.clone(), ((to - from) as usize, value));
+            self.unmodifiable_collections.insert(marker.clone(), None);
+            return Ok(crate::runtime::jar_object::collection(marker));
+        }
         let range = values[from as usize..to as usize].to_vec();
-        let made = self.new_collection(super::stand_in_class("list"), range);
+        let parent_class = crate::runtime::jar_object::collection_class(marker).to_owned();
+        let immutable_jdk = self.jdk_list_of.contains(marker);
+        let immutable_owned = matches!(
+            parent_class.as_str(),
+            "java/util/Collections$EmptyList"
+                | "java/util/Collections$SingletonList"
+                | "java/util/Collections$CopiesList"
+                | "java/util/AbstractList$RandomAccessSubList"
+                | "com/google/common/collect/RegularImmutableList"
+                | "com/google/common/collect/SingletonImmutableList"
+                | "com/google/common/collect/ImmutableList$SubList"
+        );
+        let mut unknown_class = false;
+        let made_class = if immutable_jdk {
+            "java/util/ImmutableCollections$SubList"
+        } else if parent_class == "java/util/Collections$CopiesList" {
+            // CopiesList overrides subList and returns another CopiesList,
+            // preserving its own range and immutable checks.
+            "java/util/Collections$CopiesList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Collections$SynchronizedList"
+                | "java/util/Collections$SynchronizedRandomAccessList"
+        ) {
+            // SynchronizedList delegates to the wrapped list and wraps the
+            // result with the same synchronized class.  The view class is
+            // recorded on the host marker, so getClass().getName() remains
+            // the JDK 25 class even though the runtime is single-threaded.
+            if parent_class.ends_with("RandomAccessList") {
+                "java/util/Collections$SynchronizedRandomAccessList"
+            } else {
+                "java/util/Collections$SynchronizedList"
+            }
+        } else if parent_class == "java/util/ArrayList"
+            || parent_class == "java/util/ArrayList$SubList"
+        {
+            "java/util/ArrayList$SubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Vector" | "java/util/Stack"
+        ) {
+            // Vector overrides AbstractList.subList and synchronizes the
+            // resulting RandomAccess view.
+            "java/util/Collections$SynchronizedRandomAccessList"
+        } else if parent_class == "java/util/concurrent/CopyOnWriteArrayList" {
+            "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
+        } else if parent_class == "java/util/Arrays$ArrayList" {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/LinkedList" | "java/util/AbstractList" | "java/util/AbstractList$SubList"
+        ) {
+            "java/util/AbstractList$SubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        ) {
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        } else if parent_class == "java/util/Collections$UnmodifiableList" {
+            "java/util/Collections$UnmodifiableList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/ReverseOrderListView$Rand"
+                | "java/util/ReverseOrderListView$SubList"
+                | "java/util/ReverseOrderListView"
+                | "java/util/LinkedList$ReverseOrderLinkedListView"
+        ) {
+            "java/util/ReverseOrderListView"
+        } else if immutable_owned {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else {
+            unknown_class = true;
+            super::stand_in_class("list")
+        };
+        let storage_class = if matches!(
+            made_class,
+            "java/util/ArrayList$SubList"
+                | "java/util/AbstractList$SubList"
+                | "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
+        ) {
+            "java/util/ArrayList"
+        } else {
+            made_class
+        };
+        let made = self.new_collection(storage_class, range);
+        if (storage_class != made_class || unknown_class)
+            && let Some(key) = match &made {
+                crate::runtime::Value::Host(handle) => Some(handle.key().to_owned()),
+                crate::runtime::Value::Ref(Some(key)) => Some(key.clone()),
+                _ => None,
+            }
+        {
+            self.sub_list_class_names.insert(
+                key,
+                if unknown_class {
+                    String::new()
+                } else {
+                    made_class.to_owned()
+                },
+            );
+        }
+        // A sub-list of `List.of`/`List.copyOf` is an `ImmutableCollections`
+        // sub-list, and one of an unmodifiable view an `UnmodifiableList`:
+        // every mutator throws `UnsupportedOperationException` whatever the
+        // range, and the immutable one rejects null searches as its parent
+        // does (#558 review). `emptyList`/`singletonList`/`nCopies` sub-lists
+        // use AbstractList's range-sensitive mutator behavior.
+        let immutable_parent = immutable_jdk || immutable_owned;
+        let view_parent = matches!(self.unmodifiable_collections.get(marker), Some(Some(_)));
+        if immutable_parent || view_parent {
+            let key = match &made {
+                Value::Host(handle) => Some(handle.key().to_owned()),
+                Value::Ref(Some(made)) => Some(made.clone()),
+                _ => None,
+            };
+            if let Some(key) = key {
+                self.unmodifiable_collections.insert(key.clone(), None);
+                if immutable_jdk {
+                    self.jdk_list_of.insert(key);
+                }
+            }
+        }
         // A detached copy: remember it, so `Collections.reverse` on it is counted
         // (a write through it would not reach the parent, #496).
-        match &made {
-            Value::Host(handle) => {
-                self.detached_sub_lists.insert(handle.key().to_owned());
+        if made_class == "java/util/AbstractList$SubList" {
+            match &made {
+                Value::Host(handle) => {
+                    self.detached_sub_lists.insert(handle.key().to_owned());
+                }
+                Value::Ref(Some(marker)) => {
+                    self.detached_sub_lists.insert(marker.clone());
+                }
+                _ => {}
             }
-            Value::Ref(Some(marker)) => {
-                self.detached_sub_lists.insert(marker.clone());
-            }
-            _ => {}
         }
         Ok(made)
     }

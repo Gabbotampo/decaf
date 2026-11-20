@@ -81,7 +81,9 @@ enum FailFast {
 fn fail_fast(class: &str) -> Option<FailFast> {
     Some(match class {
         "java/util/ArrayList" | "java/util/Vector" | "java/util/Stack" => FailFast::ArrayList,
-        "java/util/LinkedList" | "java/util/PriorityQueue" => FailFast::Cursor,
+        "java/util/LinkedList" | "java/util/PriorityQueue" | "java/util/Collections$CopiesList" => {
+            FailFast::Cursor
+        }
         "java/util/HashMap"
         | "java/util/LinkedHashMap"
         | "java/util/TreeMap"
@@ -283,8 +285,27 @@ impl<H: Host> Runtime<'_, H> {
                     // cursor]`): a `set` since the snapshot shows.
                     ModVerdict::Same if guard.cursor.is_some() => {
                         let cursor = self.host.iterator_cursor(&marker);
-                        let stepped = self.host.invoke_instance(r, receiver, args)?;
                         let live = self.collection_elements(&source)?;
+                        // `Collections.CopiesList` inherits `AbstractList.Itr.next`.
+                        // Its `get` uses `Objects.checkIndex`, so an empty list's
+                        // exhausted iterator wraps that IOOBE as the cause of its
+                        // NoSuchElementException (rather than the host iterator's
+                        // message-less neutral exception).
+                        if self.host_collection_class(&source).as_deref()
+                            == Some("java/util/Collections$CopiesList")
+                            && cursor.is_some_and(|cursor| cursor >= live.len())
+                        {
+                            let index = cursor.unwrap_or(live.len());
+                            return Err(NativeError::UncaughtException {
+                                class: "java/util/NoSuchElementException".into(),
+                                message: Some(format!(
+                                    "java.lang.IndexOutOfBoundsException: Index {index} out of bounds for length {}",
+                                    live.len()
+                                )),
+                                frame: None,
+                            });
+                        }
+                        let stepped = self.host.invoke_instance(r, receiver, args)?;
                         Ok(Some(
                             cursor
                                 .and_then(|cursor| live.get(cursor).cloned())

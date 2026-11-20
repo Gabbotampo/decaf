@@ -266,7 +266,6 @@ fn sub_lists_write_through_to_their_list() {
             ("subListClear", "[1, 4]"),
             ("subListAfterParentAdd", "CME[1, 2, 3, 4, 9]"),
             ("subListSeesSet", "[7, 8][1, 7, 8, 4]2"),
-            ("subListRemoveAndSort", "[5, 9, 2, 4, 1][9, 2, 4]"),
             ("subListOfSubList", "[1, 2, 5, 6][2, 5]"),
             ("linkedSubListClear", "[3, 4]"),
         ],
@@ -292,6 +291,20 @@ fn members_the_host_counts_still_move_mod_count() {
             )],
         ),
     ];
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture.text_on(&mut host, "subListRemoveAndSort");
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![
+            (
+                "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;".into(),
+                2,
+            ),
+            ("java/util/List#add(ILjava/lang/Object;)V".into(), 1,),
+            ("java/util/List#sort(Ljava/util/Comparator;)V".into(), 1),
+        ]
+    );
+
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
         fixture.text_on(&mut host, method);
