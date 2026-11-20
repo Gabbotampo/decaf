@@ -2,6 +2,7 @@ import java.lang.reflect.*;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
+import java.util.zip.*;
 import net.fabricmc.loader.api.Version;
 
 /** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
@@ -217,6 +218,47 @@ public final class ModPrioSorterOracle {
     return value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
   }
 
+  static void zip(Path path, Map<String, byte[]> entries) throws IOException {
+    try (ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(path))) {
+      for (var entry : entries.entrySet()) {
+        out.putNextEntry(new ZipEntry(entry.getKey()));
+        out.write(entry.getValue());
+        out.closeEntry();
+      }
+    }
+  }
+
+  static List<Path> syntheticGenerated(String name, Path root) throws IOException {
+    Files.createDirectories(root);
+    byte[] childOne = ("{\"schemaVersion\":1,\"id\":\"generated-lib\","
+        + "\"version\":\"1.0\",\"custom\":{\"fabric-loom:generated\":true}}")
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] childTwo = ("{\"schemaVersion\":1,\"id\":\"generated-lib\","
+        + "\"version\":\"2.0\",\"custom\":{\"fabric-loom:generated\":true}}")
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    Path childOnePath = root.resolve("lib-one.jar");
+    Path childTwoPath = root.resolve("lib-two.jar");
+    zip(childOnePath, Map.of("fabric.mod.json", childOne, "marker.txt", "one".getBytes()));
+    zip(childTwoPath, Map.of("fabric.mod.json", childTwo, "marker.txt", "two".getBytes()));
+    String firstId = name.equals("generated-single") ? "carrier" : "carrier_a";
+    String firstMetadata = "{\"schemaVersion\":1,\"id\":\"carrier_a\",\"version\":\"1\","
+        + "\"jars\":[{\"file\":\"META-INF/jars/lib.jar\"}]}";
+    String secondMetadata = "{\"schemaVersion\":1,\"id\":\"carrier_b\",\"version\":\"1\","
+        + "\"jars\":[{\"file\":\"META-INF/jars/lib.jar\"}]}";
+    String singleMetadata = name.equals("generated-single")
+        ? ("{\"schemaVersion\":1,\"id\":\"" + firstId + "\",\"version\":\"1\","
+            + "\"jars\":[{\"file\":\"META-INF/jars/lib.jar\"}]}")
+        : firstMetadata;
+    Path first = root.resolve("carrier-a.jar");
+    zip(first, Map.of("fabric.mod.json", singleMetadata.getBytes(),
+        "META-INF/jars/lib.jar", Files.readAllBytes(childOnePath)));
+    if (name.equals("generated-single")) return List.of(first);
+    Path second = root.resolve("carrier-b.jar");
+    zip(second, Map.of("fabric.mod.json", secondMetadata.getBytes(),
+        "META-INF/jars/lib.jar", Files.readAllBytes(childTwoPath)));
+    return List.of(first, second);
+  }
+
   public static void main(String[] args) throws Exception {
     Class<?> type = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
     Method addParent = type.getDeclaredMethod("addParent", type);
@@ -242,6 +284,24 @@ public final class ModPrioSorterOracle {
     for (String line : Files.readAllLines(Path.of(args[0]))) {
       if (line.isBlank() || line.startsWith("#")) continue;
       String[] split = line.split("\\|", 2);
+      if (split[1].startsWith("synthetic=")) {
+        try {
+          String name = split[1].substring("synthetic=".length());
+          Path mods = Path.of("oracle-real-scratch").resolve(split[0]).resolve("mods");
+          for (Path source : syntheticGenerated(name, mods.getParent().resolve("inputs"))) {
+            Files.createDirectories(mods);
+            Files.copy(source, mods.resolve(source.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+          }
+          RealDiscovery real = new RealDiscovery();
+          List<?> discovered = real.find(mods);
+          List<?> selected = (List<?>) resolve.invoke(null, discovered, server, new HashMap<>());
+          System.out.println(split[0] + "|OK|" + real.row(selected));
+        } catch (InvocationTargetException error) {
+          Throwable cause = error.getCause();
+          System.out.println(split[0] + "|ERROR|" + cause.getClass().getName() + "|" + escaped(cause.getMessage()));
+        }
+        continue;
+      }
       if (split[1].startsWith("jar=")) {
         try {
           Path mods = Path.of("oracle-real-scratch").resolve(split[0]).resolve("mods");

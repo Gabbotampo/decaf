@@ -1,0 +1,3 @@
+# Synthetic plain libraries with Loom-generated metadata, captured through real ModDiscoverer.
+generated-single|synthetic=generated-single
+generated-two|synthetic=generated-two

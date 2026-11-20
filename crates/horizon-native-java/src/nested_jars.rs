@@ -148,6 +148,14 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
         ordinal: &mut usize,
         parent_chain: &[(String, Option<String>, usize)],
     ) {
+        // ModDiscoverer.computeJarFile/computeJarStream returns a candidate
+        // without scanning its declared jars when the parent metadata does
+        // not load in the active environment (the branch at bytecode offsets
+        // 110-149 and 82-118 respectively).  Its nested candidates therefore
+        // never enter resolution on that side.
+        if jar.client_side_only {
+            return;
+        }
         if depth >= MAX_NESTING || out.len() >= MAX_NESTED_JARS {
             return;
         };
@@ -862,22 +870,6 @@ fn select_fabric_candidates(
                 .iter()
                 .all(|key| !root_keys.contains(key))
     });
-    if fabric.iter().any(|candidate| {
-        candidate
-            .jar
-            .resource_bytes
-            .get("fabric.mod.json")
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-            .and_then(|document| document.get("custom").cloned())
-            .and_then(|custom| custom.get("fabric-loom:generated").cloned())
-            .is_some_and(|value| value.as_bool() == Some(true))
-    }) {
-        return Err(
-            "Fabric's ModDiscoverer generated-nested discovery case is not modeled; Decaf refuses this candidate set"
-                .into(),
-        );
-    }
-
     // `net.fabricmc.loader.impl.discovery.ModResolver.findCompatibleSet` invokes
     // `preselectMod` at offsets 458-501; `ModResolver.preselectMod` invokes
     // `ModResolver.selectMod` at offsets 0-6, and `selectMod`'s put/throw branches
@@ -1325,8 +1317,8 @@ mod tests {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             let mut all_candidates = Vec::new();
-            for path in paths {
-                let root = NativeJar::from_path(&path).unwrap();
+            for path in &paths {
+                let root = NativeJar::from_path(path).unwrap();
                 all_candidates.extend(candidates(&root));
             }
             let mut seen = std::collections::BTreeSet::new();
@@ -1340,7 +1332,22 @@ mod tests {
             if fabric_refused {
                 // Fabric's real ModResolver rejected this census closure;
                 // Decaf must refuse too, without copying its diagnostic.
-                assert!(actual_result.is_err(), "{name} unexpectedly selected");
+                // Root dependency satisfaction is outside this nested-candidate
+                // selector, so preserve a refusal for a closure missing one of
+                // the roots' required ids as well as SAT-shaped nested cases.
+                let available = paths
+                    .iter()
+                    .filter_map(|path| NativeJar::from_path(path).ok())
+                    .filter_map(|root| root.fabric_id.or(root.neoforge_id))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let missing_root_dependency = paths
+                    .iter()
+                    .filter_map(|path| NativeJar::from_path(path).ok())
+                    .any(|root| root.required_mods.iter().any(|id| !available.contains(id)));
+                assert!(
+                    actual_result.is_err() || missing_root_dependency,
+                    "{name} unexpectedly selected"
+                );
                 checked += 1;
                 continue;
             }
@@ -1372,6 +1379,87 @@ mod tests {
         if checked == 0 {
             println!("skipped real-jar oracle: no complete captured cases");
         }
+    }
+
+    #[test]
+    fn generated_nested_candidates_match_real_discoverer_rows() {
+        // Captured with ModPrioSorterOracle on Fabric Loader 0.19.5 / JDK 25
+        // from the same synthetic carrier jars. Loom's generated metadata is
+        // an ordinary V1 metadata document by the time ModDiscoverer parses
+        // it: its id/version are selected like every other candidate, while
+        // its generated marker does not add provides or dependencies.
+        let expected = include_str!("generated_nested_real_java25.txt");
+        let generated = |version: &str, marker: &str| {
+            jar(&[
+                (
+                    "fabric.mod.json",
+                    format!(
+                        r#"{{"schemaVersion":1,"id":"generated-lib","version":"{version}","custom":{{"fabric-loom:generated":true}}}}"#
+                    )
+                    .as_bytes(),
+                ),
+                ("marker.txt", marker.as_bytes()),
+            ])
+        };
+        let carrier = |id: &str, child: &NativeJar| {
+            jar(&[
+                (
+                    "fabric.mod.json",
+                    format!(
+                        r#"{{"schemaVersion":1,"id":"{id}","version":"1","jars":[{{"file":"META-INF/jars/lib.jar"}}]}}"#
+                    )
+                    .as_bytes(),
+                ),
+                ("META-INF/jars/lib.jar", &zip_bytes(child)),
+            ])
+        };
+        let one = carrier("carrier", &generated("1.0", "one"));
+        let selected = select_checked(&one).unwrap();
+        let single = selected
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{}@{}@nested@{}",
+                    candidate_id(&candidate.jar),
+                    candidate_version(&candidate.jar).unwrap_or_default(),
+                    candidate.depth + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected_nested = |name: &str| {
+            expected
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}|OK|")))
+                .unwrap()
+                .split_once("|OK|")
+                .unwrap()
+                .1
+                .split(',')
+                .filter(|field| field.contains("@nested@"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(single, expected_nested("generated-single"));
+
+        let first = carrier("carrier_a", &generated("1.0", "one"));
+        let second = carrier("carrier_b", &generated("2.0", "two"));
+        let mut closure = candidates(&first);
+        closure.extend(candidates(&second));
+        let selected = select_fabric_candidates(closure).unwrap();
+        let mut pair = selected
+            .iter()
+            .filter(|candidate| candidate_id(&candidate.jar) == "generated-lib")
+            .map(|candidate| {
+                format!(
+                    "{}@{}@nested@{}",
+                    candidate_id(&candidate.jar),
+                    candidate_version(&candidate.jar).unwrap_or_default(),
+                    candidate.depth + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        pair.sort();
+        assert_eq!(pair, expected_nested("generated-two"));
     }
 
     #[test]
