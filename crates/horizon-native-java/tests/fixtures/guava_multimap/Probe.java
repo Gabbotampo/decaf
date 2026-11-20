@@ -309,6 +309,18 @@ public final class Probe {
   public static String removeIteratorArray() { return removeThroughIterator(ArrayListMultimap.create()); }
   public static String removeIteratorHash() { return removeThroughIterator(HashMultimap.create()); }
   public static String removeIteratorLinked() { return removeThroughIterator(LinkedHashMultimap.create()); }
+  /** Remove the first of two values through the wrapped iterator, then keep iterating. */
+  static String removeFirstOfTwo(Multimap<String, Integer> m) {
+    m.put("k", 1); m.put("k", 2);
+    java.util.Iterator<Integer> it = m.get("k").iterator();
+    Integer first = it.next(); it.remove();
+    boolean more = it.hasNext();
+    Integer second = more ? it.next() : null;
+    return first + "|" + more + "|" + second + "|" + m.size();
+  }
+  public static String removeFirstArray() { return removeFirstOfTwo(ArrayListMultimap.create()); }
+  public static String removeFirstHash() { return removeFirstOfTwo(HashMultimap.create()); }
+  public static String removeFirstLinked() { return removeFirstOfTwo(LinkedHashMultimap.create()); }
   public static String puzzleLoop() {
     ArrayListMultimap<String,Integer> m = ArrayListMultimap.create(); m.put("k", 1); m.put("k", 2);
     int sum = 0; for (Integer value : m.get("k")) sum += value;

@@ -243,3 +243,23 @@ fn real_guava_multimaps_match_java25() {
         );
     }
 }
+
+/// Removing the first of two values through a wrapped iterator leaves the
+/// second one next. Java 25 + Guava 33.6.0 print `1|true|2|1` for every kind
+/// (`ArrayList$Itr.remove` sets `cursor = lastRet`; hash iterators advance).
+#[test]
+fn wrapped_iterator_remove_keeps_the_next_value() {
+    let Some(guava) = guava_jar() else {
+        eprintln!("GUAVA_JAR is unavailable; real-Guava fixture is arcweld-only");
+        return;
+    };
+    let fixture = Fixture::build_with_classpath(
+        "guava-multimap-remove",
+        &[("demo/Probe.java", PROBE)],
+        &guava,
+    );
+    let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    for method in ["removeFirstArray", "removeFirstHash", "removeFirstLinked"] {
+        assert_eq!(fixture.text_on(&mut host, method), "1|true|2|1", "{method}");
+    }
+}

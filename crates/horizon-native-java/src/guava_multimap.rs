@@ -434,10 +434,13 @@ fn invoke_wrapped_iterator_member<H: Host>(
                 )?;
                 bump_collection_mod_count(this, delegate);
             } else {
-                let values = this.host.host_iterator_values(marker).ok_or_else(|| {
-                    NativeError::Metadata("Guava wrapped iterator values missing".into())
-                })?;
-                let value = values[index].clone();
+                // The cursor indexes the LIVE delegate (`hasNext`/`next` read it), so the
+                // element just returned is at `index` there; a creation-time snapshot drifts
+                // once an earlier `remove` has rewound the cursor.
+                let values = runtime_collection_values(&*this.host, delegate)?;
+                let Some(value) = values.get(index).cloned() else {
+                    return Ok(None);
+                };
                 invoke_instance(
                     this,
                     &collection_ref("remove", "(Ljava/lang/Object;)Z"),
@@ -468,6 +471,10 @@ fn invoke_wrapped_iterator_member<H: Host>(
                 Value::Ref(Some(generation.encode())),
             );
             put_field(this, marker, "wrapped-removed", Value::Int(1));
+            // JDK 25 `ArrayList$Itr.remove` sets `cursor = lastRet`, and a hash iterator's
+            // `remove` leaves the next live element next: in both the element after the
+            // removed one now sits at `index`, so a following `hasNext`/`next` reads it.
+            this.host.set_host_iterator_cursor(marker, index);
             Ok(Some(Value::Void))
         }
         _ => Ok(None),
