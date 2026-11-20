@@ -86,13 +86,19 @@ public final class ModPrioSorterOracle {
    */
   static final class RealCandidates {
     final Class<?> type;
-    final Method createPlain, createNested, addParent, nestedMods;
+    final Method createBuiltin, createPlain, createNested, addParent, nestedMods;
+    final Constructor<?> builtinConstructor, metadataBuilderConstructor;
+    final Method metadataBuild;
     final Method parseMetadata;
     final Object versionOverrides, dependencyOverrides;
     final Map<Long, Object> byHash = new HashMap<>();
 
     RealCandidates(Class<?> type) throws Exception {
       this.type = type;
+      createBuiltin = type.getDeclaredMethod("createBuiltin",
+          Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod"),
+          Class.forName("net.fabricmc.loader.impl.metadata.VersionOverrides"),
+          Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides"));
       createPlain = type.getDeclaredMethod("createPlain", List.class,
           Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"),
           boolean.class, Collection.class);
@@ -103,6 +109,7 @@ public final class ModPrioSorterOracle {
       nestedMods = type.getMethod("getNestedMods");
       createPlain.setAccessible(true);
       createNested.setAccessible(true);
+      createBuiltin.setAccessible(true);
       addParent.setAccessible(true);
       parseMetadata = Class.forName("net.fabricmc.loader.impl.metadata.ModMetadataParser")
           .getMethod("parseMetadata", InputStream.class, String.class, List.class,
@@ -113,6 +120,27 @@ public final class ModPrioSorterOracle {
           .getConstructor().newInstance();
       dependencyOverrides = Class.forName("net.fabricmc.loader.impl.metadata.DependencyOverrides")
           .getConstructor(Path.class).newInstance(Path.of("oracle-no-overrides"));
+      Class<?> builder = Class.forName("net.fabricmc.loader.impl.metadata.BuiltinModMetadata$Builder");
+      metadataBuilderConstructor = builder.getConstructor(String.class, String.class);
+      metadataBuild = builder.getMethod("build");
+      builtinConstructor = Class.forName("net.fabricmc.loader.impl.game.GameProvider$BuiltinMod")
+          .getConstructor(List.class, Class.forName("net.fabricmc.loader.api.metadata.ModMetadata"));
+    }
+
+    Object builtin(String id, String version) throws Exception {
+      Object builder = metadataBuilderConstructor.newInstance(id, version);
+      Object metadata = metadataBuild.invoke(builder);
+      Object gameMod = builtinConstructor.newInstance(List.of(), metadata);
+      return createBuiltin.invoke(null, gameMod, versionOverrides, dependencyOverrides);
+    }
+
+    // `javap -p` on Fabric Loader 0.19.5 shows this package-private factory:
+    // ModCandidateImpl.createBuiltin(GameProvider.BuiltinMod, VersionOverrides,
+    // DependencyOverrides). Use that same factory, rather than a plain
+    // candidate, so the resolver sees the candidates as real built-ins.
+    List<Object> builtinMods() throws Exception {
+      return List.of(builtin("minecraft", "26.3"), builtin("java", "25"),
+          builtin("fabricloader", "0.19.5"));
     }
 
     Object metadata(InputStream stream, String path) throws Exception {
@@ -195,6 +223,14 @@ public final class ModPrioSorterOracle {
         return candidate;
       }
     }
+
+    void addAll(Object candidate, Collection<Object> out, Set<Object> seen) throws Exception {
+      if (!seen.add(candidate)) return;
+      out.add(candidate);
+      for (Object nested : (Collection<?>) nestedMods.invoke(candidate)) {
+        addAll(nested, out, seen);
+      }
+    }
   }
 
   static String escaped(String value) {
@@ -206,7 +242,10 @@ public final class ModPrioSorterOracle {
   // /home/solenopsisbot/horizon-corpus/mega/b1b136006d-clientcommands-2.16.3.jar
   // /home/solenopsisbot/horizon-corpus/deps-pool/fabric-api-0.166.2+26.3.jar
   // /home/solenopsisbot/horizon-corpus/corpus-xl/1283899-8898481.jar
+  // /home/solenopsisbot/horizon-corpus/mega/5c80b582b9-WorldEditCUI-26.3+01.jar
+  // /home/solenopsisbot/horizon-corpus/mega/8f7962199e-worldedit-mod-7.4.6.jar
   // /home/solenopsisbot/horizon-corpus/mega/2363766a77-tweakeroo-fabric-26.3-0.30.1.jar
+  // /home/solenopsisbot/horizon-corpus/mega/832a00c0d6-malilib-fabric-26.3-0.30.2.jar
   // /home/solenopsisbot/horizon-corpus/neoforge/DistantHorizons-3.3.4-26.3-fabric-neoforge.jar
 
   public static void main(String[] args) throws Exception {
@@ -236,9 +275,11 @@ public final class ModPrioSorterOracle {
       if (split[1].startsWith("jar=")) {
         List<Object> candidates = new ArrayList<>();
         RealCandidates real = new RealCandidates(type);
+        candidates.addAll(real.builtinMods());
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         for (String raw : split[1].substring(4).split("\\|")) {
           Object candidate = real.root(Path.of(raw));
-          if (candidate != null) candidates.add(candidate);
+          if (candidate != null) real.addAll(candidate, candidates, seen);
         }
         try {
           List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
