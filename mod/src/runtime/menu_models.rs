@@ -705,10 +705,13 @@ pub(crate) fn call(
         let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
             "isEmpty" => {
-                if items.iter().all(|v| {
-                    matches!(v, Value::Ref(None))
-                        || matches!(v, Value::Ref(Some(s)) if s == "stack/empty")
-                }) {
+                // Only `ItemStack.EMPTY` is known to be empty. A Java `null` here (a mod's
+                // `setItem(i, null)`, which this model refuses below) would make
+                // `ItemStack.isEmpty()` throw, so it is never answered as empty.
+                if items
+                    .iter()
+                    .all(|v| matches!(v, Value::Ref(Some(s)) if s == "stack/empty"))
+                {
                     Ok(Value::Int(1))
                 } else {
                     // ItemStack.isEmpty is observable per element.  An arbitrary
@@ -728,6 +731,12 @@ pub(crate) fn call(
             }
             "setItem" => {
                 let value = args.get(1)?;
+                // A null stack: 26.3's containers store into a `NonNullList`, whose `set`
+                // rejects null with a `NullPointerException` (and `SimpleContainer` calls
+                // `limitSize` on it first). Counted rather than stored or answered.
+                if matches!(value, Value::Ref(None)) {
+                    return None;
+                }
                 // SimpleContainer clamps through getMaxStackSize(stack) and
                 // ItemStack.limitSize(max).  Only EMPTY is fully known here;
                 // refuse to mutate for an unknown stack so Java's clamp cannot
@@ -1030,6 +1039,56 @@ mod tests {
         assert!(
             matches!(indexes, NativeError::UncaughtException { message: Some(message), .. } if message == "Expected input slots to have continous indexes")
         );
+    }
+
+    #[test]
+    fn a_null_stack_is_counted_not_stored() {
+        // 26.3's containers keep stacks in a `NonNullList`, whose `set` rejects null with a
+        // `NullPointerException`; the model counts the call and leaves the container as it was.
+        let mut states = States::new();
+        for (owner, init, key) in [
+            ("net/minecraft/world/SimpleContainer", "(I)V", "simple/null"),
+            (
+                "net/minecraft/world/inventory/ResultContainer",
+                "()V",
+                "result/null",
+            ),
+        ] {
+            let container = Value::Ref(Some(key.into()));
+            let args: &[Value] = if init == "(I)V" {
+                &[Value::Int(1)]
+            } else {
+                &[]
+            };
+            call(
+                &mut states,
+                &method(owner, "<init>", init),
+                &container,
+                args,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                call(
+                    &mut states,
+                    &method(owner, "setItem", "(ILnet/minecraft/world/item/ItemStack;)V"),
+                    &container,
+                    &[Value::Int(0), Value::Ref(None)],
+                )
+                .is_none()
+            );
+            assert_eq!(
+                call(
+                    &mut states,
+                    &method(owner, "isEmpty", "()Z"),
+                    &container,
+                    &[]
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Int(1)
+            );
+        }
     }
 
     #[test]
