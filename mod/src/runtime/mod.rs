@@ -3710,6 +3710,10 @@ impl Default for StdHost {
 }
 
 impl StdHost {
+    pub(crate) fn menu_states_debug(&self) -> String {
+        format!("{:?}", self.menu_states)
+    }
+
     pub(crate) fn registry_lifecycle_stable(&self, id: &str) -> bool {
         self.registry_lifecycles
             .get(id)
@@ -5782,16 +5786,7 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        if menu_models::is_menu_class(&r.owner)
-            || (r.owner == "net/minecraft/world/item/ItemStack"
-                && matches!(
-                    r.name.as_str(),
-                    "isEmpty" | "getCount" | "shrink" | "copy" | "onCraftedBy"
-                ))
-        {
-            return menu_models::call(&mut self.menu_states, r, receiver, args);
-        }
-        None
+        menu_models::call(&mut self.menu_states, r, receiver, args)
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
@@ -22921,6 +22916,11 @@ impl<H: Host> Runtime<'_, H> {
         let mut current = field.owner.clone();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
+                if let Some(owner) =
+                    menu_models::field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
                 // `AbstractList.modCount`, inherited from a JDK skeleton.
                 if let Some(owner) =
                     jdk_skeletons::skeleton_field_owner(&current, &field.name, &field.descriptor)
@@ -31388,6 +31388,16 @@ impl<H: Host> Runtime<'_, H> {
                     let value = if let Some(value) = anchor_replacement {
                         value
                     } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
+                        value
+                    } else if menu_models::is_menu_class(&r.owner)
+                        && let Some(receiver) = receiver.as_ref()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.host
+                                .menu_instance_call(&r, receiver, &args)
+                                .transpose()
+                        )
+                    {
                         value
                     } else if receiver == Some(Value::Ref(None)) {
                         // JVMS §6.5: an instance call on `null` throws before

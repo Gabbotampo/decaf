@@ -358,6 +358,7 @@ impl StdHost {
         out.push(format!("{:?}", self.fabric_entrypoint_containers));
         out.push(format!("{:?}", self.content_builders));
         out.push(format!("{:?}", self.holder_rows));
+        out.push(self.menu_states_debug());
     }
 
     /// What the host keeps for the object `marker` in a table keyed by it: a
@@ -1644,6 +1645,7 @@ mod tests {
             "resource_streams",
             "calls",
             "invocations",
+            "menu_states",
             "posted_events",
             "registrations",
             "content_builders",
