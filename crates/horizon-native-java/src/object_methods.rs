@@ -987,6 +987,11 @@ impl<H: Host> Runtime<'_, H> {
         let Some(Value::Host(handle)) = receiver else {
             return Ok(None);
         };
+        // A tainted Guava multimap invalidates every derived handle before
+        // Object-method modelling gets a chance to return a stale snapshot.
+        if let Some(counted) = crate::guava_multimap::guard_tainted_call(self, r, receiver) {
+            return counted;
+        }
         if matches!(
             handle.kind(),
             crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell

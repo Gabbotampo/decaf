@@ -117,6 +117,39 @@ public final class Probe {
     m.put("a", 1);
     return Boolean.toString(m.get("a") != m.get("a"));
   }
+  public static String removeAllRefresh() {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    Collection<Integer> held = m.get("a");
+    m.removeAll("a");
+    m.put("a", 2);
+    return held + "|" + held.size() + "|" + held.contains(1) + "|"
+        + held.contains(2) + "|" + m.get("a");
+  }
+  private static String instanceofAll(Multimap<String,Integer> m) {
+    m.put("a", 1);
+    Object direct = m.get("a");
+    Object asMap = m.asMap();
+    Object asValue = m.asMap().get("a");
+    Object values = m.asMap().values();
+    Object keys = m.asMap().keySet();
+    Object entry = m.asMap().entrySet().iterator().next();
+    Object iterator = m.asMap().keySet().iterator();
+    return ((Object)m instanceof java.util.Collection) + "," + ((Object)m instanceof ListMultimap)
+        + "," + ((Object)m instanceof SetMultimap) + "," + ((Object)m instanceof java.util.Map)
+        + ";" + (direct instanceof java.util.Collection) + "," + (direct instanceof java.util.List)
+        + "," + (direct instanceof java.util.Set) + "," + (direct instanceof java.util.RandomAccess)
+        + ";" + (asMap instanceof java.util.Map) + "," + (asMap instanceof java.util.Collection)
+        + ";" + (asValue instanceof java.util.Collection) + "," + (asValue instanceof java.util.List)
+        + "," + (asValue instanceof java.util.Set) + "," + (asValue instanceof java.util.RandomAccess)
+        + ";" + (values instanceof java.util.Collection) + "," + (values instanceof java.util.Set)
+        + ";" + (keys instanceof java.util.Collection) + "," + (keys instanceof java.util.Set)
+        + ";" + (entry instanceof java.util.Map.Entry) + "," + (entry instanceof java.util.Collection)
+        + ";" + (iterator instanceof java.util.Collection) + "," + (iterator instanceof java.util.Map);
+  }
+  public static String instanceofArrayAll() { return instanceofAll(ArrayListMultimap.create()); }
+  public static String instanceofHashAll() { return instanceofAll(HashMultimap.create()); }
+  public static String instanceofLinkedAll() { return instanceofAll(LinkedHashMultimap.create()); }
   private static String countedValuesCalls() {
     ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
     m.put("a", 1);
@@ -145,6 +178,31 @@ public final class Probe {
     try { m.size(); } catch (RuntimeException ignored) {}
     return "done";
   }
+  private static void laterReads(Multimap<String,Integer> m) {
+    try { m.size(); } catch (RuntimeException ignored) {}
+    try { m.get("a").size(); } catch (RuntimeException ignored) {}
+    try { m.containsKey("a"); } catch (RuntimeException ignored) {}
+    try { m.asMap().entrySet().iterator().hasNext(); } catch (RuntimeException ignored) {}
+    try { m.entries().size(); } catch (RuntimeException ignored) {}
+  }
+  private static String countedMutationReads(int which) {
+    ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
+    m.put("a", 1);
+    try {
+      switch (which) {
+        case 0: m.entries(); break;
+        case 1: m.keys(); break;
+        case 2: m.replaceValues("a", java.util.List.of(2)); break;
+        default: m.asMap().values().remove(java.util.List.of(1)); break;
+      }
+    } catch (RuntimeException ignored) {}
+    laterReads(m);
+    return "done";
+  }
+  public static String countedMutationEntries() { return countedMutationReads(0); }
+  public static String countedMutationKeys() { return countedMutationReads(1); }
+  public static String countedMutationReplaceValues() { return countedMutationReads(2); }
+  public static String countedMutationAsMapValuesRemove() { return countedMutationReads(3); }
   private static String entrySetHandles(Multimap<String,Integer> m) {
     m.put("a", 1); m.put("a", 2);
     java.util.Set<Map.Entry<String, Collection<Integer>>> entries = m.asMap().entrySet();

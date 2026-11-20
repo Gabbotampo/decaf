@@ -51,7 +51,7 @@ fn real_guava_multimaps_match_java25() {
     assert_eq!(fixture.text_on(&mut host, "excluded"), "done");
     assert_eq!(
         host.unknown_host_call_count(),
-        13,
+        16,
         "{:?}",
         host.unknown_host_calls()
     );
@@ -79,6 +79,18 @@ fn real_guava_multimaps_match_java25() {
         "entrySetHandlesLinked",
         "instanceofKinds",
         "freshGet",
+    ] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            oracle.next().unwrap(),
+            "{method}"
+        );
+    }
+    for method in [
+        "removeAllRefresh",
+        "instanceofArrayAll",
+        "instanceofHashAll",
+        "instanceofLinkedAll",
     ] {
         assert_eq!(
             fixture.text_on(&mut host, method),
@@ -132,5 +144,28 @@ fn real_guava_multimaps_match_java25() {
             "reviewer case was not counted: {call}; calls: {:?}",
             host.unknown_host_calls()
         );
+    }
+    for method in [
+        "countedMutationEntries",
+        "countedMutationKeys",
+        "countedMutationReplaceValues",
+        "countedMutationAsMapValuesRemove",
+    ] {
+        assert_eq!(fixture.text_on(&mut host, method), "done", "{method}");
+        for call in [
+            "#size()I",
+            "#get(Ljava/lang/Object;)",
+            "#containsKey(Ljava/lang/Object;)",
+            "#asMap()Ljava/util/Map;",
+            "#entries()Ljava/util/Collection;",
+        ] {
+            assert!(
+                host.unknown_host_calls()
+                    .iter()
+                    .any(|(name, _)| name.contains(call)),
+                "{method} did not count later read {call}: {:?}",
+                host.unknown_host_calls()
+            );
+        }
     }
 }

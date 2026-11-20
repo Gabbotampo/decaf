@@ -132,11 +132,25 @@ fn taint<H: Host>(this: &mut Runtime<'_, H>, source: &str) {
     put_field(this, source, "tainted", Value::Int(1));
 }
 
-fn is_multimap_write(r: &MethodRef) -> bool {
-    matches!(
-        r.name.as_str(),
-        "add" | "clear" | "put" | "remove" | "replaceValues"
-    )
+fn counted_unknown<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    source: &str,
+) -> Result<Option<Value>, NativeError> {
+    // A counted call is an unknown observation or mutation.  Keep the small
+    // Object-method allow-list neutral: these methods cannot mutate a
+    // multimap, and their identity/hash text is already counted by the host
+    // boundary itself.  Every other counted call makes future reads unsafe.
+    if !matches!(
+        (r.name.as_str(), r.descriptor.as_str()),
+        ("toString", "()Ljava/lang/String;")
+            | ("hashCode", "()I")
+            | ("equals", "(Ljava/lang/Object;)Z")
+            | ("getClass", "()Ljava/lang/Class;")
+    ) {
+        taint(this, source);
+    }
+    this.host.unknown_operand_call(r).map(Some)
 }
 
 fn count_tainted_read<H: Host>(
@@ -144,8 +158,34 @@ fn count_tainted_read<H: Host>(
     r: &MethodRef,
     source: &str,
 ) -> Option<Result<Option<Value>, NativeError>> {
-    (tainted(this, source) && !is_multimap_write(r))
-        .then(|| this.host.unknown_operand_call(r).map(Some))
+    tainted(this, source).then(|| this.host.unknown_operand_call(r).map(Some))
+}
+
+/// The source multimap for a handle made by the Guava model.  Entries keep
+/// this in the runtime field table; asMap views and wrappers keep it through
+/// their `target` field, and asMap iterators carry it in their iterator
+/// source marker.
+fn source_for_receiver<H: Host>(this: &Runtime<'_, H>, receiver: &Value) -> Option<String> {
+    if let Some((source, _, _, _)) = map_iterator_source(this, receiver) {
+        return Some(source);
+    }
+    let key = handle_key(receiver)?;
+    field(this, &key, "source")
+        .and_then(|value| ref_text(&value).map(str::to_owned))
+        .or_else(|| {
+            (is_view(this, &key) || kind(this, &key).is_some()).then(|| target_key(this, &key))
+        })
+}
+
+/// Entry point used before any other Guava model (including map iterators).
+/// A tainted source turns every derived call into a counted call.
+pub(crate) fn guard_tainted_call<H: Host>(
+    this: &mut Runtime<'_, H>,
+    r: &MethodRef,
+    receiver: Option<&Value>,
+) -> Option<Result<Option<Value>, NativeError>> {
+    let source = receiver.and_then(|value| source_for_receiver(this, value))?;
+    tainted(this, &source).then(|| this.host.unknown_operand_call(r).map(Some))
 }
 
 fn fresh_as_map_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &str) -> Value {
@@ -159,6 +199,22 @@ fn fresh_as_map_view<H: Host>(this: &mut Runtime<'_, H>, source: &str, name: &st
     put_field(this, &view_key, "view", Value::Ref(Some(name.into())));
     put_field(this, &view_key, "target", handle(source.to_owned()));
     view
+}
+
+fn mark_source<H: Host>(this: &mut Runtime<'_, H>, value: &Value, source: &str) {
+    if let Value::Host(handle) = value
+        && matches!(
+            handle.kind(),
+            HostKind::GuavaMultimap | HostKind::MapEntry | HostKind::OpaqueMapEntry
+        )
+    {
+        put_field(
+            this,
+            handle.key(),
+            "source",
+            Value::Ref(Some(source.to_owned())),
+        );
+    }
 }
 
 fn value_collection_class(kind: &str) -> &'static str {
@@ -182,11 +238,19 @@ fn clone_values<H: Host>(
     values: &Value,
 ) -> Result<Value, NativeError> {
     let kind = source_kind(this, source).unwrap_or_else(|| "array".into());
+    let values = runtime_collection_values(&*this.host, values)?;
+    let immutable_kind = if kind == "array" { "list" } else { "set" };
+    if let Some(copy) = this
+        .host
+        .immutable_collection(immutable_kind, values.clone())
+    {
+        return Ok(copy);
+    }
     let copy = this
         .host
         .empty_mutable_collection(value_collection_class(&kind))
         .ok_or_else(|| NativeError::Metadata("Guava detached collection unavailable".into()))?;
-    for value in runtime_collection_values(&*this.host, values)? {
+    for value in values {
         invoke_instance(
             this,
             &collection_ref("add", "(Ljava/lang/Object;)Z"),
@@ -309,7 +373,7 @@ fn invoke_map_iterator<H: Host>(
                 _ => None,
             };
             let Some(map_key) = map_key else {
-                return this.host.unknown_operand_call(r).map(Some);
+                return counted_unknown(this, r, &source);
             };
             remove_key(this, &source, &map_key)?;
             let generation = backing_generation(this, &source).unwrap_or(current);
@@ -579,6 +643,9 @@ pub(crate) fn invoke<H: Host>(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
+    if let Some(counted) = guard_tainted_call(this, r, receiver) {
+        return counted;
+    }
     if let Some(Value::Host(handle)) = receiver
         && handle.kind() == HostKind::GuavaMultimap
         && r.name == "getClass"
@@ -587,16 +654,28 @@ pub(crate) fn invoke<H: Host>(
         return Ok(handle.class().map(crate::host_class::class_value));
     }
     if let Some(receiver) = receiver
-        && map_iterator_source(this, receiver).is_some()
+        && let Some((source, _, _, _)) = map_iterator_source(this, receiver)
     {
-        return invoke_map_iterator(this, r, receiver);
+        // The source check must precede iterator dispatch: an iterator is a
+        // live multimap-derived handle, never a safe snapshot after taint.
+        if let Some(counted) = count_tainted_read(this, r, &source) {
+            return counted;
+        }
+        return match invoke_map_iterator(this, r, receiver)? {
+            Some(value) => Ok(Some(value)),
+            None => counted_unknown(this, r, &source),
+        };
     }
     if let Some(receiver) = receiver
         && let Some(key) = handle_key(receiver)
         && (is_view(this, &key) || kind(this, &key).is_some())
     {
         if kind(this, &key).as_deref() == Some("sync") {
-            return this.host.unknown_operand_call(r).map(Some);
+            let source = target_key(this, &key);
+            if let Some(counted) = count_tainted_read(this, r, &source) {
+                return counted;
+            }
+            return counted_unknown(this, r, &source);
         }
         return invoke_multimap(this, r, receiver, args, &key);
     }
@@ -640,7 +719,7 @@ fn invoke_multimap<H: Host>(
     }
     if matches!(view.as_deref(), Some("asMap.get" | "get")) {
         let Some(map_key) = field(this, key, "map-key") else {
-            return this.host.unknown_operand_call(r).map(Some);
+            return counted_unknown(this, r, &source);
         };
         let current = values_for_key(this, &source, &map_key, false)?;
         let value = match (r.name.as_str(), r.descriptor.as_str()) {
@@ -701,11 +780,11 @@ fn invoke_multimap<H: Host>(
                 // multimap generation. A host snapshot cannot answer those semantics safely;
                 // count the operation and taint later multimap reads instead of guessing.
                 taint(this, &source);
-                return this.host.unknown_operand_call(r).map(Some);
+                return counted_unknown(this, r, &source);
             }
             ("get", "(I)Ljava/lang/Object;") => {
                 let Some(values) = current else {
-                    return this.host.unknown_operand_call(r).map(Some);
+                    return counted_unknown(this, r, &source);
                 };
                 if r.name == "listIterator" {
                     let start = args
@@ -738,7 +817,7 @@ fn invoke_multimap<H: Host>(
                     values.iter().map(value_text).collect::<Vec<_>>().join(", ")
                 )))
             }
-            _ => return this.host.unknown_operand_call(r).map(Some),
+            _ => return counted_unknown(this, r, &source),
         };
         return Ok(Some(value));
     }
@@ -767,12 +846,14 @@ fn invoke_multimap<H: Host>(
                         // this live wrapped collection.  It is immutable (`setValue` throws),
                         // while the wrapped collection continues to follow the multimap key.
                         let collection = fresh_as_map_value(this, &source, &candidate);
-                        entries.push(this.host.mint_map_entry(
+                        let entry = this.host.mint_map_entry(
                             Some(&map_view),
                             &candidate,
                             &collection,
                             crate::host_map_entry::EntryMade::Snapshot,
-                        ));
+                        );
+                        mark_source(this, &entry, &source);
+                        entries.push(entry);
                     }
                 }
                 entries
@@ -782,12 +863,12 @@ fn invoke_multimap<H: Host>(
             ("toString", "()Ljava/lang/String;")
                 if matches!(view.as_deref(), Some("asMap.values" | "asMap.entrySet")) =>
             {
-                return this.host.unknown_operand_call(r).map(Some);
+                return counted_unknown(this, r, &source);
             }
             ("contains", "(Ljava/lang/Object;)Z") | ("remove", "(Ljava/lang/Object;)Z")
                 if view.as_deref() == Some("asMap.values") =>
             {
-                return this.host.unknown_operand_call(r).map(Some);
+                return counted_unknown(this, r, &source);
             }
             ("size", "()I") => Value::Int(values.len() as i32),
             ("isEmpty", "()Z") => Value::Int(i32::from(values.is_empty())),
@@ -838,7 +919,7 @@ fn invoke_multimap<H: Host>(
                         )),
                     )
                     .map_or_else(
-                        || this.host.unknown_operand_call(r).map(Some),
+                        || counted_unknown(this, r, &source),
                         |iterator| Ok(Some(iterator)),
                     );
             }
@@ -887,7 +968,7 @@ fn invoke_multimap<H: Host>(
                 }
                 Value::Void
             }
-            _ => return this.host.unknown_operand_call(r).map(Some),
+            _ => return counted_unknown(this, r, &source),
         };
         return Ok(Some(value));
     }
@@ -933,14 +1014,25 @@ fn invoke_multimap<H: Host>(
                 }
                 fresh_as_map_view(this, &source, "asMap.values")
             }
-            _ => return this.host.unknown_operand_call(r).map(Some),
+            _ => return counted_unknown(this, r, &source),
         };
         return Ok(Some(value));
     }
     if args.iter().any(|value| matches!(value, Value::Ref(None))) {
-        return this.host.unknown_operand_call(r).map(Some);
+        return counted_unknown(this, r, &source);
     }
     match (r.name.as_str(), r.descriptor.as_str()) {
+        ("removeAll", "(Ljava/lang/Object;)Ljava/util/Collection;")
+        | ("removeAll", "(Ljava/lang/Object;)Ljava/util/List;")
+        | ("removeAll", "(Ljava/lang/Object;)Ljava/util/Set;") => {
+            let removed = remove_key(this, &source, &args[0])?.unwrap_or_else(|| {
+                let kind = source_kind(this, &source).unwrap_or_else(|| "array".into());
+                this.host
+                    .immutable_collection(if kind == "array" { "list" } else { "set" }, Vec::new())
+                    .unwrap_or(Value::Ref(None))
+            });
+            Ok(Some(removed))
+        }
         ("put", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
             Ok(Some(put_one(this, &source, &args[0], &args[1])?))
         }
@@ -988,6 +1080,6 @@ fn invoke_multimap<H: Host>(
             "asMap",
             "com/google/common/collect/AbstractMapBasedMultimap$AsMap",
         ))),
-        _ => this.host.unknown_operand_call(r).map(Some),
+        _ => counted_unknown(this, r, &source),
     }
 }

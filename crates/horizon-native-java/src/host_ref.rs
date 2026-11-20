@@ -950,18 +950,31 @@ pub(crate) fn instance_of_class(
         let list = class.ends_with("$WrappedList") || class.ends_with("$RandomAccessWrappedList");
         let set = class.ends_with("$WrappedSet")
             || class.ends_with("$KeySet")
-            || class.ends_with("$EntrySet");
+            || class.ends_with("$SimpleEntrySet");
         let collection = list
             || set
             || class.ends_with("$Values")
             || class == "com/google/common/collect/AbstractMultimap$Values";
         let map = class.ends_with("$AsMap");
-        let multimap = (class.ends_with("Multimap") && !class.contains("$"))
-            || matches!(
-                class,
-                "com/google/common/collect/Synchronized$SynchronizedMultimap"
-                    | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
-            );
+        let multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let list_multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let set_multimap = matches!(
+            class,
+            "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+        );
         if wanted == "java/lang/Object" {
             return Some(true);
         }
@@ -979,6 +992,12 @@ pub(crate) fn instance_of_class(
         }
         if wanted == "com/google/common/collect/Multimap" {
             return Some(multimap);
+        }
+        if wanted == "com/google/common/collect/ListMultimap" {
+            return Some(list_multimap);
+        }
+        if wanted == "com/google/common/collect/SetMultimap" {
+            return Some(set_multimap);
         }
         if wanted == "java/util/RandomAccess" {
             return Some(class.ends_with("$RandomAccessWrappedList"));
