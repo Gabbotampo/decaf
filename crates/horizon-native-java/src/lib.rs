@@ -5690,7 +5690,16 @@ impl StdHost {
                 else {
                     return Ok(None);
                 };
-                properties.insert("__template".into(), "minecraft:crafting_table".into());
+                // Only a vanilla `CraftingTableBlock` itself behaves as the crafting table (its
+                // `useWithoutItem` opens the 3x3 grid). This constructor is also the super call of
+                // a jar's subclass (Runes' altar), whose own `useWithoutItem` opens its own menu:
+                // giving it the crafting table's template would open the vanilla grid in game.
+                // Such a block keeps the inferred template; its behaviour is the jar's to bridge.
+                if crate::jar_object::key_class(marker)
+                    == Some("net/minecraft/world/level/block/CraftingTableBlock")
+                {
+                    properties.insert("__template".into(), "minecraft:crafting_table".into());
+                }
                 if self.block_property_builders.contains_key(marker)
                     || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
                 {
