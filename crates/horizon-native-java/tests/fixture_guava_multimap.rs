@@ -32,6 +32,7 @@ fn real_guava_multimaps_match_java25() {
     let fixture =
         Fixture::build_with_classpath("guava-multimap", &[("demo/Probe.java", PROBE)], &guava);
     let mut host = fixture.jar.seed_host(horizon_native_java::StdHost::new());
+    let mut oracle = AS_MAP_ORACLE.lines();
     for (method, expected) in [
         ("array", "true|true|true|2|true|true|true|2|true|1|false"),
         ("hash", "true|true|true|2|true|true|true|2|true|1|false"),
@@ -39,15 +40,21 @@ fn real_guava_multimaps_match_java25() {
     ] {
         assert_eq!(fixture.text_on(&mut host, method), expected, "{method}");
     }
+    for method in ["entryArray", "entryHash", "entryLinked"] {
+        assert_eq!(
+            fixture.text_on(&mut host, method),
+            oracle.next().unwrap(),
+            "{method}"
+        );
+    }
     assert_eq!(fixture.text_on(&mut host, "sync"), "true");
     assert_eq!(fixture.text_on(&mut host, "excluded"), "done");
     assert_eq!(
         host.unknown_host_call_count(),
-        14,
+        13,
         "{:?}",
         host.unknown_host_calls()
     );
-    let mut oracle = AS_MAP_ORACLE.lines();
     for method in [
         "asMapIdentity",
         "asMapRemoveArray",

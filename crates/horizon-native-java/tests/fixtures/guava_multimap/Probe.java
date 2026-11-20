@@ -18,6 +18,25 @@ public final class Probe {
   public static String array(){return run(ArrayListMultimap.create());}
   public static String hash(){return run(HashMultimap.create());}
   public static String linked(){return run(LinkedHashMultimap.create());}
+  private static String entryBehavior(Multimap<String,Integer> m) {
+    m.put("a", 1);
+    Map.Entry<String, Collection<Integer>> e = m.asMap().entrySet().iterator().next();
+    String set;
+    try { e.setValue(java.util.List.of(9)); set = "no"; }
+    catch (UnsupportedOperationException x) { set = "uo"; }
+    String before = Integer.toString(e.getValue().size());
+    m.put("a", 2);
+    String grown = e.getValue().size() + "|" + e.getValue().contains(2);
+    m.asMap().remove("a");
+    String empty = e.getValue().size() + "|" + e.toString();
+    return e.getClass().getName() + "|" + e.getKey() + "|" + before + "|" + grown + "|" + empty
+        + "|" + set + "|" + e.equals(java.util.Map.entry("a", e.getValue())) + "|"
+        + e.toString();
+  }
+  public static String entryArray() { return entryBehavior(ArrayListMultimap.create()); }
+  public static String entryHash() { return entryBehavior(HashMultimap.create()); }
+  public static String entryLinked() { return entryBehavior(LinkedHashMultimap.create()); }
+
   public static String asMapIdentity() {
     ArrayListMultimap<String,Integer> m = ArrayListMultimap.create();
     m.put("a", 1);
@@ -85,7 +104,7 @@ public final class Probe {
     try { m.entries().iterator(); } catch (NullPointerException ignored) {}
     try { m.keySet().iterator(); } catch (NullPointerException ignored) {}
     m.replaceValues("a", java.util.List.of(9));
-    m.removeAll("a");
+    m.asMap().remove("a");
     m.equals(m); m.toString();
     m.put(null, 1); m.get(null); m.containsKey(null);
     m.containsEntry(null, 1); m.remove(null, 1);

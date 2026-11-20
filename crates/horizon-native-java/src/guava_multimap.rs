@@ -633,12 +633,17 @@ fn invoke_multimap<H: Host>(
                 let map_view = handle(key.to_owned());
                 let mut entries = Vec::new();
                 for candidate in keys {
-                    if let Some(collection) = values_for_key(this, &source, &candidate, false)? {
+                    if values_for_key(this, &source, &candidate, false)?.is_some() {
+                        // Guava's AsMap wraps each backing collection and returns it through
+                        // `Maps.immutableEntry`: the entry is a SimpleImmutableEntry whose value is
+                        // this live wrapped collection.  It is immutable (`setValue` throws),
+                        // while the wrapped collection continues to follow the multimap key.
+                        let collection = fresh_as_map_value(this, &source, &candidate);
                         entries.push(this.host.mint_map_entry(
                             Some(&map_view),
                             &candidate,
                             &collection,
-                            crate::host_map_entry::EntryMade::Node,
+                            crate::host_map_entry::EntryMade::Snapshot,
                         ));
                     }
                 }

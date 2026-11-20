@@ -30268,6 +30268,7 @@ impl<H: Host> Runtime<'_, H> {
             names.push(name);
         }
         Ok(Some(Value::Ref(Some(format!("[{}]", names.join(", "))))))
+    }
 
     fn invoke_menu_model(
         &mut self,

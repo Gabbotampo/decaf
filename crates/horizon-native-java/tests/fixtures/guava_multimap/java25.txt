@@ -1,3 +1,6 @@
+java.util.AbstractMap$SimpleImmutableEntry|a|1|2|true|0|a=[]|uo|true|a=[]
+java.util.AbstractMap$SimpleImmutableEntry|a|1|2|true|0|a=[]|uo|true|a=[]
+java.util.AbstractMap$SimpleImmutableEntry|a|1|2|true|0|a=[]|uo|true|a=[]
 true|true|true|true|true
 true|2|0|false|1|true|true
 true|2|0|false|1|true|true
