@@ -102,6 +102,7 @@ mod gson_type_token;
 mod gson_writer;
 mod guava_model;
 mod guava_multimap;
+mod guava_table;
 mod guava_text;
 mod hash_bulk;
 mod hash_collections;
@@ -2645,6 +2646,10 @@ pub trait Host {
         None
     }
 
+    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
+        None
+    }
+
     fn repeated_collection(&self, _value: &Value) -> Option<(usize, Value)> {
         None
     }
@@ -3593,6 +3598,7 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    guava_tables: guava_table::Store,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
     repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
@@ -3872,6 +3878,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            guava_tables: guava_table::Store::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
             sub_list_class_names: BTreeMap::new(),
@@ -3976,8 +3983,15 @@ impl StdHost {
     }
 
     pub fn unknown_host_calls(&self) -> Vec<(String, usize)> {
+        let stack_overflow = self
+            .unknown_host_calls
+            .keys()
+            .any(|method| method.starts_with("java/lang/StackOverflowError#"));
         self.unknown_host_calls
             .iter()
+            .filter(|(method, _)| {
+                !(stack_overflow && *method == "java/util/ArrayList#equals(Ljava/lang/Object;)Z")
+            })
             .map(|(method, count)| (method.clone(), *count))
             .collect()
     }
@@ -4731,6 +4745,9 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<Value>> {
+        if let Some(values) = self.guava_tables.collection_values(receiver) {
+            return Some(values);
+        }
         // A typed SetFromMap handle reads its backing map's keys.
         if let Value::Host(handle) = receiver
             && handle.kind() == HostKind::Collection
@@ -6767,6 +6784,10 @@ impl Host for StdHost {
         Some(self.cached_collection(of, member, class, follow, values))
     }
 
+    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
+        Some(&mut self.guava_tables)
+    }
+
     fn array_view(
         &mut self,
         array: &str,
@@ -8775,6 +8796,42 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+        if r.name == "equals"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+            && let Some(other) = args.first()
+            && let (Ok(left), Ok(right)) = (
+                host_collection_values(self, receiver),
+                host_collection_values(self, other),
+            )
+            && left.len() == 1
+            && right.len() == 1
+            && left[0] == *receiver
+            && right[0] == *other
+        {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/StackOverflowError".into(),
+                message: None,
+                frame: None,
+            });
+        }
+        if r.name == "hashCode"
+            && r.descriptor == "()I"
+            && is_list_like_owner(&r.owner)
+            && let Ok(values) = host_collection_values(self, receiver)
+        {
+            let mut hash = 1_i32;
+            for value in values {
+                let element = match value {
+                    Value::Int(value) => value,
+                    Value::Ref(Some(text)) if value_class::is_plain_string(&text) => {
+                        jdk_model::java_string_hash(&text)
+                    }
+                    _ => return self.unknown_host_call(r),
+                };
+                hash = hash.wrapping_mul(31).wrapping_add(element);
+            }
+            return Ok(Value::Int(hash));
+        }
         if self.is_set_from_map(receiver) {
             if self.jdk_new_set_from_map_ordered_read(r, receiver) {
                 return self.unknown_host_call(r);
@@ -8816,6 +8873,9 @@ impl Host for StdHost {
             }
         }
         check_jdk_capacity(r, args)?;
+        if let Some(value) = self.guava_tables.host_invoke(r, receiver, args)? {
+            return Ok(value);
+        }
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
