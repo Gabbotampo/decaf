@@ -194,6 +194,7 @@ mod library_dispatch;
 mod linked_resources;
 mod list_equality;
 mod map_compute;
+mod menu_models;
 mod method_handles;
 mod mixin_extras;
 mod mixin_plugins;
@@ -269,6 +270,8 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_state_definers;
+mod vanilla_block_state_properties;
 mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
@@ -2381,6 +2384,43 @@ pub struct EventDispatch {
 /// keeps no such state", which the caller turns into a counted path of its own (#246's review:
 /// a silent `null` from `unknown_operand_call` printed a hook-tier player as `null`).
 pub trait Host {
+    /// Structural vanilla menu/container call. `None` leaves the call on the
+    /// ordinary host path; a returned error is a counted refusal.
+    fn menu_instance_call(
+        &mut self,
+        _r: &MethodRef,
+        _receiver: &Value,
+        _args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        None
+    }
+
+    /// A menu model may need the interpreter to run a virtual subclass method
+    /// (for example `ItemCombinerMenu$4.setChanged` reaching `createResult`).
+    /// The default host has no pending action.
+    fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
+        None
+    }
+
+    fn menu_field(&mut self, _receiver: &Value, _r: &MethodRef) -> Option<Value> {
+        None
+    }
+
+    /// Record one property added to a `StateDefinition.Builder` while a block
+    /// constructor's virtual `createBlockStateDefinition` runs.
+    fn block_state_builder_add(&mut self, _builder: &Value, _property: &Value) {}
+    fn block_state_builder_add_checked(
+        &mut self,
+        builder: &Value,
+        property: &Value,
+    ) -> Result<(), NativeError> {
+        self.block_state_builder_add(builder, property);
+        Ok(())
+    }
+    fn begin_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
+    fn finish_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
+    fn block_state_definition_unknown(&mut self, _block: &Value, _method: &MethodRef) {}
+    fn block_placement_unknown(&mut self) {}
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -3277,6 +3317,8 @@ const BLOCK_CLASS: &str = "net/minecraft/world/level/block/Block";
 const ITEM_PROPERTIES_DESC: &str = "Lnet/minecraft/world/item/Item$Properties;";
 const BLOCK_PROPERTIES_DESC: &str =
     "Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;";
+const STATE_BUILDER_CLASS: &str = "net/minecraft/world/level/block/state/StateDefinition$Builder";
+const STATE_BUILDER_DESC: &str = "Lnet/minecraft/world/level/block/state/StateDefinition$Builder;";
 /// The template an inferred item declaration names. A content plan resolves
 /// templates against vanilla's own tables, so an item whose only declared
 /// behaviour is its property chain inherits the plain vanilla item model and
@@ -3290,6 +3332,11 @@ const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:stone";
 /// builders are still answered but their chains are dropped, so a jar cannot
 /// grow the host without bound.
 const MAX_PROPERTY_BUILDERS: usize = 512;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatePropertyInfo {
+    kind: String,
+    values: Vec<String>,
+}
 /// Settings kept per builder. Builders in the wild set a handful; past this
 /// the extras are dropped rather than growing host state.
 const MAX_BUILDER_PROPERTIES: usize = 16;
@@ -3456,6 +3503,13 @@ pub struct StdHost {
     item_property_builders: BTreeMap<String, BTreeMap<String, String>>,
     /// Bounded `BlockBehaviour.Properties` chains, keyed the same way.
     block_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Properties captured from each mod block's virtual state-definition hook.
+    block_state_properties: BTreeMap<String, BTreeMap<String, StatePropertyInfo>>,
+    state_definition_builders: BTreeMap<String, String>,
+    block_states: BTreeMap<String, (String, BTreeMap<String, String>)>,
+    block_default_states: BTreeMap<String, BTreeMap<String, String>>,
+    unknown_block_state_definitions: BTreeSet<String>,
+    next_block_state: usize,
     /// Marker counter for a property builder made by a static factory
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
     next_property_builder: usize,
@@ -3682,6 +3736,7 @@ pub struct StdHost {
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
     vec2: vec2::State,
+    menu_states: menu_models::States,
 }
 
 impl Default for StdHost {
@@ -3759,6 +3814,12 @@ impl StdHost {
             declared_registrations: BTreeSet::new(),
             item_property_builders: BTreeMap::new(),
             block_property_builders: BTreeMap::new(),
+            block_state_properties: BTreeMap::new(),
+            state_definition_builders: BTreeMap::new(),
+            block_states: BTreeMap::new(),
+            block_default_states: BTreeMap::new(),
+            unknown_block_state_definitions: BTreeSet::new(),
+            next_block_state: 0,
             next_property_builder: 0,
             payload_registrations: Vec::new(),
             outgoing_payloads: Vec::new(),
@@ -3856,6 +3917,7 @@ impl StdHost {
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
             vec2: vec2::State::default(),
+            menu_states: BTreeMap::new(),
         }
     }
 
@@ -4966,6 +5028,48 @@ impl StdHost {
         self.block_property_builders.get(marker)
     }
 
+    fn captured_property(field: &str) -> Option<StatePropertyInfo> {
+        crate::vanilla_block_state_properties::TABLE
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('|');
+                (parts.next()? == field).then(|| {
+                    let _name = parts.next()?;
+                    let kind = parts.next()?.to_owned();
+                    let values = parts
+                        .next()?
+                        .trim_matches(['[', ']'])
+                        .split(", ")
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    Some(StatePropertyInfo { kind, values })
+                })?
+            })
+    }
+
+    /// The declared class of a captured `BlockStateProperties` field (`EnumProperty`,
+    /// `IntegerProperty`, `BooleanProperty`): a `getstatic` names the field by it.
+    fn captured_property_type(field: &str) -> Option<&'static str> {
+        crate::vanilla_block_state_properties::TABLE
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('|');
+                (parts.next()? == field).then(|| parts.nth(3)).flatten()
+            })
+    }
+
+    fn captured_property_name(field: &str) -> Option<String> {
+        crate::vanilla_block_state_properties::TABLE
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('|');
+                (parts.next()? == field)
+                    .then(|| parts.next().map(str::to_owned))
+                    .flatten()
+            })
+    }
+
     /// Attach a Horizon-owned declaration to a registration recorded while a
     /// Java entrypoint executed. The lookup is explicit and all-or-nothing:
     /// opaque entries remain diagnostic until a loader adapter supplies a
@@ -5460,19 +5564,42 @@ impl StdHost {
             }
             "minecraft:data_component_type" => self.content_builders.component_declaration(marker),
             "minecraft:block" => {
-                self.block_property_builders
-                    .get(marker)
-                    .map(|builder| RegistryDeclaration::Block {
+                self.block_property_builders.get(marker).map(|builder| {
+                    let mut properties = block_declaration_properties(builder);
+                    if !self.unknown_block_state_definitions.contains(marker)
+                        && let Some(state) = self.block_state_properties.get(marker)
+                    {
+                        for (name, property) in state {
+                            properties.insert(
+                                format!("state_property:{name}"),
+                                format!("{}|{}", property.kind, property.values.join(",")),
+                            );
+                            // `Block.<init>` registers `stateDefinition.any()`, the first
+                            // state: every property at its first possible value (a
+                            // `BooleanProperty` is `[true, false]`), unless the class
+                            // calls `registerDefaultState` itself (below).
+                            if let Some(default) = property.values.first().cloned() {
+                                properties.insert(format!("default_state:{name}"), default);
+                            }
+                        }
+                    }
+                    if let Some(defaults) = self.block_default_states.get(marker) {
+                        for (name, value) in defaults {
+                            properties.insert(format!("default_state:{name}"), value.clone());
+                        }
+                    }
+                    RegistryDeclaration::Block {
                         template: builder
                             .get("__template")
                             .cloned()
                             .unwrap_or_else(|| INFERRED_BLOCK_TEMPLATE.to_owned()),
-                        properties: block_declaration_properties(builder),
+                        properties,
                         // A block built this way has the item vanilla gives
                         // every block; a mod that registers its own block item
                         // records that separate row as a plain item.
                         item: true,
-                    })
+                    }
+                })
             }
             _ => None,
         }
@@ -5653,6 +5780,61 @@ impl StdHost {
         let Some(marker) = expect_ref(receiver) else {
             return Ok(None);
         };
+        if r.name == "defaultBlockState"
+            && r.descriptor.ends_with("BlockState;")
+            && r.owner.starts_with("net/minecraft/world/level/block/")
+        {
+            let state = format!("blockstate/{}/{}", marker, self.next_block_state);
+            self.next_block_state = self.next_block_state.saturating_add(1);
+            self.block_states
+                .insert(state.clone(), (marker.to_owned(), BTreeMap::new()));
+            return Ok(Some(Value::Ref(Some(state))));
+        }
+        if r.name == "setValue" && marker.starts_with("blockstate/") {
+            let Some((block, values)) = self.block_states.get(marker).cloned() else {
+                return Ok(None);
+            };
+            let Some(property) = args.first().and_then(expect_ref) else {
+                return Ok(None);
+            };
+            let Some(name) = property
+                .strip_prefix("property/BlockStateProperties.")
+                .and_then(Self::captured_property_name)
+            else {
+                return Ok(None);
+            };
+            let value = match args.get(1) {
+                Some(Value::Int(value)) => (*value != 0)
+                    .then_some("true".to_owned())
+                    .or_else(|| Some("false".to_owned())),
+                Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
+                Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
+                Some(Value::Ref(Some(value))) => value
+                    .rsplit('/')
+                    .next()
+                    .map(|value| value.to_ascii_lowercase()),
+                _ => None,
+            };
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let state = format!("blockstate/{}/{}", block, self.next_block_state);
+            self.next_block_state = self.next_block_state.saturating_add(1);
+            let mut values = values;
+            values.insert(name, value);
+            self.block_states.insert(state.clone(), (block, values));
+            return Ok(Some(Value::Ref(Some(state))));
+        }
+        if r.name == "registerDefaultState"
+            && r.descriptor.contains("BlockState")
+            && let Some((block, values)) = args
+                .first()
+                .and_then(expect_ref)
+                .and_then(|state| self.block_states.get(state).cloned())
+        {
+            self.block_default_states.insert(block, values);
+            return Ok(Some(Value::Void));
+        }
         match r.owner.as_str() {
             ITEM_PROPERTIES_CLASS | BLOCK_PROPERTIES_CLASS => {
                 let item = r.owner == ITEM_PROPERTIES_CLASS;
@@ -5789,6 +5971,127 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
 }
 
 impl Host for StdHost {
+    fn menu_instance_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        menu_models::call(&mut self.menu_states, r, receiver, args)
+    }
+
+    fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
+        menu_models::field(&self.menu_states, receiver, r)
+    }
+
+    fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
+        menu_models::take_action(&mut self.menu_states)
+    }
+
+    fn block_placement_unknown(&mut self) {
+        *self
+            .unknown_host_calls
+            .entry("Block#getStateForPlacement (placement hook)".into())
+            .or_default() += 1;
+    }
+
+    fn begin_block_state_definition(&mut self, block: &Value, builder: &Value) {
+        if let (Some(block), Some(builder)) = (expect_ref(block), expect_ref(builder)) {
+            self.state_definition_builders
+                .insert(builder.to_owned(), block.to_owned());
+        }
+    }
+
+    fn block_state_builder_add(&mut self, builder: &Value, property: &Value) {
+        let _ = self.block_state_builder_add_checked(builder, property);
+    }
+
+    fn block_state_builder_add_checked(
+        &mut self,
+        builder: &Value,
+        property: &Value,
+    ) -> Result<(), NativeError> {
+        let (Some(builder), Some(property)) = (expect_ref(builder), expect_ref(property)) else {
+            return Ok(());
+        };
+        let Some(block) = self.state_definition_builders.get(builder).cloned() else {
+            return Ok(());
+        };
+        let Some(field) = property.strip_prefix("property/BlockStateProperties.") else {
+            self.unknown_block_state_definitions.insert(block.clone());
+            *self
+                .unknown_host_calls
+                .entry("BlockStateProperties custom Property".into())
+                .or_default() += 1;
+            return Ok(());
+        };
+        let Some(info) = Self::captured_property(field) else {
+            self.unknown_block_state_definitions.insert(block.clone());
+            *self
+                .unknown_host_calls
+                .entry(format!("unknown BlockStateProperties.{field}"))
+                .or_default() += 1;
+            return Ok(());
+        };
+        let name = crate::vanilla_block_state_properties::TABLE
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split('|');
+                (parts.next()? == field)
+                    .then(|| parts.next().map(str::to_owned))
+                    .flatten()
+            });
+        if let Some(name) = name {
+            if self
+                .block_state_properties
+                .get(&block)
+                .is_some_and(|properties| properties.contains_key(&name))
+            {
+                // 26.3's `validateProperty` throws `IllegalArgumentException` whose message starts
+                // with `String.valueOf(owner)`, the block's `toString` mid-construction, which
+                // this host cannot spell. The duplicate is counted instead, and the block's state
+                // set is left undeclared rather than declared with one copy.
+                self.unknown_block_state_definitions.insert(block.clone());
+                *self
+                    .unknown_host_calls
+                    .entry(format!(
+                        "net/minecraft/world/level/block/state/StateDefinition$Builder#validateProperty duplicate {name}"
+                    ))
+                    .or_default() += 1;
+                return Ok(());
+            }
+            self.block_state_properties
+                .entry(block)
+                .or_default()
+                .insert(name, info);
+        }
+        Ok(())
+    }
+
+    fn block_state_definition_unknown(&mut self, block: &Value, method: &MethodRef) {
+        if let Some(block) = expect_ref(block) {
+            self.unknown_block_state_definitions
+                .insert(block.to_owned());
+        }
+        *self
+            .unknown_host_calls
+            .entry(format!(
+                "{}#{}{}",
+                method.owner, method.name, method.descriptor
+            ))
+            .or_default() += 1;
+    }
+
+    fn finish_block_state_definition(&mut self, block: &Value, builder: &Value) {
+        if let (Some(block), Some(builder)) = (expect_ref(block), expect_ref(builder)) {
+            self.state_definition_builders.remove(builder);
+            if let Some(properties) = self.block_state_properties.get(block) {
+                // A Java registerDefaultState call is optional; Sunrise's default is
+                // vanilla's first possible value, which the captured table provides.
+                let _ = properties;
+            }
+        }
+    }
     fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
         self.properties_put_all(marker, entries);
         true
@@ -5907,6 +6210,9 @@ impl Host for StdHost {
     }
 
     fn get_field(&mut self, receiver: &Value, r: &MethodRef) -> Result<Value, NativeError> {
+        if let Some(value) = self.menu_field(receiver, r) {
+            return Ok(value);
+        }
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
             return value;
         }
@@ -6608,6 +6914,21 @@ impl Host for StdHost {
     }
 
     fn get_static(&mut self, r: &MethodRef) -> Result<Value, NativeError> {
+        // `ItemStack.EMPTY` is one object on every side: the same typed value the client surface
+        // answers (`client_surface.rs`), so the client item model's `isEmpty` and the menu models
+        // agree on it, server side too.
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "EMPTY"
+            && r.descriptor == "Lnet/minecraft/world/item/ItemStack;"
+        {
+            return Ok(menu_models::empty_stack());
+        }
+        if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
+            && r.name == "NULL"
+            && r.descriptor == "Lnet/minecraft/world/inventory/ContainerLevelAccess;"
+        {
+            return Ok(Value::Ref(Some("container-level-access/null".into())));
+        }
         if let Some(value) = tool_material::static_field(&mut self.tool_material, r) {
             return value;
         }
@@ -6685,6 +7006,15 @@ impl Host for StdHost {
         }
         if let Some(value) = vanilla_holders::static_field(r) {
             return Ok(value);
+        }
+        if r.owner == "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+            && Self::captured_property_type(&r.name)
+                .is_some_and(|class| r.descriptor == format!("L{class};"))
+        {
+            return Ok(Value::Ref(Some(format!(
+                "property/BlockStateProperties.{}",
+                r.name
+            ))));
         }
         if let Some(value) = self.client_static(r) {
             return value;
@@ -6903,6 +7233,11 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if menu_models::is_menu_class(&r.owner)
+            && let Some(value) = menu_models::static_call(&mut self.menu_states, r, args)
+        {
+            return value;
+        }
         if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
             return value;
         }
@@ -8321,6 +8656,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Value, NativeError> {
+        if let Some(value) = self.menu_instance_call(r, receiver, args) {
+            return value;
+        }
         if let Some(value) =
             host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
         {
@@ -10779,34 +11117,42 @@ impl Host for StdHost {
             // type. Keep the conversion rules in one bounded path so a value
             // written as (for example) a Long can be read through Number.
             ("java/lang/Number", "intValue", "()I") => {
-                Ok(Value::Int(number_int_value(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                // A `Number` whose value this model does not hold (an `AtomicInteger`, a
+                // `BigDecimal` it did not make, a jar subclass) is counted, not refused.
+                let Some(value) = number_int_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "longValue", "()J") => {
-                Ok(long_value(number_long_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_long_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(long_value(value))
             }
             ("java/lang/Number", "shortValue", "()S") => {
-                Ok(Value::Int(number_short_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_short_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "byteValue", "()B") => {
-                Ok(Value::Int(number_byte_value(receiver).ok_or_else(
-                    || NativeError::Metadata("malformed java/lang/Number marker".into()),
-                )?))
+                let Some(value) = number_byte_value(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(Value::Int(value))
             }
             ("java/lang/Number", "floatValue", "()F") => {
-                Ok(float_value(boxed_number(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                let Some(value) = boxed_number(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(float_value(value))
             }
             ("java/lang/Number", "doubleValue", "()D") => {
-                Ok(double_value(boxed_number(receiver).ok_or_else(|| {
-                    NativeError::Metadata("malformed java/lang/Number marker".into())
-                })?))
+                let Some(value) = boxed_number(receiver) else {
+                    return self.unknown_host_call(r);
+                };
+                Ok(double_value(value))
             }
             ("java/lang/Integer", "intValue", "()I") => {
                 Ok(Value::Int(boxed_integer(receiver).ok_or_else(|| {
@@ -12934,13 +13280,10 @@ const REGISTRY_STATICS: &[(&str, &str)] = &[
     ("ARMOR_MATERIAL", "minecraft:armor_material"),
 ];
 
-/// `Block` itself or a vanilla block class directly in its package
-/// (`FenceBlock`, `FireBlock`), whose constructor a mod's block reaches
-/// through `super(...)`.
+/// `Block` or a vanilla subclass of it (`FenceBlock`, `piston/PistonBaseBlock`), exactly, from the
+/// captured 26.3 class table, whose constructor a mod's block reaches through `super(...)`.
 fn is_vanilla_block_class(owner: &str) -> bool {
-    owner
-        .strip_prefix("net/minecraft/world/level/block/")
-        .is_some_and(|name| !name.contains('/') && name.ends_with("Block"))
+    vanilla_block_state_definers::is_block_class(owner)
 }
 
 /// Stable registry id for a `Registries`/`BuiltInRegistries` static field.
@@ -13522,6 +13865,9 @@ fn block_declaration_properties(builder: &BTreeMap<String, String>) -> BTreeMap<
     }
     if builder.contains_key("requiresCorrectToolForDrops") {
         properties.insert("requires_tool".to_owned(), "true".to_owned());
+    }
+    if builder.contains_key("noOcclusion") {
+        properties.insert("occludes".to_owned(), "false".to_owned());
     }
     properties
 }
@@ -22906,6 +23252,11 @@ impl<H: Host> Runtime<'_, H> {
         let mut current = field.owner.clone();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
+                if let Some(owner) =
+                    menu_models::field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
                 // `AbstractList.modCount`, inherited from a JDK skeleton.
                 if let Some(owner) =
                     jdk_skeletons::skeleton_field_owner(&current, &field.name, &field.descriptor)
@@ -24430,6 +24781,81 @@ impl<H: Host> Runtime<'_, H> {
     fn generic_type_array(&mut self, class: &str, values: &[GenericType]) -> Value {
         let values = values.iter().map(generic_type_value).collect();
         self.new_array_value(class, values)
+    }
+
+    /// A jar block's `super(...)` reaching the first vanilla constructor in its chain: `Block`
+    /// or a vanilla subclass (`CraftingTableBlock`, `FenceBlock`, `piston/PistonBaseBlock`; the
+    /// captured class table decides). Every chain ends in `Block.<init>`, which calls the virtual
+    /// `createBlockStateDefinition` before the subclass constructor continues, so a jar override
+    /// runs here whichever vanilla class the jar extends. Called from the `invokespecial` site,
+    /// where a vanilla constructor call is dispatched.
+    #[inline(never)]
+    fn run_vanilla_block_constructor_hooks(&mut self, receiver: &Value) -> Result<(), NativeError> {
+        let Some(marker) = jar_object::object_key(receiver) else {
+            return Ok(());
+        };
+        let class = marker.split('#').next().unwrap_or_default();
+        let descriptor = format!("({STATE_BUILDER_DESC})V");
+        // Virtual dispatch: the nearest jar class in the receiver's chain that declares
+        // the override (a jar superclass's override counts too).
+        let mut declaring = None;
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(file) = self.class(&current) else {
+                break;
+            };
+            if file
+                .method("createBlockStateDefinition", &descriptor)
+                .is_some()
+            {
+                declaring = Some(current.clone());
+                break;
+            }
+            current = file.super_name.clone();
+        }
+        if let Some(owner) = declaring {
+            let hook = MethodRef {
+                owner,
+                name: "createBlockStateDefinition".into(),
+                descriptor,
+            };
+            let builder = self.new_object(STATE_BUILDER_CLASS);
+            self.host.begin_block_state_definition(receiver, &builder);
+            let result = self.invoke(
+                &hook.owner,
+                &hook.name,
+                &hook.descriptor,
+                Some(receiver.clone()),
+                std::slice::from_ref(&builder),
+            );
+            self.host.finish_block_state_definition(receiver, &builder);
+            result?;
+        } else if is_vanilla_block_class(&current)
+            && vanilla_block_state_definers::adds_properties(&current)
+        {
+            self.host.block_state_definition_unknown(
+                receiver,
+                &MethodRef {
+                    owner: current,
+                    name: "createBlockStateDefinition".into(),
+                    descriptor,
+                },
+            );
+        }
+        let placement = MethodRef {
+            owner: class.to_owned(),
+            name: "getStateForPlacement".into(),
+            descriptor: "(Lnet/minecraft/world/item/context/BlockPlaceContext;)Lnet/minecraft/world/level/block/state/BlockState;".into(),
+        };
+        if self
+            .class(&placement.owner)
+            .and_then(|file| file.method(&placement.name, &placement.descriptor))
+            .is_some()
+        {
+            self.host.block_placement_unknown();
+        }
+
+        Ok(())
     }
 
     /// A new object of `class`: a [`HostKind::JarObject`] handle keyed by a
@@ -30128,6 +30554,59 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(result))
     }
 
+    fn invoke_menu_model(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(result) = self.host.menu_instance_call(r, receiver, args) else {
+            return Ok(None);
+        };
+        let mut value = result?;
+        while let Some(action) = self.host.take_menu_action() {
+            value = match action {
+                menu_models::MenuAction::SlotsChanged { menu, container } => {
+                    if let Some(value) = self.invoke_menu_model(
+                        &MethodRef {
+                            owner: "net/minecraft/world/inventory/ItemCombinerMenu".into(),
+                            name: "slotsChanged".into(),
+                            descriptor: "(Lnet/minecraft/world/Container;)V".into(),
+                        },
+                        &menu,
+                        &[container],
+                    )? {
+                        value
+                    } else {
+                        let class = crate::expect_ref(&menu)
+                            .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                            .ok_or_else(|| {
+                                NativeError::Metadata("menu receiver is not a jar object".into())
+                            })?;
+                        self.invoke(&class, "createResult", "()V", Some(menu), &[])?
+                    }
+                }
+                menu_models::MenuAction::CreateResult { menu } => {
+                    let class = crate::expect_ref(&menu)
+                        .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                        .ok_or_else(|| {
+                            NativeError::Metadata("menu receiver is not a jar object".into())
+                        })?;
+                    self.invoke(&class, "createResult", "()V", Some(menu), &[])?
+                }
+                menu_models::MenuAction::Predicate { predicate, stack } => self.call_virtual(
+                    jdk_call::Site::Interface,
+                    "java/util/function/Predicate",
+                    "test",
+                    "(Ljava/lang/Object;)Z",
+                    &predicate,
+                    &[stack],
+                )?,
+            };
+        }
+        Ok(Some(value))
+    }
+
     /// Enter one jar frame under the execution's recursion and time bounds.
     ///
     /// The bound is checked here rather than in [`Self::invoke_frame`] so every
@@ -30309,6 +30788,17 @@ impl<H: Host> Runtime<'_, H> {
             (None, None) if !host_models => linked
                 .get(class)
                 .ok_or_else(|| NativeError::MissingMethod(format!("{class}#{method}{desc}")))?,
+            (None, None) if host_models => {
+                let r = MethodRef {
+                    owner: class.to_owned(),
+                    name: method.to_owned(),
+                    descriptor: desc.to_owned(),
+                };
+                return match receiver.as_ref() {
+                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    None => self.host.invoke(&r, args),
+                };
+            }
             (None, None) => {
                 return Err(NativeError::MissingMethod(format!(
                     "{class}#{method}{desc}"
@@ -31601,7 +32091,11 @@ impl<H: Host> Runtime<'_, H> {
                                 }
                                 None => {
                                     self.refuse_collected(&receiver, &r)?;
-                                    self.host.get_field(&receiver, &r)?
+                                    if let Some(value) = self.host.menu_field(&receiver, &r) {
+                                        value
+                                    } else {
+                                        self.host.get_field(&receiver, &r)?
+                                    }
                                 }
                             }
                         }
@@ -31692,6 +32186,26 @@ impl<H: Host> Runtime<'_, H> {
                         self.pending_skipped_new.pop();
                         continue;
                     }
+                    if op == 0xb7
+                        && r.name == "<init>"
+                        && is_vanilla_block_class(&r.owner)
+                        && self.class(&r.owner).is_none()
+                        && let Some(receiver) = receiver.as_ref()
+                    {
+                        invoke_or_catch!(at, self.run_vanilla_block_constructor_hooks(receiver));
+                    }
+                    // A jar override's `super.createBlockStateDefinition(builder)` into vanilla:
+                    // counted when that vanilla chain adds properties the runtime does not run;
+                    // otherwise it reaches `Block`'s empty body and adds nothing, exactly.
+                    if op == 0xb7
+                        && r.name == "createBlockStateDefinition"
+                        && is_vanilla_block_class(&r.owner)
+                        && self.class(&r.owner).is_none()
+                        && vanilla_block_state_definers::adds_properties(&r.owner)
+                        && let Some(receiver) = receiver.as_ref()
+                    {
+                        self.host.block_state_definition_unknown(receiver, &r);
+                    }
                     self.calls += 1;
                     // An anchor `@Redirect` replaces the call; otherwise an
                     // `@At("INVOKE")` callback runs just before it and a
@@ -31737,8 +32251,35 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         dispatched = Some(value);
                     }
+                    // `StateDefinition.Builder.add(Property...)` inside a jar block's
+                    // `createBlockStateDefinition`: each property is recorded for the block's
+                    // declaration (or the duplicate counted), and `add` returns the builder.
+                    if dispatched.is_none()
+                        && r.owner == STATE_BUILDER_CLASS
+                        && r.name == "add"
+                        && let Some(builder) = receiver.as_ref()
+                        && let Some(values) = args
+                            .first()
+                            .and_then(|value| self.owned_array(value).map(|v| v.into_owned()))
+                    {
+                        for property in values.iter() {
+                            invoke_or_catch!(
+                                at,
+                                self.host.block_state_builder_add_checked(builder, property)
+                            );
+                        }
+                        dispatched = Some(builder.clone());
+                    }
                     if dispatched.is_none()
                         && let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)?
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && menu_models::is_menu_class(&r.owner)
+                        && let Some(receiver) = receiver.as_ref()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_menu_model(&r, receiver, &args))
                     {
                         dispatched = Some(value);
                     }
@@ -36733,6 +37274,167 @@ mod tests {
             &[Value::Ref(Some("properties#1".into()))],
         );
         assert_eq!(host.unknown_host_call_count(), 1);
+    }
+
+    #[test]
+    fn digit_named_properties_come_from_the_capture() {
+        // `AGE_7`, `ROTATION_16`, `SLOT_0_OCCUPIED`: fields whose names hold digits are in the
+        // captured table like any other (an earlier capture dropped them). Values from the real
+        // 26.3 `BlockStateProperties` (tests/fixtures/block_state_properties/oracle).
+        let mut host = StdHost::new();
+        let block = Value::Ref(Some("crops/AgeBlock#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        host.begin_block_state_definition(&block, &builder);
+        for (field, descriptor) in [
+            (
+                "AGE_7",
+                "Lnet/minecraft/world/level/block/state/properties/IntegerProperty;",
+            ),
+            (
+                "SLOT_0_OCCUPIED",
+                "Lnet/minecraft/world/level/block/state/properties/BooleanProperty;",
+            ),
+        ] {
+            let property = host
+                .get_static(&MethodRef {
+                    owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                        .into(),
+                    name: field.into(),
+                    descriptor: descriptor.into(),
+                })
+                .unwrap();
+            host.block_state_builder_add(&builder, &property);
+        }
+        host.finish_block_state_definition(&block, &builder);
+        let captured = host.block_state_properties.get("crops/AgeBlock#1").unwrap();
+        assert_eq!(captured["age"].kind, "integer");
+        assert_eq!(
+            captured["age"].values,
+            ["0", "1", "2", "3", "4", "5", "6", "7"]
+        );
+        assert_eq!(captured["slot_0_occupied"].kind, "boolean");
+    }
+
+    #[test]
+    fn horizontal_facing_captures_real_property_values_in_order() {
+        let mut host = StdHost::new();
+        let property = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                    .into(),
+                name: "HORIZONTAL_FACING".into(),
+                // The field's declared type, as Runes' `RuneCraftingBlock` reads it.
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/EnumProperty;"
+                    .into(),
+            })
+            .unwrap();
+        let block = Value::Ref(Some("runes/RuneCraftingBlock#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        host.begin_block_state_definition(&block, &builder);
+        host.block_state_builder_add(&builder, &property);
+        host.finish_block_state_definition(&block, &builder);
+        let captured = host
+            .block_state_properties
+            .get("runes/RuneCraftingBlock#1")
+            .unwrap();
+        assert_eq!(captured["facing"].kind, "enum");
+        assert_eq!(
+            captured["facing"].values,
+            ["north", "south", "west", "east"]
+        );
+        host.block_property_builders.insert(
+            "runes/RuneCraftingBlock#1".into(),
+            BTreeMap::from([(String::from("destroyTime"), String::from("2.0"))]),
+        );
+        let declaration = host
+            .inferred_declaration("minecraft:block", &block)
+            .unwrap();
+        let file = content::declarations(&[RegistryEntry {
+            registry: "minecraft:block".into(),
+            id: "runes:crafting_altar".into(),
+            value: block,
+            declaration: Some(declaration),
+        }])[0]
+            .file_json();
+        assert_eq!(
+            file["state_properties"]["facing"]["values"],
+            serde_json::json!(["north", "south", "west", "east"])
+        );
+        assert_eq!(file["default_state"]["facing"], "north");
+    }
+
+    #[test]
+    fn state_definition_builder_counts_a_duplicate_property_name() {
+        // The real `validateProperty` throws for a second `facing`, with a message naming the
+        // block's `toString` this host cannot spell: the duplicate is counted, and the block's
+        // state set is not declared.
+        let mut host = StdHost::new();
+        let block = Value::Ref(Some("demo/Block#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        let property = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                    .into(),
+                name: "FACING".into(),
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/EnumProperty;"
+                    .into(),
+            })
+            .unwrap();
+        host.begin_block_state_definition(&block, &builder);
+        host.block_state_builder_add_checked(&builder, &property)
+            .unwrap();
+        host.block_state_builder_add_checked(&builder, &property)
+            .unwrap();
+        assert!(host.unknown_host_calls().iter().any(|(call, _)| call
+            == "net/minecraft/world/level/block/state/StateDefinition$Builder#validateProperty duplicate facing"));
+        assert!(
+            host.unknown_block_state_definitions
+                .contains("demo/Block#1")
+        );
+    }
+
+    #[test]
+    fn a_boolean_property_defaults_to_its_first_value_true() {
+        // With no `registerDefaultState` of its own, `Block.<init>` registers
+        // `stateDefinition.any()`: every property at its first possible value, and the real
+        // 26.3 `BooleanProperty.getPossibleValues()` is `[true, false]`.
+        let mut host = StdHost::new();
+        let property = host
+            .get_static(&MethodRef {
+                owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
+                    .into(),
+                name: "LIT".into(),
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/BooleanProperty;"
+                    .into(),
+            })
+            .unwrap();
+        let block = Value::Ref(Some("lamps/LampBlock#1".into()));
+        let builder = Value::Ref(Some(
+            "net/minecraft/world/level/block/state/StateDefinition$Builder#1".into(),
+        ));
+        host.begin_block_state_definition(&block, &builder);
+        host.block_state_builder_add(&builder, &property);
+        host.finish_block_state_definition(&block, &builder);
+        host.block_property_builders
+            .insert("lamps/LampBlock#1".into(), BTreeMap::new());
+        let declaration = host
+            .inferred_declaration("minecraft:block", &block)
+            .unwrap();
+        let file = content::declarations(&[RegistryEntry {
+            registry: "minecraft:block".into(),
+            id: "lamps:lamp".into(),
+            value: block,
+            declaration: Some(declaration),
+        }])[0]
+            .file_json();
+        assert_eq!(file["state_properties"]["lit"]["type"], "boolean");
+        assert_eq!(file["default_state"]["lit"], "true");
     }
 
     #[test]
