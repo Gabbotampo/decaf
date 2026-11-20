@@ -7,3 +7,4 @@ copyAndCapacity={r={c=7}, s={d=8}}/true/false|ok,java.lang.IllegalArgumentExcept
 standaloneCell=r,c,7|(r,c)=7|142421|true
 customKey=1,true
 userCell=true,true,false
+recordKey=1,true

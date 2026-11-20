@@ -142,6 +142,11 @@ public class Probe {
     Table<K,String,Integer> table = HashBasedTable.create(); table.put(first, "c", 1);
     return table.get(second, "c") + "," + table.rowKeySet().contains(second);
   }
+  public static String recordKey() {
+    record R(String x) {}
+    Table<R,String,Integer> table = HashBasedTable.create(); table.put(new R("a"), "c", 1);
+    return table.get(new R("a"), "c") + "," + table.contains(new R("a"), "c");
+  }
   public static String userCell() {
     Table.Cell<String,String,Integer> cell = Tables.immutableCell("r", "c", 7);
     Table.Cell<String,String,Integer> user = new Table.Cell<>() {
@@ -190,6 +195,7 @@ fn table_surface_counts_unmodelled_members() {
     assert!(JAVA25.contains("standaloneCell=r,c,7|(r,c)=7|142421|true"));
     assert!(JAVA25.contains("customKey=1,true"));
     assert!(JAVA25.contains("userCell=true,true,false"));
+    assert!(JAVA25.contains("recordKey=1,true"));
     let fixture = fixture();
     let mut host = fixture.jar.seed_host(StdHost::new());
     assert_eq!(
@@ -236,5 +242,28 @@ fn table_surface_counts_unmodelled_members() {
             .iter()
             .any(|(call, _)| call == "java/lang/Object#equals(Ljava/lang/Object;)Z"),
         "{calls:?}"
+    );
+}
+
+#[test]
+fn record_keys_are_counted_not_compared_raw() {
+    // A record's generated `equals` compares components; the Table store
+    // compares raw values, so two equal records would miss each other
+    // (Java 25 + Guava: `recordKey=1,true`). Every call on such a key is
+    // counted instead of answered.
+    let fixture = fixture();
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let text = fixture.text_on(&mut host, "recordKey");
+    let calls = host.unknown_host_calls();
+    for call in [
+        "com/google/common/collect/Table#put(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        "com/google/common/collect/Table#get(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        "com/google/common/collect/Table#contains(Ljava/lang/Object;Ljava/lang/Object;)Z",
+    ] {
+        assert!(calls.iter().any(|(c, _)| c == call), "{call}: {calls:?}");
+    }
+    assert_ne!(
+        text, "1,true",
+        "a counted call must not pass for Java's answer"
     );
 }

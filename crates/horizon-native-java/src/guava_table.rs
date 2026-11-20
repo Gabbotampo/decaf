@@ -975,6 +975,23 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(true))
     }
 
+    /// Whether the Table store's raw `Value` comparison is exactly Java's
+    /// `equals`/`hashCode` for this key: `null`, a string or a box, an
+    /// identity object (an enum constant, or a class overriding neither), or a
+    /// game id. `pure_equality` is not enough here: it only says running the
+    /// members has no side effects, and a record's generated `equals` compares
+    /// components, which the store's raw comparison would not, so two equal
+    /// records would miss each other. Every other key is counted.
+    fn table_key_exact(&self, value: &Value) -> bool {
+        match self.equality_of(value) {
+            crate::object_methods::Equality::Null
+            | crate::object_methods::Equality::Platform
+            | crate::object_methods::Equality::Identity => true,
+            crate::object_methods::Equality::Host => crate::host_ids::pure_equality(value),
+            crate::object_methods::Equality::Jar { .. } => false,
+        }
+    }
+
     /// The narrow Table surface; a host without a persistent Table store leaves
     /// every call unmodelled so the normal counted path handles it.
     pub(super) fn invoke_guava_table(
@@ -999,20 +1016,20 @@ impl<H: Host> Runtime<'_, H> {
             "contains" => &args[..args.len().min(2)],
             _ => &[],
         };
-        if key_args.iter().any(|key| !self.pure_equality(key)) {
+        if key_args.iter().any(|key| !self.table_key_exact(key)) {
             return Ok(None);
         }
         if r.name == "contains"
             && args.len() == 1
             && match args.first().and_then(cell_parts) {
                 Some((_, row, column, value)) => {
-                    !self.pure_equality(&row)
-                        || !self.pure_equality(&column)
-                        || !self.pure_equality(&value)
+                    !self.table_key_exact(&row)
+                        || !self.table_key_exact(&column)
+                        || !self.table_key_exact(&value)
                 }
                 None => receiver
                     .and_then(table_key)
-                    .is_some_and(|_| args.first().is_some_and(|key| !self.pure_equality(key))),
+                    .is_some_and(|_| args.first().is_some_and(|key| !self.table_key_exact(key))),
             }
         {
             return Ok(None);
