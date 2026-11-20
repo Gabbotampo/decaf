@@ -43,9 +43,9 @@ registry is already immutable.
 
 | # | Way | Declared at | Read at | Assets |
 |---|---|---|---|---|
-| 1 | Content declaration files `data/<id>/sunrise/{block,item}/<path>.json` in a `.hmod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo sunrise-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`sunrise-mod-content.stamp`) | The same `.hmod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
+| 1 | Content declaration files `data/<id>/sunrise/{block,item}/<path>.json` in a `.smod` (API 0.2, `capabilities = ["registries"]`) | package time (`cargo sunrise-mod build`, or a folder) | game start, before anything loads: `mods::content_root` → `Content::read` → generated tables; cached and rebuilt when a mod file or the game changes (`sunrise-mod-content.stamp`) | The same `.smod`'s `assets/` and `data/` are lazy pack layers: blockstates, models, item definitions, textures, lang, loot, recipes, tags |
 | 2 | Native code declarations: `Hooks::blocks` (`native_blocks`) and `Hooks::items` (`native_items`), NeoForge's `RegisterEvent` drained from `DeferredRegister.Blocks`/`.Items` | at the game's **Registration** phase, by `mods::freeze_declarations` (`crates/horizon-client/src/game.rs`), once per process | immediately, into the same content root that reads (1); together with a content mod of the same id when one is on, else as a synthetic mod with no files ("the template's look") | None of its own. A native mod's package may carry `assets/<its own id>/`, but the content fence (`Content::check_namespace`) refuses another namespace |
-| 3 | A native mod's own `assets/`/`data/` in its `.hmod` | package time | every resource/data load as a pack layer | Its own namespaces only, plus vanilla/convention tags and vanilla atlases |
+| 3 | A native mod's own `assets/`/`data/` in its `.smod` | package time | every resource/data load as a pack layer | Its own namespaces only, plus vanilla/convention tags and vanilla atlases |
 | 4 | World/game-load registration | — | — | There is none. The item/block name↔id tables are immutable once built; world load only maps saved names to numeric ids, `/reload` reloads resources and data, not content. Content selection is frozen while a world is open, and a mod installed then is read on the next start |
 
 Phases: `Packages → Registration → Setup → Config → World` (`crates/sunrise-mod-api/src/phase.rs`).
@@ -88,19 +88,19 @@ once with `StdHost` exactly as M1 does, read `host.registrations()`, translate e
 ### Option B — bake a content package at install/build time
 
 An offline tool (or a launcher step) runs the same entrypoints with `NativeJar`/`StdHost`, reads
-`registrations()`, and writes a `.hmod` for the jar:
+`registrations()`, and writes a `.smod` for the jar:
 
 - `data/<jar id>/sunrise/block/<path>.json` and `.../item/<path>.json` from the typed declarations,
   in the same vocabulary as (1);
 - the jar's `assets/` and `data/` copied verbatim: blockstates, models, item definitions, textures,
   lang, loot tables, recipes, tags;
-- the `.hmod` manifest (`id` = the jar's id, `api = "0.2"`, `side = "both"`,
+- the `.smod` manifest (`id` = the jar's id, `api = "0.2"`, `side = "both"`,
   `capabilities = ["registries"]`).
 
 The game reads it on the next start through route (1), with full fidelity and no synthetic mod.
 
 - **Full assets and names.** The mod's own models, textures, lang, loot and recipes work because the
-  same `.hmod` owns the namespace.
+  same `.smod` owns the namespace.
 - **A step and a restart.** Something has to run before the game and the result has to be installed;
   the jar's bytes are not part of the horizon-java mod package.
 - **Static.** Re-bake when the jar changes. Recipes/loot copied from the jar can name items the
@@ -112,7 +112,7 @@ The game reads it on the next start through route (1), with full fidelity and no
 ### Option C — both: A now, B for assets
 
 Route A's declarations join the content mod whose id is the same namespace when one is on
-(`mod_content::accept_declared` re-uses `mods[i]`). A baked `.hmod` and the same jar's runtime
+(`mod_content::accept_declared` re-uses `mods[i]`). A baked `.smod` and the same jar's runtime
 declarations therefore compose: the files supply assets and the synthetic mod is never created.
 This is the recommendation, delivered in two steps.
 
@@ -136,7 +136,7 @@ is the seam named in (d).
    `minecraft:stone`, with its block item): `/give @s m3_fixture:ruby` and the inventory show both,
    drawn with the vanilla stick/stone models.
 2. **B (next)**: a `bake` command that writes the same declarations as `data/.../horizon/*.json`
-   beside the jar's assets into a `.hmod`, so names, models, textures, loot and recipes follow. A
+   beside the jar's assets into a `.smod`, so names, models, textures, loot and recipes follow. A
    jar whose content is baked needs no runtime declaration for its assets, but keeps A for anything
    the bake did not know.
 
@@ -195,7 +195,7 @@ at the content root.
    `FabricLoader.getInstance().getGameDir()`/`getConfigDir()`. Fix: expose the game folder, or a
    read-only `ConfigFiles`, on `RegistrationContext`.
 3. **A native mod cannot own another namespace's assets.** Even when it declares `m:ruby`, its
-   `.hmod` may not carry `assets/m/...` (`Content::check_namespace`); only a content `.hmod` can.
+   `.smod` may not carry `assets/m/...` (`Content::check_namespace`); only a content `.smod` can.
    *NeoForge/Fabric*: a mod's code and `assets/<modid>` are in the same jar and namespace. Fix (if B
    should not be a separate package): let a manifest list additional owned namespaces for assets
    with the same fence, or let a native declaration name the files it contributes.
