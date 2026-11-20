@@ -69,7 +69,7 @@ fn invoke_atomic_integer<H: Host>(
     receiver: Option<&Value>,
     args: &[Value],
 ) -> Result<Option<Value>, NativeError> {
-    let Some(marker) = receiver.and_then(expect_ref) else {
+    let Some(marker) = receiver.and_then(crate::runtime::jar_object::object_key) else {
         return Ok(None);
     };
     let key = state_key(marker, "#atomicInteger");
