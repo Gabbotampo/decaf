@@ -181,6 +181,7 @@ fn map_entries_answer_as_java_25_or_count() {
             ),
         ),
         ("hashtableReput", Exact(r#"null,false,a=7,{a=7},false"#)),
+        ("hashtableClear", Exact(r#"1|a=1|{}"#)),
         ("hashtableLivePut", Exact(r#"5|a=5|5|{a=6}"#)),
         // Java: `computeIfPresent:1:a=1:{};merge:1:a=1:{};` (JDK 25). The map model counts
         // the remapping function's `apply` rather than running it (#598), so this stays counted.

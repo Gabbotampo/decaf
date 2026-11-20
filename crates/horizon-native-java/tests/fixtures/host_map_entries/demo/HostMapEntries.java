@@ -287,6 +287,13 @@ public final class HostMapEntries {
     return out.toString();
   }
 
+  /** Hashtable.clear empties the buckets without nulling a held entry's value. */
+  public static String hashtableClear() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Map.Entry<String, Integer> e = h.entrySet().iterator().next(); h.clear();
+    return e.getValue() + "|" + e + "|" + h;
+  }
+
   /** Hashtable put over a live key updates the same node. */
   public static String hashtableLivePut() {
     Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);

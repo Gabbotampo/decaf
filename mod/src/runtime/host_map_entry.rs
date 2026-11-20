@@ -1068,11 +1068,11 @@ impl StdHost {
                     .collect(),
             )
         });
-        // `Hashtable.remove` and `clear` null the unlinked nodes' values (`e.value = null`);
-        // `compute`, `computeIfPresent` and `merge` returning null unlink the node but leave
+        // Only `Hashtable.remove` (and the entry-set removal routed through it) nulls the
+        // unlinked node's value (`e.value = null`). `clear` only empties the buckets, and
+        // `compute`, `computeIfPresent` and `merge` returning null unlink the node, leaving
         // its value as it was (JDK 25 `Hashtable.java`), so a held entry keeps it.
-        let null_values =
-            class_of_marker(map) == "java/util/Hashtable" && matches!(name, "remove" | "clear");
+        let null_values = class_of_marker(map) == "java/util/Hashtable" && name == "remove";
         self.map_entries.before.insert(
             map.to_owned(),
             Before {
