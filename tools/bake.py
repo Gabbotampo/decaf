@@ -304,6 +304,22 @@ def _allowed(top: str, namespace: str, rest: str, path: str, bake: JarBake) -> b
     return False
 
 
+def _custom_recipe_type(top: str, rest: str, data: bytes) -> str | None:
+    """The `type` of a recipe file whose serializer is not vanilla's, else None.
+
+    A type without a namespace is vanilla's (`crafting_shaped` is `minecraft:crafting_shaped`).
+    A file that is not a recipe, or not JSON with a string `type`, is left to the game."""
+    if top != "data" or not rest.startswith("recipe/") or not rest.endswith(".json"):
+        return None
+    try:
+        kind = json.loads(data).get("type")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(kind, str) or ":" not in kind:
+        return None
+    return None if kind.split(":", 1)[0] == "minecraft" else kind
+
+
 def _manifest(namespace: str, jar: str) -> str:
     return (
         f'id = "{namespace}"\n'
@@ -432,6 +448,16 @@ def bake_jar(jar: Path, out: Path, claimed: dict[str, str], probe: Path | None) 
             continue
         top, namespace, rest = classified
         if not _allowed(top, namespace, rest, name, bake):
+            continue
+        recipe_type = _custom_recipe_type(top, rest, data)
+        if recipe_type is not None:
+            # Sunrise refuses to start when a recipe's serializer is not registered (it loads
+            # recipes strictly, where vanilla logs and skips), and nothing bridges a jar's own
+            # recipe serializer to the game yet, so such a recipe stays out of the package.
+            bake.skip(
+                f"recipe of a mod's own type {recipe_type}: no serializer for it in the game yet",
+                name,
+            )
             continue
         if namespace in SHARED_NAMESPACES:
             shared.append((name, data))

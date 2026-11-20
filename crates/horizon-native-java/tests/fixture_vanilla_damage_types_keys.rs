@@ -1,5 +1,5 @@
 //! Java 25 oracle fixture for the vanilla `DamageTypes` `ResourceKey` constants
-//! (`vanilla_registry_keys.rs`, table `vanilla_damage_types_capture.txt`; Spell Engine reads
+//! (`vanilla_registry_keys.rs`, table `vanilla_registry_captures::DAMAGE_TYPES`; Spell Engine reads
 //! `DamageTypes` keys during init).
 //!
 //! `fixtures/vanilla_damage_types_keys/demo/Probe.java` reads every one of the 51 constants and is

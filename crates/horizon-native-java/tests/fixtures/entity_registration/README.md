@@ -15,4 +15,4 @@ The capture was made with `javac`/`java` from `~/ava/jdk/jdk-25.0.5+8`.
 The committed tables are the byte-for-byte stdout captures; SHA-256 values of
 the jars and rerun outputs must be recorded when refreshing a table.
 `FullPoolProbe.java` is the producer for `full-pool-java25.tsv` and
-`PoolProbe.java` for `vanilla_entity_data_pool.tsv`.
+`PoolProbe.java` for the table in `src/vanilla_entity_data_pool.rs` (`TABLE`; it was `vanilla_entity_data_pool.tsv` before native builds needed it as Rust source). `pool-command.txt` still writes a `.tsv`: paste its output into that raw string.
