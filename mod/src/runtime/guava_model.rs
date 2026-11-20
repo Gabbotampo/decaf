@@ -332,6 +332,9 @@ impl<H: Host> Runtime<'_, H> {
                 return self.invoke_bimap(r, Some(receiver), args);
             }
         }
+        if let Some(value) = self.invoke_guava_table(r, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some(result) = sized_factory_class(r, args) {
             let class = result?;
             return Ok(self.host.empty_mutable_collection(class));
