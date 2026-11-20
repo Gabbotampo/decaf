@@ -140,7 +140,11 @@ impl Fixture {
         let inner = jar_from(
             &inner_root,
             "demo",
-            Some(r#"{"schemaVersion":1,"id":"inner-lib","version":"1.0"}"#),
+            if nested_dir.starts_with("META-INF/jarjar/") {
+                None
+            } else {
+                Some(r#"{"schemaVersion":1,"id":"inner-lib","version":"1.0"}"#)
+            },
         );
 
         let outer_root = fixture.root.join("outer");
@@ -156,12 +160,28 @@ impl Fixture {
         let nested_entry = format!("{nested_dir}inner.jar");
         let jar_path = outer_root.join("outer.jar");
         let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());
-        zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+        if nested_dir.starts_with("META-INF/jarjar/") {
+            zip.start_file("META-INF/neoforge.mods.toml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"modLoader = \"javafml\"\n[[mods]]\nmodId = \"outer-fixture\"\nversion = \"1.0\"\n")
+                .unwrap();
+            zip.start_file(
+                "META-INF/jarjar/metadata.json",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
-        let metadata = format!(
-            r#"{{"schemaVersion":1,"id":"outer-fixture","version":"1.0","entrypoints":{{"main":"demo.Entry"}},"depends":{{"inner-lib":">=1"}},"jars":[{{"file":"{nested_entry}"}}]}}"#,
-        );
-        zip.write_all(metadata.as_bytes()).unwrap();
+            let metadata = format!(
+                r#"{{"jars":[{{"path":"{nested_entry}","identifier":{{"group":"demo","artifact":"inner"}},"version":{{"range":"[1,2)","artifactVersion":"1.0"}}}}]}}"#,
+            );
+            zip.write_all(metadata.as_bytes()).unwrap();
+        } else {
+            zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+                .unwrap();
+            let metadata = format!(
+                r#"{{"schemaVersion":1,"id":"outer-fixture","version":"1.0","entrypoints":{{"main":"demo.Entry"}},"depends":{{"inner-lib":">=1"}},"jars":[{{"file":"{nested_entry}"}}]}}"#,
+            );
+            zip.write_all(metadata.as_bytes()).unwrap();
+        }
         zip.start_file(&nested_entry, SimpleFileOptions::default())
             .unwrap();
         zip.write_all(&inner).unwrap();
