@@ -101,7 +101,9 @@ mod gson_tree;
 mod gson_type_token;
 mod gson_writer;
 mod guava_model;
+
 mod guava_multimap;
+mod guava_table;
 mod guava_text;
 mod hash_bulk;
 mod hash_collections;
@@ -3209,6 +3211,12 @@ pub trait Host {
         None
     }
 
+    /// The persistent Guava Table store, when this host models the narrow
+    /// HashBasedTable surface. Other hosts leave Table calls counted.
+    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
+        None
+    }
+
     /// A fresh immutable JDK collection with the exact unmodifiable class.
     fn immutable_collection(&mut self, _kind: &str, _values: Vec<Value>) -> Option<Value> {
         None
@@ -3573,11 +3581,14 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
     detached_sub_lists: BTreeSet<String>,
     /// Live SetFromMap marker -> backing map marker.
     set_from_map_views: BTreeMap<String, String>,
     next_set_from_map: u64,
+    /// Persistent typed Guava Table handles and their live views.
+    guava_tables: guava_table::Store,
     /// Chat components changed in place, by marker (`host_component.rs`).
     pub(crate) component_states: host_component::States,
     /// The unmodifiable collections (`java_immutable.rs`), by marker: `None`
@@ -3849,9 +3860,11 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+
             detached_sub_lists: BTreeSet::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
+            guava_tables: guava_table::Store::default(),
             component_states: BTreeMap::new(),
             unmodifiable_collections: BTreeMap::new(),
             random_sources: BTreeMap::new(),
@@ -4709,6 +4722,9 @@ impl StdHost {
     }
 
     fn mutable_values(&self, receiver: &Value) -> Option<Vec<Value>> {
+        if let Some(values) = self.guava_tables.collection_values(receiver) {
+            return Some(values);
+        }
         // A typed SetFromMap handle reads its backing map's keys.
         if let Value::Host(handle) = receiver
             && handle.kind() == HostKind::Collection
@@ -6671,6 +6687,7 @@ impl Host for StdHost {
         let class = match kind {
             "map" => "java/util/LinkedHashMap",
             "set" => "java/util/LinkedHashSet",
+            "enum-set" => "java/util/EnumSet",
             "list" => "java/util/ArrayList",
             class => class,
         };
@@ -6690,6 +6707,10 @@ impl Host for StdHost {
         values: Vec<Value>,
     ) -> Option<Value> {
         Some(self.cached_collection(of, member, class, follow, values))
+    }
+
+    fn guava_table_store(&mut self) -> Option<&mut guava_table::Store> {
+        Some(&mut self.guava_tables)
     }
 
     fn array_view(
@@ -8700,6 +8721,7 @@ impl Host for StdHost {
             return value;
         }
         self.record(r, Some(receiver), args);
+
         if self.is_set_from_map(receiver) {
             if self.jdk_new_set_from_map_ordered_read(r, receiver) {
                 return self.unknown_host_call(r);
@@ -8741,6 +8763,9 @@ impl Host for StdHost {
             }
         }
         check_jdk_capacity(r, args)?;
+        if let Some(value) = self.guava_tables.host_invoke(r, receiver, args)? {
+            return Ok(value);
+        }
         if let Some(refusal) = native_library::refusal(r, args) {
             return Err(refusal);
         }
