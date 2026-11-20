@@ -281,7 +281,18 @@ pub(crate) fn is_set_value(value: &Value) -> bool {
     let class = marker
         .split_once('#')
         .map_or(marker.as_str(), |(class, _)| class);
-    class == "set" || crate::runtime::is_set_owner(class)
+    class == "set"
+        || crate::runtime::is_set_owner(class)
+        || matches!(
+            class,
+            "java/util/ImmutableCollections$Set12"
+                | "java/util/ImmutableCollections$SetN"
+                | "java/util/Collections$EmptySet"
+                | "java/util/Collections$SingletonSet"
+                | "java/util/Collections$UnmodifiableSet"
+                | "com/google/common/collect/RegularImmutableSet"
+                | "com/google/common/collect/SingletonImmutableSet"
+        )
 }
 
 /// The calls on a `ConcurrentHashMap`-backed set whose answer depends on the

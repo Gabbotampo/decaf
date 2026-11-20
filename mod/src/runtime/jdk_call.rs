@@ -414,6 +414,10 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return error;
         };
+        let cause_text = Some(match message.as_deref() {
+            Some(message) => format!("{}: {message}", caught.replace('/', ".")),
+            None => caught.replace('/', "."),
+        });
         let cause = self.caught_throwable(&caught, message, frame.as_deref());
         let thrown = self.new_object(class);
         let init = MethodRef {
@@ -421,8 +425,15 @@ impl<H: Host> Runtime<'_, H> {
             name: "<init>".into(),
             descriptor: "(Ljava/lang/Throwable;)V".into(),
         };
-        if let Err(error) = self.host.invoke_instance(&init, &thrown, &[cause]) {
+        if let Err(error) = self
+            .host
+            .invoke_instance(&init, &thrown, std::slice::from_ref(&cause))
+        {
             return error;
+        }
+        if let Some(marker) = crate::runtime::expect_ref(&thrown) {
+            self.host.record_throwable(marker, cause_text);
+            self.host.record_throwable_cause(marker, cause);
         }
         // Thrown as that object, filed under a fresh origin
         // (`jar_throwables.rs`).

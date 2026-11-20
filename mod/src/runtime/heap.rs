@@ -391,6 +391,7 @@ impl StdHost {
         push(self.view_copies.get(marker), out);
         push(self.sub_lists.get(marker), out);
         push(self.iterator_sources.get(marker), out);
+        push(self.iterator_last.get(marker), out);
         push(self.list_iterators.get(marker), out);
         push(self.iterator_guards.get(marker), out);
         push(self.collection_comparators.get(marker), out);
@@ -471,6 +472,7 @@ impl StdHost {
         self.sub_lists.retain(|key, _| keep(key));
         self.detached_sub_lists.retain(|key| keep(key));
         self.iterator_sources.retain(|key, _| keep(key));
+        self.iterator_last.retain(|key, _| keep(key));
         self.list_iterators.retain(|key, _| keep(key));
         self.iterator_guards.retain(|key, _| keep(key));
         self.collection_comparators.retain(|key, _| keep(key));
@@ -572,6 +574,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.repeated_collections.len()
         + host.set_from_map_views.len()
         + host.random_sources.len()
         + host.iterators.len()
@@ -742,6 +745,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .map(|(key, elements)| key.len() + values(elements)),
         )
         .chain(
+            host.repeated_collections
+                .iter()
+                .map(|(key, (_, value))| key.len() + value_bytes(value)),
+        )
+        .chain(
             host.set_from_map_views
                 .iter()
                 .map(|(key, source)| key.len() + source.len()),
@@ -822,6 +830,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.repeated_collections.keys().map(String::as_str))
             .chain(host.set_from_map_views.keys().map(String::as_str))
             .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
@@ -993,11 +1002,17 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .into_iter()
             .flat_map(crate::runtime::array_data::ArrayData::references);
         let collections = host.mutable_collections.get(&marker).into_iter().flatten();
+        let repeated = host
+            .repeated_collections
+            .get(&marker)
+            .into_iter()
+            .map(|(_, value)| value);
         let iterators = host
             .iterators
             .get(&marker)
             .into_iter()
             .flat_map(|(elements, _)| elements);
+        let iterator_last = host.iterator_last.get(&marker);
         // An enumeration's iterator or vector (`host_iterator.rs`).
         let enumerations = host
             .enumerations
@@ -1018,7 +1033,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         for value in fields
             .chain(arrays)
             .chain(collections)
+            .chain(repeated)
             .chain(iterators)
+            .chain(iterator_last)
             .chain(enumerations)
             .chain(components)
             .chain(entries)
@@ -1103,7 +1120,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
     host.mutable_collections.retain_markers(|key| keep(key));
+    host.repeated_collections.retain(|key, _| keep(key));
     host.iterators.retain(|key, _| keep(key));
+    host.iterator_last.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
@@ -1707,6 +1726,7 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "repeated_collections",
             "set_from_map_views",
             "random_sources",
             "guava_tables",
@@ -1730,10 +1750,12 @@ mod tests {
             "levels",
             "references",
             "iterators",
+            "iterator_last",
             "enumerations",
             "iterator_guards",
             "mod_stamps",
             "sub_lists",
+            "sub_list_class_names",
             "detached_sub_lists",
             "list_iterators",
             "deque_layouts",
