@@ -4740,9 +4740,13 @@ impl StdHost {
             return None;
         }
         if let Some((count, value)) = self.repeated_collection(receiver) {
-            // Keep accidental bulk reads bounded; indexed and size operations
-            // use the logical count directly.
-            return Some(std::iter::repeat_n(value, count.min(4096)).collect());
+            // Bulk operations must see every logical element.  Above this
+            // bound, materialising the collection would not reproduce Java's
+            // exact array/allocation behaviour, so the caller counts it;
+            // indexed and size operations use the logical count directly.
+            const MAX_MATERIALIZED_ELEMENTS: usize = 1_000_000;
+            return (count <= MAX_MATERIALIZED_ELEMENTS)
+                .then(|| std::iter::repeat_n(value, count).collect());
         }
         // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
         // may be another view, as deep as a jar nests them: followed in a loop, never by
@@ -9030,6 +9034,9 @@ impl Host for StdHost {
             if let Some(marker) = expect_ref(receiver)
                 && let Some(class) = self.sub_list_class_names.get(marker)
             {
+                if class.is_empty() {
+                    return self.unknown_host_call(r);
+                }
                 return Ok(host_class::class_value(class));
             }
             return match class_of_value(receiver) {
@@ -30231,6 +30238,13 @@ impl<H: Host> Runtime<'_, H> {
             && !is_map_owner(&r.owner)
             && let Some(receiver) = receiver
         {
+            if self
+                .host
+                .repeated_collection(receiver)
+                .is_some_and(|(count, _)| count > 1_000_000)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             let values = runtime_collection_values(self.host, receiver)?;
             let stream = self.new_stream(class, method, values);
             // A fail-fast collection's stream binds late and checks for
@@ -32075,6 +32089,23 @@ impl<H: Host> Runtime<'_, H> {
                     // vendors this file. `&&` short-circuits, so a later arm's condition runs only when no
                     // earlier arm matched, as in the chain.
                     let mut dispatched: Option<Value> = None;
+                    // SetFromMap inherits AbstractSet.equals. Handle it at
+                    // the runtime boundary so an argument whose class is a
+                    // jar implementation of Set is checked through its own
+                    // size/iterator methods before the host view shortcut.
+                    if r.name == "equals"
+                        && r.descriptor == "(Ljava/lang/Object;)Z"
+                        && let Some(receiver) = receiver.as_ref()
+                        && self.host.is_set_from_map(receiver)
+                    {
+                        let other = args.first().unwrap_or(&Value::Ref(None));
+                        let equal = invoke_or_catch!(
+                            at,
+                            self.abstract_set_equals(receiver, other)
+                                .map(|equal| Value::Int(i32::from(equal)))
+                        );
+                        dispatched = Some(equal);
+                    }
                     if dispatched.is_none()
                         && let Some(value) = mod_answer
                     {

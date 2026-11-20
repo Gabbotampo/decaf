@@ -1270,3 +1270,11 @@
 0,53=E=java.lang.IllegalArgumentException:fromIndex(1) > toIndex(0)|L=[1, 2, 3, 4]
 0,54=R=java.util.Collections$SynchronizedRandomAccessList
 0,55=R=java.util.concurrent.CopyOnWriteArrayList$COWSubList
+0,56=R=true
+0,57=R=5000
+0,58=R=5000
+0,59=R=true
+0,60=R=-1768552575
+0,61=R=java.util.Collections$UnmodifiableList
+0,62=R=java.util.ReverseOrderListView
+0,63=R=java.util.ReverseOrderListView

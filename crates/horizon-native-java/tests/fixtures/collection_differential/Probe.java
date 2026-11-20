@@ -2,6 +2,12 @@ package demo;
 import java.util.*;
 import java.util.function.*;
 public class Probe {
+  static final class UserSet extends AbstractSet<Integer> {
+    final List<Integer> values;
+    UserSet(Integer... values) { this.values = Arrays.asList(values); }
+    public Iterator<Integer> iterator() { return values.iterator(); }
+    public int size() { return values.size(); }
+  }
   static List<Integer> make(int r) {
     int family = r / 3, depth = r % 3;
     List<Integer> x;
@@ -98,6 +104,14 @@ public class Probe {
           catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
         case 54: return "R="+subListClass(7);
         case 55: return "R="+subListClass(8);
+        case 56: { Set<Integer> s=Collections.newSetFromMap(new LinkedHashMap<>()); s.add(1); return "R="+s.equals(new UserSet(1)); }
+        case 57: { List<Integer> n=Collections.nCopies(5000, 1); return "R="+n.toArray().length; }
+        case 58: { List<Integer> n=Collections.nCopies(5000, 1); return "R="+n.stream().count(); }
+        case 59: { List<Integer> n=Collections.nCopies(5000, 1); return "R="+n.equals(new ArrayList<>(n)); }
+        case 60: { List<Integer> n=Collections.nCopies(5000, 1); return "R="+n.hashCode(); }
+        case 61: { List<Integer> n=Collections.unmodifiableList(new LinkedList<>(List.of(1,2,3,4))); return "R="+n.subList(1,3).getClass().getName(); }
+        case 62: { List<Integer> n=new ArrayList<>(List.of(1,2,3,4)).reversed(); return "R="+n.subList(1,3).getClass().getName(); }
+        case 63: { List<Integer> n=new LinkedList<>(List.of(1,2,3,4)).reversed(); return "R="+n.subList(1,3).getClass().getName(); }
         default: throw new AssertionError(op);
       }
     } catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
@@ -121,6 +135,6 @@ public class Probe {
   public static String probe(int r, int op) { return run(r,op); }
   public static void main(String[] a) {
     for (int r=0;r<39;r++) for (int op=0;op<32;op++) System.out.println(r+","+op+"="+run(r,op));
-    for (int op=32;op<=55;op++) System.out.println("0,"+op+"="+run(0,op));
+    for (int op=32;op<=63;op++) System.out.println("0,"+op+"="+run(0,op));
   }
 }

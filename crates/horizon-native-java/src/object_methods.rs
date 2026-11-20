@@ -375,6 +375,7 @@ impl<H: Host> Runtime<'_, H> {
         // `hashCode` run here (`host_ref.rs`).
         if let Value::Host(handle) = value
             && !crate::jar_object::is_object_handle(handle)
+            && self.host_collection_kind(value).is_none()
         {
             return handle.hash_code(&mut RuntimeNested::new(self));
         }
@@ -715,18 +716,86 @@ impl<H: Host> Runtime<'_, H> {
         if identical(a, b) {
             return Ok(true);
         }
-        let theirs = self.collection_elements(b)?;
-        if self.collection_elements(a)?.len() != theirs.len() {
+        let is_set = match self.host_collection_kind(b) {
+            Some(CollectionKind::Set) => Some(true),
+            Some(_) => Some(false),
+            None => self.known_instance_of(b, "java/util/Set"),
+        };
+        let Some(true) = is_set else {
+            if is_set.is_none() {
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/util/Set".into(),
+                    name: "equals".into(),
+                    descriptor: EQUALS.into(),
+                })?;
+            }
+            return Ok(false);
+        };
+        let size = |runtime: &mut Self, value: &Value| {
+            runtime.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Set",
+                "size",
+                "()I",
+                value,
+                &[],
+            )
+        };
+        let mine = match size(self, a)? {
+            Value::Int(size) => size,
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "Set.size answered {other:?}"
+                )));
+            }
+        };
+        let theirs = match size(self, b)? {
+            Value::Int(size) => size,
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "Set.size answered {other:?}"
+                )));
+            }
+        };
+        if mine != theirs {
             return Ok(false);
         }
-        for element in &theirs {
+        let iterator = self.call_virtual(
+            crate::jdk_call::Site::Interface,
+            "java/util/Set",
+            "iterator",
+            "()Ljava/util/Iterator;",
+            b,
+            &[],
+        )?;
+        let iterator = iterator;
+        loop {
+            let has_next = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &iterator,
+                &[],
+            )?;
+            if !matches!(has_next, Value::Int(flag) if flag != 0) {
+                break;
+            }
+            let element = self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                &iterator,
+                &[],
+            )?;
             let found = self.call_virtual(
                 crate::jdk_call::Site::Interface,
                 "java/util/Set",
                 "contains",
                 "(Ljava/lang/Object;)Z",
                 a,
-                std::slice::from_ref(element),
+                std::slice::from_ref(&element),
             );
             match found {
                 Ok(Value::Int(0)) => return Ok(false),
@@ -976,6 +1045,24 @@ impl<H: Host> Runtime<'_, H> {
         // Annotation proxies dispatch their interface members through the reflection model,
         // which has the held annotation values and Java's proxy contract.
         if handle.kind() == crate::host_ref::HostKind::AnnotationProxy {
+            return Ok(None);
+        }
+        // SetFromMap's `equals` is AbstractSet.equals, including an argument
+        // that is a jar class implementing Set. Let the collection contract
+        // below run it instead of HostRef's concrete-kind equality gate.
+        if matches!(r.name.as_str(), "equals" | "hashCode")
+            && ((r.name == "equals"
+                && r.descriptor == EQUALS
+                && receiver.is_some_and(|value| self.host.is_set_from_map(value)))
+                || (r.name == "hashCode"
+                    && r.descriptor == HASH_CODE
+                    && receiver.is_some_and(|value| {
+                        matches!(
+                            self.host_collection_kind(value),
+                            Some(CollectionKind::List | CollectionKind::Set | CollectionKind::Map)
+                        )
+                    })))
+        {
             return Ok(None);
         }
         if handle.kind() == crate::host_ref::HostKind::KotlinLazy
@@ -1238,6 +1325,10 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(answer));
                 }
+                if contract == Contract::Set {
+                    let equal = self.abstract_set_equals(receiver, other)?;
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
                 if self.host_collection_kind(other) == Some(CollectionKind::List) {
                     let equal = self.list_equals(receiver, other)?;
                     return Ok(Some(Value::Int(i32::from(equal))));
@@ -1268,7 +1359,11 @@ impl<H: Host> Runtime<'_, H> {
                 let equal = self.list_equals(receiver, other)?;
                 return Ok(Some(Value::Int(i32::from(equal))));
             }
-            if matches!(contract, Contract::Set | Contract::Map)
+            if contract == Contract::Set && is_collection_owner(&r.owner) {
+                let equal = self.abstract_set_equals(receiver, other)?;
+                return Ok(Some(Value::Int(i32::from(equal))));
+            }
+            if contract == Contract::Map
                 && is_collection_owner(&r.owner)
                 && self.host_collection_kind(other).is_some()
             {

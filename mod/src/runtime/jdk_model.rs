@@ -729,6 +729,7 @@ impl crate::runtime::StdHost {
             .mutable_collections
             .get(marker)
             .cloned()
+            .or_else(|| self.reversed_view_values(marker))
             .unwrap_or_default();
         let logical_len = repeated.as_ref().map_or(values.len(), |(count, _)| *count);
         let failure = if from < 0 {
@@ -784,6 +785,7 @@ impl crate::runtime::StdHost {
                 | "com/google/common/collect/SingletonImmutableList"
                 | "com/google/common/collect/ImmutableList$SubList"
         );
+        let mut unknown_class = false;
         let made_class = if immutable_jdk {
             "java/util/ImmutableCollections$SubList"
         } else if parent_class == "java/util/Collections$CopiesList" {
@@ -817,15 +819,32 @@ impl crate::runtime::StdHost {
             "java/util/Collections$SynchronizedRandomAccessList"
         } else if parent_class == "java/util/concurrent/CopyOnWriteArrayList" {
             "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
-        } else if parent_class == "java/util/Arrays$ArrayList"
-            || parent_class == "java/util/LinkedList"
-            || parent_class == "java/util/AbstractList"
-            || parent_class == "java/util/AbstractList$SubList"
-        {
+        } else if parent_class == "java/util/Arrays$ArrayList" {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/LinkedList" | "java/util/AbstractList" | "java/util/AbstractList$SubList"
+        ) {
             "java/util/AbstractList$SubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        ) {
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        } else if parent_class == "java/util/Collections$UnmodifiableList" {
+            "java/util/Collections$UnmodifiableList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/ReverseOrderListView$Rand"
+                | "java/util/ReverseOrderListView$SubList"
+                | "java/util/ReverseOrderListView"
+                | "java/util/LinkedList$ReverseOrderLinkedListView"
+        ) {
+            "java/util/ReverseOrderListView"
         } else if immutable_owned {
             "java/util/AbstractList$RandomAccessSubList"
         } else {
+            unknown_class = true;
             super::stand_in_class("list")
         };
         let storage_class = if matches!(
@@ -839,14 +858,21 @@ impl crate::runtime::StdHost {
             made_class
         };
         let made = self.new_collection(storage_class, range);
-        if storage_class != made_class
+        if (storage_class != made_class || unknown_class)
             && let Some(key) = match &made {
                 crate::runtime::Value::Host(handle) => Some(handle.key().to_owned()),
                 crate::runtime::Value::Ref(Some(key)) => Some(key.clone()),
                 _ => None,
             }
         {
-            self.sub_list_class_names.insert(key, made_class.to_owned());
+            self.sub_list_class_names.insert(
+                key,
+                if unknown_class {
+                    String::new()
+                } else {
+                    made_class.to_owned()
+                },
+            );
         }
         // A sub-list of `List.of`/`List.copyOf` is an `ImmutableCollections`
         // sub-list, and one of an unmodifiable view an `UnmodifiableList`:

@@ -392,6 +392,12 @@ impl<H: Host> Runtime<'_, H> {
         let immutable = list.view || list.unmodifiable;
         match (r.name.as_str(), r.descriptor.as_str(), args) {
             ("hashCode", "()I", []) => {
+                if let Some((count, value)) = self.host.repeated_collection(receiver) {
+                    let Some(element_hash) = self.java_hash(&value)? else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    return Ok(Some(Value::Int(repeated_hash(count, element_hash))));
+                }
                 let Some(hash) = self.java_hash(receiver)? else {
                     return self.host.unknown_operand_call(r).map(Some);
                 };
@@ -627,4 +633,28 @@ impl<H: Host> Runtime<'_, H> {
         }
         Ok(Some(Value::Int(i32::from(changed))))
     }
+}
+
+/// Java's `List.hashCode` recurrence, evaluated as an affine transform so a
+/// compressed `Collections.nCopies` list never has to expand its elements.
+fn repeated_hash(count: usize, element_hash: i32) -> i32 {
+    // Each transform is f(x) = a*x + b, with all arithmetic in Java int
+    // overflow space.  Binary powering composes `f` exactly for any count.
+    let mut result = (1_i32, 0_i32);
+    let mut base = (31_i32, element_hash);
+    let mut remaining = count;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            result = (
+                base.0.wrapping_mul(result.0),
+                base.0.wrapping_mul(result.1).wrapping_add(base.1),
+            );
+        }
+        base = (
+            base.0.wrapping_mul(base.0),
+            base.0.wrapping_mul(base.1).wrapping_add(base.1),
+        );
+        remaining >>= 1;
+    }
+    result.0.wrapping_add(result.1)
 }
