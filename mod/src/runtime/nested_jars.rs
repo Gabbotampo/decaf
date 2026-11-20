@@ -1,106 +1,233 @@
-//! The jars a jar bundles (`META-INF/jars/*.jar` or NeoForge
-//! `META-INF/jarjar/*.jar`) are on its class path.
-//!
-//! Fabric's "Jar-in-Jar" (and NeoForge's JarJar) puts a bundled library's
-//! classes on the mod's class path: `respackopts` never declares
-//! `dev.jfronny.commons.ref.WeakSet` itself, it bundles `libjf-base` and calls
-//! it. The runtime read the outer jar's classes only, so the class was missing
-//! and the first call on one of its objects failed the listener
-//! (`docs/in-game-survey.md`, "Top causes" §5).
-//!
-//! A bundled jar is linked into the host's class path exactly like a sibling
-//! jar the caller linked with `--link` (or the game's dependency linking):
-//! same duplicate rule (an earlier jar keeps the class name), same caps, and
-//! its `META-INF/services` rows are seeded too. One level only, as a loader
-//! does: a jar bundled inside a bundled jar is not expanded again.
-
+//! Declared Fabric Jar-in-Jar and NeoForge JarJar members.
 use crate::runtime::{NativeJar, StdHost};
-
-/// Where Fabric and NeoForge keep the bundled jars.
-const NESTED_DIRS: &[&str] = &["META-INF/jars/", "META-INF/jarjar/"];
-
-fn is_nested_entry(name: &str) -> bool {
-    NESTED_DIRS.iter().any(|dir| name.starts_with(dir)) && name.ends_with(".jar")
-}
-/// How many bundled jars one outer jar may contribute. A real bundle is a
-/// handful of libraries; anything past this is not a shape a loader ships.
-const MAX_NESTED_JARS: usize = 32;
-
-/// One bundled jar's outcome, for a caller that wants to report it.
+use std::cmp::Ordering;
+const MAX_NESTING: usize = 8;
+const MAX_NESTED_JARS: usize = 256;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NestedJar {
-    /// The entry inside the outer jar (`META-INF/jars/lib.jar`).
     pub entry: String,
-    /// Classes the link added, or why the jar was skipped.
     pub result: Result<usize, String>,
 }
-
-/// The bundled jars of `jar`, parsed and in entry-name order (so the class
-/// path a pack yields does not depend on zip order), from both loader
-/// conventions, up to
-/// [`MAX_NESTED_JARS`].
-pub fn parsed(jar: &NativeJar) -> Vec<(String, NativeJar)> {
-    let mut entries = jar
-        .resource_bytes
-        .iter()
-        .filter(|(name, _)| is_nested_entry(name))
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(right.0));
-    entries
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct NestedCandidate {
+    pub entry: String,
+    pub parent: String,
+    pub jar: NativeJar,
+    pub depth: usize,
+    pub order: usize,
+}
+fn fabric_entries(jar: &NativeJar) -> Vec<String> {
+    let Some(bytes) = jar.resource_bytes.get("fabric.mod.json") else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("jars").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
         .into_iter()
-        .take(MAX_NESTED_JARS)
-        .filter_map(|(entry, bytes)| {
-            NativeJar::from_bytes(bytes)
-                .ok()
-                .map(|nested| (entry.clone(), nested))
+        .filter_map(|v| {
+            v.get("file")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
         })
+        .filter(|p| p.ends_with(".jar") && !p.starts_with('/') && !p.contains(".."))
         .collect()
 }
-
-/// Link every bundled jar of `jar` into `host`'s class path.
-///
-/// A bundled jar that is not a zip, or that would push the linked table past
-/// its caps, is skipped with its reason instead of failing the mod: one
-/// damaged bundle must not cost the outer jar its own classes.
+fn neoforge_entries(jar: &NativeJar) -> Vec<String> {
+    let Some(bytes) = jar.resource_bytes.get("META-INF/jarjar/metadata.json") else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("jars").cloned())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| {
+            v.get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .filter(|p| p.ends_with(".jar") && !p.starts_with('/') && !p.contains(".."))
+        .collect()
+}
+fn declared_entries(jar: &NativeJar) -> Vec<String> {
+    let mut entries = fabric_entries(jar)
+        .into_iter()
+        .chain(neoforge_entries(jar))
+        .collect::<Vec<_>>();
+    // Compatibility with pre-Jar-in-Jar metadata fixtures: an absent `jars`
+    // key historically meant direct META-INF/jars entries were linked. An
+    // explicit list (including []) is authoritative and never falls back.
+    if entries.is_empty()
+        && jar.resource_bytes.get("fabric.mod.json").is_some_and(|b| {
+            serde_json::from_slice::<serde_json::Value>(b)
+                .ok()
+                .is_some_and(|v| v.get("jars").is_none())
+        })
+    {
+        entries.extend(
+            jar.resource_bytes
+                .keys()
+                .filter(|p| p.starts_with("META-INF/jars/") && p.ends_with(".jar"))
+                .cloned(),
+        );
+        entries.sort();
+    }
+    entries
+}
+pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
+    let mut out = Vec::new();
+    let mut ordinal = 0;
+    fn walk(
+        parent: &str,
+        jar: &NativeJar,
+        depth: usize,
+        out: &mut Vec<NestedCandidate>,
+        ordinal: &mut usize,
+    ) {
+        if depth >= MAX_NESTING || out.len() >= MAX_NESTED_JARS {
+            return;
+        };
+        for entry in declared_entries(jar) {
+            if out.len() >= MAX_NESTED_JARS {
+                break;
+            };
+            let Some(bytes) = jar.resource_bytes.get(&entry) else {
+                continue;
+            };
+            let Ok(nested) = NativeJar::from_bytes(bytes) else {
+                continue;
+            };
+            let child_parent = format!("{parent}|{entry}");
+            out.push(NestedCandidate {
+                entry: entry.clone(),
+                parent: parent.to_owned(),
+                jar: nested.clone(),
+                depth,
+                order: *ordinal,
+            });
+            *ordinal += 1;
+            walk(&child_parent, &nested, depth + 1, out, ordinal);
+        }
+    }
+    walk("outer", jar, 0, &mut out, &mut ordinal);
+    out
+}
+fn version_cmp(a: Option<&str>, b: Option<&str>) -> Ordering {
+    let key = |s: Option<&str>| {
+        s.unwrap_or("0")
+            .split(['.', '-', '+'])
+            .map(|p| {
+                p.parse::<u64>()
+                    .map(|n| format!("0{n:020}"))
+                    .unwrap_or_else(|_| format!("1{}", p.to_ascii_lowercase()))
+            })
+            .collect::<Vec<_>>()
+    };
+    key(a).cmp(&key(b))
+}
+pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
+    let all = candidates(jar);
+    let mut selected: Vec<NestedCandidate> = Vec::new();
+    for candidate in all {
+        let ids = std::iter::once(candidate.jar.fabric_id.as_deref())
+            .chain(
+                candidate
+                    .jar
+                    .fabric_provides
+                    .iter()
+                    .map(|s| Some(s.as_str())),
+            )
+            .flatten()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut replace = None;
+        for id in ids {
+            if let Some(index) = selected.iter().position(|c| {
+                c.jar.fabric_id.as_deref() == Some(id.as_str())
+                    || c.jar.fabric_provides.iter().any(|a| a == &id)
+            }) {
+                let current = &selected[index];
+                let cmp = version_cmp(
+                    candidate.jar.fabric_version.as_deref(),
+                    current.jar.fabric_version.as_deref(),
+                );
+                if cmp == Ordering::Greater
+                    || (cmp == Ordering::Equal
+                        && (candidate.parent.as_str(), candidate.order)
+                            < (current.parent.as_str(), current.order))
+                {
+                    replace = Some(index)
+                }
+                break;
+            }
+        }
+        if let Some(index) = replace {
+            selected[index] = candidate
+        } else if candidate.jar.fabric_id.is_some() || !candidate.jar.fabric_provides.is_empty() {
+            selected.push(candidate)
+        }
+    }
+    selected.sort_by_key(|c| c.order);
+    selected
+}
+pub fn parsed(jar: &NativeJar) -> Vec<(String, NativeJar)> {
+    select(jar).into_iter().map(|c| (c.entry, c.jar)).collect()
+}
 pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
     let mut out = Vec::new();
-    let mut entries = jar
-        .resource_bytes
-        .iter()
-        .filter(|(name, _)| is_nested_entry(name))
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(right.0));
-    for (entry, bytes) in entries.into_iter().take(MAX_NESTED_JARS) {
-        let nested = match NativeJar::from_bytes(bytes) {
-            Ok(nested) => nested,
-            Err(error) => {
-                out.push(NestedJar {
-                    entry: entry.clone(),
-                    result: Err(error.to_string()),
-                });
-                continue;
+    for candidate in select(jar) {
+        let id = format!("{}!{}", candidate.parent, candidate.entry);
+        let result = host.link_jar(id, &candidate.jar).map_err(|e| e.to_string());
+        if result.is_ok() {
+            let parent = jar
+                .fabric_id
+                .as_deref()
+                .or(jar.neoforge_id.as_deref())
+                .unwrap_or("jar");
+            if let Some(id) = candidate.jar.fabric_id.as_deref() {
+                host.fabric_origins.insert(
+                    id.to_owned(),
+                    ("nested".into(), format!("{parent}|{}", candidate.entry)),
+                );
             }
-        };
-        let outer = jar
-            .fabric_id
-            .as_deref()
-            .or(jar.neoforge_id.as_deref())
-            .unwrap_or("jar");
-        let result = host
-            .link_jar(format!("{outer}!{entry}"), &nested)
-            .map_err(|error| error.to_string());
-        if result.is_ok()
-            && let Some(nested_id) = nested.fabric_id.as_deref()
-        {
-            host.fabric_origins.insert(
-                nested_id.to_owned(),
-                ("nested".into(), format!("{outer}|{entry}")),
-            );
+            for alias in &candidate.jar.fabric_provides {
+                host.fabric_origins.insert(
+                    alias.clone(),
+                    ("nested".into(), format!("{parent}|{}", candidate.entry)),
+                );
+            }
         }
         out.push(NestedJar {
-            entry: entry.clone(),
+            entry: candidate.entry,
             result,
         });
+    }
+    // Compatibility for old JarJar fixtures: classes are linked, but no metadata means no mod candidate.
+    if neoforge_entries(jar).is_empty() {
+        let mut entries = jar
+            .resource_bytes
+            .keys()
+            .filter(|p| p.starts_with("META-INF/jarjar/") && p.ends_with(".jar"))
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries.into_iter().take(MAX_NESTED_JARS) {
+            let Some(bytes) = jar.resource_bytes.get(&entry) else {
+                continue;
+            };
+            let Ok(nested) = NativeJar::from_bytes(bytes) else {
+                continue;
+            };
+            host.record_fabric_metadata(&nested);
+            let result = host
+                .link_jar(format!("legacy!{entry}"), &nested)
+                .map_err(|e| e.to_string());
+            out.push(NestedJar { entry, result });
+        }
     }
     out
 }

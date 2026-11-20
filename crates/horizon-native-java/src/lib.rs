@@ -3413,6 +3413,8 @@ pub struct StdHost {
     own_mod_id: Option<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric provides aliases resolve to a container but are not separate containers.
+    fabric_aliases: BTreeMap<String, String>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
     /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
     fabric_origins: BTreeMap<String, (String, String)>,
@@ -3739,6 +3741,7 @@ impl StdHost {
             own_loader_classes: BTreeSet::new(),
             own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
+            fabric_aliases: BTreeMap::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
@@ -17091,6 +17094,8 @@ pub struct NativeJar {
     resource_bytes: BTreeMap<String, Vec<u8>>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
+    /// Aliases declared by Fabric metadata's `provides` array.
+    pub fabric_provides: Vec<String>,
     /// The first mod's id/version from Forge or NeoForge `mods.toml`.
     /// These loaders do not put these in a JSON entrypoint declaration, so
     /// the native launcher keeps them beside the Fabric metadata fields.
@@ -18840,6 +18845,20 @@ impl NativeJar {
         jar.resource_bytes = resource_bytes;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
+        jar.fabric_provides = jar
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .map(|v| {
+                v.get("provides")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         jar.neoforge_id = neoforge_id;
         jar.neoforge_version = neoforge_version;
         jar.client_side_only = client_side_only || fabric_client_only;

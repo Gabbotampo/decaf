@@ -155,7 +155,21 @@ impl StdHost {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
         {
-            self.fabric_metadata.entry(id.clone()).or_insert(document);
+            self.fabric_metadata
+                .entry(id.clone())
+                .or_insert(document.clone());
+            // Fabric's mod map also indexes every provides alias to the same
+            // selected container, so isModLoaded/getModContainer answer aliases.
+            if let Some(aliases) = document
+                .get("provides")
+                .and_then(serde_json::Value::as_array)
+            {
+                for alias in aliases.iter().filter_map(serde_json::Value::as_str) {
+                    self.fabric_aliases
+                        .entry(alias.to_owned())
+                        .or_insert(id.clone());
+                }
+            }
             // Linked and nested Fabric jars contribute their declared
             // entrypoints to the same loader storage. Keep declaration order
             // within a provider; the host sorts providers by mod id below.
@@ -179,6 +193,11 @@ impl StdHost {
     /// host's own `fabric.mod.json` resource when it names `id`.
     fn fabric_document(&self, id: &str) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
         if let Some(document) = self.fabric_metadata.get(id) {
+            return Some(std::borrow::Cow::Borrowed(document));
+        }
+        if let Some(owner) = self.fabric_aliases.get(id)
+            && let Some(document) = self.fabric_metadata.get(owner)
+        {
             return Some(std::borrow::Cow::Borrowed(document));
         }
         let own = self
@@ -259,6 +278,7 @@ impl StdHost {
         self.mods.contains_key(id)
             || is_always_loaded_mod(id)
             || self.fabric_metadata.contains_key(id)
+            || self.fabric_aliases.contains_key(id)
             || Self::builtin_fabric_mod(id)
     }
 

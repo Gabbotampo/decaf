@@ -280,6 +280,18 @@ fn is_host_provided(id: &str) -> bool {
 /// Build the run order, link closure and missing-dependency rows for `jars`.
 pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
     let mut provided: BTreeMap<String, usize> = BTreeMap::new();
+    // Fabric resolves top-level candidates before nested candidates. This is
+    // observable when a pack contains an old bundled copy and a newer root.
+    for (index, (_, jar)) in jars.iter().enumerate() {
+        let own = [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::to_owned)
+            .chain(jar.fabric_provides.iter().cloned());
+        for id in own {
+            provided.entry(id.to_ascii_lowercase()).or_insert(index);
+        }
+    }
     for (index, (_, jar)) in jars.iter().enumerate() {
         for id in mod_ids(jar) {
             provided.entry(id).or_insert(index);
