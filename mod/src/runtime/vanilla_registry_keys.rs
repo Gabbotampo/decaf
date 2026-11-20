@@ -5,7 +5,7 @@ const CREATIVE_MODE_TABS: &str = "net/minecraft/world/item/CreativeModeTabs";
 const DAMAGE_TYPES: &str = "net/minecraft/world/damagesource/DamageTypes";
 const KEY: &str = "Lnet/minecraft/resources/ResourceKey;";
 fn captured(name: &str) -> Option<&'static str> {
-    include_str!("vanilla_enchantments_capture.txt")
+    crate::runtime::vanilla_registry_captures::ENCHANTMENTS
         .lines()
         .find_map(|l| {
             let (n, rest) = l.split_once('|')?;
@@ -17,7 +17,7 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         return None;
     }
     if r.owner == DAMAGE_TYPES {
-        let location = include_str!("vanilla_damage_types_capture.txt")
+        let location = crate::runtime::vanilla_registry_captures::DAMAGE_TYPES
             .lines()
             .find_map(|l| {
                 let (name, location) = l.split_once('|')?;
@@ -77,7 +77,7 @@ mod captured_walk_tests {
         let mut correct = 0;
         let mut counted = 0;
         let mut wrong = 0;
-        for line in include_str!("vanilla_enchantments_capture.txt").lines() {
+        for line in crate::runtime::vanilla_registry_captures::ENCHANTMENTS.lines() {
             let mut p = line.split('|');
             let name = p.next().unwrap();
             let registry = p.next().unwrap();
