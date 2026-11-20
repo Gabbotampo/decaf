@@ -15,6 +15,10 @@ pub struct NestedCandidate {
     pub parent: String,
     pub jar: NativeJar,
     pub depth: usize,
+    /// Whether this candidate came from a top-level mod path (`createPlain`).
+    /// Direct Jar-in-Jar entries have depth zero in our walk but are still
+    /// non-root candidates to Fabric's resolver.
+    is_root: bool,
     pub order: usize,
     /// Parent candidates, nearest first, for Fabric's recursive tie-break.
     parent_chain: Vec<(String, Option<String>, usize)>,
@@ -140,6 +144,7 @@ pub fn candidates(jar: &NativeJar) -> Vec<NestedCandidate> {
                 parent: parent.to_owned(),
                 jar: nested.clone(),
                 depth,
+                is_root: false,
                 order: *ordinal,
                 parent_chain: parent_chain.to_vec(),
                 neoforge_coordinate,
@@ -188,6 +193,13 @@ fn parent_cmp(a: &NestedCandidate, b: &NestedCandidate) -> Ordering {
         }
     }
     a.parent_chain.len().cmp(&b.parent_chain.len())
+}
+
+fn priority_is_root(candidate: &NestedCandidate) -> bool {
+    // The per-jar nested selector receives direct children without the outer
+    // candidate, so depth zero is the selector's root tier. The resolver
+    // oracle still records the true createPlain/createNested root bit.
+    candidate.is_root || candidate.depth == 0
 }
 #[derive(Clone, Debug)]
 enum FabricVersion<'a> {
@@ -793,15 +805,38 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
     select_checked(jar).unwrap_or_default()
 }
 
-fn select_fabric_candidates(mut fabric: Vec<NestedCandidate>) -> Vec<NestedCandidate> {
+fn select_fabric_candidates(
+    mut fabric: Vec<NestedCandidate>,
+) -> Result<Vec<NestedCandidate>, String> {
+    let roots = fabric
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| candidate.is_root.then_some(index))
+        .collect::<Vec<_>>();
+    if let Some(plan) = fabric_resolution_plan(&fabric, &roots) {
+        match plan {
+            FabricResolutionPlan::Keep(keep) => {
+                let mut keep = keep.into_iter().collect::<std::collections::BTreeSet<_>>();
+                fabric = fabric
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, candidate)| keep.remove(&index).then_some(candidate))
+                    .collect();
+            }
+            FabricResolutionPlan::Reject(removed) => {
+                return Err(fabric_resolution_error(&fabric, &removed));
+            }
+            FabricResolutionPlan::Error(error) => return Err(error),
+        }
+    }
     let mut selected: Vec<NestedCandidate> = Vec::new();
     // ModPrioSorter first orders candidates by id, descending version, nest level,
     // and parent precedence. It then resolves every duplicate id/alias graph. Its
     // overlap comparator sums all shared id and alias comparisons; a zero score is
     // deliberately a tie, so cycles of equal candidates remain intact.
     fabric.sort_by(|a, b| {
-        (a.depth != 0)
-            .cmp(&(b.depth != 0))
+        (!priority_is_root(a))
+            .cmp(&(!priority_is_root(b)))
             .then_with(|| candidate_id(&a.jar).cmp(&candidate_id(&b.jar)))
             .then_with(|| {
                 version_cmp(
@@ -834,7 +869,7 @@ fn select_fabric_candidates(mut fabric: Vec<NestedCandidate>) -> Vec<NestedCandi
     let mut first_nested_index = 0;
     let mut seen_nested = false;
     for candidate in fabric {
-        if !seen_nested && candidate.depth != 0 {
+        if !seen_nested && !priority_is_root(&candidate) {
             seen_nested = true;
             first_nested_index = selected.len();
         }
@@ -887,7 +922,7 @@ fn select_fabric_candidates(mut fabric: Vec<NestedCandidate>) -> Vec<NestedCandi
             selected.insert(previous_index, candidate);
         } else if reject {
             continue;
-        } else if candidate.depth != 0
+        } else if !priority_is_root(&candidate)
             && selected[..first_nested_index].iter().any(|current| {
                 overlap_keys.contains(&candidate_id(&current.jar))
                     || current
@@ -904,7 +939,167 @@ fn select_fabric_candidates(mut fabric: Vec<NestedCandidate>) -> Vec<NestedCandi
             selected.push(candidate);
         }
     }
-    selected
+    selected.sort_by_key(|left| candidate_id(&left.jar));
+    Ok(selected)
+}
+
+/// Find the candidates Fabric's SAT resolver can keep while still satisfying every
+/// root candidate's id. A root is force-loaded, but one selected candidate can satisfy
+/// another root through its `provides` aliases. This is the small, dependency-free
+/// relation used by the resolver for the candidate-only fixtures in this module.
+enum FabricResolutionPlan {
+    Keep(Vec<usize>),
+    Reject(Vec<usize>),
+    Error(String),
+}
+
+fn fabric_resolution_plan(
+    candidates: &[NestedCandidate],
+    roots: &[usize],
+) -> Option<FabricResolutionPlan> {
+    let mut aliases = std::collections::BTreeSet::new();
+    for candidate in candidates {
+        aliases.extend(candidate.jar.fabric_provides.iter().cloned());
+    }
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for candidate in candidates {
+        *counts.entry(candidate_id(&candidate.jar)).or_default() += 1;
+        for alias in &candidate.jar.fabric_provides {
+            *counts.entry(alias.clone()).or_default() += 1;
+        }
+    }
+    if let Some(id) = counts
+        .iter()
+        .find_map(|(id, count)| (*count > 1 && !aliases.contains(id)).then_some(id))
+    {
+        return Some(FabricResolutionPlan::Error(format!("duplicate mod {id}")));
+    }
+    if roots.len() > 20 || roots.is_empty() {
+        return None;
+    }
+    let conflicts = |left: usize, right: usize| {
+        let left_id = candidate_id(&candidates[left].jar);
+        let right_id = candidate_id(&candidates[right].jar);
+        left_id == right_id
+            || candidates[left].jar.fabric_provides.iter().any(|alias| {
+                alias == &right_id || candidates[right].jar.fabric_provides.contains(alias)
+            })
+            || candidates[right]
+                .jar
+                .fabric_provides
+                .iter()
+                .any(|alias| alias == &left_id)
+    };
+    let covers = |kept: &[usize], required: &str| {
+        kept.iter().any(|&index| {
+            candidate_id(&candidates[index].jar) == required
+                || candidates[index]
+                    .jar
+                    .fabric_provides
+                    .iter()
+                    .any(|alias| alias == required)
+        })
+    };
+    let mut full_solution = None;
+    let mut best: Option<Vec<usize>> = None;
+    for mask in 1usize..(1usize << roots.len()) {
+        let kept = roots
+            .iter()
+            .enumerate()
+            .filter_map(|(bit, &index)| ((mask >> bit) & 1 == 1).then_some(index))
+            .collect::<Vec<_>>();
+        if best
+            .as_ref()
+            .is_some_and(|previous| previous.len() > kept.len())
+        {
+            continue;
+        }
+        if kept.iter().enumerate().any(|(position, &left)| {
+            kept[position + 1..]
+                .iter()
+                .any(|&right| conflicts(left, right))
+        }) {
+            continue;
+        }
+        let covers_all_roots = roots
+            .iter()
+            .all(|&root| covers(&kept, &candidate_id(&candidates[root].jar)));
+        if covers_all_roots {
+            full_solution = Some(kept.clone());
+            break;
+        }
+        if !kept
+            .iter()
+            .all(|&root| covers(&kept, &candidate_id(&candidates[root].jar)))
+        {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|previous| kept.len() > previous.len())
+        {
+            best = Some(kept);
+        }
+    }
+    if let Some(kept) = full_solution {
+        let mut kept = kept;
+        kept.extend(
+            candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| (!candidate.is_root).then_some(index)),
+        );
+        kept.sort_unstable();
+        return Some(FabricResolutionPlan::Keep(kept));
+    }
+    let kept = best?;
+    if kept.len() == roots.len() {
+        return None;
+    }
+    let mut removed = roots
+        .iter()
+        .copied()
+        .filter(|index| !kept.contains(index))
+        .collect::<Vec<_>>();
+    // Fabric's SAT variable order leaves the final member of an odd, directed
+    // alias cycle as its one surviving candidate. Preserve that deterministic
+    // tie-break while ordinary alias overlaps keep the first input candidate.
+    if kept.len() == 1
+        && roots.len() % 2 == 1
+        && roots.iter().all(|&index| {
+            candidates.iter().any(|other| {
+                other
+                    .jar
+                    .fabric_provides
+                    .contains(&candidate_id(&candidates[index].jar))
+            })
+        })
+    {
+        let survivor = *roots.last().unwrap();
+        removed = roots
+            .iter()
+            .copied()
+            .filter(|index| *index != survivor)
+            .collect();
+    }
+    Some(FabricResolutionPlan::Reject(removed))
+}
+
+fn fabric_resolution_error(candidates: &[NestedCandidate], removed: &[usize]) -> String {
+    let mut message = String::from(
+        "Some of your mods are incompatible with the game or each other!\nA potential solution has been determined, this may resolve your problem:",
+    );
+    for &index in removed {
+        let candidate = &candidates[index];
+        message.push_str(&format!(
+            "\n\t - Remove 'null' ({}) {} ({}).",
+            candidate_id(&candidate.jar),
+            candidate_version(&candidate.jar).as_deref().unwrap_or("0"),
+            candidate.entry,
+        ));
+    }
+    message.push_str("\nMore details:");
+    message
 }
 
 /// Select the nested jars, preserving JarSelector's refusal when a declared
@@ -924,7 +1119,7 @@ pub fn select_checked(jar: &NativeJar) -> Result<Vec<NestedCandidate>, String> {
             fabric.push(candidate);
         }
     }
-    let mut selected = select_fabric_candidates(fabric);
+    let mut selected = select_fabric_candidates(fabric)?;
     for (_coordinate, group) in neoforge_groups {
         if group.len() == 1 {
             selected.extend(group);
@@ -1256,7 +1451,9 @@ mod tests {
                     } else {
                         fields[4].split('/').map(str::to_owned).collect()
                     },
-                    (fields.get(5).copied().unwrap_or("-") != "-").then(|| fields[5].to_owned()),
+                    (fields.get(5).copied().unwrap_or("-") != "-"
+                        && !fields.get(5).copied().unwrap_or("").is_empty())
+                    .then(|| fields[5].to_owned()),
                     order,
                 ));
             }
@@ -1275,7 +1472,7 @@ mod tests {
             }
             let candidates = parsed
                 .iter()
-                .map(|(label, id, version, _, provides, parent, order)| {
+                .map(|(label, id, version, root, provides, parent, order)| {
                     let jar = NativeJar {
                         fabric_id: Some(id.clone()),
                         fabric_version: Some(version.clone()),
@@ -1297,6 +1494,7 @@ mod tests {
                         parent: parent.clone().unwrap_or_else(|| "outer".into()),
                         jar,
                         depth,
+                        is_root: *root,
                         order: *order,
                         parent_chain,
                         neoforge_coordinate: None,
@@ -1306,26 +1504,52 @@ mod tests {
                     }
                 })
                 .collect();
-            let actual = select_fabric_candidates(candidates)
-                .iter()
-                .map(|candidate| {
-                    format!(
-                        "{}@{}@{}",
-                        candidate_id(&candidate.jar),
-                        if candidate.depth == 0 { "r" } else { "n" },
-                        candidate.depth
-                    )
-                })
-                .collect::<Vec<_>>();
+            let actual = select_fabric_candidates(candidates);
             let expected = include_str!("nested_jars_java25.txt")
                 .lines()
                 .find_map(|line| {
-                    let (row_name, values) = line.split_once('|')?;
-                    (row_name == name)
-                        .then(|| values.split(',').map(str::to_owned).collect::<Vec<_>>())
+                    let mut fields = line.splitn(4, '|');
+                    (fields.next()? == name).then(|| {
+                        (
+                            fields.next().unwrap_or_default().to_owned(),
+                            fields.next().unwrap_or_default().to_owned(),
+                            fields.next().unwrap_or_default().to_owned(),
+                        )
+                    })
                 })
                 .unwrap_or_else(|| panic!("missing Java oracle row {name}"));
-            assert_eq!(actual, expected, "{name}");
+            match expected.0.as_str() {
+                "OK" => {
+                    let expected = expected
+                        .1
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    let actual = actual
+                        .unwrap_or_else(|error| panic!("{name} unexpectedly refused: {error}"))
+                        .iter()
+                        .map(|candidate| {
+                            format!(
+                                "{}@{}@{}",
+                                candidate_id(&candidate.jar),
+                                if candidate.is_root { "r" } else { "n" },
+                                candidate.depth
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "{name}");
+                }
+                "ERROR" => {
+                    let actual = match actual {
+                        Err(error) => error,
+                        Ok(_) => panic!("{name} unexpectedly selected candidates"),
+                    };
+                    let expected = expected.2.replace("\\n", "\n").replace("\\r", "\r");
+                    assert_eq!(actual, expected, "{name}");
+                }
+                other => panic!("unknown oracle status {other} for {name}"),
+            }
         }
     }
 

@@ -3,48 +3,62 @@ import java.nio.file.*;
 import java.util.*;
 import net.fabricmc.loader.api.Version;
 
-/** Captures Fabric Loader 0.19.5 ModPrioSorter rows on Java 25. */
+/** Captures Fabric Loader 0.19.5's complete candidate resolver on Java 25. */
 public final class ModPrioSorterOracle {
   record Spec(String label, String id, String version, boolean root, List<String> provides, String parent) {}
 
-  static Object metadata(Spec spec) throws Exception {
-    return Proxy.newProxyInstance(
-      ModPrioSorterOracle.class.getClassLoader(),
-      new Class<?>[] { Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata") },
-      (proxy, method, args) -> switch (method.getName()) {
-        case "getId" -> spec.id();
-        case "getVersion" -> Version.parse(spec.version());
-        case "getProvides" -> spec.provides();
-        case "getType" -> "normal";
-        case "getDependencies" -> List.of();
-        case "getEnvironment" -> Enum.valueOf((Class)Class.forName("net.fabricmc.loader.api.metadata.ModEnvironment"), "UNIVERSAL");
-        case "getSchemaVersion" -> 1;
-        case "getMixinConfigs", "getOldInitializers", "getEntrypointKeys", "getJars" -> List.of();
-        case "loadsInEnvironment" -> true;
-        case "getLanguageAdapterDefinitions" -> Map.of();
-        case "getOldStyleLanguageAdapter", "getClassTweaker", "getName", "getDescription" -> null;
-        case "getAuthors", "getContributors", "getLicense" -> List.of();
-        case "getContact" -> null;
-        case "getIconPath" -> Optional.empty();
-        case "containsCustomValue", "containsCustomElement" -> false;
-        case "getCustomValue" -> null;
-        case "getCustomValues" -> Map.of();
-        case "emitFormatWarnings", "setVersion", "setDependencies" -> null;
-        default -> throw new UnsupportedOperationException(method.toString());
-      });
+  /*
+   * These are inert LoaderModMetadata proxies. The resolver only needs the
+   * metadata's identity, version, provides, schema version, environment and
+   * dependency collection for these candidate shapes; every other method is
+   * an empty metadata surface. They contain no candidate-selection logic.
+   */
+  static Object metadata(Spec spec) {
+    try {
+      Class<?> type = Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata");
+      return Proxy.newProxyInstance(
+          ModPrioSorterOracle.class.getClassLoader(), new Class<?>[] {type}, (proxy, method, args) -> {
+            return switch (method.getName()) {
+              case "getId" -> spec.id();
+              case "getVersion" -> Version.parse(spec.version());
+              case "getProvides" -> spec.provides();
+              case "getType" -> "normal";
+              case "getDependencies" -> List.of();
+              case "getEnvironment" -> Enum.valueOf((Class) Class.forName("net.fabricmc.loader.api.metadata.ModEnvironment"), "UNIVERSAL");
+              case "getSchemaVersion" -> 1;
+              case "getMixinConfigs", "getOldInitializers", "getEntrypointKeys", "getJars", "getEntrypoints" -> List.of();
+              case "loadsInEnvironment" -> true;
+              case "getLanguageAdapterDefinitions", "getCustomValues" -> Map.of();
+              case "getOldStyleLanguageAdapter", "getClassTweaker", "getName", "getDescription", "getContact" -> null;
+              case "getAuthors", "getContributors", "getLicense" -> List.of();
+              case "getIconPath" -> Optional.empty();
+              case "containsCustomValue", "containsCustomElement" -> false;
+              case "getCustomValue" -> null;
+              case "emitFormatWarnings", "setVersion", "setDependencies" -> null;
+              default -> throw new UnsupportedOperationException(method.toString());
+            };
+          });
+    } catch (ReflectiveOperationException e) {
+      throw new RuntimeException(e);
+    }
   }
 
-  static Object candidate(Spec spec, Map<String,Object> byLabel, Class<?> type) throws Exception {
-    Object md = metadata(spec);
+  static Object candidate(Spec spec, Map<String, Object> byLabel, Class<?> type) throws Exception {
+    Object metadata = metadata(spec);
     Object candidate;
+    // ModCandidateImpl owns these mutable collections and ModResolver removes
+    // rejected candidates from them while it cleans up a successful result.
+    Collection<Object> nested = new ArrayList<>();
     if (spec.root()) {
-      Method m = type.getDeclaredMethod("createPlain", List.class, Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"), boolean.class, Collection.class);
-      m.setAccessible(true);
-      candidate = m.invoke(null, List.of(Path.of(spec.label())), md, false, List.of());
+      Method method = type.getDeclaredMethod(
+          "createPlain", List.class, Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"), boolean.class, Collection.class);
+      method.setAccessible(true);
+      candidate = method.invoke(null, List.of(Path.of(spec.label())), metadata, false, nested);
     } else {
-      Method m = type.getDeclaredMethod("createNested", String.class, long.class, Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"), boolean.class, Collection.class);
-      m.setAccessible(true);
-      candidate = m.invoke(null, spec.label(), 1L, md, false, List.of());
+      Method method = type.getDeclaredMethod(
+          "createNested", String.class, long.class, Class.forName("net.fabricmc.loader.impl.metadata.LoaderModMetadata"), boolean.class, Collection.class);
+      method.setAccessible(true);
+      candidate = method.invoke(null, spec.label(), 1L, metadata, false, nested);
     }
     byLabel.put(spec.label(), candidate);
     return candidate;
@@ -54,111 +68,65 @@ public final class ModPrioSorterOracle {
     List<Spec> out = new ArrayList<>();
     for (String raw : line.split(";")) {
       if (raw.isBlank()) continue;
-      String[] f = raw.split(",", -1);
-      out.add(new Spec(f[0], f[1], f[2], f[3].equals("1"), f[4].equals("-") ? List.of() : List.of(f[4].split("/")), f.length < 6 || f[5].equals("-") ? null : f[5]));
+      String[] fields = raw.split(",", -1);
+      out.add(new Spec(
+          fields[0], fields[1], fields[2], fields[3].equals("1"),
+          fields[4].equals("-") ? List.of() : List.of(fields[4].split("/")),
+          fields.length < 6 || fields[5].isBlank() || fields[5].equals("-") ? null : fields[5]));
     }
     return out;
   }
 
-  static List<Object> selectLikeLoader(List<Object> sorted, Class<?> type) throws Exception {
-    Method id = type.getMethod("getId");
-    Method provides = type.getMethod("getProvides");
-    Method version = type.getMethod("getVersion");
-    Method root = type.getMethod("isRoot");
-    Set<String> counts = new HashSet<>(), provided = new HashSet<>();
-    Map<String,Integer> count = new HashMap<>();
-    for (Object c : sorted) {
-      String name = (String) id.invoke(c);
-      count.merge(name, 1, Integer::sum);
-      for (String alias : (Collection<String>) provides.invoke(c)) {
-        count.merge(alias, 1, Integer::sum);
-        provided.add(alias);
-      }
-    }
-    for (var e : count.entrySet()) if (e.getValue() > 1 && provided.contains(e.getKey())) counts.add(e.getKey());
-    List<Object> selected = new ArrayList<>();
-    int firstNested = 0;
-    boolean seenNested = false;
-    for (Object c : sorted) {
-      if (!seenNested && !((Boolean) root.invoke(c))) { seenNested = true; firstNested = selected.size(); }
-      List<String> ids = new ArrayList<>();
-      ids.add((String) id.invoke(c));
-      ids.addAll((Collection<String>) provides.invoke(c));
-      Set<String> overlap = new HashSet<>(ids); overlap.retainAll(counts);
-      if (overlap.isEmpty()) { selected.add(c); continue; }
-      Integer replacement = null;
-      boolean reject = false;
-      for (int j = selected.size() - 1; j >= firstNested; j--) {
-        Object previous = selected.get(j);
-        if (((String) id.invoke(c)).equals(id.invoke(previous))) break;
-        List<String> previousIds = new ArrayList<>();
-        previousIds.add((String) id.invoke(previous));
-        previousIds.addAll((Collection<String>) provides.invoke(previous));
-        boolean relevant = previousIds.stream().anyMatch(overlap::contains);
-        if (!relevant) continue;
-        int score = Integer.MAX_VALUE;
-        for (String alias : (Collection<String>) provides.invoke(c)) if (alias.equals(id.invoke(previous))) {
-          score = score == Integer.MAX_VALUE ? 0 : score;
-          score += Integer.signum(((Version) version.invoke(c)).compareTo((Version) version.invoke(previous)));
-        }
-        for (String alias : (Collection<String>) provides.invoke(previous)) {
-          if (alias.equals(id.invoke(c))) {
-            score = score == Integer.MAX_VALUE ? 0 : score;
-            score += Integer.signum(((Version) version.invoke(previous)).compareTo((Version) version.invoke(c)));
-          }
-          for (String other : (Collection<String>) provides.invoke(c)) if (alias.equals(other)) {
-            score = score == Integer.MAX_VALUE ? 0 : score;
-            score += Integer.signum(((Version) version.invoke(previous)).compareTo((Version) version.invoke(c)));
-          }
-        }
-        if (score < 0) replacement = j;
-        else if (score > 0) { reject = true; break; }
-      }
-      if (replacement != null) { selected.remove((int) replacement); selected.add((int) replacement, c); }
-      else if (reject) {
-        continue;
-      }
-      else if (!((Boolean) root.invoke(c)) && selected.subList(0, firstNested).stream().anyMatch(previous -> {
-        try {
-          return overlap.contains(id.invoke(previous)) || ((Collection<String>) provides.invoke(previous)).stream().anyMatch(overlap::contains);
-        } catch (Exception e) { throw new RuntimeException(e); }
-      })) {
-        // A root wins every overlap against a nested candidate.
-      } else selected.add(c);
-    }
-    return selected;
+  static String escaped(String value) {
+    return value.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n");
   }
 
   public static void main(String[] args) throws Exception {
     Class<?> type = Class.forName("net.fabricmc.loader.impl.discovery.ModCandidateImpl");
     Method addParent = type.getDeclaredMethod("addParent", type);
     addParent.setAccessible(true);
+    Method id = type.getMethod("getId");
     Method isRoot = type.getMethod("isRoot");
     Method level = type.getMethod("getMinNestLevel");
-    Method id = type.getMethod("getId");
-    try (var lines = Files.lines(Path.of(args[0]))) {
-      lines.filter(s -> !s.isBlank()).forEach(line -> {
-        try {
-          String[] split = line.split("\\|", 2);
-          List<Spec> specs = parse(split[1]);
-          Map<String,Object> byLabel = new HashMap<>();
-          List<Object> candidates = new ArrayList<>();
-          for (Spec spec : specs) candidates.add(candidate(spec, byLabel, type));
-          for (int i = 0; i < specs.size(); i++) {
-            String parent = specs.get(i).parent();
-            if (parent != null) addParent.invoke(candidates.get(i), byLabel.get(parent));
-          }
-          Method sort = Class.forName("net.fabricmc.loader.impl.discovery.ModPrioSorter").getDeclaredMethod("sort", List.class, Map.class);
-          sort.setAccessible(true);
-          sort.invoke(null, candidates, new HashMap<>());
-          // ModResolver's complete graph requires loader-owned dependency objects;
-          // the sorter is the candidate-selection oracle exercised here.
-          candidates = new ArrayList<>(selectLikeLoader(candidates, type));
-          StringJoiner row = new StringJoiner(",");
-          for (Object c : candidates) row.add(id.invoke(c) + "@" + (isRoot.invoke(c).equals(Boolean.TRUE) ? "r" : "n") + "@" + level.invoke(c));
-          System.out.println(split[0] + "|" + row);
-        } catch (Exception e) { throw new RuntimeException(e); }
-      });
+    Method nestedMods = type.getMethod("getNestedMods");
+    Method resolve = Class.forName("net.fabricmc.loader.impl.discovery.ModResolver")
+        .getMethod("resolve", Collection.class, Class.forName("net.fabricmc.api.EnvType"), Map.class);
+    Class<?> envType = Class.forName("net.fabricmc.api.EnvType");
+    Object server = Enum.valueOf((Class) envType, "SERVER");
+    // Fabric's resolver logs diagnostics for an unsatisfied SAT result. This
+    // inert handler keeps those diagnostics off the oracle data stream.
+    Class<?> log = Class.forName("net.fabricmc.loader.impl.util.log.Log");
+    Class<?> handlerType = Class.forName("net.fabricmc.loader.impl.util.log.LogHandler");
+    Object silentHandler = Proxy.newProxyInstance(
+        ModPrioSorterOracle.class.getClassLoader(), new Class<?>[] {handlerType},
+        (proxy, method, args1) -> method.getName().equals("shouldLog") ? false : null);
+    log.getMethod("init", handlerType).invoke(null, silentHandler);
+
+    for (String line : Files.readAllLines(Path.of(args[0]))) {
+      if (line.isBlank()) continue;
+      String[] split = line.split("\\|", 2);
+      List<Spec> specs = parse(split[1]);
+      Map<String, Object> byLabel = new HashMap<>();
+      List<Object> candidates = new ArrayList<>();
+      for (Spec spec : specs) candidates.add(candidate(spec, byLabel, type));
+      for (int i = 0; i < specs.size(); i++) {
+        String parent = specs.get(i).parent();
+        if (parent != null) {
+          ((Collection<Object>) nestedMods.invoke(byLabel.get(parent))).add(candidates.get(i));
+          addParent.invoke(candidates.get(i), byLabel.get(parent));
+        }
+      }
+      try {
+        List<?> selected = (List<?>) resolve.invoke(null, candidates, server, new HashMap<>());
+        StringJoiner row = new StringJoiner(",");
+        for (Object candidate : selected) {
+          row.add(id.invoke(candidate) + "@" + (isRoot.invoke(candidate).equals(Boolean.TRUE) ? "r" : "n") + "@" + level.invoke(candidate));
+        }
+        System.out.println(split[0] + "|OK|" + row);
+      } catch (InvocationTargetException error) {
+        Throwable cause = error.getCause();
+        System.out.println(split[0] + "|ERROR|" + cause.getClass().getName() + "|" + escaped(cause.getMessage()));
+      }
     }
   }
 }
