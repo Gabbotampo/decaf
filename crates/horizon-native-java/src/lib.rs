@@ -26747,6 +26747,17 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if r.name == "commonFields" && r.owner.starts_with("net/minecraft/") {
+            if r.owner
+                == "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction"
+            {
+                if let Some(value) = dfu_codec::invoke(self.host, r, receiver, args) {
+                    return Ok(Some(value));
+                }
+            } else if let Some(value) = dfu_codec::counted_product(self.host, r) {
+                return Ok(Some(value));
+            }
+        }
         if let Some(value) = thread_local::call(self, r, receiver, args) {
             return value.map(Some);
         }
@@ -31432,6 +31443,14 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         dispatched = Some(value);
                     }
+                    if dispatched.is_none()
+                        && receiver == Some(Value::Ref(None))
+                        && r.owner.starts_with("com/mojang/datafixers/Products$P")
+                        && r.name == "apply"
+                        && let Some(value) = dfu_codec::counted_app(self.host, &r)
+                    {
+                        dispatched = Some(value);
+                    }
                     if dispatched.is_none() && (receiver == Some(Value::Ref(None))) {
                         dispatched = Some({
                             // JVMS §6.5: an instance call on `null` throws before
@@ -31478,6 +31497,20 @@ impl<H: Host> Runtime<'_, H> {
                                 descriptor: "(Lcom/mojang/datafixers/kinds/App;)Lcom/mojang/datafixers/Products$P1;".into(),
                             }))
                         )
+                        });
+                    }
+                    if dispatched.is_none()
+                        && r.name == "commonFields"
+                        && r.owner.starts_with("net/minecraft/")
+                        && r.owner
+                            != "net/minecraft/world/level/storage/loot/functions/LootItemConditionalFunction"
+                        && let Some(value) = dfu_codec::counted_product(self.host, &r)
+                    {
+                        dispatched = Some({
+                            // Other vanilla loot bases also return non-null Products.Pn. If their
+                            // graph is outside the bounded model, count the call while preserving
+                            // that Java invariant for the following `and`/`apply` chain.
+                            value
                         });
                     }
                     if dispatched.is_none()

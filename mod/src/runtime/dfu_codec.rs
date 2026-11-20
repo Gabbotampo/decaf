@@ -603,6 +603,64 @@ fn product_parts(value: &Value) -> Option<(usize, Vec<Value>)> {
     (parts.len() == arity).then_some((arity, parts))
 }
 
+/// A counted product keeps DFU's non-null construction invariant after a bounded graph refusal.
+/// It carries only its arity; component reads remain unknown calls rather than fabricated values.
+fn opaque_product(arity: usize) -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::DfuCodec,
+        &[
+            Value::Ref(Some(PRODUCT.to_owned())),
+            Value::Long(NEXT_NODE.fetch_add(1, Ordering::Relaxed) as i64),
+            Value::Int(arity as i32),
+        ],
+    ))
+}
+
+fn opaque_app() -> Value {
+    Value::Host(HostRef::of_values(
+        HostKind::DfuCodec,
+        &[
+            Value::Ref(Some(APPLIED.to_owned())),
+            Value::Long(NEXT_NODE.fetch_add(1, Ordering::Relaxed) as i64),
+        ],
+    ))
+}
+
+/// Counted fallback for a vanilla product constructor whose full codec graph is over budget.
+pub(crate) fn counted_product(host: &mut dyn Host, r: &MethodRef) -> Option<Value> {
+    let arity = r
+        .descriptor
+        .rsplit_once("$P")
+        .and_then(|(_, rest)| rest.strip_suffix(';'))
+        .and_then(|rest| rest.parse().ok())?;
+    if !(1..=16).contains(&arity) {
+        return None;
+    }
+    host.unknown_operand_call(r).ok()?;
+    Some(opaque_product(arity))
+}
+
+/// Counted fallback for a product application whose receiver was lost after an earlier bounded
+/// refusal. The real DFU application is non-null; keeping an opaque App lets the enclosing codec
+/// construction remain counted instead of turning the refusal into an impossible receiver NPE.
+pub(crate) fn counted_app(host: &mut dyn Host, r: &MethodRef) -> Option<Value> {
+    host.unknown_operand_call(r).ok()?;
+    Some(opaque_app())
+}
+
+fn product_arity(value: &Value) -> Option<usize> {
+    let values = held_values(value)?;
+    if tag(value).as_deref() != Some(PRODUCT) {
+        return None;
+    }
+    let Value::Int(arity) = values.get(2)? else {
+        return None;
+    };
+    usize::try_from(*arity)
+        .ok()
+        .filter(|arity| (1..=16).contains(arity))
+}
+
 fn product_and_values(receiver: &Value, argument: &Value) -> Option<Vec<Value>> {
     let (_, receiver_parts) = product_parts(receiver)?;
     let mut values = receiver_parts;
@@ -792,7 +850,13 @@ pub(crate) fn runtime_instance_call<H: Host>(
             values.extend_from_slice(args);
             return match node(runtime.host, PRODUCT, values) {
                 Ok(value) => Ok(Some(value)),
-                Err(reason) => runtime_refuse(runtime, r, reason),
+                Err(reason) => {
+                    runtime_refuse(runtime, r, reason)?;
+                    runtime
+                        .host
+                        .unknown_operand_call(r)
+                        .map(|_| Some(opaque_product(arity)))
+                }
             };
         }
     }
@@ -808,6 +872,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
             return Ok(None);
         }
         let Some(parts) = product_and_values(receiver, argument) else {
+            if product_arity(receiver).is_some() && product_arity(argument).is_some() {
+                runtime.host.unknown_operand_call(r)?;
+                return Ok(Some(opaque_product(arity)));
+            }
             return Ok(None);
         };
         if parts.len() != arity {
@@ -817,7 +885,13 @@ pub(crate) fn runtime_instance_call<H: Host>(
         values.extend(parts);
         return match node(runtime.host, PRODUCT, values) {
             Ok(value) => Ok(Some(value)),
-            Err(reason) => runtime_refuse(runtime, r, reason),
+            Err(reason) => {
+                runtime_refuse(runtime, r, reason)?;
+                runtime
+                    .host
+                    .unknown_operand_call(r)
+                    .map(|_| Some(opaque_product(arity)))
+            }
         };
     }
     if receiver_tag.as_deref() == Some(PRODUCT)
@@ -825,7 +899,8 @@ pub(crate) fn runtime_instance_call<H: Host>(
         && r.name == "apply"
     {
         let Some(constructor) = args.get(1).filter(|value| is_callback(value)) else {
-            return Ok(None);
+            runtime.host.unknown_operand_call(r)?;
+            return Ok(Some(opaque_app()));
         };
         return match node(
             runtime.host,
@@ -833,7 +908,13 @@ pub(crate) fn runtime_instance_call<H: Host>(
             vec![receiver.clone(), args[0].clone(), constructor.clone()],
         ) {
             Ok(value) => Ok(Some(value)),
-            Err(reason) => runtime_refuse(runtime, r, reason),
+            Err(reason) => {
+                runtime_refuse(runtime, r, reason)?;
+                runtime
+                    .host
+                    .unknown_operand_call(r)
+                    .map(|_| Some(opaque_app()))
+            }
         };
     }
     if r.name == "toString" && r.descriptor == "()Ljava/lang/String;" {
@@ -925,7 +1006,7 @@ pub(crate) fn invoke(
             Vec::new(),
             false,
         );
-        let getter = invoke(
+        let getter = match invoke(
             host,
             &MethodRef {
                 owner: MAP_CODEC.into(),
@@ -934,8 +1015,23 @@ pub(crate) fn invoke(
             },
             Some(&optional),
             &[callback],
-        )?;
-        return build(host, r, PRODUCT, vec![Value::Int(1), getter]);
+        ) {
+            Some(getter) => getter,
+            None => {
+                // The exact getter is known, but this jar has exhausted the bounded callback
+                // graph. Count the commonFields call and keep Java's non-null P1 invariant so a
+                // following `P1.and` cannot turn a bounded refusal into an impossible NPE.
+                host.unknown_operand_call(r).ok()?;
+                return Some(opaque_product(1));
+            }
+        };
+        return match build(host, r, PRODUCT, vec![Value::Int(1), getter]) {
+            Some(value) => Some(value),
+            None => {
+                host.unknown_operand_call(r).ok()?;
+                Some(opaque_product(1))
+            }
+        };
     }
     if r.owner.starts_with("com/mojang/datafixers/Products$P") && r.name == "and" {
         let receiver = receiver?.clone();
@@ -944,7 +1040,13 @@ pub(crate) fn invoke(
         if !(1..=16).contains(&arity) {
             return None;
         }
-        let parts = product_and_values(&receiver, &argument)?;
+        let Some(parts) = product_and_values(&receiver, &argument) else {
+            if product_arity(&receiver).is_some() && product_arity(&argument).is_some() {
+                host.unknown_operand_call(r).ok()?;
+                return Some(opaque_product(arity));
+            }
+            return None;
+        };
         return (parts.len() == arity).then(|| {
             let mut values = vec![Value::Int(arity as i32)];
             values.extend(parts);
