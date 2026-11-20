@@ -271,6 +271,7 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
 mod vanilla_blocks;
 mod vanilla_entity_types;
@@ -6006,14 +6007,18 @@ impl Host for StdHost {
                 .get(&block)
                 .is_some_and(|properties| properties.contains_key(&name))
             {
-                return Err(NativeError::UncaughtException {
-                    class: "java/lang/IllegalArgumentException".into(),
-                    message: Some(format!(
-                        "{} has duplicate property: {name}",
-                        value_text(&Value::Ref(Some(block.clone())))
-                    )),
-                    frame: None,
-                });
+                // 26.3's `validateProperty` throws `IllegalArgumentException` whose message starts
+                // with `String.valueOf(owner)`, the block's `toString` mid-construction, which
+                // this host cannot spell. The duplicate is counted instead, and the block's state
+                // set is left undeclared rather than declared with one copy.
+                self.unknown_block_state_definitions.insert(block.clone());
+                *self
+                    .unknown_host_calls
+                    .entry(format!(
+                        "net/minecraft/world/level/block/state/StateDefinition$Builder#validateProperty duplicate {name}"
+                    ))
+                    .or_default() += 1;
+                return Ok(());
             }
             self.block_state_properties
                 .entry(block)
@@ -24736,7 +24741,9 @@ impl<H: Host> Runtime<'_, H> {
             );
             self.host.finish_block_state_definition(receiver, &builder);
             result?;
-        } else if is_vanilla_block_class(&current) {
+        } else if is_vanilla_block_class(&current)
+            && vanilla_block_state_definers::adds_properties(&current)
+        {
             self.host.block_state_definition_unknown(
                 receiver,
                 &MethodRef {
@@ -31657,9 +31664,14 @@ impl<H: Host> Runtime<'_, H> {
                     {
                         invoke_or_catch!(at, self.run_vanilla_block_constructor_hooks(receiver));
                     }
+                    // A jar override's `super.createBlockStateDefinition(builder)` into vanilla:
+                    // counted when that vanilla chain adds properties the runtime does not run;
+                    // otherwise it reaches `Block`'s empty body and adds nothing, exactly.
                     if op == 0xb7
                         && r.name == "createBlockStateDefinition"
                         && is_vanilla_block_class(&r.owner)
+                        && self.class(&r.owner).is_none()
+                        && vanilla_block_state_definers::adds_properties(&r.owner)
                         && let Some(receiver) = receiver.as_ref()
                     {
                         self.host.block_state_definition_unknown(receiver, &r);
@@ -36433,7 +36445,10 @@ mod tests {
     }
 
     #[test]
-    fn state_definition_builder_rejects_duplicate_property_names() {
+    fn state_definition_builder_counts_a_duplicate_property_name() {
+        // The real `validateProperty` throws for a second `facing`, with a message naming the
+        // block's `toString` this host cannot spell: the duplicate is counted, and the block's
+        // state set is not declared.
         let mut host = StdHost::new();
         let block = Value::Ref(Some("demo/Block#1".into()));
         let builder = Value::Ref(Some(
@@ -36444,25 +36459,21 @@ mod tests {
                 owner: "net/minecraft/world/level/block/state/properties/BlockStateProperties"
                     .into(),
                 name: "FACING".into(),
-                descriptor: "Lnet/minecraft/world/level/block/state/properties/DirectionProperty;"
+                descriptor: "Lnet/minecraft/world/level/block/state/properties/EnumProperty;"
                     .into(),
             })
             .unwrap();
         host.begin_block_state_definition(&block, &builder);
         host.block_state_builder_add_checked(&builder, &property)
             .unwrap();
-        let error = host
-            .block_state_builder_add_checked(&builder, &property)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            NativeError::UncaughtException {
-                class,
-                message: Some(message),
-                ..
-            } if class == "java/lang/IllegalArgumentException"
-                && message == "demo/Block#1 has duplicate property: facing"
-        ));
+        host.block_state_builder_add_checked(&builder, &property)
+            .unwrap();
+        assert!(host.unknown_host_calls().iter().any(|(call, _)| call
+            == "net/minecraft/world/level/block/state/StateDefinition$Builder#validateProperty duplicate facing"));
+        assert!(
+            host.unknown_block_state_definitions
+                .contains("demo/Block#1")
+        );
     }
 
     #[test]

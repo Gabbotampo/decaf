@@ -648,6 +648,14 @@ public class CraftingTableBlock extends Block {
 }"#,
     );
     stubs.insert(
+        "net/minecraft/world/level/block/FurnaceBlock.java",
+        r#"package net.minecraft.world.level.block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public class FurnaceBlock extends Block {
+    public FurnaceBlock(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+    );
+    stubs.insert(
         "net/minecraft/world/level/block/state/BlockState.java",
         r#"package net.minecraft.world.level.block.state;
 import net.minecraft.world.level.block.state.properties.Property;
@@ -721,13 +729,21 @@ import net.minecraft.world.level.block.state.BlockBehaviour;
 public final class Lamp extends LampBase {
     public Lamp(BlockBehaviour.Properties properties) { super(properties); }
 }"#,
-        // No jar override: the inherited vanilla state-definition method is counted, so this
-        // declaration must not claim an incomplete state set.
+        // No jar override, and 26.3's `CraftingTableBlock` inherits `Block`'s empty
+        // `createBlockStateDefinition`: exactly no state property, nothing counted.
         "demo/Inherited.java" => r#"package demo;
 import net.minecraft.world.level.block.CraftingTableBlock;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 public final class Inherited extends CraftingTableBlock {
     public Inherited(BlockBehaviour.Properties properties) { super(properties); }
+}"#,
+        // No jar override, but 26.3's `FurnaceBlock` inherits `AbstractFurnaceBlock`'s definition
+        // (FACING, LIT), which the runtime does not run: counted, and no state set is claimed.
+        "demo/Smelter.java" => r#"package demo;
+import net.minecraft.world.level.block.FurnaceBlock;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Smelter extends FurnaceBlock {
+    public Smelter(BlockBehaviour.Properties properties) { super(properties); }
 }"#,
         "demo/StateMod.java" => r#"package demo;
 import net.fabricmc.api.ModInitializer;
@@ -744,6 +760,8 @@ public final class StateMod implements ModInitializer {
                 new Lamp(BlockBehaviour.Properties.of()));
         Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "inherited"),
                 new Inherited(BlockBehaviour.Properties.of()));
+        Registry.register(Registries.BLOCK, Identifier.fromNamespaceAndPath("fixture", "smelter"),
+                new Smelter(BlockBehaviour.Properties.of()));
     }
 }"#,
     };
@@ -787,16 +805,27 @@ public final class StateMod implements ModInitializer {
             .keys()
             .any(|key| key.starts_with("state_property:"))
     );
-    assert!(
-        host.unknown_host_calls()
-            .iter()
-            .any(|(key, _)| key.contains("createBlockStateDefinition"))
+    // `FurnaceBlock`'s own constructor is counted (vanilla subclass constructors other than the
+    // crafting table's stay unmodelled), so its row stays opaque: no declaration, no state set.
+    assert!(host.registrations()[3].declaration.is_none());
+    let counted: Vec<String> = host
+        .unknown_host_calls()
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.contains("createBlockStateDefinition"))
+        .collect();
+    assert_eq!(
+        counted,
+        [
+            "net/minecraft/world/level/block/FurnaceBlock#createBlockStateDefinition(Lnet/minecraft/world/level/block/state/StateDefinition$Builder;)V"
+        ],
+        "only the FurnaceBlock chain adds properties the runtime does not run"
     );
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
-fn state_definition_builder_duplicate_is_the_vanilla_illegal_argument() {
+fn state_definition_builder_duplicate_is_counted() {
     run_on_large_stack(|| {
         let mut stubs = game_stubs();
         stubs.insert(
@@ -872,7 +901,11 @@ public final class BadMod implements ModInitializer {
         let mut host = jar.seed_host(StdHost::new());
         jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
             .unwrap();
-        assert!(host.take_stdout().contains("has duplicate property: lit"));
+        // Java throws `IllegalArgumentException` whose message names the block's `toString`
+        // mid-construction, which the host cannot spell: the duplicate is counted instead of an
+        // exception with an invented message (so nothing is printed here).
+        assert!(host.unknown_host_calls().iter().any(|(call, _)| call
+            == "net/minecraft/world/level/block/state/StateDefinition$Builder#validateProperty duplicate lit"));
         let _ = fs::remove_dir_all(root);
     });
 }
