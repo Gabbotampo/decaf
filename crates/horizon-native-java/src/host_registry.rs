@@ -431,17 +431,21 @@ fn family_class(target: &str) -> bool {
         )
 }
 
+/// Whether `text` is spelled like one of this family's retired markers: the
+/// runtime makes no value spelled so, so such a text is a jar `String`.
+pub(crate) fn spells_retired_marker(text: &str) -> bool {
+    RETIRED_MARKERS
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 /// `checkcast` of a String spelled like a retired marker to one of this
 /// family's game classes: Java's `ClassCastException`, naming `String`.
 pub(crate) fn retired_marker_cast(value: &Value, target: &str) -> Option<String> {
     let Value::Ref(Some(text)) = value else {
         return None;
     };
-    (family_class(target)
-        && RETIRED_MARKERS
-            .iter()
-            .any(|prefix| text.starts_with(prefix)))
-    .then(|| "java/lang/String".to_owned())
+    (family_class(target) && spells_retired_marker(text)).then(|| "java/lang/String".to_owned())
 }
 
 /// When NeoForge binds a holder to its entry (`DeferredHolder.bind`): at its
