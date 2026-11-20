@@ -945,6 +945,64 @@ pub(crate) fn instance_of_class(
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
+    if handle.kind() == HostKind::GuavaMultimap {
+        let class = handle.class()?;
+        let list = class.ends_with("$WrappedList") || class.ends_with("$RandomAccessWrappedList");
+        let set = class.ends_with("$WrappedSet")
+            || class.ends_with("$KeySet")
+            || class.ends_with("$SimpleEntrySet");
+        let collection = list
+            || set
+            || class.ends_with("$Values")
+            || class == "com/google/common/collect/AbstractMultimap$Values";
+        let map = class.ends_with("$AsMap");
+        let multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let list_multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let set_multimap = matches!(
+            class,
+            "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+        );
+        if wanted == "java/lang/Object" {
+            return Some(true);
+        }
+        if wanted == "java/util/Collection" {
+            return Some(collection);
+        }
+        if wanted == "java/util/List" {
+            return Some(list);
+        }
+        if wanted == "java/util/Set" {
+            return Some(set);
+        }
+        if wanted == "java/util/Map" {
+            return Some(map);
+        }
+        if wanted == "com/google/common/collect/Multimap" {
+            return Some(multimap);
+        }
+        if wanted == "com/google/common/collect/ListMultimap" {
+            return Some(list_multimap);
+        }
+        if wanted == "com/google/common/collect/SetMultimap" {
+            return Some(set_multimap);
+        }
+        if wanted == "java/util/RandomAccess" {
+            return Some(class.ends_with("$RandomAccessWrappedList"));
+        }
+    }
     let declared = match handle.kind.info().class {
         ClassRule::Unknown { declared } => declared(handle.key()),
         _ => return hierarchy.is_instance(handle.class()?, wanted),
