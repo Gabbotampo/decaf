@@ -184,9 +184,10 @@ fn fabric_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &
 ///   discovery pipeline as a mod file, so every `[[mods]]` `modId` of its
 ///   `META-INF/neoforge.mods.toml` is a mod.
 ///
-/// Not modelled: JarJar's version selection (`JarSelector.select` keeps one
-/// version per `group:artifact` and fails the launch on disjoint ranges);
-/// every named jar answers for its ids here. A named path that is missing
+/// JarJar's version selection (`JarSelector.select` keeps one
+/// version per `group:artifact` and fails the launch on disjoint ranges) is
+/// mirrored by the nested-jar loader. Every named jar answers for its ids
+/// here. A named path that is missing
 /// fails a NeoForge launch (`Mod file {} declares Jar-in-Jar {} but does not
 /// contain it`) and is skipped here.
 fn neoforge_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &mut Vec<String>) {

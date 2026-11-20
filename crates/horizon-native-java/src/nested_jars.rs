@@ -790,28 +790,19 @@ fn maven_restrict(left: &MavenRange, right: &MavenRange) -> MavenRange {
 }
 
 pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
-    let all = candidates(jar);
+    select_checked(jar).unwrap_or_default()
+}
+
+fn select_fabric_candidates(mut fabric: Vec<NestedCandidate>) -> Vec<NestedCandidate> {
     let mut selected: Vec<NestedCandidate> = Vec::new();
-    let mut neoforge_groups: std::collections::BTreeMap<String, Vec<NestedCandidate>> =
-        Default::default();
-    let mut fabric = Vec::new();
-    for candidate in all {
-        if let Some(coordinate) = candidate.neoforge_coordinate.clone() {
-            neoforge_groups
-                .entry(coordinate)
-                .or_default()
-                .push(candidate);
-        } else {
-            fabric.push(candidate);
-        }
-    }
     // ModPrioSorter first orders candidates by id, descending version, nest level,
     // and parent precedence. It then resolves every duplicate id/alias graph. Its
     // overlap comparator sums all shared id and alias comparisons; a zero score is
     // deliberately a tie, so cycles of equal candidates remain intact.
     fabric.sort_by(|a, b| {
-        candidate_id(&a.jar)
-            .cmp(&candidate_id(&b.jar))
+        (a.depth != 0)
+            .cmp(&(b.depth != 0))
+            .then_with(|| candidate_id(&a.jar).cmp(&candidate_id(&b.jar)))
             .then_with(|| {
                 version_cmp(
                     candidate_version(&b.jar).as_deref(),
@@ -823,22 +814,30 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             .then_with(|| a.order.cmp(&b.order))
     });
     let mut key_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut provided_keys = std::collections::BTreeSet::new();
     for candidate in &fabric {
         *key_counts.entry(candidate_id(&candidate.jar)).or_default() += 1;
         for alias in &candidate.jar.fabric_provides {
             *key_counts.entry(alias.clone()).or_default() += 1;
+            provided_keys.insert(alias.clone());
         }
     }
     let duplicate_keys = key_counts
         .into_iter()
-        .filter_map(|(key, count)| (count > 1).then_some(key))
+        .filter_map(|(key, count)| (count > 1 && provided_keys.contains(&key)).then_some(key))
         .collect::<std::collections::BTreeSet<_>>();
     let sign = |ordering: Ordering| match ordering {
         Ordering::Less => -1,
         Ordering::Equal => 0,
         Ordering::Greater => 1,
     };
+    let mut first_nested_index = 0;
+    let mut seen_nested = false;
     for candidate in fabric {
+        if !seen_nested && candidate.depth != 0 {
+            seen_nested = true;
+            first_nested_index = selected.len();
+        }
         let ids = std::iter::once(candidate.jar.fabric_id.as_deref())
             .chain(
                 candidate
@@ -854,76 +853,78 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             selected.push(candidate);
             continue;
         }
+        let overlap_keys = ids
+            .iter()
+            .filter(|id| duplicate_keys.contains(*id))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut replace = None;
-        let mut overlap_keys = std::collections::BTreeSet::new();
-        overlap_keys.extend(
-            ids.iter()
-                .filter(|id| duplicate_keys.contains(*id))
-                .cloned(),
-        );
-        for index in (0..selected.len()).rev() {
-            let current = &selected[index];
+        let mut reject = false;
+        for previous_index in (first_nested_index..selected.len()).rev() {
+            let current = &selected[previous_index];
             if candidate_id(&candidate.jar) == candidate_id(&current.jar) {
                 break;
             }
-            let current_ids = std::iter::once(current.jar.fabric_id.as_deref())
-                .chain(current.jar.fabric_provides.iter().map(|s| Some(s.as_str())))
-                .flatten()
-                .collect::<std::collections::BTreeSet<_>>();
-            let current_overlaps = current_ids.iter().any(|id| overlap_keys.contains(*id));
-            let shared_aliases = current
-                .jar
-                .fabric_provides
-                .iter()
-                .any(|alias| overlap_keys.contains(alias));
-            if !current_overlaps && !shared_aliases {
+            if !overlap_keys.contains(&candidate_id(&current.jar))
+                && current
+                    .jar
+                    .fabric_provides
+                    .iter()
+                    .all(|alias| !overlap_keys.contains(alias))
+            {
                 continue;
             }
-            let mut score = 0i32;
-            let mut found = false;
-            for alias in &candidate.jar.fabric_provides {
-                if alias == &candidate_id(&current.jar) {
-                    score += sign(version_cmp(
-                        candidate_version(&candidate.jar).as_deref(),
-                        candidate_version(&current.jar).as_deref(),
-                    ));
-                    found = true;
-                }
-            }
-            for alias in &current.jar.fabric_provides {
-                if alias == &candidate_id(&candidate.jar) {
-                    score += sign(version_cmp(
-                        candidate_version(&current.jar).as_deref(),
-                        candidate_version(&candidate.jar).as_deref(),
-                    ));
-                    found = true;
-                }
-                for candidate_alias in &candidate.jar.fabric_provides {
-                    if alias == candidate_alias {
-                        score += sign(version_cmp(
-                            candidate_version(&current.jar).as_deref(),
-                            candidate_version(&candidate.jar).as_deref(),
-                        ));
-                        found = true;
-                    }
-                }
-            }
-            if found && score < 0 {
-                replace = Some(index);
-                continue;
-            }
-            if found {
-                replace = None;
+            let score = compare_overlapping_ids(&candidate, current, &sign);
+            if score < 0 {
+                replace = Some(previous_index);
+            } else if score > 0 {
+                reject = true;
                 break;
             }
         }
-        if let Some(index) = replace {
-            selected.remove(index);
-            selected.insert(index, candidate);
+        if let Some(previous_index) = replace {
+            selected.remove(previous_index);
+            selected.insert(previous_index, candidate);
+        } else if reject {
+            continue;
+        } else if candidate.depth != 0
+            && selected[..first_nested_index].iter().any(|current| {
+                overlap_keys.contains(&candidate_id(&current.jar))
+                    || current
+                        .jar
+                        .fabric_provides
+                        .iter()
+                        .any(|alias| overlap_keys.contains(alias))
+            })
+        {
+            // ModPrioSorter never compares a candidate after the first nested
+            // one with a root. The resolver consequently keeps the root and
+            // drops this lower-priority nested provider.
         } else {
             selected.push(candidate);
         }
     }
+    selected
+}
+
+/// Select the nested jars, preserving JarSelector's refusal when a declared
+/// coordinate has no artifact in the restricted Maven range.
+pub fn select_checked(jar: &NativeJar) -> Result<Vec<NestedCandidate>, String> {
+    let all = candidates(jar);
+    let mut neoforge_groups: std::collections::BTreeMap<String, Vec<NestedCandidate>> =
+        Default::default();
+    let mut fabric = Vec::new();
+    for candidate in all {
+        if let Some(coordinate) = candidate.neoforge_coordinate.clone() {
+            neoforge_groups
+                .entry(coordinate)
+                .or_default()
+                .push(candidate);
+        } else {
+            fabric.push(candidate);
+        }
+    }
+    let mut selected = select_fabric_candidates(fabric);
     for (_coordinate, group) in neoforge_groups {
         if group.len() == 1 {
             selected.extend(group);
@@ -954,10 +955,10 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             }
         }
         let Some(allowed) = allowed else {
-            continue;
+            return Err(neoforge_no_match_error(&group));
         };
         if allowed.restrictions.is_empty() && allowed.recommended.is_none() {
-            continue;
+            return Err(neoforge_no_match_error(&group));
         }
         let matches = |candidate: &NestedCandidate| {
             candidate
@@ -970,15 +971,86 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
                 candidate.neoforge_artifact_version.as_deref() == Some(recommended.as_str())
             }) {
                 selected.push(candidate.clone());
+            } else {
+                return Err(neoforge_no_match_error(&group));
             }
-        } else if let Some(candidate) = group.into_iter().find(matches) {
-            // JarSelector uses Collection.stream().findFirst(), preserving
-            // metadata iteration order; it never chooses the maximum.
-            selected.push(candidate);
+        } else {
+            let coordinate = group
+                .first()
+                .and_then(|candidate| candidate.neoforge_coordinate.clone());
+            let requester = group
+                .first()
+                .map(|candidate| candidate.parent.clone())
+                .unwrap_or_else(|| "unknown".into());
+            if let Some(candidate) = group.into_iter().find(matches) {
+                // JarSelector uses Collection.stream().findFirst(), preserving
+                // metadata iteration order; it never chooses the maximum.
+                selected.push(candidate);
+            } else {
+                return Err(format!(
+                    "Some mods have agreed upon an acceptable version range for : §6{}§r, but no jar was provided which matched the range. Requested by: §e{}§r.",
+                    coordinate.as_deref().unwrap_or("unknown:unknown"),
+                    requester,
+                ));
+            }
         }
     }
     selected.sort_by_key(|c| c.order);
-    selected
+    Ok(selected)
+}
+
+fn compare_overlapping_ids(
+    candidate: &NestedCandidate,
+    current: &NestedCandidate,
+    sign: &impl Fn(Ordering) -> i32,
+) -> i32 {
+    let mut score = i32::MAX;
+    let mut add = |ordering| {
+        if score == i32::MAX {
+            score = 0;
+        }
+        score += sign(ordering);
+    };
+    for alias in &candidate.jar.fabric_provides {
+        if alias == &candidate_id(&current.jar) {
+            add(version_cmp(
+                candidate_version(&candidate.jar).as_deref(),
+                candidate_version(&current.jar).as_deref(),
+            ));
+        }
+    }
+    for alias in &current.jar.fabric_provides {
+        if alias == &candidate_id(&candidate.jar) {
+            add(version_cmp(
+                candidate_version(&current.jar).as_deref(),
+                candidate_version(&candidate.jar).as_deref(),
+            ));
+        }
+        for candidate_alias in &candidate.jar.fabric_provides {
+            if alias == candidate_alias {
+                add(version_cmp(
+                    candidate_version(&current.jar).as_deref(),
+                    candidate_version(&candidate.jar).as_deref(),
+                ));
+            }
+        }
+    }
+    score
+}
+
+fn neoforge_no_match_error(group: &[NestedCandidate]) -> String {
+    let coordinate = group
+        .first()
+        .and_then(|candidate| candidate.neoforge_coordinate.as_deref())
+        .unwrap_or("unknown:unknown");
+    let requester = group
+        .iter()
+        .map(|candidate| candidate.parent.as_str())
+        .next()
+        .unwrap_or("unknown");
+    format!(
+        "Some mods have agreed upon an acceptable version range for : §6{coordinate}§r, but no jar was provided which matched the range. Requested by: §e{requester}§r."
+    )
 }
 pub fn parsed(jar: &NativeJar) -> Vec<(String, NativeJar)> {
     fn walk(jar: &NativeJar, out: &mut Vec<(String, NativeJar)>, prefix: &str) {
@@ -998,7 +1070,15 @@ pub fn parsed(jar: &NativeJar) -> Vec<(String, NativeJar)> {
 }
 pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
     let mut out = Vec::new();
-    let selected = select(jar);
+    let selected = match select_checked(jar) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return vec![NestedJar {
+                entry: "<jarjar-resolution>".into(),
+                result: Err(error),
+            }];
+        }
+    };
     for candidate in selected {
         let id = format!("{}!{}", candidate.parent, candidate.entry);
         let result = host.link_jar(id, &candidate.jar).map_err(|e| e.to_string());
@@ -1032,6 +1112,7 @@ pub fn link_nested_jars(host: &mut StdHost, jar: &NativeJar) -> Vec<NestedJar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -1156,6 +1237,133 @@ mod tests {
             .filter_map(|candidate| candidate.jar.fabric_id.as_deref())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(ids, std::collections::BTreeSet::from(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn fabric_selection_matches_the_java25_mod_prio_oracle() {
+        for case in include_str!("nested_jars_cases.txt").lines() {
+            let (name, specs) = case.split_once('|').unwrap();
+            let mut parsed = Vec::new();
+            for (order, raw) in specs.split(';').filter(|raw| !raw.is_empty()).enumerate() {
+                let fields = raw.split(',').collect::<Vec<_>>();
+                parsed.push((
+                    fields[0].to_owned(),
+                    fields[1].to_owned(),
+                    fields[2].to_owned(),
+                    fields[3] == "1",
+                    if fields[4] == "-" {
+                        Vec::new()
+                    } else {
+                        fields[4].split('/').map(str::to_owned).collect()
+                    },
+                    (fields.get(5).copied().unwrap_or("-") != "-").then(|| fields[5].to_owned()),
+                    order,
+                ));
+            }
+            let mut depths = BTreeMap::new();
+            for (label, _, _, root, _, parent, _) in &parsed {
+                let depth = if *root {
+                    0
+                } else {
+                    parent
+                        .as_ref()
+                        .and_then(|parent| depths.get(parent).copied())
+                        .unwrap_or(0)
+                        + 1
+                };
+                depths.insert(label.clone(), depth);
+            }
+            let candidates = parsed
+                .iter()
+                .map(|(label, id, version, _, provides, parent, order)| {
+                    let jar = NativeJar {
+                        fabric_id: Some(id.clone()),
+                        fabric_version: Some(version.clone()),
+                        fabric_provides: provides.clone(),
+                        ..NativeJar::default()
+                    };
+                    let depth = depths[label];
+                    let parent_chain = parent
+                        .as_ref()
+                        .and_then(|parent| {
+                            parsed.iter().find(|(candidate, ..)| candidate == parent)
+                        })
+                        .map(|(_, id, version, _, _, _, _)| {
+                            vec![(id.clone(), Some(version.clone()), depth - 1)]
+                        })
+                        .unwrap_or_default();
+                    NestedCandidate {
+                        entry: label.clone(),
+                        parent: parent.clone().unwrap_or_else(|| "outer".into()),
+                        jar,
+                        depth,
+                        order: *order,
+                        parent_chain,
+                        neoforge_coordinate: None,
+                        neoforge_artifact_version: None,
+                        neoforge_version_range: None,
+                        neoforge_declared: false,
+                    }
+                })
+                .collect();
+            let actual = select_fabric_candidates(candidates)
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "{}@{}@{}",
+                        candidate_id(&candidate.jar),
+                        if candidate.depth == 0 { "r" } else { "n" },
+                        candidate.depth
+                    )
+                })
+                .collect::<Vec<_>>();
+            let expected = include_str!("nested_jars_java25.txt")
+                .lines()
+                .find_map(|line| {
+                    let (row_name, values) = line.split_once('|')?;
+                    (row_name == name)
+                        .then(|| values.split(',').map(str::to_owned).collect::<Vec<_>>())
+                })
+                .unwrap_or_else(|| panic!("missing Java oracle row {name}"));
+            assert_eq!(actual, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn fabric_root_beats_an_overlapping_nested_candidate() {
+        let inner = jar(&[(
+            "fabric.mod.json",
+            br#"{"id":"bb","version":"1","provides":["aa"]}"#,
+        )]);
+        let carrier = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"id":"carrier","version":"1","jars":[{"file":"bb.jar"}]}"#,
+            ),
+            ("bb.jar", &zip_bytes(&inner)),
+        ]);
+        let outer = jar(&[
+            (
+                "fabric.mod.json",
+                br#"{"id":"outer","version":"1","jars":[{"file":"aa.jar"},{"file":"carrier.jar"}]}"#,
+            ),
+            (
+                "aa.jar",
+                &zip_bytes(&jar(&[(
+                    "fabric.mod.json",
+                    br#"{"id":"aa","version":"2"}"#,
+                )])),
+            ),
+            ("carrier.jar", &zip_bytes(&carrier)),
+        ]);
+        let selected = select(&outer);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(|candidate| candidate.jar.fabric_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["aa", "carrier"]
+        );
     }
 
     fn zip_bytes(jar: &NativeJar) -> Vec<u8> {
@@ -1310,6 +1518,14 @@ mod tests {
             ("META-INF/jarjar/two.jar", &empty),
         ]);
         assert!(select(&outer).is_empty());
+        assert_eq!(
+            select_checked(&outer).unwrap_err(),
+            "Some mods have agreed upon an acceptable version range for : §6g:a§r, but no jar was provided which matched the range. Requested by: §eouter§r."
+        );
+        assert_eq!(
+            outer.try_seed_host(StdHost::new()).unwrap_err(),
+            "Some mods have agreed upon an acceptable version range for : §6g:a§r, but no jar was provided which matched the range. Requested by: §eouter§r."
+        );
     }
 
     fn empty_zip() -> Vec<u8> {

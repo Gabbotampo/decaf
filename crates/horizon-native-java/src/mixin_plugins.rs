@@ -173,7 +173,28 @@ impl NativeJar {
             {
                 continue;
             }
-            let host = host.get_or_insert_with(|| self.config_plugin_host(side));
+            let host = if let Some(host) = host.as_mut() {
+                host
+            } else {
+                match self.config_plugin_host(side) {
+                    Ok(new_host) => host.insert(new_host),
+                    Err(error) => {
+                        plugins.sessions.insert(
+                            config.path.clone(),
+                            PluginSession {
+                                report: ConfigPluginReport {
+                                    config: config.path.clone(),
+                                    plugin: plugin.to_owned(),
+                                    refused: Some(error),
+                                    ..ConfigPluginReport::default()
+                                },
+                                answers: BTreeMap::new(),
+                            },
+                        );
+                        continue;
+                    }
+                }
+            };
             let session = self.plugin_session(config, plugin, index, configs, side, host);
             plugins
                 .companions
@@ -259,15 +280,16 @@ impl NativeJar {
     }
 
     /// The host a plugin runs on: the jar alone on `side`, strict.
-    fn config_plugin_host(&self, side: MixinSide) -> StdHost {
+    fn config_plugin_host(&self, side: MixinSide) -> Result<StdHost, String> {
         let mut host = self
-            .seed_host(StdHost::new())
+            .try_seed_host(StdHost::new())
+            .map_err(|error| error.to_string())?
             .with_environment_type(match side {
                 MixinSide::Client => "CLIENT",
                 MixinSide::Server => "SERVER",
             });
         host.set_strict_unknown_host_calls(true);
-        host
+        Ok(host)
     }
 
     /// One config's session, steps 1–6 and the apply hooks.

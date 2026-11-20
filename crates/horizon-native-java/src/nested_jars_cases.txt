@@ -1,0 +1,8 @@
+root-vs-nested|aa,aa,2,1,-,;carrier,carrier,1,1,-,;bb,bb,1,0,aa,carrier
+three-cycle|a,a,1,1,b,;b,b,1,1,c,;c,c,1,1,a,
+overlap|aa,aa,1,1,shared,;bb,bb,2,1,shared,;cc,cc,2,1,other,
+version-tie|aa,aa,1,1,tie,;bb,bb,1,1,tie,;cc,cc,1,1,tie,
+nest-levels|base,base,1,1,level,;carrier,carrier,1,1,-,;deep,deep,1,0,level,carrier;deeper,deeper,1,0,level,deep
+aliases|owner-a,owner-a,2,1,alias-a,;alias-a,alias-a,1,0,alias-a,owner-a;owner-b,owner-b,1,1,alias-b,;alias-b,alias-b,1,0,alias-b,owner-b
+four-cycle|a,a,1,1,b,;b,b,1,1,c,;c,c,1,1,d,;d,d,1,1,a,
+mixed-versions|aa,aa,2,1,mix,;bb,bb,10,1,mix,;cc,cc,1.0-alpha,1,mix,;dd,dd,1.0,1,mix,

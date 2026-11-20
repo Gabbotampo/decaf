@@ -1,0 +1,8 @@
+root-vs-nested|aa@r@0,carrier@r@0
+three-cycle|a@r@0,b@r@0,c@r@0
+overlap|bb@r@0,cc@r@0
+version-tie|aa@r@0,bb@r@0,cc@r@0
+nest-levels|base@r@0,carrier@r@0
+aliases|owner-a@r@0,owner-b@r@0
+four-cycle|a@r@0,b@r@0,c@r@0,d@r@0
+mixed-versions|bb@r@0
