@@ -20606,7 +20606,11 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -20825,7 +20829,11 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -21000,7 +21008,11 @@ impl NativeJar {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -23215,12 +23227,16 @@ struct Runtime<'a, H> {
     io_reader_errors: BTreeMap<String, usize>,
     scanners: BTreeMap<String, scanner_model::ScannerState>,
     io_stream_paths: BTreeMap<String, String>,
+    io_channel_streams: BTreeSet<String>,
     /// Text each `java.io` writer this invocation built holds, keyed by its
     /// sink: `file:<path>` for a writer over a virtual file, `mem:<marker>` for
     /// one that only exists in memory. A wrapper (`BufferedWriter`,
     /// `OutputStreamWriter`) opens the same sink as the writer it wraps, so the
     /// text is committed once and a later close cannot truncate it.
     io_writers: BTreeMap<String, String>,
+    io_closed: BTreeSet<String>,
+    io_writer_bytes: BTreeMap<String, Vec<u8>>,
+    io_stream_positions: BTreeMap<String, usize>,
     /// Charset selected by each writer sink; UTF-8 is Java 25's default.
     io_writer_charsets: BTreeMap<String, String>,
     /// Charset-independent bytes committed for each virtual file. Text is
@@ -27444,6 +27460,10 @@ impl<H: Host> Runtime<'_, H> {
                     self.watch_writer_opened(&path, true);
                     self.io_files.insert(path.clone(), String::new());
                     self.io_file_bytes.insert(path.clone(), Vec::new());
+                    // A FileOutputStream's byte sink is per open stream.  The
+                    // next non-append open truncates the file and must not
+                    // inherit bytes accumulated by the previous stream.
+                    self.io_writer_bytes.remove(&format!("file:{path}"));
                     self.io_dirs.remove(&path);
                 }
                 format!("file:{path}")
@@ -27483,12 +27503,52 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
+    /// FileOutputStream writes are unbuffered and each stream has its own
+    /// file position.  Publish the bytes immediately so every reader sees
+    /// the same virtual file before close.
+    fn io_write_binary(&mut self, marker: &str, bytes: &[u8]) {
+        let Some(path) = self.io_paths.get(marker).cloned() else {
+            return;
+        };
+        let position = self
+            .io_stream_positions
+            .entry(marker.to_owned())
+            .or_default();
+        let file = self.io_file_bytes.entry(path.clone()).or_default();
+        if *position > file.len() {
+            file.resize(*position, 0);
+        }
+        let end = position.saturating_add(bytes.len());
+        if end > file.len() {
+            file.resize(end, 0);
+        }
+        file[*position..end].copy_from_slice(bytes);
+        *position = end;
+        self.io_files
+            .insert(path, String::from_utf8_lossy(file).into_owned());
+    }
+
     /// Copy a writer's sink into the virtual file it names. A close or flush
     /// repeats harmlessly because every wrapper shares one sink per file.
     fn io_commit(&mut self, marker: &str) {
         let Some(path) = self.io_paths.get(marker).cloned() else {
             return;
         };
+        // FileOutputStream writes are published at each write and therefore
+        // must not be replaced by the empty text sink on close.
+        if marker.contains("java/io/FileOutputStream/")
+            || self.io_stream_positions.contains_key(marker)
+        {
+            return;
+        }
+        if let Some(raw) = self.io_writer_bytes.get(&format!("file:{path}")).cloned() {
+            self.io_file_bytes.insert(path.clone(), raw);
+            if let Some(raw) = self.io_file_bytes.get(&path) {
+                self.io_files
+                    .insert(path.clone(), String::from_utf8_lossy(raw).into_owned());
+            }
+            return;
+        }
         if let Some(text) = self.io_writers.get(&format!("file:{path}")).cloned() {
             let key = format!("file:{path}");
             let charset = self
@@ -27672,7 +27732,11 @@ impl<H: Host> Runtime<'_, H> {
         path: &str,
         required: bool,
     ) -> Result<(), NativeError> {
-        let Some(text) = self.io_files.get(path).cloned() else {
+        let Some(text) = self.io_files.get(path).cloned().or_else(|| {
+            self.io_file_bytes
+                .get(path)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        }) else {
             if !required {
                 // `Files.newBufferedReader` over a path the invocation never
                 // wrote reads the jar resource `Files.exists` already answers
@@ -28308,6 +28372,7 @@ impl<H: Host> Runtime<'_, H> {
                         let value = self.new_object("java/io/FileInputStream");
                         if let Some(stream) = jar_object::object_key(&value) {
                             self.io_open_reader(r, stream, &path, false)?;
+                            self.io_channel_streams.insert(stream.to_owned());
                         }
                         value
                     }
@@ -28381,11 +28446,44 @@ impl<H: Host> Runtime<'_, H> {
                 if r.owner == "java/io/FileInputStream" {
                     self.io_open_reader(r, &marker, &path, true)?;
                 } else {
+                    // Opening below a parent that isn't a directory fails with a
+                    // FileNotFoundException whose text is the OS's (`strerror` on Unix,
+                    // a Windows system message there), so the call is counted rather
+                    // than answered with Linux's wording. The check still keeps the
+                    // model from silently creating a file below an absent parent.
+                    let canonical = host_path::sandbox_canonical(&path);
+                    if let Some((parent, _)) = canonical.rsplit_once('/')
+                        && !parent.is_empty()
+                        && self.file_kind(parent) != file_attributes::FileKind::Directory
+                    {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    }
                     let appending = r.descriptor.ends_with("Z)V")
                         && args
                             .get(1)
                             .is_some_and(|value| expect_int(r, value).unwrap_or(0) != 0);
-                    self.io_open_writer(&marker, Some(path), !appending)?;
+                    if self.io_paths.iter().any(|(other, other_path)| {
+                        other != &marker
+                            && other.contains("java/io/FileOutputStream/")
+                            && other_path == &path
+                            && !self.io_closed.contains(other)
+                    }) {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    }
+                    // The model has no symlink table. Java redirects an append
+                    // stream through a symlink to its target, so answering from
+                    // the lexical path would invent the target's contents.
+                    if appending {
+                        self.host.unknown_operand_call(r)?;
+                        return Ok(Some(Value::Void));
+                    }
+                    self.io_open_writer(&marker, Some(path.clone()), !appending)?;
+                    let position = if appending {
+                        self.io_file_bytes.get(&path).map_or(0, Vec::len)
+                    } else {
+                        0
+                    };
+                    self.io_stream_positions.insert(marker, position);
                 }
                 Ok(Some(Value::Void))
             }
@@ -28442,7 +28540,9 @@ impl<H: Host> Runtime<'_, H> {
                 self.string_readers.insert(marker, text);
                 Ok(Some(Value::Void))
             }
-            "java/io/Writer"
+            "java/io/OutputStream"
+            | "java/io/FileOutputStream"
+            | "java/io/Writer"
             | "java/io/BufferedWriter"
             | "java/io/FileWriter"
             | "java/io/OutputStreamWriter"
@@ -28455,6 +28555,17 @@ impl<H: Host> Runtime<'_, H> {
                 let Some(_) = self.io_sink_key(&marker) else {
                     return Ok(None);
                 };
+                let is_closed = self.io_closed.contains(&marker);
+                let file_output_byte_array = r.owner == "java/io/FileOutputStream"
+                    && r.name == "write"
+                    && matches!(r.descriptor.as_str(), "([B)V" | "([BII)V");
+                if is_closed && !file_output_byte_array && r.name != "close" && r.name != "flush" {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/io/IOException".into(),
+                        message: Some("Stream Closed".into()),
+                        frame: None,
+                    });
+                }
                 Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
                     ("write", "(Ljava/lang/String;)V") => {
                         let text = args.first().map(expect_string).unwrap_or_default();
@@ -28475,6 +28586,73 @@ impl<H: Host> Runtime<'_, H> {
                             .unwrap_or(0);
                         let slice = slice_utf16(text, start, length);
                         self.io_write(&marker, &slice)?;
+                        Value::Void
+                    }
+                    ("write", "([BII)V") => {
+                        let Some(array) = args.first() else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        if matches!(array, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: None,
+                                frame: None,
+                            });
+                        }
+                        let values = self.array(array).map(std::borrow::Cow::into_owned)?;
+                        let off = expect_int(r, StdHost::argument(r, args, 1)?)? as i64;
+                        let len = expect_int(r, StdHost::argument(r, args, 2)?)? as i64;
+                        if off < 0 || len < 0 || off.saturating_add(len) > values.len() as i64 {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IndexOutOfBoundsException".into(),
+                                message: None,
+                                frame: None,
+                            });
+                        }
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
+                        let bytes = values[off as usize..(off + len) as usize]
+                            .iter()
+                            .map(|v| match v {
+                                Value::Int(n) => *n as u8,
+                                _ => 0,
+                            })
+                            .collect::<Vec<_>>();
+                        self.io_write_binary(&marker, &bytes);
+                        Value::Void
+                    }
+                    ("write", "([B)V") if r.owner == "java/io/FileOutputStream" => {
+                        let Some(array) = args.first() else {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        };
+                        if matches!(array, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: None,
+                                frame: None,
+                            });
+                        }
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
+                        let values = self.array(array).map(std::borrow::Cow::into_owned)?;
+                        let bytes = values
+                            .iter()
+                            .map(|value| match value {
+                                Value::Int(n) => *n as u8,
+                                _ => 0,
+                            })
+                            .collect::<Vec<_>>();
+                        self.io_write_binary(&marker, &bytes);
                         Value::Void
                     }
                     // `write(char[])` and `write(char[], off, len)`: the units in
@@ -28517,6 +28695,22 @@ impl<H: Host> Runtime<'_, H> {
                             }
                             None => self.host.unknown_operand_call(r)?,
                         }
+                    }
+                    ("write", "(I)V") if r.owner == "java/io/FileOutputStream" => {
+                        if is_closed {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/io/IOException".into(),
+                                message: Some("Stream Closed".into()),
+                                frame: None,
+                            });
+                        }
+                        let code = args
+                            .first()
+                            .map(|v| expect_int(r, v))
+                            .transpose()?
+                            .unwrap_or(0);
+                        self.io_write_binary(&marker, &[code as u8]);
+                        Value::Void
                     }
                     ("write", "(I)V") => {
                         let code = args
@@ -28601,8 +28795,15 @@ impl<H: Host> Runtime<'_, H> {
                         self.io_write(&marker, &text)?;
                         receiver.cloned().unwrap_or(Value::Void)
                     }
-                    ("flush", "()V") | ("close", "()V") => {
+                    ("flush", "()V") => {
                         self.io_commit(&marker);
+                        Value::Void
+                    }
+                    ("close", "()V") => {
+                        if !self.io_closed.contains(&marker) {
+                            self.io_commit(&marker);
+                            self.io_closed.insert(marker.clone());
+                        }
                         Value::Void
                     }
                     ("checkError", "()Z") => Value::Int(0),
@@ -28624,6 +28825,200 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
+                }
+                // FileInputStream (including the object returned by
+                // Files.newInputStream) is a byte stream.  Its source of
+                // truth is the virtual file's raw byte table; the lossy text
+                // reader is retained only for the character-reader wrappers.
+                if let Some(path) = self.io_stream_paths.get(&marker).cloned()
+                    && let Some(file_bytes) = self.io_file_bytes.get(&path).cloned()
+                {
+                    let position = self.io_stream_positions.entry(marker.clone()).or_default();
+                    let remaining = file_bytes.len().saturating_sub(*position);
+                    let channel_stream = self.io_channel_streams.contains(&marker);
+                    let closed_error = || NativeError::UncaughtException {
+                        class: if channel_stream {
+                            "java/nio/channels/ClosedChannelException"
+                        } else {
+                            "java/io/IOException"
+                        }
+                        .into(),
+                        // `FileInputStream`'s own Java text. Closed calls whose
+                        // failure text comes from the OS instead are counted
+                        // below (`closed_ordinary`), never answered.
+                        message: (!channel_stream).then(|| "Stream Closed".into()),
+                        frame: None,
+                    };
+                    if r.name == "readNBytes" && r.descriptor == "(I)[B" {
+                        let len = expect_int(r, args.first().unwrap_or(&Value::Int(0)))?;
+                        if len < 0 {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/IllegalArgumentException".into(),
+                                message: Some("len < 0".into()),
+                                frame: None,
+                            });
+                        }
+                    }
+                    if self.io_closed.contains(&marker)
+                        && r.name != "close"
+                        && !channel_stream
+                        && ((r.name == "skip" && r.descriptor == "(J)J")
+                            || (r.name == "readAllBytes" && r.descriptor == "()[B")
+                            || (r.name == "readNBytes"
+                                && r.descriptor == "(I)[B"
+                                && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? > 0))
+                    {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    }
+                    if self.io_closed.contains(&marker)
+                        && r.name != "close"
+                        && !((r.name == "read" || r.name == "readNBytes")
+                            && (r.descriptor == "([B)I" || r.descriptor == "([BII)I"))
+                        && !(r.name == "readNBytes"
+                            && r.descriptor == "(I)[B"
+                            && expect_int(r, args.first().unwrap_or(&Value::Int(0)))? <= 0)
+                    {
+                        // Only these closed `FileInputStream` calls fail in Java
+                        // code ("Stream Closed"). The rest (`transferTo`, ...)
+                        // fail in native code with the OS's `strerror` text,
+                        // which differs between Linux, macOS and Windows.
+                        let closed_ordinary = (r.name == "read"
+                            && (r.descriptor == "()I"
+                                || r.descriptor == "([B)I"
+                                || r.descriptor == "([BII)I"))
+                            || r.name == "available"
+                            || (r.name == "readNBytes"
+                                && (r.descriptor == "([BII)I" || r.descriptor == "(I)[B"));
+                        if !channel_stream && !closed_ordinary {
+                            return self.host.unknown_operand_call(r).map(Some);
+                        }
+                        return Err(closed_error());
+                    }
+                    return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                        ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
+                            let bytes = file_bytes.get(*position..).unwrap_or_default().to_vec();
+                            *position = file_bytes.len();
+                            self.string_readers.insert(marker.clone(), String::new());
+                            self.io_bytes_array(bytes)
+                        }
+                        ("readNBytes", "(I)[B") => {
+                            let len =
+                                expect_int(r, args.first().unwrap_or(&Value::Int(0)))? as usize;
+                            let end = (*position).saturating_add(len).min(file_bytes.len());
+                            let bytes = file_bytes.get(*position..end).unwrap_or_default().to_vec();
+                            *position = end;
+                            self.string_readers.insert(marker.clone(), String::new());
+                            self.io_bytes_array(bytes)
+                        }
+                        ("read", "()I") => {
+                            if *position >= file_bytes.len() {
+                                Value::Int(-1)
+                            } else {
+                                let byte = file_bytes[*position];
+                                *position += 1;
+                                Value::Int(i32::from(byte))
+                            }
+                        }
+                        ("read", "([B)I") | ("read", "([BII)I") | ("readNBytes", "([BII)I") => {
+                            if matches!(args.first(), Some(Value::Ref(None))) {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot read the array length because \"b\" is null".into(),
+                                    ),
+                                    frame: None,
+                                });
+                            }
+                            let Some(array) = args.first().and_then(host_array::array_key) else {
+                                return Ok(None);
+                            };
+                            let array_len =
+                                self.arrays.get(array).map_or(0, array_data::ArrayData::len);
+                            let (offset, length) = if r.descriptor == "([BII)I" {
+                                let offset = expect_int(r, args.get(1).unwrap_or(&Value::Int(0)))?;
+                                let length = expect_int(r, args.get(2).unwrap_or(&Value::Int(0)))?;
+                                if offset < 0
+                                    || length < 0
+                                    || offset as usize > array_len
+                                    || length as usize > array_len.saturating_sub(offset as usize)
+                                {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/lang/IndexOutOfBoundsException".into(),
+                                        message: Some(format!(
+                                            "Range [{offset}, {offset} + {length}) out of bounds for length {array_len}"
+                                        )),
+                                        frame: None,
+                                    });
+                                }
+                                (offset as usize, length as usize)
+                            } else {
+                                (0, array_len)
+                            };
+                            if self.io_closed.contains(&marker)
+                                && !(r.name == "readNBytes" && length == 0)
+                            {
+                                return Err(closed_error());
+                            }
+                            if length == 0 {
+                                Value::Int(0)
+                            } else if remaining == 0 {
+                                if r.name == "readNBytes" {
+                                    Value::Int(0)
+                                } else {
+                                    Value::Int(-1)
+                                }
+                            } else {
+                                let count = length.min(remaining);
+                                if let Some(data) = self.arrays.get_mut(array) {
+                                    for (index, byte) in
+                                        file_bytes[*position..*position + count].iter().enumerate()
+                                    {
+                                        data.store(
+                                            offset + index,
+                                            Value::Int(i32::from(*byte as i8)),
+                                        );
+                                    }
+                                }
+                                *position += count;
+                                Value::Int(count as i32)
+                            }
+                        }
+                        ("available", "()I") => Value::Int(remaining.min(i32::MAX as usize) as i32),
+                        ("skip", "(J)J") => {
+                            let requested = match args.first() {
+                                Some(Value::Long(value)) => *value,
+                                _ => return Ok(None),
+                            };
+                            if channel_stream {
+                                let old = *position as i64;
+                                let new = if requested > 0 {
+                                    old.saturating_add(requested).min(file_bytes.len() as i64)
+                                } else {
+                                    old.saturating_add(requested).max(0)
+                                };
+                                *position = new as usize;
+                                Value::Long(new - old)
+                            } else {
+                                // `FileInputStream.skip` is native `skip0`: a
+                                // negative skip's outcome and error text are the
+                                // OS's (`lseek`/`SetFilePointerEx`), so count it.
+                                if requested < 0 {
+                                    return self.host.unknown_operand_call(r).map(Some);
+                                }
+                                *position = (*position).saturating_add(requested as usize);
+                                Value::Long(requested)
+                            }
+                        }
+                        ("close", "()V") => {
+                            self.io_closed.insert(marker.clone());
+                            Value::Void
+                        }
+                        _ => {
+                            // Keep close and any future stream methods on the
+                            // existing bounded dispatch.
+                            return Ok(None);
+                        }
+                    }));
                 }
                 // A stream this invocation opened carries its bytes as UTF-8
                 // text: reading drains from the front, exactly the way the
@@ -38045,7 +38440,11 @@ mod tests {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -38121,7 +38520,11 @@ mod tests {
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45277,7 +45680,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45495,7 +45902,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -45688,7 +46099,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -46057,7 +46472,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -46370,7 +46789,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -51641,7 +52064,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
@@ -51704,7 +52131,11 @@ mandatory = true
             io_reader_errors: BTreeMap::new(),
             scanners: BTreeMap::new(),
             io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_file_bytes: BTreeMap::new(),
             io_paths: BTreeMap::new(),
