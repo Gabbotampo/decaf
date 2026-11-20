@@ -30958,28 +30958,48 @@ impl<H: Host> Runtime<'_, H> {
                     // A plain `String`, however it is spelled, is an instance
                     // of `String`'s supertypes only (`"java/lang/Class"` is no
                     // `Class`, #156 P13c).
+                    let unresolved_string_shape = expect_ref(&value).is_some_and(|marker| {
+                        value_class::string_shape(marker) == value_class::Shape::Undecidable
+                            && value_class::STRING_TYPES.contains(&wanted.as_str())
+                    });
                     let plain_string = match &value {
                         Value::Ref(Some(text)) if value_class::is_plain_string(text) => {
                             Some(value_class::string_instance_of(text, &wanted))
                         }
                         _ => None,
                     };
-                    let matches = unboxed
-                        || plain_string.unwrap_or_else(|| {
-                            !wanted.starts_with('[')
-                                && !jar_object::spells_key(&value)
-                                && expect_ref(&value).is_some_and(|marker| {
-                                    self.forged_stream_instance_of(marker, &wanted)
-                                        || self.live_stream_instance_of(marker, &wanted)
-                                            == Some(true)
-                                        || self.object_is_instance_of(marker, &wanted)
-                                        || self.host.host_instance_of(marker, &wanted)
-                                        || jdk_model::platform_instance_of(marker, &wanted)
-                                })
-                        });
+                    let matches = if unresolved_string_shape {
+                        let check = MethodRef {
+                            owner: wanted.to_owned(),
+                            name: "<instanceof>".into(),
+                            descriptor: "(Ljava/lang/Object;)Z".into(),
+                        };
+                        let answer = invoke_or_catch!(
+                            at,
+                            self.host.invoke(&check, std::slice::from_ref(&value))
+                        );
+                        matches!(answer, Value::Int(flag) if flag != 0)
+                    } else {
+                        unboxed
+                            || plain_string.unwrap_or_else(|| {
+                                !wanted.starts_with('[')
+                                    && !jar_object::spells_key(&value)
+                                    && expect_ref(&value).is_some_and(|marker| {
+                                        self.forged_stream_instance_of(marker, &wanted)
+                                            || self.live_stream_instance_of(marker, &wanted)
+                                                == Some(true)
+                                            || self.object_is_instance_of(marker, &wanted)
+                                            || self.host.host_instance_of(marker, &wanted)
+                                            || jdk_model::platform_instance_of(marker, &wanted)
+                                    })
+                            })
+                    };
                     // A `false` no model can stand behind is counted
                     // (`checkcast.rs`), and the host's answer is the result.
-                    let matches = if !matches && self.instance_of_is_guess(&value, &wanted) {
+                    let matches = if !matches
+                        && !unresolved_string_shape
+                        && self.instance_of_is_guess(&value, &wanted)
+                    {
                         let check = MethodRef {
                             owner: wanted.to_owned(),
                             name: "<instanceof>".into(),
