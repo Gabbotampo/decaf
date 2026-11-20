@@ -210,11 +210,18 @@ pub(crate) fn member_class_names(name: &str) -> Option<(String, String)> {
         "java.util.Collections$SingletonMap",
         "java.util.Collections$UnmodifiableList",
         "java.util.Collections$UnmodifiableRandomAccessList",
+        "java.util.Collections$SynchronizedList",
+        "java.util.Collections$SynchronizedRandomAccessList",
         "java.util.Collections$UnmodifiableCollection",
         "java.util.Collections$UnmodifiableSet",
         "java.util.Collections$UnmodifiableMap",
         "java.util.ReverseOrderListView$Rand",
         "java.util.LinkedList$ReverseOrderLinkedListView",
+        "java.util.ArrayList$SubList",
+        "java.util.AbstractList$SubList",
+        "java.util.AbstractList$RandomAccessSubList",
+        "java.util.ImmutableCollections$SubList",
+        "java.util.Collections$CopiesList",
     ];
     MEMBERS.contains(&name).then(|| {
         let simple = name.rsplit('$').next().unwrap_or(name).to_owned();
@@ -487,6 +494,22 @@ pub(crate) fn supertypes(class: &str) -> &'static [&'static str] {
     }
 }
 
+/// The synchronized list wrappers implement these interfaces for casts and
+/// `instanceof`. Keep them out of [`supertypes`]: that table also drives host
+/// collection dispatch, and the wrappers' methods must retain their existing
+/// dispatch paths.
+pub(crate) fn cast_supertypes(class: &str) -> &'static [&'static str] {
+    match class {
+        "java/util/Collections$SynchronizedRandomAccessList" => {
+            supertypes("java/util/ImmutableCollections$ListN")
+        }
+        "java/util/Collections$SynchronizedList" => {
+            supertypes("java/util/Collections$UnmodifiableList")
+        }
+        _ => supertypes(class),
+    }
+}
+
 impl StdHost {
     /// A new unmodifiable collection of the JDK (or Guava) class `class`
     /// holding `values`: an object of its own (#156 P14c), keyed
@@ -680,6 +703,35 @@ impl StdHost {
         {
             return Some(Ok(arg.clone()));
         }
+        if r.owner == "java/util/Collections"
+            && r.name == "nCopies"
+            && r.descriptor == "(ILjava/lang/Object;)Ljava/util/List;"
+        {
+            let count = crate::expect_int(r, args.first()?).ok()?;
+            if count < 0 {
+                return Some(Err(throw(
+                    "java/lang/IllegalArgumentException",
+                    Some(format!("List length = {count}")),
+                )));
+            }
+            let value = args.get(1)?.clone();
+            if count as usize > 4096 {
+                let marker = crate::jar_object::collection_key_for(
+                    "java/util/Collections$CopiesList",
+                    crate::jar_object::CollectionFamily::Immutable,
+                    self.next_unmodifiable_collection,
+                );
+                self.next_unmodifiable_collection += 1;
+                self.repeated_collections
+                    .insert(marker.clone(), (count as usize, value));
+                self.unmodifiable_collections.insert(marker.clone(), None);
+                return Some(Ok(crate::jar_object::collection(marker)));
+            }
+            return Some(Ok(self.unmodifiable_as(
+                "java/util/Collections$CopiesList",
+                vec![value; count as usize],
+            )));
+        }
         let kind = match (r.owner.as_str(), r.name.as_str()) {
             ("java/util/List", "of") | ("com/google/common/collect/ImmutableList", "of")
                 if !varargs =>
@@ -805,6 +857,229 @@ impl StdHost {
         marker: &str,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        let class = crate::jar_object::collection_class(marker);
+        let repeated = self.repeated_collections.get(marker).cloned();
+        let repeated_size = repeated.as_ref().map(|(size, _)| *size);
+        let owned_by_this_model = matches!(
+            class,
+            "java/util/ImmutableCollections$List12"
+                | "java/util/ImmutableCollections$ListN"
+                | "java/util/ImmutableCollections$SubList"
+                | "java/util/ImmutableCollections$Set12"
+                | "java/util/ImmutableCollections$SetN"
+                | "java/util/ImmutableCollections$Map1"
+                | "java/util/ImmutableCollections$MapN"
+                | "java/util/Collections$EmptyList"
+                | "java/util/Collections$SingletonList"
+                | "java/util/Collections$CopiesList"
+                | "java/util/Collections$EmptySet"
+                | "java/util/Collections$SingletonSet"
+                | "java/util/Collections$EmptyMap"
+                | "java/util/Collections$SingletonMap"
+                | "java/util/Collections$UnmodifiableCollection"
+                | "java/util/Collections$UnmodifiableList"
+                | "java/util/Collections$UnmodifiableRandomAccessList"
+                | "java/util/Collections$UnmodifiableSet"
+                | "java/util/Collections$UnmodifiableMap"
+                | "com/google/common/collect/RegularImmutableList"
+                | "com/google/common/collect/SingletonImmutableList"
+                | "com/google/common/collect/ImmutableList$SubList"
+                | "com/google/common/collect/RegularImmutableSet"
+                | "com/google/common/collect/SingletonImmutableSet"
+        ) || self.unmodifiable_collections.contains_key(marker)
+            || self.empty_collections.contains(marker);
+        if !owned_by_this_model {
+            return None;
+        }
+        if class.contains("SubList")
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            let index = args
+                .first()
+                .and_then(|value| match value {
+                    Value::Int(index) => Some(*index),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return Some(Err(throw(
+                "java/lang/IndexOutOfBoundsException",
+                Some(format!("Index {index} out of bounds for length 0")),
+            )));
+        }
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return Some(self.unknown_host_call(r));
+        }
+        // These classes inherit AbstractCollection's bulk methods. They only
+        // throw if the iterator actually tries to remove an element; the
+        // differential fixture's absent/retained values therefore return
+        // false and must reach the JDK skeleton default.
+        if matches!(
+            class,
+            "java/util/Collections$SingletonList" | "java/util/Collections$CopiesList"
+        ) && matches!(r.name.as_str(), "removeAll" | "retainAll")
+        {
+            return None;
+        }
+        if class == "java/util/Collections$CopiesList" && r.name == "removeIf" {
+            return None;
+        }
+        // `SingletonList.remove(Object)` and `CopiesList.remove(Object)` are
+        // inherited from `AbstractCollection`: an absent element is reported
+        // as false before the immutable list's mutator refusal is reached.
+        // A present element still attempts the write and throws UOE.
+        if matches!(
+            class,
+            "java/util/Collections$SingletonList" | "java/util/Collections$CopiesList"
+        ) && r.name == "remove"
+            && r.descriptor == "(Ljava/lang/Object;)Z"
+        {
+            let wanted = args.first()?;
+            let wanted = crate::value_marker(wanted);
+            let present = repeated.as_ref().map_or_else(
+                || {
+                    self.mutable_collections.get(marker).is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| crate::value_marker(value) == wanted)
+                    })
+                },
+                |(_, value)| crate::value_marker(value) == wanted,
+            );
+            return Some(if present {
+                Err(throw("java/lang/UnsupportedOperationException", None))
+            } else {
+                Ok(Value::Int(0))
+            });
+        }
+        // SingletonList overrides sort as a no-op.  CopiesList has the same
+        // result when empty because its iterator has no elements to set.
+        if r.name == "sort"
+            && (class == "java/util/Collections$SingletonList"
+                || (class == "java/util/Collections$CopiesList"
+                    && repeated_size
+                        .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                        == Some(0)))
+        {
+            return Some(Ok(Value::Void));
+        }
+        // `nCopies(0, x)` inherits the empty-list default operations.  The
+        // iterator has no elements to set or replace, so these are no-ops.
+        if class == "java/util/Collections$CopiesList"
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+            && matches!(
+                r.name.as_str(),
+                "clear" | "replaceAll" | "removeIf" | "removeAll" | "retainAll"
+            )
+        {
+            return Some(Ok(
+                if r.name == "replaceAll" || r.descriptor.ends_with(")V") {
+                    Value::Void
+                } else {
+                    Value::Int(0)
+                },
+            ));
+        }
+        if r.name == "get" && r.descriptor == "(I)Ljava/lang/Object;" {
+            let index = match args.first() {
+                Some(Value::Int(index)) => *index,
+                _ => 0,
+            };
+            let size = repeated_size
+                .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                .unwrap_or(0);
+            if index < 0 || index >= size as i32 {
+                let (class, message) = match class {
+                    "java/util/ImmutableCollections$ListN" => (
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        format!("Index {index} out of bounds for length {size}"),
+                    ),
+                    "java/util/ImmutableCollections$List12" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index} Size: {size}"),
+                    ),
+                    "java/util/Collections$SingletonList" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index}, Size: {size}"),
+                    ),
+                    "java/util/Collections$EmptyList" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index}"),
+                    ),
+                    _ => ("", String::new()),
+                };
+                if !class.is_empty() {
+                    return Some(Err(throw(class, Some(message))));
+                }
+            }
+        }
+        // Empty AbstractList sub-lists inherit the root's range behavior:
+        // adding is refused, while searches/removal/clear/sort do no work.
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+        {
+            let null_argument = matches!(args.first(), Some(Value::Ref(None)));
+            return match r.name.as_str() {
+                "add" | "addAll" => {
+                    Some(Err(throw("java/lang/UnsupportedOperationException", None)))
+                }
+                "remove" if r.descriptor.starts_with("(Ljava/lang/Object;") => {
+                    Some(Ok(Value::Int(0)))
+                }
+                "set" | "remove" => Some(self.unknown_host_call(r)),
+                "clear" | "sort" => Some(Ok(Value::Void)),
+                "removeAll" | "retainAll" | "removeIf" | "replaceAll" if null_argument => {
+                    Some(Err(throw("java/lang/NullPointerException", None)))
+                }
+                "removeAll" | "retainAll" | "removeIf" | "replaceAll" => {
+                    Some(Ok(if r.descriptor.ends_with(")Z") {
+                        Value::Int(0)
+                    } else {
+                        Value::Void
+                    }))
+                }
+                _ => None,
+            };
+        }
+        // An empty sub-list of `nCopies` is still immutable.  Its indexed
+        // mutators check the root's unsupported operation before applying the
+        // sub-list's range check, so index 0 gets UOE rather than IOOBE.
+        if (class == "java/util/ImmutableCollections$SubList"
+            || class == "java/util/Collections$CopiesList")
+            && self.unmodifiable_collections.contains_key(marker)
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+            && matches!(r.name.as_str(), "set" | "add" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
+        }
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                == Some(0)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            // SingletonList/EmptyList use AbstractList.SubList. Its indexed
+            // set/remove range check runs before the immutable root write.
+            let index = match args.first() {
+                Some(Value::Int(index)) => *index,
+                _ => 0,
+            };
+            return Some(Err(throw(
+                "java/lang/IndexOutOfBoundsException",
+                Some(format!("Index {index} out of bounds for length 0")),
+            )));
+        }
         if MUTATORS.contains(&r.name.as_str())
             && self.empty_collections.contains(marker)
             && let Some(answer) = empty_collection_member(r, args)
@@ -813,9 +1088,36 @@ impl StdHost {
         }
         if MUTATORS.contains(&r.name.as_str()) && self.unmodifiable_collections.contains_key(marker)
         {
+            if class.contains("SubList")
+                && repeated_size.or_else(|| self.mutable_collections.get(marker).map(Vec::len))
+                    == Some(0)
+                && matches!(r.name.as_str(), "set" | "remove")
+            {
+                return Some(self.unknown_host_call(r));
+            }
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
         }
         if (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z") {
+            // `ImmutableCollections.ListN.get` indexes its backing array
+            // directly.  Java 25 therefore exposes AIOOBE for the empty
+            // `List.of()` instance, with the array's standard message.
+            if class == "java/util/ImmutableCollections$ListN"
+                && r.name == "get"
+                && r.descriptor == "(I)Ljava/lang/Object;"
+                && self
+                    .mutable_collections
+                    .get(marker)
+                    .is_some_and(Vec::is_empty)
+            {
+                let index = match args.first() {
+                    Some(Value::Int(index)) => *index,
+                    _ => 0,
+                };
+                return Some(Err(throw(
+                    "java/lang/ArrayIndexOutOfBoundsException",
+                    Some(format!("Index {index} out of bounds for length 0")),
+                )));
+            }
             return None;
         }
         // Fabric's metadata uses `Collections.unmodifiableCollection`, whose
@@ -829,29 +1131,7 @@ impl StdHost {
                 args.first()?,
             )))));
         }
-        let receiver = crate::jar_object::stored_value(marker);
-        let mine = self.elements(&receiver).ok()?;
-        let Ok(theirs) = self.elements(args.first()?) else {
-            return Some(Ok(Value::Int(0)));
-        };
-        let is_list = |owner: &str| crate::is_list_owner(owner) || owner == "java/util/Collection";
-        let equal = if is_list(&r.owner) {
-            mine == theirs
-        } else {
-            // A set or a map: the same members (map entries as pairs) in any
-            // order.
-            let step = if crate::is_map_owner(&r.owner) { 2 } else { 1 };
-            let members = |values: &[Value]| {
-                let mut members = values
-                    .chunks(step)
-                    .map(|chunk| chunk.iter().map(crate::value_marker).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                members.sort();
-                members
-            };
-            members(&mine) == members(&theirs)
-        };
-        Some(Ok(Value::Int(i32::from(equal))))
+        None
     }
 }
 

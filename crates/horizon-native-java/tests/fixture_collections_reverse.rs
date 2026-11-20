@@ -30,9 +30,23 @@ fn collections_reverse_and_stream_iterator_match_java25() {
     let mut counted_host = fixture.jar.seed_host(StdHost::new());
     // `Collections.reverse` on a host subList view is counted: a counted call has no effect, so the
     // list's text afterwards is not Java's; only the count is asserted.
-    let _ = fixture.text_on(&mut counted_host, "subListReverse");
+    let result = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "subListReverse",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut counted_host,
+        )
+        .unwrap();
+    assert_eq!(result, horizon_native_java::Value::Ref(None));
     assert_eq!(
         counted_host.unknown_host_calls(),
-        vec![("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1)]
+        vec![
+            ("java/util/Collections#reverse(Ljava/util/List;)V".into(), 1),
+            ("java/util/List#toString()Ljava/lang/String;".into(), 2),
+        ]
     );
 }

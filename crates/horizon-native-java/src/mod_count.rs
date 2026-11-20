@@ -139,6 +139,25 @@ fn tracked(class: &str) -> bool {
 }
 
 /// Members that may change a collection's structure.
+fn is_collection_read(r: &MethodRef) -> bool {
+    matches!(
+        r.name.as_str(),
+        "get"
+            | "size"
+            | "toString"
+            | "iterator"
+            | "listIterator"
+            | "spliterator"
+            | "equals"
+            | "hashCode"
+            | "contains"
+            | "indexOf"
+            | "lastIndexOf"
+            | "isEmpty"
+            | "toArray"
+    )
+}
+
 fn may_modify(name: &str) -> bool {
     matches!(
         name,
@@ -242,6 +261,7 @@ pub(crate) struct ModToken {
     creates: Option<(usize, usize)>,
     /// An `ArrayDeque`'s layout to follow (`array_deque.rs`).
     deque: DequeStep,
+    pub(crate) answer: Option<Value>,
     /// A stale `ArrayList.SubList` member that checks `modCount` after its
     /// work (`equals`, `hashCode`, `indexOf`...): throw once it returned.
     throw_after: bool,
@@ -278,7 +298,7 @@ enum SubCheck {
 /// How a call on a `subList` copy goes ahead.
 enum SubSync {
     Ready,
-    Counted,
+    Counted(Value),
     ThrowAfter,
 }
 
@@ -292,6 +312,14 @@ impl<H: Host> Runtime<'_, H> {
     pub(crate) fn bump_mod_count(&mut self, marker: &str, uncertain: bool) {
         let stamp = self.host.mod_stamp(marker).bumped(uncertain);
         self.host.store_mod_stamp(marker, stamp);
+    }
+
+    pub(crate) fn mark_sub_list_unknown(&mut self, marker: &str) {
+        self.bump_mod_count(marker, true);
+        let root = self.mod_count_root(marker);
+        if root != marker {
+            self.bump_mod_count(&root, true);
+        }
     }
 
     /// The collection whose `modCount` a view's iterator checks: the root
@@ -330,7 +358,23 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<ModToken>, NativeError> {
         // A sub-list read as an argument (copied, compared, printed) checks
         // its list first, as its `toArray`/`iterator`/`toString` would.
-        self.sync_sub_list_arguments(r, op, receiver, args)?;
+        if let Some((marker, answer)) = self.sync_sub_list_arguments(r, op, receiver, args)? {
+            return Ok(Some(self.counted_read_token(r, &marker, answer)));
+        }
+        // An unmodifiable wrapper over a sub-list still delegates that
+        // sub-list's fail-fast check before reading or writing it.
+        if let Some(receiver) = receiver.and_then(expect_ref)
+            && let Some(source) = self.host.unmodifiable_view_source(receiver)
+            && self.host.sub_list_link(&source).is_some()
+        {
+            match self.sync_sub_list(r, &source, SubCheck::Before)? {
+                SubSync::Ready => {}
+                SubSync::Counted(answer) => {
+                    return Ok(Some(self.counted_read_token(r, &source, answer)));
+                }
+                SubSync::ThrowAfter => {}
+            }
+        }
         if op == 0xb7
             && r.owner == "java/util/ArrayDeque"
             && r.name == "<init>"
@@ -356,6 +400,7 @@ impl<H: Host> Runtime<'_, H> {
                 stamp: ModStamp::default(),
                 creates: None,
                 deque: DequeStep::Init(layout),
+                answer: None,
                 throw_after: false,
             }));
         }
@@ -387,13 +432,22 @@ impl<H: Host> Runtime<'_, H> {
         else {
             return Ok(None);
         };
+        let root = self.mod_count_root(marker);
+        let root_is_uncertain = root == *marker
+            && !self.host.sub_lists_of(marker).is_empty()
+            && self.host.mod_stamp(&root).uncertain > 0;
+        if !sub_list && root_is_uncertain && is_collection_read(r) {
+            let answer = self.host.unknown_operand_call(r)?;
+            return Ok(Some(self.counted_read_token(r, marker, answer)));
+        }
         let mut throw_after = false;
         if sub_list {
             let point = self.sub_list_check_point(r, marker, target, args)?;
             match self.sync_sub_list(r, marker, point)? {
                 SubSync::Ready => {}
-                // Counted: the view may be stale; the host answers from its copy.
-                SubSync::Counted => return Ok(None),
+                SubSync::Counted(answer) => {
+                    return Ok(Some(self.counted_read_token(r, marker, answer)));
+                }
                 SubSync::ThrowAfter => throw_after = true,
             }
         }
@@ -439,8 +493,23 @@ impl<H: Host> Runtime<'_, H> {
             stamp: self.host.mod_stamp(marker),
             creates,
             deque,
+            answer: None,
             throw_after,
         }))
+    }
+
+    fn counted_read_token(&self, r: &MethodRef, marker: &str, answer: Value) -> ModToken {
+        ModToken {
+            marker: marker.to_owned(),
+            name: r.name.clone(),
+            rule: None,
+            size: 0,
+            stamp: self.host.mod_stamp(marker),
+            creates: None,
+            deque: DequeStep::None,
+            answer: Some(answer),
+            throw_after: false,
+        }
     }
 
     /// After a call that returned: bump by the member's rule, write a
@@ -473,7 +542,9 @@ impl<H: Host> Runtime<'_, H> {
         }
         let after = self.host.mod_stamp(&token.marker);
         self.host.entries_after_call(&token.marker);
-        if self.host.sub_list_link(&token.marker).is_some() {
+        let counted_sub_list_write = self.host.sub_list_link(&token.marker).is_some()
+            && matches!(token.name.as_str(), "replaceAll" | "sort");
+        if !counted_sub_list_write && self.host.sub_list_link(&token.marker).is_some() {
             let structural =
                 (after != token.stamp).then_some(after.uncertain != token.stamp.uncertain);
             self.write_back_sub_list(&token.marker, structural);
@@ -491,7 +562,9 @@ impl<H: Host> Runtime<'_, H> {
                 }),
             );
         }
-        self.refresh_sub_lists_of(&token.marker);
+        if !counted_sub_list_write {
+            self.refresh_sub_lists_of(&token.marker);
+        }
         // `keySet()`/`values()`/`entrySet()` kept from this map follow it
         // (`hash_collections.rs`).
         self.refresh_map_views(&token.marker);
@@ -606,8 +679,8 @@ impl<H: Host> Runtime<'_, H> {
             // The work runs over the root's current range, then throws.
             (ModVerdict::Changed, SubCheck::After) if reslice_all(self) => Ok(SubSync::ThrowAfter),
             _ => {
-                self.host.unknown_operand_call(r)?;
-                Ok(SubSync::Counted)
+                let answer = self.host.unknown_operand_call(r)?;
+                Ok(SubSync::Counted(answer))
             }
         }
     }
@@ -622,9 +695,9 @@ impl<H: Host> Runtime<'_, H> {
         op: u8,
         receiver: Option<&Value>,
         args: &[Value],
-    ) -> Result<(), NativeError> {
+    ) -> Result<Option<(String, Value)>, NativeError> {
         if args.is_empty() || self.host.sub_lists_of_any() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let params = descriptor_arguments(&r.descriptor);
         let text_call = matches!(
@@ -641,7 +714,12 @@ impl<H: Host> Runtime<'_, H> {
             let Some(marker) = expect_ref(arg).cloned() else {
                 continue;
             };
-            if self.host.sub_list_link(&marker).is_none() || receiver == Some(arg) {
+            let linked = self.host.sub_list_link(&marker).is_some();
+            let root_uncertain = !linked
+                && self.mod_count_root(&marker) == marker
+                && !self.host.sub_lists_of(&marker).is_empty()
+                && self.host.mod_stamp(&marker).uncertain > 0;
+            if (!linked && !root_uncertain) || receiver == Some(arg) {
                 continue;
             }
             let param = params.get(index).map(String::as_str).unwrap_or("");
@@ -651,16 +729,28 @@ impl<H: Host> Runtime<'_, H> {
             ) || (param == "Ljava/lang/Object;"
                 && (text_call || (collection_receiver && r.name == "equals")));
             if reads {
-                self.sync_sub_list(r, &marker, SubCheck::Before)?;
+                if linked {
+                    if let SubSync::Counted(answer) =
+                        self.sync_sub_list(r, &marker, SubCheck::Before)?
+                    {
+                        return Ok(Some((marker, answer)));
+                    }
+                } else {
+                    let answer = self.host.unknown_operand_call(r)?;
+                    return Ok(Some((marker, answer)));
+                }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Sub-lists a string concatenation prints: `toString` iterates them.
-    pub(crate) fn sync_sub_list_operands(&mut self, values: &[Value]) -> Result<(), NativeError> {
+    pub(crate) fn sync_sub_list_operands(
+        &mut self,
+        values: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
         if self.host.sub_lists_of_any() == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let to_string = MethodRef {
             owner: "java/util/List".into(),
@@ -670,11 +760,13 @@ impl<H: Host> Runtime<'_, H> {
         for value in values {
             if let Some(marker) = expect_ref(value)
                 && self.host.sub_list_link(marker).is_some()
+                && let SubSync::Counted(answer) =
+                    self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?
             {
-                self.sync_sub_list(&to_string, &marker.clone(), SubCheck::Before)?;
+                return Ok(Some(answer));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Re-read a view's range from its parent (a parent's `set` shows).
@@ -702,6 +794,9 @@ impl<H: Host> Runtime<'_, H> {
             let Some(mut link) = self.host.sub_list_link(&view) else {
                 return;
             };
+            if self.host.is_detached_sub_list(&view) {
+                return;
+            }
             let parent = crate::jar_object::stored_value(&link.parent);
             let copy = crate::jar_object::stored_value(&view);
             let (Ok(content), Ok(mut elements)) = (
@@ -747,6 +842,22 @@ impl SubListLink {
     /// The list this view was taken from.
     pub(crate) fn parent(&self) -> &str {
         &self.parent
+    }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    pub(crate) fn set_size(&mut self, size: usize) {
+        self.size = size;
+    }
+
+    pub(crate) fn set_expected(&mut self, expected: ModStamp) {
+        self.expected = expected;
     }
 }
 
@@ -809,6 +920,17 @@ impl<H: Host> Runtime<'_, H> {
         let marker = expect_ref(collection).map_or("", String::as_str);
         let root = self.mod_count_root(marker);
         self.bump_mod_count(&root, false);
-        self.host.mod_stamp(&root)
+        let stamp = self.host.mod_stamp(&root);
+        let mut view = marker.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(mut link) = self.host.sub_list_link(&view) else {
+                break;
+            };
+            link.set_expected(stamp);
+            let parent = link.parent().to_owned();
+            self.host.store_sub_list_link(&view, Some(link));
+            view = parent;
+        }
+        stamp
     }
 }
