@@ -32472,6 +32472,12 @@ impl<H: Host> Runtime<'_, H> {
                     // mod-source scan (`sunrise-mod-surface`, 256 nesting levels) can read the native mod that
                     // vendors this file. `&&` short-circuits, so a later arm's condition runs only when no
                     // earlier arm matched, as in the chain.
+                    // All counted calls, including library/JDK calls that do not
+                    // pass through the jar-operand helper, converge below. Keep
+                    // the operands until the result is known so structural
+                    // multimap taint is applied exactly when the host counts.
+                    let taint_receiver = receiver.clone();
+                    let unknown_before = self.host.counted_unknown_calls();
                     let mut dispatched: Option<Value> = None;
                     if dispatched.is_none()
                         && let Some(value) = anchor_replacement
@@ -33718,6 +33724,9 @@ impl<H: Host> Runtime<'_, H> {
                             )));
                         }
                     };
+                    if self.host.counted_unknown_calls() > unknown_before {
+                        crate::runtime::guava_multimap::taint_operands(self, taint_receiver.as_ref(), &args);
+                    }
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.

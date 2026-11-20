@@ -169,12 +169,50 @@ fn source_for_receiver<H: Host>(this: &Runtime<'_, H>, receiver: &Value) -> Opti
     if let Some((source, _, _, _)) = map_iterator_source(this, receiver) {
         return Some(source);
     }
-    let key = handle_key(receiver)?;
-    field(this, &key, "source")
-        .and_then(|value| ref_text(&value).map(str::to_owned))
-        .or_else(|| {
-            (is_view(this, &key) || kind(this, &key).is_some()).then(|| target_key(this, &key))
-        })
+    let mut key = handle_key(receiver)?;
+    for _ in 0..16 {
+        if let Some(source) =
+            field(this, &key, "source").and_then(|value| ref_text(&value).map(str::to_owned))
+        {
+            return Some(source);
+        }
+        let Some(Value::Host(target)) = field(this, &key, "target") else {
+            break;
+        };
+        key = target.key().to_owned();
+    }
+    None
+}
+
+/// Return the source multimap carried by any value produced by this model.
+/// Counted calls use this for arguments as well as receivers.
+pub(crate) fn source_for_value<H: Host>(this: &Runtime<'_, H>, value: &Value) -> Option<String> {
+    source_for_receiver(this, value)
+}
+
+/// A counted call may inspect or mutate every multimap operand.  Taint all
+/// source multimaps before the call's neutral answer can be observed.
+pub(crate) fn taint_operands<H: Host>(
+    this: &mut Runtime<'_, H>,
+    receiver: Option<&Value>,
+    args: &[Value],
+) {
+    let mut sources = Vec::new();
+    if let Some(value) = receiver
+        && let Some(source) = source_for_value(this, value)
+    {
+        sources.push(source);
+    }
+    for value in args {
+        if let Some(source) = source_for_value(this, value) {
+            sources.push(source);
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    for source in sources {
+        taint(this, &source);
+    }
 }
 
 /// Entry point used before any other Guava model (including map iterators).
@@ -802,6 +840,13 @@ fn invoke_multimap<H: Host>(
                         })?;
                     if let Some(marker) = crate::runtime::host_iterator::marker(&iterator) {
                         this.host.set_host_iterator_cursor(marker, start);
+                        this.host.set_host_iterator_source(
+                            marker,
+                            format!(
+                                "{MAP_ITERATOR}{source}|view=get|generation={}",
+                                backing_generation(this, &source).unwrap_or(0)
+                            ),
+                        );
                     }
                     return Ok(Some(iterator));
                 }
