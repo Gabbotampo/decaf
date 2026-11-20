@@ -83,6 +83,20 @@ fn shown(out: Result<Value, horizon_native_java::NativeError>) -> String {
 
 #[test]
 fn every_rc261_case_answers_as_java_or_is_named() {
+    // `consumerThrow` and `biOrder` nest six jar frames. A debug build's interpreter frame is
+    // large, and the runtime's frame bound (`frame_bound.rs`) throws `StackOverflowError` once
+    // the native stack left runs low: on the default 2 MiB test thread these two cases sit at
+    // that bound (CI's build crossed it), so the test runs on a roomy thread, as
+    // `fixture_callbacks_rc261c` does.
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(every_rc261_case)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn every_rc261_case() {
     let fixture = javac_fixture::Fixture::build("callbacks-rc261", &[("demo/Rv.java", PROBE)]);
     let lookup = |method: &str| {
         COUNTED
