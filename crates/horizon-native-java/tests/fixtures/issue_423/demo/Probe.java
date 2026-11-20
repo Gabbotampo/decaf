@@ -46,5 +46,10 @@ public class Probe {
       +"|"+rowThrow(() -> new String(bytes, (String)null))+"|"+row(() -> new String((StringBuilder)null))
       +"|"+row(() -> new String((StringBuffer)null));
   }
+  /** A constructor Decaf can't model (UTF-16 decoding): every later use counts, `==` included. */
+  public static String countedSelf() {
+    String s = new String(new byte[] {0, 65}, java.nio.charset.StandardCharsets.UTF_16);
+    return String.valueOf(s == s);
+  }
   public static void main(String[] args) { System.out.print(rows()); }
 }

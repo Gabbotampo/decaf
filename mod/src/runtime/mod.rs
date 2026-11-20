@@ -31389,6 +31389,16 @@ impl<H: Host> Runtime<'_, H> {
                 0xa5 | 0xa6 => {
                     let rhs = pop(&mut stack, class, method, at)?;
                     let lhs = pop(&mut stack, class, method, at)?;
+                    // A String from a constructor Decaf counted (an unmodelled
+                    // charset, ...) counts on every later use, `==` included
+                    // (#423): record the comparison before answering it.
+                    if self.is_counted_string(&lhs) || self.is_counted_string(&rhs) {
+                        self.host.unknown_operand_call(&MethodRef {
+                            owner: "java/lang/Object".into(),
+                            name: "if_acmp".into(),
+                            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+                        })?;
+                    }
                     // Identity, not value equality, for boxes and strings
                     // (`reference_identity.rs`).
                     let same = self.same_reference(
