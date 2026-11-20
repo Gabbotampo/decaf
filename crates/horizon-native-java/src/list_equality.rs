@@ -113,6 +113,9 @@ impl<H: Host> Runtime<'_, H> {
             "java/util/LinkedList"
             | "java/util/Vector"
             | "java/util/Stack"
+            | "java/util/ReverseOrderListView$Rand"
+            | "java/util/ReverseOrderListView$SubList"
+            | "java/util/ArrayList$SubList"
             | crate::array_views::CLASS
             | crate::array_views::WINDOW_CLASS => ABSTRACT_LIST,
             "java/util/concurrent/CopyOnWriteArrayList" => COPY_ON_WRITE,

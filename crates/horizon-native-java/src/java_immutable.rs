@@ -688,10 +688,22 @@ impl StdHost {
             if count < 0 {
                 return Some(Err(throw(
                     "java/lang/IllegalArgumentException",
-                    Some(count.to_string()),
+                    Some(format!("List length = {count}")),
                 )));
             }
             let value = args.get(1)?.clone();
+            if count as usize > 4096 {
+                let marker = crate::jar_object::collection_key_for(
+                    "java/util/Collections$CopiesList",
+                    crate::jar_object::CollectionFamily::Immutable,
+                    self.next_unmodifiable_collection,
+                );
+                self.next_unmodifiable_collection += 1;
+                self.repeated_collections
+                    .insert(marker.clone(), (count as usize, value));
+                self.unmodifiable_collections.insert(marker.clone(), None);
+                return Some(Ok(crate::jar_object::collection(marker)));
+            }
             return Some(Ok(self.unmodifiable_as(
                 "java/util/Collections$CopiesList",
                 vec![value; count as usize],
@@ -823,6 +835,37 @@ impl StdHost {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         let class = crate::jar_object::collection_class(marker);
+        let owned_by_this_model = matches!(
+            class,
+            "java/util/ImmutableCollections$List12"
+                | "java/util/ImmutableCollections$ListN"
+                | "java/util/ImmutableCollections$SubList"
+                | "java/util/ImmutableCollections$Set12"
+                | "java/util/ImmutableCollections$SetN"
+                | "java/util/ImmutableCollections$Map1"
+                | "java/util/ImmutableCollections$MapN"
+                | "java/util/Collections$EmptyList"
+                | "java/util/Collections$SingletonList"
+                | "java/util/Collections$CopiesList"
+                | "java/util/Collections$EmptySet"
+                | "java/util/Collections$SingletonSet"
+                | "java/util/Collections$EmptyMap"
+                | "java/util/Collections$SingletonMap"
+                | "java/util/Collections$UnmodifiableCollection"
+                | "java/util/Collections$UnmodifiableList"
+                | "java/util/Collections$UnmodifiableRandomAccessList"
+                | "java/util/Collections$UnmodifiableSet"
+                | "java/util/Collections$UnmodifiableMap"
+                | "com/google/common/collect/RegularImmutableList"
+                | "com/google/common/collect/SingletonImmutableList"
+                | "com/google/common/collect/ImmutableList$SubList"
+                | "com/google/common/collect/RegularImmutableSet"
+                | "com/google/common/collect/SingletonImmutableSet"
+        ) || self.unmodifiable_collections.contains_key(marker)
+            || self.empty_collections.contains(marker);
+        if !owned_by_this_model {
+            return None;
+        }
         if class.contains("SubList")
             && self
                 .mutable_collections
@@ -1074,29 +1117,7 @@ impl StdHost {
                 args.first()?,
             )))));
         }
-        let receiver = crate::jar_object::stored_value(marker);
-        let mine = self.elements(&receiver).ok()?;
-        let Ok(theirs) = self.elements(args.first()?) else {
-            return Some(Ok(Value::Int(0)));
-        };
-        let is_list = |owner: &str| crate::is_list_owner(owner) || owner == "java/util/Collection";
-        let equal = if is_list(&r.owner) {
-            mine == theirs
-        } else {
-            // A set or a map: the same members (map entries as pairs) in any
-            // order.
-            let step = if crate::is_map_owner(&r.owner) { 2 } else { 1 };
-            let members = |values: &[Value]| {
-                let mut members = values
-                    .chunks(step)
-                    .map(|chunk| chunk.iter().map(crate::value_marker).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                members.sort();
-                members
-            };
-            members(&mine) == members(&theirs)
-        };
-        Some(Ok(Value::Int(i32::from(equal))))
+        None
     }
 }
 

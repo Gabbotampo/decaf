@@ -2604,6 +2604,10 @@ pub trait Host {
         None
     }
 
+    fn repeated_collection(&self, _value: &Value) -> Option<(usize, Value)> {
+        None
+    }
+
     /// Whether a `Collections$SetFromMap` receiver must route through the
     /// backing map instead of the standalone identity-set helper.
     fn is_set_from_map(&self, _value: &Value) -> bool {
@@ -3534,6 +3538,8 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
+    repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
     detached_sub_lists: BTreeSet<String>,
     /// Live SetFromMap marker -> backing map marker.
@@ -3803,6 +3809,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
             set_from_map_views: BTreeMap::new(),
             next_set_from_map: 0,
@@ -4669,6 +4676,11 @@ impl StdHost {
         // A `String` is no collection, whatever it spells (`jar_object.rs`).
         if jar_object::spells_key(receiver) {
             return None;
+        }
+        if let Some((count, value)) = self.repeated_collection(receiver) {
+            // Keep accidental bulk reads bounded; indexed and size operations
+            // use the logical count directly.
+            return Some(std::iter::repeat_n(value, count.min(4096)).collect());
         }
         // A view (synchronized, unmodifiable, reversed) reads the collection it wraps, which
         // may be another view, as deep as a jar nests them: followed in a loop, never by
@@ -5992,6 +6004,11 @@ impl Host for StdHost {
         self.mutable_values(value)
     }
 
+    fn repeated_collection(&self, value: &Value) -> Option<(usize, Value)> {
+        let marker = self.synchronized_target(expect_ref(value)?);
+        self.repeated_collections.get(marker).cloned()
+    }
+
     fn collection_len(&self, value: &Value) -> Option<usize> {
         let marker = self.synchronized_target(expect_ref(value)?);
         if let Some(values) = self.view_values(marker) {
@@ -6003,7 +6020,10 @@ impl Host for StdHost {
         if let Some(values) = self.reversed_view_values(marker) {
             return Some(values.len());
         }
-        self.mutable_collections.get(marker).map(Vec::len)
+        self.repeated_collections
+            .get(marker)
+            .map(|(count, _)| *count)
+            .or_else(|| self.mutable_collections.get(marker).map(Vec::len))
     }
 
     fn holds_collection(&self, value: &Value) -> bool {
@@ -6012,6 +6032,7 @@ impl Host for StdHost {
         };
         let marker = self.synchronized_target(marker);
         self.mutable_collections.contains_key(marker)
+            || self.repeated_collections.contains_key(marker)
             || self.view_values(marker).is_some()
             || self.reversed_view_values(marker).is_some()
     }
@@ -10592,6 +10613,9 @@ impl Host for StdHost {
                 Ok(Value::Int(class_is_assignable(&target, &source) as i32))
             }
             (owner, "size", "()I") if is_collection_owner(owner) => {
+                if let Some((count, _)) = self.repeated_collection(receiver) {
+                    return Ok(Value::Int(count as i32));
+                }
                 let values = host_collection_values(self, receiver)?;
                 let size = if is_map_owner(owner) {
                     values.len() / 2
@@ -10710,6 +10734,16 @@ impl Host for StdHost {
             }
             (owner, "get", "(I)Ljava/lang/Object;") if is_list_like_owner(owner) => {
                 let at = expect_int(r, Self::argument(r, args, 0)?)?;
+                if let Some((count, value)) = self.repeated_collection(receiver) {
+                    if at < 0 || at as usize >= count {
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IndexOutOfBoundsException".into(),
+                            message: Some(format!("Index: {at}, Size: {count}")),
+                            frame: None,
+                        });
+                    }
+                    return Ok(value);
+                }
                 let values = host_collection_values(self, receiver)?;
                 if expect_ref(receiver).is_some_and(|marker| {
                     jar_object::collection_class(marker) == "java/util/LinkedList"

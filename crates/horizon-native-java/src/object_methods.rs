@@ -1238,7 +1238,52 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(answer));
                 }
+                if self.host_collection_kind(other) == Some(CollectionKind::List) {
+                    let equal = self.list_equals(receiver, other)?;
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
+                if matches!(contract, Contract::Set | Contract::Map)
+                    && self.host_collection_kind(other).is_some()
+                {
+                    let step = usize::from(contract == Contract::Map) + 1;
+                    let members = |values: Vec<Value>| {
+                        let mut rows = values
+                            .chunks(step)
+                            .map(|row| row.iter().map(crate::value_marker).collect::<Vec<_>>())
+                            .collect::<Vec<_>>();
+                        rows.sort();
+                        rows
+                    };
+                    let equal = members(self.collection_elements(receiver)?)
+                        == members(self.collection_elements(other)?);
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
                 return self.host.invoke_instance(&typed, receiver, args).map(Some);
+            }
+            // A List/Collection-typed call still dispatches by the receiver's
+            // concrete class.  The host's immutable-member hook is reserved
+            // for immutable collections; mutable and view lists need the same
+            // list contract here, including pure host values.
+            if contract == Contract::List && is_collection_owner(&r.owner) {
+                let equal = self.list_equals(receiver, other)?;
+                return Ok(Some(Value::Int(i32::from(equal))));
+            }
+            if matches!(contract, Contract::Set | Contract::Map)
+                && is_collection_owner(&r.owner)
+                && self.host_collection_kind(other).is_some()
+            {
+                let step = usize::from(contract == Contract::Map) + 1;
+                let members = |values: Vec<Value>| {
+                    let mut rows = values
+                        .chunks(step)
+                        .map(|row| row.iter().map(crate::value_marker).collect::<Vec<_>>())
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    rows
+                };
+                let equal = members(self.collection_elements(receiver)?)
+                    == members(self.collection_elements(other)?);
+                return Ok(Some(Value::Int(i32::from(equal))));
             }
         }
         // `o.equals(x)` on a JDK object a jar built, whatever class the call names

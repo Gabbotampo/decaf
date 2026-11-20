@@ -360,6 +360,20 @@ impl<H: Host> Runtime<'_, H> {
         if let Some((marker, answer)) = self.sync_sub_list_arguments(r, op, receiver, args)? {
             return Ok(Some(self.counted_read_token(r, &marker, answer)));
         }
+        // An unmodifiable wrapper over a sub-list still delegates that
+        // sub-list's fail-fast check before reading or writing it.
+        if let Some(receiver) = receiver.and_then(expect_ref)
+            && let Some(source) = self.host.unmodifiable_view_source(receiver)
+            && self.host.sub_list_link(&source).is_some()
+        {
+            match self.sync_sub_list(r, &source, SubCheck::Before)? {
+                SubSync::Ready => {}
+                SubSync::Counted(answer) => {
+                    return Ok(Some(self.counted_read_token(r, &source, answer)));
+                }
+                SubSync::ThrowAfter => {}
+            }
+        }
         if op == 0xb7
             && r.owner == "java/util/ArrayDeque"
             && r.name == "<init>"

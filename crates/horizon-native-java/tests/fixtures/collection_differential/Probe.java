@@ -62,12 +62,19 @@ public class Probe {
         case 23: return result("R="+x.contains(1), x);
         case 24: return result("R="+x.indexOf(1), x);
         case 25: return result("R="+x.lastIndexOf(1), x);
+        case 26: return result("R="+x.equals(Set.of(1,2)), x);
+        case 27: return result("R="+x.hashCode(), x);
+        case 28: return result("R="+x.toArray().length, x);
+        case 29: return result("R="+x.toString(), x);
+        case 30: { List<Integer> n=Collections.nCopies(Integer.MAX_VALUE, 1); return "R="+n.size()+"|L="+n.get(Integer.MAX_VALUE-1); }
+        case 31: try { Collections.nCopies(-1, 1); return "R=bad|L="+safeList(x); }
+          catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
         default: throw new AssertionError(op);
       }
     } catch (Throwable t) { return result("E="+t.getClass().getName()+":"+t.getMessage(), x); }
   }
   public static String probe(int r, int op) { return run(r,op); }
   public static void main(String[] a) {
-    for (int r=0;r<39;r++) for (int op=0;op<26;op++) System.out.println(r+","+op+"="+run(r,op));
+    for (int r=0;r<39;r++) for (int op=0;op<32;op++) System.out.println(r+","+op+"="+run(r,op));
   }
 }

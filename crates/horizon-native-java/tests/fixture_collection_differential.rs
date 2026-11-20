@@ -50,5 +50,5 @@ fn collection_matrix_matches_jdk_25_for_modelled_calls() {
         mismatches.len(),
         mismatches.join("\n")
     );
-    assert_eq!(exact + counted, 39 * 26);
+    assert_eq!(exact + counted, 39 * 32);
 }
