@@ -231,6 +231,48 @@ public final class ModPrioSorterOracle {
 
   static List<Path> syntheticGenerated(String name, Path root) throws IOException {
     Files.createDirectories(root);
+    if (name.equals("root-constraint") || name.equals("root-breaks")
+        || name.equals("nested-sibling-constraint") || name.equals("two-top-level-same-path")) {
+      byte[] oldBytes = ("{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"1.0\"}").getBytes();
+      byte[] newBytes = ("{\"schemaVersion\":1,\"id\":\"shared-lib\",\"version\":\"2.0\"}").getBytes();
+      byte[] pinnerBytes = ("{\"schemaVersion\":1,\"id\":\"pinner\",\"version\":\"1.0\","
+          + "\"depends\":{\"shared-lib\":\"<2.0.0\"}}").getBytes();
+      Path oldJar = root.resolve("shared-old.jar");
+      Path newJar = root.resolve("shared-new.jar");
+      Path pinnerJar = root.resolve("pinner.jar");
+      zip(oldJar, Map.of("fabric.mod.json", oldBytes));
+      zip(newJar, Map.of("fabric.mod.json", newBytes));
+      zip(pinnerJar, Map.of("fabric.mod.json", pinnerBytes));
+      if (name.equals("two-top-level-same-path")) {
+        Path first = root.resolve("carrier-first.jar");
+        Path second = root.resolve("carrier-second.jar");
+        zip(first, Map.of(
+            "fabric.mod.json", "{\"schemaVersion\":1,\"id\":\"carrier-first\",\"version\":\"1\",\"jars\":[{\"file\":\"META-INF/jars/shared.jar\"}]}".getBytes(),
+            "META-INF/jars/shared.jar", Files.readAllBytes(oldJar)));
+        zip(second, Map.of(
+            "fabric.mod.json", "{\"schemaVersion\":1,\"id\":\"carrier-second\",\"version\":\"1\",\"jars\":[{\"file\":\"META-INF/jars/shared.jar\"}]}".getBytes(),
+            "META-INF/jars/shared.jar", Files.readAllBytes(newJar)));
+        return List.of(first, second);
+      }
+      String constraint = name.equals("root-breaks")
+          ? "\"breaks\":{\"shared-lib\":\">=2.0.0\"},"
+          : name.equals("root-constraint")
+              ? "\"depends\":{\"shared-lib\":\"<2.0.0\"},"
+              : "";
+      String members = name.equals("nested-sibling-constraint")
+          ? "META-INF/jars/pinner.jar\"},{\"file\":\"META-INF/jars/shared-old.jar\"},{\"file\":\"META-INF/jars/shared-new.jar"
+          : "shared-old.jar\"},{\"file\":\"shared-new.jar";
+      String metadata = "{\"schemaVersion\":1,\"id\":\"carrier\",\"version\":\"1\","
+          + constraint + "\"jars\":[{\"file\":\"" + members + "\"}]}";
+      Path carrier = root.resolve("carrier.jar");
+      Map<String, byte[]> entries = new HashMap<>();
+      entries.put("fabric.mod.json", metadata.getBytes());
+      entries.put(name.equals("nested-sibling-constraint") ? "META-INF/jars/shared-old.jar" : "shared-old.jar", Files.readAllBytes(oldJar));
+      entries.put(name.equals("nested-sibling-constraint") ? "META-INF/jars/shared-new.jar" : "shared-new.jar", Files.readAllBytes(newJar));
+      if (name.equals("nested-sibling-constraint")) entries.put("META-INF/jars/pinner.jar", Files.readAllBytes(pinnerJar));
+      zip(carrier, entries);
+      return List.of(carrier);
+    }
     if (name.equals("plain-library")) {
       Path plain = root.resolve("plain.jar");
       zip(plain, Map.of("plain/Library.class", new byte[] {0}));

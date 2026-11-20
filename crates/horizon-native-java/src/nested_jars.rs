@@ -244,7 +244,7 @@ fn candidates_for_side(jar: &NativeJar, side: &str) -> Vec<NestedCandidate> {
         }
     }
     walk(
-        "outer",
+        &root_identity(jar),
         jar,
         0,
         &mut out,
@@ -254,6 +254,19 @@ fn candidates_for_side(jar: &NativeJar, side: &str) -> Vec<NestedCandidate> {
         side,
     );
     out
+}
+
+/// The root component of a nested class-path id. Path-loaded roots use their
+/// own path, while in-memory fixtures retain a readable metadata label and
+/// finally fall back to the byte identity. This is stable for one discovery
+/// run and distinct for separate top-level jars.
+fn root_identity(jar: &NativeJar) -> String {
+    jar.source_path
+        .clone()
+        .or_else(|| jar.fabric_id.clone())
+        .or_else(|| jar.neoforge_id.clone())
+        .or_else(|| jar.source_hash.map(|hash| format!("jar-{hash:016x}")))
+        .unwrap_or_else(|| format!("jar-{:016x}", identity(jar)))
 }
 
 /// Discover nested candidates using Fabric's server-side environment, which
@@ -888,20 +901,26 @@ fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
     select_checked(jar).unwrap_or_default()
 }
 
-fn select_fabric_candidates(
+#[cfg(test)]
+fn select_fabric_candidates(fabric: Vec<NestedCandidate>) -> Result<Vec<NestedCandidate>, String> {
+    select_fabric_candidates_with_roots(fabric, &[])
+}
+
+fn select_fabric_candidates_with_roots(
     mut fabric: Vec<NestedCandidate>,
+    roots: &[NativeJar],
 ) -> Result<Vec<NestedCandidate>, String> {
     // `net.fabricmc.loader.impl.discovery.ModPrioSorter.sort` first calls
     // List.sort (bytecode offsets 0-4), then recognizes the first non-root at
     // offsets 228-273 and removes a nested candidate that overlaps an earlier
     // root at offsets 387-531. This is the only overlap decision Decaf can make
     // without Fabric's SAT solver.
-    let roots = fabric
+    let root_candidates = fabric
         .iter()
         .filter(|candidate| priority_is_root(candidate))
         .cloned()
         .collect::<Vec<_>>();
-    let root_keys = roots
+    let root_keys = root_candidates
         .iter()
         .flat_map(candidate_keys)
         .collect::<std::collections::BTreeSet<_>>();
@@ -953,39 +972,13 @@ fn select_fabric_candidates(
                 "Fabric's mod resolver would decide equal-version copies of {id}; Decaf cannot prove its byte tie-break"
             ));
         }
-        let mentions_id = |candidate: &NestedCandidate| {
-            let Some(bytes) = candidate.jar.resource_bytes.get("fabric.mod.json") else {
-                return false;
-            };
-            let Ok(document) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-                return true;
-            };
-            ["depends", "breaks", "conflicts"].iter().any(|key| {
-                document
-                    .get(key)
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|entries| entries.contains_key(&id))
-            })
-        };
-        if fabric.iter().any(mentions_id) {
-            return Err(format!(
-                "Fabric's mod resolver would decide version constraints for {id}; Decaf does not model its SAT solver"
-            ));
-        }
-        let own_declarations = newest
-            .jar
-            .resource_bytes
-            .get("fabric.mod.json")
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-            .is_none_or(|document| {
-                ["depends", "breaks", "conflicts"]
-                    .iter()
-                    .all(|key| document.get(key).is_none())
-            });
-        if !own_declarations {
-            return Err(format!(
-                "Fabric's mod resolver would decide dependencies of {id}; Decaf does not model its SAT solver"
-            ));
+        let all_candidates = fabric
+            .iter()
+            .map(|candidate| &candidate.jar)
+            .chain(roots.iter())
+            .collect::<Vec<_>>();
+        if let Some(reason) = constraint_blocks_forced_newest(&id, &newest, &all_candidates) {
+            return Err(reason);
         }
         let keep = identity(&newest.jar);
         fabric.retain(|candidate| {
@@ -1033,6 +1026,144 @@ fn select_fabric_candidates(
     Ok(fabric)
 }
 
+/// Check whether the newest copy is provably compatible with every metadata
+/// constraint in the complete discovery set. A false/unknown result is a
+/// refusal: the bounded resolver must never guess at Fabric's SAT outcome.
+fn constraint_blocks_forced_newest(
+    id: &str,
+    newest: &NestedCandidate,
+    all_candidates: &[&NativeJar],
+) -> Option<String> {
+    for source in all_candidates {
+        let Some(document) = source
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        else {
+            continue;
+        };
+        for kind in ["depends", "breaks", "conflicts"] {
+            let Some(entries) = document.get(kind).and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            let Some(raw_range) = entries.get(id).and_then(serde_json::Value::as_str) else {
+                if entries.contains_key(id) {
+                    return Some(format!(
+                        "Fabric's mod resolver would decide version constraints for {id}; Decaf cannot prove the range"
+                    ));
+                }
+                continue;
+            };
+            let Some(matches) =
+                fabric_range_matches(raw_range, candidate_version(&newest.jar).as_deref())
+            else {
+                return Some(format!(
+                    "Fabric's mod resolver would decide version constraints for {id}; Decaf cannot prove the range"
+                ));
+            };
+            let excludes_newest = match kind {
+                "depends" => !matches,
+                "breaks" | "conflicts" => matches,
+                _ => false,
+            };
+            if excludes_newest {
+                return Some(format!(
+                    "Fabric's mod resolver would decide version constraints for {id}; Decaf refuses the constrained newest copy"
+                ));
+            }
+        }
+    }
+
+    let document = newest
+        .jar
+        .resource_bytes
+        .get("fabric.mod.json")
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())?;
+    let dependencies = document
+        .get("depends")
+        .and_then(serde_json::Value::as_object)?;
+    for (dependency_id, raw_range) in dependencies {
+        // `parse_metadata` already removes loader-provided dependencies from
+        // `required_mods`; those are satisfied by Fabric's builtins rather
+        // than by this nested candidate closure.
+        if !newest
+            .jar
+            .required_mods
+            .iter()
+            .any(|required| required == dependency_id)
+        {
+            continue;
+        }
+        let Some(raw_range) = raw_range.as_str() else {
+            return Some(format!(
+                "Fabric's mod resolver would decide dependencies of {id}; Decaf cannot prove dependency {dependency_id}"
+            ));
+        };
+        let found = all_candidates.iter().any(|candidate| {
+            candidate_keys_for_jar(candidate)
+                .iter()
+                .any(|key| key == dependency_id)
+                && fabric_range_matches(raw_range, candidate_version(candidate).as_deref())
+                    == Some(true)
+        });
+        if !found {
+            return Some(format!(
+                "Fabric's mod resolver would decide dependencies of {id}; Decaf cannot prove dependency {dependency_id}"
+            ));
+        }
+    }
+    None
+}
+
+fn candidate_keys_for_jar(jar: &NativeJar) -> Vec<String> {
+    std::iter::once(candidate_id(jar))
+        .chain(jar.fabric_provides.iter().cloned())
+        .collect()
+}
+
+/// Evaluate the range subset needed for a safe forced-newest proof. Ranges
+/// outside this subset return `None`, which deliberately preserves a refusal.
+fn fabric_range_matches(range: &str, version: Option<&str>) -> Option<bool> {
+    let version = version?;
+    let range = range.trim();
+    if range.is_empty() || range == "*" {
+        return Some(true);
+    }
+    if range.contains("||") {
+        return None;
+    }
+    let mut matched = true;
+    for term in range.split([',', ' ']).filter(|term| !term.is_empty()) {
+        let (operator, expected) = [">=", "<=", ">", "<", "=", "^", "~"]
+            .iter()
+            .find_map(|operator| term.strip_prefix(operator).map(|value| (*operator, value)))
+            .unwrap_or(("=", term));
+        if expected.is_empty() {
+            return None;
+        }
+        let cmp = version_cmp(Some(version), Some(expected));
+        matched &= match operator {
+            ">=" => cmp != Ordering::Less,
+            "<=" => cmp != Ordering::Greater,
+            ">" => cmp == Ordering::Greater,
+            "<" => cmp == Ordering::Less,
+            "=" => cmp == Ordering::Equal,
+            "^" => {
+                cmp != Ordering::Less
+                    && version_cmp(Some(version), Some(&format!("{}.0", expected)))
+                        != Ordering::Greater
+            }
+            "~" => {
+                cmp != Ordering::Less
+                    && version_cmp(Some(version), Some(&format!("{}.999999", expected)))
+                        != Ordering::Greater
+            }
+            _ => return None,
+        };
+    }
+    Some(matched)
+}
+
 fn candidate_keys(candidate: &NestedCandidate) -> Vec<String> {
     std::iter::once(candidate_id(&candidate.jar))
         .chain(candidate.jar.fabric_provides.iter().cloned())
@@ -1061,7 +1192,7 @@ fn select_checked_for_side(jar: &NativeJar, side: &str) -> Result<Vec<NestedCand
             fabric.push(candidate);
         }
     }
-    let mut selected = select_fabric_candidates(fabric)?;
+    let mut selected = select_fabric_candidates_with_roots(fabric, std::slice::from_ref(jar))?;
     for (_coordinate, group) in neoforge_groups {
         if group.len() == 1 {
             selected.extend(group);
@@ -1146,6 +1277,11 @@ fn neoforge_no_match_error(group: &[NestedCandidate]) -> String {
         .map(|candidate| candidate.parent.as_str())
         .next()
         .unwrap_or("unknown");
+    // In-memory roots without metadata labels use a hash only for class-path
+    // identity; Fabric/JarJar's diagnostic still names the logical outer jar.
+    let requester = requester
+        .strip_prefix("jar-")
+        .map_or(requester, |_| "outer");
     format!(
         "Some mods have agreed upon an acceptable version range for : §6{coordinate}§r, but no jar was provided which matched the range. Requested by: §e{requester}§r."
     )
@@ -1611,6 +1747,150 @@ mod tests {
         let plain = carrier("plain-carrier", &jar(&[]));
         assert!(candidates_for_side(&plain, "CLIENT").is_empty());
         assert!(expected_nested("plain-library").is_empty());
+    }
+
+    #[test]
+    fn review579_nested_shapes_match_java25_rows() {
+        // Captured by the real Fabric Loader 0.19.5 ModDiscoverer on JDK 25.
+        // Fabric selects the older copy for the three constrained shapes and
+        // the newer copy when two top-level roots bundle the same path.
+        let rows = include_str!("review579_nested_real_java25.txt");
+        let child = |id: &str, version: &str, extra: Option<&str>| {
+            let suffix = extra.unwrap_or("");
+            jar(&[(
+                "fabric.mod.json",
+                format!(r#"{{"schemaVersion":1,"id":"{id}","version":"{version}"{suffix}}}"#)
+                    .as_bytes(),
+            )])
+        };
+        let carrier = |id: &str, constraint: &str, children: Vec<(&str, NativeJar)>| {
+            let files = children
+                .iter()
+                .map(|(entry, _)| format!(r#"{{"file":"{entry}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",");
+            let metadata = format!(
+                r#"{{"schemaVersion":1,"id":"{id}","version":"1"{constraint},"jars":[{files}]}}"#
+            );
+            let mut entries = vec![("fabric.mod.json".to_owned(), metadata.into_bytes())];
+            let mut bytes = Vec::new();
+            for (entry, nested) in children {
+                bytes.push((entry.to_owned(), zip_bytes(&nested)));
+            }
+            entries.extend(bytes);
+            let refs = entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect::<Vec<_>>();
+            jar(&refs)
+        };
+        let old = child("shared-lib", "1.0", None);
+        let new = child("shared-lib", "2.0", None);
+        let pinner = child(
+            "pinner",
+            "1.0",
+            Some(r#","depends":{"shared-lib":"<2.0.0"}"#),
+        );
+        let constrained = [
+            (
+                "root-constraint",
+                carrier(
+                    "carrier",
+                    r#","depends":{"shared-lib":"<2.0.0"}"#,
+                    vec![
+                        ("shared-old.jar", old.clone()),
+                        ("shared-new.jar", new.clone()),
+                    ],
+                ),
+            ),
+            (
+                "root-breaks",
+                carrier(
+                    "carrier",
+                    r#","breaks":{"shared-lib":">=2.0.0"}"#,
+                    vec![
+                        ("shared-old.jar", old.clone()),
+                        ("shared-new.jar", new.clone()),
+                    ],
+                ),
+            ),
+            (
+                "nested-sibling-constraint",
+                carrier(
+                    "carrier",
+                    "",
+                    vec![
+                        ("META-INF/jars/pinner.jar", pinner),
+                        ("META-INF/jars/shared-old.jar", old.clone()),
+                        ("META-INF/jars/shared-new.jar", new.clone()),
+                    ],
+                ),
+            ),
+        ];
+        for (name, root) in constrained {
+            let row = rows
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}|")))
+                .unwrap_or_else(|| panic!("missing oracle row {name}"));
+            let actual =
+                select_fabric_candidates_with_roots(candidates(&root), std::slice::from_ref(&root));
+            // Fabric's row is OK and names the older nested copy; Decaf
+            // refuses rather than inventing the SAT choice.
+            assert!(row.contains("shared-lib@1.0@nested@1"));
+            assert!(
+                actual.is_err(),
+                "{name} unexpectedly selected a constrained newest copy"
+            );
+        }
+
+        let first = carrier("carrier-first", "", vec![("META-INF/jars/shared.jar", old)]);
+        let second = carrier(
+            "carrier-second",
+            "",
+            vec![("META-INF/jars/shared.jar", new)],
+        );
+        let row = rows
+            .lines()
+            .find(|line| line.starts_with("two-top-level-same-path|"))
+            .unwrap();
+        let mut all = candidates(&first);
+        all.extend(candidates(&second));
+        let actual =
+            select_fabric_candidates_with_roots(all, &[first.clone(), second.clone()]).unwrap();
+        let selected = actual
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "{}@{}@nested@{}",
+                    candidate_id(&candidate.jar),
+                    candidate_version(&candidate.jar).unwrap_or_default(),
+                    candidate.depth + 1
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(row.contains("shared-lib@2.0@nested@1"));
+        assert_eq!(selected, ["shared-lib@2.0@nested@1"]);
+
+        let mut host = StdHost::new();
+        assert!(
+            link_nested_jars(&mut host, &first)
+                .into_iter()
+                .all(|nested| nested.result.is_ok())
+        );
+        assert!(
+            link_nested_jars(&mut host, &second)
+                .into_iter()
+                .all(|nested| nested.result.is_ok())
+        );
+        let ids = host.linked_classes().jar_ids().collect::<Vec<_>>();
+        assert!(
+            ids.iter()
+                .any(|id| id.contains("carrier-first!META-INF/jars/shared.jar"))
+        );
+        assert!(
+            ids.iter()
+                .any(|id| id.contains("carrier-second!META-INF/jars/shared.jar"))
+        );
     }
 
     #[test]

@@ -17649,6 +17649,10 @@ pub struct NativeJar {
     /// Fabric uses this key for nested Jar-in-Jar discovery; path-loaded roots
     /// do not need it because only nested entries are deduplicated.
     source_hash: Option<u64>,
+    /// Stable identity of a path-loaded top-level jar. Nested class-path ids
+    /// include this root so two physical jars that contain the same entry do
+    /// not collide (`path-a.jar!META-INF/jars/lib.jar` vs path-b.jar...).
+    source_path: Option<String>,
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
@@ -19218,12 +19222,16 @@ impl NativeJar {
     /// annotation.
     pub fn from_path_metadata(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, false)
+        let mut jar = Self::read(file, false)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, true)
+        let mut jar = Self::read(file, true)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     /// Reads a jar this process already holds in memory, the way [`Self::from_path`] reads one
