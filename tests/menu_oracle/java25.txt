@@ -1,0 +1,10 @@
+[16:45:40] [main/INFO]: [STDOUT]: inputCount=3
+[16:45:40] [main/INFO]: [STDOUT]: slot index=0 x=8 y=48
+[16:45:40] [main/INFO]: [STDOUT]: slot index=1 x=26 y=48
+[16:45:40] [main/INFO]: [STDOUT]: slot index=2 x=44 y=48
+[16:45:40] [main/INFO]: [STDOUT]: result index=3 x=98 y=48
+[16:45:40] [main/INFO]: [STDOUT]: resultSlot=3
+[16:45:40] [main/INFO]: [STDOUT]: inventoryStart=4
+[16:45:40] [main/INFO]: [STDOUT]: inventoryEnd=31
+[16:45:40] [main/INFO]: [STDOUT]: useRowStart=31
+[16:45:40] [main/INFO]: [STDOUT]: useRowEnd=40

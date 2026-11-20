@@ -3697,7 +3697,7 @@ pub struct StdHost {
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
     vec2: vec2::State,
-    menu_states: BTreeMap<String, menu_models::MenuState>,
+    menu_states: menu_models::States,
 }
 
 impl Default for StdHost {
@@ -5792,10 +5792,7 @@ impl Host for StdHost {
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
-        let key = crate::expect_ref(receiver)?;
-        self.menu_states
-            .get(key)
-            .and_then(|state| menu_models::field(state, r))
+        menu_models::field(&self.menu_states, receiver, r)
     }
 
     fn properties_put_all(&mut self, marker: &str, entries: Vec<(String, String)>) -> bool {
@@ -6927,6 +6924,11 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if menu_models::is_menu_class(&r.owner)
+            && let Some(value) = menu_models::static_call(&mut self.menu_states, r, args)
+        {
+            return value;
+        }
         if let Some(value) = fabric_block_api::static_call(&mut self.fabric_block_api, r, args) {
             return value;
         }
