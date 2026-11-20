@@ -26,7 +26,7 @@ public final class ResourceKey<T> {
   private ResourceKey(ResourceKey<?> registry, Identifier location) { this.registry = registry; this.location = location; }
   public static <T> ResourceKey<T> createRegistryKey(Identifier id) { return new ResourceKey<>(null, id); }
   public static <T> ResourceKey<T> create(ResourceKey<?> registry, Identifier id) { return new ResourceKey<>(registry, id); }
-  public Identifier location() { return location; }
+  public Identifier identifier() { return location; }
   public boolean equals(Object other) { return other instanceof ResourceKey<?> key && location.toString().equals(key.location.toString()); }
 }"#,
     ),

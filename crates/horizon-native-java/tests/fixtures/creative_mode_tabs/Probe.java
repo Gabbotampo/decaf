@@ -6,8 +6,8 @@ public final class Probe {
   public static String rows() {
     ResourceKey<CreativeModeTab> functional = CreativeModeTabs.FUNCTIONAL_BLOCKS;
     ResourceKey<CreativeModeTab> combat = CreativeModeTabs.COMBAT;
-    return "functional=" + functional.location() + "\n"
-        + "combat=" + combat.location() + "\n"
+    return "functional=" + functional.identifier() + "\n"
+        + "combat=" + combat.identifier() + "\n"
         + "same=" + (functional == CreativeModeTabs.FUNCTIONAL_BLOCKS) + "\n"
         + "different=" + functional.equals(combat) + "\n";
   }
