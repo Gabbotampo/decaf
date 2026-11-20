@@ -25,10 +25,10 @@
 //! counted instead of being answered as a truncating write.
 //!
 //! `close`/`flush` on a stream `Files.newOutputStream` opened commits what its
-//! wrappers wrote to the file, as the model's writers do. A `FileOutputStream`
-//! the jar constructs itself keeps its counted `close`: `Properties.store`
-//! writes nothing in the host's model, and committing that stream would turn
-//! the missing text into an empty file.
+//! wrappers wrote to the file, as the model's writers do. Direct
+//! `FileOutputStream` construction is modelled by `invoke_io` for byte writes
+//! and close state; operations whose descriptor or channel identity the VFS
+//! cannot reproduce remain counted.
 
 use super::*;
 
@@ -265,7 +265,15 @@ fn invoke_stream<H: Host>(
     if !rt.fields.contains_key(&format!("{marker}|{NIO_STREAM}")) {
         return Ok(None);
     }
-    rt.io_commit(&marker);
+    if r.name == "close" {
+        if rt.io_closed.contains(&marker) {
+            return Ok(Some(Value::Void));
+        }
+        rt.io_commit(&marker);
+        rt.io_closed.insert(marker);
+    } else {
+        rt.io_commit(&marker);
+    }
     Ok(Some(Value::Void))
 }
 
