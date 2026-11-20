@@ -254,7 +254,10 @@ fn load_jar(
     if entrypoints.is_empty() {
         return Err(Row::refused(&file, id, "no client entrypoint"));
     }
-    let mut host = jar.seed_host(StdHost::new().with_environment_type("CLIENT"));
+    let mut host = match jar.try_seed_host(StdHost::new().with_environment_type("CLIENT")) {
+        Ok(host) => host,
+        Err(error) => return Err(Row::refused(&file, id, error)),
+    };
     imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {
         if let Err(error) = host.link_jar(link.clone(), dependency) {

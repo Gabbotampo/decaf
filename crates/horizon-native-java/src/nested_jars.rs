@@ -354,168 +354,353 @@ struct MavenInterval {
     high_inclusive: bool,
 }
 
-fn maven_cmp(a: &str, b: &str) -> Ordering {
-    // Maven ComparableVersion's Item tree, reduced to its observable ordering.
-    // Delimiters and digit/letter transitions split items; a missing item is
-    // the release (empty qualifier), while numeric items sort after strings.
-    fn tokens(s: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut current = String::new();
-        let mut previous_digit = None;
-        for c in s.chars() {
-            // ComparableVersion's parser has only these two delimiters. A
-            // plus (or any other punctuation) stays in its string item.
-            let delimiter = matches!(c, '.' | '-');
-            let transition = previous_digit.is_some_and(|digit| digit != c.is_ascii_digit());
-            if (delimiter || transition) && !current.is_empty() {
-                if transition && c.is_ascii_digit() && matches!(current.as_str(), "a" | "b" | "m") {
-                    current = match current.as_str() {
-                        "a" => "alpha",
-                        "b" => "beta",
-                        _ => "milestone",
-                    }
-                    .to_owned();
-                }
-                out.push(current.to_ascii_lowercase());
-                current.clear();
-            }
-            if !delimiter {
-                current.push(c);
-            }
-            previous_digit = Some(c.is_ascii_digit());
-        }
-        if !current.is_empty() {
-            out.push(current.to_ascii_lowercase());
-        }
-        while out.last().is_some_and(|part| {
-            !part.is_empty()
-                && part.chars().all(|c| c.is_ascii_digit())
-                && part.trim_start_matches('0').is_empty()
-        }) {
-            out.pop();
-        }
-        out
-    }
-    fn qualifier(s: &str) -> (&str, i32) {
-        if let Some(s) = s.strip_prefix('@') {
-            return (s, 9);
-        }
-        let (canonical, rank) = match s {
-            "alpha" => ("alpha", 1),
-            "beta" => ("beta", 2),
-            "milestone" => ("milestone", 3),
-            "rc" | "cr" => ("rc", 4),
-            "snapshot" => ("snapshot", 5),
-            "" | "ga" | "final" | "release" => ("", 6),
-            "sp" => ("sp", 7),
-            other => (other, 8),
-        };
-        (canonical, rank)
-    }
-    fn item_cmp(x: Option<&str>, y: Option<&str>) -> Ordering {
-        let x = x.unwrap_or("");
-        let y = y.unwrap_or("");
-        let xn = !x.is_empty() && x.chars().all(|c| c.is_ascii_digit());
-        let yn = !y.is_empty() && y.chars().all(|c| c.is_ascii_digit());
-        match (xn, yn) {
-            (true, true) => {
-                let x = x.trim_start_matches('0');
-                let y = y.trim_start_matches('0');
-                let x = if x.is_empty() { "0" } else { x };
-                let y = if y.is_empty() { "0" } else { y };
-                x.len().cmp(&y.len()).then_with(|| x.cmp(y))
-            }
-            (true, false) => {
-                if y.is_empty() && x.trim_start_matches('0').is_empty() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                if x.is_empty() && y.trim_start_matches('0').is_empty() {
-                    Ordering::Equal
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {
-                let (x, xr) = qualifier(x);
-                let (y, yr) = qualifier(y);
-                xr.cmp(&yr).then_with(|| x.cmp(y))
-            }
-        }
-    }
-    let at = tokens(a);
-    let bt = tokens(b);
-    for i in 0..at.len().max(bt.len()) {
-        let cmp = item_cmp(at.get(i).map(String::as_str), bt.get(i).map(String::as_str));
-        if cmp != Ordering::Equal {
-            return cmp;
-        }
-    }
-    Ordering::Equal
+#[derive(Clone, Debug)]
+struct MavenRange {
+    recommended: Option<String>,
+    restrictions: Vec<MavenInterval>,
 }
 
-fn maven_range(value: &str) -> Option<Vec<MavenInterval>> {
-    let value = value.trim();
-    // Maven's createFromVersionSpec accepts a bare version as a recommended
-    // version (an exact [v] restriction is not equivalent when selecting).
-    if !value.starts_with('[') && !value.starts_with('(') {
-        if value.is_empty() || value.contains(']') || value.contains(')') || value.contains(',') {
-            return None;
+fn maven_cmp(a: &str, b: &str) -> Ordering {
+    #[derive(Clone, Debug)]
+    enum Item {
+        Big(String),
+        Str(String),
+        List(Vec<Item>),
+        Int(String),
+        Long(String),
+    }
+    impl Item {
+        fn kind(&self) -> u8 {
+            match self {
+                Self::Big(_) => 0,
+                Self::Str(_) => 1,
+                Self::List(_) => 2,
+                Self::Int(_) => 3,
+                Self::Long(_) => 4,
+            }
         }
-        return Some(vec![MavenInterval {
+        fn is_null(&self) -> bool {
+            match self {
+                Self::Big(v) | Self::Int(v) | Self::Long(v) => v == "0",
+                Self::Str(v) => comparable_qualifier(v) == "5",
+                Self::List(v) => v.is_empty(),
+            }
+        }
+        fn compare(&self, other: Option<&Self>) -> Ordering {
+            let Some(other) = other else {
+                return match self {
+                    Self::Big(v) | Self::Int(v) | Self::Long(v) => {
+                        if v == "0" {
+                            Ordering::Equal
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    Self::Str(v) => comparable_qualifier(v).as_str().cmp("5"),
+                    Self::List(v) => {
+                        for item in v {
+                            let cmp = item.compare(None);
+                            if cmp != Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        Ordering::Equal
+                    }
+                };
+            };
+            match (self.kind(), other.kind()) {
+                (0, 0) => numeric_cmp(item_value(self), item_value(other)),
+                (0, 1..=4) => Ordering::Greater,
+                (1, 0 | 2 | 3 | 4) => Ordering::Less,
+                (2, 0) => Ordering::Less,
+                (2, 1) => Ordering::Greater,
+                (2, 3 | 4) => Ordering::Less,
+                (1, 1) => comparable_qualifier(item_value(self))
+                    .cmp(&comparable_qualifier(item_value(other))),
+                (2, 2) => {
+                    let (Self::List(left), Self::List(right)) = (self, other) else {
+                        unreachable!()
+                    };
+                    for i in 0..left.len().max(right.len()) {
+                        let cmp = match (left.get(i), right.get(i)) {
+                            (Some(a), Some(b)) => a.compare(Some(b)),
+                            (Some(a), None) => a.compare(None),
+                            (None, Some(b)) => b.compare(None).reverse(),
+                            (None, None) => Ordering::Equal,
+                        };
+                        if cmp != Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    Ordering::Equal
+                }
+                (3, 3) => numeric_cmp(item_value(self), item_value(other)),
+                (4, 4) => numeric_cmp(item_value(self), item_value(other)),
+                (3, 0) => Ordering::Less,
+                (3, 1 | 2) => Ordering::Greater,
+                (3, 4) => Ordering::Less,
+                (4, 0) => Ordering::Less,
+                (4, 1 | 2) => Ordering::Greater,
+                (4, 3) => Ordering::Greater,
+                _ => unreachable!(),
+            }
+        }
+    }
+    fn item_value(item: &Item) -> &str {
+        match item {
+            Item::Big(v) | Item::Str(v) | Item::Int(v) | Item::Long(v) => v,
+            Item::List(_) => unreachable!(),
+        }
+    }
+    fn numeric_cmp(a: &str, b: &str) -> Ordering {
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    }
+    fn comparable_qualifier(value: &str) -> String {
+        match value {
+            "alpha" => "0".into(),
+            "beta" => "1".into(),
+            "milestone" => "2".into(),
+            "rc" => "3".into(),
+            "snapshot" => "4".into(),
+            "" => "5".into(),
+            "sp" => "6".into(),
+            other => format!("7-{other}"),
+        }
+    }
+    fn parse_item(is_digit: bool, value: &str, transition: bool) -> Item {
+        if is_digit {
+            let value = value.trim_start_matches('0');
+            let value = if value.is_empty() { "0" } else { value };
+            match value.len() {
+                0..=9 => Item::Int(value.into()),
+                10..=18 => Item::Long(value.into()),
+                _ => Item::Big(value.into()),
+            }
+        } else {
+            let value = if transition && value == "a" {
+                "alpha"
+            } else if transition && value == "b" {
+                "beta"
+            } else if transition && value == "m" {
+                "milestone"
+            } else {
+                value
+            };
+            let value = match value {
+                "ga" | "final" | "release" => "",
+                "cr" => "rc",
+                value => value,
+            };
+            Item::Str(value.to_owned())
+        }
+    }
+    fn normalize(items: &mut Vec<Item>) {
+        for item in items.iter_mut() {
+            if let Item::List(children) = item {
+                normalize(children);
+            }
+        }
+        let mut index = items.len();
+        while index > 0 {
+            index -= 1;
+            if items[index].is_null() {
+                items.remove(index);
+            } else if !matches!(items[index], Item::List(_)) {
+                break;
+            }
+        }
+    }
+    fn parse(value: &str) -> Item {
+        let value = value.to_ascii_lowercase();
+        let bytes = value.as_bytes();
+        let mut nodes = vec![Vec::new()];
+        let mut current = 0usize;
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        let mut is_digit = false;
+        // The parser is deliberately written in the same state-machine shape as Maven's
+        // bytecode. Pointers only refer to vectors owned by `root` and its nested lists.
+        for i in 0..bytes.len() {
+            let c = bytes[i] as char;
+            if c == '.' || c == '-' {
+                if i == start {
+                    nodes[current].push(Item::Int("0".into()));
+                } else {
+                    nodes[current].push(parse_item(is_digit, &value[start..i], false));
+                }
+                start = i + 1;
+                if c == '-'
+                    || (!is_digit
+                        && c == '.'
+                        && bytes.get(i + 1).is_some_and(|next| !next.is_ascii_digit()))
+                {
+                    let slot = nodes[current].len();
+                    nodes[current].push(Item::List(Vec::new()));
+                    let child = nodes.len();
+                    nodes.push(Vec::new());
+                    stack.push((current, slot));
+                    current = child;
+                    is_digit = false;
+                }
+                continue;
+            }
+            if c.is_ascii_digit() {
+                if !is_digit && i > start {
+                    if !nodes[current].is_empty() {
+                        let slot = nodes[current].len();
+                        nodes[current].push(Item::List(Vec::new()));
+                        let child = nodes.len();
+                        nodes.push(Vec::new());
+                        stack.push((current, slot));
+                        current = child;
+                    }
+                    nodes[current].push(parse_item(false, &value[start..i], true));
+                    let slot = nodes[current].len();
+                    nodes[current].push(Item::List(Vec::new()));
+                    let child = nodes.len();
+                    nodes.push(Vec::new());
+                    stack.push((current, slot));
+                    current = child;
+                    start = i;
+                }
+                is_digit = true;
+            } else if is_digit {
+                if i > start {
+                    nodes[current].push(parse_item(true, &value[start..i], false));
+                }
+                let slot = nodes[current].len();
+                nodes[current].push(Item::List(Vec::new()));
+                let child = nodes.len();
+                nodes.push(Vec::new());
+                stack.push((current, slot));
+                current = child;
+                start = i;
+                is_digit = false;
+            }
+        }
+        if bytes.len() > start {
+            nodes[current].push(parse_item(is_digit, &value[start..], false));
+        }
+        while let Some((parent, slot)) = stack.pop() {
+            let child = std::mem::take(&mut nodes[current]);
+            nodes[parent][slot] = Item::List(child);
+            current = parent;
+        }
+        normalize(&mut nodes[0]);
+        // A dot-separated qualifier following the first qualifier is flattened by
+        // Maven's parser (while a `+` string remains in its hyphen list).
+        let dot_qualifier = value
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'.' && !pair[1].is_ascii_digit());
+        if nodes[0].len() > 1 && dot_qualifier && !value.contains('-') {
+            let mut promoted = Vec::new();
+            if let Item::List(items) = &mut nodes[0][1]
+                && items.len() > 1
+                && matches!(&items[0], Item::Str(value) if !value.starts_with('+'))
+            {
+                if matches!(&items[1], Item::List(_)) {
+                    promoted.push(items.remove(0));
+                } else {
+                    promoted.append(items);
+                }
+            }
+            for item in promoted.into_iter().rev() {
+                nodes[0].insert(1, item);
+            }
+        }
+        Item::List(std::mem::take(&mut nodes[0]))
+    }
+    let left = parse(a);
+    let right = parse(b);
+    left.compare(Some(&right))
+}
+
+fn maven_range(value: &str) -> Result<MavenRange, String> {
+    let original = value.to_owned();
+    let mut rest = value;
+    let mut restrictions = Vec::new();
+    let mut previous_upper: Option<String> = None;
+    while rest.starts_with('[') || rest.starts_with('(') {
+        let close_paren = rest.find(')');
+        let close_bracket = rest.find(']');
+        let close = match (close_paren, close_bracket) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return Err(format!("Unbounded range: {original}")),
+        };
+        let part = &rest[..=close];
+        let interval = parse_maven_interval(part)?;
+        if let (Some(previous), Some(lower)) = (&previous_upper, &interval.low)
+            && maven_cmp(lower, previous) == Ordering::Less
+        {
+            return Err(format!("Ranges overlap: {original}"));
+        }
+        previous_upper = interval.high.clone();
+        restrictions.push(interval);
+        rest = rest[close + 1..].trim_start();
+        if rest.starts_with(',') {
+            rest = rest[1..].trim_start();
+        }
+    }
+    let recommended = if rest.is_empty() {
+        None
+    } else {
+        if !restrictions.is_empty() {
+            return Err(format!(
+                "Only fully-qualified sets allowed in multiple set scenario: {original}"
+            ));
+        }
+        Some(rest.to_owned())
+    };
+    if recommended.is_some() {
+        restrictions.push(MavenInterval {
             low: None,
             high: None,
             low_inclusive: false,
             high_inclusive: false,
-        }]);
+        });
     }
-    let mut ranges = Vec::new();
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0;
-    for (i, c) in value.char_indices() {
-        match c {
-            '[' | '(' => depth += 1,
-            ']' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(&value[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    for part in parts {
-        let part = part.trim();
-        let bytes = part.as_bytes();
-        if bytes.len() < 2 {
-            return None;
-        }
-        let low_inclusive = bytes[0] == b'[';
-        let high_inclusive = bytes[bytes.len() - 1] == b']';
-        let body = &part[1..part.len() - 1];
-        if let Some((low, high)) = body.split_once(',') {
-            ranges.push(MavenInterval {
-                low: (!low.trim().is_empty()).then(|| low.trim().to_owned()),
-                high: (!high.trim().is_empty()).then(|| high.trim().to_owned()),
-                low_inclusive,
-                high_inclusive,
-            });
-        } else if low_inclusive && high_inclusive {
-            ranges.push(MavenInterval {
-                low: Some(body.trim().to_owned()),
-                high: Some(body.trim().to_owned()),
+    Ok(MavenRange {
+        recommended,
+        restrictions,
+    })
+}
+
+fn parse_maven_interval(part: &str) -> Result<MavenInterval, String> {
+    let bytes = part.as_bytes();
+    let low_inclusive = bytes.first() == Some(&b'[');
+    let high_inclusive = bytes.last() == Some(&b']');
+    let body = part[1..part.len() - 1].trim();
+    let Some(comma) = body.find(',') else {
+        if low_inclusive && high_inclusive {
+            let version = body.to_owned();
+            return Ok(MavenInterval {
+                low: Some(version.clone()),
+                high: Some(version),
                 low_inclusive: true,
                 high_inclusive: true,
             });
-        } else {
-            return None;
+        }
+        return Err(format!("Single version must be surrounded by []: {part}"));
+    };
+    let low = body[..comma].trim();
+    let high = body[comma + 1..].trim();
+    let low = (!low.is_empty()).then(|| low.to_owned());
+    let high = (!high.is_empty()).then(|| high.to_owned());
+    if let (Some(low), Some(high)) = (&low, &high) {
+        let cmp = maven_cmp(high, low);
+        if cmp == Ordering::Less || (cmp == Ordering::Equal && low_inclusive && !high_inclusive) {
+            return Err(format!("Range defies version ordering: {part}"));
         }
     }
-    Some(ranges)
+    Ok(MavenInterval {
+        low,
+        high,
+        low_inclusive,
+        high_inclusive,
+    })
 }
 
 fn intersect(a: &[MavenInterval], b: &[MavenInterval]) -> Vec<MavenInterval> {
@@ -574,19 +759,86 @@ fn maven_in_range(version: &str, ranges: &[MavenInterval]) -> bool {
         low && high
     })
 }
+
+fn maven_restrict(left: &MavenRange, right: &MavenRange) -> MavenRange {
+    let restrictions = if left.restrictions.is_empty() || right.restrictions.is_empty() {
+        Vec::new()
+    } else {
+        intersect(&left.restrictions, &right.restrictions)
+    };
+    let recommended = if !restrictions.is_empty() {
+        left.recommended
+            .as_ref()
+            .filter(|v| maven_in_range(v, &restrictions))
+            .cloned()
+            .or_else(|| {
+                right
+                    .recommended
+                    .as_ref()
+                    .filter(|v| maven_in_range(v, &restrictions))
+                    .cloned()
+            })
+    } else {
+        left.recommended
+            .clone()
+            .or_else(|| right.recommended.clone())
+    };
+    MavenRange {
+        recommended,
+        restrictions,
+    }
+}
+
 pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
     let all = candidates(jar);
     let mut selected: Vec<NestedCandidate> = Vec::new();
     let mut neoforge_groups: std::collections::BTreeMap<String, Vec<NestedCandidate>> =
         Default::default();
+    let mut fabric = Vec::new();
     for candidate in all {
         if let Some(coordinate) = candidate.neoforge_coordinate.clone() {
             neoforge_groups
                 .entry(coordinate)
                 .or_default()
                 .push(candidate);
-            continue;
+        } else {
+            fabric.push(candidate);
         }
+    }
+    // ModPrioSorter first orders candidates by id, descending version, nest level,
+    // and parent precedence. It then resolves every duplicate id/alias graph. Its
+    // overlap comparator sums all shared id and alias comparisons; a zero score is
+    // deliberately a tie, so cycles of equal candidates remain intact.
+    fabric.sort_by(|a, b| {
+        candidate_id(&a.jar)
+            .cmp(&candidate_id(&b.jar))
+            .then_with(|| {
+                version_cmp(
+                    candidate_version(&b.jar).as_deref(),
+                    candidate_version(&a.jar).as_deref(),
+                )
+            })
+            .then_with(|| a.depth.cmp(&b.depth))
+            .then_with(|| parent_cmp(a, b))
+            .then_with(|| a.order.cmp(&b.order))
+    });
+    let mut key_counts = std::collections::BTreeMap::<String, usize>::new();
+    for candidate in &fabric {
+        *key_counts.entry(candidate_id(&candidate.jar)).or_default() += 1;
+        for alias in &candidate.jar.fabric_provides {
+            *key_counts.entry(alias.clone()).or_default() += 1;
+        }
+    }
+    let duplicate_keys = key_counts
+        .into_iter()
+        .filter_map(|(key, count)| (count > 1).then_some(key))
+        .collect::<std::collections::BTreeSet<_>>();
+    let sign = |ordering: Ordering| match ordering {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    };
+    for candidate in fabric {
         let ids = std::iter::once(candidate.jar.fabric_id.as_deref())
             .chain(
                 candidate
@@ -598,59 +850,78 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             .flatten()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        // ModPrioSorter compares every id/alias shared by two candidates. A
-        // candidate that wins one key but loses another cannot remain beside
-        // the incompatible winner; it is discarded until the resolver has a
-        // single candidate for every overlapping key.
-        let overlaps = selected
-            .iter()
-            .enumerate()
-            .filter_map(|(index, current)| {
-                let current_ids = std::iter::once(current.jar.fabric_id.as_deref())
-                    .chain(
-                        current
-                            .jar
-                            .fabric_provides
-                            .iter()
-                            .map(|alias| Some(alias.as_str())),
-                    )
-                    .flatten();
-                ids.iter()
-                    .any(|id| current_ids.clone().any(|other| other == id))
-                    .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        let had_overlaps = !overlaps.is_empty();
-        let mut replace = Vec::new();
-        let mut loses = false;
-        for index in overlaps {
+        if !ids.iter().any(|id| duplicate_keys.contains(id)) {
+            selected.push(candidate);
+            continue;
+        }
+        let mut replace = None;
+        let mut overlap_keys = std::collections::BTreeSet::new();
+        overlap_keys.extend(
+            ids.iter()
+                .filter(|id| duplicate_keys.contains(*id))
+                .cloned(),
+        );
+        for index in (0..selected.len()).rev() {
             let current = &selected[index];
-            let cmp = version_cmp(
-                candidate.jar.fabric_version.as_deref(),
-                current.jar.fabric_version.as_deref(),
-            );
-            let cmp = if cmp == Ordering::Equal {
-                parent_cmp(&candidate, current).then_with(|| candidate.order.cmp(&current.order))
-            } else {
-                cmp
-            };
-            if cmp == Ordering::Greater {
-                replace.push(index);
-            } else if cmp == Ordering::Less {
-                loses = true;
+            if candidate_id(&candidate.jar) == candidate_id(&current.jar) {
+                break;
+            }
+            let current_ids = std::iter::once(current.jar.fabric_id.as_deref())
+                .chain(current.jar.fabric_provides.iter().map(|s| Some(s.as_str())))
+                .flatten()
+                .collect::<std::collections::BTreeSet<_>>();
+            let current_overlaps = current_ids.iter().any(|id| overlap_keys.contains(*id));
+            let shared_aliases = current
+                .jar
+                .fabric_provides
+                .iter()
+                .any(|alias| overlap_keys.contains(alias));
+            if !current_overlaps && !shared_aliases {
+                continue;
+            }
+            let mut score = 0i32;
+            let mut found = false;
+            for alias in &candidate.jar.fabric_provides {
+                if alias == &candidate_id(&current.jar) {
+                    score += sign(version_cmp(
+                        candidate_version(&candidate.jar).as_deref(),
+                        candidate_version(&current.jar).as_deref(),
+                    ));
+                    found = true;
+                }
+            }
+            for alias in &current.jar.fabric_provides {
+                if alias == &candidate_id(&candidate.jar) {
+                    score += sign(version_cmp(
+                        candidate_version(&current.jar).as_deref(),
+                        candidate_version(&candidate.jar).as_deref(),
+                    ));
+                    found = true;
+                }
+                for candidate_alias in &candidate.jar.fabric_provides {
+                    if alias == candidate_alias {
+                        score += sign(version_cmp(
+                            candidate_version(&current.jar).as_deref(),
+                            candidate_version(&candidate.jar).as_deref(),
+                        ));
+                        found = true;
+                    }
+                }
+            }
+            if found && score < 0 {
+                replace = Some(index);
+                continue;
+            }
+            if found {
+                replace = None;
                 break;
             }
         }
-        if !loses && !replace.is_empty() {
-            for index in replace.into_iter().rev() {
-                selected.remove(index);
-            }
+        if let Some(index) = replace {
+            selected.remove(index);
+            selected.insert(index, candidate);
+        } else {
             selected.push(candidate);
-        } else if !had_overlaps {
-            // A declared Fabric Jar-in-Jar library need not carry
-            // `fabric.mod.json`.  It is still on the outer loader's class
-            // path; only its absence from the mod-id graph is significant.
-            selected.push(candidate)
         }
     }
     for (_coordinate, group) in neoforge_groups {
@@ -658,43 +929,43 @@ pub fn select(jar: &NativeJar) -> Vec<NestedCandidate> {
             selected.extend(group);
             continue;
         }
-        let mut allowed: Option<Vec<MavenInterval>> = None;
-        let mut recommended: Option<String> = None;
+        let mut allowed: Option<MavenRange> = None;
         for candidate in &group {
-            let Some(range) = candidate
+            let Ok(range) = candidate
                 .neoforge_version_range
                 .as_deref()
-                .and_then(maven_range)
+                .map_or_else(|| Err("missing version range".to_owned()), maven_range)
             else {
-                allowed = Some(Vec::new());
+                allowed = Some(MavenRange {
+                    recommended: None,
+                    restrictions: Vec::new(),
+                });
                 break;
             };
-            if let Some(version) = candidate.neoforge_version_range.as_deref()
-                && !version.trim_start().starts_with(['[', '('])
-            {
-                recommended.get_or_insert_with(|| version.trim().to_owned());
-            }
             allowed = Some(match allowed {
-                Some(ref current) => intersect(current, &range),
+                Some(ref current) => maven_restrict(current, &range),
                 None => range,
             });
-            if allowed.as_ref().is_some_and(Vec::is_empty) {
+            if allowed
+                .as_ref()
+                .is_some_and(|range| range.restrictions.is_empty() && range.recommended.is_none())
+            {
                 break;
             }
         }
         let Some(allowed) = allowed else {
             continue;
         };
-        if allowed.is_empty() {
+        if allowed.restrictions.is_empty() && allowed.recommended.is_none() {
             continue;
         }
         let matches = |candidate: &NestedCandidate| {
             candidate
                 .neoforge_artifact_version
                 .as_deref()
-                .is_some_and(|v| maven_in_range(v, &allowed))
+                .is_some_and(|v| maven_in_range(v, &allowed.restrictions))
         };
-        if let Some(recommended) = recommended {
+        if let Some(recommended) = allowed.recommended {
             if let Some(candidate) = group.iter().find(|candidate| {
                 candidate.neoforge_artifact_version.as_deref() == Some(recommended.as_str())
             }) {
@@ -859,6 +1130,34 @@ mod tests {
         assert_eq!(selected[0].jar.fabric_id.as_deref(), Some("two"));
     }
 
+    #[test]
+    fn overlapping_fabric_alias_cycle_keeps_all_zero_score_candidates() {
+        let child = |id: &str, provides: &str| {
+            jar(&[(
+                "fabric.mod.json",
+                format!(
+                    r#"{{"schemaVersion":1,"id":"{id}","version":"1","provides":["{provides}"]}}"#
+                )
+                .as_bytes(),
+            )])
+        };
+        let a = child("a", "b");
+        let b = child("b", "c");
+        let c = child("c", "a");
+        let outer = jar(&[
+            ("fabric.mod.json", br#"{"schemaVersion":1,"id":"outer","version":"1","jars":[{"file":"a.jar"},{"file":"b.jar"},{"file":"c.jar"}]}"#),
+            ("a.jar", &zip_bytes(&a)),
+            ("b.jar", &zip_bytes(&b)),
+            ("c.jar", &zip_bytes(&c)),
+        ]);
+        let selected = select(&outer);
+        let ids = selected
+            .iter()
+            .filter_map(|candidate| candidate.jar.fabric_id.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids, std::collections::BTreeSet::from(["a", "b", "c"]));
+    }
+
     fn zip_bytes(jar: &NativeJar) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut bytes);
@@ -931,6 +1230,71 @@ mod tests {
                 expected.signum(),
                 "{line}"
             );
+        }
+    }
+
+    fn maven_display(range: &MavenRange) -> String {
+        if let Some(recommended) = &range.recommended {
+            return recommended.clone();
+        }
+        range
+            .restrictions
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}{},{}{}",
+                    if r.low_inclusive { '[' } else { '(' },
+                    r.low.as_deref().unwrap_or(""),
+                    r.high.as_deref().unwrap_or(""),
+                    if r.high_inclusive { ']' } else { ')' }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[test]
+    fn maven_ranges_and_restrictions_match_the_jdk25_oracle() {
+        for line in include_str!("jarjar_version_java25.txt").lines() {
+            let fields = line.split('|').collect::<Vec<_>>();
+            match fields.first().copied() {
+                Some("range") => {
+                    let range = maven_range(fields[1]).unwrap();
+                    assert_eq!(maven_display(&range), fields[2], "{line}");
+                    assert_eq!(
+                        range.recommended.as_deref().unwrap_or("null"),
+                        fields[3],
+                        "{line}"
+                    );
+                }
+                Some("range-error") => {
+                    assert_eq!(maven_range(fields[1]).unwrap_err(), fields[3], "{line}");
+                }
+                Some("restrict") => {
+                    let left = maven_range(fields[1]).unwrap();
+                    let right = maven_range(fields[2]).unwrap();
+                    let restricted = maven_restrict(&left, &right);
+                    assert_eq!(maven_display(&restricted), fields[3], "{line}");
+                    assert_eq!(
+                        restricted.recommended.as_deref().unwrap_or("null"),
+                        fields[4],
+                        "{line}"
+                    );
+                    if fields.len() == 7 {
+                        assert_eq!(
+                            maven_in_range("2", &restricted.restrictions).to_string(),
+                            fields[5],
+                            "{line}"
+                        );
+                        assert_eq!(
+                            maven_in_range("1.5", &restricted.restrictions).to_string(),
+                            fields[6],
+                            "{line}"
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

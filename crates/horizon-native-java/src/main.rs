@@ -896,7 +896,20 @@ fn main() -> ExitCode {
             }
         };
     }
-    let mut host = jar.seed_host(seed);
+    let mut host = match jar.try_seed_host(seed) {
+        Ok(host) => host,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "error", "stage": "load", "error": error})
+                );
+            } else {
+                eprintln!("error loading jar: {error}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
     for link in &links {
         let dependency = match NativeJar::from_path(&PathBuf::from(link)) {
             Ok(dependency) => dependency,
