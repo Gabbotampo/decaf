@@ -823,6 +823,50 @@ impl StdHost {
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
         let class = crate::runtime::jar_object::collection_class(marker);
+        if class.contains("SubList")
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            let index = args
+                .first()
+                .and_then(|value| match value {
+                    Value::Int(index) => Some(*index),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return Some(Err(throw(
+                "java/lang/IndexOutOfBoundsException",
+                Some(format!("Index {index} out of bounds for length 0")),
+            )));
+        }
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return Some(self.unknown_host_call(r));
+        }
+        // These classes inherit AbstractCollection's bulk methods. They only
+        // throw if the iterator actually tries to remove an element; the
+        // differential fixture's absent/retained values therefore return
+        // false and must reach the JDK skeleton default.
+        if matches!(
+            class,
+            "java/util/Collections$SingletonList" | "java/util/Collections$CopiesList"
+        ) && matches!(r.name.as_str(), "removeAll" | "retainAll")
+        {
+            return None;
+        }
+        if class == "java/util/Collections$CopiesList" && r.name == "removeIf" {
+            return None;
+        }
         // `SingletonList.remove(Object)` and `CopiesList.remove(Object)` are
         // inherited from `AbstractCollection`: an absent element is reported
         // as false before the immutable list's mutator refusal is reached.
@@ -868,9 +912,49 @@ impl StdHost {
                 .mutable_collections
                 .get(marker)
                 .is_some_and(Vec::is_empty)
-            && matches!(r.name.as_str(), "clear" | "replaceAll")
+            && matches!(
+                r.name.as_str(),
+                "clear" | "replaceAll" | "removeIf" | "removeAll" | "retainAll"
+            )
         {
-            return Some(Ok(Value::Void));
+            return Some(Ok(
+                if r.name == "replaceAll" || r.descriptor.ends_with(")V") {
+                    Value::Void
+                } else {
+                    Value::Int(0)
+                },
+            ));
+        }
+        if r.name == "get" && r.descriptor == "(I)Ljava/lang/Object;" {
+            let index = match args.first() {
+                Some(Value::Int(index)) => *index,
+                _ => 0,
+            };
+            let size = self.mutable_collections.get(marker).map_or(0, Vec::len);
+            if index < 0 || index >= size as i32 {
+                let (class, message) = match class {
+                    "java/util/ImmutableCollections$ListN" => (
+                        "java/lang/ArrayIndexOutOfBoundsException",
+                        format!("Index {index} out of bounds for length {size}"),
+                    ),
+                    "java/util/ImmutableCollections$List12" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index} Size: {size}"),
+                    ),
+                    "java/util/Collections$SingletonList" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index}, Size: {size}"),
+                    ),
+                    "java/util/Collections$EmptyList" => (
+                        "java/lang/IndexOutOfBoundsException",
+                        format!("Index: {index}"),
+                    ),
+                    _ => ("", String::new()),
+                };
+                if !class.is_empty() {
+                    return Some(Err(throw(class, Some(message))));
+                }
+            }
         }
         // Empty AbstractList sub-lists inherit the root's range behavior:
         // adding is refused, while searches/removal/clear/sort do no work.
@@ -888,6 +972,7 @@ impl StdHost {
                 "remove" if r.descriptor.starts_with("(Ljava/lang/Object;") => {
                     Some(Ok(Value::Int(0)))
                 }
+                "set" | "remove" => Some(self.unknown_host_call(r)),
                 "clear" | "sort" => Some(Ok(Value::Void)),
                 "removeAll" | "retainAll" | "removeIf" | "replaceAll" if null_argument => {
                     Some(Err(throw("java/lang/NullPointerException", None)))
@@ -905,7 +990,8 @@ impl StdHost {
         // An empty sub-list of `nCopies` is still immutable.  Its indexed
         // mutators check the root's unsupported operation before applying the
         // sub-list's range check, so index 0 gets UOE rather than IOOBE.
-        if class.contains("SubList")
+        if (class == "java/util/ImmutableCollections$SubList"
+            || class == "java/util/Collections$CopiesList")
             && self.unmodifiable_collections.contains_key(marker)
             && self
                 .mutable_collections
@@ -916,6 +1002,25 @@ impl StdHost {
         {
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
         }
+        if class == "java/util/AbstractList$RandomAccessSubList"
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            // SingletonList/EmptyList use AbstractList.SubList. Its indexed
+            // set/remove range check runs before the immutable root write.
+            let index = match args.first() {
+                Some(Value::Int(index)) => *index,
+                _ => 0,
+            };
+            return Some(Err(throw(
+                "java/lang/IndexOutOfBoundsException",
+                Some(format!("Index {index} out of bounds for length 0")),
+            )));
+        }
         if MUTATORS.contains(&r.name.as_str())
             && self.empty_collections.contains(marker)
             && let Some(answer) = empty_collection_member(r, args)
@@ -924,6 +1029,15 @@ impl StdHost {
         }
         if MUTATORS.contains(&r.name.as_str()) && self.unmodifiable_collections.contains_key(marker)
         {
+            if class.contains("SubList")
+                && self
+                    .mutable_collections
+                    .get(marker)
+                    .is_some_and(Vec::is_empty)
+                && matches!(r.name.as_str(), "set" | "remove")
+            {
+                return Some(self.unknown_host_call(r));
+            }
             return Some(Err(throw("java/lang/UnsupportedOperationException", None)));
         }
         if (r.name.as_str(), r.descriptor.as_str()) != ("equals", "(Ljava/lang/Object;)Z") {

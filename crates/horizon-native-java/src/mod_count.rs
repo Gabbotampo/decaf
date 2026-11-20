@@ -828,6 +828,22 @@ impl SubListLink {
     pub(crate) fn parent(&self) -> &str {
         &self.parent
     }
+
+    pub(crate) fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    pub(crate) fn set_size(&mut self, size: usize) {
+        self.size = size;
+    }
+
+    pub(crate) fn set_expected(&mut self, expected: ModStamp) {
+        self.expected = expected;
+    }
 }
 
 /// The fail-fast protocol for iterators and spliterators kept outside this
@@ -889,6 +905,17 @@ impl<H: Host> Runtime<'_, H> {
         let marker = expect_ref(collection).map_or("", String::as_str);
         let root = self.mod_count_root(marker);
         self.bump_mod_count(&root, false);
-        self.host.mod_stamp(&root)
+        let stamp = self.host.mod_stamp(&root);
+        let mut view = marker.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(mut link) = self.host.sub_list_link(&view) else {
+                break;
+            };
+            link.set_expected(stamp);
+            let parent = link.parent().to_owned();
+            self.host.store_sub_list_link(&view, Some(link));
+            view = parent;
+        }
+        stamp
     }
 }

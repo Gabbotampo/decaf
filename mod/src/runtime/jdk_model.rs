@@ -769,6 +769,10 @@ impl crate::runtime::StdHost {
         );
         let made_class = if immutable_jdk {
             "java/util/ImmutableCollections$SubList"
+        } else if parent_class == "java/util/Collections$CopiesList" {
+            // CopiesList overrides subList and returns another CopiesList,
+            // preserving its own range and immutable checks.
+            "java/util/Collections$CopiesList"
         } else if immutable_owned {
             "java/util/AbstractList$RandomAccessSubList"
         } else {

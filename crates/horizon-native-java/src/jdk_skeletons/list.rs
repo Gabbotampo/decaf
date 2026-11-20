@@ -272,6 +272,20 @@ impl<H: Host> Runtime<'_, H> {
             // `throw new NoSuchElementException(e)`: `e` is the cause.
             Err(error) if self.catches(&error, IOOBE) => {
                 self.itr_check(itr)?;
+                if self
+                    .host_collection_class(&list)
+                    .is_some_and(|class| class == "java/util/Collections$CopiesList")
+                    || expect_ref(&list).is_some_and(|marker| {
+                        crate::jar_object::collection_class(marker)
+                            == "java/util/Collections$CopiesList"
+                    })
+                {
+                    return self.host.unknown_operand_call(&MethodRef {
+                        owner: "java/util/List".into(),
+                        name: "iterator.next".into(),
+                        descriptor: "()Ljava/lang/Object;".into(),
+                    });
+                }
                 Err(self.throw_caused(NSEE, error))
             }
             Err(error) => Err(error),
@@ -647,7 +661,23 @@ impl<H: Host> Runtime<'_, H> {
             }
             "set" => inner_call(self, "set", "(Ljava/lang/Object;)V", args),
             _ => {
-                inner_call(self, "add", "(Ljava/lang/Object;)V", args)?;
+                if let Err(error) = inner_call(self, "add", "(Ljava/lang/Object;)V", args) {
+                    if !self.catches(&error, CME) {
+                        return Err(error);
+                    }
+                    let next = int_of(&own(self, "nextIndex", "()I")?);
+                    self.call_virtual(
+                        Site::Virtual,
+                        SUB_LIST,
+                        "add",
+                        "(ILjava/lang/Object;)V",
+                        &outer,
+                        &[
+                            Value::Int(next),
+                            args.first().cloned().unwrap_or(Value::Ref(None)),
+                        ],
+                    )?;
+                }
                 self.sub_update(&outer, 1);
                 Ok(Value::Void)
             }
@@ -680,6 +710,21 @@ impl<H: Host> Runtime<'_, H> {
                 Ok(boolean(true))
             }
             (ABSTRACT_LIST, "set" | "add" | "remove", _) => {
+                if matches!(name, "set" | "remove")
+                    && descriptor != "(Ljava/lang/Object;)Z"
+                    && self
+                        .host_collection_class(this)
+                        .is_some_and(|class| class == RANDOM_ACCESS_SUB_LIST)
+                    && self
+                        .collection_elements(this)
+                        .is_ok_and(|elements| elements.is_empty())
+                {
+                    let index = int_of(&arg(0));
+                    return Err(throw(
+                        IOOBE,
+                        Some(format!("Index {index} out of bounds for length 0")),
+                    ));
+                }
                 Err(throw("java/lang/UnsupportedOperationException", None))
             }
             (ABSTRACT_LIST, "indexOf" | "lastIndexOf", _) => {
@@ -916,7 +961,13 @@ impl<H: Host> Runtime<'_, H> {
         })();
         match result {
             Err(error) if self.catches(&error, NSEE) => {
-                Err(throw(IOOBE, Some(format!("Index: {at}"))))
+                let message = self
+                    .host_collection_class(this)
+                    .filter(|class| *class == "java/util/LinkedList")
+                    .and_then(|_| self.collection_elements(this).ok())
+                    .map(|elements| format!("Index: {at}, Size: {}", elements.len()))
+                    .unwrap_or_else(|| format!("Index: {at}"));
+                Err(throw(IOOBE, Some(message)))
             }
             other => other,
         }

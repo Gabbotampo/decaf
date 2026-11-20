@@ -343,6 +343,18 @@ impl<H: Host> Runtime<'_, H> {
         // not in fields: the host answers it.
         let host_made = matches!(this, Value::Host(handle)
             if handle.kind() == crate::runtime::host_ref::HostKind::Collection);
+        if host_made
+            && crate::runtime::expect_ref(this).is_some_and(|marker| {
+                crate::runtime::jar_object::collection_class(marker) == list::RANDOM_ACCESS_SUB_LIST
+            })
+            && self
+                .collection_elements(this)
+                .is_ok_and(|elements| elements.is_empty())
+            && matches!(r.name.as_str(), "set" | "remove")
+            && (r.name != "remove" || r.descriptor == "(I)Ljava/lang/Object;")
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
         if !host_made
             && let Some(class) = crate::runtime::jar_object::object_class(this)
             && INTERNAL.iter().any(|(internal, _, _)| *internal == class)

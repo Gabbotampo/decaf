@@ -1630,6 +1630,19 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.is_unmodifiable_collection(marker)
     }
 
+    fn unmodifiable_member(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        self.inner.unmodifiable_member(r, marker, args)
+    }
+
+    fn is_immutable_empty_sublist(&self, marker: &str) -> bool {
+        self.inner.is_immutable_empty_sublist(marker)
+    }
+
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.inner.service_providers(service)
     }

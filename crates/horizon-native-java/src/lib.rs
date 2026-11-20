@@ -2669,6 +2669,21 @@ pub trait Host {
         false
     }
 
+    /// A JDK default method that an unmodifiable collection overrides. The
+    /// runtime asks this before running an inherited `Collection` default.
+    fn unmodifiable_member(
+        &mut self,
+        _r: &MethodRef,
+        _marker: &str,
+        _args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        None
+    }
+
+    fn is_immutable_empty_sublist(&self, _marker: &str) -> bool {
+        false
+    }
+
     /// Whether the host keeps a collection row for `marker`.
     fn has_mutable_collection(&self, _marker: &str) -> bool {
         false
@@ -6027,7 +6042,25 @@ impl Host for StdHost {
         }
         if let Some(marker) = expect_ref(value) {
             let marker = self.synchronized_target(marker).to_owned();
-            self.mutable_collections.insert(marker, values);
+            let link = self.sub_lists.get(&marker).cloned();
+            let new_size = values.len();
+            self.mutable_collections
+                .insert(marker.clone(), values.clone());
+            if let Some(link) = link {
+                let mut parent_values = self
+                    .mutable_collections
+                    .get(link.parent())
+                    .cloned()
+                    .unwrap_or_default();
+                let start = link.offset();
+                let end = start.saturating_add(link.size()).min(parent_values.len());
+                parent_values.splice(start..end, values);
+                let parent = Value::Ref(Some(link.parent().to_owned()));
+                self.replace_mutable_collection(&parent, parent_values);
+                if let Some(current) = self.sub_lists.get_mut(&marker) {
+                    current.set_size(new_size);
+                }
+            }
         }
     }
 
@@ -6050,6 +6083,24 @@ impl Host for StdHost {
         // is a no-op where there is nothing to set (JDK 25).
         self.jdk_list_of.contains(marker)
             || matches!(self.unmodifiable_collections.get(marker), Some(Some(_)))
+    }
+
+    fn unmodifiable_member(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        StdHost::unmodifiable_member(self, r, marker, args)
+    }
+
+    fn is_immutable_empty_sublist(&self, marker: &str) -> bool {
+        jar_object::collection_class(marker) == "java/util/AbstractList$RandomAccessSubList"
+            && self.unmodifiable_collections.contains_key(marker)
+            && self
+                .mutable_collections
+                .get(marker)
+                .is_some_and(Vec::is_empty)
     }
 
     fn has_mutable_collection(&self, marker: &str) -> bool {
@@ -10657,6 +10708,12 @@ impl Host for StdHost {
             (owner, "get", "(I)Ljava/lang/Object;") if is_list_like_owner(owner) => {
                 let at = expect_int(r, Self::argument(r, args, 0)?)?;
                 let values = host_collection_values(self, receiver)?;
+                if expect_ref(receiver).is_some_and(|marker| {
+                    jar_object::collection_class(marker) == "java/util/LinkedList"
+                }) && (at < 0 || at as usize >= values.len())
+                {
+                    return self.unknown_host_call(r);
+                }
                 let index = checked_list_index(at, values.len())?;
                 Ok(values[index].clone())
             }
@@ -31570,6 +31627,37 @@ impl<H: Host> Runtime<'_, H> {
                                 frame: None,
                             })
                         )
+                    } else if let Some(marker) = receiver.as_ref().and_then(expect_ref)
+                        && self.host.is_immutable_empty_sublist(marker)
+                        && matches!(
+                            (r.name.as_str(), r.descriptor.as_str()),
+                            ("set", "(ILjava/lang/Object;)Ljava/lang/Object;")
+                                | ("remove", "(I)Ljava/lang/Object;")
+                        )
+                    {
+                        let index = args
+                            .first()
+                            .and_then(|value| match value {
+                                Value::Int(index) => Some(*index),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        invoke_or_catch!(
+                            at,
+                            Err(NativeError::UncaughtException {
+                                class: "java/lang/IndexOutOfBoundsException".into(),
+                                message: Some(format!("Index {index} out of bounds for length 0")),
+                                frame: None,
+                            })
+                        )
+                    } else if let Some(value) =
+                        receiver.as_ref().and_then(expect_ref).and_then(|marker| {
+                            is_collection_owner(&r.owner)
+                                .then(|| self.host.unmodifiable_member(&r, marker, &args))
+                                .flatten()
+                        })
+                    {
+                        invoke_or_catch!(at, value)
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
