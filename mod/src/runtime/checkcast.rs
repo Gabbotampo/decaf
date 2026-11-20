@@ -191,6 +191,16 @@ impl<H: Host> Runtime<'_, H> {
         if *value == Value::Ref(None) || target == "java/lang/Object" {
             return Ok(());
         }
+        if let Some(verdict) = self.collection_instance_of(value, target) {
+            return match verdict {
+                Some(true) => Ok(()),
+                Some(false) => Err(class_cast_exception(
+                    crate::runtime::jar_object::object_class(value).unwrap_or_default(),
+                    target,
+                )),
+                None => self.count_cast(value, target),
+            };
+        }
         if let Value::Ref(Some(marker)) = value
             && crate::runtime::value_class::string_shape(marker) == crate::runtime::value_class::Shape::Undecidable
             && crate::runtime::value_class::STRING_TYPES.contains(&target)
@@ -529,6 +539,9 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
         }
+        if let Some(verdict) = self.collection_instance_of(value, target) {
+            return verdict;
+        }
         if let Value::Host(handle) = value
             && handle.kind() == HostKind::Callback
         {
@@ -584,6 +597,9 @@ impl<H: Host> Runtime<'_, H> {
     /// #242). The JDK models answer for the JDK objects they build, and an
     /// opaque marker against a JDK interface is left for a later change.
     pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
+        if let Some(verdict) = self.collection_instance_of(value, target) {
+            return verdict.is_none();
+        }
         let marker = match value {
             Value::Ref(Some(marker)) => marker.as_str(),
             // An object: by its class's chain, below.
@@ -650,6 +666,41 @@ impl<H: Host> Runtime<'_, H> {
         // known not to be a game or loader type; one whose chain reaches a
         // game class is not.
         !matches!(self.cast_verdict(value, target, None).0, Verdict::No)
+    }
+
+    /// The concrete class of a host collection is intentionally omitted for a
+    /// sub-list whose parent class is unknown. Its list interfaces remain
+    /// exact, while `RandomAccess` still depends on that omitted class.
+    fn collection_instance_of(&self, value: &Value, target: &str) -> Option<Option<bool>> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::Collection {
+            return None;
+        }
+        let key = handle.key();
+        let mapped_class = self.host.sub_list_class(value);
+        let unknown_sublist = mapped_class == Some(None);
+        let class = mapped_class
+            .as_ref()
+            .and_then(Option::as_deref)
+            .unwrap_or_else(|| crate::runtime::jar_object::collection_class(key));
+        let list = unknown_sublist
+            || crate::runtime::java_immutable::cast_supertypes(class).contains(&"java/util/List");
+        if !list {
+            return None;
+        }
+        match target {
+            "java/util/List"
+            | "java/util/Collection"
+            | "java/lang/Iterable"
+            | "java/util/SequencedCollection" => Some(Some(true)),
+            "java/util/RandomAccess" if unknown_sublist => Some(None),
+            "java/util/RandomAccess" => Some(Some(
+                crate::runtime::java_immutable::cast_supertypes(class).contains(&target),
+            )),
+            _ => None,
+        }
     }
 
     /// The held class of a jar object (an object handle) or of a jar enum

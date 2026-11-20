@@ -59,7 +59,22 @@ impl StdHost {
         let wrapped = self
             .synchronized_receiver(wrapped)
             .unwrap_or_else(|| wrapped.clone());
-        let view = self.empty_collection(kind);
+        let view = if kind == "list" {
+            let random_access = crate::runtime::jar_object::object_class(&wrapped).is_some_and(|class| {
+                crate::runtime::jdk_model::class_instance_of(class, "java/util/RandomAccess")
+            });
+            let values = self.mutable_values(&wrapped).unwrap_or_default();
+            self.new_collection(
+                if random_access {
+                    "java/util/Collections$SynchronizedRandomAccessList"
+                } else {
+                    "java/util/Collections$SynchronizedList"
+                },
+                values,
+            )
+        } else {
+            self.empty_collection(kind)
+        };
         if let Some(marker) = expect_ref(&view) {
             self.synchronized_views.insert(marker.to_owned(), wrapped);
         }
