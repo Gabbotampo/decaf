@@ -31307,640 +31307,1079 @@ impl<H: Host> Runtime<'_, H> {
                     // (which may legitimately be `null`) rather than a host or
                     // model answer.
                     let mut jar_body = false;
-                    let value = if let Some(value) = anchor_replacement {
-                        value
-                    } else if let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)? {
-                        value
-                    } else if receiver == Some(Value::Ref(None)) {
-                        // JVMS §6.5: an instance call on `null` throws before
-                        // anything is dispatched. An `@Redirect` or a cancelling
-                        // hook above replaced the call, so it never ran.
-                        invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
-                    } else if r.owner == "java/lang/String"
-                        && r.name == "format"
-                        && (r.descriptor
-                            == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
-                            || r.descriptor
-                                == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
+                    // The call's answer: the first arm that matches, in order. Written as flat statements over
+                    // `dispatched` rather than one `if … else if …` expression of ~90 arms, so Sunrise's
+                    // mod-source scan (`sunrise-mod-surface`, 256 nesting levels) can read the native mod that
+                    // vendors this file. `&&` short-circuits, so a later arm's condition runs only when no
+                    // earlier arm matched, as in the chain.
+                    let mut dispatched: Option<Value> = None;
+                    if dispatched.is_none()
+                        && let Some(value) = anchor_replacement
                     {
-                        invoke_or_catch!(at, format_java_string_call(self, &r, &args))
-                    } else if let Some(set) = receiver.as_ref()
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.dispatch_invoke_hooks(&r, class, method, at)?
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none() && (receiver == Some(Value::Ref(None))) {
+                        dispatched = Some({
+                            // JVMS §6.5: an instance call on `null` throws before
+                            // anything is dispatched. An `@Redirect` or a cancelling
+                            // hook above replaced the call, so it never ran.
+                            invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
+                        });
+                    }
+                    if dispatched.is_none()
+                        && (r.owner == "java/lang/String"
+                            && r.name == "format"
+                            && (r.descriptor
+                                == "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"
+                                || r.descriptor
+                                    == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;"))
+                    {
+                        dispatched = Some({
+                            invoke_or_catch!(at, format_java_string_call(self, &r, &args))
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(set) = receiver.as_ref()
                         && self.host.is_chm_set(set)
                         && jdk_new_set_from_map::chm_set_ordered_read(&r.name, &r.descriptor)
                     {
-                        // A `ConcurrentHashMap`-backed set's iteration order is
-                        // the JVM's hash table layout: every read exposing it,
-                        // the default methods `forEach`/`toArray(IntFunction)`
-                        // too, is counted before any collection model could
-                        // answer it in some other order (#548 review).
-                        invoke_or_catch!(at, self.host.unknown_operand_call(&r))
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_properties_reader(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_array_view(&r, receiver.as_ref(), &args))
-                    {
-                        // `Arrays.asList`'s view and its windows, before any
-                        // model (`array_views.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_owned_class(&r, receiver.as_ref()))
-                    {
-                        // A `Class` call on a name a family kind owns (`owned_class.rs`).
-                        value
-                    } else if let Some(owner) =
-                        invoke_or_catch!(at, self.jvm_selected_jar_body(&r, op, receiver.as_ref()))
-                    {
-                        // The receiver's own body, before any host model
-                        // (`jvm_dispatch.rs`).
-                        jar_body = true;
-                        invoke_or_catch!(
+                        dispatched = Some({
+                            // A `ConcurrentHashMap`-backed set's iteration order is
+                            // the JVM's hash table layout: every read exposing it,
+                            // the default methods `forEach`/`toArray(IntFunction)`
+                            // too, is counted before any collection model could
+                            // answer it in some other order (#548 review).
+                            invoke_or_catch!(at, self.host.unknown_operand_call(&r))
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke(&owner, &r.name, &r.descriptor, receiver, &args)
-                        )
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_jar_server_value(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // A jar's own `BlockPos`/`LevelResource`: the game's
-                        // members on its fields (`jar_server_values.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_throwable_suppressed(&r, receiver.as_ref())
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_jar_throwable(&r, op, receiver.as_ref()))
-                    {
-                        // A jar exception's inherited `Throwable` text members
-                        // (`jar_throwables.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_throwable_metadata(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_jar_loader_copy(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // A jar's copy of a loader class its run's loader
-                        // lacks (`class_precedence.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        client_surface::text::runtime_call(self, receiver.as_ref(), &r, &args)
-                            .transpose()
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        dfu_pair_ops::runtime_call(
-                            self,
-                            &r,
-                            receiver.as_ref(),
-                            &args,
-                            &mut stack,
-                            &mut locals,
-                        )
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        dfu_either::runtime_call(self, &r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_bigdecimal_instance(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
-                    {
-                        value
-                    } else if r.name == "compareTo"
-                        && object_methods::is_compare_to(&r.descriptor)
-                        && !matches!(
-                            receiver.as_ref(),
-                            Some(Value::Host(handle))
-                                if jar_object::is_object_handle(handle)
-                                    && !self.is_enum_object(receiver.as_ref().unwrap_or(&Value::Ref(None)))
+                            self.invoke_properties_reader(&r, receiver.as_ref(), &args)
                         )
                     {
-                        let other = args.first().unwrap_or(&Value::Ref(None));
-                        Value::Int(invoke_or_catch!(
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
                             at,
-                            self.natural_order(
-                                receiver.as_ref().unwrap_or(&Value::Ref(None)),
-                                other
+                            self.invoke_unmodifiable_sublist(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_array_view(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `Arrays.asList`'s view and its windows, before any
+                            // model (`array_views.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_owned_class(&r, receiver.as_ref()))
+                    {
+                        dispatched = Some({
+                            // A `Class` call on a name a family kind owns (`owned_class.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(owner) = invoke_or_catch!(
+                            at,
+                            self.jvm_selected_jar_body(&r, op, receiver.as_ref())
+                        )
+                    {
+                        dispatched = Some({
+                            // The receiver's own body, before any host model
+                            // (`jvm_dispatch.rs`).
+                            jar_body = true;
+                            // A clone: later arms are statements the borrow checker sees
+                            // reaching `receiver`, though `dispatched` keeps them from running.
+                            invoke_or_catch!(
+                                at,
+                                self.invoke(
+                                    &owner,
+                                    &r.name,
+                                    &r.descriptor,
+                                    receiver.clone(),
+                                    &args
+                                )
                             )
-                        ))
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        thread_local::call(self, &r, receiver.as_ref(), &args)
-                            .map_or(Ok(None), |value| value.map(Some))
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // A JDK skeleton's body or a JDK interface default the
-                        // receiver inherits (`jdk_skeletons/`). It never
-                        // claims a call the jar copy above runs: that one
-                        // takes only static/`invokespecial` calls whose member
-                        // a jar class declares, while a skeleton
-                        // `invokespecial` needs the member to resolve to the
-                        // JDK class, as the JVM's resolution does.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_jdk_spliterator(
-                            &r,
-                            op,
-                            receiver.as_ref(),
-                            &args,
-                            class,
-                            method
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jar_server_value(&r, op, receiver.as_ref(), &args)
                         )
-                    ) {
-                        // The JDK's spliterators and `StreamSupport.stream`
-                        // (`jdk_spliterators.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        // FML's `InterModComms` (`neoforge_imc.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(text) =
-                        invoke_or_catch!(at, string_constructors::build(self, &r, &args))
                     {
-                        // `new String(char[]|int[], ..)` (`string_constructors.rs`):
-                        // the allocation marker becomes the text it built.
-                        if let Some(marker) = receiver
-                            .as_ref()
-                            .filter(|value| jar_object::is_object(value))
-                        {
-                            let built = Value::Ref(Some(text));
-                            for slot in stack.iter_mut().chain(locals.iter_mut()) {
-                                if slot == marker {
-                                    *slot = built.clone();
+                        dispatched = Some({
+                            // A jar's own `BlockPos`/`LevelResource`: the game's
+                            // members on its fields (`jar_server_values.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_throwable_suppressed(&r, receiver.as_ref())
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jar_throwable(&r, op, receiver.as_ref())
+                        )
+                    {
+                        dispatched = Some({
+                            // A jar exception's inherited `Throwable` text members
+                            // (`jar_throwables.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_throwable_metadata(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jar_loader_copy(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // A jar's copy of a loader class its run's loader
+                            // lacks (`class_precedence.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            client_surface::text::runtime_call(self, receiver.as_ref(), &r, &args)
+                                .transpose()
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            dfu_pair_ops::runtime_call(
+                                self,
+                                &r,
+                                receiver.as_ref(),
+                                &args,
+                                &mut stack,
+                                &mut locals,
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            dfu_either::runtime_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_bigdecimal_instance(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_bigdecimal_static(&r, &args))
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && (r.name == "compareTo"
+                            && object_methods::is_compare_to(&r.descriptor)
+                            && !matches!(
+                                receiver.as_ref(),
+                                Some(Value::Host(handle))
+                                    if jar_object::is_object_handle(handle)
+                                        && !self.is_enum_object(receiver.as_ref().unwrap_or(&Value::Ref(None)))
+                            ))
+                    {
+                        dispatched = Some({
+                            let other = args.first().unwrap_or(&Value::Ref(None));
+                            Value::Int(invoke_or_catch!(
+                                at,
+                                self.natural_order(
+                                    receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                                    other
+                                )
+                            ))
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            thread_local::call(self, &r, receiver.as_ref(), &args)
+                                .map_or(Ok(None), |value| value.map(Some))
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jdk_skeleton(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // A JDK skeleton's body or a JDK interface default the
+                            // receiver inherits (`jdk_skeletons/`). It never
+                            // claims a call the jar copy above runs: that one
+                            // takes only static/`invokespecial` calls whose member
+                            // a jar class declares, while a skeleton
+                            // `invokespecial` needs the member to resolve to the
+                            // JDK class, as the JVM's resolution does.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jdk_spliterator(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
+                                class,
+                                method
+                            )
+                        )
+                    {
+                        dispatched = Some({
+                            // The JDK's spliterators and `StreamSupport.stream`
+                            // (`jdk_spliterators.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_neoforge_imc(&r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some({
+                            // FML's `InterModComms` (`neoforge_imc.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(text) =
+                            invoke_or_catch!(at, string_constructors::build(self, &r, &args))
+                    {
+                        dispatched = Some({
+                            // `new String(char[]|int[], ..)` (`string_constructors.rs`):
+                            // the allocation marker becomes the text it built.
+                            if let Some(marker) = receiver
+                                .as_ref()
+                                .filter(|value| jar_object::is_object(value))
+                            {
+                                let built = Value::Ref(Some(text));
+                                for slot in stack.iter_mut().chain(locals.iter_mut()) {
+                                    if slot == marker {
+                                        *slot = built.clone();
+                                    }
                                 }
                             }
-                        }
-                        Value::Void
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, string_constructors::count(self, &r))
+                            Value::Void
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, string_constructors::count(self, &r))
                     {
-                        // `new String(...)` builds no text yet: counted.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_host_object_method(
-                            &r,
-                            op,
-                            receiver.as_ref(),
-                            &args,
-                            class,
-                            method
+                        dispatched = Some({
+                            // `new String(...)` builds no text yet: counted.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
                         )
-                    ) {
-                        // A host handle's `toString`/`hashCode`/`equals`: its
-                        // kind's row, held jar objects run here (`host_ref.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_joiner_iterator(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `Joiner.join(Iterator)` walks the iterator, a jar's own too, through
-                        // its own `hasNext`/`next` (`host_iterator.rs`), before a jar operand
-                        // would be counted.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // A model handed a jar object it has no state for
-                        // counts it instead of answering (`jar_operands.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_guava(&r, receiver.as_ref(), &args))
                     {
-                        // Guava bimap views must run before the generic map-view
-                        // copy path, which otherwise detaches key/value/entry sets.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_immutable_collection(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `Set.of`/`Map.of` and `IdentityHashMap`
-                        // (`immutable_collections.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_hash_collection(&r, op, receiver.as_ref(), &mut args)
-                    ) {
-                        // `HashMap`/`HashSet` order and lookups
-                        // (`hash_collections.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_priority_queue(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `PriorityQueue`'s heap (`priority_queue.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_tree_collection(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `TreeMap`/`TreeSet`'s red-black tree (`tree_map.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_gson_types(&r, receiver.as_ref(), &args))
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_host_object_method(
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
+                                class,
+                                method
+                            )
+                        )
                     {
-                        // Gson's `TypeToken`, whose `equals`/`hashCode`/`toString`
-                        // a jar's subclass inherits (`gson_type_token.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `equals`/`hashCode` as the JVM runs them
-                        // (`object_methods.rs`, `list_equality.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // Fail-fast iteration (`iteration_guard.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_list_iterator(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `listIterator` on a host list (`host_list_iterator.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_enumeration(&r, op, receiver.as_ref(), &args)
-                    ) {
-                        // `Collections.enumeration`, `Vector.elements()`, the empty
-                        // iterator and enumeration (`host_iterator.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_service_loader(&r, receiver.as_ref(), &args)
-                    ) {
-                        // Providers built as the JDK builds them (`service_loader.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_jar_text(&r, op, receiver.as_ref(), &args, class, method)
-                    ) {
-                        // A jar object's `toString` (`jar_text.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_compound_tag(&r, receiver.as_ref(), &args))
+                        dispatched = Some({
+                            // A host handle's `toString`/`hashCode`/`equals`: its
+                            // kind's row, held jar objects run here (`host_ref.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_joiner_iterator(&r, op, receiver.as_ref(), &args)
+                        )
                     {
-                        value
-                    } else if let Some(value) =
-                        dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
+                        dispatched = Some({
+                            // `Joiner.join(Iterator)` walks the iterator, a jar's own too, through
+                            // its own `hasNext`/`next` (`host_iterator.rs`), before a jar operand
+                            // would be counted.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.count_unmodelled_jar_operand(&r, op, receiver.as_ref(), &args)
+                        )
                     {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_neoforge_attachment(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_neoforge_bus(&r, receiver.as_ref(), &args))
+                        dispatched = Some({
+                            // A model handed a jar object it has no state for
+                            // counts it instead of answering (`jar_operands.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_guava(&r, receiver.as_ref(), &args))
                     {
-                        // NeoForge's `IEventBus#addListener` (`neoforge_bus.rs`).
-                        value
-                    } else if r.owner == "java/lang/String"
+                        dispatched = Some({
+                            // Guava bimap views must run before the generic map-view
+                            // copy path, which otherwise detaches key/value/entry sets.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_immutable_collection(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `Set.of`/`Map.of` and `IdentityHashMap`
+                            // (`immutable_collections.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_hash_collection(&r, op, receiver.as_ref(), &mut args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `HashMap`/`HashSet` order and lookups
+                            // (`hash_collections.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_priority_queue(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `PriorityQueue`'s heap (`priority_queue.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_tree_collection(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `TreeMap`/`TreeSet`'s red-black tree (`tree_map.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_gson_types(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // Gson's `TypeToken`, whose `equals`/`hashCode`/`toString`
+                            // a jar's subclass inherits (`gson_type_token.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_object_methods(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `equals`/`hashCode` as the JVM runs them
+                            // (`object_methods.rs`, `list_equality.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_iteration_guard(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // Fail-fast iteration (`iteration_guard.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_list_iterator(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `listIterator` on a host list (`host_list_iterator.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_enumeration(&r, op, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `Collections.enumeration`, `Vector.elements()`, the empty
+                            // iterator and enumeration (`host_iterator.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_service_loader(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // Providers built as the JDK builds them (`service_loader.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jar_text(&r, op, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some({
+                            // A jar object's `toString` (`jar_text.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_compound_tag(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            dfu_codec::invoke(self.host, &r, receiver.as_ref(), &args)
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_neoforge_attachment(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_neoforge_bus(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // NeoForge's `IEventBus#addListener` (`neoforge_bus.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && r.owner == "java/lang/String"
                         && r.name == "formatted"
                         && r.descriptor == "([Ljava/lang/Object;)Ljava/lang/String;"
                         && let Some(format) = receiver.clone()
                         && let [values] = args.as_slice()
                     {
-                        // `text.formatted(args)` is `String.format(text, args)`.
-                        // A call the formatter refuses goes to the host as
-                        // the `formatted` call it is, so the count names it.
-                        // A jar `toString()` that throws makes `formatted` throw it.
-                        match invoke_or_catch!(at, self.java_format(None, &format, values)) {
-                            Some(text) => Value::Ref(Some(text)),
-                            None => {
-                                invoke_or_catch!(at, self.host.invoke_instance(&r, &format, &args))
+                        dispatched = Some({
+                            // `text.formatted(args)` is `String.format(text, args)`.
+                            // A call the formatter refuses goes to the host as
+                            // the `formatted` call it is, so the count names it.
+                            // A jar `toString()` that throws makes `formatted` throw it.
+                            match invoke_or_catch!(at, self.java_format(None, &format, values)) {
+                                Some(text) => Value::Ref(Some(text)),
+                                None => {
+                                    invoke_or_catch!(
+                                        at,
+                                        self.host.invoke_instance(&r, &format, &args)
+                                    )
+                                }
                             }
-                        }
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_string_join(&r, &args))
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_string_join(&r, &args))
                     {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_regex(&r, receiver.as_ref(), &args))
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_regex(&r, receiver.as_ref(), &args))
                     {
-                        // `String`'s regex methods (`regex_calls.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_reflect_array(&r, &args))
-                    {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
-                    {
-                        // `System.arraycopy` (`array_copy.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(at, self.invoke_arrays(&r, &args))
-                    {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_code_points(&r, receiver.as_ref(), &args))
-                    {
-                        // `String.codePoints().forEach` (`string_code_points.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_files_move(&r, &args))
-                    {
-                        // `Files.move`/`copy` between paths (`files_move.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
-                    {
-                        // `Files.copy(InputStream, ..)` (`files_copy.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        open_options::invoke(self, &r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        // `Files` writers' `StandardOpenOption`s (`open_options.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_io(&r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        mod_origin::invoke(&r, receiver.as_ref(), &args, &mut *self.host)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        concurrent_sync::invoke(self, &r, receiver.as_ref(), &args)
-                    ) {
-                        // `CountDownLatch`, `new ThreadPoolExecutor` (`concurrent_sync.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        executors::invoke_thread(self, &r, receiver.as_ref(), &args)
-                    ) {
-                        // A constructed thread's target (`executors.rs`, #194).
-                        value
-                    } else if let Some(value) =
-                        executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)
-                    {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, executors::invoke(self, &r, receiver.as_ref(), &args))
-                    {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_gson_fromjson(&r, receiver.as_ref(), &args)
-                    ) {
-                        // Gson's bounded reflective fromJson adapter (`gson_fromjson.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        gson_to_json_tree::instance_call(
-                            self,
-                            &r,
-                            receiver.as_ref().unwrap_or(&Value::Ref(None)),
-                            &args,
-                        )
-                    ) {
-                        // Gson's `toJsonTree` instance surface (`gson_to_json_tree.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_gson_tree(&r, receiver.as_ref(), &args))
-                    {
-                        // Gson's JSON tree (`gson_tree.rs`).
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
-                    {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_commons_pair(&r, receiver.as_ref(), &args))
-                    {
-                        // commons-lang3 `Pair` (`commons_pair.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_field_access(&r, receiver.as_ref(), &args, class)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_reflect_method(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_stack_walker(&r, receiver.as_ref(), &args))
-                    {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_map_compute(&r, receiver.as_ref(), &args))
-                    {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_collection_default(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_collection_callback(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_optionull(&r, &args))
-                    {
-                        // The game's pure `Optionull` helper (`optionull.rs`).
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_server_facade(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_color_collection(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_callback_info(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if r.owner == "java/lang/Class"
-                        && r.name == "forName"
-                        && r.descriptor.ends_with(")Ljava/lang/Class;")
-                    {
-                        invoke_or_catch!(at, self.class_for_name(&r, &args))
-                    } else if let Some(value) = self.invoke_class_interfaces(&r, receiver.as_ref())
-                    {
-                        value
-                    } else if let Some(value) = self.invoke_array_clone(&r, receiver.as_ref()) {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_string_builder(&r, receiver.as_ref(), &args)
-                    ) {
-                        // `jdk_string_builder.rs`: its index checks throw.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_library_model(&r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_jdk_runtime(&r, receiver.as_ref(), &args))
-                    {
-                        // A sort's comparator may throw for the jar to catch.
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_modelled_comparator(&r, receiver.as_ref(), &args)
-                    ) {
-                        value
-                    } else if let Some(value) = self.invoke_game_enum_values(&r) {
-                        value
-                    } else if let Some(value) =
-                        invoke_or_catch!(at, self.invoke_game_enum_value_of(&r, &args))
-                    {
-                        value
-                    } else if let Some(value) = invoke_or_catch!(
-                        at,
-                        self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
-                    ) {
-                        value
-                    } else if let Some((owner, jar_owned)) =
-                        self.dispatch_owner(&r, op, receiver.as_ref())
-                    {
-                        let resolved = MethodRef {
-                            owner,
-                            name: r.name.clone(),
-                            descriptor: r.descriptor.clone(),
-                        };
-                        if let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_enum_member(&resolved, receiver.as_ref(), &args)
-                        ) {
+                        dispatched = Some({
+                            // `String`'s regex methods (`regex_calls.rs`).
                             value
-                        } else if jar_owned {
-                            jar_body = true;
-                            invoke_or_catch!(
-                                at,
-                                self.invoke(
-                                    &resolved.owner,
-                                    &resolved.name,
-                                    &resolved.descriptor,
-                                    receiver,
-                                    &args,
-                                )
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_reflect_array(&r, &args))
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(at, self.invoke_array_copy(&r, &args))
+                    {
+                        dispatched = Some({
+                            // `System.arraycopy` (`array_copy.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(at, self.invoke_arrays(&r, &args))
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_code_points(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `String.codePoints().forEach` (`string_code_points.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_stream(&r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(at, self.invoke_files_move(&r, &args))
+                    {
+                        dispatched = Some({
+                            // `Files.move`/`copy` between paths (`files_move.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(at, self.invoke_files_copy(&r, &args))
+                    {
+                        dispatched = Some({
+                            // `Files.copy(InputStream, ..)` (`files_copy.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            open_options::invoke(self, &r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some({
+                            // `Files` writers' `StandardOpenOption`s (`open_options.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_io(&r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            mod_origin::invoke(&r, receiver.as_ref(), &args, &mut *self.host)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            concurrent_sync::invoke(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `CountDownLatch`, `new ThreadPoolExecutor` (`concurrent_sync.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            executors::invoke_thread(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // A constructed thread's target (`executors.rs`, #194).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            executors::invoke_thread_factory(self, &r, receiver.as_ref(), &args)
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            executors::invoke(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_gson_fromjson(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // Gson's bounded reflective fromJson adapter (`gson_fromjson.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            gson_to_json_tree::instance_call(
+                                self,
+                                &r,
+                                receiver.as_ref().unwrap_or(&Value::Ref(None)),
+                                &args,
                             )
-                        } else {
-                            // A superclass outside the jar answers an inherited
-                            // member, so the host keeps the contract it always
-                            // had for the original owner.
-                            let optional = invoke_or_catch!(at, receiver
-                                .as_ref()
-                                .map(|receiver| self.invoke_optional(&resolved, receiver, &args))
-                                .transpose())
-                            .flatten();
-                            if let Some(value) = optional {
-                                value
-                            } else if let Some(value) = invoke_or_catch!(
+                        )
+                    {
+                        dispatched = Some({
+                            // Gson's `toJsonTree` instance surface (`gson_to_json_tree.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_gson_tree(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // Gson's JSON tree (`gson_tree.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_gson(&r, receiver.as_ref(), &args))
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_mod_config_spec(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_commons_pair(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // commons-lang3 `Pair` (`commons_pair.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_field_access(&r, receiver.as_ref(), &args, class)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_reflect_method(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_stack_walker(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_map_compute(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_collection_default(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_collection_callback(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(at, self.invoke_optionull(&r, &args))
+                    {
+                        dispatched = Some({
+                            // The game's pure `Optionull` helper (`optionull.rs`).
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_server_facade(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_color_collection(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_callback_info(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && (r.owner == "java/lang/Class"
+                            && r.name == "forName"
+                            && r.descriptor.ends_with(")Ljava/lang/Class;"))
+                    {
+                        dispatched = Some(invoke_or_catch!(at, self.class_for_name(&r, &args)));
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_class_interfaces(&r, receiver.as_ref())
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_array_clone(&r, receiver.as_ref())
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_string_builder(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // `jdk_string_builder.rs`: its index checks throw.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_library_model(&r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_jdk_runtime(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some({
+                            // A sort's comparator may throw for the jar to catch.
+                            value
+                        });
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_modelled_comparator(&r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = self.invoke_game_enum_values(&r)
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) =
+                            invoke_or_catch!(at, self.invoke_game_enum_value_of(&r, &args))
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_game_helpers(&r, receiver.as_ref(), &args, class, method)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some((owner, jar_owned)) =
+                            self.dispatch_owner(&r, op, receiver.as_ref())
+                    {
+                        dispatched = Some({
+                            let resolved = MethodRef {
+                                owner,
+                                name: r.name.clone(),
+                                descriptor: r.descriptor.clone(),
+                            };
+                            if let Some(value) = invoke_or_catch!(
                                 at,
-                                self.invoke_fabric_entrypoints(
-                                    &resolved,
-                                    receiver.as_ref(),
-                                    &args,
-                                )
+                                self.invoke_enum_member(&resolved, receiver.as_ref(), &args)
                             ) {
                                 value
-                            } else if matches!(
-                                resolved.owner.as_str(),
-                                "java/util/function/Function"
-                                    | "java/util/function/UnaryOperator"
-                                    | "java/util/function/Consumer"
-                                    | "java/util/function/Predicate"
-                                    | "java/util/function/BiPredicate"
-                                    | "java/util/function/BiConsumer"
-                                    | "java/util/function/BiFunction"
-                                    | "java/util/function/Supplier"
-                            ) || is_jdk_functional_method(&resolved)
-                            {
-                                if let Some(receiver) = receiver.as_ref() {
-                                    // A default combinator (`Consumer.andThen`,
-                                    // `Function.compose`, `Predicate.and`) closes
-                                    // over both callbacks. Running the receiver
-                                    // as a callback would pass the second
-                                    // callback as its argument and answer the
-                                    // callback's void, which loses the value the
-                                    // combinator returns.
-                                    if let Some(value) =
-                                        functional_composition_marker(&resolved, receiver, &args)
-                                    {
-                                        invoke_or_catch!(at, value)
-                                    } else if let Some(value) =
-                                        invoke_or_catch!(at, self.invoke_callback(receiver, &args))
-                                    {
-                                        // A method reference whose target returns a
-                                        // primitive (`list::add` as a `Function`) is
-                                        // boxed by the lambda's own synthetic method in
-                                        // Java, which the callback path bypasses.
-                                        invoke_or_catch!(
+                            } else if jar_owned {
+                                jar_body = true;
+                                invoke_or_catch!(
+                                    at,
+                                    self.invoke(
+                                        &resolved.owner,
+                                        &resolved.name,
+                                        &resolved.descriptor,
+                                        receiver,
+                                        &args,
+                                    )
+                                )
+                            } else {
+                                // A superclass outside the jar answers an inherited
+                                // member, so the host keeps the contract it always
+                                // had for the original owner.
+                                let optional = invoke_or_catch!(
+                                    at,
+                                    receiver
+                                        .as_ref()
+                                        .map(|receiver| self
+                                            .invoke_optional(&resolved, receiver, &args))
+                                        .transpose()
+                                )
+                                .flatten();
+                                if let Some(value) = optional {
+                                    value
+                                } else if let Some(value) = invoke_or_catch!(
+                                    at,
+                                    self.invoke_fabric_entrypoints(
+                                        &resolved,
+                                        receiver.as_ref(),
+                                        &args,
+                                    )
+                                ) {
+                                    value
+                                } else if matches!(
+                                    resolved.owner.as_str(),
+                                    "java/util/function/Function"
+                                        | "java/util/function/UnaryOperator"
+                                        | "java/util/function/Consumer"
+                                        | "java/util/function/Predicate"
+                                        | "java/util/function/BiPredicate"
+                                        | "java/util/function/BiConsumer"
+                                        | "java/util/function/BiFunction"
+                                        | "java/util/function/Supplier"
+                                ) || is_jdk_functional_method(&resolved)
+                                {
+                                    if let Some(receiver) = receiver.as_ref() {
+                                        // A default combinator (`Consumer.andThen`,
+                                        // `Function.compose`, `Predicate.and`) closes
+                                        // over both callbacks. Running the receiver
+                                        // as a callback would pass the second
+                                        // callback as its argument and answer the
+                                        // callback's void, which loses the value the
+                                        // combinator returns.
+                                        if let Some(value) = functional_composition_marker(
+                                            &resolved, receiver, &args,
+                                        ) {
+                                            invoke_or_catch!(at, value)
+                                        } else if let Some(value) = invoke_or_catch!(
                                             at,
-                                            box_callback_result(
-                                                self,
-                                                receiver,
-                                                value,
-                                                &resolved.descriptor
+                                            self.invoke_callback(receiver, &args)
+                                        ) {
+                                            // A method reference whose target returns a
+                                            // primitive (`list::add` as a `Function`) is
+                                            // boxed by the lambda's own synthetic method in
+                                            // Java, which the callback path bypasses.
+                                            invoke_or_catch!(
+                                                at,
+                                                box_callback_result(
+                                                    self,
+                                                    receiver,
+                                                    value,
+                                                    &resolved.descriptor
+                                                )
                                             )
-                                        )
+                                        } else {
+                                            invoke_or_catch!(
+                                                at,
+                                                if let Some(value) =
+                                                    client_reload::runtime_instance_call(
+                                                        self, &resolved, receiver, &args
+                                                    )
+                                                {
+                                                    value
+                                                } else {
+                                                    self.host
+                                                        .invoke_instance(&resolved, receiver, &args)
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        invoke_or_catch!(at, {
+                                            if resolved.owner
+                                                == "net/minecraft/network/syncher/SynchedEntityData"
+                                                && resolved.name == "defineId"
+                                            {
+                                                self.prepare_entity_data_hierarchy(&args);
+                                            }
+                                            self.host.invoke(&resolved, &args)
+                                        })
+                                    }
+                                } else if let Some(receiver) = receiver.as_ref() {
+                                    // A library's own functional interface (log4j's
+                                    // `TriConsumer`, a mod API's callback type)
+                                    // called on a lambda of this jar: its one
+                                    // abstract method is the lambda's body.
+                                    if self.foreign_functional_call(&resolved, receiver, &args) {
+                                        // A lambda the runtime cannot run is the
+                                        // host's call to answer (and count), not a
+                                        // silent default.
+                                        match invoke_or_catch!(
+                                            at,
+                                            self.invoke_callback(receiver, &args)
+                                        ) {
+                                            // Boxed or unboxed to the interface
+                                            // method's return (`lambda_boxing.rs`).
+                                            Some(value) => invoke_or_catch!(
+                                                at,
+                                                box_callback_result(
+                                                    self,
+                                                    receiver,
+                                                    value,
+                                                    &resolved.descriptor
+                                                )
+                                            ),
+                                            None => invoke_or_catch!(
+                                                at,
+                                                if let Some(value) =
+                                                    client_reload::runtime_instance_call(
+                                                        self, &resolved, receiver, &args
+                                                    )
+                                                {
+                                                    value
+                                                } else {
+                                                    self.host
+                                                        .invoke_instance(&resolved, receiver, &args)
+                                                }
+                                            ),
+                                        }
                                     } else {
                                         invoke_or_catch!(
                                             at,
@@ -31967,73 +32406,17 @@ impl<H: Host> Runtime<'_, H> {
                                         self.host.invoke(&resolved, &args)
                                     })
                                 }
-                            } else if let Some(receiver) = receiver.as_ref() {
-                                // A library's own functional interface (log4j's
-                                // `TriConsumer`, a mod API's callback type)
-                                // called on a lambda of this jar: its one
-                                // abstract method is the lambda's body.
-                                if self.foreign_functional_call(&resolved, receiver, &args) {
-                                    // A lambda the runtime cannot run is the
-                                    // host's call to answer (and count), not a
-                                    // silent default.
-                                    match invoke_or_catch!(
-                                        at,
-                                        self.invoke_callback(receiver, &args)
-                                    ) {
-                                        // Boxed or unboxed to the interface
-                                        // method's return (`lambda_boxing.rs`).
-                                        Some(value) => invoke_or_catch!(
-                                            at,
-                                            box_callback_result(
-                                                self,
-                                                receiver,
-                                                value,
-                                                &resolved.descriptor
-                                            )
-                                        ),
-                                        None => invoke_or_catch!(
-                                            at,
-                                            if let Some(value) =
-                                                client_reload::runtime_instance_call(
-                                                    self, &resolved, receiver, &args
-                                                )
-                                            {
-                                                value
-                                            } else {
-                                                self.host
-                                                    .invoke_instance(&resolved, receiver, &args)
-                                            }
-                                        ),
-                                    }
-                                } else {
-                                    invoke_or_catch!(
-                                        at,
-                                        if let Some(value) = client_reload::runtime_instance_call(
-                                            self, &resolved, receiver, &args
-                                        ) {
-                                            value
-                                        } else {
-                                            self.host.invoke_instance(&resolved, receiver, &args)
-                                        }
-                                    )
-                                }
-                            } else {
-                                invoke_or_catch!(at, {
-                                    if resolved.owner
-                                        == "net/minecraft/network/syncher/SynchedEntityData"
-                                        && resolved.name == "defineId"
-                                    {
-                                        self.prepare_entity_data_hierarchy(&args);
-                                    }
-                                    self.host.invoke(&resolved, &args)
-                                })
                             }
+                        });
+                    }
+                    let value = match dispatched {
+                        Some(value) => value,
+                        None => {
+                            return Err(NativeError::Metadata(format!(
+                                "native dispatch for {}#{}{} exceeded {MAX_SUPERCLASS_WALK} superclasses",
+                                r.owner, r.name, r.descriptor
+                            )));
                         }
-                    } else {
-                        return Err(NativeError::Metadata(format!(
-                            "native dispatch for {}#{}{} exceeded {MAX_SUPERCLASS_WALK} superclasses",
-                            r.owner, r.name, r.descriptor
-                        )));
                     };
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
