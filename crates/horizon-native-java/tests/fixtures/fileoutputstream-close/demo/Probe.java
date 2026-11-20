@@ -8,6 +8,41 @@ public class Probe {
       return java.util.Arrays.toString(in.readAllBytes());
     }
   }
+  static String raw(Path p) throws Exception {
+    try (FileInputStream in = new FileInputStream(p.toFile())) {
+      int a=in.read(), b=in.read(), c=in.read(), d=in.read();
+      return a+","+b+","+c+","+d;
+    }
+  }
+  static String bulk(Path p) throws Exception {
+    try (InputStream in = Files.newInputStream(p)) {
+      byte[] b=new byte[8]; int n=in.read(b);
+      return n+":"+java.util.Arrays.toString(b);
+    }
+  }
+  static String bulkOffset(Path p) throws Exception {
+    try (InputStream in = Files.newInputStream(p)) {
+      byte[] b={9,9,9,9,9}; int n=in.read(b,1,2);
+      return n+":"+java.util.Arrays.toString(b);
+    }
+  }
+  static String positioning(Path p) throws Exception {
+    try (InputStream in = Files.newInputStream(p)) {
+      int before=in.available(); long skipped=in.skip(2); int after=in.available();
+      return before+":"+skipped+":"+after+":"+java.util.Arrays.toString(in.readAllBytes());
+    }
+  }
+  static String all(Path p) throws Exception {
+    try (InputStream in = Files.newInputStream(p)) {
+      return java.util.Arrays.toString(in.readAllBytes());
+    }
+  }
+  static String buffered(Path p) {
+    return err(()->{try (BufferedReader r=Files.newBufferedReader(p)) { r.read(); }});
+  }
+  static String string(Path p) {
+    return err(()->Files.readString(p));
+  }
   public static String rows() {
     try {
       Path d=Path.of("fos-scratch"); Files.createDirectories(d); Path f=d.resolve("x.bin"); Files.deleteIfExists(f);
@@ -34,7 +69,8 @@ public class Probe {
       one.write('A'); two.write('B'); one.write('C'); one.close(); two.close();
       String twoStreams=fis(shared);
       Path nd=Path.of("missing-parent"); Files.deleteIfExists(nd.resolve("x.zip")); String parent=err(()->{new FileOutputStream(nd.resolve("x.zip").toFile());});
-      return "bytes="+bytes+";after="+after+";closedNull="+closedNull+";closedOff="+closedOff+";closedLen="+closedLen+";negOff="+negOff+";negLen="+negLen+";over="+over+";null="+nul+";beforeFis="+beforeFis+";beforeFiles="+beforeFiles+";afterFis="+afterFis+";afterFiles="+afterFiles+";reopen="+reopen+";twoStreams="+twoStreams+";parent="+parent;
+      Path raw=d.resolve("raw.bin"); Files.write(raw,new byte[]{(byte)0xc3,0x28,(byte)0xff,0});
+      return "bytes="+bytes+";after="+after+";closedNull="+closedNull+";closedOff="+closedOff+";closedLen="+closedLen+";negOff="+negOff+";negLen="+negLen+";over="+over+";null="+nul+";beforeFis="+beforeFis+";beforeFiles="+beforeFiles+";afterFis="+afterFis+";afterFiles="+afterFiles+";reopen="+reopen+";twoStreams="+twoStreams+";parent="+parent+";raw="+raw(raw)+";bulk="+bulk(raw)+";bulkOffset="+bulkOffset(raw)+";positioning="+positioning(raw)+";all="+all(raw)+";buffered="+buffered(raw)+";string="+string(raw);
     } catch(Exception x){return "ERR:"+x;}
   }
   public static void main(String[] a){System.out.println(rows());}

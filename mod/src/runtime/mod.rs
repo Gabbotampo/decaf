@@ -28291,6 +28291,101 @@ impl<H: Host> Runtime<'_, H> {
                 if !self.string_readers.contains_key(&marker) {
                     return Ok(None);
                 }
+                // FileInputStream (including the object returned by
+                // Files.newInputStream) is a byte stream.  Its source of
+                // truth is the virtual file's raw byte table; the lossy text
+                // reader is retained only for the character-reader wrappers.
+                if let Some(path) = self.io_stream_paths.get(&marker).cloned()
+                    && let Some(file_bytes) = self.io_file_bytes.get(&path).cloned()
+                {
+                    let position = self.io_stream_positions.entry(marker.clone()).or_default();
+                    let remaining = file_bytes.len().saturating_sub(*position);
+                    return Ok(Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                        ("readAllBytes", "()[B") | ("readNBytes", "()[B") => {
+                            let bytes = file_bytes[*position..].to_vec();
+                            *position = file_bytes.len();
+                            self.string_readers.insert(marker.clone(), String::new());
+                            self.io_bytes_array(bytes)
+                        }
+                        ("read", "()I") => {
+                            if *position == file_bytes.len() {
+                                Value::Int(-1)
+                            } else {
+                                let byte = file_bytes[*position];
+                                *position += 1;
+                                Value::Int(i32::from(byte))
+                            }
+                        }
+                        ("read", "([B)I") | ("read", "([BII)I") | ("readNBytes", "([BII)I") => {
+                            if matches!(args.first(), Some(Value::Ref(None))) {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: None,
+                                    frame: None,
+                                });
+                            }
+                            let Some(array) = args.first().and_then(host_array::array_key) else {
+                                return Ok(None);
+                            };
+                            let array_len =
+                                self.arrays.get(array).map_or(0, array_data::ArrayData::len);
+                            let (offset, length) = if r.descriptor == "([BII)I" {
+                                let offset = expect_int(r, args.get(1).unwrap_or(&Value::Int(0)))?;
+                                let length = expect_int(r, args.get(2).unwrap_or(&Value::Int(0)))?;
+                                if offset < 0
+                                    || length < 0
+                                    || offset as usize > array_len
+                                    || length as usize > array_len.saturating_sub(offset as usize)
+                                {
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/lang/IndexOutOfBoundsException".into(),
+                                        message: None,
+                                        frame: None,
+                                    });
+                                }
+                                (offset as usize, length as usize)
+                            } else {
+                                (0, array_len)
+                            };
+                            if length == 0 {
+                                Value::Int(0)
+                            } else if remaining == 0 {
+                                Value::Int(-1)
+                            } else {
+                                let count = length.min(remaining);
+                                if let Some(data) = self.arrays.get_mut(array) {
+                                    for (index, byte) in
+                                        file_bytes[*position..*position + count].iter().enumerate()
+                                    {
+                                        data.store(
+                                            offset + index,
+                                            Value::Int(i32::from(*byte as i8)),
+                                        );
+                                    }
+                                }
+                                *position += count;
+                                Value::Int(count as i32)
+                            }
+                        }
+                        ("available", "()I") => Value::Int(remaining.min(i32::MAX as usize) as i32),
+                        ("skip", "(J)J") => {
+                            let requested = match args.first() {
+                                Some(Value::Long(value)) => *value,
+                                _ => return Ok(None),
+                            };
+                            let count = requested.max(0) as usize;
+                            let skipped = count.min(remaining);
+                            *position += skipped;
+                            Value::Long(skipped as i64)
+                        }
+                        ("close", "()V") => Value::Void,
+                        _ => {
+                            // Keep close and any future stream methods on the
+                            // existing bounded dispatch.
+                            return Ok(None);
+                        }
+                    }));
+                }
                 // A stream this invocation opened carries its bytes as UTF-8
                 // text: reading drains from the front, exactly the way the
                 // bounded reader surface consumes a file.
