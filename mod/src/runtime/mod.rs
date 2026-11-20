@@ -13912,16 +13912,7 @@ impl StdHost {
         if !self.is_chm_set(receiver) {
             return false;
         }
-        matches!(
-            (r.name.as_str(), r.descriptor.as_str()),
-            ("iterator", "()Ljava/util/Iterator;")
-                | ("toArray", "()[Ljava/lang/Object;")
-                | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
-                | ("stream", "()Ljava/util/stream/Stream;")
-                | ("parallelStream", "()Ljava/util/stream/Stream;")
-                | ("spliterator", "()Ljava/util/Spliterator;")
-                | ("toString", "()Ljava/lang/String;")
-        )
+        crate::runtime::jdk_new_set_from_map::chm_set_ordered_read(&r.name, &r.descriptor)
     }
 
     /// A handle's `toString`/`hashCode`/`equals` through its kind's row
@@ -31313,6 +31304,16 @@ impl<H: Host> Runtime<'_, H> {
                                 == "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;")
                     {
                         invoke_or_catch!(at, format_java_string_call(self, &r, &args))
+                    } else if let Some(set) = receiver.as_ref()
+                        && self.host.is_chm_set(set)
+                        && jdk_new_set_from_map::chm_set_ordered_read(&r.name, &r.descriptor)
+                    {
+                        // A `ConcurrentHashMap`-backed set's iteration order is
+                        // the JVM's hash table layout: every read exposing it,
+                        // the default methods `forEach`/`toArray(IntFunction)`
+                        // too, is counted before any collection model could
+                        // answer it in some other order (#548 review).
+                        invoke_or_catch!(at, self.host.unknown_operand_call(&r))
                     } else if let Some(value) = invoke_or_catch!(
                         at,
                         self.invoke_properties_reader(&r, receiver.as_ref(), &args)

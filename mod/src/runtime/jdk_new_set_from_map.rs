@@ -246,6 +246,26 @@ pub(crate) fn is_set_value(value: &Value) -> bool {
     class == "set" || crate::runtime::is_set_owner(class)
 }
 
+/// The calls on a `ConcurrentHashMap`-backed set whose answer depends on the
+/// map's iteration order, which only a JVM's hash table layout decides: they
+/// are counted, never answered. Membership, size, equality and `hashCode` do
+/// not depend on order and are answered.
+pub(crate) fn chm_set_ordered_read(name: &str, descriptor: &str) -> bool {
+    matches!(
+        (name, descriptor),
+        ("iterator", "()Ljava/util/Iterator;")
+            | ("toArray", "()[Ljava/lang/Object;")
+            | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+            | ("toArray", "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;")
+            // Runs the action in iteration order (#548 review).
+            | ("forEach", "(Ljava/util/function/Consumer;)V")
+            | ("stream", "()Ljava/util/stream/Stream;")
+            | ("parallelStream", "()Ljava/util/stream/Stream;")
+            | ("spliterator", "()Ljava/util/Spliterator;")
+            | ("toString", "()Ljava/lang/String;")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::runtime::host_ref::HostKind;

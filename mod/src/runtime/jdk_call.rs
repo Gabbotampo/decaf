@@ -319,16 +319,7 @@ impl<H: Host> Runtime<'_, H> {
         }
         let opcode = if kind == Site::Interface { 0xb9 } else { 0xb6 };
         if self.host.is_chm_set(receiver)
-            && matches!(
-                (name, descriptor),
-                ("iterator", "()Ljava/util/Iterator;")
-                    | ("toArray", "()[Ljava/lang/Object;")
-                    | ("toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
-                    | ("stream", "()Ljava/util/stream/Stream;")
-                    | ("parallelStream", "()Ljava/util/stream/Stream;")
-                    | ("spliterator", "()Ljava/util/Spliterator;")
-                    | ("toString", "()Ljava/lang/String;")
-            )
+            && crate::runtime::jdk_new_set_from_map::chm_set_ordered_read(name, descriptor)
         {
             return self.host.unknown_operand_call(&r);
         }
