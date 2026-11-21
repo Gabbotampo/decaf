@@ -1,0 +1,8 @@
+# Synthetic nested-jar review cases captured through real ModDiscoverer.
+root-constraint|synthetic=root-constraint
+root-breaks|synthetic=root-breaks
+nested-sibling-constraint|synthetic=nested-sibling-constraint
+two-top-level-same-path|synthetic=two-top-level-same-path
+alias-constraint|synthetic=alias-constraint
+caret-breaks|synthetic=caret-breaks
+tilde-breaks|synthetic=tilde-breaks

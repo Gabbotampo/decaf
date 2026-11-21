@@ -23,7 +23,6 @@ pub(crate) const DATA_COMPONENT_PATCH_BUILDER: &str =
 pub(crate) const DATA_COMPONENTS: &str = "net/minecraft/core/component/DataComponents";
 pub(crate) const INGREDIENT: &str = "net/minecraft/world/item/crafting/Ingredient";
 pub(crate) const RECIPE_COMMON_INFO: &str = "net/minecraft/world/item/crafting/Recipe$CommonInfo";
-pub(crate) const RECIPE_SERIALIZER: &str = "net/minecraft/world/item/crafting/RecipeSerializer";
 pub(crate) const RECIPE_HOLDER: &str = "net/minecraft/world/item/crafting/RecipeHolder";
 pub(crate) const RECIPE_MANAGER: &str = "net/minecraft/world/item/crafting/RecipeManager";
 pub(crate) const RECIPE_ACCESS: &str = "net/minecraft/world/item/crafting/RecipeAccess";
@@ -87,12 +86,6 @@ pub(crate) enum IngredientSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SerializerData {
-    pub(crate) codec: Value,
-    pub(crate) stream_codec: Value,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct HolderData {
     pub(crate) id: Value,
     pub(crate) value: Value,
@@ -131,7 +124,6 @@ pub(crate) struct RecipeState {
     pub(crate) patches: BTreeMap<String, ComponentPatch>,
     pub(crate) patch_builders: BTreeMap<String, ComponentPatch>,
     pub(crate) ingredients: BTreeMap<String, IngredientSpec>,
-    pub(crate) serializers: BTreeMap<String, SerializerData>,
     pub(crate) holders: BTreeMap<String, HolderData>,
     pub(crate) common_infos: BTreeMap<String, bool>,
     pub(crate) menu_types: BTreeMap<String, MenuTypeData>,
@@ -186,18 +178,6 @@ impl RecipeState {
         Value::Host(HostRef::new(HostKind::RecipeCommonInfo, key))
     }
 
-    pub(crate) fn alloc_serializer(&mut self, codec: Value, stream_codec: Value) -> Value {
-        let key = self.next_key("recipe-serializer");
-        self.serializers.insert(
-            key.clone(),
-            SerializerData {
-                codec,
-                stream_codec,
-            },
-        );
-        Value::Host(HostRef::new(HostKind::RecipeSerializer, key))
-    }
-
     pub(crate) fn alloc_holder(&mut self, id: Value, value: Value) -> Value {
         let key = self.next_key("recipe-holder");
         self.holders.insert(key.clone(), HolderData { id, value });
@@ -237,10 +217,6 @@ impl RecipeState {
                 push_val(val, out);
             }
         }
-        for ser in self.serializers.values() {
-            push_val(&ser.codec, out);
-            push_val(&ser.stream_codec, out);
-        }
         for holder in self.holders.values() {
             push_val(&holder.id, out);
             push_val(&holder.value, out);
@@ -264,7 +240,6 @@ impl RecipeState {
             + self.patches.len()
             + self.patch_builders.len()
             + self.ingredients.len()
-            + self.serializers.len()
             + self.holders.len()
             + self.common_infos.len()
             + self.menu_types.len()
@@ -288,7 +263,6 @@ pub(crate) fn is_recipe_object_kind(kind: HostKind) -> bool {
             | HostKind::DataComponentPatchBuilder
             | HostKind::Ingredient
             | HostKind::RecipeCommonInfo
-            | HostKind::RecipeSerializer
             | HostKind::RecipeHolder
     )
 }
@@ -394,17 +368,6 @@ pub(crate) const COMMON_INFO_METHODS: Methods = Methods {
     equals: |_, _, _| Ok(None),
     instance_of: |_, wanted, hierarchy| {
         fixed_instance_of(RECIPE_COMMON_INFO, &["java/lang/Record"], wanted, hierarchy)
-    },
-    crosses_jars: |_, _| false,
-    compare_to: None,
-};
-
-pub(crate) const SERIALIZER_METHODS: Methods = Methods {
-    to_string: |_, _| Ok(None),
-    hash_code: |_, _| Ok(None),
-    equals: identity_equals,
-    instance_of: |_, wanted, hierarchy| {
-        fixed_instance_of(RECIPE_SERIALIZER, &["java/lang/Record"], wanted, hierarchy)
     },
     crosses_jars: |_, _| false,
     compare_to: None,
@@ -1303,10 +1266,6 @@ pub(crate) fn random_new(host: &mut StdHost, class: &str) -> Option<Value> {
             }))
         }
         RECIPE_COMMON_INFO => Some(host.recipes.alloc_common_info(true)),
-        RECIPE_SERIALIZER => Some(
-            host.recipes
-                .alloc_serializer(Value::Ref(None), Value::Ref(None)),
-        ),
         RECIPE_HOLDER => Some(
             host.recipes
                 .alloc_holder(Value::Ref(None), Value::Ref(None)),
@@ -1561,7 +1520,6 @@ pub(crate) fn instance_call(
         HostKind::DataComponentPatchBuilder => patch_builder_instance_call(host, handle, r, args),
         HostKind::Ingredient => ingredient_instance_call(host, handle, r, args),
         HostKind::RecipeCommonInfo => common_info_instance_call(host, handle, r, args),
-        HostKind::RecipeSerializer => serializer_instance_call(host, handle, r, args),
         HostKind::RecipeHolder => holder_instance_call(host, handle, r, args),
         _ => None,
     }
@@ -2001,42 +1959,6 @@ fn common_info_instance_call(
     }
 }
 
-fn serializer_instance_call(
-    host: &mut StdHost,
-    handle: &HostRef,
-    r: &MethodRef,
-    args: &[Value],
-) -> Option<Result<Value, NativeError>> {
-    if r.owner != RECIPE_SERIALIZER {
-        return None;
-    }
-    let key = handle.key().to_owned();
-    match (r.name.as_str(), r.descriptor.as_str()) {
-        (
-            "<init>",
-            "(Lcom/mojang/serialization/MapCodec;Lnet/minecraft/network/codec/StreamCodec;)V",
-        ) => {
-            let codec = args.first()?.clone();
-            let stream_codec = args.get(1)?.clone();
-            host.recipes.serializers.insert(
-                key,
-                SerializerData {
-                    codec,
-                    stream_codec,
-                },
-            );
-            Some(Ok(Value::Void))
-        }
-        ("codec", "()Lcom/mojang/serialization/MapCodec;") => {
-            Some(Ok(host.recipes.serializers.get(&key)?.codec.clone()))
-        }
-        ("streamCodec", "()Lnet/minecraft/network/codec/StreamCodec;") => {
-            Some(Ok(host.recipes.serializers.get(&key)?.stream_codec.clone()))
-        }
-        _ => None,
-    }
-}
-
 fn holder_instance_call(
     host: &mut StdHost,
     handle: &HostRef,
@@ -2108,9 +2030,7 @@ pub(crate) fn object_hash_code(host: &StdHost, handle: &HostRef) -> Option<i32> 
 /// Stateful `equals` for recipe-model handles that don't need recursive jar `equals`.
 pub(crate) fn host_object_equals(host: &StdHost, handle: &HostRef, other: &Value) -> Option<bool> {
     match handle.kind() {
-        HostKind::LiveItemStack
-        | HostKind::DataComponentPatchBuilder
-        | HostKind::RecipeSerializer => match other {
+        HostKind::LiveItemStack | HostKind::DataComponentPatchBuilder => match other {
             Value::Host(other) => handle.same_object(other),
             _ => Some(false),
         },
@@ -2325,19 +2245,13 @@ fn cache_fingerprint(host: &StdHost) -> (usize, usize, u64, usize) {
     (serializers, items, res_gen, tags)
 }
 
-/// Isolated accessor reading a `RecipeSerializer`'s `MapCodec` so swapping to PR #614's
-/// `recipe_serializer::parts` is a one-line change.
-fn serializer_codec(host: &StdHost, value: &Value) -> Option<Value> {
+/// Read the `MapCodec` component from PR #614's canonical `RecipeSerializer` record handle.
+fn serializer_codec(value: &Value) -> Option<Value> {
     let Value::Host(handle) = value else {
         return None;
     };
-    if handle.kind() != HostKind::RecipeSerializer {
-        return None;
-    }
-    host.recipes
-        .serializers
-        .get(handle.key())
-        .map(|data| data.codec.clone())
+    let (codec, _) = crate::runtime::recipe_serializer::parts(handle)?;
+    (!matches!(codec, Value::Ref(None))).then_some(codec)
 }
 
 fn parse_recipe_resource_id(path: &str) -> Option<String> {
@@ -2390,7 +2304,7 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
         let mut ser_codecs: BTreeMap<String, Value> = BTreeMap::new();
         for entry in std_host.registrations() {
             if entry.registry == "minecraft:recipe_serializer"
-                && let Some(codec) = serializer_codec(std_host, &entry.value)
+                && let Some(codec) = serializer_codec(&entry.value)
             {
                 ser_codecs.insert(entry.id.clone(), codec);
             }
@@ -2884,10 +2798,9 @@ mod tests {
 
     #[test]
     fn item_tags_support_nested_vanilla_replace_optional_and_cycles() {
-        let mut host = StdHost::new();
         // Nested vanilla tag
-        host.resource_bytes.insert(
-            "data/demo/tags/item/stone_like.json".into(),
+        let host = StdHost::new().with_resource_bytes(
+            "data/demo/tags/item/stone_like.json",
             br##"{"values":["#minecraft:stone_tool_materials",{"id":"demo:missing_optional","required":false}]}"##
                 .to_vec(),
         );
@@ -2898,8 +2811,8 @@ mod tests {
         assert!(!stone_like.contains("minecraft:dirt"));
 
         // Replace vanilla tag cleanly
-        host.resource_bytes.insert(
-            "data/minecraft/tags/item/stone_tool_materials.json".into(),
+        let host = host.with_resource_bytes(
+            "data/minecraft/tags/item/stone_tool_materials.json",
             br#"{"replace":true,"values":["minecraft:granite"]}"#.to_vec(),
         );
         let replaced = resolve_item_tag(&host, "demo:stone_like").unwrap();
@@ -2907,20 +2820,21 @@ mod tests {
         assert!(replaced.contains("minecraft:granite"));
 
         // Cycle detection terminates cleanly
-        host.resource_bytes.insert(
-            "data/demo/tags/item/cycle_a.json".into(),
-            br##"{"values":["#demo:cycle_b","minecraft:stick"]}"##.to_vec(),
-        );
-        host.resource_bytes.insert(
-            "data/demo/tags/item/cycle_b.json".into(),
-            br##"{"values":["#demo:cycle_a"]}"##.to_vec(),
-        );
+        let host = host
+            .with_resource_bytes(
+                "data/demo/tags/item/cycle_a.json",
+                br##"{"values":["#demo:cycle_b","minecraft:stick"]}"##.to_vec(),
+            )
+            .with_resource_bytes(
+                "data/demo/tags/item/cycle_b.json",
+                br##"{"values":["#demo:cycle_a"]}"##.to_vec(),
+            );
         let cyclic = resolve_item_tag(&host, "demo:cycle_a").unwrap();
         assert!(cyclic.contains("minecraft:stick"));
 
         // Missing required tag entry fails resolution
-        host.resource_bytes.insert(
-            "data/demo/tags/item/broken.json".into(),
+        let host = host.with_resource_bytes(
+            "data/demo/tags/item/broken.json",
             br#"{"values":["demo:does_not_exist"]}"#.to_vec(),
         );
         assert!(resolve_item_tag(&host, "demo:broken").is_none());

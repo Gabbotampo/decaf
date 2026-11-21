@@ -630,8 +630,6 @@ pub enum HostKind {
     Ingredient,
     /// Vanilla's `Recipe$CommonInfo` (`recipe_models.rs`).
     RecipeCommonInfo,
-    /// Vanilla's `RecipeSerializer` (`recipe_models.rs`).
-    RecipeSerializer,
     /// Vanilla's `RecipeHolder` (`recipe_models.rs`).
     RecipeHolder,
     /// Fabric CreativeModeTab builder and built tab handles.
@@ -645,6 +643,8 @@ pub enum HostKind {
     /// A Fabric `BiomeModification` that `BiomeModifications.create` made
     /// (`fabric_biome_modifications.rs`).
     FabricBiomeModification,
+    /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
+    RecipeSerializer,
 }
 
 /// How a kind's Java class follows from its key.
@@ -2797,13 +2797,6 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::runtime::recipe_models::COMMON_INFO_METHODS,
     },
     KindInfo {
-        kind: HostKind::RecipeSerializer,
-        tag: "rser",
-        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::RECIPE_SERIALIZER),
-        canonical: always_canonical,
-        methods: &crate::runtime::recipe_models::SERIALIZER_METHODS,
-    },
-    KindInfo {
         kind: HostKind::RecipeHolder,
         tag: "rhld",
         class: ClassRule::FromKey(|_| crate::runtime::recipe_models::RECIPE_HOLDER),
@@ -2861,6 +2854,14 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         // It overrides nothing of `Object`: identity `equals`, `hashCode`/`toString` counted.
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeSerializer,
+        tag: "rser",
+        class: ClassRule::Fixed(crate::runtime::recipe_serializer::OWNER),
+        // A serial per `new RecipeSerializer` allocation: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_serializer::METHODS,
     },
 ];
 

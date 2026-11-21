@@ -241,7 +241,9 @@ impl Fixture {
         zip.start_file("fabric.mod.json", SimpleFileOptions::default())
             .unwrap();
         zip.write_all(
-            br#"{"id":"origin-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
+            // Fabric's ModDiscoverer loads only the nested jars a mod lists in
+            // `jars`, so the child is declared exactly as a real mod declares it.
+            br#"{"id":"origin-fixture","version":"1.0","entrypoints":{"main":"demo.Probe"},"jars":[{"file":"META-INF/jars/nested-child.jar"}]}"#,
         )
         .unwrap();
         let mut nested_bytes = Cursor::new(Vec::new());

@@ -1,0 +1,16 @@
+root-vs-nested|aa,aa,2,1,-,;carrier,carrier,1,1,-,;bb,bb,1,0,aa,carrier
+three-cycle|a,a,1,1,b,;b,b,1,1,c,;c,c,1,1,a,
+overlap|aa,aa,1,1,shared,;bb,bb,2,1,shared,;cc,cc,2,1,other,
+version-tie|aa,aa,1,1,tie,;bb,bb,1,1,tie,;cc,cc,1,1,tie,
+nest-levels|base,base,1,1,level,;carrier,carrier,1,1,-,;deep,deep,1,0,level,carrier;deeper,deeper,1,0,level,deep
+aliases|owner-a,owner-a,2,1,alias-a,;alias-a,alias-a,1,0,alias-a,owner-a;owner-b,owner-b,1,1,alias-b,;alias-b,alias-b,1,0,alias-b,owner-b
+four-cycle|a,a,1,1,b,;b,b,1,1,c,;c,c,1,1,d,;d,d,1,1,a,
+mixed-versions|aa,aa,2,1,mix,;bb,bb,10,1,mix,;cc,cc,1.0-alpha,1,mix,;dd,dd,1.0,1,mix,
+nested-depths|root,root,1,1,-,;one,one,1,0,-,root;two,two,1,0,-,one;three,three,1,0,-,two;four,four,1,0,-,three
+no-conflict|aa,aa,1,1,-,;bb,bb,2,1,-,;cc,cc,1,0,-,bb
+duplicate-id|aa,aa,1,1,-,;bb,aa,2,1,-,
+duplicate-alias|aa,aa,1,1,shared,;bb,bb,1,1,shared,;cc,cc,1,0,-,bb
+root-alias-id|owner,owner,1,1,provided,;provided,provided,1,1,-,
+newer-missing-dependency|old,shared-lib,1.0,1,-,-,;new,shared-lib,2.0,1,-,-,missing:>=1.0
+pinned-upper-bound|old,shared-lib,1.0,1,-,-,;new,shared-lib,2.0,1,-,-,;pin,pinner,1.0,1,-,-,shared-lib:<2.0.0
+equal-version-bytes|first,shared-lib,1.0,1,-,-,;second,shared-lib,1.0,1,-,-,
