@@ -426,10 +426,12 @@ fn a_javac_item_combiner_screen_exposes_layout_and_background() {
 
 #[test]
 fn a_real_runes_client_registers_its_container_screen() {
-    let jar = NativeJar::from_path(std::path::Path::new(
-        "/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar",
-    ))
-    .unwrap();
+    // The real Runes 1.3.2 jar isn't in the repo or on CI: point RUNES_JAR at it to run this.
+    let Some(path) = std::env::var_os("RUNES_JAR") else {
+        eprintln!("RUNES_JAR is unset; real Runes screen test skipped");
+        return;
+    };
+    let jar = NativeJar::from_path(std::path::Path::new(&path)).unwrap();
     let mut host = StdHost::new();
     host.begin_client_frame(frame(Some(0.0)), &[]);
     let result = jar.invoke_method(
