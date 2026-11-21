@@ -243,12 +243,25 @@ const FABRIC_STUBS: &[(&str, &str)] = &[
 
 const SCREEN_API_STUBS: &[(&str, &str)] = &[
     (
+        "net/minecraft/world/flag/FeatureFlag.java",
+        "package net.minecraft.world.flag; public class FeatureFlag {}",
+    ),
+    (
         "net/minecraft/world/flag/FeatureFlagSet.java",
-        "package net.minecraft.world.flag; public final class FeatureFlagSet {}",
+        "package net.minecraft.world.flag;\n\
+         public final class FeatureFlagSet {\n\
+           public static FeatureFlagSet of() { return null; }\n\
+           public static FeatureFlagSet of(FeatureFlag flag) { return null; }\n\
+           public boolean isEmpty() { return false; } }",
     ),
     (
         "net/minecraft/world/flag/FeatureFlags.java",
-        "package net.minecraft.world.flag; public final class FeatureFlags { public static final FeatureFlagSet VANILLA_SET = null; }",
+        "package net.minecraft.world.flag;\n\
+         public final class FeatureFlags {\n\
+           public static final FeatureFlag VANILLA = null;\n\
+           public static final FeatureFlag TRADE_REBALANCE = null;\n\
+           public static final FeatureFlagSet VANILLA_SET = null;\n\
+           public static boolean isExperimental(FeatureFlagSet features) { return false; } }",
     ),
     (
         "net/minecraft/world/item/ItemStack.java",
@@ -331,6 +344,7 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
          public class MenuType<T extends AbstractContainerMenu> {\n\
            public interface MenuSupplier<T extends AbstractContainerMenu> { T create(int id, Inventory inv); }\n\
            public MenuType(MenuSupplier<T> s, FeatureFlagSet f) {}\n\
+           public FeatureFlagSet requiredFeatures() { return null; }\n\
            public T create(int id, Inventory inv) { return null; } }",
     ),
     (
@@ -2190,6 +2204,11 @@ public class Round3Menu extends ItemCombinerMenu {
   public static boolean inputIsString;
   public static boolean resultIsResultContainer;
   public static boolean resultIsString;
+  public static boolean reqFeaturesMatchVanilla;
+  public static boolean vanillaNotExperimental;
+  public static boolean emptyNotExperimental;
+  public static boolean tradeIsExperimental;
+  public static String isExperimentalNullMsg;
 
   public Round3Menu(MenuType<?> t, int id, Inventory inv) {
     this(t, id, inv, false);
@@ -2245,6 +2264,19 @@ public class Round3Menu extends ItemCombinerMenu {
     Object resObj = this.resultSlots;
     resultIsResultContainer = resObj instanceof ResultContainer && resObj instanceof Container;
     resultIsString = resObj instanceof String;
+
+    net.minecraft.world.flag.FeatureFlagSet req = Round3Menu.TYPE_A.requiredFeatures();
+    reqFeaturesMatchVanilla = req == FeatureFlags.VANILLA_SET && req.equals(FeatureFlags.VANILLA_SET);
+    vanillaNotExperimental = !FeatureFlags.isExperimental(req);
+    emptyNotExperimental = !FeatureFlags.isExperimental(net.minecraft.world.flag.FeatureFlagSet.of());
+    tradeIsExperimental = FeatureFlags.isExperimental(
+        net.minecraft.world.flag.FeatureFlagSet.of(FeatureFlags.TRADE_REBALANCE));
+    try {
+      FeatureFlags.isExperimental(null);
+      isExperimentalNullMsg = "no-throw";
+    } catch (NullPointerException e) {
+      isExperimentalNullMsg = e.getMessage();
+    }
   }
 }
 "#,
@@ -2473,6 +2505,33 @@ public class Round3Mod {
     assert_eq!(
         static_value(&host, "demo/Round3Menu", "resultIsStringZ"),
         Some(Value::Int(0))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "reqFeaturesMatchVanillaZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "vanillaNotExperimentalZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "emptyNotExperimentalZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "tradeIsExperimentalZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(
+            &host,
+            "demo/Round3Menu",
+            "isExperimentalNullMsgLjava/lang/String;"
+        ),
+        Some(Value::Ref(Some(
+            "Cannot invoke \"net.minecraft.world.flag.FeatureFlagSet.isSubsetOf(net.minecraft.world.flag.FeatureFlagSet)\" because \"features\" is null"
+                .into()
+        )))
     );
     // StdHost::retain pins the MenuObject handle (not dropped as a plain String).
     let captured_slots =
