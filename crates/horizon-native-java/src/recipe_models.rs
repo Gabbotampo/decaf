@@ -27,7 +27,6 @@ pub(crate) const RECIPE_HOLDER: &str = "net/minecraft/world/item/crafting/Recipe
 pub(crate) const RECIPE_MANAGER: &str = "net/minecraft/world/item/crafting/RecipeManager";
 pub(crate) const RECIPE_ACCESS: &str = "net/minecraft/world/item/crafting/RecipeAccess";
 pub(crate) const TRANSMUTE_RECIPE: &str = "net/minecraft/world/item/crafting/TransmuteRecipe";
-pub(crate) const MENU_TYPE: &str = "net/minecraft/world/inventory/MenuType";
 pub(crate) const EMPTY_PATCH_KEY: &str = "empty";
 pub(crate) const RECIPE_MANAGER_KEY: &str = "game/recipe-manager";
 
@@ -136,12 +135,6 @@ pub(crate) struct HolderData {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct MenuTypeData {
-    pub(crate) supplier: Value,
-    pub(crate) features: Value,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct LoadedRecipe {
     pub(crate) id: String,
     pub(crate) source_pack: String,
@@ -170,7 +163,6 @@ pub(crate) struct RecipeState {
     pub(crate) ingredients: BTreeMap<String, IngredientSpec>,
     pub(crate) holders: BTreeMap<String, HolderData>,
     pub(crate) common_infos: BTreeMap<String, bool>,
-    pub(crate) menu_types: BTreeMap<String, MenuTypeData>,
     pub(crate) extra_item_tags: BTreeMap<String, Vec<String>>,
     pub(crate) loaded: Option<LoadedRecipeCache>,
 }
@@ -268,10 +260,6 @@ impl RecipeState {
             push_val(&holder.id, out);
             push_val(&holder.value, out);
         }
-        for mt in self.menu_types.values() {
-            push_val(&mt.supplier, out);
-            push_val(&mt.features, out);
-        }
         if let Some(cache) = &self.loaded {
             for recipe in &cache.recipes {
                 push_val(&recipe.recipe_type, out);
@@ -289,7 +277,6 @@ impl RecipeState {
             + self.ingredients.len()
             + self.holders.len()
             + self.common_infos.len()
-            + self.menu_types.len()
     }
 }
 
@@ -1518,23 +1505,6 @@ pub(crate) fn instance_call(
     receiver: &Value,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
-    // MenuType.<init>(MenuSupplier, FeatureFlagSet)
-    if r.owner == MENU_TYPE
-        && r.name == "<init>"
-        && r.descriptor
-            == "(Lnet/minecraft/world/inventory/MenuType$MenuSupplier;Lnet/minecraft/world/flag/FeatureFlagSet;)V"
-        && let Some(marker) = crate::jar_object::object_key(receiver)
-    {
-        host.recipes.menu_types.insert(
-            marker.to_owned(),
-            MenuTypeData {
-                supplier: args.first().cloned().unwrap_or(Value::Ref(None)),
-                features: args.get(1).cloned().unwrap_or(Value::Ref(None)),
-            },
-        );
-        return Some(Ok(Value::Void));
-    }
-
     // Item.asItem() on known server item handles returns `this`.
     if !host.in_client_frame()
         && matches!(

@@ -1,5 +1,6 @@
-SORTER_MOD_ORDER=[bad_form, cyc_a, cyc_b, mod_b, mod_c, mod_a, mod_y, mod_z, mod_x, nested_aaa, nested_zzz]
-RM_PACK_ORDER=[vanilla, bad_form, cyc_a, cyc_b, mod_a, mod_b, mod_c, mod_x, mod_y, mod_z, nested_aaa, nested_zzz, file/dp_override]
+SORTER_MOD_ORDER=[bad_form, cyc_a, cyc_b, emp_z, empty_bridge, emp_a, inv_a, inv_z, mod_b, mod_c, mod_a, mod_y, mod_z, mod_x, nested_aaa, nested_zzz]
+RM_PACK_ORDER=[vanilla, bad_form, cyc_a, cyc_b, emp_a, emp_z, empty_bridge, inv_a, inv_z, mod_a, mod_b, mod_c, mod_x, mod_y, mod_z, nested_aaa, nested_zzz, file/dp_override]
+EMPTY_BRIDGE_NAMESPACES=[empty_ns]
 BEFORE_RECIPE_WINNER=mod_c
 BEFORE_TAG_STACK=[mod_a, mod_b, mod_c]
 AFTER_RECIPE_WINNER=mod_z

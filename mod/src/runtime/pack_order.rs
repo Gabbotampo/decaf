@@ -86,7 +86,10 @@ pub(crate) struct JarDataLayer {
     pub(crate) fabric_mod_id: Option<String>,
     /// Raw `custom["fabric:resource_load_order"]` value from `fabric.mod.json`, if present.
     pub(crate) resource_load_order: Option<serde_json::Value>,
-    /// All `data/` entries belonging to this jar.
+    /// Valid immediate `data/<ns>/` namespace directories discovered in the jar (including empty
+    /// `data/<ns>/` directory entries with no files inside, matching `ModNioPackResources.readNamespaces`).
+    pub(crate) data_namespaces: BTreeSet<String>,
+    /// All `data/` file entries belonging to this jar.
     pub(crate) resources: BTreeMap<String, Vec<u8>>,
 }
 
@@ -182,23 +185,55 @@ impl PartialOrd for JavaStringKey {
     }
 }
 
-/// Check whether `resources` contains at least one valid `data/<ns>/...` namespace matching
-/// `ModNioPackResources.RESOURCE_PACK_PATH` (`[a-z0-9-_.]+`, `ModNioPackResources.<clinit>:8..14`,
-/// `readNamespaces:186..240`).
-pub(crate) fn has_valid_data_namespace(resources: &BTreeMap<String, Vec<u8>>) -> bool {
-    resources.keys().any(|path| {
-        let Some(rest) = path.strip_prefix("data/") else {
-            return false;
-        };
-        let Some((ns, tail)) = rest.split_once('/') else {
-            return false;
-        };
-        !ns.is_empty()
-            && !tail.is_empty()
-            && ns
-                .bytes()
-                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
-    })
+/// Check whether `ns` matches `ModNioPackResources.RESOURCE_PACK_PATH` (`[a-z0-9-_.]+`,
+/// `ModNioPackResources.<clinit>:8..14`, `readNamespaces:186..197`, verified on Java 25).
+pub(crate) fn is_valid_namespace(ns: &str) -> bool {
+    !ns.is_empty()
+        && ns
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.'))
+}
+
+/// Extract a valid Fabric `ModNioPackResources` server-data namespace from a ZIP entry path
+/// (`ModNioPackResources.readNamespaces:55..244`, `Files.isDirectory` at `87, 152`,
+/// `RESOURCE_PACK_PATH` match at `186..214`).
+///
+/// Matches JDK `ZipFileSystem` directory semantics:
+/// - Any entry under `data/<ns>/...` — including an empty directory entry `data/<ns>/` with no
+///   files inside — yields an immediate child directory `<ns>` of `data/`.
+/// - A bare file directly inside `data/` (`data/<file>`, no slash after `<file>`) fails
+///   `Files.isDirectory` (`readNamespaces:152`) and returns `None`.
+/// - `.` and `..` path segments normalize as in `ZipFileSystem`.
+/// - `<ns>` must match `[a-z0-9-_.]+`.
+pub(crate) fn valid_data_namespace_from_entry(entry_name: &str) -> Option<String> {
+    let mut normalized: Vec<&str> = Vec::new();
+    for seg in entry_name.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    if normalized.first().copied() != Some("data") {
+        return None;
+    }
+    let ns = *normalized.get(1)?;
+    let is_dir = normalized.len() >= 3 || (normalized.len() == 2 && entry_name.ends_with('/'));
+    (is_dir && is_valid_namespace(ns)).then(|| ns.to_owned())
+}
+
+/// Check whether a jar exposes at least one valid `data/<ns>/` namespace directory matching
+/// `ModNioPackResources.readNamespaces` (`0..338`) and `ModNioPackResources.create` (`314..334`).
+pub(crate) fn has_valid_data_namespace(
+    resources: &BTreeMap<String, Vec<u8>>,
+    namespaces: &BTreeSet<String>,
+) -> bool {
+    namespaces.iter().any(|ns| is_valid_namespace(ns))
+        || resources
+            .keys()
+            .any(|path| valid_data_namespace_from_entry(path).is_some())
 }
 
 #[derive(Default)]
@@ -527,6 +562,7 @@ pub(crate) fn resolve_data_pack_order<'a>(
     primary_mod_id: Option<&'a str>,
     primary_load_order: Option<&'a serde_json::Value>,
     primary_data_layer: &'a BTreeMap<String, Vec<u8>>,
+    primary_data_namespaces: &BTreeSet<String>,
     all_loaded_mod_ids: &BTreeSet<String>,
     explicit_datapacks: &'a [(String, BTreeMap<String, Vec<u8>>)],
 ) -> OrderedDataPacks<'a> {
@@ -537,7 +573,7 @@ pub(crate) fn resolve_data_pack_order<'a>(
 
     for entry in linked_layers {
         if let Some(mod_id) = entry.fabric_mod_id.as_deref() {
-            let valid_ns = has_valid_data_namespace(&entry.resources);
+            let valid_ns = has_valid_data_namespace(&entry.resources, &entry.data_namespaces);
             fabric_inputs.push(ModPackInput {
                 mod_id,
                 is_builtin: false,
@@ -553,9 +589,9 @@ pub(crate) fn resolve_data_pack_order<'a>(
         }
     }
 
-    if !primary_data_layer.is_empty() {
+    if !primary_data_layer.is_empty() || !primary_data_namespaces.is_empty() {
         if let Some(mod_id) = primary_mod_id {
-            let valid_ns = has_valid_data_namespace(primary_data_layer);
+            let valid_ns = has_valid_data_namespace(primary_data_layer, primary_data_namespaces);
             fabric_inputs.push(ModPackInput {
                 mod_id,
                 is_builtin: false,
@@ -568,7 +604,7 @@ pub(crate) fn resolve_data_pack_order<'a>(
                     (mod_id, primary_data_layer),
                 );
             }
-        } else {
+        } else if !primary_data_layer.is_empty() {
             non_fabric_layers.push(("primary", primary_data_layer));
         }
     }
@@ -627,6 +663,10 @@ mod tests {
         let cyc_b: serde_json::Value = serde_json::json!({"before": ["cyc_b"]});
         let cyc_a: serde_json::Value = serde_json::json!({"before": ["cyc_a"]});
         let bad_form: serde_json::Value = serde_json::json!("not_an_object");
+        let empty_bridge_order: serde_json::Value =
+            serde_json::json!({"before": ["emp_z"], "after": ["emp_a"]});
+        let empty_invalid_order: serde_json::Value =
+            serde_json::json!({"before": ["inv_z"], "after": ["inv_a"]});
 
         // Supply in a deliberately scrambled link order that disagrees with both id order
         // and `fabric:resource_load_order`.
@@ -635,74 +675,134 @@ mod tests {
                 link_id: "link_1".into(),
                 fabric_mod_id: Some("mod_c".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_2".into(),
                 fabric_mod_id: Some("mod_a".into()),
                 resource_load_order: Some(before_c),
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_3".into(),
                 fabric_mod_id: Some("mod_b".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_4".into(),
                 fabric_mod_id: Some("mod_z".into()),
                 resource_load_order: Some(after_x),
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_5".into(),
                 fabric_mod_id: Some("mod_x".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_6".into(),
                 fabric_mod_id: Some("mod_y".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "mod_a!META-INF/jars/nested_zzz.jar".into(),
                 fabric_mod_id: Some("nested_zzz".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "mod_c!META-INF/jars/nested_aaa.jar".into(),
                 fabric_mod_id: Some("nested_aaa".into()),
                 resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_9".into(),
                 fabric_mod_id: Some("cyc_b".into()),
                 resource_load_order: Some(cyc_a),
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_10".into(),
                 fabric_mod_id: Some("cyc_a".into()),
                 resource_load_order: Some(cyc_b),
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
             },
             JarDataLayer {
                 link_id: "link_11".into(),
                 fabric_mod_id: Some("bad_form".into()),
                 resource_load_order: Some(bad_form),
+                data_namespaces: BTreeSet::new(),
                 resources: map_with_recipe("orderprobe"),
+            },
+            JarDataLayer {
+                link_id: "link_12".into(),
+                fabric_mod_id: Some("emp_a".into()),
+                resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
+                resources: map_with_recipe("orderprobe"),
+            },
+            JarDataLayer {
+                link_id: "link_13".into(),
+                fabric_mod_id: Some("emp_z".into()),
+                resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
+                resources: map_with_recipe("orderprobe"),
+            },
+            // Empty `data/empty_ns/` directory with ZERO files inside `resources`:
+            JarDataLayer {
+                link_id: "link_14".into(),
+                fabric_mod_id: Some("empty_bridge".into()),
+                resource_load_order: Some(empty_bridge_order),
+                data_namespaces: BTreeSet::from(["empty_ns".to_owned()]),
+                resources: BTreeMap::new(),
+            },
+            JarDataLayer {
+                link_id: "link_15".into(),
+                fabric_mod_id: Some("inv_a".into()),
+                resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
+                resources: map_with_recipe("orderprobe"),
+            },
+            JarDataLayer {
+                link_id: "link_16".into(),
+                fabric_mod_id: Some("inv_z".into()),
+                resource_load_order: None,
+                data_namespaces: BTreeSet::new(),
+                resources: map_with_recipe("orderprobe"),
+            },
+            // Invalid uppercase dir + bare file under `data/`: must be excluded with its edges.
+            JarDataLayer {
+                link_id: "link_17".into(),
+                fabric_mod_id: Some("empty_invalid".into()),
+                resource_load_order: Some(empty_invalid_order),
+                data_namespaces: BTreeSet::new(),
+                resources: BTreeMap::from([(
+                    "data/plain_file.txt".to_owned(),
+                    b"not a directory".to_vec(),
+                )]),
             },
         ];
 
         let dp = vec![("file/dp_override".to_owned(), map_with_recipe("orderprobe"))];
         let empty = BTreeMap::new();
+        let empty_ns = BTreeSet::new();
         let all_ids = BTreeSet::new();
-        let ordered = resolve_data_pack_order(&linked, None, None, &empty, &all_ids, &dp);
+        let ordered =
+            resolve_data_pack_order(&linked, None, None, &empty, &empty_ns, &all_ids, &dp);
 
         // Stage 1 matches `SORTER_MOD_ORDER` captured from real Fabric 26.3:
         assert_eq!(
@@ -711,6 +811,11 @@ mod tests {
                 "bad_form",
                 "cyc_a",
                 "cyc_b",
+                "emp_z",
+                "empty_bridge",
+                "emp_a",
+                "inv_a",
+                "inv_z",
                 "mod_b",
                 "mod_c",
                 "mod_a",
@@ -729,6 +834,11 @@ mod tests {
                 "bad_form",
                 "cyc_a",
                 "cyc_b",
+                "emp_a",
+                "emp_z",
+                "empty_bridge",
+                "inv_a",
+                "inv_z",
                 "mod_a",
                 "mod_b",
                 "mod_c",
@@ -746,6 +856,34 @@ mod tests {
                 mod_id: "bad_form".into(),
             }]
         );
+    }
+
+    #[test]
+    fn valid_data_namespace_matches_mod_nio_read_namespaces() {
+        assert_eq!(
+            valid_data_namespace_from_entry("data/empty_ns/"),
+            Some("empty_ns".to_owned())
+        );
+        assert_eq!(
+            valid_data_namespace_from_entry("data/a-b_c.0/"),
+            Some("a-b_c.0".to_owned())
+        );
+        assert_eq!(
+            valid_data_namespace_from_entry("data/mod_x/recipe/a.json"),
+            Some("mod_x".to_owned())
+        );
+        assert_eq!(
+            valid_data_namespace_from_entry("data/./empty_ns/"),
+            Some("empty_ns".to_owned())
+        );
+        assert_eq!(valid_data_namespace_from_entry("data/"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/plain_file.txt"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/Bad_NS/"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/bad space/"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/bad:ns/"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/./"), None);
+        assert_eq!(valid_data_namespace_from_entry("data/../"), None);
+        assert_eq!(valid_data_namespace_from_entry("assets/empty_ns/"), None);
     }
 
     #[test]

@@ -2055,6 +2055,106 @@ public final class PackOrderProbe {
 }
 
 #[test]
+fn empty_data_namespace_directory_participates_in_pack_order_matching_oracle() {
+    const FABRIC_ORACLE: &str = include_str!("fixtures/recipes/fabric263_pack_order.txt");
+    let oracle: BTreeMap<&str, &str> = FABRIC_ORACLE
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    let emp_a = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-emp-a",
+        &[("dummy/EA.java", "package dummy; public class EA {}")],
+        r#"{"schemaVersion":1,"id":"emp_a","version":"1.0.0"}"#,
+        &[(
+            "data/orderprobe/recipe/emp_only.json",
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stick"}}"#,
+        )],
+    );
+    let emp_z = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-emp-z",
+        &[("dummy/EZ.java", "package dummy; public class EZ {}")],
+        r#"{"schemaVersion":1,"id":"emp_z","version":"1.0.0"}"#,
+        &[(
+            "data/orderprobe/recipe/emp_only.json",
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stick"}}"#,
+        )],
+    );
+    // Jar with ONLY an empty `data/empty_ns/` directory (zero files under `data/`) plus
+    // before/after constraints flipping `emp_z` ahead of `emp_a`.
+    let empty_bridge = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-bridge",
+        &[("dummy/EB.java", "package dummy; public class EB {}")],
+        r#"{"schemaVersion":1,"id":"empty_bridge","version":"1.0.0","custom":{"fabric:resource_load_order":{"before":["emp_z"],"after":["emp_a"]}}}"#,
+        &[("data/", b""), ("data/empty_ns/", b"")],
+    );
+    let inv_a = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-inv-a",
+        &[("dummy/IA.java", "package dummy; public class IA {}")],
+        r#"{"schemaVersion":1,"id":"inv_a","version":"1.0.0"}"#,
+        &[(
+            "data/orderprobe/recipe/inv_only.json",
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stick"}}"#,
+        )],
+    );
+    let inv_z = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-inv-z",
+        &[("dummy/IZ.java", "package dummy; public class IZ {}")],
+        r#"{"schemaVersion":1,"id":"inv_z","version":"1.0.0"}"#,
+        &[(
+            "data/orderprobe/recipe/inv_only.json",
+            br#"{"type":"minecraft:crafting_shapeless","ingredients":["minecraft:stone"],"result":{"id":"minecraft:stick"}}"#,
+        )],
+    );
+    // Jar with ONLY an invalid uppercase namespace directory `data/Bad_NS/` and a bare file
+    // `data/plain_file.txt`: ModNioPackResources.readNamespaces rejects both, so `empty_invalid`
+    // is excluded along with its `before`/`after` edges (`inv_a` stays before `inv_z`).
+    let empty_invalid = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "empty-ns-invalid",
+        &[("dummy/EI.java", "package dummy; public class EI {}")],
+        r#"{"schemaVersion":1,"id":"empty_invalid","version":"1.0.0","custom":{"fabric:resource_load_order":{"before":["inv_z"],"after":["inv_a"]}}}"#,
+        &[
+            ("data/", b""),
+            ("data/Bad_NS/", b""),
+            ("data/plain_file.txt", b"not a directory"),
+        ],
+    );
+
+    // Case 1: `empty_bridge` and `empty_invalid` as linked jars.
+    let mut host = emp_a.jar.seed_host(StdHost::new());
+    host.link_jar("emp_z", &emp_z.jar).unwrap();
+    host.link_jar("empty_bridge", &empty_bridge.jar).unwrap();
+    host.link_jar("inv_a", &inv_a.jar).unwrap();
+    host.link_jar("inv_z", &inv_z.jar).unwrap();
+    host.link_jar("empty_invalid", &empty_invalid.jar).unwrap();
+
+    let expected_subseq = vec!["emp_z", "empty_bridge", "emp_a", "inv_a", "inv_z"];
+    assert_eq!(host.mod_pack_sorter_order(), expected_subseq);
+    assert!(
+        oracle["SORTER_MOD_ORDER"].contains("emp_z, empty_bridge, emp_a, inv_a, inv_z"),
+        "oracle SORTER_MOD_ORDER={}",
+        oracle["SORTER_MOD_ORDER"]
+    );
+    assert_eq!(oracle["EMPTY_BRIDGE_NAMESPACES"], "[empty_ns]");
+    assert!(
+        !oracle["SORTER_MOD_ORDER"].contains("empty_invalid")
+            && !oracle["RM_PACK_ORDER"].contains("empty_invalid"),
+        "oracle must exclude empty_invalid: {oracle:?}"
+    );
+
+    // Case 2: `empty_bridge` as the primary seeded jar itself (same exact sorter order).
+    let mut host_primary = empty_bridge.jar.seed_host(StdHost::new());
+    host_primary.link_jar("emp_a", &emp_a.jar).unwrap();
+    host_primary.link_jar("emp_z", &emp_z.jar).unwrap();
+    host_primary.link_jar("inv_a", &inv_a.jar).unwrap();
+    host_primary.link_jar("inv_z", &inv_z.jar).unwrap();
+    host_primary
+        .link_jar("empty_invalid", &empty_invalid.jar)
+        .unwrap();
+    assert_eq!(host_primary.mod_pack_sorter_order(), expected_subseq);
+}
+
+#[test]
 fn unsupported_resource_load_order_constraints_are_counted() {
     let mut sources = STUBS.to_vec();
     sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));

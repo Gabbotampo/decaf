@@ -28,6 +28,11 @@ import net.minecraft.server.packs.resources.Resource;
  * - cycle breaking ({@code cyc_a} <-> {@code cyc_b})
  * - malformed {@code fabric:resource_load_order} ({@code bad_form})
  * - nested JiJ mods ({@code nested_zzz} in {@code mod_a}, {@code nested_aaa} in {@code mod_c})
+ * - empty {@code data/<ns>/} directory bridge ({@code empty_bridge} with empty {@code data/empty_ns/}
+ *   plus {@code before: ["emp_z"], after: ["emp_a"]} flipping {@code emp_z} ahead of {@code emp_a})
+ * - invalid/non-directory {@code data/} entries ({@code empty_invalid} with {@code data/Bad_NS/}
+ *   and bare file {@code data/plain_file.txt} plus {@code before: ["inv_z"], after: ["inv_a"]},
+ *   excluded by {@code ModNioPackResources.readNamespaces} so {@code inv_a} stays before {@code inv_z})
  * - world datapack ({@code file/dp_override})
  * - self-dependency exception in {@link ModPackResourcesSorter#addLoadOrdering}
  *
@@ -101,8 +106,15 @@ public final class FabricPackOrderOracle implements ModInitializer {
                     selfDep = cause.getClass().getName() + ": " + cause.getMessage();
                 }
 
+                List<String> emptyBridgeNs = sorted.stream()
+                    .filter(p -> "empty_bridge".equals(p.packId()))
+                    .flatMap(p -> p.getNamespaces(PackType.SERVER_DATA).stream())
+                    .sorted()
+                    .toList();
+
                 lines.add("SORTER_MOD_ORDER=" + sortedIds);
                 lines.add("RM_PACK_ORDER=" + rmPackIds);
+                lines.add("EMPTY_BRIDGE_NAMESPACES=" + emptyBridgeNs);
                 lines.add("BEFORE_RECIPE_WINNER=" + recBefore);
                 lines.add("BEFORE_TAG_STACK=" + tagBefore);
                 lines.add("AFTER_RECIPE_WINNER=" + recAfter);

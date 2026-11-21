@@ -250,8 +250,25 @@ pub(crate) const ITEM_STACK_METHODS: Methods = Methods {
     compare_to: None,
 };
 
-fn feature_flag_instance_of(_: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option<bool> {
-    Some(matches!(wanted, FEATURE_FLAG | "java/lang/Object"))
+fn crosses_jars_always(_: &HostRef, _: &dyn Fn(&Value) -> bool) -> bool {
+    true
+}
+
+fn feature_flag_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if matches!(wanted, FEATURE_FLAG | "java/lang/Object")
+        || hierarchy.is_instance(FEATURE_FLAG, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (wanted.starts_with('[')
+        || hierarchy.is_interface(wanted) == Some(false)
+        || crate::host_ref::exact_class_rules_out(FEATURE_FLAG, wanted)
+        || wanted == FEATURE_FLAG_SET)
+        .then_some(false)
 }
 
 pub(crate) const FEATURE_FLAG_METHODS: Methods = Methods {
@@ -259,12 +276,25 @@ pub(crate) const FEATURE_FLAG_METHODS: Methods = Methods {
     hash_code: unknown_hash,
     equals: identity_equals,
     instance_of: feature_flag_instance_of,
-    crosses_jars: stays_in_jar,
+    crosses_jars: crosses_jars_always,
     compare_to: None,
 };
 
-fn feature_flag_set_instance_of(_: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option<bool> {
-    Some(matches!(wanted, FEATURE_FLAG_SET | "java/lang/Object"))
+fn feature_flag_set_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if matches!(wanted, FEATURE_FLAG_SET | "java/lang/Object")
+        || hierarchy.is_instance(FEATURE_FLAG_SET, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (wanted.starts_with('[')
+        || hierarchy.is_interface(wanted) == Some(false)
+        || crate::host_ref::exact_class_rules_out(FEATURE_FLAG_SET, wanted)
+        || wanted == FEATURE_FLAG)
+        .then_some(false)
 }
 
 /// `FeatureFlagSet.equals(Object)` (`server-26.3.jar` offsets 0..47):
@@ -303,7 +333,7 @@ pub(crate) const FEATURE_FLAG_SET_METHODS: Methods = Methods {
     hash_code: feature_flag_set_hash,
     equals: feature_flag_set_equals,
     instance_of: feature_flag_set_instance_of,
-    crosses_jars: stays_in_jar,
+    crosses_jars: crosses_jars_always,
     compare_to: None,
 };
 
@@ -374,6 +404,31 @@ pub(crate) fn feature_flag_static_field(r: &MethodRef) -> Option<Value> {
         ) => Some(Value::Host(HostRef::new(HostKind::FeatureFlag, &r.name))),
         ("VANILLA_SET" | "DEFAULT_FLAGS", "Lnet/minecraft/world/flag/FeatureFlagSet;") => {
             Some(vanilla_feature_flag_set())
+        }
+        _ => None,
+    }
+}
+
+/// `FeatureFlags.isExperimental(FeatureFlagSet)` (`server-26.3.jar` offsets 0..15):
+/// `return !features.isSubsetOf(VANILLA_SET);`
+/// Throws `NullPointerException` with HotSpot's exact message when `features` is null.
+pub(crate) fn feature_flags_static_call(
+    r: &MethodRef,
+    args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    if r.owner != FEATURE_FLAGS {
+        return None;
+    }
+    match (r.name.as_str(), r.descriptor.as_str(), args) {
+        ("isExperimental", "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z", [features]) => {
+            if matches!(features, Value::Ref(None)) {
+                return Some(Err(npe(
+                    "Cannot invoke \"net.minecraft.world.flag.FeatureFlagSet.isSubsetOf(net.minecraft.world.flag.FeatureFlagSet)\" because \"features\" is null",
+                )));
+            }
+            let mask = feature_flag_set_mask(features)?;
+            let is_subset = (mask & !FEATURE_VANILLA_SET) == 0;
+            Some(Ok(Value::Int(i32::from(!is_subset))))
         }
         _ => None,
     }
@@ -768,6 +823,9 @@ pub(crate) fn static_call(
             k,
         ))));
     }
+    if let Some(res) = feature_flags_static_call(r, args) {
+        return Some(res);
+    }
     feature_flag_set_static_call(state, r, args)
 }
 
@@ -1054,5 +1112,154 @@ mod output_tests {
             Value::Int(1)
         );
         assert_eq!(host.unknown_host_call_count(), 0);
+    }
+
+    #[test]
+    fn feature_flags_is_experimental_and_handle_metadata_match_mc263() {
+        use crate::Host;
+
+        let mut host = crate::StdHost::new();
+        let m = |owner: &str, name: &str, descriptor: &str| MethodRef {
+            owner: owner.into(),
+            name: name.into(),
+            descriptor: descriptor.into(),
+        };
+        let vanilla = host
+            .get_static(&m(FEATURE_FLAGS, "VANILLA", &format!("L{FEATURE_FLAG};")))
+            .unwrap();
+        let trade = host
+            .get_static(&m(
+                FEATURE_FLAGS,
+                "TRADE_REBALANCE",
+                &format!("L{FEATURE_FLAG};"),
+            ))
+            .unwrap();
+        let vanilla_set = host
+            .get_static(&m(
+                FEATURE_FLAGS,
+                "VANILLA_SET",
+                &format!("L{FEATURE_FLAG_SET};"),
+            ))
+            .unwrap();
+        let empty = host
+            .invoke(
+                &m(FEATURE_FLAG_SET, "of", &format!("()L{FEATURE_FLAG_SET};")),
+                &[],
+            )
+            .unwrap();
+        let of_vanilla = host
+            .invoke(
+                &m(
+                    FEATURE_FLAG_SET,
+                    "of",
+                    &format!("(L{FEATURE_FLAG};)L{FEATURE_FLAG_SET};"),
+                ),
+                std::slice::from_ref(&vanilla),
+            )
+            .unwrap();
+        let of_trade = host
+            .invoke(
+                &m(
+                    FEATURE_FLAG_SET,
+                    "of",
+                    &format!("(L{FEATURE_FLAG};)L{FEATURE_FLAG_SET};"),
+                ),
+                std::slice::from_ref(&trade),
+            )
+            .unwrap();
+        let joined = host
+            .invoke_instance(
+                &m(
+                    FEATURE_FLAG_SET,
+                    "join",
+                    &format!("(L{FEATURE_FLAG_SET};)L{FEATURE_FLAG_SET};"),
+                ),
+                &vanilla_set,
+                std::slice::from_ref(&of_trade),
+            )
+            .unwrap();
+        let is_exp = m(
+            FEATURE_FLAGS,
+            "isExperimental",
+            &format!("(L{FEATURE_FLAG_SET};)Z"),
+        );
+        assert_eq!(
+            host.invoke(&is_exp, std::slice::from_ref(&empty)).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(&is_exp, std::slice::from_ref(&vanilla_set))
+                .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(&is_exp, std::slice::from_ref(&of_vanilla))
+                .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke(&is_exp, std::slice::from_ref(&of_trade))
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke(&is_exp, std::slice::from_ref(&joined)).unwrap(),
+            Value::Int(1)
+        );
+        assert!(matches!(
+            host.invoke(&is_exp, &[Value::Ref(None)]),
+            Err(NativeError::UncaughtException {
+                class,
+                message: Some(msg),
+                ..
+            }) if class == "java/lang/NullPointerException"
+                && msg == "Cannot invoke \"net.minecraft.world.flag.FeatureFlagSet.isSubsetOf(net.minecraft.world.flag.FeatureFlagSet)\" because \"features\" is null"
+        ));
+        assert_eq!(host.unknown_host_call_count(), 0);
+
+        // `crosses_jars` is true for both FeatureFlag and FeatureFlagSet, and `instance_of`
+        // consults ClassHierarchy (honouring Mixin-added interfaces while ruling out final JDK types).
+        struct WithMixin;
+        impl ClassHierarchy for WithMixin {
+            fn is_instance(&self, class: &str, wanted: &str) -> Option<bool> {
+                if (class == FEATURE_FLAG || class == FEATURE_FLAG_SET)
+                    && wanted == "demo/MixinAdded"
+                {
+                    return Some(true);
+                }
+                crate::host_ref::JdkHierarchy.is_instance(class, wanted)
+            }
+            fn is_interface(&self, class: &str) -> Option<bool> {
+                crate::host_ref::JdkHierarchy.is_interface(class)
+            }
+        }
+        let Value::Host(flag_h) = &vanilla else {
+            panic!("expected HostRef for FeatureFlag");
+        };
+        let Value::Host(set_h) = &vanilla_set else {
+            panic!("expected HostRef for FeatureFlagSet");
+        };
+        assert!(flag_h.crosses_jars(&|_| false));
+        assert!(set_h.crosses_jars(&|_| false));
+        assert_eq!(
+            flag_h.instance_of("demo/MixinAdded", &WithMixin),
+            Some(true)
+        );
+        assert_eq!(set_h.instance_of("demo/MixinAdded", &WithMixin), Some(true));
+        assert_eq!(
+            flag_h.instance_of("java/lang/String", &WithMixin),
+            Some(false)
+        );
+        assert_eq!(
+            set_h.instance_of("java/lang/String", &WithMixin),
+            Some(false)
+        );
+        assert_eq!(
+            flag_h.instance_of(FEATURE_FLAG_SET, &WithMixin),
+            Some(false)
+        );
+        assert_eq!(set_h.instance_of(FEATURE_FLAG, &WithMixin), Some(false));
+        assert_eq!(flag_h.instance_of("demo/UnknownIface", &WithMixin), None);
+        assert_eq!(set_h.instance_of("demo/UnknownIface", &WithMixin), None);
     }
 }

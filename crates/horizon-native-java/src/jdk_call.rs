@@ -318,13 +318,6 @@ impl<H: Host> Runtime<'_, H> {
             return Err(null_checks::invoke_on_null(&r));
         }
         let opcode = if kind == Site::Interface { 0xb9 } else { 0xb6 };
-        if (crate::menu_models::is_menu_class(owner)
-            || self.jar_extends(owner, "net/minecraft/world/SimpleContainer")
-            || self.jar_extends(owner, "net/minecraft/world/inventory/ResultContainer"))
-            && let Some(value) = self.invoke_menu_model(&r, opcode, receiver, args)?
-        {
-            return Ok(value);
-        }
         if self.host.is_chm_set(receiver)
             && crate::jdk_new_set_from_map::chm_set_ordered_read(name, descriptor)
         {
@@ -332,6 +325,9 @@ impl<H: Host> Runtime<'_, H> {
         }
         if let Some(body) = self.jvm_selected_jar_body(&r, opcode, Some(receiver))? {
             return self.invoke(&body, name, descriptor, Some(receiver.clone()), args);
+        }
+        if let Some(value) = self.invoke_screen_or_menu_method(&r, opcode, receiver, args)? {
+            return Ok(value);
         }
         if name == "compareTo"
             && crate::object_methods::is_compare_to(descriptor)
