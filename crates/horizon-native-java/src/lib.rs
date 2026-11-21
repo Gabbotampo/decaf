@@ -2408,8 +2408,13 @@ pub trait Host {
         None
     }
 
-    fn menu_field_set(&mut self, _receiver: &Value, _r: &MethodRef, _value: &Value) -> bool {
-        false
+    fn menu_field_set(
+        &mut self,
+        _receiver: &Value,
+        _r: &MethodRef,
+        _value: &Value,
+    ) -> menu_models::FieldSetResult {
+        menu_models::FieldSetResult::NotOwned
     }
 
     fn menu_screen_initialized(&self, _screen: &Value) -> Option<bool> {
@@ -2426,6 +2431,54 @@ pub trait Host {
         None
     }
 
+    fn menu_remove_slot_listener(&mut self, _menu: &Value, _listener: &Value) -> Option<bool> {
+        None
+    }
+
+    fn menu_combiner_access(&self, _menu: &Value) -> Option<Value> {
+        None
+    }
+
+    fn menu_slot_container_and_index(&self, _slot: &Value) -> Option<(Value, i32)> {
+        None
+    }
+
+    fn menu_register_slot(
+        &mut self,
+        _slot: &Value,
+        _container: Value,
+        _container_slot: i32,
+        _x: i32,
+        _y: i32,
+        _may_place: Option<Value>,
+        _kind: menu_models::ScreenSlotKind,
+    ) {
+    }
+
+    fn menu_register_container_screen(
+        &mut self,
+        _screen: &Value,
+        _menu: Value,
+        _player_inventory_title: Value,
+        _title: Value,
+        _image_width: i32,
+        _image_height: i32,
+        _menu_resource: Option<Value>,
+    ) {
+    }
+
+    fn menu_register_combiner(
+        &mut self,
+        _menu: &Value,
+        _menu_type: Value,
+        _container_id: i32,
+        _access: Value,
+        _player: Value,
+        _definition: &Value,
+    ) -> Option<menu_models::CombinerInit> {
+        None
+    }
+
     fn menu_broadcast_slots(&self, _menu: &Value) -> Option<Vec<menu_models::BroadcastSlot>> {
         None
     }
@@ -2434,10 +2487,18 @@ pub trait Host {
         Vec::new()
     }
 
-    fn menu_set_last_slot(&mut self, _menu: &Value, _index: usize, _stack: Value) {}
+    fn menu_set_last_slot(&mut self, _menu: &Value, _index: usize, _slot: menu_models::LastSlot) {}
 
-    fn client_inventory_slot_is_empty(&self, _container_slot: usize) -> Option<bool> {
+    fn client_inventory_stack(&self, _container_slot: i32) -> Option<client_surface::ClientStack> {
         None
+    }
+
+    fn client_has_player(&self) -> bool {
+        false
+    }
+
+    fn unknown_call_count(&self) -> usize {
+        0
     }
 
     /// Record one property added to a `StateDefinition.Builder` while a block
@@ -3820,6 +3881,7 @@ pub struct StdHost {
     fabric_biome_modifications: fabric_biome_modifications::State,
     vec2: vec2::State,
     menu_states: menu_models::States,
+    next_menu_object: u64,
 }
 
 impl Default for StdHost {
@@ -4008,6 +4070,7 @@ impl StdHost {
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
+            next_menu_object: 0,
         }
     }
 
@@ -6139,6 +6202,7 @@ impl Host for StdHost {
             .then(|| crate::game_object::client_value("client/player".into()));
         menu_models::call_with_client_player(
             &mut self.menu_states,
+            &mut self.next_menu_object,
             r,
             receiver,
             args,
@@ -6150,7 +6214,12 @@ impl Host for StdHost {
         menu_models::field(&self.menu_states, receiver, r)
     }
 
-    fn menu_field_set(&mut self, receiver: &Value, r: &MethodRef, value: &Value) -> bool {
+    fn menu_field_set(
+        &mut self,
+        receiver: &Value,
+        r: &MethodRef,
+        value: &Value,
+    ) -> menu_models::FieldSetResult {
         menu_models::set_field(&mut self.menu_states, receiver, r, value)
     }
 
@@ -6170,6 +6239,83 @@ impl Host for StdHost {
         menu_models::menu_add_slot_listener(&mut self.menu_states, menu, listener)
     }
 
+    fn menu_remove_slot_listener(&mut self, menu: &Value, listener: &Value) -> Option<bool> {
+        menu_models::menu_remove_slot_listener(&mut self.menu_states, menu, listener)
+    }
+
+    fn menu_combiner_access(&self, menu: &Value) -> Option<Value> {
+        menu_models::menu_combiner_access(&self.menu_states, menu)
+    }
+
+    fn menu_slot_container_and_index(&self, slot: &Value) -> Option<(Value, i32)> {
+        menu_models::slot_container_and_index(&self.menu_states, slot)
+    }
+
+    fn menu_register_slot(
+        &mut self,
+        slot: &Value,
+        container: Value,
+        container_slot: i32,
+        x: i32,
+        y: i32,
+        may_place: Option<Value>,
+        kind: menu_models::ScreenSlotKind,
+    ) {
+        menu_models::register_slot(
+            &mut self.menu_states,
+            slot,
+            container,
+            container_slot,
+            x,
+            y,
+            may_place,
+            kind,
+        );
+    }
+
+    fn menu_register_container_screen(
+        &mut self,
+        screen: &Value,
+        menu: Value,
+        player_inventory_title: Value,
+        title: Value,
+        image_width: i32,
+        image_height: i32,
+        menu_resource: Option<Value>,
+    ) {
+        menu_models::register_container_screen(
+            &mut self.menu_states,
+            screen,
+            menu,
+            player_inventory_title,
+            title,
+            image_width,
+            image_height,
+            menu_resource,
+        );
+    }
+
+    fn menu_register_combiner(
+        &mut self,
+        menu: &Value,
+        menu_type: Value,
+        container_id: i32,
+        access: Value,
+        player: Value,
+        definition: &Value,
+    ) -> Option<menu_models::CombinerInit> {
+        menu_models::register_combiner_menu(
+            &mut self.menu_states,
+            &mut self.next_menu_object,
+            menu,
+            menu_type,
+            container_id,
+            access,
+            player,
+            definition,
+        )
+    }
+
     fn menu_broadcast_slots(&self, menu: &Value) -> Option<Vec<menu_models::BroadcastSlot>> {
         menu_models::menu_broadcast_slots(&self.menu_states, menu)
     }
@@ -6178,12 +6324,20 @@ impl Host for StdHost {
         menu_models::menu_listeners(&self.menu_states, menu)
     }
 
-    fn menu_set_last_slot(&mut self, menu: &Value, index: usize, stack: Value) {
-        menu_models::menu_set_last_slot(&mut self.menu_states, menu, index, stack);
+    fn menu_set_last_slot(&mut self, menu: &Value, index: usize, slot: menu_models::LastSlot) {
+        menu_models::menu_set_last_slot(&mut self.menu_states, menu, index, slot);
     }
 
-    fn client_inventory_slot_is_empty(&self, container_slot: usize) -> Option<bool> {
-        self.client_inventory_stack_is_empty(container_slot)
+    fn client_inventory_stack(&self, container_slot: i32) -> Option<client_surface::ClientStack> {
+        StdHost::client_inventory_stack(self, container_slot)
+    }
+
+    fn client_has_player(&self) -> bool {
+        StdHost::client_has_player(self)
+    }
+
+    fn unknown_call_count(&self) -> usize {
+        self.unknown_host_call_count()
     }
 
     fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
@@ -7515,7 +7669,8 @@ impl Host for StdHost {
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
         if menu_models::is_menu_class(&r.owner)
-            && let Some(value) = menu_models::static_call(&mut self.menu_states, r, args)
+            && let Some(value) =
+                menu_models::static_call(&mut self.menu_states, &mut self.next_menu_object, r, args)
         {
             return value;
         }
@@ -31388,7 +31543,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Walk jar superclasses from `class` and return the first non-jar
     /// superclass (the vanilla/platform base class where the jar hierarchy exits).
-    pub(crate) fn vanilla_superclass(&self, class: &str) -> Option<String> {
+    fn vanilla_superclass(&self, class: &str) -> Option<String> {
         let mut current = class.to_owned();
         for _ in 0..MAX_SUPERCLASS_WALK {
             let Some(file) = self.class(&current) else {
@@ -31407,7 +31562,7 @@ impl<H: Host> Runtime<'_, H> {
     /// `MenuType`/`Slot`/`Container` call after `jvm_selected_jar_body` has
     /// already given any jar override first crack (for `0xb6`/`0xb9`) or for
     /// `invokespecial` (`0xb7`) targeting a non-jar superclass.
-    pub(crate) fn invoke_screen_or_menu_method(
+    fn invoke_screen_or_menu_method(
         &mut self,
         r: &MethodRef,
         op: u8,
@@ -31465,6 +31620,133 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(value));
         }
 
+        // 26.3 AbstractContainerScreen / ItemCombinerScreen constructors:
+        // resolve `inventory.getDisplayName()` via virtual dispatch so jar
+        // Inventory subclasses overriding `getDisplayName`/`getName` run as
+        // bytecode and a missing client player is counted.
+        if r.name == "<init>" {
+            match (effective_owner.as_str(), r.descriptor.as_str()) {
+                (
+                    menu_models::ABSTRACT_CONTAINER_SCREEN,
+                    "(Lnet/minecraft/world/inventory/AbstractContainerMenu;Lnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/network/chat/Component;)V",
+                ) => {
+                    if let [menu, inventory, title] = args {
+                        return self
+                            .invoke_container_screen_init(
+                                receiver,
+                                menu.clone(),
+                                inventory,
+                                title.clone(),
+                                176,
+                                166,
+                                None,
+                            )
+                            .map(Some);
+                    }
+                }
+                (
+                    menu_models::ABSTRACT_CONTAINER_SCREEN,
+                    "(Lnet/minecraft/world/inventory/AbstractContainerMenu;Lnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/network/chat/Component;II)V",
+                ) => {
+                    if let [
+                        menu,
+                        inventory,
+                        title,
+                        Value::Int(image_width),
+                        Value::Int(image_height),
+                    ] = args
+                    {
+                        return self
+                            .invoke_container_screen_init(
+                                receiver,
+                                menu.clone(),
+                                inventory,
+                                title.clone(),
+                                *image_width,
+                                *image_height,
+                                None,
+                            )
+                            .map(Some);
+                    }
+                }
+                (
+                    menu_models::ITEM_COMBINER_SCREEN,
+                    "(Lnet/minecraft/world/inventory/ItemCombinerMenu;Lnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/network/chat/Component;Lnet/minecraft/resources/Identifier;)V",
+                ) => {
+                    if let [menu, inventory, title, texture] = args {
+                        return self
+                            .invoke_container_screen_init(
+                                receiver,
+                                menu.clone(),
+                                inventory,
+                                title.clone(),
+                                176,
+                                166,
+                                Some(texture.clone()),
+                            )
+                            .map(Some);
+                    }
+                }
+                // 26.3 ItemCombinerMenu.<init> offsets 0-75: NPE on null inventory,
+                // count `inventory.player` when client frame has no player, and
+                // virtually dispatch `addSlot` (offsets 55/34) and `addStandardInventorySlots` (72).
+                (
+                    menu_models::ITEM_COMBINER_MENU,
+                    "(Lnet/minecraft/world/inventory/MenuType;ILnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/inventory/ContainerLevelAccess;Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition;)V",
+                ) => {
+                    return self.invoke_item_combiner_menu_init(receiver, args);
+                }
+                _ => {}
+            }
+        }
+
+        // 26.3 Nameable.getDisplayName offsets 0-6 delegates virtually to getName():
+        // respect a jar Inventory subclass overriding getName().
+        if effective_owner == menu_models::INVENTORY
+            && r.name == "getDisplayName"
+            && r.descriptor == "()Lnet/minecraft/network/chat/Component;"
+        {
+            let get_name_ref = MethodRef {
+                owner: menu_models::INVENTORY.into(),
+                name: "getName".into(),
+                descriptor: "()Lnet/minecraft/network/chat/Component;".into(),
+            };
+            if let Some(owner) = self.jvm_selected_jar_body(&get_name_ref, 0xb6, Some(receiver))? {
+                return self
+                    .invoke(
+                        &owner,
+                        "getName",
+                        "()Lnet/minecraft/network/chat/Component;",
+                        Some(receiver.clone()),
+                        &[],
+                    )
+                    .map(Some);
+            }
+        }
+
+        // 26.3 Slot.getItem() offsets 0-13: `return this.container.getItem(this.slot);`
+        if matches!(
+            effective_owner.as_str(),
+            menu_models::SLOT
+                | "net/minecraft/world/inventory/ItemCombinerMenu$2"
+                | "net/minecraft/world/inventory/ItemCombinerMenu$3"
+        ) && r.name == "getItem"
+            && r.descriptor == "()Lnet/minecraft/world/item/ItemStack;"
+            && let Some((container, container_slot)) =
+                self.host.menu_slot_container_and_index(receiver)
+        {
+            return self
+                .call_virtual(
+                    jdk_call::Site::Interface,
+                    "net/minecraft/world/Container",
+                    "getItem",
+                    "(I)Lnet/minecraft/world/item/ItemStack;",
+                    &container,
+                    &[Value::Int(container_slot)],
+                )
+                .map(Some);
+        }
+
         if matches!(
             effective_owner.as_str(),
             menu_models::ABSTRACT_CONTAINER_MENU | menu_models::ITEM_COMBINER_MENU
@@ -31476,14 +31758,54 @@ impl<H: Host> Runtime<'_, H> {
                         return Ok(Some(Value::Void));
                     }
                 }
+                // 26.3 AbstractContainerMenu.removeSlotListener offsets 0-11
+                ("removeSlotListener", "(Lnet/minecraft/world/inventory/ContainerListener;)V") => {
+                    if let Some(listener) = args.first()
+                        && self
+                            .host
+                            .menu_remove_slot_listener(receiver, listener)
+                            .is_some()
+                    {
+                        return Ok(Some(Value::Void));
+                    }
+                }
+                // 26.3 AbstractContainerMenu.removed(Player) offsets 0-32 +
+                // ItemCombinerMenu.removed(Player) offsets 0-21.
+                ("removed", "(Lnet/minecraft/world/entity/player/Player;)V") => {
+                    if let Some(player) = args.first()
+                        && crate::game_object::handle_key(player) == Some("client/player")
+                    {
+                        if effective_owner == menu_models::ITEM_COMBINER_MENU {
+                            if self
+                                .host
+                                .menu_combiner_access(receiver)
+                                .as_ref()
+                                .and_then(expect_ref)
+                                .is_some_and(|k| k == "container-level-access/null")
+                            {
+                                return Ok(Some(Value::Void));
+                            }
+                        } else {
+                            return Ok(Some(Value::Void));
+                        }
+                    }
+                }
                 ("broadcastChanges", "()V") => {
                     self.invoke_menu_broadcast_changes(receiver)?;
                     return Ok(Some(Value::Void));
                 }
+                // 26.3 AbstractContainerMenu.addStandardInventorySlots offsets 0-24:
+                //   4:  this.addInventoryExtendedSlots(container, x, y)
+                //   21: this.addInventoryHotbarSlots(container, x, y + 58)
+                ("addStandardInventorySlots", "(Lnet/minecraft/world/Container;II)V") => {
+                    if let [container, Value::Int(x), Value::Int(y)] = args {
+                        return self
+                            .invoke_menu_add_standard_inventory_slots(receiver, container, *x, *y)
+                            .map(Some);
+                    }
+                }
                 (
-                    name @ ("addStandardInventorySlots"
-                    | "addInventoryExtendedSlots"
-                    | "addInventoryHotbarSlots"),
+                    name @ ("addInventoryExtendedSlots" | "addInventoryHotbarSlots"),
                     "(Lnet/minecraft/world/Container;II)V",
                 ) => {
                     if let [container, Value::Int(x), Value::Int(y)] = args {
@@ -31509,11 +31831,187 @@ impl<H: Host> Runtime<'_, H> {
         Ok(None)
     }
 
+    /// 26.3 `AbstractContainerScreen.<init>` (offsets 0-87) / `ItemCombinerScreen.<init>`
+    /// (offsets 0-13): resolves `inventory.getDisplayName()` virtually so jar `Inventory`
+    /// overrides execute as bytecode and a missing client player is counted.
+    fn invoke_container_screen_init(
+        &mut self,
+        screen: &Value,
+        menu: Value,
+        inventory: &Value,
+        title: Value,
+        image_width: i32,
+        image_height: i32,
+        menu_resource: Option<Value>,
+    ) -> Result<Value, NativeError> {
+        let player_inventory_title = self.call_virtual(
+            jdk_call::Site::Virtual,
+            menu_models::INVENTORY,
+            "getDisplayName",
+            "()Lnet/minecraft/network/chat/Component;",
+            inventory,
+            &[],
+        )?;
+        self.host.menu_register_container_screen(
+            screen,
+            menu,
+            player_inventory_title,
+            title,
+            image_width,
+            image_height,
+            menu_resource,
+        );
+        Ok(Value::Void)
+    }
+
+    /// 26.3 `ItemCombinerMenu.<init>` offsets 0-75:
+    ///   26: `this.player = inventory.player` (NPE on null inventory; counts when client has no player)
+    ///   39: `createContainer(def.getNumOfInputSlots())`
+    ///   54: `createInputSlots(def)` -> virtual `addSlot` (offset 55)
+    ///   60: `createResultSlot(def)` -> virtual `addSlot` (offset 34)
+    ///   72: virtual `addStandardInventorySlots(inventory, 8, 84)`
+    fn invoke_item_combiner_menu_init(
+        &mut self,
+        menu: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let [
+            menu_type,
+            Value::Int(container_id),
+            inventory,
+            access,
+            definition,
+        ] = args
+        else {
+            return Ok(None);
+        };
+        let inv_player_ref = MethodRef {
+            owner: menu_models::INVENTORY.into(),
+            name: "player".into(),
+            descriptor: "Lnet/minecraft/world/entity/player/Player;".into(),
+        };
+        if *inventory == Value::Ref(None) {
+            return Err(null_checks::read_field_on_null(&inv_player_ref));
+        }
+        let player = if crate::game_object::handle_key(inventory) == Some("client/inventory") {
+            if self.host.client_has_player() {
+                crate::game_object::client_value("client/player".into())
+            } else {
+                // Count `Inventory.player` when client frame has no player.
+                self.host.get_field(inventory, &inv_player_ref)?
+            }
+        } else if let Some(player) = self.host.menu_field(inventory, &inv_player_ref) {
+            player
+        } else {
+            self.host.get_field(inventory, &inv_player_ref)?
+        };
+        if *definition == Value::Ref(None) {
+            return Err(null_checks::invoke_on_null(&MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "getNumOfInputSlots".into(),
+                descriptor: "()I".into(),
+            }));
+        }
+        let create_container_ref = MethodRef {
+            owner: menu_models::ITEM_COMBINER_MENU.into(),
+            name: "createContainer".into(),
+            descriptor: "(I)Lnet/minecraft/world/SimpleContainer;".into(),
+        };
+        if let Some(owner) = self.jvm_selected_jar_body(&create_container_ref, 0xb6, Some(menu))? {
+            self.host.unknown_operand_call(&MethodRef {
+                owner,
+                ..create_container_ref
+            })?;
+        }
+        let Some(init) = self.host.menu_register_combiner(
+            menu,
+            menu_type.clone(),
+            *container_id,
+            access.clone(),
+            player,
+            definition,
+        ) else {
+            return Ok(None);
+        };
+        let add_slot_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "addSlot".into(),
+            descriptor:
+                "(Lnet/minecraft/world/inventory/Slot;)Lnet/minecraft/world/inventory/Slot;".into(),
+        };
+        let jar_add_slot = self.jvm_selected_jar_body(&add_slot_ref, 0xb6, Some(menu))?;
+        // 26.3 ItemCombinerMenu.createInputSlots offsets 0-62 (addSlot at offset 55)
+        for def in init.inputs {
+            let slot = self.new_object("net/minecraft/world/inventory/ItemCombinerMenu$2");
+            self.host.menu_register_slot(
+                &slot,
+                init.input.clone(),
+                def.index,
+                def.x,
+                def.y,
+                Some(def.may_place),
+                menu_models::ScreenSlotKind::Container,
+            );
+            if let Some(owner) = &jar_add_slot {
+                let _ = self.invoke(
+                    owner,
+                    "addSlot",
+                    &add_slot_ref.descriptor,
+                    Some(menu.clone()),
+                    &[slot],
+                )?;
+            } else {
+                let _ = self.invoke_menu_model(&add_slot_ref, menu, &[slot])?;
+            }
+        }
+        // 26.3 ItemCombinerMenu.createResultSlot offsets 0-38 (addSlot at offset 34)
+        let res = init.result_slot;
+        let result_slot = self.new_object("net/minecraft/world/inventory/ItemCombinerMenu$3");
+        self.host.menu_register_slot(
+            &result_slot,
+            init.result,
+            res.index,
+            res.x,
+            res.y,
+            Some(res.may_place),
+            menu_models::ScreenSlotKind::Result,
+        );
+        if let Some(owner) = &jar_add_slot {
+            let _ = self.invoke(
+                owner,
+                "addSlot",
+                &add_slot_ref.descriptor,
+                Some(menu.clone()),
+                &[result_slot],
+            )?;
+        } else {
+            let _ = self.invoke_menu_model(&add_slot_ref, menu, &[result_slot])?;
+        }
+        // 26.3 ItemCombinerMenu.<init> offset 72: virtual addStandardInventorySlots(inventory, 8, 84)
+        let std_slots_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "addStandardInventorySlots".into(),
+            descriptor: "(Lnet/minecraft/world/Container;II)V".into(),
+        };
+        if let Some(owner) = self.jvm_selected_jar_body(&std_slots_ref, 0xb6, Some(menu))? {
+            let _ = self.invoke(
+                &owner,
+                "addStandardInventorySlots",
+                &std_slots_ref.descriptor,
+                Some(menu.clone()),
+                &[inventory.clone(), Value::Int(8), Value::Int(84)],
+            )?;
+        } else {
+            let _ = self.invoke_menu_add_standard_inventory_slots(menu, inventory, 8, 84)?;
+        }
+        Ok(Some(Value::Void))
+    }
+
     /// 26.3 `AbstractContainerMenu.addSlotListener` offsets 0-29:
     ///   0-13:  if (containerListeners.contains(listener)) return;
     ///   14-24: containerListeners.add(listener);
     ///   25-26: this.broadcastChanges();
-    pub(crate) fn invoke_menu_add_slot_listener(
+    fn invoke_menu_add_slot_listener(
         &mut self,
         menu: &Value,
         listener: &Value,
@@ -31544,42 +32042,55 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// 26.3 `AbstractContainerMenu.broadcastChanges` offsets 0-63 + `triggerSlotListeners`
-    /// offsets 0-91: compare each slot's current stack against `lastSlots`, and on mismatch
-    /// update `lastSlots` and notify every `ContainerListener.slotChanged`.
-    pub(crate) fn invoke_menu_broadcast_changes(
-        &mut self,
-        menu: &Value,
-    ) -> Result<(), NativeError> {
+    /// offsets 0-91 + `ItemStack.matches` offsets 0-25:
+    /// - Offset 24: virtual `Slot.getItem()` (runs jar `Slot` overrides as bytecode)
+    /// - Offset 30: `Objects.requireNonNull(stack)` -> throws NPE on null stack
+    /// - Counts `broadcastChanges` if `getItem` hits an unknown host call or if
+    ///   `ItemStack.matches` cannot be determined from tracked stack contents.
+    fn invoke_menu_broadcast_changes(&mut self, menu: &Value) -> Result<(), NativeError> {
+        let broadcast_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "broadcastChanges".into(),
+            descriptor: "()V".into(),
+        };
         let Some(entries) = self.host.menu_broadcast_slots(menu) else {
-            let r = MethodRef {
-                owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
-                name: "broadcastChanges".into(),
-                descriptor: "()V".into(),
-            };
-            self.host.unknown_operand_call(&r)?;
+            self.host.unknown_operand_call(&broadcast_ref)?;
             return Ok(());
+        };
+        let slot_get_item_ref = MethodRef {
+            owner: menu_models::SLOT.into(),
+            name: "getItem".into(),
+            descriptor: "()Lnet/minecraft/world/item/ItemStack;".into(),
         };
         let empty = menu_models::empty_stack();
         for entry in entries {
-            let current = if let Some(stack) = entry.known_current {
+            let unknown_before = self.host.unknown_call_count();
+            let mut client_stack_snapshot: Option<client_surface::ClientStack> = None;
+            let current = if let Some(owner) =
+                self.jvm_selected_jar_body(&slot_get_item_ref, 0xb6, Some(&entry.slot))?
+            {
+                self.invoke(
+                    &owner,
+                    "getItem",
+                    &slot_get_item_ref.descriptor,
+                    Some(entry.slot.clone()),
+                    &[],
+                )?
+            } else if let Some(stack) = entry.known_current {
                 stack
             } else if crate::game_object::handle_key(&entry.container) == Some("client/inventory") {
-                match self
-                    .host
-                    .client_inventory_slot_is_empty(entry.container_slot as usize)
-                {
-                    Some(true) => empty.clone(),
-                    Some(false) => crate::game_object::client_value(format!(
-                        "client/stack/{}",
-                        entry.container_slot
-                    )),
+                match self.host.client_inventory_stack(entry.container_slot) {
+                    Some(stack) => {
+                        let is_empty = stack.is_empty();
+                        client_stack_snapshot = Some(stack);
+                        if is_empty {
+                            empty.clone()
+                        } else {
+                            client_surface::inventory_stack_marker(entry.container_slot)
+                        }
+                    }
                     None => {
-                        let r = MethodRef {
-                            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
-                            name: "broadcastChanges".into(),
-                            descriptor: "()V".into(),
-                        };
-                        self.host.unknown_operand_call(&r)?;
+                        self.host.unknown_operand_call(&broadcast_ref)?;
                         return Ok(());
                     }
                 }
@@ -31593,12 +32104,71 @@ impl<H: Host> Runtime<'_, H> {
                     &[Value::Int(entry.container_slot)],
                 )?
             };
-            if entry.last == empty && current == empty {
-                continue;
+            // If `getItem` hit an unmodelled call, do not store or fire a neutral/null stack.
+            if self.host.unknown_call_count() > unknown_before {
+                self.host.unknown_operand_call(&broadcast_ref)?;
+                return Ok(());
             }
-            if entry.last != current {
-                self.host
-                    .menu_set_last_slot(menu, entry.index, current.clone());
+            // 26.3 AbstractContainerMenu.broadcastChanges offset 30: Objects.requireNonNull(stack).
+            if current == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            // If a jar Slot.getItem() returned a client stack handle, read its ClientStack contents.
+            if client_stack_snapshot.is_none()
+                && let Some(key) = crate::game_object::handle_key(&current)
+                && let Some(rest) = key.strip_prefix("client/stack/")
+            {
+                let slot_index = match rest {
+                    "feet" => Some(36),
+                    "legs" => Some(37),
+                    "chest" => Some(38),
+                    "head" => Some(39),
+                    "offhand" => Some(40),
+                    n => n.parse::<i32>().ok().filter(|i| (0..36).contains(i)),
+                };
+                if let Some(idx) = slot_index {
+                    client_stack_snapshot = self.host.client_inventory_stack(idx);
+                }
+            }
+            // 26.3 triggerSlotListeners offsets 13-19: ItemStack.matches(last, current)
+            // (offsets 0-25: reference eq -> count eq -> isSameItemSameComponents).
+            let current_is_empty = current == empty
+                || client_stack_snapshot
+                    .as_ref()
+                    .is_some_and(client_surface::ClientStack::is_empty);
+            let match_outcome: Option<(bool, menu_models::LastSlot)> =
+                match (&entry.last, current_is_empty, client_stack_snapshot) {
+                    (menu_models::LastSlot::Empty, true, _) => {
+                        Some((true, menu_models::LastSlot::Empty))
+                    }
+                    (menu_models::LastSlot::Empty, false, Some(stack)) => {
+                        Some((false, menu_models::LastSlot::ClientStack(stack)))
+                    }
+                    (menu_models::LastSlot::ClientStack(_), true, _) => {
+                        Some((false, menu_models::LastSlot::Empty))
+                    }
+                    (menu_models::LastSlot::ClientStack(prev), false, Some(cur)) => {
+                        if prev.count != cur.count || prev.item != cur.item {
+                            Some((false, menu_models::LastSlot::ClientStack(cur)))
+                        } else {
+                            // Both non-empty with same item and count: ClientStack does not carry
+                            // full DataComponentMap, so ItemStack.matches cannot be guessed.
+                            None
+                        }
+                    }
+                    // Opaque/untracked non-empty stack: cannot prove emptiness or components.
+                    _ => None,
+                };
+            let Some((matched, next_last)) = match_outcome else {
+                self.host.unknown_operand_call(&broadcast_ref)?;
+                return Ok(());
+            };
+            if !matched {
+                self.host.menu_set_last_slot(menu, entry.index, next_last);
                 let listeners = self.host.menu_listeners(menu);
                 for listener in listeners {
                     let slot_changed_ref = MethodRef {
@@ -31643,8 +32213,66 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
-    /// 26.3 `AbstractContainerMenu.addStandardInventorySlots` (0-24),
-    /// `addInventoryExtendedSlots` (0-68), and `addInventoryHotbarSlots` (0-39).
+    /// 26.3 `AbstractContainerMenu.addStandardInventorySlots` offsets 0-24:
+    ///   4:  virtual `addInventoryExtendedSlots(container, x, y)`
+    ///   21: virtual `addInventoryHotbarSlots(container, x, y + 58)`
+    fn invoke_menu_add_standard_inventory_slots(
+        &mut self,
+        menu: &Value,
+        container: &Value,
+        x: i32,
+        y: i32,
+    ) -> Result<Value, NativeError> {
+        let ext_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "addInventoryExtendedSlots".into(),
+            descriptor: "(Lnet/minecraft/world/Container;II)V".into(),
+        };
+        if let Some(owner) = self.jvm_selected_jar_body(&ext_ref, 0xb6, Some(menu))? {
+            let _ = self.invoke(
+                &owner,
+                "addInventoryExtendedSlots",
+                &ext_ref.descriptor,
+                Some(menu.clone()),
+                &[container.clone(), Value::Int(x), Value::Int(y)],
+            )?;
+        } else {
+            let _ = self.invoke_menu_add_inventory_slots(
+                menu,
+                "addInventoryExtendedSlots",
+                container,
+                x,
+                y,
+            )?;
+        }
+        let hotbar_y = y.wrapping_add(58);
+        let hotbar_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "addInventoryHotbarSlots".into(),
+            descriptor: "(Lnet/minecraft/world/Container;II)V".into(),
+        };
+        if let Some(owner) = self.jvm_selected_jar_body(&hotbar_ref, 0xb6, Some(menu))? {
+            let _ = self.invoke(
+                &owner,
+                "addInventoryHotbarSlots",
+                &hotbar_ref.descriptor,
+                Some(menu.clone()),
+                &[container.clone(), Value::Int(x), Value::Int(hotbar_y)],
+            )?;
+        } else {
+            let _ = self.invoke_menu_add_inventory_slots(
+                menu,
+                "addInventoryHotbarSlots",
+                container,
+                x,
+                hotbar_y,
+            )?;
+        }
+        Ok(Value::Void)
+    }
+
+    /// 26.3 `AbstractContainerMenu.addInventoryExtendedSlots` (offsets 0-68)
+    /// and `addInventoryHotbarSlots` (offsets 0-39).
     /// Allocates real `Slot` `JarObject` handles and dispatches `addSlot`
     /// virtually so mod overrides of `addSlot` run as bytecode.
     fn invoke_menu_add_inventory_slots(
@@ -31656,10 +32284,7 @@ impl<H: Host> Runtime<'_, H> {
         y: i32,
     ) -> Result<Value, NativeError> {
         let mut specs: Vec<(i32, i32, i32)> = Vec::new();
-        if matches!(
-            name,
-            "addStandardInventorySlots" | "addInventoryExtendedSlots"
-        ) {
+        if name == "addInventoryExtendedSlots" {
             for row in 0..3 {
                 for column in 0..9 {
                     specs.push((
@@ -31670,17 +32295,9 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
         }
-        if matches!(
-            name,
-            "addStandardInventorySlots" | "addInventoryHotbarSlots"
-        ) {
-            let hotbar_y = if name == "addStandardInventorySlots" {
-                y.wrapping_add(58)
-            } else {
-                y
-            };
+        if name == "addInventoryHotbarSlots" {
             for column in 0..9 {
-                specs.push((column, x.wrapping_add(column * 18), hotbar_y));
+                specs.push((column, x.wrapping_add(column * 18), y));
             }
         }
         let slot_init = MethodRef {
@@ -31722,7 +32339,7 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Value::Void)
     }
 
-    pub(crate) fn invoke_menu_model(
+    fn invoke_menu_model(
         &mut self,
         r: &MethodRef,
         receiver: &Value,
@@ -33552,8 +34169,14 @@ impl<H: Host> Runtime<'_, H> {
                         if !self.fields.contains_key(&key) {
                             self.refuse_collected(&receiver, &r)?;
                         }
-                        if !self.host.menu_field_set(&receiver, &r, &value) {
-                            self.fields.insert(key, value);
+                        match self.host.menu_field_set(&receiver, &r, &value) {
+                            menu_models::FieldSetResult::Written => {}
+                            menu_models::FieldSetResult::NotOwned => {
+                                self.fields.insert(key, value);
+                            }
+                            menu_models::FieldSetResult::Counted => {
+                                invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                            }
                         }
                     }
                 }

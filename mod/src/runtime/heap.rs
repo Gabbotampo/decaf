@@ -530,11 +530,14 @@ fn collectable(marker: &str) -> bool {
     {
         return rest.ends_with(|c: char| c.is_ascii_digit());
     }
-    // A host map entry (`host_map_entry.rs`): `<class>#entry<n>`/`<class>#node<n>`.
+    // A host map entry (`host_map_entry.rs`): `<class>#entry<n>`/`<class>#node<n>`,
+    // or a host-synthesized menu model object (`menu_models.rs`): `<class>#menu<n>`.
+    // Non-numeric prefixes keep them out of `jar_object::parse_key` / `freed_objects`.
     if let Some((_, serial)) = marker.rsplit_once('#')
         && let Some(number) = serial
             .strip_prefix("entry")
             .or_else(|| serial.strip_prefix("node"))
+            .or_else(|| serial.strip_prefix("menu"))
     {
         return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     }
@@ -1792,6 +1795,7 @@ mod tests {
             "next_unmodifiable_collection",
             "next_reversed_view",
             "next_ranged_attribute",
+            "next_menu_object",
             "properties",
             "environment",
             "resources",
@@ -1910,5 +1914,89 @@ mod tests {
         heap.next_object = 256;
         collect(&mut heap, &mut host, &[]);
         assert!(host.menu_states.is_empty());
+    }
+
+    #[test]
+    fn menu_gc_does_not_mark_future_jar_objects_freed() {
+        // Finding 1 regression: building a menu with host-synthesized `#menu<n>` keys,
+        // running GC, then allocating and using a new jar object must never trip
+        // `freed_objects` ("collected while still reachable") and must never reuse
+        // pruned `#menu<n>` ids.
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap {
+            next_object: 10,
+            ..Default::default()
+        };
+
+        let builder = crate::runtime::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder_key = crate::runtime::expect_ref(&builder).unwrap().clone();
+        assert!(
+            builder_key.contains("#menu"),
+            "expected non-numeric #menu<n> key, got {builder_key:?}"
+        );
+        // Build an AbstractContainerMenu (mints NonNullList#menu<n> via next_menu_object).
+        let menu_val = crate::runtime::jar_object::handle("demo/TestMenu#3".into());
+        crate::runtime::menu_models::call_with_client_player(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::runtime::MethodRef {
+                owner: crate::runtime::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/inventory/MenuType;I)V".into(),
+            },
+            &menu_val,
+            &[Value::Ref(None), Value::Int(1)],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let before_next = host.next_menu_object;
+        assert!(before_next >= 2);
+
+        // Run GC: menu + builder are unrooted so both are collected, and limit stays at heap.next_object (10).
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.menu_states.contains_key(&builder_key));
+        assert!(!host.menu_states.contains_key("demo/TestMenu#3"));
+
+        // Allocating a brand-new jar object at heap.next_object (10, 11, 50) must NEVER be marked freed.
+        for id in [10usize, 11, 50] {
+            let fresh_key = format!("demo/AfterGc#{id}");
+            assert!(
+                !host.freed_objects.holds_key(&fresh_key),
+                "{fresh_key} was falsely marked freed after menu GC"
+            );
+        }
+
+        // Next menu allocation uses a strictly monotonic counter (never reuses pruned ids).
+        let builder2 = crate::runtime::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::runtime::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder2_key = crate::runtime::expect_ref(&builder2).unwrap().clone();
+        assert_ne!(builder2_key, builder_key);
+        assert!(host.next_menu_object > before_next);
     }
 }

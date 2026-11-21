@@ -35,7 +35,7 @@ impl<H: Host> Runtime<'_, H> {
     /// Invoke a `MenuScreens$ScreenConstructor` (a constructor method reference,
     /// a static or capturing lambda, a bound method reference, or a jar class
     /// implementing `MenuScreens$ScreenConstructor.create`).
-    pub(crate) fn invoke_screen_constructor(
+    fn invoke_screen_constructor(
         &mut self,
         constructor: &Value,
         menu: Value,
@@ -63,7 +63,7 @@ impl<H: Host> Runtime<'_, H> {
 
     /// Run `Gui.setScreen` offsets 234 (virtual `added()`) and 298-319
     /// (`screen.init(guiWidth, guiHeight)`).
-    pub(crate) fn run_screen_init(
+    fn run_screen_init(
         &mut self,
         screen: &Value,
         gui_width: i32,
@@ -83,8 +83,14 @@ impl<H: Host> Runtime<'_, H> {
         Ok(())
     }
 
+    /// Run `Gui.setScreen`'s teardown of the previous screen (virtual `removed()`).
+    fn run_screen_removed(&mut self, screen: &Value) -> Result<(), NativeError> {
+        self.dispatch_screen_virtual(screen, "removed", "()V", &[])?;
+        Ok(())
+    }
+
     /// Run virtual `extractBackground(graphics, mouseX, mouseY, partialTick)` on `screen`.
-    pub(crate) fn run_screen_extract_background(
+    fn run_screen_extract_background(
         &mut self,
         screen: &Value,
         graphics: Value,
@@ -120,7 +126,7 @@ impl<H: Host> Runtime<'_, H> {
     /// Virtual dispatch of a `Screen` method on `screen`: runs the jar override
     /// if present; otherwise dispatches to the screen's modelled vanilla base
     /// class, or counts it if the vanilla base is unmodelled.
-    pub(crate) fn dispatch_screen_virtual(
+    fn dispatch_screen_virtual(
         &mut self,
         screen: &Value,
         name: &str,
@@ -160,7 +166,7 @@ impl<H: Host> Runtime<'_, H> {
     ///
     /// Returns `Ok(None)` when `vanilla_class` or `(name, desc)` is outside the
     /// modelled surface so the caller counts it as unknown.
-    pub(crate) fn invoke_vanilla_screen_method(
+    pub(super) fn invoke_vanilla_screen_method(
         &mut self,
         vanilla_class: &str,
         name: &str,
@@ -238,8 +244,110 @@ impl<H: Host> Runtime<'_, H> {
                     self.host.unknown_operand_call(&r)?;
                 }
                 self.host.set_menu_screen_initialized(screen, true);
+                // Offset 39: virtual `triggerImmediateNarration(false)`.
+                // 26.3 Screen.triggerImmediateNarration offsets 0-15 calls private
+                // `shouldRunNarration()` (offsets 0-24: `DEBUG_UI_NARRATION ||
+                // minecraft.getNarrator().isActive()`, false by default). Run any
+                // jar override as bytecode; `super.triggerImmediateNarration` stays
+                // unmodelled so calling super from an override is counted.
+                if let Some(owner) =
+                    self.jar_screen_override(screen, "triggerImmediateNarration", "(Z)V")?
+                {
+                    let _ = self.invoke(
+                        &owner,
+                        "triggerImmediateNarration",
+                        "(Z)V",
+                        Some(screen.clone()),
+                        &[Value::Int(0)],
+                    )?;
+                }
                 Ok(Some(Value::Void))
             }
+            // 26.3 Screen.added() offset 0: return (allows `super.added()` from jar overrides).
+            ("added", "()V") => Ok(Some(Value::Void)),
+            ("removed", "()V") => match vanilla_class {
+                // 26.3 ItemCombinerScreen.removed() offsets 0-15:
+                //   0-1:  super.removed()  (AbstractContainerScreen.removed)
+                //   4-12: ((ItemCombinerMenu) this.menu).removeSlotListener(this)
+                ITEM_COMBINER_SCREEN => {
+                    self.invoke_vanilla_screen_method(
+                        ABSTRACT_CONTAINER_SCREEN,
+                        "removed",
+                        "()V",
+                        screen,
+                        &[],
+                    )?;
+                    let menu_ref = MethodRef {
+                        owner: ABSTRACT_CONTAINER_SCREEN.into(),
+                        name: "menu".into(),
+                        descriptor: "Lnet/minecraft/world/inventory/AbstractContainerMenu;".into(),
+                    };
+                    let menu = self
+                        .host
+                        .menu_field(screen, &menu_ref)
+                        .unwrap_or(Value::Ref(None));
+                    let remove_listener_ref = MethodRef {
+                        owner: ITEM_COMBINER_MENU.into(),
+                        name: "removeSlotListener".into(),
+                        descriptor: "(Lnet/minecraft/world/inventory/ContainerListener;)V".into(),
+                    };
+                    if menu == Value::Ref(None) {
+                        return Err(crate::null_checks::invoke_on_null(&remove_listener_ref));
+                    }
+                    if let Some(owner) =
+                        self.jvm_selected_jar_body(&remove_listener_ref, 0xb6, Some(&menu))?
+                    {
+                        let _ = self.invoke(
+                            &owner,
+                            "removeSlotListener",
+                            "(Lnet/minecraft/world/inventory/ContainerListener;)V",
+                            Some(menu),
+                            std::slice::from_ref(screen),
+                        )?;
+                    } else if self.host.menu_remove_slot_listener(&menu, screen).is_none() {
+                        self.host.unknown_operand_call(&remove_listener_ref)?;
+                    }
+                    Ok(Some(Value::Void))
+                }
+                // 26.3 AbstractContainerScreen.removed() offsets 0-25:
+                //   0-10:  if (this.minecraft.player == null) return;
+                //   11-25: this.menu.removed(this.minecraft.player);
+                ABSTRACT_CONTAINER_SCREEN => {
+                    if !self.host.client_has_player() {
+                        return Ok(Some(Value::Void));
+                    }
+                    let menu_ref = MethodRef {
+                        owner: ABSTRACT_CONTAINER_SCREEN.into(),
+                        name: "menu".into(),
+                        descriptor: "Lnet/minecraft/world/inventory/AbstractContainerMenu;".into(),
+                    };
+                    let menu = self
+                        .host
+                        .menu_field(screen, &menu_ref)
+                        .unwrap_or(Value::Ref(None));
+                    let removed_ref = MethodRef {
+                        owner: ABSTRACT_CONTAINER_MENU.into(),
+                        name: "removed".into(),
+                        descriptor: "(Lnet/minecraft/world/entity/player/Player;)V".into(),
+                    };
+                    if menu == Value::Ref(None) {
+                        return Err(crate::null_checks::invoke_on_null(&removed_ref));
+                    }
+                    let player = crate::game_object::client_value("client/player".into());
+                    self.call_virtual(
+                        Site::Virtual,
+                        ABSTRACT_CONTAINER_MENU,
+                        "removed",
+                        "(Lnet/minecraft/world/entity/player/Player;)V",
+                        &menu,
+                        &[player],
+                    )?;
+                    Ok(Some(Value::Void))
+                }
+                // 26.3 Screen.removed() offset 0: return
+                SCREEN => Ok(Some(Value::Void)),
+                _ => Ok(None),
+            },
             ("init", "()V") => match vanilla_class {
                 // 26.3 ItemCombinerScreen.init() offsets 0-19:
                 //   0-1:  super.init()  (AbstractContainerScreen.init)
@@ -552,7 +660,8 @@ impl NativeJar {
     }
 
     /// Construct and initialize (`Screen.init(guiWidth, guiHeight)`) the screen
-    /// registered for `menu_type` and return its post-init layout.
+    /// registered for `menu_type`, tearing down any previously active screen via
+    /// virtual `removed()`, and return its post-init layout.
     pub fn open_client_screen(
         &self,
         host: &mut StdHost,
@@ -569,35 +678,46 @@ impl NativeJar {
             .client_menu_value_for_type(&menu_type)
             .ok_or_else(|| NativeError::Metadata("no constructed menu matches menu type".into()))?;
         let inventory = host.client_inventory_value();
-        let screen = self.with_persistent_runtime(
-            host,
-            &[
-                constructor.clone(),
+        let previous = host.take_client_active_screen();
+        let mut roots = vec![
+            constructor.clone(),
+            menu.clone(),
+            inventory.clone(),
+            title.clone(),
+        ];
+        if let Some(prev) = &previous {
+            roots.push(prev.clone());
+        }
+        let screen = self.with_persistent_runtime(host, &roots, |runtime| {
+            if let Some(prev) = previous {
+                runtime.run_screen_removed(&prev)?;
+            }
+            let screen = runtime.invoke_screen_constructor(
+                &constructor,
                 menu.clone(),
-                inventory.clone(),
+                inventory,
                 title.clone(),
-            ],
-            |runtime| {
-                let screen =
-                    runtime.invoke_screen_constructor(&constructor, menu, inventory, title)?;
-                if matches!(screen, Value::Ref(None)) {
-                    return Err(NativeError::Metadata(
-                        "MenuScreens constructor returned null".into(),
-                    ));
-                }
-                runtime.run_screen_init(&screen, gui_w, gui_h)?;
-                Ok(screen)
-            },
-        )?;
+            )?;
+            if matches!(screen, Value::Ref(None)) {
+                return Err(NativeError::Metadata(
+                    "MenuScreens constructor returned null".into(),
+                ));
+            }
+            runtime.run_screen_init(&screen, gui_w, gui_h)?;
+            Ok(screen)
+        })?;
+        host.set_client_active_screen(menu_type, menu, title, [gui_w, gui_h], screen.clone());
         let layout = host.client_screen_layout(&screen).ok_or_else(|| {
             NativeError::Metadata("screen constructor did not initialize a container screen".into())
         })?;
         Ok(ClientScreenLayout { layout })
     }
 
-    /// Construct, initialize (`Screen.init(guiWidth, guiHeight)`), and invoke
-    /// `extractBackground` on the screen registered for `menu_type`, returning
-    /// the recorded [`DrawOp`]s.
+    /// Invoke `extractBackground` on the active screen for `menu_type` (reusing
+    /// an already-open screen from `open_client_screen` for the same menu/title/size
+    /// so no duplicate screen or leaked slot listener is created; otherwise tearing
+    /// down any previous screen via `removed()`, constructing, and initializing),
+    /// returning the recorded [`DrawOp`]s.
     pub fn draw_client_screen_bg(
         &self,
         host: &mut StdHost,
@@ -615,33 +735,58 @@ impl NativeJar {
             .ok_or_else(|| NativeError::Metadata("no constructed menu matches menu type".into()))?;
         let inventory = host.client_inventory_value();
         let before = host.client_draws().len();
-        self.with_persistent_runtime(
-            host,
-            &[
-                constructor.clone(),
-                menu.clone(),
-                inventory.clone(),
-                title.clone(),
-            ],
-            |runtime| {
-                let screen =
-                    runtime.invoke_screen_constructor(&constructor, menu, inventory, title)?;
-                if matches!(screen, Value::Ref(None)) {
-                    return Err(NativeError::Metadata(
-                        "MenuScreens constructor returned null".into(),
-                    ));
-                }
-                runtime.run_screen_init(&screen, gui_w, gui_h)?;
+        if let Some(existing) =
+            host.client_matching_active_screen(&menu_type, &menu, &title, [gui_w, gui_h])
+        {
+            let root = existing.clone();
+            self.with_persistent_runtime(host, std::slice::from_ref(&root), |runtime| {
                 runtime.run_screen_extract_background(
-                    &screen,
+                    &existing,
                     crate::game_object::client_value("client/gui-graphics".to_owned()),
                     0,
                     0,
                     0.0,
                 )?;
-                Ok(screen)
-            },
-        )?;
+                Ok(existing)
+            })?;
+            return Ok(host.client_draws()[before..].to_vec());
+        }
+        let previous = host.take_client_active_screen();
+        let mut roots = vec![
+            constructor.clone(),
+            menu.clone(),
+            inventory.clone(),
+            title.clone(),
+        ];
+        if let Some(prev) = &previous {
+            roots.push(prev.clone());
+        }
+        let screen = self.with_persistent_runtime(host, &roots, |runtime| {
+            if let Some(prev) = previous {
+                runtime.run_screen_removed(&prev)?;
+            }
+            let screen = runtime.invoke_screen_constructor(
+                &constructor,
+                menu.clone(),
+                inventory,
+                title.clone(),
+            )?;
+            if matches!(screen, Value::Ref(None)) {
+                return Err(NativeError::Metadata(
+                    "MenuScreens constructor returned null".into(),
+                ));
+            }
+            runtime.run_screen_init(&screen, gui_w, gui_h)?;
+            runtime.run_screen_extract_background(
+                &screen,
+                crate::game_object::client_value("client/gui-graphics".to_owned()),
+                0,
+                0,
+                0.0,
+            )?;
+            Ok(screen)
+        })?;
+        host.set_client_active_screen(menu_type, menu, title, [gui_w, gui_h], screen);
         Ok(host.client_draws()[before..].to_vec())
     }
 }

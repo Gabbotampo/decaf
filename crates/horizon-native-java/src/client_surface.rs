@@ -56,6 +56,7 @@ use crate::{
 #[path = "client_items.rs"]
 mod items;
 pub(crate) use items::NON_NULL_LIST;
+pub(crate) use items::inventory_stack_marker;
 pub use items::{ClientEffect, ClientItem, ClientStack, ItemTable, StackSlot};
 // Style objects (`Style`, `TextColor`, `ChatFormatting`).
 #[path = "client_text.rs"]
@@ -616,6 +617,19 @@ pub(crate) struct ClientState {
     /// A built stack's object marker → its slot.
     made_aliases: BTreeMap<String, StackSlot>,
     tasks: Vec<Value>,
+    /// Currently open client screen (reused across `open_client_screen` ->
+    /// `draw_client_screen_bg`, and closed via virtual `removed()` before opening
+    /// a different screen so slot listeners never leak).
+    active_screen: Option<ActiveScreen>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveScreen {
+    menu_type: Value,
+    menu: Value,
+    title: Value,
+    gui_size: [i32; 2],
+    screen: Value,
 }
 
 /// A client object or value: a game handle (#156 P16d) for a `client/…` or
@@ -1034,17 +1048,62 @@ impl StdHost {
             .is_some_and(|frame| frame.player.is_some())
     }
 
-    pub(crate) fn client_inventory_stack_is_empty(&self, container_slot: usize) -> Option<bool> {
+    pub(crate) fn client_inventory_stack(&self, container_slot: i32) -> Option<ClientStack> {
         let player = self.client.frame.as_ref()?.player.as_ref()?;
-        if container_slot >= 36 {
-            return None;
+        match container_slot {
+            0..=35 => Some(
+                player
+                    .inventory
+                    .get(container_slot as usize)
+                    .cloned()
+                    .unwrap_or_else(ClientStack::empty),
+            ),
+            36..=39 => Some(
+                player
+                    .armor
+                    .get((container_slot - 36) as usize)
+                    .cloned()
+                    .unwrap_or_else(ClientStack::empty),
+            ),
+            40 => Some(player.offhand.clone()),
+            _ => None,
         }
-        Some(
-            player
-                .inventory
-                .get(container_slot)
-                .is_none_or(ClientStack::is_empty),
-        )
+    }
+
+    pub(crate) fn client_matching_active_screen(
+        &self,
+        menu_type: &Value,
+        menu: &Value,
+        title: &Value,
+        gui_size: [i32; 2],
+    ) -> Option<Value> {
+        let active = self.client.active_screen.as_ref()?;
+        (active.menu_type == *menu_type
+            && active.menu == *menu
+            && active.title == *title
+            && active.gui_size == gui_size)
+            .then(|| active.screen.clone())
+    }
+
+    pub(crate) fn take_client_active_screen(&mut self) -> Option<Value> {
+        self.client.active_screen.take().map(|active| active.screen)
+    }
+
+    pub(crate) fn set_client_active_screen(
+        &mut self,
+        menu_type: Value,
+        menu: Value,
+        title: Value,
+        gui_size: [i32; 2],
+        screen: Value,
+    ) {
+        self.client.active_screen = Some(ActiveScreen {
+            menu_type,
+            menu,
+            title,
+            gui_size,
+            screen,
+        });
     }
 
     pub(crate) fn client_menu_value_for_type(&self, menu_type: &Value) -> Option<Value> {
@@ -2286,7 +2345,10 @@ impl StdHost {
                 let h = int_arg(args, 7)?;
                 let tex_w = int_arg(args, 8)?;
                 let tex_h = int_arg(args, 9)?;
-                let rect = state.posed_rect([x, y, x + w, y + h]);
+                if tex_w <= 0 || tex_h <= 0 {
+                    return None;
+                }
+                let rect = state.posed_rect([x, y, x.wrapping_add(w), y.wrapping_add(h)]);
                 state.draw(DrawOp::Blit {
                     texture,
                     src: [u, v, w as f32, h as f32],

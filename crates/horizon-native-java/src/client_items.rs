@@ -207,6 +207,10 @@ impl StackSlot {
     }
 }
 
+pub(crate) fn inventory_stack_marker(index: i32) -> Value {
+    StackSlot::of_container_index(index).marker()
+}
+
 /// The stacks a frame's callbacks built, kept only while it runs.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MadeStacks {
@@ -556,7 +560,7 @@ impl StdHost {
             // 26.3 Inventory.<clinit> offsets 93-99: DEFAULT_NAME = Component.translatable("container.inventory");
             // Inventory.getName offsets 0-3 returns DEFAULT_NAME; Nameable.getDisplayName offsets 0-6 delegates to getName.
             ("getDisplayName" | "getName", "Lnet/minecraft/network/chat/Component;") => {
-                component_value("translatable", "container.inventory")
+                crate::host_component::inventory_default_name()
             }
             ("getContainerSize", "I") => Value::Int(41),
             ("getItem", _) => StackSlot::of_container_index(int_arg(args, 0)?).marker(),

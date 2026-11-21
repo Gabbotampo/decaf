@@ -13,8 +13,8 @@ mod scratch;
 use horizon_native_java::{
     ExecutionBudget, Host, HostKind, NativeError, NativeJar, StdHost, Value,
     client_surface::{
-        ClientKeyMapping, ClientLevel, ClientMessage, ClientPlayer, ClientSnapshot, ClientText,
-        DrawOp, KeyPress, TextMetrics,
+        ClientKeyMapping, ClientLevel, ClientMessage, ClientPlayer, ClientSnapshot, ClientStack,
+        ClientText, DrawOp, KeyPress, TextMetrics,
     },
     events::{EventContext, EventFacade, EventFiring, EventLoader, GameEvent, GameListener},
     screen_models::{ScreenSlot, ScreenSlotKind},
@@ -251,8 +251,12 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
         "package net.minecraft.world.flag; public final class FeatureFlags { public static final FeatureFlagSet VANILLA_SET = null; }",
     ),
     (
+        "net/minecraft/world/item/ItemStack.java",
+        "package net.minecraft.world.item; public final class ItemStack { public static final ItemStack EMPTY = null; }",
+    ),
+    (
         "net/minecraft/world/Container.java",
-        "package net.minecraft.world; public interface Container {}",
+        "package net.minecraft.world; import net.minecraft.world.item.ItemStack; public interface Container { default ItemStack getItem(int slot) { return ItemStack.EMPTY; } }",
     ),
     (
         "net/minecraft/world/SimpleContainer.java",
@@ -264,7 +268,13 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/entity/player/Inventory.java",
-        "package net.minecraft.world.entity.player; public class Inventory implements net.minecraft.world.Container { public final Player player = null; public net.minecraft.network.chat.Component getDisplayName() { return null; } }",
+        "package net.minecraft.world.entity.player;\n\
+         import net.minecraft.network.chat.Component;\n\
+         public class Inventory implements net.minecraft.world.Container {\n\
+           public final Player player = null;\n\
+           public Inventory() {}\n\
+           public Component getName() { return null; }\n\
+           public Component getDisplayName() { return getName(); } }",
     ),
     (
         "net/minecraft/world/inventory/ContainerLevelAccess.java",
@@ -272,11 +282,17 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/inventory/ContainerListener.java",
-        "package net.minecraft.world.inventory; public interface ContainerListener {}",
+        "package net.minecraft.world.inventory; import net.minecraft.world.item.ItemStack; public interface ContainerListener { void slotChanged(AbstractContainerMenu m, int slot, ItemStack stack); void dataChanged(AbstractContainerMenu m, int id, int value); }",
     ),
     (
         "net/minecraft/world/inventory/Slot.java",
-        "package net.minecraft.world.inventory; import net.minecraft.world.Container; public class Slot { public final Container container; public int index; public final int x, y; public Slot(Container c, int i, int x, int y) { container = c; this.x = x; this.y = y; } }",
+        "package net.minecraft.world.inventory;\n\
+         import net.minecraft.world.Container;\n\
+         import net.minecraft.world.item.ItemStack;\n\
+         public class Slot {\n\
+           public final Container container; public int index; public final int x, y;\n\
+           public Slot(Container c, int i, int x, int y) { container = c; this.x = x; this.y = y; }\n\
+           public ItemStack getItem() { return container.getItem(0); } }",
     ),
     (
         "net/minecraft/world/inventory/AbstractContainerMenu.java",
@@ -285,8 +301,12 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
          public abstract class AbstractContainerMenu {\n\
            protected AbstractContainerMenu(MenuType<?> t, int id) {}\n\
            protected Slot addSlot(Slot s) { return s; }\n\
+           protected void addInventoryExtendedSlots(Container c, int x, int y) {}\n\
+           protected void addInventoryHotbarSlots(Container c, int x, int y) {}\n\
            protected void addStandardInventorySlots(Container c, int x, int y) {}\n\
            public void addSlotListener(ContainerListener l) {}\n\
+           public void removeSlotListener(ContainerListener l) {}\n\
+           public void broadcastChanges() {}\n\
            public MenuType<?> getType() { return null; } }",
     ),
     (
@@ -334,6 +354,9 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
            protected Screen(Component t) { this.title = t; this.minecraft = null; this.font = null; }\n\
            public final void init(int w, int h) {}\n\
            protected void init() {}\n\
+           public void added() {}\n\
+           public void removed() {}\n\
+           public void triggerImmediateNarration(boolean b) {}\n\
            public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {}\n\
            public void extractTransparentBackground(GuiGraphicsExtractor g) {}\n\
            public boolean isInGameUi() { return false; } }",
@@ -372,6 +395,8 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
            protected ItemCombinerScreen(T m, Inventory i, Component t, Identifier id) { super(m, i, t); }\n\
            protected void subInit() {}\n\
            protected void init() { super.init(); subInit(); }\n\
+           public void removed() { super.removed(); }\n\
+           public void slotChanged(net.minecraft.world.inventory.AbstractContainerMenu m, int slot, net.minecraft.world.item.ItemStack stack) {}\n\
            public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) { super.extractBackground(g, mx, my, pt); }\n\
            protected abstract void extractErrorIcon(GuiGraphicsExtractor g, int x, int y); }",
     ),
@@ -1095,6 +1120,517 @@ public class CountedMod {
         "expected extractTransparentBackground override in {:?}",
         host.unknown_host_calls()
     );
+}
+
+/// Round-2 regression suite covering:
+/// - `super.added()` handled cleanly + `triggerImmediateNarration(false)` override called at Screen.init(int, int) offset 39
+/// - `open_client_screen` -> `draw_client_screen_bg` reuses Screen #1 (no duplicate init/listener leak);
+///   switching screens runs `removed()` and removes Screen #1's listener
+/// - `broadcastChanges`: virtual `Slot.getItem()` override, `Objects.requireNonNull` NPE on null stack,
+///   counted `getItem` counts `broadcastChanges` instead of storing/firing null, client inventory 0..41
+///   (including armor/offhand) fires `slotChanged` once on initial non-empty slot and counts ambiguous repeat
+/// - `ItemCombinerMenu.<init>`: virtual `addSlot`, `addStandardInventorySlots` -> `addInventoryExtendedSlots` /
+///   `addInventoryHotbarSlots`, NPE on null inventory, and counted `Inventory.player` when frame has no player
+/// - `Inventory.getDisplayName()` / `getName()`: canonical `DEFAULT_NAME` (`==` holds), jar `Inventory`
+///   subclass override respected, missing client player counted
+/// - `blit`: `tex_w <= 0 || tex_h <= 0` counted, `wrapping_add` for `x + w` / `y + h` without panic
+#[test]
+fn round2_screen_lifecycle_broadcast_overrides_inventory_and_blit_guards() {
+    let root = scratch("screen-bridge-round2");
+    let mut sources = GAME_STUBS.to_vec();
+    sources.extend_from_slice(SCREEN_API_STUBS);
+    sources.extend_from_slice(&[
+        (
+            "demo/CustomSlot.java",
+            r#"package demo;
+import net.minecraft.world.Container;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.ItemStack;
+public class CustomSlot extends Slot {
+  public static int getItemCalls = 0;
+  private final int mode;
+  public CustomSlot(Container c, int i, int x, int y, int mode) {
+    super(c, i, x, y);
+    this.mode = mode;
+  }
+  @Override
+  public ItemStack getItem() {
+    getItemCalls++;
+    if (mode == 1) return null; // triggers Objects.requireNonNull NPE (offset 30)
+    if (mode == 2) return super.getItem(); // calls unmodelled container -> counted
+    return ItemStack.EMPTY;
+  }
+}
+"#,
+        ),
+        (
+            "demo/HookCombinerMenu.java",
+            r#"package demo;
+import net.minecraft.world.Container;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.*;
+public class HookCombinerMenu extends ItemCombinerMenu {
+  public static final MenuType<HookCombinerMenu> TYPE =
+      new MenuType<>(HookCombinerMenu::new, FeatureFlags.VANILLA_SET);
+  public static int addSlotCount = 0;
+  public static int extCount = 0;
+  public static int hotbarCount = 0;
+  public HookCombinerMenu(int id, Inventory inv) {
+    super(TYPE, id, inv, ContainerLevelAccess.NULL,
+        ItemCombinerMenuSlotDefinition.create()
+            .withSlot(0, 27, 47, s -> true)
+            .withResultSlot(1, 134, 47)
+            .build());
+    // Also add an offhand slot (index 40) to exercise 0..41 client inventory broadcast.
+    this.addSlot(new Slot(inv, 40, 152, 47));
+  }
+  @Override
+  protected Slot addSlot(Slot s) {
+    addSlotCount++;
+    return super.addSlot(s);
+  }
+  @Override
+  protected void addInventoryExtendedSlots(Container c, int x, int y) {
+    extCount++;
+    super.addInventoryExtendedSlots(c, x, y);
+  }
+  @Override
+  protected void addInventoryHotbarSlots(Container c, int x, int y) {
+    hotbarCount++;
+    super.addInventoryHotbarSlots(c, x, y);
+  }
+}
+"#,
+        ),
+        (
+            "demo/LifecycleScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.ItemCombinerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.item.ItemStack;
+public class LifecycleScreen extends ItemCombinerScreen<HookCombinerMenu> {
+  public static final Identifier TEX =
+      Identifier.fromNamespaceAndPath("demo", "textures/gui/life.png");
+  public static int ctorCount = 0;
+  public static int addedCount = 0;
+  public static int removedCount = 0;
+  public static int narrationCalls = 0;
+  public static boolean narrationArg = true;
+  public static int slotChangedCalls = 0;
+  public static int lastChangedSlot = -1;
+  public static boolean canonicalInvTitle = false;
+  public LifecycleScreen(HookCombinerMenu m, Inventory i, Component t) {
+    super(m, i, t, TEX);
+    ctorCount++;
+    canonicalInvTitle = (this.playerInventoryTitle == i.getDisplayName())
+        && (i.getDisplayName() == i.getName());
+  }
+  @Override
+  public void added() {
+    super.added();
+    addedCount++;
+  }
+  @Override
+  public void removed() {
+    super.removed();
+    removedCount++;
+  }
+  @Override
+  public void triggerImmediateNarration(boolean b) {
+    narrationCalls++;
+    narrationArg = b;
+  }
+  @Override
+  public void slotChanged(AbstractContainerMenu m, int slot, ItemStack stack) {
+    slotChangedCalls++;
+    lastChangedSlot = slot;
+  }
+  @Override
+  protected void extractErrorIcon(GuiGraphicsExtractor g, int x, int y) {
+    // Exercise wrapping_add on large coordinates without overflow panic.
+    g.blit(RenderPipelines.GUI_TEXTURED, TEX, Integer.MAX_VALUE, 0, 0f, 0f, 1, 1, 256, 256);
+  }
+}
+"#,
+        ),
+        (
+            "demo/BadTexBlitScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.*;
+import net.minecraft.world.flag.FeatureFlags;
+public class BadTexBlitScreen extends AbstractContainerScreen<BadTexBlitScreen.Menu> {
+  public static final Identifier TEX = Identifier.fromNamespaceAndPath("demo", "textures/gui/bad.png");
+  public static class Menu extends AbstractContainerMenu {
+    public static final MenuType<Menu> TYPE =
+        new MenuType<>((id, inv) -> new Menu(Menu.TYPE, id), FeatureFlags.VANILLA_SET);
+    public Menu(MenuType<?> t, int id) { super(t, id); }
+  }
+  public BadTexBlitScreen(Menu m, Inventory i, Component t) { super(m, i, t); }
+  public Component getPlayerInventoryTitle() { return this.playerInventoryTitle; }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+    g.blit(RenderPipelines.GUI_TEXTURED, TEX, 0, 0, 0f, 0f, 16, 16, 0, 256);
+  }
+}
+"#,
+        ),
+        (
+            "demo/CustomInventory.java",
+            r#"package demo;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class CustomInventory extends Inventory {
+  public static final Component CUSTOM_NAME = Component.literal("Custom Bag");
+  @Override
+  public Component getName() {
+    return CUSTOM_NAME;
+  }
+}
+"#,
+        ),
+        (
+            "demo/BroadcastMenus.java",
+            r#"package demo;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.Container;
+import net.minecraft.world.inventory.*;
+public class BroadcastMenus {
+  public static class SlotTestMenu extends AbstractContainerMenu {
+    public SlotTestMenu(int mode) {
+      super(null, 1);
+      Container c = new Container() {};
+      this.addSlot(new CustomSlot(c, 0, 0, 0, mode));
+    }
+  }
+  public static boolean checkNullInventoryThrowsNpe() {
+    try {
+      new HookCombinerMenu(1, null);
+      return false;
+    } catch (NullPointerException expected) {
+      return true;
+    }
+  }
+  public static boolean checkNullSlotGetItemThrowsNpe() {
+    SlotTestMenu m = new SlotTestMenu(1);
+    try {
+      m.broadcastChanges();
+      return false;
+    } catch (NullPointerException expected) {
+      return true;
+    }
+  }
+  public static void runCustomEmptySlotBroadcast() {
+    SlotTestMenu m = new SlotTestMenu(0);
+    m.broadcastChanges();
+  }
+  public static void runUnmodelledContainerBroadcast() {
+    SlotTestMenu m = new SlotTestMenu(2);
+    m.broadcastChanges();
+  }
+  public static void runBroadcastOn(AbstractContainerMenu m) {
+    m.broadcastChanges();
+  }
+  public static boolean checkCustomInventorySubclassOverride() {
+    CustomInventory inv = new CustomInventory();
+    BadTexBlitScreen.Menu m = new BadTexBlitScreen.Menu(BadTexBlitScreen.Menu.TYPE, 1);
+    BadTexBlitScreen screen = new BadTexBlitScreen(m, inv, Component.literal("T"));
+    return screen.getPlayerInventoryTitle() == CustomInventory.CUSTOM_NAME;
+  }
+  public static void triggerResidentGcWithThrowawayArrays() {
+    for (int i = 0; i < 8250; i++) {
+      int[] trash = new int[1];
+      trash[0] = i;
+    }
+  }
+  public static class Box {
+    public int value;
+    public Box(int v) { this.value = v; }
+  }
+  public static int allocateAndUseFreshJarObject(int v) {
+    Box b = new Box(v);
+    b.value = b.value + 1;
+    return b.value;
+  }
+}
+"#,
+        ),
+        (
+            "demo/Round2Mod.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.MenuScreens;
+public class Round2Mod {
+  public void onInitializeClient() {
+    MenuScreens.register(HookCombinerMenu.TYPE, LifecycleScreen::new);
+    MenuScreens.register(BadTexBlitScreen.Menu.TYPE, BadTexBlitScreen::new);
+  }
+}
+"#,
+        ),
+    ]);
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        (
+            "fabric.mod.json",
+            r#"{"id":"demo-round2","version":"1","environment":"client","entrypoints":{"client":["demo.Round2Mod"]}}"#,
+        ),
+    ) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let hook_type = static_value(
+        &host,
+        "demo/HookCombinerMenu",
+        "TYPELnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let bad_type = static_value(
+        &host,
+        "demo/BadTexBlitScreen$Menu",
+        "TYPELnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+
+    // Frame with an item in offhand (slot 40) to test 0..41 client inventory broadcast.
+    let mut snap = (*frame_in_world(0.0)).clone();
+    snap.player.as_mut().unwrap().offhand = ClientStack {
+        item: "minecraft:shield".into(),
+        count: 1,
+        max_stack: 1,
+        name: "Shield".into(),
+        ..ClientStack::default()
+    };
+    host.begin_client_frame(Arc::new(snap), &[]);
+
+    let hook_menu = jar
+        .create_client_menu(&mut host, hook_type.clone(), 1)
+        .unwrap();
+    // 1 input + 1 result + 36 standard player slots + 1 extra offhand slot = 39 addSlot calls;
+    // addStandardInventorySlots virtually dispatched both extended (1) and hotbar (1).
+    assert_eq!(
+        static_value(&host, "demo/HookCombinerMenu", "addSlotCountI"),
+        Some(Value::Int(39))
+    );
+    assert_eq!(
+        static_value(&host, "demo/HookCombinerMenu", "extCountI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/HookCombinerMenu", "hotbarCountI"),
+        Some(Value::Int(1))
+    );
+
+    // open_client_screen + draw_client_screen_bg: reuses Screen #1, runs super.added(),
+    // runs triggerImmediateNarration(false), fires slotChanged once for offhand slot 38,
+    // verifies canonical DEFAULT_NAME (`==`), and handles wrapping_add in blit without panic.
+    let _layout = jar
+        .open_client_screen(
+            &mut host,
+            hook_type.clone(),
+            Value::Ref(Some("Life".into())),
+        )
+        .unwrap();
+    let draws = jar
+        .draw_client_screen_bg(&mut host, hook_type, Value::Ref(Some("Life".into())))
+        .unwrap();
+    assert_eq!(draws.len(), 2);
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "ctorCountI"),
+        Some(Value::Int(1)),
+        "draw_client_screen_bg must reuse Screen #1 instead of constructing a duplicate"
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "addedCountI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "narrationCallsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "narrationArgZ"),
+        Some(Value::Int(0))
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "slotChangedCallsI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "lastChangedSlotI"),
+        Some(Value::Int(38))
+    );
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "canonicalInvTitleZ"),
+        Some(Value::Int(1))
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "unexpected unknown calls before counted checks: {:?}",
+        host.unknown_host_calls()
+    );
+
+    // Calling broadcastChanges a second time while offhand still has 1x shield (same item & count):
+    // ClientStack lacks DataComponentMap, so ItemStack.matches is counted rather than guessed.
+    let before = host.unknown_host_call_count();
+    let _ = jar.invoke_method_with_args(
+        "demo/BroadcastMenus",
+        "runBroadcastOn",
+        "(Lnet/minecraft/world/inventory/AbstractContainerMenu;)V",
+        None,
+        &[hook_menu],
+        &mut host,
+    );
+    assert!(
+        host.unknown_host_call_count() > before,
+        "expected ambiguous non-empty ItemStack.matches to be counted"
+    );
+
+    // Switching to BadTexBlitScreen calls LifecycleScreen.removed() (removing listener),
+    // and tex_w == 0 in blit is refused and counted.
+    jar.create_client_menu(&mut host, bad_type.clone(), 2)
+        .unwrap();
+    let bad_err = jar
+        .draw_client_screen_bg(&mut host, bad_type, Value::Ref(Some("Bad".into())))
+        .unwrap_err();
+    assert!(matches!(bad_err, NativeError::UnknownHostCall(ref m) if m.name == "blit"));
+    assert_eq!(
+        static_value(&host, "demo/LifecycleScreen", "removedCountI"),
+        Some(Value::Int(1)),
+        "opening another screen must call removed() on the previous screen"
+    );
+
+    // Static checks: null inventory NPE, null Slot.getItem() NPE, virtual empty Slot.getItem(),
+    // unmodelled Container.getItem counted, and jar Inventory subclass overriding getName().
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo/BroadcastMenus",
+            "checkNullInventoryThrowsNpe",
+            "()Z",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo/BroadcastMenus",
+            "checkNullSlotGetItemThrowsNpe",
+            "()Z",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+    let before = host.unknown_host_call_count();
+    jar.invoke_method_with_args(
+        "demo/BroadcastMenus",
+        "runCustomEmptySlotBroadcast",
+        "()V",
+        None,
+        &[],
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert!(
+        matches!(
+            static_value(&host, "demo/CustomSlot", "getItemCallsI"),
+            Some(Value::Int(n)) if n >= 2
+        ),
+        "virtual Slot.getItem() must run for jar Slot subclasses"
+    );
+    let before = host.unknown_host_call_count();
+    jar.invoke_method_with_args(
+        "demo/BroadcastMenus",
+        "runUnmodelledContainerBroadcast",
+        "()V",
+        None,
+        &[],
+        &mut host,
+    )
+    .unwrap();
+    assert!(
+        host.unknown_host_call_count() > before,
+        "unmodelled Container.getItem in broadcastChanges must be counted"
+    );
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo/BroadcastMenus",
+            "checkCustomInventorySubclassOverride",
+            "()Z",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(1)
+    );
+
+    // End-to-end Finding 1 check: after building menus (with #menu<n> host keys),
+    // force a real resident-heap GC (8250 > MAX_RESIDENT_ARRAYS) and then allocate
+    // and read/write fields on a brand-new jar object without hitting refuse_collected.
+    jar.invoke_method_with_args(
+        "demo/BroadcastMenus",
+        "triggerResidentGcWithThrowawayArrays",
+        "()V",
+        None,
+        &[],
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(
+        jar.invoke_method_with_args(
+            "demo/BroadcastMenus",
+            "allocateAndUseFreshJarObject",
+            "(I)I",
+            None,
+            &[Value::Int(41)],
+            &mut host,
+        )
+        .unwrap(),
+        Value::Int(42)
+    );
+
+    // Frame with NO player: ItemCombinerMenu.<init> counts Inventory.player (no silent null).
+    host.begin_client_frame(Arc::new(ClientSnapshot::default()), &[]);
+    let before = host.unknown_host_call_count();
+    let hook_type_no_player = hook_type_for_no_player(&host);
+    let _ = jar.create_client_menu(&mut host, hook_type_no_player, 3);
+    assert!(
+        host.unknown_host_call_count() > before,
+        "creating ItemCombinerMenu with client/inventory and no player must count Inventory.player"
+    );
+}
+
+fn hook_type_for_no_player(host: &StdHost) -> Value {
+    static_value(
+        host,
+        "demo/HookCombinerMenu",
+        "TYPELnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap()
 }
 
 #[test]
