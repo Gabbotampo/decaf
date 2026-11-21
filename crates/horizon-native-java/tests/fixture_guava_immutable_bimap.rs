@@ -180,13 +180,18 @@ impl Drop for Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        // The tests run in parallel in one process, and two can read the same
+        // nanosecond; without the counter they share a directory and one reads
+        // the other's half-written jar ("Unexpected end of zip").
+        static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "horizon-guava-bimap-{}-{}",
+            "horizon-guava-bimap-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let classes = root.join("classes");
         let srcs = [
