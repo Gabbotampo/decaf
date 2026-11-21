@@ -122,6 +122,16 @@ public final class Probe {
             + replacedEqual + ":" + removedSame + ":" + n.size();
     }
 
+    /// `Map.computeIfAbsent` on an IdentityHashMap finds keys by reference.
+    public static String identityComputeIfAbsent() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        Integer added = m.computeIfAbsent(b, k -> 2);
+        Integer kept = m.computeIfAbsent(a, k -> 3);
+        return added + ":" + kept + ":" + m.size();
+    }
+
     public static String random_m0() { return RandomImm.m0(); }
     public static String random_m1() { return RandomImm.m2(); }
     public static String random_m2() { return RandomImm.m3(); }
@@ -452,6 +462,9 @@ fn identity_hash_maps_keep_identity() {
             ("identityKeys", "2|null|false"),
             ("identityStrings", "null"),
             ("identityOperations", "2:1:2:false:false:true:0"),
+            // Both "k" literals are the same interned String (JLS 3.10.5).
+            ("identityStringPresent", "1"),
+            ("identityComputeIfAbsent", "2:1:2"),
         ],
     );
 }
