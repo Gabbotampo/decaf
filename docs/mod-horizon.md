@@ -136,8 +136,7 @@ The three block-state failures are the area of #581 (block state properties).
   proposes `Host::log` for this.
 - **M3b**: `tools/bake.py` writes Sunrise packages (`.smod` in `sunrise-mods/`). A bake for the
   official Horizon (`.hmod` in `horizon-mods/`, its own manifest name) does not exist yet.
-- An item the jar declares shows `block.horizon_java.proof_item` as its name key, where Java uses
-  `item.horizon_java.proof_item`. The game picks the key, not this bridge: Horizon's command
-  feedback (`crates/horizon-client/src/game/administration/commands/mod.rs` at the pin) uses
-  `item.<id>` only when the language pack holds that key, and `block.<id>` otherwise. An item with
-  no name in any language pack therefore prints the block form.
+- An item the jar declares shows `block.horizon_java.proof_item` as its name key in command
+  feedback, where Java uses `item.horizon_java.proof_item`. This bridge sets no name or
+  translation key on the item it declares (`item_entry` in `src/content.rs`), so the key comes
+  from the game; it was observed for an item that has no name in any language pack.
