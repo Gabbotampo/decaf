@@ -92,6 +92,18 @@ impl ModStamp {
             uncertain: self.uncertain + u64::from(uncertain),
         }
     }
+
+    pub(crate) fn encode(self) -> String {
+        format!("{},{}", self.count, self.uncertain)
+    }
+
+    pub(crate) fn decode(text: &str) -> Option<Self> {
+        let (count, uncertain) = text.split_once(',')?;
+        Some(Self {
+            count: count.parse().ok()?,
+            uncertain: uncertain.parse().ok()?,
+        })
+    }
 }
 
 /// Where a `subList` copy sits in its parent, and the parent's counter when

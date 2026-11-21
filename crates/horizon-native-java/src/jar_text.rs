@@ -248,6 +248,16 @@ impl<H: Host> Runtime<'_, H> {
                 crate::stream_pipeline::STREAM_TEXT.into(),
             ))));
         }
+        if let Some(text) = self.invoke_enum_set_text(
+            &crate::MethodRef {
+                owner: "java/util/EnumSet".into(),
+                name: "toString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            },
+            Some(value),
+        )? {
+            return Ok(Some(text));
+        }
         // A host map entry prints `key=value` (`host_entry.rs`).
         if let Some(text) = self.host_entry_text(value, class, method)? {
             return Ok(Some(text));
