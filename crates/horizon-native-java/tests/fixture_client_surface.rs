@@ -295,10 +295,24 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
            public ItemStack getItem() { return container.getItem(0); } }",
     ),
     (
+        "net/minecraft/core/NonNullList.java",
+        "package net.minecraft.core;\n\
+         import java.util.AbstractList;\n\
+         public class NonNullList<E> extends AbstractList<E> {\n\
+           @Override public E get(int i) { return null; }\n\
+           @Override public int size() { return 0; } }",
+    ),
+    (
+        "net/minecraft/world/inventory/ResultContainer.java",
+        "package net.minecraft.world.inventory; import net.minecraft.world.Container; public class ResultContainer implements Container {}",
+    ),
+    (
         "net/minecraft/world/inventory/AbstractContainerMenu.java",
         "package net.minecraft.world.inventory;\n\
+         import net.minecraft.core.NonNullList;\n\
          import net.minecraft.world.Container;\n\
          public abstract class AbstractContainerMenu {\n\
+           public final NonNullList<Slot> slots = null;\n\
            protected AbstractContainerMenu(MenuType<?> t, int id) {}\n\
            protected Slot addSlot(Slot s) { return s; }\n\
            protected void addInventoryExtendedSlots(Container c, int x, int y) {}\n\
@@ -325,7 +339,13 @@ const SCREEN_API_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/inventory/ItemCombinerMenu.java",
-        "package net.minecraft.world.inventory; import net.minecraft.world.entity.player.Inventory; public abstract class ItemCombinerMenu extends AbstractContainerMenu { protected ItemCombinerMenu(MenuType<?> t,int id,Inventory i,ContainerLevelAccess a,ItemCombinerMenuSlotDefinition d) { super(t, id); } }",
+        "package net.minecraft.world.inventory;\n\
+         import net.minecraft.world.Container;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         public abstract class ItemCombinerMenu extends AbstractContainerMenu {\n\
+           protected final Container inputSlots = null;\n\
+           protected final ResultContainer resultSlots = null;\n\
+           protected ItemCombinerMenu(MenuType<?> t,int id,Inventory i,ContainerLevelAccess a,ItemCombinerMenuSlotDefinition d) { super(t, id); } }",
     ),
     (
         "net/minecraft/client/gui/screens/MenuScreens.java",
@@ -2082,5 +2102,474 @@ fn a_neoforge_client_mod_registers_through_its_mod_bus_events() {
             scale: [1.0, 1.0],
         }]
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Round-3 regression suite covering:
+/// 1. `#menu<n>` objects are real `HostKind::MenuObject` handles (not plain `String`s):
+///    `(List) menu.slots`, `menu.slots instanceof List`, `!(menu.slots instanceof String)`,
+///    `(String) menu.slots` throwing CCE, `menu.slots.getClass().getName()`, `menu.slots.size()`,
+///    forged String `"net/minecraft/core/NonNullList#menu0"` staying a plain `String`,
+///    and `StdHost::retain(&menu_slots)` pinning the handle.
+/// 2. `broadcastChanges` runs a jar `SimpleContainer` subclass's `getItem(int)` override
+///    instead of bypassing it via `entry.known_current`, and counts `broadcastChanges` if
+///    that override hits an unmodelled call.
+/// 3. Screen replacement order (`MenuScreens$ScreenConstructor.fromPacket` offset 22 ->
+///    `Gui.setScreen` offsets 77/220/234/319): if the new screen constructor throws or
+///    returns null, the previous active screen stays active and its `removed()` is NOT
+///    called; on valid replacement, constructor runs BEFORE `prev.removed()`, which runs
+///    BEFORE `new.added()` and `new.init()`.
+/// 4. Private `ItemCombinerMenu.createContainer(int)` is not treated as overridable.
+#[test]
+fn round3_menu_object_handles_container_override_and_screen_replacement_order() {
+    let root = scratch("screen-bridge-round3");
+    let mut sources = GAME_STUBS.to_vec();
+    sources.extend_from_slice(SCREEN_API_STUBS);
+    sources.extend_from_slice(&[
+        (
+            "demo/OverrideContainer.java",
+            r#"package demo;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.item.ItemStack;
+public class OverrideContainer extends SimpleContainer {
+  public static int getItemCalls = 0;
+  private final boolean hitUnknown;
+  public OverrideContainer(int size, boolean hitUnknown) {
+    super(size);
+    this.hitUnknown = hitUnknown;
+  }
+  @Override
+  public ItemStack getItem(int slot) {
+    getItemCalls++;
+    if (hitUnknown) {
+      // Unmodelled static call -> increments unknown_call_count, so broadcastChanges must count.
+      System.gc();
+      return ItemStack.EMPTY;
+    }
+    return super.getItem(slot);
+  }
+}
+"#,
+        ),
+        (
+            "demo/Round3Menu.java",
+            r#"package demo;
+import java.util.Collection;
+import java.util.List;
+import net.minecraft.core.NonNullList;
+import net.minecraft.world.Container;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.*;
+public class Round3Menu extends ItemCombinerMenu {
+  public static final MenuType<Round3Menu> TYPE_A =
+      new MenuType<>((id, inv) -> new Round3Menu(Round3Menu.TYPE_A, id, inv), FeatureFlags.VANILLA_SET);
+  public static final MenuType<Round3Menu> TYPE_THROW =
+      new MenuType<>((id, inv) -> new Round3Menu(Round3Menu.TYPE_THROW, id, inv), FeatureFlags.VANILLA_SET);
+  public static final MenuType<Round3Menu> TYPE_NULL =
+      new MenuType<>((id, inv) -> new Round3Menu(Round3Menu.TYPE_NULL, id, inv), FeatureFlags.VANILLA_SET);
+  public static final MenuType<Round3Menu> TYPE_B =
+      new MenuType<>((id, inv) -> new Round3Menu(Round3Menu.TYPE_B, id, inv), FeatureFlags.VANILLA_SET);
+  public static final MenuType<Round3Menu> TYPE_UNKNOWN_CONTAINER =
+      new MenuType<>((id, inv) -> new Round3Menu(Round3Menu.TYPE_UNKNOWN_CONTAINER, id, inv, true), FeatureFlags.VANILLA_SET);
+
+  public static Object capturedSlots;
+  public static boolean slotsIsList;
+  public static boolean slotsIsCollection;
+  public static boolean slotsIsNonNullList;
+  public static boolean slotsIsString;
+  public static boolean slotsCastToStringThrew;
+  public static boolean forgedIsString;
+  public static boolean forgedIsList;
+  public static boolean forgedCastToListThrew;
+  public static int castListSize;
+  public static int directSlotsSize;
+  public static String slotsClassName;
+  public static boolean inputIsSimpleContainer;
+  public static boolean inputIsString;
+  public static boolean resultIsResultContainer;
+  public static boolean resultIsString;
+
+  public Round3Menu(MenuType<?> t, int id, Inventory inv) {
+    this(t, id, inv, false);
+  }
+
+  public Round3Menu(MenuType<?> t, int id, Inventory inv, boolean hitUnknown) {
+    super(t, id, inv, ContainerLevelAccess.NULL,
+        ItemCombinerMenuSlotDefinition.create()
+            .withSlot(0, 27, 47, s -> true)
+            .withResultSlot(1, 134, 47)
+            .build());
+    // Add a vanilla Slot backed by a jar SimpleContainer subclass overriding getItem(int).
+    this.addSlot(new Slot(new OverrideContainer(1, hitUnknown), 0, 80, 47));
+  }
+
+  // Same name/descriptor as vanilla private ItemCombinerMenu.createContainer(int):
+  // NOT an override in 26.3, so constructing Round3Menu must NOT count it.
+  public SimpleContainer createContainer(int size) {
+    throw new AssertionError("private vanilla method must not be overridden");
+  }
+
+  public void probeHandles() {
+    Object o = this.slots;
+    capturedSlots = o;
+    slotsIsList = o instanceof List;
+    slotsIsCollection = o instanceof Collection;
+    slotsIsNonNullList = o instanceof NonNullList;
+    slotsIsString = o instanceof String;
+    List<?> asList = (List<?>) o;
+    castListSize = asList.size();
+    directSlotsSize = this.slots.size();
+    slotsClassName = o.getClass().getName();
+    try {
+      String bad = (String) o;
+      slotsCastToStringThrew = bad == null;
+    } catch (ClassCastException e) {
+      slotsCastToStringThrew = true;
+    }
+
+    Object forged = "net/minecraft/core/NonNullList#menu0";
+    forgedIsString = forged instanceof String;
+    forgedIsList = forged instanceof List;
+    try {
+      List<?> bad = (List<?>) forged;
+      forgedCastToListThrew = bad == null;
+    } catch (ClassCastException e) {
+      forgedCastToListThrew = true;
+    }
+
+    Object inObj = this.inputSlots;
+    inputIsSimpleContainer = inObj instanceof SimpleContainer && inObj instanceof Container;
+    inputIsString = inObj instanceof String;
+    Object resObj = this.resultSlots;
+    resultIsResultContainer = resObj instanceof ResultContainer && resObj instanceof Container;
+    resultIsString = resObj instanceof String;
+  }
+}
+"#,
+        ),
+        (
+            "demo/ScreenOrderLog.java",
+            r#"package demo;
+public class ScreenOrderLog {
+  public static String trace = "";
+  public static int removedA = 0;
+  public static int ctorA = 0;
+  public static void log(String entry) {
+    trace = trace.isEmpty() ? entry : trace + "," + entry;
+  }
+}
+"#,
+        ),
+        (
+            "demo/ScreenA.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class ScreenA extends AbstractContainerScreen<Round3Menu> {
+  public ScreenA(Round3Menu m, Inventory i, Component t) {
+    super(m, i, t);
+    ScreenOrderLog.ctorA++;
+    ScreenOrderLog.log("ctorA");
+    m.probeHandles();
+    m.broadcastChanges();
+  }
+  @Override
+  public void added() {
+    super.added();
+    ScreenOrderLog.log("addedA");
+  }
+  @Override
+  protected void init() {
+    super.init();
+    ScreenOrderLog.log("initA");
+  }
+  @Override
+  public void removed() {
+    ScreenOrderLog.removedA++;
+    ScreenOrderLog.log("removedA");
+    super.removed();
+  }
+}
+"#,
+        ),
+        (
+            "demo/ThrowingScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class ThrowingScreen extends AbstractContainerScreen<Round3Menu> {
+  public ThrowingScreen(Round3Menu m, Inventory i, Component t) {
+    super(m, i, t);
+    ScreenOrderLog.log("ctorThrow");
+    throw new IllegalStateException("boom");
+  }
+}
+"#,
+        ),
+        (
+            "demo/ScreenB.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class ScreenB extends AbstractContainerScreen<Round3Menu> {
+  public ScreenB(Round3Menu m, Inventory i, Component t) {
+    super(m, i, t);
+    ScreenOrderLog.log("ctorB");
+  }
+  @Override
+  public void added() {
+    super.added();
+    ScreenOrderLog.log("addedB");
+  }
+  @Override
+  protected void init() {
+    super.init();
+    ScreenOrderLog.log("initB");
+  }
+}
+"#,
+        ),
+        (
+            "demo/Round3Mod.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.MenuScreens;
+public class Round3Mod {
+  public void onInitializeClient() {
+    MenuScreens.register(Round3Menu.TYPE_A, ScreenA::new);
+    MenuScreens.register(Round3Menu.TYPE_THROW, ThrowingScreen::new);
+    MenuScreens.register(Round3Menu.TYPE_NULL, (m, i, t) -> {
+      ScreenOrderLog.log("ctorNull");
+      return null;
+    });
+    MenuScreens.register(Round3Menu.TYPE_B, ScreenB::new);
+    MenuScreens.register(Round3Menu.TYPE_UNKNOWN_CONTAINER, (m, i, t) -> {
+      m.broadcastChanges();
+      return new ScreenB(m, i, t);
+    });
+  }
+}
+"#,
+        ),
+    ]);
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        (
+            "fabric.mod.json",
+            r#"{"id":"demo-round3","version":"1","environment":"client","entrypoints":{"client":["demo.Round3Mod"]}}"#,
+        ),
+    ) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let type_a = static_value(
+        &host,
+        "demo/Round3Menu",
+        "TYPE_ALnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let type_throw = static_value(
+        &host,
+        "demo/Round3Menu",
+        "TYPE_THROWLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let type_null = static_value(
+        &host,
+        "demo/Round3Menu",
+        "TYPE_NULLLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let type_b = static_value(
+        &host,
+        "demo/Round3Menu",
+        "TYPE_BLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+
+    host.begin_client_frame(frame_in_world(0.0), &[]);
+    jar.create_client_menu(&mut host, type_a.clone(), 1)
+        .unwrap();
+    jar.create_client_menu(&mut host, type_throw.clone(), 2)
+        .unwrap();
+    jar.create_client_menu(&mut host, type_null.clone(), 3)
+        .unwrap();
+    jar.create_client_menu(&mut host, type_b.clone(), 4)
+        .unwrap();
+
+    // Opening ScreenA runs handle probes, broadcastChanges with OverrideContainer.getItem,
+    // and private createContainer check (0 unknown calls!).
+    jar.open_client_screen(&mut host, type_a.clone(), Value::Ref(Some("A".into())))
+        .unwrap();
+
+    // Finding 1 assertions:
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsIsListZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsIsCollectionZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsIsNonNullListZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsIsStringZ"),
+        Some(Value::Int(0))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsCastToStringThrewZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "forgedIsStringZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "forgedIsListZ"),
+        Some(Value::Int(0))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "forgedCastToListThrewZ"),
+        Some(Value::Int(1))
+    );
+    // 1 input + 1 result + 36 player inventory + 1 custom OverrideContainer slot = 39 slots.
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "castListSizeI"),
+        Some(Value::Int(39))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "directSlotsSizeI"),
+        Some(Value::Int(39))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "slotsClassNameLjava/lang/String;"),
+        Some(Value::Ref(Some("net.minecraft.core.NonNullList".into())))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "inputIsSimpleContainerZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "inputIsStringZ"),
+        Some(Value::Int(0))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "resultIsResultContainerZ"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/Round3Menu", "resultIsStringZ"),
+        Some(Value::Int(0))
+    );
+    // StdHost::retain pins the MenuObject handle (not dropped as a plain String).
+    let captured_slots =
+        static_value(&host, "demo/Round3Menu", "capturedSlotsLjava/lang/Object;").unwrap();
+    host.retain(&captured_slots);
+    assert_eq!(host.retained_count(), 1);
+    host.release(&captured_slots);
+    assert_eq!(host.retained_count(), 0);
+
+    // Finding 2 assertion: OverrideContainer.getItem(int) ran virtually during broadcastChanges!
+    assert_eq!(
+        static_value(&host, "demo/OverrideContainer", "getItemCallsI"),
+        Some(Value::Int(1))
+    );
+
+    // Finding 5 + cleanliness: zero unknown calls across menu construction, probes, and broadcastChanges!
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "unexpected unknown calls: {:?}",
+        host.unknown_host_calls()
+    );
+
+    // Finding 3 assertions:
+    // 3a. Throwing new screen constructor does NOT remove or clear ScreenA.
+    let err = jar
+        .open_client_screen(&mut host, type_throw, Value::Ref(Some("Throw".into())))
+        .unwrap_err();
+    assert!(
+        matches!(err, NativeError::UncaughtException { ref class, .. } if class == "java/lang/IllegalStateException"),
+        "expected IllegalStateException, got {err:?}"
+    );
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "removedAI"),
+        Some(Value::Int(0))
+    );
+    // ScreenA is still active: draw_client_screen_bg reuses it without calling ctorA again!
+    jar.draw_client_screen_bg(&mut host, type_a.clone(), Value::Ref(Some("A".into())))
+        .unwrap();
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "ctorAI"),
+        Some(Value::Int(1))
+    );
+
+    // 3b. Null-returning screen constructor also does NOT remove or clear ScreenA.
+    let err = jar
+        .open_client_screen(&mut host, type_null, Value::Ref(Some("Null".into())))
+        .unwrap_err();
+    assert!(
+        matches!(err, NativeError::Metadata(ref msg) if msg.contains("returned null")),
+        "expected null constructor Metadata error, got {err:?}"
+    );
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "removedAI"),
+        Some(Value::Int(0))
+    );
+    jar.draw_client_screen_bg(&mut host, type_a, Value::Ref(Some("A".into())))
+        .unwrap();
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "ctorAI"),
+        Some(Value::Int(1))
+    );
+
+    // 3c. Valid replacement constructs ScreenB FIRST, THEN removes ScreenA, THEN runs addedB/initB.
+    jar.open_client_screen(&mut host, type_b, Value::Ref(Some("B".into())))
+        .unwrap();
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "removedAI"),
+        Some(Value::Int(1))
+    );
+    assert_eq!(
+        static_value(&host, "demo/ScreenOrderLog", "traceLjava/lang/String;"),
+        Some(Value::Ref(Some(
+            "ctorA,addedA,initA,ctorThrow,ctorNull,ctorB,removedA,addedB,initB".into()
+        )))
+    );
+
+    // 2b. Container.getItem(int) override hitting an unmodelled call counts broadcastChanges.
+    let type_unknown_container = static_value(
+        &host,
+        "demo/Round3Menu",
+        "TYPE_UNKNOWN_CONTAINERLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    jar.create_client_menu(&mut host, type_unknown_container.clone(), 5)
+        .unwrap();
+    jar.open_client_screen(
+        &mut host,
+        type_unknown_container,
+        Value::Ref(Some("Unk".into())),
+    )
+    .unwrap();
+    assert!(
+        host.unknown_host_calls().iter().any(|(call, _)| call
+            == "net/minecraft/world/inventory/AbstractContainerMenu#broadcastChanges()V"),
+        "expected counted broadcastChanges after container override hit unknown call, got {:?}",
+        host.unknown_host_calls()
+    );
+
     let _ = fs::remove_dir_all(root);
 }

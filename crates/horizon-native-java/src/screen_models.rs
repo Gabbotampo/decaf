@@ -678,8 +678,9 @@ impl NativeJar {
             .client_menu_value_for_type(&menu_type)
             .ok_or_else(|| NativeError::Metadata("no constructed menu matches menu type".into()))?;
         let inventory = host.client_inventory_value();
-        let previous = host.take_client_active_screen();
+        let previous = host.client_active_screen_value();
         let mut roots = vec![
+            menu_type.clone(),
             constructor.clone(),
             menu.clone(),
             inventory.clone(),
@@ -688,10 +689,12 @@ impl NativeJar {
         if let Some(prev) = &previous {
             roots.push(prev.clone());
         }
+        // 26.3 order: `MenuScreens$ScreenConstructor.fromPacket` constructs the new screen
+        // first (offset 22); if construction throws or returns null, the previous active
+        // screen is left untouched. Only after non-null construction does `Gui.setScreen`
+        // run `prev.removed()` (offset 77), switch active screen (offset 220), then
+        // `added()` (offset 234) and `init(w, h)` (offsets 298-319).
         let screen = self.with_persistent_runtime(host, &roots, |runtime| {
-            if let Some(prev) = previous {
-                runtime.run_screen_removed(&prev)?;
-            }
             let screen = runtime.invoke_screen_constructor(
                 &constructor,
                 menu.clone(),
@@ -703,10 +706,19 @@ impl NativeJar {
                     "MenuScreens constructor returned null".into(),
                 ));
             }
+            if let Some(prev) = previous {
+                runtime.run_screen_removed(&prev)?;
+            }
+            runtime.host.set_client_active_screen_slot(
+                menu_type.clone(),
+                menu.clone(),
+                title.clone(),
+                [gui_w, gui_h],
+                screen.clone(),
+            );
             runtime.run_screen_init(&screen, gui_w, gui_h)?;
             Ok(screen)
         })?;
-        host.set_client_active_screen(menu_type, menu, title, [gui_w, gui_h], screen.clone());
         let layout = host.client_screen_layout(&screen).ok_or_else(|| {
             NativeError::Metadata("screen constructor did not initialize a container screen".into())
         })?;
@@ -751,8 +763,9 @@ impl NativeJar {
             })?;
             return Ok(host.client_draws()[before..].to_vec());
         }
-        let previous = host.take_client_active_screen();
+        let previous = host.client_active_screen_value();
         let mut roots = vec![
+            menu_type.clone(),
             constructor.clone(),
             menu.clone(),
             inventory.clone(),
@@ -761,10 +774,7 @@ impl NativeJar {
         if let Some(prev) = &previous {
             roots.push(prev.clone());
         }
-        let screen = self.with_persistent_runtime(host, &roots, |runtime| {
-            if let Some(prev) = previous {
-                runtime.run_screen_removed(&prev)?;
-            }
+        let _screen = self.with_persistent_runtime(host, &roots, |runtime| {
             let screen = runtime.invoke_screen_constructor(
                 &constructor,
                 menu.clone(),
@@ -776,6 +786,16 @@ impl NativeJar {
                     "MenuScreens constructor returned null".into(),
                 ));
             }
+            if let Some(prev) = previous {
+                runtime.run_screen_removed(&prev)?;
+            }
+            runtime.host.set_client_active_screen_slot(
+                menu_type.clone(),
+                menu.clone(),
+                title.clone(),
+                [gui_w, gui_h],
+                screen.clone(),
+            );
             runtime.run_screen_init(&screen, gui_w, gui_h)?;
             runtime.run_screen_extract_background(
                 &screen,
@@ -786,7 +806,6 @@ impl NativeJar {
             )?;
             Ok(screen)
         })?;
-        host.set_client_active_screen(menu_type, menu, title, [gui_w, gui_h], screen);
         Ok(host.client_draws()[before..].to_vec())
     }
 }

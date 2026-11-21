@@ -616,7 +616,9 @@ pub(crate) fn is_menu_class(owner: &str) -> bool {
 
 fn marker(key: impl Into<String>) -> Value {
     let key = key.into();
-    if crate::jar_object::key_class(&key).is_some() {
+    if crate::jar_object::key_class(&key).is_some()
+        || crate::jar_object::menu_object_key(&key).is_some()
+    {
         crate::jar_object::stored(&key)
     } else {
         Value::Ref(Some(key))
@@ -905,19 +907,24 @@ pub(crate) fn set_field(
                     FieldSetResult::Written
                 }
                 (ABSTRACT_CONTAINER_SCREEN, name, "I") if state.is_container => {
+                    match name {
+                        // 26.3 `AbstractContainerScreen.imageWidth` / `imageHeight` are `final`.
+                        "imageWidth" | "imageHeight" => return FieldSetResult::Counted,
+                        "titleLabelX" | "titleLabelY" | "inventoryLabelX" | "inventoryLabelY"
+                        | "leftPos" | "topPos" => {}
+                        _ => return FieldSetResult::NotOwned,
+                    }
                     let Value::Int(v) = value else {
                         return FieldSetResult::Counted;
                     };
                     match name {
-                        "imageWidth" => state.image_width = *v,
-                        "imageHeight" => state.image_height = *v,
                         "titleLabelX" => state.title_label_x = *v,
                         "titleLabelY" => state.title_label_y = *v,
                         "inventoryLabelX" => state.inventory_label_x = *v,
                         "inventoryLabelY" => state.inventory_label_y = *v,
                         "leftPos" => state.left_pos = *v,
                         "topPos" => state.top_pos = *v,
-                        _ => return FieldSetResult::NotOwned,
+                        _ => unreachable!(),
                     }
                     FieldSetResult::Written
                 }
@@ -2051,7 +2058,11 @@ pub(crate) fn call_with_client_player(
     if let Some(Object::SlotList { slots }) = states.get(&key)
         && matches!(
             r.owner.as_str(),
-            "java/util/List" | "java/util/Collection" | "net/minecraft/core/NonNullList"
+            "java/util/List"
+                | "java/util/Collection"
+                | "java/util/AbstractList"
+                | "java/util/AbstractCollection"
+                | "net/minecraft/core/NonNullList"
         )
     {
         return Some(match (r.name.as_str(), r.descriptor.as_str()) {
@@ -2798,6 +2809,24 @@ mod tests {
                 &screen,
                 &method(SCREEN, "title", "Lnet/minecraft/network/chat/Component;"),
                 &Value::Ref(Some("Mutated".into())),
+            ),
+            FieldSetResult::Counted
+        );
+        assert_eq!(
+            set_field(
+                &mut states,
+                &screen,
+                &method(ABSTRACT_CONTAINER_SCREEN, "imageWidth", "I"),
+                &Value::Int(999),
+            ),
+            FieldSetResult::Counted
+        );
+        assert_eq!(
+            set_field(
+                &mut states,
+                &screen,
+                &method(ABSTRACT_CONTAINER_SCREEN, "imageHeight", "I"),
+                &Value::Int(999),
             ),
             FieldSetResult::Counted
         );

@@ -1085,8 +1085,11 @@ impl StdHost {
             .then(|| active.screen.clone())
     }
 
-    pub(crate) fn take_client_active_screen(&mut self) -> Option<Value> {
-        self.client.active_screen.take().map(|active| active.screen)
+    pub(crate) fn client_active_screen_value(&self) -> Option<Value> {
+        self.client
+            .active_screen
+            .as_ref()
+            .map(|active| active.screen.clone())
     }
 
     pub(crate) fn set_client_active_screen(

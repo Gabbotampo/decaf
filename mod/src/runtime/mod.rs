@@ -2501,6 +2501,16 @@ pub trait Host {
         false
     }
 
+    fn set_client_active_screen_slot(
+        &mut self,
+        _menu_type: Value,
+        _menu: Value,
+        _title: Value,
+        _gui_size: [i32; 2],
+        _screen: Value,
+    ) {
+    }
+
     fn unknown_call_count(&self) -> usize {
         0
     }
@@ -3898,6 +3908,7 @@ pub struct StdHost {
     vec2: vec2::State,
     menu_states: menu_models::States,
     next_menu_object: u64,
+    freed_menu_objects: heap::FreedObjects,
 }
 
 impl Default for StdHost {
@@ -4088,6 +4099,7 @@ impl StdHost {
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
+            freed_menu_objects: heap::FreedObjects::default(),
         }
     }
 
@@ -6219,6 +6231,9 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
+        if jar_object::spells_key(receiver) {
+            return None;
+        }
         let client_player = self
             .client_has_player()
             .then(|| crate::runtime::game_object::client_value("client/player".into()));
@@ -6233,6 +6248,9 @@ impl Host for StdHost {
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
+        if jar_object::spells_key(receiver) {
+            return None;
+        }
         menu_models::field(&self.menu_states, receiver, r)
     }
 
@@ -6242,6 +6260,9 @@ impl Host for StdHost {
         r: &MethodRef,
         value: &Value,
     ) -> menu_models::FieldSetResult {
+        if jar_object::spells_key(receiver) {
+            return menu_models::FieldSetResult::NotOwned;
+        }
         menu_models::set_field(&mut self.menu_states, receiver, r, value)
     }
 
@@ -6356,6 +6377,17 @@ impl Host for StdHost {
 
     fn client_has_player(&self) -> bool {
         StdHost::client_has_player(self)
+    }
+
+    fn set_client_active_screen_slot(
+        &mut self,
+        menu_type: Value,
+        menu: Value,
+        title: Value,
+        gui_size: [i32; 2],
+        screen: Value,
+    ) {
+        self.set_client_active_screen(menu_type, menu, title, gui_size, screen);
     }
 
     fn unknown_call_count(&self) -> usize {
@@ -13613,7 +13645,7 @@ impl Host for StdHost {
     }
 
     fn object_collected(&self, key: &str) -> bool {
-        self.freed_objects.holds_key(key)
+        self.freed_objects.holds_key(key) || self.freed_menu_objects.holds_menu_key(key)
     }
 
     fn pause_collections(&mut self, paused: bool) {
@@ -31959,17 +31991,7 @@ impl<H: Host> Runtime<'_, H> {
                 descriptor: "()I".into(),
             }));
         }
-        let create_container_ref = MethodRef {
-            owner: menu_models::ITEM_COMBINER_MENU.into(),
-            name: "createContainer".into(),
-            descriptor: "(I)Lnet/minecraft/world/SimpleContainer;".into(),
-        };
-        if let Some(owner) = self.jvm_selected_jar_body(&create_container_ref, 0xb6, Some(menu))? {
-            self.host.unknown_operand_call(&MethodRef {
-                owner,
-                ..create_container_ref
-            })?;
-        }
+        // 26.3 ItemCombinerMenu.createContainer(int) is `private`, so subclasses never override it.
         let Some(init) = self.host.menu_register_combiner(
             menu,
             menu_type.clone(),
@@ -32109,6 +32131,11 @@ impl<H: Host> Runtime<'_, H> {
             name: "getItem".into(),
             descriptor: "()Lnet/minecraft/world/item/ItemStack;".into(),
         };
+        let container_get_item_ref = MethodRef {
+            owner: "net/minecraft/world/Container".into(),
+            name: "getItem".into(),
+            descriptor: "(I)Lnet/minecraft/world/item/ItemStack;".into(),
+        };
         let empty = menu_models::empty_stack();
         for entry in entries {
             let unknown_before = self.host.unknown_call_count();
@@ -32123,7 +32150,11 @@ impl<H: Host> Runtime<'_, H> {
                     Some(entry.slot.clone()),
                     &[],
                 )?
-            } else if let Some(stack) = entry.known_current {
+            } else if let Some(stack) = entry.known_current
+                && self
+                    .jvm_selected_jar_body(&container_get_item_ref, 0xb9, Some(&entry.container))?
+                    .is_none()
+            {
                 stack
             } else if crate::runtime::game_object::handle_key(&entry.container) == Some("client/inventory") {
                 match self.host.client_inventory_stack(entry.container_slot) {

@@ -674,6 +674,16 @@ impl FreedObjects {
             .and_then(|(_, number)| number.parse().ok())
             .is_some_and(|n| self.contains(n))
     }
+
+    /// Whether a host-synthesized menu object `key` (`class#menu<n>`) was collected.
+    pub(crate) fn holds_menu_key(&self, key: &str) -> bool {
+        if !collectable(key) {
+            return false;
+        }
+        crate::jar_object::menu_object_key(key)
+            .and_then(|(_, number)| number.parse().ok())
+            .is_some_and(|n| self.contains(n))
+    }
 }
 
 fn value_bytes(value: &Value) -> usize {
@@ -816,6 +826,27 @@ fn note_numbers(text: &str, out: &mut Vec<usize>) {
     }
 }
 
+/// Note the allocation number of every `#menu<digits>` in `text` so live
+/// host-synthesized menu objects stay out of `freed_menu_objects`.
+fn note_menu_numbers(text: &str, out: &mut Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].windows(5).position(|w| w == b"#menu") {
+        let start = at + offset + 5;
+        let end = start
+            + bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        if end > start
+            && let Ok(number) = text[start..end].parse()
+        {
+            out.push(number);
+        }
+        at = end.max(start);
+    }
+}
+
 /// The collectable markers of a heap and the distinct lengths they come in,
 /// which is what [`scan`] tries at each digit-run end.
 struct Collectable {
@@ -925,6 +956,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     // Every allocation number a text the trace reaches names: the objects
     // found live, those without a row of their own included (`FreedObjects`).
     let mut live = Vec::new();
+    let mut live_menu = Vec::new();
     {
         let mut roots: Vec<&str> = extra.iter().map(String::as_str).collect();
         host.root_texts(&mut roots);
@@ -975,6 +1007,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             );
             collectable.scan(text, &mut pending);
             note_numbers(text, &mut live);
+            note_menu_numbers(text, &mut live_menu);
         }
     }
     // The objects any per-object table keeps a row for: only these need
@@ -1057,11 +1090,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
+                note_menu_numbers(text, &mut live_menu);
             }
         }
         for cached in cached_for.get(&marker).into_iter().flatten() {
             collectable.scan(cached, &mut found);
             note_numbers(cached, &mut live);
+            note_menu_numbers(cached, &mut live_menu);
         }
         // What the host keeps for this object in a table keyed by it.
         if keyed_keys.contains(&marker) {
@@ -1077,6 +1112,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
+                note_menu_numbers(text, &mut live_menu);
             }
         }
         pending.extend(found.drain(..).filter(|next| !reached.contains(next)));
@@ -1097,9 +1133,16 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 live.push(number);
             }
             limit = limit.max(number.saturating_add(1));
+        } else if let Some((_, number)) = crate::jar_object::menu_object_key(marker)
+            && let Ok(number) = number.parse::<usize>()
+            && reached.contains(marker)
+        {
+            live_menu.push(number);
         }
     }
     host.freed_objects.rebuild(limit, live);
+    host.freed_menu_objects
+        .rebuild(host.next_menu_object as usize, live_menu);
     // What the host keeps for an object with no row of its own (a
     // `ResourceLocation`'s id, a `UUID`'s bits, a `Locale`'s tags) goes with
     // it. These name no other object, so they are never edges.
@@ -1779,6 +1822,7 @@ mod tests {
             "heap",
             "retained",
             "freed_objects",
+            "freed_menu_objects",
             "collections_paused",
             "threads",
             "game_event",
@@ -2003,6 +2047,91 @@ mod tests {
         let builder2_key = crate::expect_ref(&builder2).unwrap().clone();
         assert_ne!(builder2_key, builder_key);
         assert!(host.next_menu_object > before_next);
+    }
+
+    #[test]
+    fn menu_object_handles_retain_across_gc_and_track_collection_separately() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap {
+            next_object: 10,
+            ..Default::default()
+        };
+
+        // Construct a menu and read its `slots` field (`NonNullList#menu<n>`).
+        let menu_val = crate::jar_object::handle("demo/TestMenu#3".into());
+        crate::menu_models::call_with_client_player(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: crate::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/inventory/MenuType;I)V".into(),
+            },
+            &menu_val,
+            &[Value::Ref(None), Value::Int(1)],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let menu_slots = crate::menu_models::field(
+            &host.menu_states,
+            &menu_val,
+            &crate::MethodRef {
+                owner: crate::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "slots".into(),
+                descriptor: "Lnet/minecraft/core/NonNullList;".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &menu_slots,
+            Value::Host(handle) if handle.kind() == crate::host_ref::HostKind::MenuObject
+        ));
+        let slots_key = crate::jar_object::object_key(&menu_slots)
+            .expect("menu.slots must have an object_key")
+            .to_owned();
+        assert_eq!(
+            crate::jar_object::object_class(&menu_slots),
+            Some("net/minecraft/core/NonNullList")
+        );
+        assert_eq!(crate::jar_object::parse_key(&slots_key), None);
+
+        // Construct a second unrooted `#menu<n>` object.
+        let builder = crate::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder_key = crate::jar_object::object_key(&builder)
+            .expect("builder must have an object_key")
+            .to_owned();
+
+        // `StdHost::retain(&menu_slots)` must pin `menu_slots` (not drop it as a plain String).
+        host.retain(&menu_slots);
+        assert_eq!(host.retained_count(), 1);
+
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.menu_states.contains_key(&slots_key));
+        assert!(!host.object_collected(&slots_key));
+        assert!(!host.menu_states.contains_key(&builder_key));
+        assert!(host.object_collected(&builder_key));
+        assert!(!host.freed_objects.holds_key("demo/AfterGc#10"));
+
+        // Releasing `menu_slots` allows the next collection to prune and mark it collected.
+        host.release(&menu_slots);
+        assert_eq!(host.retained_count(), 0);
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.menu_states.contains_key(&slots_key));
+        assert!(host.object_collected(&slots_key));
     }
 
     #[test]
