@@ -1,0 +1,16 @@
+class.list=net.minecraft.network.codec.ByteBufCodecs$26
+class.fixed=net.minecraft.network.codec.ByteBufCodecs$27
+class.map=net.minecraft.network.codec.StreamCodec$4
+class.composite2=net.minecraft.network.codec.StreamCodec$8
+distinct.list=true
+rt.int_empty=hex=00|remaining=0|eq=true|val=[]
+rt.int_vals=hex=0800017f8001808001ffffffff0fffffffff078080808008|remaining=0|eq=true|val=[0, 1, 127, 128, 16384, -1, 2147483647, -2147483648]
+rt.str_empty=hex=00|remaining=0|eq=true|val=[]
+rt.str_vals=hex=0305616c70686102ceb200|remaining=0|eq=true|val=[alpha, β, ]
+rt.wire_content=hex=020f6d696e6563726166743a6170706c65030f72756e65733a666972655f72756e6540|remaining=0|eq=true|val=WireContent[entries=[WireEntry[id=minecraft:apple, count=3], WireEntry[id=runes:fire_rune, count=64]]]
+rt.fixed2=hex=072a|remaining=0|eq=true|val=[7, 42]
+rt.opt_list=hex=02000163|remaining=0|eq=true|val=[Optional.empty, Optional[99]]
+rt.linked=hex=020a14|remaining=0|eq=true|val=[10, 20]
+ex.encode_max=EX:io.netty.handler.codec.EncoderException:4 elements exceeded max size of: 3
+ex.decode_max=EX:io.netty.handler.codec.DecoderException:4 elements exceeded max size of: 3
+ex.fixed_wrong_size=EX:io.netty.handler.codec.EncoderException:Invalid list size, expected 2, but got 1

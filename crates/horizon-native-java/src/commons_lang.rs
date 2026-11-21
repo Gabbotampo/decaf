@@ -17,11 +17,18 @@ pub(crate) fn consumer_types(_: &str) -> &'static [&'static str] {
     &["java/util/function/Consumer"]
 }
 
+pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
+    crate::commons_fraction::static_field(r)
+}
+
 pub(crate) fn static_call(
     host: &mut StdHost,
     r: &MethodRef,
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
+    if let Some(result) = crate::commons_fraction::static_call(r, args) {
+        return Some(result);
+    }
     if r.owner == CONSUMERS && r.name == "nop" && r.descriptor == "()Ljava/util/function/Consumer;"
     {
         return Some(Ok(Value::Host(HostRef::new(
@@ -146,7 +153,10 @@ pub(crate) fn runtime_call<H: Host>(
     {
         return Ok(Some(Value::Void));
     }
-    if receiver.is_some() {
+    if let Some(receiver) = receiver {
+        if let Some(result) = crate::commons_fraction::instance_call(r, receiver, args) {
+            return result.map(Some);
+        }
         return Ok(None);
     }
     if r.owner == VALIDATE

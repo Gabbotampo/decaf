@@ -207,6 +207,17 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// The `Supplier<String>` stored inside a modelled `DataResult.error(Supplier)`, if any.
+    pub(crate) fn read_data_result_error_supplier(&self, result: &Value) -> Option<Value> {
+        let marker = expect_ref(result)?;
+        match self.fields.get(&result_key(marker, "kind")) {
+            Some(Value::Ref(Some(kind))) if kind == "error" => {
+                self.fields.get(&result_key(marker, "v")).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// Runs one mod lambda of a codec. A Java exception it throws is the codec failing; any other
     /// interpreter error is outside the model.
     fn codec_lambda(&mut self, lambda: &Value, argument: Value) -> Coded<Value> {

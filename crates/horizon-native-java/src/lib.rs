@@ -50,6 +50,7 @@ mod collection_base;
 mod collection_callback;
 mod collection_store;
 mod color_collection;
+mod commons_fraction;
 mod commons_io;
 mod commons_lang;
 mod commons_pair;
@@ -58,6 +59,7 @@ pub mod content;
 mod declarations_content;
 pub mod dependencies;
 mod dfu_codec;
+pub use dfu_codec::DfuCodecResult;
 mod dfu_either;
 mod dfu_pair;
 mod dfu_pair_ops;
@@ -205,6 +207,7 @@ mod mod_count;
 mod mod_origin;
 mod model_layers;
 mod modified_utf8;
+mod mutable_container;
 mod native_library;
 mod neoforge_api;
 pub mod neoforge_attachments;
@@ -8821,6 +8824,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         // `CompoundTag.CODEC`, the root of a modelled attachment codec (`attachment_codec.rs`).
+        if let Some(value) = commons_lang::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = dfu_codec::static_field(r) {
             return Ok(value);
         }
@@ -23485,6 +23491,76 @@ impl NativeJar {
         result
     }
 
+    /// Decode a JSON value through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn decode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        json: &serde_json::Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<Value>> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            let res = dfu_codec::decode_value_json(runtime, codec, json)?;
+            let rooted = match &res {
+                DfuCodecResult::Ok(v) => v.clone(),
+                _ => Value::Void,
+            };
+            outcome = Some(res);
+            Ok(rooted)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no decode outcome".into())))
+    }
+
+    /// Encode a runtime value to JSON through a modelled DFU `Codec` handle constructed by this jar.
+    pub fn encode_dfu_codec_json<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<DfuCodecResult<serde_json::Value>, NativeError> {
+        let mut outcome: Option<DfuCodecResult<serde_json::Value>> = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            outcome = Some(dfu_codec::encode_value_json(runtime, codec, value)?);
+            Ok(Value::Void)
+        })?;
+        Ok(outcome.unwrap_or_else(|| DfuCodecResult::Unmodelled("no encode outcome".into())))
+    }
+
+    /// Encode a runtime value to exact MC 26.3 wire bytes through a modelled `StreamCodec`.
+    pub fn encode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        value: &Value,
+        host: &mut H,
+    ) -> Result<Option<Vec<u8>>, NativeError> {
+        let mut encoded = None;
+        let roots = [codec.clone(), value.clone()];
+        self.with_persistent_runtime(host, &roots, |runtime| {
+            encoded = stream_codec::encode_bytes(runtime, codec, value)?;
+            Ok(Value::Void)
+        })?;
+        Ok(encoded)
+    }
+
+    /// Decode a runtime value from exact MC 26.3 wire bytes through a modelled `StreamCodec`,
+    /// returning `(value, bytes_consumed)`.
+    pub fn decode_stream_codec_bytes<H: Host>(
+        &self,
+        codec: &Value,
+        bytes: &[u8],
+        host: &mut H,
+    ) -> Result<Option<(Value, usize)>, NativeError> {
+        let mut decoded: Option<(Value, usize)> = None;
+        self.with_persistent_runtime(host, std::slice::from_ref(codec), |runtime| {
+            decoded = stream_codec::decode_bytes(runtime, codec, bytes)?;
+            Ok(decoded
+                .as_ref()
+                .map_or(Value::Void, |(value, _)| value.clone()))
+        })?;
+        Ok(decoded)
+    }
+
     /// Invoke one jar method with the `CallbackInfo` objects of the execution
     /// that owns it, so `ci.cancel()` inside a Mixin callback is visible to the
     /// caller once the call returns.
@@ -25952,6 +26028,11 @@ impl<H: Host> Runtime<'_, H> {
             let Some(file) = self.class(&current) else {
                 if let Some(owner) =
                     menu_models::field_owner(&current, &field.name, &field.descriptor)
+                {
+                    return owner.to_owned();
+                }
+                if let Some(owner) =
+                    mutable_container::field_owner(&current, &field.name, &field.descriptor)
                 {
                     return owner.to_owned();
                 }
@@ -36543,13 +36624,17 @@ impl<H: Host> Runtime<'_, H> {
                         if !self.fields.contains_key(&key) {
                             self.refuse_collected(&receiver, &r)?;
                         }
-                        match self.host.menu_field_set(&receiver, &r, &value) {
-                            menu_models::FieldSetResult::Written => {}
-                            menu_models::FieldSetResult::NotOwned => {
-                                self.fields.insert(key, value);
-                            }
-                            menu_models::FieldSetResult::Counted => {
-                                invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                        if mutable_container::is_final_field(&r) {
+                            invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                        } else {
+                            match self.host.menu_field_set(&receiver, &r, &value) {
+                                menu_models::FieldSetResult::Written => {}
+                                menu_models::FieldSetResult::NotOwned => {
+                                    self.fields.insert(key, value);
+                                }
+                                menu_models::FieldSetResult::Counted => {
+                                    invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                                }
                             }
                         }
                     }
@@ -37162,6 +37247,14 @@ impl<H: Host> Runtime<'_, H> {
                         && let Some(value) = invoke_or_catch!(
                             at,
                             commons_lang::runtime_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            mutable_container::runtime_call(self, &r, op, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);

@@ -1,0 +1,9 @@
+predicate.codec_nonnull=true
+case.01_empty_default=OK|size=0|mult=1|json={"content":[]}
+case.02_shorthand_mult4=OK|size=1|mult=4|json={"content":[{"id":"minecraft:apple"}],"size_multiplier":4}
+case.03_explicit_default_mult=OK|size=2|mult=1|json={"content":[{"id":"minecraft:diamond","count":16},{"id":"minecraft:iron_sword","components":{"minecraft:damage":5,"minecraft:custom_name":"Blade"}}]}
+case.04_missing_content=ERROR
+case.05_bad_count_zero=ERROR
+case.06_bad_count_100=ERROR
+case.07_air_item=ERROR
+case.08_bad_mult_type=ERROR
