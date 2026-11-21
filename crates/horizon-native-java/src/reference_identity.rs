@@ -8,13 +8,16 @@
 //! instead. What JDK 25 does, read from its bytecode (`javap -c`, OpenJDK
 //! 25.0.5) and checked by running it:
 //!
-//! * `Integer`/`Short`/`Long.valueOf` (and so autoboxing) answer a cached
-//!   object for -128..=127, `Character.valueOf` for 0..=127, `Byte.valueOf`
-//!   always, `Boolean.valueOf` the `TRUE`/`FALSE` singletons; outside its
-//!   cache every call is a `new`. The `valueOf(String)` overloads go through
-//!   the same caches. `Float`/`Double.valueOf` are always a `new`. (The
-//!   `Integer` cache's upper bound can be raised with `-XX:AutoBoxCacheMax`;
-//!   the game's launcher does not, so 127 holds.)
+//! * `Short`/`Long.valueOf` (and so autoboxing) answer a cached object for
+//!   -128..=127, `Character.valueOf` for 0..=127, `Byte.valueOf` always,
+//!   `Boolean.valueOf` the `TRUE`/`FALSE` singletons; outside their fixed
+//!   caches every call is a `new`. `Integer.valueOf` caches -128..=127 and
+//!   always allocates `< -128`, but its upper bound can be raised above 127
+//!   with `-XX:AutoBoxCacheMax` or `-Djava.lang.Integer.IntegerCache.high`
+//!   (which Decaf's launcher forwards through `JAVA_TOOL_OPTIONS` /
+//!   `_JAVA_OPTIONS` / `JDK_JAVA_OPTIONS`), so `Integer` values `> 127` have
+//!   unknown caching identity and are counted. The `valueOf(String)` overloads
+//!   go through the same caches. `Float`/`Double.valueOf` are always a `new`.
 //! * `new X(..)` and string concatenation (`StringConcatHelper.simpleConcat`,
 //!   `newStringOf`, `doConcat` all end in `new String`, JLS 15.18.1) always
 //!   make a new object.
@@ -361,13 +364,22 @@ pub(crate) fn call_identity(
     }
     let boxed = box_key(value)?;
     match operand.kind {
-        Kind::Cached(box_class) if in_cache(box_class, boxed.bits) => {
-            Some(ValueIdentity::CachedBox {
+        Kind::Cached(box_class) => match cache_status(box_class, boxed.bits) {
+            CacheStatus::Cached => Some(ValueIdentity::CachedBox {
                 class: box_class,
                 bits: boxed.bits,
-            })
-        }
-        Kind::Cached(_) | Kind::Uncached(_) | Kind::Fresh if !operand.repeats => {
+            }),
+            CacheStatus::Uncached if !operand.repeats => {
+                let Source::At(pc) = operand.source? else {
+                    return None;
+                };
+                Some(ValueIdentity::Fresh(format!(
+                    "{class}.{method}{desc}#{frame_id}:{pc}"
+                )))
+            }
+            CacheStatus::Uncached | CacheStatus::Unknown => None,
+        },
+        Kind::Uncached(_) | Kind::Fresh if !operand.repeats => {
             let Source::At(pc) = operand.source? else {
                 return None;
             };
@@ -666,10 +678,12 @@ fn decide(boxed: Option<BoxKey>, empty: bool, left: Operand, right: Operand) -> 
         (Kind::Cached(a) | Kind::Uncached(a), Kind::Cached(b) | Kind::Uncached(b)) if a != b => {
             Identity::Different
         }
-        (Kind::Cached(class), Kind::Cached(_))
-            if boxed.is_some_and(|value| in_cache(class, value.bits)) =>
-        {
-            Identity::Same
+        (Kind::Cached(class), Kind::Cached(_)) => {
+            match boxed.map(|value| cache_status(class, value.bits)) {
+                Some(CacheStatus::Cached) => Identity::Same,
+                Some(CacheStatus::Uncached) => separate(Identity::Different),
+                Some(CacheStatus::Unknown) | None => Identity::Unknown,
+            }
         }
         // Each run of a fresh producer (or a box outside its cache) makes its
         // own object.
@@ -677,13 +691,50 @@ fn decide(boxed: Option<BoxKey>, empty: bool, left: Operand, right: Operand) -> 
     }
 }
 
-/// Whether `valueOf` of `class` answers its cached object for `value`.
-fn in_cache(class: &str, value: i64) -> bool {
+/// Whether `valueOf` of `class` is guaranteed to return a cached object,
+/// guaranteed to allocate a fresh box, or dependent on JVM options.
+///
+/// In JDK 25 (`javap -c -p`), `Byte`, `Boolean`, `Character` (`0..=127`),
+/// `Short` (`-128..=127`), and `Long` (`-128..=127`) have fixed caches.
+/// `Integer`'s lower bound is fixed at `-128` (`< -128` is always fresh),
+/// `-128..=127` is always cached, and `> 127` can be cached when
+/// `-XX:AutoBoxCacheMax` or `-Djava.lang.Integer.IntegerCache.high` is set
+/// (forwarded via `JAVA_TOOL_OPTIONS` / `_JAVA_OPTIONS` / `JDK_JAVA_OPTIONS`),
+/// so `Integer` values `> 127` are [`CacheStatus::Unknown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheStatus {
+    Cached,
+    Uncached,
+    Unknown,
+}
+
+fn cache_status(class: &str, value: i64) -> CacheStatus {
     match class {
-        "java/lang/Byte" | "java/lang/Boolean" => true,
-        "java/lang/Character" => (0..=127).contains(&value),
-        "java/lang/Integer" | "java/lang/Short" | "java/lang/Long" => (-128..=127).contains(&value),
-        _ => false,
+        "java/lang/Byte" | "java/lang/Boolean" => CacheStatus::Cached,
+        "java/lang/Character" => {
+            if (0..=127).contains(&value) {
+                CacheStatus::Cached
+            } else {
+                CacheStatus::Uncached
+            }
+        }
+        "java/lang/Short" | "java/lang/Long" => {
+            if (-128..=127).contains(&value) {
+                CacheStatus::Cached
+            } else {
+                CacheStatus::Uncached
+            }
+        }
+        "java/lang/Integer" => {
+            if (-128..=127).contains(&value) {
+                CacheStatus::Cached
+            } else if value < -128 {
+                CacheStatus::Uncached
+            } else {
+                CacheStatus::Unknown
+            }
+        }
+        _ => CacheStatus::Uncached,
     }
 }
 

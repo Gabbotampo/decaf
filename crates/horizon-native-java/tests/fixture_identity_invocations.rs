@@ -34,6 +34,22 @@ fn adversarial_identity_review() {
             "dynamicInternOut",
             "A intern self=true|B lookup=1 same=true",
         ),
+        // Integer > 127 caching depends on -XX:AutoBoxCacheMax /
+        // -Djava.lang.Integer.IntegerCache.high (forwarded via JAVA_TOOL_OPTIONS /
+        // _JAVA_OPTIONS / JDK_JAVA_OPTIONS):
+        //   JDK 25.0.5 default:               integerAbove127EqOut="false", integerAbove127MapOut="2:null"
+        //   JDK 25.0.5 -XX:AutoBoxCacheMax=1000 (and -Djava.lang.Integer.IntegerCache.high=1000):
+        //                                     integerAbove127EqOut="true",  integerAbove127MapOut="1:b"
+        // Because the JVM flag changes the answer, Decaf counts Integer > 127.
+        ("integerAbove127EqOut", "false"),
+        ("integerAbove127MapOut", "2:null"),
+        // Live Map.Entry.setValue, entrySet().toArray() detached SimpleEntry,
+        // replaceAll, and entrySet().iterator().remove() on IdentityHashMap:
+        ("entrySetValueOut", "false:v"),
+        ("entrySetValueOpaqueOut", "false:v"),
+        ("entryToArraySetValueOut", "true:null"),
+        ("replaceAllValueOut", "false:v"),
+        ("entryIterRemoveOut", "0:null"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -45,12 +61,19 @@ fn adversarial_identity_review() {
         "lambdaCaseOut",
         "stringValueOfOut",
         "callbackMutationOut",
+        "entrySetValueOut",
+        "entryToArraySetValueOut",
+        "entryIterRemoveOut",
     ];
     let must_count = [
         "loopAllocOut",
         "wholeSubstringOut",
         "computeValueOverwriteOut",
         "dynamicInternOut",
+        "integerAbove127EqOut",
+        "integerAbove127MapOut",
+        "entrySetValueOpaqueOut",
+        "replaceAllValueOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -94,6 +117,38 @@ fn adversarial_identity_review() {
                     calls.iter().any(|(call, _)| call
                         == "java/lang/String#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z"),
                     "dynamicInternOut must count String#if_acmp: {calls:?}"
+                );
+            }
+            if method == "integerAbove127EqOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/lang/Object#if_acmp(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+                    "integerAbove127EqOut must count Object#if_acmp: {calls:?}"
+                );
+            }
+            if method == "integerAbove127MapOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "integerAbove127MapOut must count IdentityHashMap#put: {calls:?}"
+                );
+            }
+            if method == "entrySetValueOpaqueOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#remove(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+                    "entrySetValueOpaqueOut must count IdentityHashMap#remove(k, v): {calls:?}"
+                );
+            }
+            if method == "replaceAllValueOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#replaceAll(Ljava/util/function/BiFunction;)V"),
+                    "replaceAllValueOut must count IdentityHashMap#replaceAll: {calls:?}"
                 );
             }
         } else if counted == 0 {

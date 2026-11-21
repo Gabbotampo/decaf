@@ -59,6 +59,7 @@ use crate::mod_count::ModStamp;
 use crate::{MethodRef, NativeError, StdHost, Value};
 
 pub(crate) const KEY_VALUE_HOLDER: &str = "java/util/KeyValueHolder";
+pub(crate) const SIMPLE_ENTRY: &str = "java/util/AbstractMap$SimpleEntry";
 pub(crate) const SIMPLE_IMMUTABLE_ENTRY: &str = "java/util/AbstractMap$SimpleImmutableEntry";
 const OPAQUE: &str = "java/util/Map$Entry";
 
@@ -69,6 +70,8 @@ pub enum EntryMade {
     Holder,
     /// A `TreeMap` navigation entry: a new immutable `SimpleImmutableEntry`.
     Snapshot,
+    /// A detached mutable `AbstractMap.SimpleEntry` (`IdentityHashMap.EntrySet.toArray`).
+    SimpleEntry,
     /// An entry of a map's `entrySet()`: its node.
     Node,
 }
@@ -567,6 +570,20 @@ impl StdHost {
         match made {
             EntryMade::Holder => return fixed(self, KEY_VALUE_HOLDER),
             EntryMade::Snapshot => return fixed(self, SIMPLE_IMMUTABLE_ENTRY),
+            EntryMade::SimpleEntry => {
+                let entry_key = self.mint_key(SIMPLE_ENTRY, false);
+                let handle = Value::Host(HostRef::new(HostKind::MapEntry, entry_key.clone()));
+                self.map_entries.states.insert(
+                    entry_key,
+                    EntryState {
+                        key: key.clone(),
+                        value: value.clone(),
+                        life: Life::Detached,
+                        handle: handle.clone(),
+                    },
+                );
+                return handle;
+            }
             EntryMade::Node => {}
         }
         let map = map.and_then(crate::expect_ref).cloned().unwrap_or_default();

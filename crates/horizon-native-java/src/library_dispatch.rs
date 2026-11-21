@@ -1409,16 +1409,47 @@ impl<H: Host> Runtime<'_, H> {
         let Ok(items) = runtime_collection_values(&*self.host, receiver) else {
             return Ok(None);
         };
+        let identity_entry_source = expect_ref(receiver)
+            .filter(|marker| self.host.view_copy_kind(marker).as_deref() == Some("entrySet"))
+            .and_then(|marker| self.host.view_copy_source(marker))
+            .map(|source| crate::jar_object::stored_value(&source))
+            .filter(|source| {
+                self.host_collection_class(source).as_deref() == Some("java/util/IdentityHashMap")
+            });
+        if let Some(source) = identity_entry_source.as_ref()
+            && self.collection_uncertain(source)
+        {
+            return self.host.unknown_operand_call(r).map(Some);
+        }
         // `toArray(IntFunction)` on an entry set of `Collections.unmodifiableMap` is JDK 25's
         // `UnmodifiableCollection.toArray(f)`, `c.toArray(f)`: the source map's own entries.
         // `UnmodifiableEntrySet` wraps each entry only in `toArray()` and `toArray(T[])`, so the
         // other two forms keep the wrappers (#221 review 7, B11). Only a view's entry set holds
         // wrappers (a list copied from it keeps them, as Java's copy does).
+        // JDK 25's `IdentityHashMap$EntrySet.toArray` allocates detached `AbstractMap$SimpleEntry`
+        // copies instead of returning live `EntryIterator$Entry` handles.
         let unwrap = r.descriptor == "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;"
             && expect_ref(receiver).is_some_and(|marker| {
                 self.host.view_copy_kind(marker).as_deref() == Some("entrySet")
             });
-        let values = if unwrap {
+        let values = if identity_entry_source.is_some() {
+            items
+                .into_iter()
+                .map(|entry| {
+                    self.host
+                        .map_entry_parts(&entry)
+                        .map(|(key, value)| {
+                            self.host.mint_map_entry(
+                                None,
+                                &key,
+                                &value,
+                                host_map_entry::EntryMade::SimpleEntry,
+                            )
+                        })
+                        .unwrap_or(entry)
+                })
+                .collect()
+        } else if unwrap {
             items
                 .into_iter()
                 .map(|entry| self.host.unwrapped_view_entry(&entry).unwrap_or(entry))

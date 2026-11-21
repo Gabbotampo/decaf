@@ -35,10 +35,27 @@ public final class Probe {
     m.put(a, 1);
     return String.valueOf(m.get(String.valueOf(a)));
   }
+  public static String entrySetValue() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String,String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    m.entrySet().iterator().next().setValue(fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  public static String entryToArraySetValue() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String,String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    ((java.util.Map.Entry<String,String>) m.entrySet().toArray()[0]).setValue(fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
   public static void main(String[] args) {
     System.out.println(rows());
     System.out.println(sameReference());
     System.out.println(callbackMutation());
     System.out.println(stringValueOfIdentity());
+    System.out.println(entrySetValue());
+    System.out.println(entryToArraySetValue());
   }
 }

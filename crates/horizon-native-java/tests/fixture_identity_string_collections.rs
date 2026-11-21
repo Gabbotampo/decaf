@@ -17,6 +17,8 @@ fn identity_map_distinguishes_literals_and_string_copies() {
         "sameReference",
         "callbackMutation",
         "stringValueOfIdentity",
+        "entrySetValue",
+        "entryToArraySetValue",
     ]
     .iter()
     .map(|method| fixture.text_on(&mut host, method))

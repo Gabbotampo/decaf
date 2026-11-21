@@ -88,6 +88,53 @@ public class Probe {
   static String dynamicIntern() {
     return InternA.make() + "|" + InternB.lookup();
   }
+  static String integerAbove127Eq() {
+    return String.valueOf(Integer.valueOf(200) == Integer.valueOf(200));
+  }
+  static String integerAbove127Map() {
+    IdentityHashMap<Integer, String> m = new IdentityHashMap<>();
+    m.put(Integer.valueOf(200), "a");
+    m.put(Integer.valueOf(200), "b");
+    return m.size() + ":" + m.get(Integer.valueOf(200));
+  }
+  static String entrySetValue() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    m.entrySet().iterator().next().setValue(fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
+  static String entrySetValueOpaque() {
+    String k = new String("k"), old = new String("v"), fresh = result(new String("v"));
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    m.entrySet().iterator().next().setValue(fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  static String entryToArraySetValue() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    ((Map.Entry<String, String>) m.entrySet().toArray()[0]).setValue(fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
+  static String replaceAllValue() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    m.replaceAll((kk, vv) -> fresh);
+    return m.remove(k, old) + ":" + m.get(k);
+  }
+  static String entryIterRemove() {
+    String k = new String("k"), old = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    Iterator<Map.Entry<String, String>> it = m.entrySet().iterator();
+    it.next();
+    it.remove();
+    return m.size() + ":" + m.get(k);
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -106,4 +153,11 @@ public class Probe {
   public static String callbackMutationOut(){return callbackMutation();}
   public static String computeValueOverwriteOut(){return computeValueOverwrite();}
   public static String dynamicInternOut(){return dynamicIntern();}
+  public static String integerAbove127EqOut(){return integerAbove127Eq();}
+  public static String integerAbove127MapOut(){return integerAbove127Map();}
+  public static String entrySetValueOut(){return entrySetValue();}
+  public static String entrySetValueOpaqueOut(){return entrySetValueOpaque();}
+  public static String entryToArraySetValueOut(){return entryToArraySetValue();}
+  public static String replaceAllValueOut(){return replaceAllValue();}
+  public static String entryIterRemoveOut(){return entryIterRemove();}
 }

@@ -2590,6 +2590,11 @@ pub trait Host {
         None
     }
 
+    /// The backing map marker of a live host `Map.Entry`, if any.
+    fn map_entry_source(&self, _value: &Value) -> Option<String> {
+        None
+    }
+
     /// Whether a host map entry implements a fastutil primitive entry interface.
     fn map_entry_is_instance_of(&self, _value: &Value, _wanted: &str) -> Option<bool> {
         None
@@ -6940,6 +6945,13 @@ impl Host for StdHost {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.map_entry_now(value)
+    }
+
+    fn map_entry_source(&self, value: &Value) -> Option<String> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        self.map_entries.map_of(handle.key()).map(str::to_owned)
     }
 
     fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
@@ -23566,9 +23578,10 @@ struct Runtime<'a, H> {
     string_builders: BTreeMap<String, String>,
     /// Allocation keys of constructors whose String text is not modelled exactly.
     counted_strings: std::collections::BTreeSet<String>,
-    /// Known identity provenance for keys in identity-based collections.
+    /// Known identity provenance for keys and values in identity-based collections,
+    /// stamped with the host collection generation so external mutations invalidate it.
     identity_collection_keys:
-        std::collections::BTreeMap<String, Vec<reference_identity::CallIdentity>>,
+        std::collections::BTreeMap<String, immutable_collections::IdentityCollectionTokens>,
     /// Runtime-local JVM string-pool observations for `String.intern()`.
     string_pool: reference_identity::StringPoolState,
     /// Allocation keys (or I/O sink keys) whose held text was written from a

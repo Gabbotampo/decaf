@@ -71,6 +71,19 @@ enum IdentityMatch {
     Unknown,
 }
 
+/// Key and value allocation provenance tracked for one `IdentityHashMap` (or
+/// `IdentityHashSet`), stamped with the host `CollectionStore` generation at
+/// which those tokens were stored. Any mutation outside this module (e.g.
+/// `Map.Entry.setValue`, `Iterator.remove`, `replaceAll`, view mutators, or
+/// `Collections.synchronizedMap`) advances the host generation and
+/// automatically invalidates stale tokens on read.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct IdentityCollectionTokens {
+    generation: Option<u64>,
+    keys: Vec<reference_identity::CallIdentity>,
+    values: Vec<reference_identity::CallIdentity>,
+}
+
 /// The JVM's helpful message for `o.equals(..)` on a null `o`
 /// (`Set12.contains`, `Map1.get`/`containsKey`/`containsValue`).
 fn null_receiver() -> NativeError {
@@ -112,6 +125,7 @@ fn mutates(name: &str) -> bool {
             | "retainAll"
             | "removeIf"
             | "clear"
+            | "setValue"
     )
 }
 
@@ -121,8 +135,56 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Whether a counted call may have changed `collection` (#464).
-    fn collection_uncertain(&self, collection: &Value) -> bool {
+    pub(crate) fn collection_uncertain(&self, collection: &Value) -> bool {
         Self::uncertain_key(collection).is_some_and(|key| self.fields.contains_key(&key))
+    }
+
+    /// Load `(key_tokens, value_tokens)` for `marker`, padded to `len`. Drops
+    /// stale tokens automatically whenever the host collection's generation
+    /// changed outside this module.
+    fn load_identity_tokens(
+        &self,
+        marker: Option<&str>,
+        len: usize,
+    ) -> (
+        Vec<reference_identity::CallIdentity>,
+        Vec<reference_identity::CallIdentity>,
+    ) {
+        let Some(marker) = marker else {
+            return (vec![None; len], vec![None; len]);
+        };
+        let current_gen = self.host.collection_generation(marker);
+        let (mut keys, mut values) = self
+            .identity_collection_keys
+            .get(marker)
+            .filter(|entry| entry.generation == current_gen)
+            .map(|entry| (entry.keys.clone(), entry.values.clone()))
+            .unwrap_or_default();
+        keys.resize(len, None);
+        values.resize(len, None);
+        (keys, values)
+    }
+
+    /// Store `(keys, values)` for `marker` stamped with its current host
+    /// collection generation.
+    fn store_identity_tokens(
+        &mut self,
+        marker: Option<String>,
+        keys: Vec<reference_identity::CallIdentity>,
+        values: Vec<reference_identity::CallIdentity>,
+    ) {
+        let Some(marker) = marker else {
+            return;
+        };
+        let generation = self.host.collection_generation(&marker);
+        self.identity_collection_keys.insert(
+            marker,
+            IdentityCollectionTokens {
+                generation,
+                keys,
+                values,
+            },
+        );
     }
 
     /// Count `r`, an identity-collection call whose answer depends on an identity the runtime
@@ -478,6 +540,11 @@ impl<H: Host> Runtime<'_, H> {
         if self.host.is_set_from_map(receiver) {
             return Ok(None);
         }
+        if crate::runtime::host_map_entry::is_identity_entry(receiver)
+            && let Some(answer) = self.identity_entry_member(r, receiver, args, identity_args)?
+        {
+            return Ok(Some(answer));
+        }
         if let ("equals", "(Ljava/lang/Object;)Z", [other]) =
             (r.name.as_str(), r.descriptor.as_str(), args)
             && matches!(
@@ -574,11 +641,7 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(None);
         };
         let mut values = self.collection_elements(receiver)?;
-        let mut tokens = marker
-            .as_deref()
-            .and_then(|key| self.identity_collection_keys.get(key).cloned())
-            .unwrap_or_default();
-        tokens.resize(values.len(), None);
+        let (mut tokens, _) = self.load_identity_tokens(marker.as_deref(), values.len());
         let wanted = identity_args.first().cloned().flatten();
         let Some(position) = self.identity_position(&values, &tokens, value, wanted.as_ref())
         else {
@@ -592,9 +655,7 @@ impl<H: Host> Runtime<'_, H> {
                     values.push(value.clone());
                     tokens.push(wanted);
                     self.host.replace_mutable_collection(receiver, values);
-                    if let Some(marker) = marker {
-                        self.identity_collection_keys.insert(marker, tokens);
-                    }
+                    self.store_identity_tokens(marker, tokens, Vec::new());
                     Ok(Some(Value::Int(1)))
                 }
             }
@@ -608,9 +669,7 @@ impl<H: Host> Runtime<'_, H> {
                 values.remove(index);
                 tokens.remove(index);
                 self.host.replace_mutable_collection(receiver, values);
-                if let Some(marker) = marker {
-                    self.identity_collection_keys.insert(marker, tokens);
-                }
+                self.store_identity_tokens(marker, tokens, Vec::new());
                 Ok(Some(Value::Int(1)))
             }
             _ => Ok(None),
@@ -878,9 +937,13 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
-    /// Whether `receiver` is an identity-based collection or a view over one,
-    /// so argument allocation provenance needs to be collected for calls on it.
+    /// Whether `receiver` is an identity-based collection, a view over one, or
+    /// a live `IdentityHashMap` entry, so argument allocation provenance needs
+    /// to be collected for calls on it.
     pub(crate) fn tracks_identity_args(&self, receiver: &Value) -> bool {
+        if crate::runtime::host_map_entry::is_identity_entry(receiver) {
+            return true;
+        }
         if matches!(
             self.host_collection_class(receiver).as_deref(),
             Some(IDENTITY_MAP | IDENTITY_SET)
@@ -1036,7 +1099,6 @@ impl<H: Host> Runtime<'_, H> {
         let marker = by_identity
             .then(|| crate::runtime::jar_object::object_key(receiver).map(str::to_owned))
             .flatten();
-        let value_marker = marker.as_deref().map(|key| format!("{key}|values"));
         let key_token = if by_identity {
             identity_args.first().cloned().flatten()
         } else {
@@ -1044,11 +1106,7 @@ impl<H: Host> Runtime<'_, H> {
         };
         let old_index = if by_identity {
             let stored_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
-            let mut tokens = marker
-                .as_deref()
-                .and_then(|key| self.identity_collection_keys.get(key).cloned())
-                .unwrap_or_default();
-            tokens.resize(stored_keys.len(), None);
+            let (tokens, _) = self.load_identity_tokens(marker.as_deref(), stored_keys.len());
             let Some(found) =
                 self.identity_position(&stored_keys, &tokens, key, key_token.as_ref())
             else {
@@ -1102,16 +1160,8 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(Some(new));
         }
         let reloaded_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
-        let mut tokens = marker
-            .as_deref()
-            .and_then(|key| self.identity_collection_keys.get(key).cloned())
-            .unwrap_or_default();
-        let mut value_tokens = value_marker
-            .as_deref()
-            .and_then(|key| self.identity_collection_keys.get(key).cloned())
-            .unwrap_or_default();
-        tokens.resize(reloaded_keys.len(), None);
-        value_tokens.resize(reloaded_keys.len(), None);
+        let (mut tokens, mut value_tokens) =
+            self.load_identity_tokens(marker.as_deref(), reloaded_keys.len());
         let Some(current_index) =
             self.identity_position(&reloaded_keys, &tokens, key, key_token.as_ref())
         else {
@@ -1144,13 +1194,65 @@ impl<H: Host> Runtime<'_, H> {
             }
         }
         self.host.replace_mutable_collection(receiver, entries);
-        if let Some(marker) = marker {
-            self.identity_collection_keys.insert(marker, tokens);
-        }
-        if let Some(marker) = value_marker {
-            self.identity_collection_keys.insert(marker, value_tokens);
-        }
+        self.store_identity_tokens(marker, tokens, value_tokens);
         Ok(Some(new))
+    }
+
+    /// A member of a live `IdentityHashMap$EntryIterator$Entry`: keep the
+    /// backing map's value-provenance table in sync with `setValue`, count any
+    /// call when the backing map is uncertain, and count+mark uncertain when
+    /// duplicate equal-valued keys make `setValue`'s target slot ambiguous.
+    fn identity_entry_member(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+        identity_args: &[reference_identity::CallIdentity],
+    ) -> Result<Option<Value>, NativeError> {
+        let Some(map_marker) = self.host.map_entry_source(receiver) else {
+            return Ok(None);
+        };
+        let map_value = crate::runtime::jar_object::stored_value(&map_marker);
+        if self.host_collection_class(&map_value).as_deref() != Some(IDENTITY_MAP) {
+            return Ok(None);
+        }
+        if self.collection_uncertain(&map_value) {
+            return self.count_identity_call(r, &map_value).map(Some);
+        }
+        if r.name != "setValue" || r.descriptor != "(Ljava/lang/Object;)Ljava/lang/Object;" {
+            return Ok(None);
+        }
+        let Some(entries) = self.host.mutable_collection_entries(&map_value) else {
+            return Ok(None);
+        };
+        let Some((entry_key, _)) = self.host.map_entry_parts(receiver) else {
+            return Ok(None);
+        };
+        let mut matching = entries
+            .chunks(2)
+            .enumerate()
+            .filter_map(|(index, pair)| (pair.first() == Some(&entry_key)).then_some(index));
+        let Some(index) = matching.next() else {
+            // Detached/removed entry: let host handle (count or update detached state).
+            return Ok(None);
+        };
+        if matching.next().is_some() {
+            // Multiple entries have equal-valued keys (e.g. distinct `new String("k")`
+            // instances), so `StdHost::map_entry_set_value`'s value-equality lookup
+            // cannot identify which slot belongs to this entry.
+            return self.count_identity_call(r, &map_value).map(Some);
+        }
+        let pair_count = entries.len() / 2;
+        let (keys, mut values) = self.load_identity_tokens(Some(&map_marker), pair_count);
+        let before_gen = self.host.collection_generation(&map_marker);
+        let old = self.host.invoke_instance(r, receiver, args)?;
+        let after_gen = self.host.collection_generation(&map_marker);
+        if after_gen != before_gen {
+            values[index] = identity_args.first().cloned().flatten();
+            self.store_identity_tokens(Some(map_marker.clone()), keys, values);
+            self.refresh_map_views(&map_marker);
+        }
+        Ok(Some(old))
     }
 
     /// A member of a `keySet()`/`values()`/`entrySet()` copy of an
@@ -1176,6 +1278,11 @@ impl<H: Host> Runtime<'_, H> {
         if self.host_collection_class(&source).as_deref() != Some(IDENTITY_MAP) {
             return Ok(None);
         }
+        if self.collection_uncertain(&source) {
+            return self
+                .count_identity_call(r, &source)
+                .map(|value| Some(Some(value)));
+        }
         let entries = match self.host.mutable_collection_entries(&source) {
             Some(entries) => entries,
             None => self.collection_elements(&source)?,
@@ -1183,15 +1290,8 @@ impl<H: Host> Runtime<'_, H> {
         let keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
         let values: Vec<Value> = entries.iter().skip(1).step_by(2).cloned().collect();
         let source_marker = crate::runtime::jar_object::object_key(&source).map(str::to_owned);
-        let key_tokens = source_marker
-            .as_deref()
-            .and_then(|key| self.identity_collection_keys.get(key).cloned())
-            .unwrap_or_default();
-        let value_tokens = source_marker
-            .as_deref()
-            .map(|key| format!("{key}|values"))
-            .and_then(|key| self.identity_collection_keys.get(&key).cloned())
-            .unwrap_or_default();
+        let (key_tokens, value_tokens) =
+            self.load_identity_tokens(source_marker.as_deref(), keys.len());
         // The arguments as the copy's elements: one, or a collection's.
         let mut wanted = Vec::new();
         for (arg_index, arg) in args.iter().enumerate() {
@@ -1246,12 +1346,13 @@ impl<H: Host> Runtime<'_, H> {
                 .count_identity_call(r, &source)
                 .map(|value| Some(Some(value)));
         }
-        if mutates(&r.name)
-            && let Some(marker) = source_marker.as_deref()
-        {
-            self.identity_collection_keys.remove(marker);
-            self.identity_collection_keys
-                .remove(&format!("{marker}|values"));
+        if mutates(&r.name) && !matches!(r.name.as_str(), "add" | "addAll") {
+            if let Some(marker) = source_marker.as_deref() {
+                self.identity_collection_keys.remove(marker);
+            }
+            return self
+                .count_identity_call(r, &source)
+                .map(|value| Some(Some(value)));
         }
         Ok(None)
     }
@@ -1267,12 +1368,8 @@ impl<H: Host> Runtime<'_, H> {
         identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
         let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
-        let value_marker = marker.as_deref().map(|key| format!("{key}|values"));
         if r.name == "clear" {
             if let Some(marker) = marker.as_deref() {
-                self.identity_collection_keys.remove(marker);
-            }
-            if let Some(marker) = value_marker.as_deref() {
                 self.identity_collection_keys.remove(marker);
             }
             return Ok(None);
@@ -1301,18 +1398,10 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = args.first() else {
                 return Ok(None);
             };
-            let mut tokens = marker
-                .as_deref()
-                .and_then(|key| self.identity_collection_keys.get(key).cloned())
-                .unwrap_or_default();
-            let mut value_tokens = value_marker
-                .as_deref()
-                .and_then(|key| self.identity_collection_keys.get(key).cloned())
-                .unwrap_or_default();
             let key_token = identity_args.first().cloned().flatten();
             let stored_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
-            tokens.resize(stored_keys.len(), None);
-            value_tokens.resize(stored_keys.len(), None);
+            let (mut tokens, mut value_tokens) =
+                self.load_identity_tokens(marker.as_deref(), stored_keys.len());
             let Some(position) =
                 self.identity_position(&stored_keys, &tokens, key, key_token.as_ref())
             else {
@@ -1364,12 +1453,7 @@ impl<H: Host> Runtime<'_, H> {
                                     tokens.remove(index);
                                     value_tokens.remove(index);
                                     self.host.replace_mutable_collection(receiver, updated);
-                                    if let Some(marker) = marker {
-                                        self.identity_collection_keys.insert(marker, tokens);
-                                    }
-                                    if let Some(marker) = value_marker {
-                                        self.identity_collection_keys.insert(marker, value_tokens);
-                                    }
+                                    self.store_identity_tokens(marker, tokens, value_tokens);
                                 }
                                 return Ok(Some(Value::Int(matches as i32)));
                             }
@@ -1381,12 +1465,7 @@ impl<H: Host> Runtime<'_, H> {
                             tokens.remove(index);
                             value_tokens.remove(index);
                             self.host.replace_mutable_collection(receiver, updated);
-                            if let Some(marker) = marker {
-                                self.identity_collection_keys.insert(marker, tokens);
-                            }
-                            if let Some(marker) = value_marker {
-                                self.identity_collection_keys.insert(marker, value_tokens);
-                            }
+                            self.store_identity_tokens(marker, tokens, value_tokens);
                             return Ok(Some(old));
                         }
                         "put" => {
@@ -1395,21 +1474,14 @@ impl<H: Host> Runtime<'_, H> {
                                 updated[index * 2 + 1] = value;
                                 value_tokens[index] = identity_args.get(1).cloned().flatten();
                                 self.host.replace_mutable_collection(receiver, updated);
-                                if let Some(marker) = value_marker {
-                                    self.identity_collection_keys.insert(marker, value_tokens);
-                                }
+                                self.store_identity_tokens(marker, tokens, value_tokens);
                                 return Ok(Some(old));
                             }
                             updated.extend([key.clone(), value]);
                             tokens.push(key_token);
                             value_tokens.push(identity_args.get(1).cloned().flatten());
                             self.host.replace_mutable_collection(receiver, updated);
-                            if let Some(marker) = marker {
-                                self.identity_collection_keys.insert(marker, tokens);
-                            }
-                            if let Some(marker) = value_marker {
-                                self.identity_collection_keys.insert(marker, value_tokens);
-                            }
+                            self.store_identity_tokens(marker, tokens, value_tokens);
                             return Ok(Some(Value::Ref(None)));
                         }
                         "putIfAbsent" => {
@@ -1420,12 +1492,7 @@ impl<H: Host> Runtime<'_, H> {
                             tokens.push(key_token);
                             value_tokens.push(identity_args.get(1).cloned().flatten());
                             self.host.replace_mutable_collection(receiver, updated);
-                            if let Some(marker) = marker {
-                                self.identity_collection_keys.insert(marker, tokens);
-                            }
-                            if let Some(marker) = value_marker {
-                                self.identity_collection_keys.insert(marker, value_tokens);
-                            }
+                            self.store_identity_tokens(marker, tokens, value_tokens);
                             return Ok(Some(Value::Ref(None)));
                         }
                         "replace" => {
@@ -1456,18 +1523,14 @@ impl<H: Host> Runtime<'_, H> {
                                     updated[index * 2 + 1] = args[2].clone();
                                     value_tokens[index] = identity_args.get(2).cloned().flatten();
                                     self.host.replace_mutable_collection(receiver, updated);
-                                    if let Some(marker) = value_marker {
-                                        self.identity_collection_keys.insert(marker, value_tokens);
-                                    }
+                                    self.store_identity_tokens(marker, tokens, value_tokens);
                                 }
                                 return Ok(Some(Value::Int(matches as i32)));
                             }
                             updated[index * 2 + 1] = value;
                             value_tokens[index] = identity_args.get(1).cloned().flatten();
                             self.host.replace_mutable_collection(receiver, updated);
-                            if let Some(marker) = value_marker {
-                                self.identity_collection_keys.insert(marker, value_tokens);
-                            }
+                            self.store_identity_tokens(marker, tokens, value_tokens);
                             return Ok(Some(old));
                         }
                         _ => {}
@@ -1496,7 +1559,7 @@ impl<H: Host> Runtime<'_, H> {
             if ambiguous {
                 return self.count_identity_call(r, receiver).map(Some);
             }
-            if let Some(marker) = value_marker.as_deref() {
+            if let Some(marker) = marker.as_deref() {
                 self.identity_collection_keys.remove(marker);
             }
             return Ok(None);
@@ -1515,10 +1578,14 @@ impl<H: Host> Runtime<'_, H> {
             }
             return Ok(None);
         }
-        if r.name == "replaceAll"
-            && let Some(marker) = value_marker.as_deref()
-        {
-            self.identity_collection_keys.remove(marker);
+        if r.name == "replaceAll" {
+            if args.first() == Some(&Value::Ref(None)) {
+                return Err(thrown("java/lang/NullPointerException", None));
+            }
+            if entries.is_empty() {
+                return Ok(Some(Value::Void));
+            }
+            return self.count_identity_call(r, receiver).map(Some);
         }
         if matches!(r.name.as_str(), "size" | "isEmpty" | "clear" | "<init>") || entries.len() < 4 {
             return Ok(None);
