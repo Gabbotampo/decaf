@@ -396,6 +396,13 @@ fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Bloc
     block.properties.friction = declaration.friction;
     block.properties.requires_tool = declaration.requires_tool;
     block.properties.occludes = declaration.occludes;
+    if let Some(shapes) = &declaration.shapes {
+        block.shapes = Some(mod_api::BlockShapes {
+            properties: shapes.properties.clone(),
+            values: shapes.values.clone(),
+            default: shapes.default.clone(),
+        });
+    }
     // The vocabulary has `Boolean` and `Enum`: an integer property is an enum of the same value
     // strings, in its `getPossibleValues()` order (as blockstate JSON spells `age=3`). The runtime
     // records only these three kinds; any other is left out rather than guessed.
@@ -538,6 +545,14 @@ impl LoadedJar {
     /// more), and the row's verdict over everything its load ran. The log line is written again
     /// when the stages changed it.
     fn finish_loading(&mut self) {
+        let budget = runtime::ExecutionBudget::within(crate::JAR_BUDGET);
+        let (jar, host) = (&self.jar, &mut self.host);
+        if let Err(panic) = crate::caught(&format!("{} block shapes", self.row.id), || {
+            jar.populate_block_shapes(host, &budget);
+        }) {
+            self.failures
+                .push(format!("block shapes: panicked: {panic}"));
+        }
         let registered = self.host.game_listeners(&self.jar, true);
         self.listeners = registered.listeners;
         self.orderings = registered.phase_orderings;
@@ -724,6 +739,7 @@ mod tests {
             state_properties: BTreeMap::new(),
             default_state: BTreeMap::new(),
             occludes: None,
+            shapes: None,
         };
         let block = block_entry(&declaration, &declaration.id);
         assert!(!block.item);
@@ -735,6 +751,60 @@ mod tests {
         assert_eq!(block.properties.hardness, Some(2.0));
         assert_eq!(block.properties.explosion_resistance, Some(6.0));
         assert_eq!(block.properties.requires_tool, Some(true));
+        assert!(block.shapes.is_none());
+    }
+
+    #[test]
+    fn a_block_declaration_carries_evaluated_shapes_into_mod_api() {
+        let declaration = runtime::content::Block {
+            id: "horizon_java:shaped_block".to_owned(),
+            template: "minecraft:stone".to_owned(),
+            item: false,
+            hardness: None,
+            explosion_resistance: None,
+            friction: None,
+            requires_tool: None,
+            state_properties: BTreeMap::from([(
+                "facing".to_owned(),
+                runtime::content::StateProperty {
+                    kind: "enum".to_owned(),
+                    values: vec!["north".into(), "south".into(), "west".into(), "east".into()],
+                },
+            )]),
+            default_state: BTreeMap::from([("facing".to_owned(), "north".to_owned())]),
+            occludes: None,
+            shapes: Some(runtime::content::BlockShapes {
+                properties: vec!["facing".to_owned()],
+                values: BTreeMap::from([
+                    (
+                        "east".to_owned(),
+                        vec![[0.625, 0.0, 0.125, 1.0, 0.75, 0.875]],
+                    ),
+                    (
+                        "north".to_owned(),
+                        vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]],
+                    ),
+                    (
+                        "south".to_owned(),
+                        vec![[0.125, 0.0, 0.625, 0.875, 0.75, 1.0]],
+                    ),
+                    (
+                        "west".to_owned(),
+                        vec![[0.0, 0.0, 0.125, 0.375, 0.75, 0.875]],
+                    ),
+                ]),
+                default: None,
+            }),
+        };
+        let block = block_entry(&declaration, &declaration.id);
+        let shapes = block.shapes.expect("shapes mapped to mod_api::BlockShapes");
+        assert_eq!(shapes.properties, vec!["facing".to_owned()]);
+        assert_eq!(shapes.default, None);
+        assert_eq!(
+            shapes.values.get("north"),
+            Some(&vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]])
+        );
+        assert_eq!(shapes.values.len(), 4);
     }
 
     /// A mod's own `BlockItem` is an item registration and is declared with its properties even

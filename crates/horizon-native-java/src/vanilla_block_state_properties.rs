@@ -131,3 +131,101 @@ WEST|west|boolean|[true, false]|net/minecraft/world/level/block/state/properties
 WEST_REDSTONE|west|enum|[up, side, none]|net/minecraft/world/level/block/state/properties/EnumProperty
 WEST_WALL|west|enum|[none, low, tall]|net/minecraft/world/level/block/state/properties/EnumProperty
 "#;
+
+/// Exact enum value class and `serialized=CONSTANT` pairs for every `EnumProperty` field in 26.3
+/// `BlockStateProperties`, captured from the real server classes with JDK 25 (`Property.getValueClass()`
+/// + `Property.getName(v)` + `Enum.name()`).
+#[rustfmt::skip]
+pub(crate) const ENUM_VALUES: &str = r#"ATTACH_FACE|net/minecraft/world/level/block/state/properties/AttachFace|floor=FLOOR,wall=WALL,ceiling=CEILING
+AXIS|net/minecraft/core/Direction$Axis|x=X,y=Y,z=Z
+BAMBOO_LEAVES|net/minecraft/world/level/block/state/properties/BambooLeaves|none=NONE,small=SMALL,large=LARGE
+BED_PART|net/minecraft/world/level/block/state/properties/BedPart|head=HEAD,foot=FOOT
+BELL_ATTACHMENT|net/minecraft/world/level/block/state/properties/BellAttachType|floor=FLOOR,ceiling=CEILING,single_wall=SINGLE_WALL,double_wall=DOUBLE_WALL
+CHEST_TYPE|net/minecraft/world/level/block/state/properties/ChestType|single=SINGLE,left=LEFT,right=RIGHT
+COPPER_GOLEM_POSE|net/minecraft/world/level/block/CopperGolemStatueBlock$Pose|standing=STANDING,sitting=SITTING,running=RUNNING,star=STAR
+CREAKING_HEART_STATE|net/minecraft/world/level/block/state/properties/CreakingHeartState|uprooted=UPROOTED,dormant=DORMANT,awake=AWAKE
+DOOR_HINGE|net/minecraft/world/level/block/state/properties/DoorHingeSide|left=LEFT,right=RIGHT
+DOUBLE_BLOCK_HALF|net/minecraft/world/level/block/state/properties/DoubleBlockHalf|upper=UPPER,lower=LOWER
+EAST_REDSTONE|net/minecraft/world/level/block/state/properties/RedstoneSide|up=UP,side=SIDE,none=NONE
+EAST_WALL|net/minecraft/world/level/block/state/properties/WallSide|none=NONE,low=LOW,tall=TALL
+FACING|net/minecraft/core/Direction|north=NORTH,east=EAST,south=SOUTH,west=WEST,up=UP,down=DOWN
+FACING_HOPPER|net/minecraft/core/Direction|down=DOWN,north=NORTH,south=SOUTH,west=WEST,east=EAST
+HALF|net/minecraft/world/level/block/state/properties/Half|top=TOP,bottom=BOTTOM
+HORIZONTAL_AXIS|net/minecraft/core/Direction$Axis|x=X,z=Z
+HORIZONTAL_FACING|net/minecraft/core/Direction|north=NORTH,south=SOUTH,west=WEST,east=EAST
+MODE_COMPARATOR|net/minecraft/world/level/block/state/properties/ComparatorMode|compare=COMPARE,subtract=SUBTRACT
+NORTH_REDSTONE|net/minecraft/world/level/block/state/properties/RedstoneSide|up=UP,side=SIDE,none=NONE
+NORTH_WALL|net/minecraft/world/level/block/state/properties/WallSide|none=NONE,low=LOW,tall=TALL
+NOTEBLOCK_INSTRUMENT|net/minecraft/world/level/block/state/properties/NoteBlockInstrument|harp=HARP,basedrum=BASEDRUM,snare=SNARE,hat=HAT,bass=BASS,flute=FLUTE,bell=BELL,guitar=GUITAR,chime=CHIME,xylophone=XYLOPHONE,iron_xylophone=IRON_XYLOPHONE,cow_bell=COW_BELL,didgeridoo=DIDGERIDOO,bit=BIT,banjo=BANJO,pling=PLING,trumpet=TRUMPET,trumpet_exposed=TRUMPET_EXPOSED,trumpet_oxidized=TRUMPET_OXIDIZED,trumpet_weathered=TRUMPET_WEATHERED,zombie=ZOMBIE,skeleton=SKELETON,creeper=CREEPER,dragon=DRAGON,wither_skeleton=WITHER_SKELETON,piglin=PIGLIN,custom_head=CUSTOM_HEAD
+ORIENTATION|net/minecraft/core/FrontAndTop|down_east=DOWN_EAST,down_north=DOWN_NORTH,down_south=DOWN_SOUTH,down_west=DOWN_WEST,up_east=UP_EAST,up_north=UP_NORTH,up_south=UP_SOUTH,up_west=UP_WEST,west_up=WEST_UP,east_up=EAST_UP,north_up=NORTH_UP,south_up=SOUTH_UP
+PISTON_TYPE|net/minecraft/world/level/block/state/properties/PistonType|normal=DEFAULT,sticky=STICKY
+POTENT_SULFUR_STATE|net/minecraft/world/level/block/state/properties/PotentSulfurState|dry=DRY,wet=WET,dormant=DORMANT,erupting=ERUPTING,continuous=CONTINUOUS
+RAIL_SHAPE|net/minecraft/world/level/block/state/properties/RailShape|north_south=NORTH_SOUTH,east_west=EAST_WEST,ascending_east=ASCENDING_EAST,ascending_west=ASCENDING_WEST,ascending_north=ASCENDING_NORTH,ascending_south=ASCENDING_SOUTH,south_east=SOUTH_EAST,south_west=SOUTH_WEST,north_west=NORTH_WEST,north_east=NORTH_EAST
+RAIL_SHAPE_STRAIGHT|net/minecraft/world/level/block/state/properties/RailShape|north_south=NORTH_SOUTH,east_west=EAST_WEST,ascending_east=ASCENDING_EAST,ascending_west=ASCENDING_WEST,ascending_north=ASCENDING_NORTH,ascending_south=ASCENDING_SOUTH
+SCULK_SENSOR_PHASE|net/minecraft/world/level/block/state/properties/SculkSensorPhase|inactive=INACTIVE,active=ACTIVE,cooldown=COOLDOWN
+SIDE_CHAIN_PART|net/minecraft/world/level/block/state/properties/SideChainPart|unconnected=UNCONNECTED,right=RIGHT,center=CENTER,left=LEFT
+SLAB_TYPE|net/minecraft/world/level/block/state/properties/SlabType|top=TOP,bottom=BOTTOM,double=DOUBLE
+SOUTH_REDSTONE|net/minecraft/world/level/block/state/properties/RedstoneSide|up=UP,side=SIDE,none=NONE
+SOUTH_WALL|net/minecraft/world/level/block/state/properties/WallSide|none=NONE,low=LOW,tall=TALL
+SPELEOTHEM_THICKNESS|net/minecraft/world/level/block/state/properties/SpeleothemThickness|tip_merge=TIP_MERGE,tip=TIP,frustum=FRUSTUM,middle=MIDDLE,base=BASE
+STAIRS_SHAPE|net/minecraft/world/level/block/state/properties/StairsShape|straight=STRAIGHT,inner_left=INNER_LEFT,inner_right=INNER_RIGHT,outer_left=OUTER_LEFT,outer_right=OUTER_RIGHT
+STRUCTUREBLOCK_MODE|net/minecraft/world/level/block/state/properties/StructureMode|save=SAVE,load=LOAD,corner=CORNER,data=DATA
+TEST_BLOCK_MODE|net/minecraft/world/level/block/state/properties/TestBlockMode|start=START,log=LOG,fail=FAIL,accept=ACCEPT
+TILT|net/minecraft/world/level/block/state/properties/Tilt|none=NONE,unstable=UNSTABLE,partial=PARTIAL,full=FULL
+TRIAL_SPAWNER_STATE|net/minecraft/world/level/block/entity/trialspawner/TrialSpawnerState|inactive=INACTIVE,waiting_for_players=WAITING_FOR_PLAYERS,active=ACTIVE,waiting_for_reward_ejection=WAITING_FOR_REWARD_EJECTION,ejecting_reward=EJECTING_REWARD,cooldown=COOLDOWN
+VAULT_STATE|net/minecraft/world/level/block/entity/vault/VaultState|inactive=INACTIVE,active=ACTIVE,unlocking=UNLOCKING,ejecting=EJECTING
+VERTICAL_DIRECTION|net/minecraft/core/Direction|up=UP,down=DOWN
+WEST_REDSTONE|net/minecraft/world/level/block/state/properties/RedstoneSide|up=UP,side=SIDE,none=NONE
+WEST_WALL|net/minecraft/world/level/block/state/properties/WallSide|none=NONE,low=LOW,tall=TALL
+"#;
+
+/// Convert a serialized property value (e.g. `"north"`, `"true"`, `"3"`) for a captured
+/// `BlockStateProperties.<field>` into the exact Java `Value` returned by `StateHolder.getValue`.
+pub(crate) fn property_value(field: &str, kind: &str, serialized: &str) -> Option<crate::Value> {
+    match kind {
+        "boolean" => match serialized {
+            "true" => Some(crate::Value::Boxed(crate::Boxed::Boolean(true))),
+            "false" => Some(crate::Value::Boxed(crate::Boxed::Boolean(false))),
+            _ => None,
+        },
+        "integer" => serialized
+            .parse::<i32>()
+            .ok()
+            .map(|n| crate::Value::Boxed(crate::Boxed::Integer(n))),
+        "enum" => ENUM_VALUES.lines().find_map(|line| {
+            let mut parts = line.split('|');
+            if parts.next()? != field {
+                return None;
+            }
+            let class = parts.next()?;
+            let pairs = parts.next()?;
+            pairs.split(',').find_map(|pair| {
+                let (ser, constant) = pair.split_once('=')?;
+                (ser == serialized)
+                    .then(|| crate::Value::Ref(Some(format!("enum/{class}/{constant}"))))
+            })
+        }),
+        _ => None,
+    }
+}
+
+/// Convert a Java enum constant marker (`enum/<class>/<CONSTANT>`) to its serialized property value
+/// for `BlockStateProperties.<field>` (e.g. `PistonType.DEFAULT` -> `"normal"`).
+pub(crate) fn enum_serialized_name(field: &str, enum_marker: &str) -> Option<String> {
+    let rest = enum_marker.strip_prefix("enum/")?;
+    let (class, constant) = rest.rsplit_once('/')?;
+    ENUM_VALUES.lines().find_map(|line| {
+        let mut parts = line.split('|');
+        if parts.next()? != field {
+            return None;
+        }
+        if parts.next()? != class {
+            return None;
+        }
+        let pairs = parts.next()?;
+        pairs.split(',').find_map(|pair| {
+            let (ser, cname) = pair.split_once('=')?;
+            (cname == constant).then(|| ser.to_owned())
+        })
+    })
+}

@@ -984,6 +984,7 @@ fn main() -> ExitCode {
             failures.extend(jar.run_loading_stage(stage, &mut host, &budget));
             failures.extend(jar.run_deferred_work(&mut host, &budget));
         }
+        jar.populate_block_shapes(&mut host, &budget);
     }
     let error = (ran == 0).then(|| failures.join("; "));
     match error {

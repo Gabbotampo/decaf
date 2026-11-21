@@ -271,6 +271,7 @@ mod tree_map;
 mod type_switch;
 mod value_class;
 mod vanilla_block_items;
+mod vanilla_block_shapes;
 mod vanilla_block_state_definers;
 mod vanilla_block_state_properties;
 mod vanilla_blocks;
@@ -283,8 +284,11 @@ mod vanilla_registry_keys;
 mod vanilla_static;
 mod vanilla_values;
 pub mod verdict;
+mod voxel_shape;
 mod watch_service;
 pub mod weaver;
+
+pub use voxel_shape::{BlockShapes, BlockStateShape};
 
 pub use facade_server::{GameRuleValue, ServerFacts};
 pub use game_hooks::{
@@ -2422,6 +2426,14 @@ pub trait Host {
     fn finish_block_state_definition(&mut self, _block: &Value, _builder: &Value) {}
     fn block_state_definition_unknown(&mut self, _block: &Value, _method: &MethodRef) {}
     fn block_placement_unknown(&mut self) {}
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        _first: &Value,
+        _others: &[Value],
+    ) -> Result<Value, NativeError> {
+        Err(NativeError::UnknownHostCall(r.clone()))
+    }
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -3370,6 +3382,7 @@ const INFERRED_BLOCK_TEMPLATE: &str = "minecraft:stone";
 const MAX_PROPERTY_BUILDERS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatePropertyInfo {
+    field: String,
     kind: String,
     values: Vec<String>,
 }
@@ -3640,6 +3653,8 @@ pub struct StdHost {
     cached_collections: BTreeMap<(String, String), String>,
     /// Primitive state for vanilla RangedAttribute handles.
     ranged_attributes: BTreeMap<String, vanilla_values::RangedAttributeState>,
+    /// Modelled Minecraft 26.3 `VoxelShape` values, keyed by their host handle.
+    voxel_shapes: BTreeMap<String, voxel_shape::VoxelShapeData>,
     /// The `Arrays.asList` views and the arrays they mirror (`array_views.rs`).
     array_views: array_views::ArrayViews,
     /// The JDK's own `List.of`/`List.copyOf` lists among the unmodifiable
@@ -3761,6 +3776,7 @@ pub struct StdHost {
     next_unmodifiable_collection: usize,
     next_reversed_view: usize,
     next_ranged_attribute: usize,
+    next_voxel_shape: u64,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -3908,6 +3924,7 @@ impl StdHost {
             shared_empties: BTreeMap::new(),
             cached_collections: BTreeMap::new(),
             ranged_attributes: BTreeMap::new(),
+            voxel_shapes: BTreeMap::new(),
             array_views: Default::default(),
             jdk_list_of: std::collections::BTreeSet::new(),
             charset_decoders: BTreeMap::new(),
@@ -3961,6 +3978,7 @@ impl StdHost {
             next_unmodifiable_collection: 0,
             next_reversed_view: 0,
             next_ranged_attribute: 0,
+            next_voxel_shape: 0,
             game_event: None,
             client: client_surface::ClientState::default(),
             render_objects: BTreeMap::new(),
@@ -5167,9 +5185,80 @@ impl StdHost {
                         .filter(|value| !value.is_empty())
                         .map(str::to_owned)
                         .collect();
-                    Some(StatePropertyInfo { kind, values })
+                    Some(StatePropertyInfo {
+                        field: field.to_owned(),
+                        kind,
+                        values,
+                    })
                 })?
             })
+    }
+
+    pub(crate) fn has_unknown_block_state_definition(&self, marker: &str) -> bool {
+        self.unknown_block_state_definitions.contains(marker)
+    }
+
+    /// Enumerate every state combination of `block_marker` in `BTreeMap` property-name order.
+    /// Returns `None` if the Cartesian product would exceed `max_states`.
+    pub(crate) fn enumerate_block_state_combinations(
+        &self,
+        block_marker: &str,
+        max_states: usize,
+    ) -> Option<(Vec<String>, Vec<BTreeMap<String, String>>)> {
+        let Some(props) = self.block_state_properties.get(block_marker) else {
+            return Some((Vec::new(), vec![BTreeMap::new()]));
+        };
+        let names: Vec<String> = props.keys().cloned().collect();
+        let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+        for (name, info) in props {
+            if info.values.is_empty() {
+                return None;
+            }
+            let next_len = combos.len().checked_mul(info.values.len())?;
+            if next_len > max_states {
+                return None;
+            }
+            let mut next = Vec::with_capacity(next_len);
+            for base in &combos {
+                for val in &info.values {
+                    let mut entry = base.clone();
+                    entry.insert(name.clone(), val.clone());
+                    next.push(entry);
+                }
+            }
+            combos = next;
+        }
+        Some((names, combos))
+    }
+
+    pub(crate) fn mint_block_state(
+        &mut self,
+        block_marker: &str,
+        values: BTreeMap<String, String>,
+    ) -> Value {
+        let state = format!("blockstate/{block_marker}/{}", self.next_block_state);
+        self.next_block_state = self.next_block_state.saturating_add(1);
+        self.block_states
+            .insert(state.clone(), (block_marker.to_owned(), values));
+        Value::Ref(Some(state))
+    }
+
+    pub(crate) fn remove_block_states(&mut self, markers: &[String]) {
+        for marker in markers {
+            self.block_states.remove(marker);
+        }
+    }
+
+    pub(crate) fn set_block_declaration_shapes(
+        &mut self,
+        registration_index: usize,
+        shapes_json: String,
+    ) {
+        if let Some(entry) = self.registrations.get_mut(registration_index)
+            && let Some(RegistryDeclaration::Block { properties, .. }) = entry.declaration.as_mut()
+        {
+            properties.insert("shapes".to_owned(), shapes_json);
+        }
     }
 
     /// The declared class of a captured `BlockStateProperties` field (`EnumProperty`,
@@ -5908,46 +5997,210 @@ impl StdHost {
             && r.descriptor.ends_with("BlockState;")
             && r.owner.starts_with("net/minecraft/world/level/block/")
         {
+            let mut values = BTreeMap::new();
+            if let Some(props) = self.block_state_properties.get(marker) {
+                for (name, info) in props {
+                    if let Some(first) = info.values.first() {
+                        values.insert(name.clone(), first.clone());
+                    }
+                }
+            }
+            if let Some(defaults) = self.block_default_states.get(marker) {
+                for (name, value) in defaults {
+                    values.insert(name.clone(), value.clone());
+                }
+            }
             let state = format!("blockstate/{}/{}", marker, self.next_block_state);
             self.next_block_state = self.next_block_state.saturating_add(1);
             self.block_states
-                .insert(state.clone(), (marker.to_owned(), BTreeMap::new()));
+                .insert(state.clone(), (marker.to_owned(), values));
             return Ok(Some(Value::Ref(Some(state))));
         }
-        if r.name == "setValue" && marker.starts_with("blockstate/") {
+        if marker.starts_with("blockstate/") {
             let Some((block, values)) = self.block_states.get(marker).cloned() else {
                 return Ok(None);
             };
-            let Some(property) = args.first().and_then(expect_ref) else {
-                return Ok(None);
-            };
-            let Some(name) = property
-                .strip_prefix("property/BlockStateProperties.")
-                .and_then(Self::captured_property_name)
-            else {
-                return Ok(None);
-            };
-            let value = match args.get(1) {
-                Some(Value::Int(value)) => (*value != 0)
-                    .then_some("true".to_owned())
-                    .or_else(|| Some("false".to_owned())),
-                Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
-                Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
-                Some(Value::Ref(Some(value))) => value
-                    .rsplit('/')
-                    .next()
-                    .map(|value| value.to_ascii_lowercase()),
-                _ => None,
-            };
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let state = format!("blockstate/{}/{}", block, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            let mut values = values;
-            values.insert(name, value);
-            self.block_states.insert(state.clone(), (block, values));
-            return Ok(Some(Value::Ref(Some(state))));
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getBlock", "()Lnet/minecraft/world/level/block/Block;") => {
+                    return Ok(Some(jar_object::stored_value(&block)));
+                }
+                ("is", "(Lnet/minecraft/world/level/block/Block;)Z") => {
+                    if let Some(other) = args.first().and_then(jar_object::object_key) {
+                        return Ok(Some(Value::Int(i32::from(other == block))));
+                    }
+                    return Ok(None);
+                }
+                (
+                    "hasProperty",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Z",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let has = self
+                        .block_state_properties
+                        .get(&block)
+                        .is_some_and(|props| props.values().any(|info| info.field == field));
+                    return Ok(Some(Value::Int(i32::from(has))));
+                }
+                (
+                    "getValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                (
+                    "getOptionalValue",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;)Ljava/util/Optional;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(Some(empty_optional()));
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(val) = vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(optional_wrap(val)));
+                }
+                (
+                    "getValueOrElse",
+                    "(Lnet/minecraft/world/level/block/state/properties/Property;Ljava/lang/Comparable;)Ljava/lang/Comparable;",
+                ) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                    else {
+                        return Ok(args.get(1).cloned());
+                    };
+                    let Some(serialized) = values
+                        .get(prop_name)
+                        .or_else(|| {
+                            self.block_default_states
+                                .get(&block)
+                                .and_then(|d| d.get(prop_name))
+                        })
+                        .or_else(|| info.values.first())
+                    else {
+                        return Ok(None);
+                    };
+                    return Ok(vanilla_block_state_properties::property_value(
+                        field, &info.kind, serialized,
+                    ));
+                }
+                ("setValue", _) => {
+                    let Some(field) = args
+                        .first()
+                        .and_then(expect_ref)
+                        .and_then(|p| p.strip_prefix("property/BlockStateProperties."))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(name) = Self::captured_property_name(field) else {
+                        return Ok(None);
+                    };
+                    let value = match args.get(1) {
+                        Some(Value::Int(value)) => (*value != 0)
+                            .then_some("true".to_owned())
+                            .or_else(|| Some("false".to_owned())),
+                        Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
+                        Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
+                        Some(Value::Ref(Some(value))) => {
+                            vanilla_block_state_properties::enum_serialized_name(field, value)
+                                .or_else(|| {
+                                    value
+                                        .rsplit('/')
+                                        .next()
+                                        .map(|value| value.to_ascii_lowercase())
+                                })
+                        }
+                        _ => None,
+                    };
+                    let Some(value) = value else {
+                        return Ok(None);
+                    };
+                    let state = format!("blockstate/{}/{}", block, self.next_block_state);
+                    self.next_block_state = self.next_block_state.saturating_add(1);
+                    let mut values = values;
+                    values.insert(name, value);
+                    self.block_states.insert(state.clone(), (block, values));
+                    return Ok(Some(Value::Ref(Some(state))));
+                }
+                _ => {}
+            }
         }
         if r.name == "registerDefaultState"
             && r.descriptor.contains("BlockState")
@@ -6117,6 +6370,15 @@ impl Host for StdHost {
             .unknown_host_calls
             .entry("Block#getStateForPlacement (placement hook)".into())
             .or_default() += 1;
+    }
+
+    fn voxel_shape_or_array(
+        &mut self,
+        r: &MethodRef,
+        first: &Value,
+        others: &[Value],
+    ) -> Result<Value, NativeError> {
+        voxel_shape::or_array_call(self, r, first, others)
     }
 
     fn begin_block_state_definition(&mut self, block: &Value, builder: &Value) {
@@ -6338,6 +6600,9 @@ impl Host for StdHost {
             return Ok(value);
         }
         if let Some(value) = vec2::get_field(&self.vec2, receiver, r) {
+            return value;
+        }
+        if let Some(value) = voxel_shape::get_field(receiver, r) {
             return value;
         }
         // A façade object's own field (`facade_server.rs`).
@@ -7142,6 +7407,15 @@ impl Host for StdHost {
         if let Some(value) = vanilla_values::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = voxel_shape::static_field(self, r) {
+            return value;
+        }
+        if r.owner == "net/minecraft/core/BlockPos"
+            && r.name == "ZERO"
+            && r.descriptor == "Lnet/minecraft/core/BlockPos;"
+        {
+            return Ok(game_object::server_value("block-pos/0,0,0".into()));
+        }
         if let Some(value) = block_entity_types::static_field(r) {
             return Ok(value);
         }
@@ -7467,6 +7741,12 @@ impl Host for StdHost {
         }
         self.record(r, None, args);
         if let Some(result) = vanilla_values::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::static_call(self, r, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_static_call(r, args) {
             return result;
         }
         if let Some(result) = self.random_static(r, args) {
@@ -8934,6 +9214,33 @@ impl Host for StdHost {
         }
         if let Some(result) = vanilla_values::instance_call(self, r, receiver, args) {
             return result;
+        }
+        if let Some(result) = voxel_shape::instance_call(self, r, receiver, args) {
+            return result;
+        }
+        if let Some(result) = voxel_shape::direction_instance_call(r, receiver) {
+            return result;
+        }
+        if let Value::Host(handle) = receiver
+            && handle.kind() == host_ref::HostKind::GameValue
+            && let Some([x, y, z]) = server_values::block_pos(handle.key())
+            && matches!(
+                r.owner.as_str(),
+                "net/minecraft/core/BlockPos" | "net/minecraft/core/Vec3i"
+            )
+        {
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("getX", "()I") => return Ok(Value::Int(x)),
+                ("getY", "()I") => return Ok(Value::Int(y)),
+                ("getZ", "()I") => return Ok(Value::Int(z)),
+                _ => {}
+            }
+        }
+        if r.name == "getShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_shape(&r.owner)
+        {
+            return Ok(voxel_shape::block_shape());
         }
         if let Some(result) = self.random_instance(r, receiver, args) {
             return result;
@@ -14328,6 +14635,130 @@ pub(crate) fn game_enum_class(class: &str) -> bool {
 fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
     Some(match owner {
         "net/minecraft/core/Direction" => &["DOWN", "UP", "NORTH", "SOUTH", "WEST", "EAST"],
+        "net/minecraft/world/level/EmptyBlockGetter" => &["INSTANCE"],
+        "net/minecraft/core/FrontAndTop" => &[
+            "DOWN_EAST",
+            "DOWN_NORTH",
+            "DOWN_SOUTH",
+            "DOWN_WEST",
+            "UP_EAST",
+            "UP_NORTH",
+            "UP_SOUTH",
+            "UP_WEST",
+            "WEST_UP",
+            "EAST_UP",
+            "NORTH_UP",
+            "SOUTH_UP",
+        ],
+        "net/minecraft/world/level/block/CopperGolemStatueBlock$Pose" => {
+            &["STANDING", "SITTING", "RUNNING", "STAR"]
+        }
+        "net/minecraft/world/level/block/entity/trialspawner/TrialSpawnerState" => &[
+            "INACTIVE",
+            "WAITING_FOR_PLAYERS",
+            "ACTIVE",
+            "WAITING_FOR_REWARD_EJECTION",
+            "EJECTING_REWARD",
+            "COOLDOWN",
+        ],
+        "net/minecraft/world/level/block/entity/vault/VaultState" => {
+            &["INACTIVE", "ACTIVE", "UNLOCKING", "EJECTING"]
+        }
+        "net/minecraft/world/level/block/state/properties/AttachFace" => {
+            &["FLOOR", "WALL", "CEILING"]
+        }
+        "net/minecraft/world/level/block/state/properties/BambooLeaves" => {
+            &["NONE", "SMALL", "LARGE"]
+        }
+        "net/minecraft/world/level/block/state/properties/BedPart" => &["HEAD", "FOOT"],
+        "net/minecraft/world/level/block/state/properties/BellAttachType" => {
+            &["FLOOR", "CEILING", "SINGLE_WALL", "DOUBLE_WALL"]
+        }
+        "net/minecraft/world/level/block/state/properties/ChestType" => {
+            &["SINGLE", "LEFT", "RIGHT"]
+        }
+        "net/minecraft/world/level/block/state/properties/ComparatorMode" => {
+            &["COMPARE", "SUBTRACT"]
+        }
+        "net/minecraft/world/level/block/state/properties/CreakingHeartState" => {
+            &["UPROOTED", "DORMANT", "AWAKE"]
+        }
+        "net/minecraft/world/level/block/state/properties/DoorHingeSide" => &["LEFT", "RIGHT"],
+        "net/minecraft/world/level/block/state/properties/DoubleBlockHalf" => &["UPPER", "LOWER"],
+        "net/minecraft/world/level/block/state/properties/Half" => &["TOP", "BOTTOM"],
+        "net/minecraft/world/level/block/state/properties/NoteBlockInstrument" => &[
+            "HARP",
+            "BASEDRUM",
+            "SNARE",
+            "HAT",
+            "BASS",
+            "FLUTE",
+            "BELL",
+            "GUITAR",
+            "CHIME",
+            "XYLOPHONE",
+            "IRON_XYLOPHONE",
+            "COW_BELL",
+            "DIDGERIDOO",
+            "BIT",
+            "BANJO",
+            "PLING",
+            "TRUMPET",
+            "TRUMPET_EXPOSED",
+            "TRUMPET_OXIDIZED",
+            "TRUMPET_WEATHERED",
+            "ZOMBIE",
+            "SKELETON",
+            "CREEPER",
+            "DRAGON",
+            "WITHER_SKELETON",
+            "PIGLIN",
+            "CUSTOM_HEAD",
+        ],
+        "net/minecraft/world/level/block/state/properties/PistonType" => &["DEFAULT", "STICKY"],
+        "net/minecraft/world/level/block/state/properties/PotentSulfurState" => {
+            &["DRY", "WET", "DORMANT", "ERUPTING", "CONTINUOUS"]
+        }
+        "net/minecraft/world/level/block/state/properties/RailShape" => &[
+            "NORTH_SOUTH",
+            "EAST_WEST",
+            "ASCENDING_EAST",
+            "ASCENDING_WEST",
+            "ASCENDING_NORTH",
+            "ASCENDING_SOUTH",
+            "SOUTH_EAST",
+            "SOUTH_WEST",
+            "NORTH_WEST",
+            "NORTH_EAST",
+        ],
+        "net/minecraft/world/level/block/state/properties/RedstoneSide" => &["UP", "SIDE", "NONE"],
+        "net/minecraft/world/level/block/state/properties/SculkSensorPhase" => {
+            &["INACTIVE", "ACTIVE", "COOLDOWN"]
+        }
+        "net/minecraft/world/level/block/state/properties/SideChainPart" => {
+            &["UNCONNECTED", "RIGHT", "CENTER", "LEFT"]
+        }
+        "net/minecraft/world/level/block/state/properties/SlabType" => &["TOP", "BOTTOM", "DOUBLE"],
+        "net/minecraft/world/level/block/state/properties/SpeleothemThickness" => {
+            &["TIP_MERGE", "TIP", "FRUSTUM", "MIDDLE", "BASE"]
+        }
+        "net/minecraft/world/level/block/state/properties/StairsShape" => &[
+            "STRAIGHT",
+            "INNER_LEFT",
+            "INNER_RIGHT",
+            "OUTER_LEFT",
+            "OUTER_RIGHT",
+        ],
+        "net/minecraft/world/level/block/state/properties/StructureMode" => {
+            &["SAVE", "LOAD", "CORNER", "DATA"]
+        }
+        "net/minecraft/world/level/block/state/properties/TestBlockMode" => {
+            &["START", "LOG", "FAIL", "ACCEPT"]
+        }
+        "net/minecraft/world/level/block/state/properties/Tilt" => {
+            &["NONE", "UNSTABLE", "PARTIAL", "FULL"]
+        }
+        "net/minecraft/world/level/block/state/properties/WallSide" => &["NONE", "LOW", "TALL"],
         "net/minecraft/world/phys/HitResult$Type" => &["MISS", "BLOCK", "ENTITY"],
         "net/minecraft/client/ParticleStatus" => &["ALL", "DECREASED", "MINIMAL"],
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
@@ -27694,6 +28125,25 @@ impl<H: Host> Runtime<'_, H> {
         // the same way.
         if let Some(value) = self.content_builder_call(r, receiver, args)? {
             return Ok(Some(value));
+        }
+        // `Shapes.or(VoxelShape, VoxelShape...)`: needs the runtime-owned varargs array.
+        if r.owner == voxel_shape::SHAPES
+            && r.name == "or"
+            && r.descriptor
+                == "(Lnet/minecraft/world/phys/shapes/VoxelShape;[Lnet/minecraft/world/phys/shapes/VoxelShape;)Lnet/minecraft/world/phys/shapes/VoxelShape;"
+        {
+            let first = args.first().unwrap_or(&Value::Ref(None));
+            let rest_arg = args.get(1).unwrap_or(&Value::Ref(None));
+            if *rest_arg == Value::Ref(None) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            if let Some(others) = self.owned_array(rest_arg).map(|v| v.into_owned()) {
+                return self.host.voxel_shape_or_array(r, first, &others).map(Some);
+            }
         }
         // `BlockPos.betweenClosedStream` is the game's own bounding-box stream.
         // A mod filters and maps it for a shape offset table; the bounded host

@@ -456,6 +456,7 @@ impl StdHost {
             .chain(self.array_view_markers())
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
+            .chain(self.voxel_shapes.keys())
             .chain(self.menu_states.keys())
             .map(String::as_str)
     }
@@ -496,6 +497,7 @@ impl StdHost {
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
+        self.voxel_shapes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
@@ -520,6 +522,14 @@ fn collectable(marker: &str) -> bool {
     }
     // A host-created ranged attribute is a per-allocation handle and follows the heap.
     if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
+    }
+    // A host-created VoxelShape (`cube/<n>` or `array/<n>`) follows the heap; the shared
+    // singletons (`empty`, `block`) live outside `voxel_shapes` and are never collected.
+    if let Some(serial) = marker
+        .strip_prefix("cube/")
+        .or_else(|| marker.strip_prefix("array/"))
+    {
         return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
@@ -580,6 +590,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.iterators.len()
         + host.component_states.len()
         + host.ranged_attributes.len()
+        + host.voxel_shapes.len()
         + host.entity_registration.entry_count()
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
@@ -772,6 +783,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 + state.description_id.as_ref().map_or(0, String::len)
                 + 4 * std::mem::size_of::<f64>()
         }))
+        .chain(
+            host.voxel_shapes
+                .iter()
+                .map(|(key, shape)| key.len() + shape.estimated_bytes()),
+        )
         .chain(std::iter::once(host.guava_tables.estimated_bytes()))
         .sum()
 }
@@ -1736,6 +1752,7 @@ mod tests {
             "shared_empties",
             "cached_collections",
             "ranged_attributes",
+            "voxel_shapes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1792,6 +1809,7 @@ mod tests {
             "next_unmodifiable_collection",
             "next_reversed_view",
             "next_ranged_attribute",
+            "next_voxel_shape",
             "properties",
             "environment",
             "resources",

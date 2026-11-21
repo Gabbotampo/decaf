@@ -245,6 +245,14 @@ pub enum HostKind {
     MobEffectCategory,
     /// A freshly constructed vanilla `RangedAttribute`.
     RangedAttribute,
+    /// A modelled Minecraft 26.3 `VoxelShape` (`voxel_shape.rs`).
+    VoxelShape,
+    /// A modelled Minecraft 26.3 `AABB` (`voxel_shape.rs`).
+    Aabb,
+    /// A canonical Minecraft 26.3 `BooleanOp` constant (`voxel_shape.rs`).
+    BooleanOp,
+    /// A modelled Minecraft 26.3 `CollisionContext` (`CollisionContext.empty()`).
+    CollisionContext,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -1365,6 +1373,36 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::vanilla_values::RANGED_ATTRIBUTE),
         canonical: never_canonical,
         methods: &crate::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::VoxelShape,
+        tag: "vshp",
+        class: ClassRule::FromKey(crate::voxel_shape::voxel_shape_class),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::VOXEL_SHAPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Aabb,
+        tag: "aabb",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::AABB),
+        canonical: never_canonical,
+        methods: &crate::voxel_shape::AABB_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::BooleanOp,
+        tag: "bop",
+        class: ClassRule::Unknown {
+            declared: crate::voxel_shape::boolean_op_declared_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::BOOLEAN_OP_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CollisionContext,
+        tag: "cctx",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::EMPTY_COLLISION_CONTEXT),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::COLLISION_CONTEXT_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,

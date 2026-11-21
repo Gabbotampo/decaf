@@ -61,6 +61,91 @@ pub struct Block {
     pub state_properties: BTreeMap<String, StateProperty>,
     pub default_state: BTreeMap<String, String>,
     pub occludes: Option<bool>,
+    /// Block-local outline shape table (`sunrise-mod-package` `BlockShapes`), resolved by running
+    /// the block's own `getShape` across every state.
+    pub shapes: Option<BlockShapes>,
+}
+
+/// Block-local outline boxes selected by an ordered tuple of state properties
+/// (`sunrise-mod-package/src/content.rs` `BlockShapes`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlockShapes {
+    /// State property names selecting a shape, in tuple order. Empty when `default` applies to
+    /// every state.
+    pub properties: Vec<String>,
+    /// Comma-separated property-value tuples mapped to boxes `[min_x, min_y, min_z, max_x, max_y, max_z]`.
+    pub values: BTreeMap<String, Vec<[f64; 6]>>,
+    /// Boxes used when no tuple matches (or for every state when `properties`/`values` are empty).
+    pub default: Option<Vec<[f64; 6]>>,
+}
+
+impl BlockShapes {
+    /// Serialize into Sunrise's `BlockFile.shapes` JSON object.
+    pub fn to_json(&self) -> Value {
+        let mut object = Map::new();
+        if !self.properties.is_empty() {
+            object.insert("properties".into(), json!(self.properties));
+        }
+        if !self.values.is_empty() {
+            let values = self
+                .values
+                .iter()
+                .map(|(k, boxes)| (k.clone(), json!(boxes)))
+                .collect::<Map<_, _>>();
+            object.insert("values".into(), Value::Object(values));
+        }
+        if let Some(default) = &self.default {
+            object.insert("default".into(), json!(default));
+        }
+        Value::Object(object)
+    }
+
+    /// Parse from the JSON representation stored on a `RegistryDeclaration::Block`.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let parse_boxes = |value: &Value| -> Option<Vec<[f64; 6]>> {
+            value
+                .as_array()?
+                .iter()
+                .map(|entry| {
+                    let coords = entry.as_array()?;
+                    if coords.len() != 6 {
+                        return None;
+                    }
+                    let mut out = [0.0; 6];
+                    for (slot, raw) in out.iter_mut().zip(coords) {
+                        *slot = raw.as_f64()?;
+                    }
+                    Some(out)
+                })
+                .collect()
+        };
+        let properties = match object.get("properties") {
+            Some(raw) => raw
+                .as_array()?
+                .iter()
+                .map(|item| item.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?,
+            None => Vec::new(),
+        };
+        let values = match object.get("values") {
+            Some(raw) => raw
+                .as_object()?
+                .iter()
+                .map(|(key, entry)| Some((key.clone(), parse_boxes(entry)?)))
+                .collect::<Option<BTreeMap<_, _>>>()?,
+            None => BTreeMap::new(),
+        };
+        let default = match object.get("default") {
+            Some(raw) => Some(parse_boxes(raw)?),
+            None => None,
+        };
+        Some(Self {
+            properties,
+            values,
+            default,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,13 +234,17 @@ impl ContentDeclaration {
                         (name.clone(), value)
                     })
                     .collect::<Map<_, _>>();
-                json!({
+                let mut file = json!({
                     "template": block.template,
                     "properties": Value::Object(properties),
                     "state_properties": Value::Object(state_properties),
                     "default_state": block.default_state,
                     "item": block.item,
-                })
+                });
+                if let Some(shapes) = &block.shapes {
+                    file["shapes"] = shapes.to_json();
+                }
+                file
             }
             Self::Item(item) => {
                 let mut value = json!({ "template": item.template });
@@ -196,6 +285,10 @@ pub fn declarations(entries: &[RegistryEntry]) -> Vec<ContentDeclaration> {
                 occludes: properties
                     .get("occludes")
                     .and_then(|value| value.parse().ok()),
+                shapes: properties
+                    .get("shapes")
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .and_then(|value| BlockShapes::from_json(&value)),
             })),
             Some(RegistryDeclaration::Item {
                 template,
@@ -330,5 +423,85 @@ mod tests {
             },
         )];
         assert!(declarations(&entries)[0].file_json()["max_stack_size"].is_null());
+    }
+
+    /// Block shapes serialize at the top level (`"shapes"`) — never inside `"properties"`, which
+    /// Sunrise parses with `#[serde(deny_unknown_fields)]` — supporting both uniform (`default`)
+    /// and per-state (`properties` + `values`) tables.
+    #[test]
+    fn block_shapes_round_trip_at_top_level_for_uniform_and_per_state() {
+        let uniform = BlockShapes {
+            properties: Vec::new(),
+            values: BTreeMap::new(),
+            default: Some(vec![[0.125, 0.0, 0.125, 0.875, 0.25, 0.875]]),
+        };
+        let per_state = BlockShapes {
+            properties: vec!["facing".to_owned()],
+            values: BTreeMap::from([
+                (
+                    "east".to_owned(),
+                    vec![[0.625, 0.0, 0.125, 1.0, 0.75, 0.875]],
+                ),
+                (
+                    "north".to_owned(),
+                    vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]],
+                ),
+                (
+                    "south".to_owned(),
+                    vec![[0.125, 0.0, 0.625, 0.875, 0.75, 1.0]],
+                ),
+                (
+                    "west".to_owned(),
+                    vec![[0.0, 0.0, 0.125, 0.375, 0.75, 0.875]],
+                ),
+            ]),
+            default: None,
+        };
+        let entries = vec![
+            entry(
+                "m3_fixture:pedestal",
+                RegistryDeclaration::Block {
+                    template: "minecraft:stone".into(),
+                    properties: BTreeMap::from([(
+                        "shapes".to_owned(),
+                        uniform.to_json().to_string(),
+                    )]),
+                    item: false,
+                },
+            ),
+            entry(
+                "m3_fixture:directional",
+                RegistryDeclaration::Block {
+                    template: "minecraft:stone".into(),
+                    properties: BTreeMap::from([(
+                        "shapes".to_owned(),
+                        per_state.to_json().to_string(),
+                    )]),
+                    item: false,
+                },
+            ),
+        ];
+        let parsed = declarations(&entries);
+        let pedestal_json = parsed[0].file_json();
+        assert_eq!(
+            pedestal_json["shapes"],
+            json!({ "default": [[0.125, 0.0, 0.125, 0.875, 0.25, 0.875]] })
+        );
+        assert!(pedestal_json["properties"].get("shapes").is_none());
+
+        let dir_json = parsed[1].file_json();
+        assert_eq!(
+            dir_json["shapes"],
+            json!({
+                "properties": ["facing"],
+                "values": {
+                    "east": [[0.625, 0.0, 0.125, 1.0, 0.75, 0.875]],
+                    "north": [[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]],
+                    "south": [[0.125, 0.0, 0.625, 0.875, 0.75, 1.0]],
+                    "west": [[0.0, 0.0, 0.125, 0.375, 0.75, 0.875]],
+                }
+            })
+        );
+        assert!(dir_json["properties"].get("shapes").is_none());
     }
 }
