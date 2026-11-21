@@ -196,6 +196,13 @@ impl StdHost {
         self.map_entries.len()
     }
 
+    /// How many canonical `BlockState` rows the host keeps (`block_states`): each lives as
+    /// long as its owning `Block` (reachable directly or through a jar reference to a state),
+    /// so this follows live blocks rather than every block a jar ever constructed.
+    pub fn block_state_count(&self) -> usize {
+        self.block_states.len()
+    }
+
     pub(crate) fn take_resident_heap(&mut self) -> JavaHeap {
         let live = self.heap.live;
         let heap = std::mem::take(&mut self.heap);
@@ -307,16 +314,10 @@ impl StdHost {
         out.extend(self.payload_bytes.keys().map(String::as_str));
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
-        out.extend(self.block_property_builders.keys().map(String::as_str));
-        out.extend(self.block_state_properties.keys().map(String::as_str));
-        out.extend(self.state_definition_builders.keys().map(String::as_str));
-        out.extend(self.block_states.keys().map(String::as_str));
-        out.extend(self.block_default_states.keys().map(String::as_str));
-        out.extend(
-            self.unknown_block_state_definitions
-                .iter()
-                .map(String::as_str),
-        );
+        // Per-block metadata (`block_property_builders`, `block_copied_properties`,
+        // `block_state_properties`, `state_definition_builders`, `block_default_states`,
+        // `unknown_block_state_definitions`) and canonical `block_states` are traced and
+        // pruned with their owning block object rather than becoming GC roots.
         // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
         // allocated mod objects. It is traced and pruned with the object
         // rather than becoming a lifetime root.
@@ -412,9 +413,6 @@ impl StdHost {
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
         push(self.state_definition_builders.get(marker), out);
-        if let Some((block, _)) = self.block_states.get(marker) {
-            out.push(block.clone());
-        }
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -463,14 +461,16 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.item_required_features.keys())
+            .chain(self.block_property_builders.keys())
             .chain(self.block_state_properties.keys())
+            .chain(self.block_copied_properties.iter())
             .chain(self.state_definition_builders.keys())
-            .chain(self.block_states.keys())
             .chain(self.block_default_states.keys())
             .chain(self.unknown_block_state_definitions.iter())
             .chain(self.array_view_markers())
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
+            .chain(self.voxel_shapes.keys())
             .chain(self.menu_states.keys())
             .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
@@ -496,9 +496,10 @@ impl StdHost {
         self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
+        self.block_property_builders.retain(|key, _| keep(key));
         self.block_state_properties.retain(|key, _| keep(key));
+        self.block_copied_properties.retain(|key| keep(key));
         self.state_definition_builders.retain(|key, _| keep(key));
-        self.block_states.retain(|key, _| keep(key));
         self.block_default_states.retain(|key, _| keep(key));
         self.unknown_block_state_definitions.retain(|key| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
@@ -513,6 +514,7 @@ impl StdHost {
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
+        self.voxel_shapes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
         self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
@@ -536,8 +538,19 @@ fn collectable(marker: &str) -> bool {
     }) {
         return true;
     }
-    // A host-created ranged attribute is a per-allocation handle and follows the heap.
-    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+    // A host-created ranged attribute or block property builder follows the heap.
+    if let Some(serial) = marker
+        .strip_prefix("ranged-attribute/")
+        .or_else(|| marker.strip_prefix("block/properties/"))
+    {
+        return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
+    }
+    // A host-created VoxelShape (`cube/<n>` or `array/<n>`) follows the heap; the shared
+    // singletons (`empty`, `block`) live outside `voxel_shapes` and are never collected.
+    if let Some(serial) = marker
+        .strip_prefix("cube/")
+        .or_else(|| marker.strip_prefix("array/"))
+    {
         return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // An iterator's or enumeration's key (`host_iterator.rs`); the shared empty ones
@@ -601,6 +614,8 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.iterators.len()
         + host.component_states.len()
         + host.ranged_attributes.len()
+        + host.voxel_shapes.len()
+        + host.block_states.len()
         + host.entity_registration.entry_count()
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
@@ -804,6 +819,14 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 + state.description_id.as_ref().map_or(0, String::len)
                 + 4 * std::mem::size_of::<f64>()
         }))
+        .chain(
+            host.voxel_shapes
+                .iter()
+                .map(|(key, shape)| key.len() + shape.estimated_bytes()),
+        )
+        .chain(host.block_states.iter().map(|(key, (block, values))| {
+            key.len() + block.len() + values.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+        }))
         .chain(std::iter::once(host.guava_tables.estimated_bytes()))
         .sum()
 }
@@ -890,6 +913,7 @@ impl Collectable {
             .chain(host.enumerations.keys().map(String::as_str))
             .chain(host.component_states.keys().map(String::as_str))
             .chain(host.map_entries.keys().map(String::as_str))
+            .chain(host.block_states.values().map(|(block, _)| block.as_str()))
             .chain(host.keyed_table_keys())
             .filter(|marker| collectable(marker))
             .map(str::to_owned)
@@ -947,6 +971,119 @@ fn mark_kotlin_lazy_states(
     }
 }
 
+fn text_has_shape_probe(text: &str) -> bool {
+    crate::voxel_shape::parse_shape_probe_key(text).is_some()
+        || text.contains("hsprobe:")
+        || text.contains("ShapeProbe")
+}
+
+fn value_has_shape_probe(value: &Value) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending = vec![value];
+    while let Some(current) = pending.pop() {
+        match current {
+            Value::Host(handle) => {
+                if handle.kind() == crate::host_ref::HostKind::ShapeProbe
+                    || text_has_shape_probe(handle.key())
+                {
+                    return true;
+                }
+                if let Some(row) = handle.row()
+                    && seen.insert(std::ptr::from_ref(row).cast::<u8>())
+                {
+                    pending.extend(row.values());
+                }
+                let held = handle.held();
+                if !held.is_empty() && seen.insert(held.as_ptr().cast::<u8>()) {
+                    pending.extend(held);
+                }
+            }
+            Value::Ref(Some(text)) if text.contains("hsprobe:") => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether any live `HostKind::ShapeProbe` handle remains in `heap`, `host`, or
+/// `extra` after collection swept unreachable objects. Only called when
+/// `host.retained_shape_probes` is set so clean hosts pay zero cost.
+fn has_live_shape_probe(heap: &JavaHeap, host: &StdHost, extra: &[String]) -> bool {
+    if extra.iter().any(|text| text_has_shape_probe(text)) {
+        return true;
+    }
+    let mut roots = Vec::new();
+    host.root_texts(&mut roots);
+    if roots.into_iter().any(text_has_shape_probe) {
+        return true;
+    }
+    let mut opaque = Vec::new();
+    host.opaque_root_texts(&mut opaque);
+    if opaque.iter().any(|text| text_has_shape_probe(text)) {
+        return true;
+    }
+    if heap.fields.values().any(value_has_shape_probe)
+        || heap
+            .arrays
+            .values()
+            .flat_map(crate::array_data::ArrayData::references)
+            .any(value_has_shape_probe)
+        || host
+            .mutable_collections
+            .values()
+            .flatten()
+            .any(value_has_shape_probe)
+        || host
+            .repeated_collections
+            .values()
+            .map(|(_, value)| value)
+            .any(value_has_shape_probe)
+        || host
+            .iterators
+            .values()
+            .flat_map(|(elements, _)| elements)
+            .any(value_has_shape_probe)
+        || host.iterator_last.values().any(value_has_shape_probe)
+        || host
+            .enumerations
+            .values()
+            .map(crate::host_iterator::EnumerationOver::held)
+            .any(value_has_shape_probe)
+        || host
+            .component_states
+            .values()
+            .flat_map(|state| state.siblings.iter().chain(state.args.iter().flatten()))
+            .any(value_has_shape_probe)
+        || host
+            .map_entries
+            .keys()
+            .flat_map(|key| host.map_entries.held(key))
+            .any(value_has_shape_probe)
+    {
+        return true;
+    }
+    if host
+        .cached_collections
+        .iter()
+        .any(|((identity, _), cached)| {
+            text_has_shape_probe(identity) || text_has_shape_probe(cached)
+        })
+    {
+        return true;
+    }
+    let mut keyed = Vec::new();
+    for key in host.keyed_table_keys() {
+        keyed.clear();
+        host.keyed_texts(key, &mut keyed);
+        if keyed.iter().any(|text| text_has_shape_probe(text)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Drop every collectable object of `heap` (and every collectable collection
 /// or iterator of `host`) that nothing reaches from the roots.
 ///
@@ -964,6 +1101,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         host.render_objects
             .retain(|key, _| render_live.contains(key));
         host.render_handles.retain(|key| render_live.contains(key));
+        if host.retained_shape_probes {
+            host.retained_shape_probes = has_live_shape_probe(heap, host, extra);
+        }
         return;
     }
     let mut pending = Vec::new();
@@ -1167,6 +1307,12 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.constructed_uuids
         .retain(|key, _| !freed.holds_key(key));
     host.locales.retain(|key, _| !freed.holds_key(key));
+    // Canonical BlockState markers live exactly as long as their owning Block:
+    // they are not GC roots themselves, are kept alive by their block or by any
+    // jar reference to `blockstate/<block>[...]` (which `Collectable::scan`
+    // resolves to `<block>`), and are dropped when `<block>` is collected.
+    host.block_states
+        .retain(|_, (block, _)| keep(block) && !freed.holds_key(block));
     // A cached collection goes with what it was cached for, and an entry
     // whose collection went is rebuilt on its next call (#226 re-check 4:
     // every map's views used to stay cached forever).
@@ -1200,6 +1346,11 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.render_handles.retain(|key| render_live.contains(key));
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
+    // Disarm the per-opcode shape-probe check once GC confirms no live
+    // `HostKind::ShapeProbe` handles remain anywhere in heap or host state.
+    if host.retained_shape_probes {
+        host.retained_shape_probes = has_live_shape_probe(heap, host, extra);
+    }
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -1767,6 +1918,7 @@ mod tests {
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "block_copied_properties",
             "block_state_properties",
             "state_definition_builders",
             "block_states",
@@ -1804,6 +1956,7 @@ mod tests {
             "shared_empties",
             "cached_collections",
             "ranged_attributes",
+            "voxel_shapes",
             "jdk_list_of",
             "synchronized_views",
             "reversed_views",
@@ -1839,6 +1992,7 @@ mod tests {
             "io_paths",
             "heap",
             "retained",
+            "retained_shape_probes",
             "freed_objects",
             "freed_menu_objects",
             "collections_paused",
@@ -1862,6 +2016,8 @@ mod tests {
             "next_unmodifiable_collection",
             "next_reversed_view",
             "next_ranged_attribute",
+            "next_voxel_shape",
+            "next_shape_extraction",
             "next_menu_object",
             "properties",
             "environment",
@@ -1900,7 +2056,6 @@ mod tests {
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",
-            "next_block_state",
             "outgoing_payloads",
             "incoming_payloads",
             "level_resources",
@@ -2196,5 +2351,157 @@ mod tests {
                 "demo/StreamCodec#5",
             ]
         );
+    }
+
+    #[test]
+    fn canonical_block_states_live_exactly_as_long_as_their_block() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+
+        // Block #0 is held directly in a static field: all of its canonical states stay alive.
+        let live_block = "demo/LiveBlock#0";
+        host.persistent_static_fields.insert(
+            "demo/Mod#LIVE_BLOCKLnet/minecraft/world/level/block/Block;".into(),
+            crate::jar_object::handle(live_block.into()),
+        );
+        let live_north = host.canonical_block_state(
+            live_block,
+            BTreeMap::from([("facing".into(), "north".into())]),
+        );
+        let live_east = host.canonical_block_state(
+            live_block,
+            BTreeMap::from([("facing".into(), "east".into())]),
+        );
+
+        // Block #1 is NOT referenced directly, only through one of its canonical states in a static.
+        let state_only_block = "demo/StateOnlyBlock#1";
+        let state_only_east = host.canonical_block_state(
+            state_only_block,
+            BTreeMap::from([("facing".into(), "east".into())]),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Mod#SAVED_STATELnet/minecraft/world/level/block/state/BlockState;".into(),
+            state_only_east.clone(),
+        );
+        heap.fields
+            .insert(field(state_only_block, "tag"), Value::Int(7));
+
+        // Blocks #2..#201 are temporary and unreachable: they and their states must be dropped.
+        for i in 2..202 {
+            let dead_block = format!("demo/TempBlock#{i}");
+            let builder = format!("block/properties/{i}");
+            host.block_property_builders
+                .insert(builder, BTreeMap::new());
+            host.block_property_builders
+                .insert(dead_block.clone(), BTreeMap::new());
+            host.block_default_states.insert(
+                dead_block.clone(),
+                BTreeMap::from([("facing".into(), "north".into())]),
+            );
+            let _ = host.canonical_block_state(
+                &dead_block,
+                BTreeMap::from([("facing".into(), "north".into())]),
+            );
+            let _ = host.canonical_block_state(
+                &dead_block,
+                BTreeMap::from([("facing".into(), "south".into())]),
+            );
+        }
+        heap.next_object = 202;
+        assert_eq!(host.block_state_count(), 403);
+
+        collect(&mut heap, &mut host, &[]);
+
+        // All 400 dead states, their property builders, and default states are gone.
+        assert_eq!(host.block_state_count(), 3);
+        assert!(host.block_property_builders.is_empty());
+        assert!(host.block_default_states.is_empty());
+        // Live block's states remain canonical and stable.
+        assert_eq!(
+            host.canonical_block_state(
+                live_block,
+                BTreeMap::from([("facing".into(), "north".into())]),
+            ),
+            live_north
+        );
+        assert_eq!(
+            host.canonical_block_state(
+                live_block,
+                BTreeMap::from([("facing".into(), "east".into())]),
+            ),
+            live_east
+        );
+        // State-only-in-static keeps its block's fields and state row alive.
+        assert_eq!(
+            host.block_state_block(&state_only_east),
+            Some(crate::jar_object::stored(state_only_block))
+        );
+        assert_eq!(objects(&heap), [state_only_block]);
+    }
+
+    #[test]
+    fn retained_shape_probes_flag_disarms_once_leaked_probes_are_collected() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        let probe = Value::Host(crate::host_ref::HostRef::new(
+            crate::host_ref::HostKind::ShapeProbe,
+            "1:block-getter",
+        ));
+
+        // Simulate a leaky extraction arming `retained_shape_probes` and storing the probe
+        // in a static field, an instance field, an array, and a list.
+        host.retained_shape_probes = true;
+        host.persistent_static_fields.insert(
+            "demo/Leak#SAVEDLnet/minecraft/world/level/BlockGetter;".into(),
+            probe.clone(),
+        );
+        heap.fields
+            .insert(field("demo/Holder#1", "saved"), probe.clone());
+        heap.arrays.insert(
+            "[Ljava/lang/Object;#2".into(),
+            crate::array_data::ArrayData::Ref(vec![probe.clone()]),
+        );
+        host.mutable_collections
+            .insert("java/util/ArrayList#neutral3".into(), vec![probe]);
+        host.persistent_static_fields.insert(
+            "demo/Leak#HOLDERLdemo/Holder;".into(),
+            crate::jar_object::handle("demo/Holder#1".into()),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Leak#ARRLjava/lang/Object;".into(),
+            Value::Host(crate::host_ref::HostRef::new(
+                crate::host_ref::HostKind::Array,
+                "[Ljava/lang/Object;#2",
+            )),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Leak#LISTLjava/util/List;".into(),
+            text("java/util/ArrayList#neutral3"),
+        );
+        heap.next_object = 4;
+
+        // While any live reference holds the probe, GC keeps `retained_shape_probes` armed.
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop the static probe; instance field, array, and list still hold it.
+        host.persistent_static_fields
+            .remove("demo/Leak#SAVEDLnet/minecraft/world/level/BlockGetter;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop holder and array; list still holds it.
+        host.persistent_static_fields
+            .remove("demo/Leak#HOLDERLdemo/Holder;");
+        host.persistent_static_fields
+            .remove("demo/Leak#ARRLjava/lang/Object;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop the list too: GC sweeps the list and disarms `retained_shape_probes`.
+        host.persistent_static_fields
+            .remove("demo/Leak#LISTLjava/util/List;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.has_retained_shape_probes());
     }
 }

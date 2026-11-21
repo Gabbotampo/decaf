@@ -90,8 +90,21 @@ fn family_classes(key: &str) -> Option<&'static [&'static str]> {
 /// value; `Some(None)` when Java's answer needs fields the model lacks.
 pub(crate) fn equals(key: &str, other_key: Option<&str>, other: &Value) -> Option<Option<bool>> {
     let classes = family_classes(key)?;
+    if matches!(other, Value::Host(h) if h.kind() == crate::host_ref::HostKind::ShapeProbe) {
+        return Some(None);
+    }
+    // An opaque position probe (`block-pos/shape-probe`) has unknown coordinates, so any
+    // equality check against another `BlockPos` is counted as a position dependency.
+    if key.starts_with(BLOCK_POS) && block_pos(key).is_none() {
+        return Some(None);
+    }
     match other_key.filter(|other| family_classes(other) == Some(classes)) {
-        Some(other_key) => Some(Some(key == other_key)),
+        Some(other_key) => {
+            if other_key.starts_with(BLOCK_POS) && block_pos(other_key).is_none() {
+                return Some(None);
+            }
+            Some(Some(key == other_key))
+        }
         // A jar's own `BlockPos`/`LevelResource`: its fields are not ours.
         None => {
             let foreign = crate::jar_object::object_class(other)

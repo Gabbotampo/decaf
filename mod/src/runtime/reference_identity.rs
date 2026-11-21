@@ -313,6 +313,16 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<bool, NativeError> {
         // The old answer, kept when the comparison is counted.
         let equal = lhs == rhs;
+        if matches!(lhs, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+            || matches!(rhs, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+        {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "if_acmp".into(),
+                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+            })?;
+            return Ok(equal);
+        }
         // A host handle (`host_ref.rs`): different handles are different
         // objects, a canonical kind's equal handles one object, and so is a
         // handle and its own clone (`HostRef::same_object`); other equal

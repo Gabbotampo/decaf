@@ -585,6 +585,9 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
             .or_else(|| crate::server_values::hash_code(key)))
     },
     equals: |handle, other, nested| {
+        if matches!(other, Value::Host(h) if h.kind() == HostKind::ShapeProbe) {
+            return Ok(None);
+        }
         if let Value::Host(other) = other
             && other.kind() == HostKind::GameValue
             && let Some(result) = crate::sound_event::equals_keys(handle.key(), other.key())
