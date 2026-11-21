@@ -1016,12 +1016,105 @@ pub struct GameListeners {
     pub phase_orderings: Vec<PhaseOrdering>,
 }
 
+/// A Fabric creative-tab modify-output callback, retained separately from
+/// game events because the game supplies a tab-specific output collector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreativeTabListener {
+    pub tab: String,
+    pub callback: ListenerCallback,
+}
+
 impl GameListeners {
     /// Bitmask of the events with at least one listener ([`GameEvent::bit`]).
     pub fn mask(&self) -> u64 {
         self.listeners
             .iter()
             .fold(0, |mask, listener| mask | listener.event.bit())
+    }
+}
+
+/// Return creative-tab listeners registered through `modifyOutputEvent(key)`.
+pub fn creative_tab_listeners(
+    invocations: &[HostInvocation],
+    jar: &NativeJar,
+) -> Vec<CreativeTabListener> {
+    let mut out = Vec::new();
+    for invocation in invocations {
+        if invocation.method.owner != FABRIC_EVENT || invocation.method.name != "register" {
+            continue;
+        }
+        let Some(receiver) = invocation.receiver.as_ref() else {
+            continue;
+        };
+        let Value::Host(handle) = receiver else {
+            continue;
+        };
+        if handle.kind() != crate::HostKind::FabricEvent {
+            continue;
+        }
+        let Some(values) = handle.values() else {
+            continue;
+        };
+        let [kind, tab] = values.as_slice() else {
+            continue;
+        };
+        if kind != &Value::Ref(Some("tab".into())) {
+            continue;
+        }
+        let Some(tab) = expect_ref(tab) else { continue };
+        let callback = if let Some(indy) = indy_argument(&invocation.args) {
+            let Ok(marker) = indy else { continue };
+            ListenerCallback::Indy {
+                target: marker.target,
+                captures: marker.captures,
+            }
+        } else if let Some((class, value)) = invocation.args.last().and_then(|v| jar_object(jar, v))
+        {
+            let Some(method) = resolve_method(
+                jar,
+                class,
+                "modifyOutput",
+                "(Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V",
+            ) else {
+                continue;
+            };
+            ListenerCallback::Object {
+                receiver: value.clone(),
+                method,
+            }
+        } else {
+            continue;
+        };
+        out.push(CreativeTabListener {
+            tab: tab.to_owned(),
+            callback,
+        });
+    }
+    out
+}
+
+impl NativeJar {
+    /// Fire every registered Fabric modify-output callback against a fresh
+    /// collector per tab. The returned values preserve accept/prepend order;
+    /// unsupported output methods remain counted by the host boundary.
+    pub fn creative_tab_contents(
+        &self,
+        host: &mut StdHost,
+    ) -> Result<BTreeMap<String, Vec<Value>>, NativeError> {
+        let listeners = creative_tab_listeners(host.invocations(), self);
+        let mut contents: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for listener in listeners {
+            let output = host.begin_creative_tab_output(&listener.tab);
+            self.invoke_listener_callback(
+                &listener.callback,
+                vec![output.clone()],
+                host,
+                &ExecutionBudget::UNBOUNDED,
+            )?;
+            let values = host.take_creative_tab_output(&output).unwrap_or_default();
+            contents.entry(listener.tab).or_default().extend(values);
+        }
+        Ok(contents)
     }
 }
 
@@ -2096,6 +2189,11 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         let Some(source) = crate::host_events::fabric_event_name(event) else {
             return;
         };
+        // Creative-tab modify-output listeners are dispatched by the
+        // tab-specific collector, not the lifecycle event table below.
+        if event_values_are_tab(event) {
+            return;
+        }
         if let Some((owner, field)) = crate::host_events::fabric_field_of(event)
             && unfired_client_fabric_field(&owner, &field)
         {
@@ -2223,6 +2321,16 @@ fn listeners_from(invocation: &HostInvocation, jar: &NativeJar, out: &mut GameLi
         }
         _ => {}
     }
+}
+
+fn event_values_are_tab(event: &Value) -> bool {
+    let Value::Host(handle) = event else {
+        return false;
+    };
+    if handle.kind() != crate::HostKind::FabricEvent {
+        return false;
+    }
+    matches!(handle.values().as_deref(), Some([Value::Ref(Some(kind)), _]) if kind == "tab")
 }
 
 /// A NeoForge/Forge listener on `class` whose callback is the registration's

@@ -18,7 +18,7 @@
 //! every other tab getter; the protected `type`.
 use crate::{
     MethodRef, NativeError, Value,
-    host_ref::{HostKind, HostRef},
+    host_ref::{ClassHierarchy, HostKind, HostRef, Methods},
 };
 use std::collections::BTreeMap;
 const FABRIC: &str = "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab";
@@ -41,6 +41,7 @@ pub(crate) struct State {
     builders: BTreeMap<String, Builder>,
     /// Tab key → its display name (`None`: counted).
     tabs: BTreeMap<String, Option<Value>>,
+    outputs: BTreeMap<String, Vec<Value>>,
 }
 impl State {
     /// The values the host holds: collector roots.
@@ -50,6 +51,64 @@ impl State {
             .flat_map(|builder| builder.held.iter())
             .chain(self.tabs.values().flatten())
     }
+}
+
+/// Methods on FabricCreativeModeTabOutput which the collector handles. Other
+/// output methods remain counted by the normal host boundary.
+fn output_instance_of(_: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option<bool> {
+    Some(matches!(
+        wanted,
+        "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput"
+            | "net/minecraft/world/item/CreativeModeTab$Output"
+            | "java/lang/Object"
+    ))
+}
+fn output_text(
+    _: &HostRef,
+    _: &mut dyn crate::host_ref::Nested,
+) -> Result<Option<String>, NativeError> {
+    Ok(None)
+}
+fn output_hash(
+    _: &HostRef,
+    _: &mut dyn crate::host_ref::Nested,
+) -> Result<Option<i32>, NativeError> {
+    Ok(None)
+}
+fn output_equals(
+    a: &HostRef,
+    b: &Value,
+    _: &mut dyn crate::host_ref::Nested,
+) -> Result<Option<bool>, NativeError> {
+    Ok(match b {
+        Value::Host(b) => a.same_object(b),
+        _ => Some(false),
+    })
+}
+fn output_crosses(_: &HostRef, _: &dyn Fn(&Value) -> bool) -> bool {
+    false
+}
+pub(crate) const OUTPUT_METHODS: Methods = Methods {
+    to_string: output_text,
+    hash_code: output_hash,
+    equals: output_equals,
+    instance_of: output_instance_of,
+    crosses_jars: output_crosses,
+    compare_to: None,
+};
+
+pub(crate) fn begin_output(state: &mut State, tab: &str) -> Value {
+    let key = format!("{tab}#{}", state.outputs.len());
+    state.outputs.insert(key.clone(), Vec::new());
+    Value::Host(HostRef::new(HostKind::CreativeModeTabOutput, key))
+}
+
+pub(crate) fn take_output(state: &mut State, output: &Value) -> Option<Vec<Value>> {
+    let Value::Host(handle) = output else {
+        return None;
+    };
+    (handle.kind() == HostKind::CreativeModeTabOutput)
+        .then(|| state.outputs.remove(handle.key()).unwrap_or_default())
 }
 
 /// The argument a public setter stores, by name and parameter list; `None` for any other method.
@@ -132,6 +191,56 @@ pub(crate) fn instance_call(
             }
             None
         }
+        HostKind::CreativeModeTabOutput => {
+            let values = state.outputs.get_mut(h.key())?;
+            let value = args.first()?.clone();
+            match r.name.as_str() {
+                "accept" => values.push(value),
+                "prepend" => values.insert(0, value),
+                _ => return None,
+            }
+            Some(Ok(Value::Void))
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn output_records_accept_and_prepend_in_order() {
+        let mut state = State::default();
+        let output = begin_output(&mut state, "minecraft:combat");
+        let first = Value::Host(HostRef::new(
+            HostKind::GameRegistryObject,
+            "game/item/demo:a",
+        ));
+        let second = Value::Host(HostRef::new(
+            HostKind::GameRegistryObject,
+            "game/item/demo:b",
+        ));
+        instance_call(
+            &mut state,
+            &MethodRef {
+                owner: "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput".into(),
+                name: "accept".into(),
+                descriptor: "(Lnet/minecraft/world/level/ItemLike;)V".into(),
+            },
+            &output,
+            std::slice::from_ref(&first),
+        );
+        instance_call(
+            &mut state,
+            &MethodRef {
+                owner: "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput".into(),
+                name: "prepend".into(),
+                descriptor: "(Lnet/minecraft/world/level/ItemLike;)V".into(),
+            },
+            &output,
+            std::slice::from_ref(&second),
+        );
+        assert_eq!(take_output(&mut state, &output), Some(vec![second, first]));
     }
 }

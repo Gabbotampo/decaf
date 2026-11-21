@@ -623,6 +623,8 @@ pub enum HostKind {
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
+    /// Output collector passed to Fabric creative-tab modify callbacks.
+    CreativeModeTabOutput,
     /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
     Url,
@@ -2762,6 +2764,15 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         // No overrides: identity `equals`, counted `hashCode`/`toString`.
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTabOutput,
+        tag: "ctout",
+        class: ClassRule::Fixed(
+            "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput",
+        ),
+        canonical: always_canonical,
+        methods: &crate::runtime::host_creative_tab::OUTPUT_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,

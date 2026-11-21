@@ -5044,6 +5044,16 @@ impl StdHost {
         &self.invocations
     }
 
+    /// Create the output collector used when a Fabric creative-tab callback fires.
+    pub fn begin_creative_tab_output(&mut self, tab: &str) -> Value {
+        host_creative_tab::begin_output(&mut self.creative_tab, tab)
+    }
+
+    /// Finish a creative-tab callback and return the values in their recorded order.
+    pub fn take_creative_tab_output(&mut self, output: &Value) -> Option<Vec<Value>> {
+        host_creative_tab::take_output(&mut self.creative_tab, output)
+    }
+
     /// Events posted through the bounded NeoForge event-bus contract, in
     /// invocation order.  The native host does not model the full event
     /// inheritance/cancellation graph; callers can inspect these values and
