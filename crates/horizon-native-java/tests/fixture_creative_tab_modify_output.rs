@@ -178,6 +178,13 @@ public class Block extends BlockBehaviour implements ItemLike {
 }"#,
     ),
     (
+        "net/minecraft/world/level/block/Blocks.java",
+        r#"package net.minecraft.world.level.block;
+public final class Blocks {
+    public static final Block STONE = null;
+}"#,
+    ),
+    (
         "net/minecraft/world/item/Item.java",
         r#"package net.minecraft.world.item;
 import net.minecraft.resources.ResourceKey;
@@ -325,6 +332,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.flag.FeatureFlag;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.item.BlockItem;
@@ -333,6 +341,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ItemLike;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 
 public final class Probe {
@@ -416,6 +425,7 @@ public final class Probe {
         Identifier earlyPhase = Identifier.parse("demo:early");
         Identifier latePhase = Identifier.parse("demo:late");
         Identifier dynamicPhase = Identifier.parse("demo:dynamic");
+        Identifier allFromPerTabPhase = Identifier.parse("demo:all_from_per_tab");
         Identifier allLatePhase = Identifier.parse("demo:all_late");
 
         Event<CreativeModeTabEvents.ModifyOutput> primaryEvent =
@@ -424,7 +434,8 @@ public final class Probe {
         primaryEvent.addPhaseOrdering(Event.DEFAULT_PHASE, latePhase);
         primaryEvent.addPhaseOrdering(latePhase, dynamicPhase);
 
-        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(Event.DEFAULT_PHASE, allLatePhase);
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(Event.DEFAULT_PHASE, allFromPerTabPhase);
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(allFromPerTabPhase, allLatePhase);
 
         // Register late BEFORE default and early to test phase ordering.
         primaryEvent.register(latePhase, output -> {
@@ -433,11 +444,17 @@ public final class Probe {
             if (!dynamicAdded) {
                 dynamicAdded = true;
                 primaryEvent.register(dynamicPhase, o2 -> order.add("dynamic"));
+                // Registered during per-tab dispatch; runs in this SAME firing because
+                // CreativeModeTabMixin.getStacks snapshots MODIFY_OUTPUT_ALL after per-tab.
+                CreativeModeTabEvents.MODIFY_OUTPUT_ALL.register(allFromPerTabPhase, (tab, o2) -> {
+                    order.add("all_from_per_tab");
+                });
             }
         });
         primaryEvent.register(output -> {
             order.add("default1");
             output.accept(enabledA);
+            output.accept(Blocks.STONE);
             output.accept(customHolder, CreativeModeTab.TabVisibility.PARENT_TAB_ONLY);
             output.accept(new ItemStack(altarItem), CreativeModeTab.TabVisibility.SEARCH_TAB_ONLY);
             // Disabled item: silently skipped before checkStack and visibility check.
@@ -545,7 +562,24 @@ public final class Probe {
                 + disabledItem.isEnabled(FeatureFlags.VANILLA_SET) + "|"
                 + disabledItem.isEnabled(withTrade) + "|"
                 + out1EnabledMatchesVanilla + "|"
-                + out1ShowOp;
+                + out1ShowOp + "\n"
+                + "item_enabled_props="
+                + ItemStack.EMPTY.isItemEnabled(FeatureFlagSet.of()) + "|"
+                + ItemStack.EMPTY.isItemEnabled(null) + "|"
+                + stackZero.isItemEnabled(FeatureFlagSet.of()) + "|"
+                + new ItemStack(disabledItem, 0).isItemEnabled(FeatureFlagSet.of()) + "|"
+                + stackA.isItemEnabled(FeatureFlagSet.of()) + "|"
+                + stackA.isItemEnabled(FeatureFlags.VANILLA_SET) + "|"
+                + new ItemStack(disabledItem).isItemEnabled(FeatureFlags.VANILLA_SET) + "|"
+                + new ItemStack(disabledItem).isItemEnabled(withTrade) + "\n"
+                + "npe_of_null_flags="
+                + catchErr(() -> FeatureFlagSet.of(FeatureFlags.VANILLA, (FeatureFlag[]) null)) + "\n"
+                + "npe_of_null_flag_empty="
+                + catchErr(() -> FeatureFlagSet.of(null, new FeatureFlag[0])) + "\n"
+                + "npe_of_null_flag_nonempty="
+                + catchErr(() -> FeatureFlagSet.of(null, FeatureFlags.VANILLA)) + "\n"
+                + "npe_of_null_elem="
+                + catchErr(() -> FeatureFlagSet.of(FeatureFlags.VANILLA, (FeatureFlag) null));
     }
 }
 "##;
@@ -731,6 +765,7 @@ fn javac_creative_tab_modify_output_matches_java25_oracle() {
         vec![
             ("demo:enabled_b".to_owned(), 1, false),
             ("demo:enabled_a".to_owned(), 1, false),
+            ("minecraft:stone".to_owned(), 1, false),
             ("demo:enabled_c".to_owned(), 1, false),
             ("demo:altar".to_owned(), 1, false),
             ("demo:enabled_c".to_owned(), 1, false),

@@ -21,6 +21,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.flag.FeatureFlag;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.item.BlockItem;
@@ -29,6 +30,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ItemLike;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 
 /**
@@ -131,6 +133,7 @@ public final class CaptureCreativeTabOutput {
         java.io.PrintStream rawOut = System.out;
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
+        bindComponents(Blocks.STONE.asItem().builtInRegistryHolder());
         unfreeze(BuiltInRegistries.BLOCK, true);
         unfreeze(BuiltInRegistries.ITEM, true);
         unfreeze(BuiltInRegistries.CREATIVE_MODE_TAB, false);
@@ -174,6 +177,7 @@ public final class CaptureCreativeTabOutput {
         Identifier earlyPhase = Identifier.parse("demo:early");
         Identifier latePhase = Identifier.parse("demo:late");
         Identifier dynamicPhase = Identifier.parse("demo:dynamic");
+        Identifier allFromPerTabPhase = Identifier.parse("demo:all_from_per_tab");
         Identifier allLatePhase = Identifier.parse("demo:all_late");
 
         Event<CreativeModeTabEvents.ModifyOutput> primaryEvent =
@@ -182,7 +186,8 @@ public final class CaptureCreativeTabOutput {
         primaryEvent.addPhaseOrdering(Event.DEFAULT_PHASE, latePhase);
         primaryEvent.addPhaseOrdering(latePhase, dynamicPhase);
 
-        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(Event.DEFAULT_PHASE, allLatePhase);
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(Event.DEFAULT_PHASE, allFromPerTabPhase);
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(allFromPerTabPhase, allLatePhase);
 
         List<String> order = new ArrayList<>();
         FabricCreativeModeTabOutput[] seenOutput = new FabricCreativeModeTabOutput[1];
@@ -199,12 +204,20 @@ public final class CaptureCreativeTabOutput {
             sharedPerTab[0] = (output == seenOutput[0]);
             if (!dynamicAdded[0]) {
                 dynamicAdded[0] = true;
+                // A per-tab listener registered during this firing does NOT run until firing 2.
                 primaryEvent.register(dynamicPhase, o2 -> order.add("dynamic"));
+                // A MODIFY_OUTPUT_ALL listener registered during per-tab dispatch DOES run in the
+                // same firing because CreativeModeTabMixin.getStacks reads MODIFY_OUTPUT_ALL.invoker()
+                // after per-tab listeners finish (offsets 146..162).
+                CreativeModeTabEvents.MODIFY_OUTPUT_ALL.register(allFromPerTabPhase, (tab, o2) -> {
+                    order.add("all_from_per_tab");
+                });
             }
         });
         primaryEvent.register(output -> {
             order.add("default1");
             output.accept(enabledA);
+            output.accept(Blocks.STONE);
             try {
                 acceptLikeVis.invoke(output, customHolder, PARENT_ONLY);
                 acceptStackVis.invoke(output, new ItemStack(altarItem), SEARCH_ONLY);
@@ -314,6 +327,23 @@ public final class CaptureCreativeTabOutput {
                 .append(disabledItem.isEnabled(withTrade)).append('|')
                 .append(out1.getEnabledFeatures().equals(FeatureFlags.VANILLA_SET)).append('|')
                 .append(out1.shouldShowOpRestrictedItems()).append('\n');
+        sb.append("item_enabled_props=")
+                .append(ItemStack.EMPTY.isItemEnabled(FeatureFlagSet.of())).append('|')
+                .append(ItemStack.EMPTY.isItemEnabled(null)).append('|')
+                .append(stackZero.isItemEnabled(FeatureFlagSet.of())).append('|')
+                .append(new ItemStack(disabledItem, 0).isItemEnabled(FeatureFlagSet.of())).append('|')
+                .append(stackA.isItemEnabled(FeatureFlagSet.of())).append('|')
+                .append(stackA.isItemEnabled(FeatureFlags.VANILLA_SET)).append('|')
+                .append(new ItemStack(disabledItem).isItemEnabled(FeatureFlags.VANILLA_SET)).append('|')
+                .append(new ItemStack(disabledItem).isItemEnabled(withTrade)).append('\n');
+        sb.append("npe_of_null_flags=")
+                .append(catchErr(() -> FeatureFlagSet.of(FeatureFlags.VANILLA, (FeatureFlag[]) null))).append('\n');
+        sb.append("npe_of_null_flag_empty=")
+                .append(catchErr(() -> FeatureFlagSet.of(null, new FeatureFlag[0]))).append('\n');
+        sb.append("npe_of_null_flag_nonempty=")
+                .append(catchErr(() -> FeatureFlagSet.of(null, FeatureFlags.VANILLA))).append('\n');
+        sb.append("npe_of_null_elem=")
+                .append(catchErr(() -> FeatureFlagSet.of(FeatureFlags.VANILLA, (FeatureFlag) null))).append('\n');
         rawOut.print(sb);
     }
 }

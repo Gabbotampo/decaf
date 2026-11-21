@@ -985,4 +985,73 @@ mod output_tests {
             Some((vec![], vec![]))
         );
     }
+
+    #[test]
+    fn copper_block_registry_item_is_accepted_without_counting() {
+        use crate::Host;
+        let mut host = crate::StdHost::new();
+        let output = host.begin_creative_tab_output("minecraft:building_blocks");
+        let copper_block =
+            crate::game_object::server_value("game/item/minecraft:copper_block".into());
+        let accept = MethodRef {
+            owner: OUTPUT_FABRIC.into(),
+            name: "accept".into(),
+            descriptor: "(Lnet/minecraft/world/level/ItemLike;)V".into(),
+        };
+        host.invoke_instance(&accept, &output, std::slice::from_ref(&copper_block))
+            .unwrap();
+        assert_eq!(host.unknown_host_call_count(), 0);
+        let stacks = host.take_creative_tab_output(&output).unwrap();
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(
+            host.item_stack_item_id(&stacks[0]).as_deref(),
+            Some("minecraft:copper_block")
+        );
+        assert_eq!(host.item_stack_count(&stacks[0]), Some(1));
+        assert_eq!(host.item_stack_is_empty(&stacks[0]), Some(false));
+
+        // Direct `StdHost` `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` 0..23):
+        // empty stacks short-circuit to `true` before touching `flags` (even when `flags` is null).
+        let is_item_enabled = MethodRef {
+            owner: ITEM_STACK.into(),
+            name: "isItemEnabled".into(),
+            descriptor: "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z".into(),
+        };
+        let empty_flags = empty_feature_flag_set();
+        let vanilla_flags = vanilla_feature_flag_set();
+        let empty_stack = crate::menu_models::empty_stack();
+        assert_eq!(
+            host.invoke_instance(
+                &is_item_enabled,
+                &empty_stack,
+                std::slice::from_ref(&empty_flags)
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(&is_item_enabled, &empty_stack, &[Value::Ref(None)])
+                .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &is_item_enabled,
+                &stacks[0],
+                std::slice::from_ref(&empty_flags)
+            )
+            .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            host.invoke_instance(
+                &is_item_enabled,
+                &stacks[0],
+                std::slice::from_ref(&vanilla_flags)
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(host.unknown_host_call_count(), 0);
+    }
 }

@@ -5222,7 +5222,7 @@ impl StdHost {
                 .strip_prefix("game/item/")
                 .or_else(|| key.strip_prefix("client/item/"))
         {
-            return (id == "minecraft:air" || vanilla_items::is_vanilla_item_id(id))
+            return vanilla_items::is_vanilla_item_id(id)
                 .then_some(host_creative_tab::FEATURE_VANILLA_SET);
         }
         let marker = jar_object::object_key(item)?;
@@ -5291,8 +5291,12 @@ impl StdHost {
                     };
                     return Some(Ok(Value::Int(i32::from(same))));
                 }
-                // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..9).
+                // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..23):
+                // offsets 0..4 return `true` when `isEmpty()` before reading `flags`.
                 ("isItemEnabled", "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z", [flags]) => {
+                    if is_empty {
+                        return Some(Ok(Value::Int(1)));
+                    }
                     let req = self.item_required_features_mask_impl(&item)?;
                     if req == 0 {
                         return Some(Ok(Value::Int(1)));

@@ -296,35 +296,43 @@ impl<H: Host> Runtime<'_, H> {
                 == "(Lnet/minecraft/world/flag/FeatureFlag;[Lnet/minecraft/world/flag/FeatureFlag;)Lnet/minecraft/world/flag/FeatureFlagSet;"
             && let [first, rest] = args
         {
-            // Offset 1: `rest.length` throws NPE before `first` is read.
+            // Offset 1: `flags.length` throws NPE before `flag` is read.
             if matches!(rest, Value::Ref(None)) {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
-                    message: Some(
-                        "Cannot read the array length because \"otherFlags\" is null".into(),
-                    ),
+                    message: Some("Cannot read the array length because \"flags\" is null".into()),
                     frame: None,
                 });
             }
+            let Ok(elements) = self.array(rest).map(std::borrow::Cow::into_owned) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            // Offset 2: `ifne 12`; empty `flags` reads `flag.mask` (offset 6),
+            // non-empty `flags` reads `flag.universe` first (offset 13).
             if matches!(first, Value::Ref(None)) {
+                let field = if elements.is_empty() {
+                    "mask"
+                } else {
+                    "universe"
+                };
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
-                    message: Some("Cannot read field \"mask\" because \"flag\" is null".into()),
+                    message: Some(format!(
+                        "Cannot read field \"{field}\" because \"flag\" is null"
+                    )),
                     frame: None,
                 });
             }
             let Some(mut mask) = crate::runtime::host_creative_tab::feature_flag_mask(first) else {
                 return self.host.unknown_operand_call(r).map(Some);
             };
-            let Ok(elements) = self.array(rest).map(std::borrow::Cow::into_owned) else {
-                return self.host.unknown_operand_call(r).map(Some);
-            };
             for element in elements {
+                // `computeMask` offset 33: reads `f.universe` (slot 5 named `f`).
                 if matches!(element, Value::Ref(None)) {
                     return Err(NativeError::UncaughtException {
                         class: "java/lang/NullPointerException".into(),
                         message: Some(
-                            "Cannot read field \"universe\" because \"flag\" is null".into(),
+                            "Cannot read field \"universe\" because \"f\" is null".into(),
                         ),
                         frame: None,
                     });
@@ -423,15 +431,20 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.host.unknown_operand_call(r).map(Some),
             };
         }
-        // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..9).
+        // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..23):
+        // offsets 0..4 short-circuit to `true` when `this.isEmpty()` before touching `flags`;
+        // offsets 7..23 delegate to `this.getItem().isEnabled(flags)`.
         if !self.host.in_client_frame()
             && let Some(receiver) = receiver
             && r.owner == "net/minecraft/world/item/ItemStack"
             && r.name == "isItemEnabled"
             && r.descriptor == "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z"
             && let [flags] = args
-            && let Some((item, _, _)) = self.host.read_item_stack(receiver)
+            && let Some((item, _, is_empty)) = self.host.read_item_stack(receiver)
         {
+            if is_empty {
+                return Ok(Some(Value::Int(1)));
+            }
             return match self.item_is_enabled_value(&item, flags)? {
                 Some(enabled) => Ok(Some(Value::Int(i32::from(enabled)))),
                 None => self.host.unknown_operand_call(r).map(Some),

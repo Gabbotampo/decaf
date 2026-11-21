@@ -1330,15 +1330,14 @@ impl NativeJar {
         if tab_id == "minecraft:op_blocks" && !context.has_permissions {
             return Ok(CreativeTabContents::default());
         }
-        // Snapshot both events' phase-sorted listeners BEFORE running any callback, matching
-        // `ArrayBackedEvent.invoker()` capturing its `handlers[]` array before invocation.
+        // Snapshot the per-tab event's phase-sorted listeners BEFORE running any per-tab
+        // callback (`CreativeModeTabMixin.getStacks` offsets 119..145; `ArrayBackedEvent.invoker()`
+        // captures its `handlers[]` array before invocation).
         let per_tab = sorted_creative_tab_listeners(
             host.invocations(),
             self,
             &CreativeTabEventTarget::Tab(event_key.clone()),
         );
-        let all_tabs =
-            sorted_creative_tab_listeners(host.invocations(), self, &CreativeTabEventTarget::All);
         // One shared collector across every listener of this tab firing (offsets 90..102).
         let output = host.begin_creative_tab_output_with(
             &event_key,
@@ -1357,6 +1356,11 @@ impl NativeJar {
                 return Err(error);
             }
         }
+        // Snapshot `MODIFY_OUTPUT_ALL` AFTER the per-tab loop: `CreativeModeTabMixin.getStacks`
+        // reads `MODIFY_OUTPUT_ALL.invoker()` at offsets 146..162, so an all-tabs listener
+        // registered by a per-tab callback runs in this same firing.
+        let all_tabs =
+            sorted_creative_tab_listeners(host.invocations(), self, &CreativeTabEventTarget::All);
         for (invocation_index, callback) in all_tabs {
             host.mark_creative_tab_registration_fired(invocation_index);
             if let Err(error) = self.invoke_listener_callback(

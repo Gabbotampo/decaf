@@ -9,6 +9,7 @@ SERVER_LIBS="<path-to-server-26.3-libraries>"
 FAPI_BASE="<path-to-fabric-api-base-2.0.6.jar>"
 FAPI_CT="<path-to-fabric-creative-tab-api-v1-5.0.21.jar>"
 CP="$SERVER_JAR:$(find "$SERVER_LIBS" -name '*.jar' | tr '\n' ':'):$FAPI_BASE:$FAPI_CT"
-javac -cp "$CP" -d out oracle/CaptureCreativeTabOutput.java
+javac -cp "$CP" -d out oracle/CaptureCreativeTabOutput.java oracle/CaptureVanillaItemIds.java
 java -cp "$CP:out" CaptureCreativeTabOutput > java25.txt
+java -cp "$CP:out" CaptureVanillaItemIds > ../../../src/vanilla_item_ids_java25.txt
 ```
