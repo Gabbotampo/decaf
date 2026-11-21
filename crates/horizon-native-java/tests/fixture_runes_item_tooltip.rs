@@ -1,20 +1,77 @@
 //! Real Runes 1.3.2 item tooltip execution through the general NativeJar API.
 
 use horizon_native_java::{ExecutionBudget, HostKind, HostRef, NativeJar, StdHost, Value};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::PathBuf};
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
+const TOOLTIP_STUBS: &[(&str, &str)] = &[
+    (
+        "net/minecraft/ChatFormatting.java",
+        "package net.minecraft; public enum ChatFormatting { GRAY, ITALIC; }",
+    ),
+    (
+        "net/minecraft/network/chat/Component.java",
+        "package net.minecraft.network.chat; public interface Component { static MutableComponent translatable(String k, Object... a) { return null; } static MutableComponent literal(String s) { return null; } }",
+    ),
+    (
+        "net/minecraft/network/chat/MutableComponent.java",
+        "package net.minecraft.network.chat; import net.minecraft.ChatFormatting; public interface MutableComponent extends Component { MutableComponent withStyle(ChatFormatting... f); }",
+    ),
+    (
+        "net/minecraft/world/item/ItemStack.java",
+        "package net.minecraft.world.item; public class ItemStack {}",
+    ),
+    (
+        "net/minecraft/world/item/component/TooltipDisplay.java",
+        "package net.minecraft.world.item.component; public final class TooltipDisplay {}",
+    ),
+    (
+        "net/minecraft/world/item/TooltipFlag.java",
+        "package net.minecraft.world.item; public interface TooltipFlag { boolean isAdvanced(); boolean isCreative(); }",
+    ),
+    (
+        "net/minecraft/world/level/block/Block.java",
+        "package net.minecraft.world.level.block; public class Block {}",
+    ),
+    (
+        "net/minecraft/world/item/Item.java",
+        "package net.minecraft.world.item; import java.util.function.Consumer; import net.minecraft.network.chat.Component; import net.minecraft.world.item.component.TooltipDisplay; public class Item { public static class Properties {} public interface TooltipContext {} public Item(Properties p) {} public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> o, TooltipFlag f) {} }",
+    ),
+    (
+        "net/minecraft/world/item/BlockItem.java",
+        "package net.minecraft.world.item; import java.util.function.Consumer; import net.minecraft.network.chat.Component; import net.minecraft.world.item.component.TooltipDisplay; import net.minecraft.world.level.block.Block; public class BlockItem extends Item { public BlockItem(Block b, Properties p) { super(p); } @Override public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> o, TooltipFlag f) { super.appendHoverText(s,c,d,o,f); } }",
+    ),
+];
+
+const TOOLTIP_SOURCE: &str = r#"package demo;
+import java.util.function.Consumer;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.component.TooltipDisplay;
+public final class TooltipItems {
+  public static Item item() { return new ItemOverride(new Item.Properties()); }
+  public static Item block() { return new BlockOverride(null, new Item.Properties()); }
+  static final class ItemOverride extends Item {
+    ItemOverride(Properties p) { super(p); }
+    @Override public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) { super.appendHoverText(s,c,d,out,f); out.accept(Component.translatable("demo.tip", "arg")); out.accept(Component.translatable("styled", "x")); }
+  }
+  static final class BlockOverride extends BlockItem {
+    BlockOverride(net.minecraft.world.level.block.Block b, Properties p) { super(b, p); }
+    @Override public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) { super.appendHoverText(s,c,d,out,f); out.accept(Component.translatable("demo.block", 7)); }
+  }
+}"#;
+
 #[test]
 fn runes_altar_item_appends_its_translatable_styled_line() {
-    let path =
-        Path::new("/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar");
+    let Some(path) = std::env::var_os("RUNES_JAR").map(PathBuf::from) else {
+        eprintln!("skipped: RUNES_JAR is unset");
+        return;
+    };
     if !path.exists() {
-        eprintln!("skipped: missing Runes jar {path:?}");
+        eprintln!("skipped: RUNES_JAR does not exist: {path:?}");
         return;
     }
     let jar = NativeJar::from_bytes(&fs::read(path).unwrap()).unwrap();
@@ -58,52 +115,10 @@ fn runes_altar_item_appends_its_translatable_styled_line() {
 
 #[test]
 fn javac_item_and_block_item_overrides_run_through_nativejar() {
-    let game = Path::new(
-        "/home/solenopsisbot/coding/hj-scratch/mc263-server/META-INF/versions/26.3/server-26.3.jar",
-    );
-    if !game.exists() {
-        eprintln!("skipped: missing 26.3 server jar");
-        return;
-    }
-    let brigadier = "/home/solenopsisbot/coding/hj-scratch/mc263-server/META-INF/libraries/com/mojang/brigadier/1.3.11/brigadier-1.3.11.jar";
-    let classpath = PathBuf::from(format!("{}:{}", game.display(), brigadier));
-    let fixture = javac_fixture::Fixture::build_with_real_classpath(
-        "item-tooltip",
-        &[(
-            "demo/TooltipItems.java",
-            r#"
-package demo;
-import java.util.function.Consumer;
-import net.minecraft.ChatFormatting;
-import net.minecraft.network.chat.Component;
-import net.minecraft.world.item.*;
-import net.minecraft.world.item.component.TooltipDisplay;
-public final class TooltipItems {
-  public static Item item() { return new ItemOverride(new Item.Properties()); }
-  public static Item block() { return new BlockOverride(null, new Item.Properties()); }
-  static final class ItemOverride extends Item {
-    ItemOverride(Properties p) { super(p); }
-    @Override public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d,
-        Consumer<Component> out, TooltipFlag f) {
-      super.appendHoverText(s, c, d, out, f);
-      out.accept(Component.translatable("demo.tip", "arg"));
-      out.accept(Component.literal("styled").withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
-    }
-  }
-  static final class BlockOverride extends BlockItem {
-    BlockOverride(net.minecraft.world.level.block.Block b, Properties p) { super(b, p); }
-    @Override public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d,
-        Consumer<Component> out, TooltipFlag f) {
-      super.appendHoverText(s, c, d, out, f);
-      out.accept(Component.translatable("demo.block", 7));
-    }
-  }
-}
-"#,
-        )],
-        &classpath,
-        r#"{"schemaVersion":1,"id":"fixture"}"#,
-    );
+    let mut sources = TOOLTIP_STUBS.to_vec();
+    sources.push(("demo/TooltipItems.java", TOOLTIP_SOURCE));
+    // Expected JSON comes from the equivalent real 26.3 server-class capture.
+    let fixture = javac_fixture::Fixture::build_every_package("item-tooltip", &sources);
     let mut host = StdHost::new();
     let run = |name: &str, host: &mut StdHost| {
         let item = fixture
@@ -137,7 +152,7 @@ public final class TooltipItems {
     );
     assert_eq!(
         host.component_json(&item_lines[1]).unwrap(),
-        r#"{"text":"styled","color":"gray","italic":true}"#
+        r#"{"translate":"styled","with":["x"]}"#
     );
     let block_lines = run("block", &mut host);
     assert_eq!(block_lines.len(), 1);

@@ -219,6 +219,33 @@ impl<H: Host> Runtime<'_, H> {
         let descriptor = r.descriptor.as_str();
         let Some(receiver) = receiver else {
             // Static factories with arguments.
+            if name == "literal"
+                && descriptor == "(Ljava/lang/String;)Lnet/minecraft/network/chat/MutableComponent;"
+            {
+                let made = crate::runtime::host_component::literal(
+                    expect_ref(
+                        args.first()
+                            .ok_or_else(|| NativeError::Metadata("literal missing text".into()))?,
+                    )
+                    .map_or("", String::as_str),
+                );
+                if let Some(states) = self.host.component_states_mut()
+                    && let Value::Host(handle) = &made
+                {
+                    states.insert(
+                        crate::runtime::host_component::marker(handle).to_owned(),
+                        ComponentState {
+                            base: Map::from_iter([(
+                                "text".into(),
+                                json!(expect_ref(args.first().unwrap()).map_or("", String::as_str)),
+                            )]),
+                            siblings: Vec::new(),
+                            args: None,
+                        },
+                    );
+                }
+                return Ok(Some(made));
+            }
             let (key, fallback, array) = match (name, args) {
                 ("translatable" | "translatableEscape", [key, array])
                     if descriptor
@@ -254,10 +281,7 @@ impl<H: Host> Runtime<'_, H> {
             let made = bounded(Json::Object(object.clone()))?;
             // `TranslatableContents` keeps its arguments: a component one
             // changed later shows in this one.
-            if values.iter().any(crate::runtime::host_component::is_component)
-                && let (Some(states), Value::Host(handle)) =
-                    (self.host.component_states_mut(), &made)
-            {
+            if let (Some(states), Value::Host(handle)) = (self.host.component_states_mut(), &made) {
                 states.insert(
                     crate::runtime::host_component::marker(handle).to_owned(),
                     ComponentState {
