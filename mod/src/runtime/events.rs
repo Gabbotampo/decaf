@@ -1570,6 +1570,25 @@ impl StdHost {
             }
             kind => kind,
         };
+        // ServerLevel.recipeAccess() and MinecraftServer.getRecipeManager() return the server's
+        // recipe manager singleton, whether called inside an event firing or directly on a
+        // server/level handle.
+        if matches!(kind, Facade::Level(_))
+            && r.name == "recipeAccess"
+            && matches!(
+                r.descriptor.as_str(),
+                "()Lnet/minecraft/world/item/crafting/RecipeManager;"
+                    | "()Lnet/minecraft/world/item/crafting/RecipeAccess;"
+            )
+        {
+            return Some(Ok(marker(crate::runtime::recipe_models::RECIPE_MANAGER_KEY.into())));
+        }
+        if matches!(kind, Facade::Server)
+            && r.name == "getRecipeManager"
+            && r.descriptor == "()Lnet/minecraft/world/item/crafting/RecipeManager;"
+        {
+            return Some(Ok(marker(crate::runtime::recipe_models::RECIPE_MANAGER_KEY.into())));
+        }
         if matches!(
             kind,
             Facade::Server | Facade::Level(_) | Facade::Player(_) | Facade::Entity(_)

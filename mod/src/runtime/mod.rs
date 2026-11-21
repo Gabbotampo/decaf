@@ -246,6 +246,7 @@ mod random_source;
 #[cfg(test)]
 #[path = "random_source_tests.rs"]
 mod random_source_tests;
+mod recipe_models;
 mod reference_identity;
 mod references;
 mod reflect_constructors;
@@ -280,6 +281,7 @@ mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
 mod vanilla_holders_table;
+mod vanilla_item_data;
 mod vanilla_items;
 mod vanilla_registries;
 mod vanilla_registry_keys;
@@ -2507,6 +2509,16 @@ pub trait Host {
         None
     }
 
+    #[doc(hidden)]
+    fn as_std_host(&self) -> Option<&StdHost> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn as_std_host_mut(&mut self) -> Option<&mut StdHost> {
+        None
+    }
+
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
     /// (`jar_operands.rs`). A host that counts nothing errors instead.
@@ -3604,6 +3616,7 @@ pub struct StdHost {
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
     guava_tables: guava_table::Store,
+    pub(crate) recipes: recipe_models::RecipeState,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
     repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
@@ -3886,6 +3899,7 @@ impl StdHost {
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
             guava_tables: guava_table::Store::default(),
+            recipes: recipe_models::RecipeState::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
             sub_list_class_names: BTreeMap::new(),
@@ -4027,6 +4041,55 @@ impl StdHost {
     /// Named DFU construction refusals for the current jar.
     pub fn dfu_codec_refusals(&self) -> &[String] {
         &self.dfu_codec_refusals
+    }
+
+    /// Recipe ids loaded through mod-registered `RecipeSerializer` codecs so far.
+    pub fn loaded_recipe_ids(&self) -> Vec<String> {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| cache.recipes.iter().map(|r| r.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Recipe JSON decode errors captured when loading mod-registered recipe types.
+    pub fn recipe_decode_errors(&self) -> &[(String, String)] {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| cache.errors.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn in_client_frame(&self) -> bool {
+        self.client.frame.is_some()
+    }
+
+    pub(crate) fn block_item_for_block_key(&self, key: &str) -> Option<&Value> {
+        self.block_items.get(key)
+    }
+
+    pub(crate) fn item_properties_for_marker(
+        &self,
+        marker: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.item_property_builders.get(marker)
+    }
+
+    pub(crate) fn is_constructed_item_marker(&self, marker: &str) -> bool {
+        self.constructed_items.contains(marker)
+    }
+
+    pub(crate) fn resource_bytes_for(&self, path: &str) -> Option<&Vec<u8>> {
+        self.resource_bytes.get(path)
+    }
+
+    pub(crate) fn resource_byte_count(&self) -> usize {
+        self.resource_bytes.len()
+    }
+
+    pub(crate) fn iter_resource_bytes(&self) -> impl Iterator<Item = (&String, &Vec<u8>)> {
+        self.resource_bytes.iter()
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -6041,6 +6104,16 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
     Ok(())
 }
 
+impl menu_models::StackOps for StdHost {
+    fn is_empty(&self, value: &Value) -> Option<bool> {
+        recipe_models::stack_is_empty(self, value)
+    }
+
+    fn clamp(&mut self, value: &Value, max: i32) -> Option<()> {
+        recipe_models::limit_stack_for_container(self, value, max)
+    }
+}
+
 impl Host for StdHost {
     fn menu_instance_call(
         &mut self,
@@ -6048,7 +6121,10 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        menu_models::call(&mut self.menu_states, r, receiver, args)
+        let mut states = std::mem::take(&mut self.menu_states);
+        let result = menu_models::call_with_stacks(&mut states, r, receiver, args, self);
+        self.menu_states = states;
+        result
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
@@ -6812,6 +6888,14 @@ impl Host for StdHost {
         Some(&mut self.guava_tables)
     }
 
+    fn as_std_host(&self) -> Option<&StdHost> {
+        Some(self)
+    }
+
+    fn as_std_host_mut(&mut self) -> Option<&mut StdHost> {
+        Some(self)
+    }
+
     fn array_view(
         &mut self,
         array: &str,
@@ -7114,6 +7198,9 @@ impl Host for StdHost {
         if let Some(value) = dfu_codec::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = recipe_models::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
@@ -7188,6 +7275,14 @@ impl Host for StdHost {
         {
             return match crate::runtime::vanilla_blocks::field_id(&r.name) {
                 Some(id) => Ok(crate::runtime::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
+        }
+        if r.owner == "net/minecraft/world/item/Items"
+            && r.descriptor == "Lnet/minecraft/world/item/Item;"
+        {
+            return match crate::runtime::vanilla_items::field_id(&r.name) {
+                Some(id) => Ok(crate::runtime::game_object::server_value(format!("game/item/{id}"))),
                 None => self.unknown_host_call(r),
             };
         }
@@ -7367,7 +7462,9 @@ impl Host for StdHost {
     }
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
-        vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
+        recipe_models::random_new(self, class)
+            .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| StdHost::random_new(self, class))
     }
 
     fn note_entity_data_hierarchy(&mut self, entries: &[(String, String)]) {
@@ -7528,7 +7625,10 @@ impl Host for StdHost {
             }
             _ => {}
         }
-        if let Some(value) = host_item_stack_template::static_call(r, args) {
+        if let Some(value) = host_item_stack_template::static_call(self, r, args) {
+            return value;
+        }
+        if let Some(value) = recipe_models::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
@@ -8806,7 +8906,10 @@ impl Host for StdHost {
         {
             return value;
         }
-        if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+        if let Some(value) = host_item_stack_template::instance_call(self, r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = recipe_models::instance_call(self, r, receiver, args) {
             return value;
         }
         if let Some(value) =
@@ -14103,6 +14206,19 @@ fn item_builder_settings(
                 _ => "true".to_owned(),
             }),
         ),
+        "component"
+            if first
+                .and_then(game_object::handle_key)
+                .is_some_and(|key| key == "game/data-component-type/minecraft:max_stack_size") =>
+        {
+            (
+                "stacksTo",
+                args.get(1).and_then(|value| match value {
+                    Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => Some(n.to_string()),
+                    _ => None,
+                }),
+            )
+        }
         _ => return Vec::new(),
     };
     setting
@@ -14674,6 +14790,23 @@ impl StdHost {
         {
             self.unknown_host_call(r)?;
             return Ok(Value::Int(1));
+        }
+        if recipe_models::is_recipe_object_kind(handle.kind()) {
+            let answer = match r.name.as_str() {
+                "toString" => recipe_models::object_to_string(self, &handle)
+                    .map(|text| Value::Ref(Some(text))),
+                "hashCode" => recipe_models::object_hash_code(self, &handle).map(Value::Int),
+                "equals" => {
+                    let other = Self::argument(r, args, 0)?;
+                    recipe_models::host_object_equals(self, &handle, other)
+                        .map(|equal| Value::Int(i32::from(equal)))
+                }
+                _ => None,
+            };
+            return match answer {
+                Some(answer) => Ok(answer),
+                None => self.unknown_host_call(r),
+            };
         }
         let answer = match r.name.as_str() {
             // A callback's text: counted, a text answered, never its key.
@@ -33499,6 +33632,28 @@ impl<H: Host> Runtime<'_, H> {
                         && let Some(value) = invoke_or_catch!(
                             at,
                             dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            recipe_models::runtime_recipe_manager_call(
+                                self,
+                                &r,
+                                receiver.as_ref(),
+                                &args
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && receiver.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            recipe_models::runtime_static_call(self, &r, &args)
                         )
                     {
                         dispatched = Some(value);

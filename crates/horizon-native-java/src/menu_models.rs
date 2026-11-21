@@ -221,11 +221,41 @@ pub(crate) fn keyed_text(states: &States, key: &str) -> Option<String> {
     states.get(key).map(|object| format!("{object:?}"))
 }
 
+pub(crate) trait StackOps {
+    fn is_empty(&self, value: &Value) -> Option<bool>;
+    fn clamp(&mut self, value: &Value, max: i32) -> Option<()>;
+}
+
+#[cfg(test)]
+struct EmptyOnlyStacks;
+
+#[cfg(test)]
+impl StackOps for EmptyOnlyStacks {
+    fn is_empty(&self, value: &Value) -> Option<bool> {
+        (*value == empty_stack()).then_some(true)
+    }
+
+    fn clamp(&mut self, value: &Value, _max: i32) -> Option<()> {
+        (*value == empty_stack()).then_some(())
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn call(
     states: &mut States,
     r: &MethodRef,
     receiver: &Value,
     args: &[Value],
+) -> Option<Result<Value, NativeError>> {
+    call_with_stacks(states, r, receiver, args, &mut EmptyOnlyStacks)
+}
+
+pub(crate) fn call_with_stacks(
+    states: &mut States,
+    r: &MethodRef,
+    receiver: &Value,
+    args: &[Value],
+    stacks: &mut dyn StackOps,
 ) -> Option<Result<Value, NativeError>> {
     let key = expect_ref(receiver)?.to_owned();
 
@@ -715,16 +745,20 @@ pub(crate) fn call(
         let answer = match r.name.as_str() {
             "getContainerSize" => Ok(Value::Int(*size)),
             "isEmpty" => {
-                // Only `ItemStack.EMPTY` is known to be empty. A Java `null` here (a mod's
-                // `setItem(i, null)`, which this model refuses below) would make
-                // `ItemStack.isEmpty()` throw, so it is never answered as empty.
-                if items.iter().all(|v| *v == empty_stack()) {
-                    Ok(Value::Int(1))
-                } else {
-                    // ItemStack.isEmpty is observable per element.  An arbitrary
-                    // marker does not tell us whether its count/item is empty.
-                    return None;
+                // Only `ItemStack.EMPTY` and known live stacks have known emptiness.
+                // Any unknown stack marker stays counted so we never guess.
+                let mut all_empty = true;
+                for v in items.iter() {
+                    match stacks.is_empty(v) {
+                        Some(true) => {}
+                        Some(false) => {
+                            all_empty = false;
+                            break;
+                        }
+                        None => return None,
+                    }
                 }
+                Ok(Value::Int(i32::from(all_empty)))
             }
             "getItem" => {
                 let position = if *result { 0 } else { index };
@@ -744,11 +778,10 @@ pub(crate) fn call(
                 if matches!(value, Value::Ref(None)) {
                     return None;
                 }
-                // SimpleContainer clamps through getMaxStackSize(stack) and
-                // ItemStack.limitSize(max).  Only EMPTY is fully known here;
-                // refuse to mutate for an unknown stack so Java's clamp cannot
-                // be silently skipped. ResultContainer has no clamp in 26.3.
-                if !*result && *value != empty_stack() {
+                // SimpleContainer clamps through getMaxStackSize(stack) (min(64, stack.getMaxStackSize()))
+                // and ItemStack.limitSize(max). Refuse to mutate for an unknown stack so Java's
+                // clamp cannot be silently skipped. ResultContainer has no clamp in 26.3.
+                if !*result && stacks.clamp(value, 64).is_none() {
                     return None;
                 }
                 let item = items.get_mut(index)?;

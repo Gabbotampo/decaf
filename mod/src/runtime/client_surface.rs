@@ -592,7 +592,7 @@ pub(crate) struct ClientState {
     refused: Vec<String>,
     /// HUD registrations as recorded: (id, element value, source).
     layers: Vec<(String, Value, &'static str)>,
-    frame: Option<Arc<ClientSnapshot>>,
+    pub(crate) frame: Option<Arc<ClientSnapshot>>,
     presses: Vec<KeyPress>,
     draws: Vec<DrawOp>,
     messages: Vec<ClientMessage>,

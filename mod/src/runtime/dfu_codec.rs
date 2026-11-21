@@ -32,6 +32,7 @@ const GETTER: &str = "dfu-builder-getter";
 const OR_ELSE: &str = "dfu-or-else";
 const UNIT: &str = "dfu-unit";
 const UNIT_CODEC: &str = "dfu-unit-codec";
+const MAP_TO_CODEC: &str = "dfu-map-to-codec";
 const LIST: &str = "dfu-list";
 const FLAT_XMAP: &str = "dfu-flat-xmap";
 const COMAP_FLAT_MAP: &str = "dfu-comap-flat-map";
@@ -121,7 +122,7 @@ fn codec_receiver(value: &Value) -> bool {
     };
     (matches!(
         tag.as_str(),
-        CONSTANT | XMAP | FLAT_XMAP | COMAP_FLAT_MAP | UNIT_CODEC | LIST | RECORD
+        CONSTANT | XMAP | FLAT_XMAP | COMAP_FLAT_MAP | UNIT_CODEC | MAP_TO_CODEC | LIST | RECORD
     ) || crate::runtime::host_codec::opaque_codec_type(value).is_some_and(|t| t == CODEC || t == PRIMITIVE))
         && !map_codec(value)
 }
@@ -414,10 +415,38 @@ pub(crate) fn codec_type(value: &Value) -> Option<&'static str> {
 }
 
 pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
-    if r.owner == "net/minecraft/resources/Identifier"
-        && r.name == "CODEC"
-        && r.descriptor == "Lcom/mojang/serialization/Codec;"
-    {
+    if matches!(
+        (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()),
+        (
+            "net/minecraft/resources/Identifier",
+            "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        ) | (
+            "net/minecraft/world/item/crafting/Recipe$CommonInfo",
+            "MAP_CODEC",
+            "Lcom/mojang/serialization/MapCodec;"
+        ) | (
+            "net/minecraft/world/item/crafting/Ingredient",
+            "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        ) | (
+            "net/minecraft/world/item/ItemStackTemplate",
+            "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        ) | (
+            "net/minecraft/world/item/ItemStackTemplate",
+            "MAP_CODEC",
+            "Lcom/mojang/serialization/MapCodec;"
+        ) | (
+            "net/minecraft/core/component/DataComponentPatch",
+            "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        ) | (
+            "net/minecraft/world/item/Item",
+            "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        )
+    ) {
         return Some(constant(
             &r.descriptor[1..r.descriptor.len() - 1],
             &r.owner,
@@ -1183,15 +1212,42 @@ pub(crate) fn invoke(
         }
         (MAP_CODEC, "codec", "()Lcom/mojang/serialization/Codec;") => {
             let receiver = receiver.filter(|value| map_receiver(value))?;
-            (tag(receiver).as_deref() == Some(UNIT))
-                .then(|| build(host, r, UNIT_CODEC, vec![receiver_held_value(receiver)?]))?
+            match tag(receiver).as_deref() {
+                Some(UNIT) => build(host, r, UNIT_CODEC, vec![receiver_held_value(receiver)?]),
+                Some(
+                    RECORD_MAP | FIELD | OPTIONAL | MAP_XMAP | FLAT_XMAP | COMAP_FLAT_MAP | OR_ELSE,
+                ) => build(host, r, MAP_TO_CODEC, vec![receiver.clone()]),
+                Some(CONSTANT) => {
+                    let values = held_values(receiver)?;
+                    match (values.get(2), values.get(3)) {
+                        (Some(Value::Ref(Some(owner))), Some(Value::Ref(Some(name))))
+                            if matches!(
+                                (owner.as_str(), name.as_str()),
+                                (
+                                    "net/minecraft/world/item/crafting/Recipe$CommonInfo",
+                                    "MAP_CODEC"
+                                ) | ("net/minecraft/world/item/ItemStackTemplate", "MAP_CODEC")
+                            ) =>
+                        {
+                            build(host, r, MAP_TO_CODEC, vec![receiver.clone()])
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
         }
         (CODEC | PRIMITIVE, "listOf", descriptor)
             if (descriptor == "()Lcom/mojang/serialization/Codec;"
                 || descriptor == "(II)Lcom/mojang/serialization/Codec;") =>
         {
             let inner = receiver.filter(|value| codec_receiver(value))?.clone();
-            build(host, r, LIST, vec![inner])
+            let mut values = vec![inner];
+            if descriptor == "(II)Lcom/mojang/serialization/Codec;" {
+                values.push(args.first().cloned()?);
+                values.push(args.get(1).cloned()?);
+            }
+            build(host, r, LIST, values)
         }
         (
             CODEC | PRIMITIVE | MAP_CODEC,
@@ -1257,6 +1313,531 @@ pub(crate) fn invoke(
             )
         }
         _ => None,
+    }
+}
+
+/// Decode a JSON object using a DFU `MapCodec` node built by the mod's own bytecode.
+///
+/// Reuses the exact DFU construction graph recorded by [`invoke`] and [`runtime_instance_call`].
+/// Any unmodelled node or opaque codec returns `Ok(Err(DecodeError::Unmodelled(_)))` rather than
+/// guessing a value.
+pub(crate) fn decode_map_json<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    codec: &Value,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
+    decode_map_json_depth(runtime, codec, map, 0)
+}
+
+fn decode_map_json_depth<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    codec: &Value,
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
+    use crate::runtime::recipe_models::DecodeError;
+    if depth > MAX_NODE_DEPTH {
+        return Ok(Err(DecodeError::Unmodelled(
+            "DFU decode recursion depth exceeded".into(),
+        )));
+    }
+    let Some(values) = held_values(codec) else {
+        return Ok(Err(DecodeError::Unmodelled(
+            "MapCodec handle is not a modelled DFU node".into(),
+        )));
+    };
+    let Some(Value::Ref(Some(kind))) = values.first() else {
+        return Ok(Err(DecodeError::Unmodelled("DFU node missing tag".into())));
+    };
+    match kind.as_str() {
+        RECORD_MAP => {
+            let Some(app) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder map node missing App".into(),
+                )));
+            };
+            decode_app_json(runtime, app, map, depth + 1)
+        }
+        APPLIED | POINT => decode_app_json(runtime, codec, map, depth + 1),
+        GETTER => {
+            let Some(inner) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder getter node missing inner MapCodec".into(),
+                )));
+            };
+            decode_map_json_depth(runtime, inner, map, depth + 1)
+        }
+        FIELD => {
+            let (Some(inner), Some(Value::Ref(Some(name)))) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "fieldOf node missing inner codec or field name".into(),
+                )));
+            };
+            let Some(field_val) = map.get(name) else {
+                return Ok(Err(DecodeError::Invalid(format!(
+                    "No key {name} in MapLike"
+                ))));
+            };
+            decode_value_json_depth(runtime, inner, field_val, depth + 1)
+        }
+        OPTIONAL => {
+            let (Some(inner), Some(Value::Ref(Some(name)))) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "optionalFieldOf node missing inner codec or field name".into(),
+                )));
+            };
+            let default = values.get(5).cloned().unwrap_or(Value::Void);
+            let has_default = !matches!(default, Value::Void);
+            match map.get(name) {
+                None => {
+                    if has_default {
+                        Ok(Ok(default))
+                    } else {
+                        Ok(Ok(crate::runtime::empty_optional()))
+                    }
+                }
+                Some(field_val) => {
+                    match decode_value_json_depth(runtime, inner, field_val, depth + 1)? {
+                        Ok(decoded) => {
+                            if has_default {
+                                Ok(Ok(decoded))
+                            } else {
+                                Ok(Ok(crate::runtime::optional_wrap(decoded)))
+                            }
+                        }
+                        Err(err) => Ok(Err(err)),
+                    }
+                }
+            }
+        }
+        OR_ELSE => {
+            let Some(inner) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "orElse node missing inner MapCodec".into(),
+                )));
+            };
+            let fallback = values.get(3).cloned().unwrap_or(Value::Void);
+            match decode_map_json_depth(runtime, inner, map, depth + 1)? {
+                Ok(decoded) => Ok(Ok(decoded)),
+                Err(DecodeError::Invalid(_)) => {
+                    if is_callback(&fallback) {
+                        Ok(Ok(runtime
+                            .invoke_callback(&fallback, &[])?
+                            .unwrap_or(Value::Ref(None))))
+                    } else if !matches!(fallback, Value::Void) {
+                        Ok(Ok(fallback))
+                    } else {
+                        Ok(Err(DecodeError::Unmodelled(
+                            "orElse node missing fallback".into(),
+                        )))
+                    }
+                }
+                Err(other) => Ok(Err(other)),
+            }
+        }
+        UNIT => {
+            let Some(source) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "MapCodec.unit node missing value".into(),
+                )));
+            };
+            Ok(Ok(unit_value(runtime, source)?))
+        }
+        MAP_XMAP => {
+            let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "MapCodec.xmap node missing inner or function".into(),
+                )));
+            };
+            let decoded = match decode_map_json_depth(runtime, inner, map, depth + 1)? {
+                Ok(v) => v,
+                Err(err) => return Ok(Err(err)),
+            };
+            match runtime.invoke_callback(to_cb, &[decoded])? {
+                Some(mapped) => Ok(Ok(mapped)),
+                None => Ok(Err(DecodeError::Unmodelled(
+                    "MapCodec.xmap callback could not be invoked".into(),
+                ))),
+            }
+        }
+        FLAT_XMAP | COMAP_FLAT_MAP => {
+            let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "MapCodec flatXmap/comapFlatMap node missing inner or function".into(),
+                )));
+            };
+            let decoded = match decode_map_json_depth(runtime, inner, map, depth + 1)? {
+                Ok(v) => v,
+                Err(err) => return Ok(Err(err)),
+            };
+            run_data_result_callback(runtime, to_cb, decoded)
+        }
+        CONSTANT => {
+            let (Some(Value::Ref(Some(owner))), Some(Value::Ref(Some(name)))) =
+                (values.get(2), values.get(3))
+            else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "DFU constant MapCodec missing owner/name".into(),
+                )));
+            };
+            let Some(std_host) = runtime.host.as_std_host_mut() else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "host does not support recipe codec decoding".into(),
+                )));
+            };
+            match (owner.as_str(), name.as_str()) {
+                ("net/minecraft/world/item/crafting/Recipe$CommonInfo", "MAP_CODEC") => {
+                    Ok(crate::runtime::recipe_models::decode_common_info_map(std_host, map))
+                }
+                ("net/minecraft/world/item/ItemStackTemplate", "MAP_CODEC") => Ok(
+                    crate::runtime::recipe_models::decode_item_stack_template_map(std_host, map),
+                ),
+                _ => Ok(Err(DecodeError::Unmodelled(format!(
+                    "constant MapCodec {owner}.{name}"
+                )))),
+            }
+        }
+        other => Ok(Err(DecodeError::Unmodelled(format!(
+            "unsupported MapCodec node kind: {other}"
+        )))),
+    }
+}
+
+fn decode_app_json<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    app: &Value,
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
+    use crate::runtime::recipe_models::DecodeError;
+    if depth > MAX_NODE_DEPTH {
+        return Ok(Err(DecodeError::Unmodelled(
+            "DFU App decode depth exceeded".into(),
+        )));
+    }
+    let Some(values) = held_values(app) else {
+        return Ok(Err(DecodeError::Unmodelled(
+            "App is not a modelled DFU node".into(),
+        )));
+    };
+    let Some(Value::Ref(Some(kind))) = values.first() else {
+        return Ok(Err(DecodeError::Unmodelled("App node missing tag".into())));
+    };
+    match kind.as_str() {
+        POINT => {
+            let Some(val) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder.point missing value".into(),
+                )));
+            };
+            Ok(Ok(val.clone()))
+        }
+        GETTER => {
+            let Some(inner) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder getter missing MapCodec".into(),
+                )));
+            };
+            decode_map_json_depth(runtime, inner, map, depth + 1)
+        }
+        APPLIED => {
+            let (Some(product), Some(ctor_cb)) = (values.get(2), values.get(4)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "opaque or incomplete Products.apply node".into(),
+                )));
+            };
+            let Some((_, parts)) = product_parts(product) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "opaque Products node in apply".into(),
+                )));
+            };
+            let mut decoded_args = Vec::with_capacity(parts.len());
+            for part in &parts {
+                match decode_app_json(runtime, part, map, depth + 1)? {
+                    Ok(v) => decoded_args.push(v),
+                    Err(err) => return Ok(Err(err)),
+                }
+            }
+            match runtime.invoke_callback(ctor_cb, &decoded_args) {
+                Ok(Some(constructed)) => Ok(Ok(constructed)),
+                Ok(None) => Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder constructor callback could not be invoked".into(),
+                ))),
+                Err(NativeError::UncaughtException { class, message, .. }) => {
+                    Ok(Err(DecodeError::Invalid(format!(
+                        "{}{}",
+                        class.replace('/', "."),
+                        message.map(|m| format!(": {m}")).unwrap_or_default()
+                    ))))
+                }
+                Err(other) => Err(other),
+            }
+        }
+        _ => decode_map_json_depth(runtime, app, map, depth + 1),
+    }
+}
+
+fn run_data_result_callback<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    cb: &Value,
+    arg: Value,
+) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
+    use crate::runtime::recipe_models::DecodeError;
+    match runtime.invoke_callback(cb, &[arg]) {
+        Ok(Some(result)) => match runtime.read_data_result(&result) {
+            Ok(v) => Ok(Ok(v)),
+            Err(None) => Ok(Err(DecodeError::Invalid(
+                "codec callback returned DataResult.error".into(),
+            ))),
+            Err(Some(why)) => Ok(Err(DecodeError::Unmodelled(why))),
+        },
+        Ok(None) => Ok(Err(DecodeError::Unmodelled(
+            "codec DataResult callback could not be invoked".into(),
+        ))),
+        Err(NativeError::UncaughtException { class, message, .. }) => {
+            Ok(Err(DecodeError::Invalid(format!(
+                "{}{}",
+                class.replace('/', "."),
+                message.map(|m| format!(": {m}")).unwrap_or_default()
+            ))))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn decode_value_json_depth<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    codec: &Value,
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
+    use crate::runtime::Boxed;
+    use crate::runtime::recipe_models::DecodeError;
+    if depth > MAX_NODE_DEPTH {
+        return Ok(Err(DecodeError::Unmodelled(
+            "DFU value decode depth exceeded".into(),
+        )));
+    }
+    let Some(values) = held_values(codec) else {
+        return Ok(Err(DecodeError::Unmodelled(
+            "Codec handle is not a modelled DFU node".into(),
+        )));
+    };
+    let Some(Value::Ref(Some(kind))) = values.first() else {
+        return Ok(Err(DecodeError::Unmodelled(
+            "Codec node missing tag".into(),
+        )));
+    };
+    match kind.as_str() {
+        RECORD => {
+            let Some(app) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "RecordCodecBuilder.create node missing App".into(),
+                )));
+            };
+            let Some(obj) = value.as_object() else {
+                return Ok(Err(DecodeError::Invalid(format!(
+                    "Not a JSON object: {value}"
+                ))));
+            };
+            decode_app_json(runtime, app, obj, depth + 1)
+        }
+        MAP_TO_CODEC => {
+            let Some(inner) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "MapCodec.codec() node missing inner MapCodec".into(),
+                )));
+            };
+            let Some(obj) = value.as_object() else {
+                return Ok(Err(DecodeError::Invalid(format!(
+                    "Not a JSON object: {value}"
+                ))));
+            };
+            decode_map_json_depth(runtime, inner, obj, depth + 1)
+        }
+        UNIT_CODEC => {
+            let Some(source) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "Unit codec missing value".into(),
+                )));
+            };
+            Ok(Ok(unit_value(runtime, source)?))
+        }
+        LIST => {
+            let Some(inner) = values.get(2) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "ListCodec missing element codec".into(),
+                )));
+            };
+            let Some(arr) = value.as_array() else {
+                return Ok(Err(DecodeError::Invalid(format!(
+                    "Not a JSON array: {value}"
+                ))));
+            };
+            if let (Some(Value::Int(min)), Some(Value::Int(max))) = (values.get(3), values.get(4)) {
+                let len = arr.len() as i64;
+                if len < i64::from(*min) || len > i64::from(*max) {
+                    return Ok(Err(DecodeError::Invalid(format!(
+                        "List size {len} outside [{min}; {max}]"
+                    ))));
+                }
+            }
+            let mut decoded_elems = Vec::with_capacity(arr.len());
+            for elem in arr {
+                match decode_value_json_depth(runtime, inner, elem, depth + 1)? {
+                    Ok(v) => decoded_elems.push(v),
+                    Err(err) => return Ok(Err(err)),
+                }
+            }
+            let Some(std_host) = runtime.host.as_std_host_mut() else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "host cannot construct decoded List".into(),
+                )));
+            };
+            Ok(Ok(std_host.unmodifiable_values("list", decoded_elems)))
+        }
+        XMAP => {
+            let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "Codec.xmap node missing inner or function".into(),
+                )));
+            };
+            let decoded = match decode_value_json_depth(runtime, inner, value, depth + 1)? {
+                Ok(v) => v,
+                Err(err) => return Ok(Err(err)),
+            };
+            match runtime.invoke_callback(to_cb, &[decoded]) {
+                Ok(Some(mapped)) => Ok(Ok(mapped)),
+                Ok(None) => Ok(Err(DecodeError::Unmodelled(
+                    "Codec.xmap callback could not be invoked".into(),
+                ))),
+                Err(NativeError::UncaughtException { class, message, .. }) => {
+                    Ok(Err(DecodeError::Invalid(format!(
+                        "{}{}",
+                        class.replace('/', "."),
+                        message.map(|m| format!(": {m}")).unwrap_or_default()
+                    ))))
+                }
+                Err(other) => Err(other),
+            }
+        }
+        FLAT_XMAP | COMAP_FLAT_MAP => {
+            let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "Codec flatXmap/comapFlatMap node missing inner or function".into(),
+                )));
+            };
+            let decoded = match decode_value_json_depth(runtime, inner, value, depth + 1)? {
+                Ok(v) => v,
+                Err(err) => return Ok(Err(err)),
+            };
+            run_data_result_callback(runtime, to_cb, decoded)
+        }
+        CONSTANT => {
+            let (Some(Value::Ref(Some(owner))), Some(Value::Ref(Some(name)))) =
+                (values.get(2), values.get(3))
+            else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "DFU constant Codec missing owner/name".into(),
+                )));
+            };
+            match (owner.as_str(), name.as_str()) {
+                (CODEC, "BOOL") => match value.as_bool() {
+                    Some(b) => Ok(Ok(Value::Boxed(Boxed::Boolean(b)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a boolean: {value}")))),
+                },
+                (CODEC, "BYTE") => match value.as_i64().and_then(|n| i8::try_from(n).ok()) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Byte(n)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a byte: {value}")))),
+                },
+                (CODEC, "SHORT") => match value.as_i64().and_then(|n| i16::try_from(n).ok()) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Short(n)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a short: {value}")))),
+                },
+                (CODEC, "INT") => match value.as_i64().and_then(|n| i32::try_from(n).ok()) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Integer(n)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not an int: {value}")))),
+                },
+                (CODEC, "LONG") => match value.as_i64() {
+                    Some(n) => Ok(Ok(Value::Long(n))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a long: {value}")))),
+                },
+                (CODEC, "FLOAT") => match value.as_f64() {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Float((n as f32).to_bits())))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a float: {value}")))),
+                },
+                (CODEC, "DOUBLE") => match value.as_f64() {
+                    Some(n) => Ok(Ok(Value::Float(n))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a double: {value}")))),
+                },
+                (CODEC, "STRING") => match value.as_str() {
+                    Some(s) => Ok(Ok(Value::Ref(Some(s.to_owned())))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a string: {value}")))),
+                },
+                ("net/minecraft/resources/Identifier", "CODEC") => match value.as_str() {
+                    Some(raw) => match crate::runtime::recipe_models::normalize_id(raw) {
+                        Some(id) => Ok(Ok(crate::runtime::host_ids::identifier_of_text(&id))),
+                        None => Ok(Err(DecodeError::Invalid(format!(
+                            "Not a valid resource location: {raw}"
+                        )))),
+                    },
+                    None => Ok(Err(DecodeError::Invalid(format!(
+                        "Not a string for Identifier: {value}"
+                    )))),
+                },
+                ("net/minecraft/world/item/crafting/Ingredient", "CODEC") => {
+                    let Some(std_host) = runtime.host.as_std_host_mut() else {
+                        return Ok(Err(DecodeError::Unmodelled(
+                            "host does not support Ingredient decoding".into(),
+                        )));
+                    };
+                    Ok(crate::runtime::recipe_models::decode_ingredient_json(
+                        std_host, value,
+                    ))
+                }
+                ("net/minecraft/world/item/ItemStackTemplate", "CODEC") => {
+                    let Some(std_host) = runtime.host.as_std_host_mut() else {
+                        return Ok(Err(DecodeError::Unmodelled(
+                            "host does not support ItemStackTemplate decoding".into(),
+                        )));
+                    };
+                    Ok(crate::runtime::recipe_models::decode_item_stack_template_json(
+                        std_host, value,
+                    ))
+                }
+                ("net/minecraft/core/component/DataComponentPatch", "CODEC") => {
+                    let Some(std_host) = runtime.host.as_std_host_mut() else {
+                        return Ok(Err(DecodeError::Unmodelled(
+                            "host does not support DataComponentPatch decoding".into(),
+                        )));
+                    };
+                    Ok(
+                        crate::runtime::recipe_models::decode_component_patch_json(std_host, value)
+                            .map(|patch| std_host.recipes.alloc_patch(patch)),
+                    )
+                }
+                ("net/minecraft/world/item/Item", "CODEC") => {
+                    let Some(raw) = value.as_str() else {
+                        return Ok(Err(DecodeError::Invalid(format!(
+                            "Not a string for Item: {value}"
+                        ))));
+                    };
+                    let Some(std_host) = runtime.host.as_std_host() else {
+                        return Ok(Err(DecodeError::Unmodelled(
+                            "host does not support Item decoding".into(),
+                        )));
+                    };
+                    Ok(crate::runtime::recipe_models::decode_non_air_item_id(std_host, raw)
+                        .map(|id| crate::runtime::recipe_models::item_holder_for_id(std_host, &id)))
+                }
+                _ => Ok(Err(DecodeError::Unmodelled(format!(
+                    "constant Codec {owner}.{name}"
+                )))),
+            }
+        }
+        other => Ok(Err(DecodeError::Unmodelled(format!(
+            "unsupported Codec node kind: {other}"
+        )))),
     }
 }
 

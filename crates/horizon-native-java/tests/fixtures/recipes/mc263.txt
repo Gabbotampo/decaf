@@ -1,0 +1,26 @@
+decoded:demo:iron_alloy|notify=true|tier=2|label=BASIC|count=4
+decoded:demo:precious_alloy|notify=false|tier=1|label=none|count=1
+decoded:demo:stone_alloy|notify=true|tier=1|label=none|count=2
+decoded:demo:small_stack|notify=true|tier=1|label=none|count=16
+invalidErrorCount=5
+query:iron+redstone|id=demo:iron_alloy|out=4 demo:alloy_ingot|empty=false|repairCost=9|hasCustomName=false
+query:gold+amethyst|id=demo:precious_alloy|out=1 demo:alloy_ingot|empty=false|repairCost=0|hasCustomName=false
+query:copper+amethyst|id=demo:precious_alloy|out=1 demo:alloy_ingot|empty=false|repairCost=0|hasCustomName=false
+query:cobble+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=true
+query:blackstone+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=false
+query:deepslate+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=false
+query:diamond+nugget|id=demo:small_stack|out=16 demo:small_stack_item|empty=false|repairCost=0|hasCustomName=false
+query:dirt+coal|id=empty|out=0 minecraft:air|empty=true|repairCost=null|hasCustomName=false
+query:empty+empty|id=empty|out=0 minecraft:air|empty=true|repairCost=null|hasCustomName=false
+pearl20=0 minecraft:air|empty=true
+small20=0 minecraft:air|empty=true
+stickExtra=5 minecraft:stick|repairCost=9
+ci=CommonInfo[showNotification=true]|CommonInfo[showNotification=false]|eq=true|false|hash=1231|1237
+emptyStack=0 minecraft:air|isAir=true|isStick=false|patchEmpty=true|patchStr={}
+optIngr=true|false|true
+boxClamp=16 minecraft:ender_pearl|boxEmpty=false
+ingrAir=java.lang.UnsupportedOperationException:Ingredient can't contain air
+tplZero=java.lang.IllegalStateException:Item must be non-empty
+tplAir=java.lang.IllegalStateException:Item must be non-empty
+fromEmpty=java.lang.IllegalStateException:Stack must be non-empty
+holder=ResourceKey[minecraft:recipe / demo:one]|eqSame=true|eqDiff=false

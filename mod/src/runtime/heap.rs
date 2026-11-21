@@ -354,6 +354,8 @@ impl StdHost {
         // Table rows and iterators are host-owned roots. Their values may be
         // jar objects, so the collector must see them across callbacks.
         self.guava_tables.root_texts(out);
+        // Recipe holders, serializers, component patches, and decoded mod recipes.
+        self.recipes.root_texts(out);
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -584,6 +586,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
         + host.guava_tables.entry_count()
+        + host.recipes.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -1730,6 +1733,7 @@ mod tests {
             "set_from_map_views",
             "random_sources",
             "guava_tables",
+            "recipes",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",
