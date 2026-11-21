@@ -4008,6 +4008,12 @@ impl StdHost {
             .collect()
     }
 
+    /// The current bounded JSON representation of a component value.
+    pub fn component_json(&self, value: &Value) -> Option<String> {
+        crate::runtime::facade_text::json_now(value, Some(&self.component_states))
+            .map(|json| json.to_string())
+    }
+
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
     }
