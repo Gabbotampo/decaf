@@ -12,18 +12,18 @@ description = "Horizon Java: runs Java mod jars on the native bytecode runtime"
 path = "src/lib.rs"
 
 [dependencies]
-crc32fast = "=1.5.4"
 # The mod API of the exact build pinned in `sunrise-mod.toml`, from its signed SDK, which
 # `cargo sunrise-mod` (`check`, `build`, `run`) fetches into `.sunrise/sdk/`. Sunrise refuses
 # every other form (git, version, another path) under E_SDK_SOURCE
 # (docs/modding/src/reference/sdk/03-in-a-project.md).
 sunrise-mod-api = { path = ".sunrise/sdk/api/crates/sunrise-mod-api" }
 # The runtime's dependencies, pinned to the exact versions in Sunrise's `Cargo.lock`
-# (docs/modding/src/how-to/native-mods/016-the-mods-crate.md): a native mod may only use crates
-# the locked game already resolves, at the same version.
+# (docs/modding/src/how-to/native-mods/01-the-mods-crate.md): keeping the same versions as the
+# pinned game build avoids duplicate registry copies across mods.
+crc32fast = "=1.5.2"
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 zip = { version = "=9.1.3", default-features = false, features = ["deflate"] }
-log = "0.4"
+log = "=0.4.34"
 
 [dev-dependencies]
 # The dispatch-level game-hook tests use the API's in-process fake server host.
