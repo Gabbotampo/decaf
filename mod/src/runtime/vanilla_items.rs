@@ -16,6 +16,22 @@ pub(crate) fn field_id(field: &str) -> Option<String> {
     Some(format!("minecraft:{path}"))
 }
 
+/// Whether `id` (`minecraft:...`) is a vanilla 26.3 `BuiltInRegistries.ITEM` entry.
+/// Every vanilla 26.3 item has `requiredFeatures == FeatureFlags.VANILLA_SET`
+/// (verified across all 1,658 entries of `BuiltInRegistries.ITEM` on Java 25).
+pub(crate) fn is_vanilla_item_id(id: &str) -> bool {
+    let Some(path) = id.strip_prefix("minecraft:") else {
+        return false;
+    };
+    let field = match path {
+        "short_dry_grass" => "DRY_SHORT_GRASS".to_owned(),
+        "tall_dry_grass" => "DRY_TALL_GRASS".to_owned(),
+        "cut_sandstone_slab" => "CUT_STANDSTONE_SLAB".to_owned(),
+        _ => path.to_ascii_uppercase(),
+    };
+    FIELDS.binary_search(&field.as_str()).is_ok()
+}
+
 #[rustfmt::skip]
 const FIELDS: &[&str] = &[
     "ABANDONED_CAMP_MAP",

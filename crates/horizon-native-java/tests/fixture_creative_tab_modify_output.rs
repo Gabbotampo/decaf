@@ -1,168 +1,1063 @@
-//! Fabric modify-output listeners run through NativeJar and retain tab order.
-//! The real API's `FabricCreativeModeTabOutput` declares `accept(ItemStack,
-//! TabVisibility)` as its sole abstract Output method; its ItemLike overloads
-//! are interface defaults. We model only the one-argument defaults here.
+//! Fabric creative-tab modify-output callbacks (`host_creative_tab.rs`, `events.rs`).
+//!
+//! `fixtures/creative_tab_modify_output/java25.txt` is captured by running
+//! `oracle/CaptureCreativeTabOutput.java` on Java 25 against the real
+//! `fabric-creative-tab-api-v1` (5.0.21), `fabric-api-base` (2.0.6), and Minecraft 26.3
+//! server jar. Every row in the javac fixture below is compared against that capture with
+//! zero unknown host calls.
+
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
 
-use horizon_native_java::{StdHost, Value};
+use horizon_native_java::{CreativeTabBuildContext, NativeJar, StdHost, Value};
+use std::collections::BTreeMap;
 use std::path::Path;
 
-const PROBE: &str = r#"
-package demo;
-import net.fabricmc.fabric.api.event.Event;
-import net.fabricmc.fabric.api.creativetab.v1.*;
-import net.minecraft.resources.*;
-import net.minecraft.world.item.*;
-import net.minecraft.world.level.ItemLike;
-public final class Probe {
-  static ResourceKey<CreativeModeTab> key(String id) { return ResourceKey.create(ResourceKey.createRegistryKey(Identifier.parse("minecraft:creative_mode_tab")), Identifier.parse(id)); }
-  static final class DemoItem extends net.minecraft.world.item.Item implements ItemLike { final String id; DemoItem(String id) { this.id=id; } public net.minecraft.world.item.Item asItem() { return this; } public String toString(){return id;} }
-  static final class ObjectListener implements CreativeModeTabEvents.ModifyOutput { public void modifyOutput(FabricCreativeModeTabOutput o) { o.accept(new DemoItem("object")); } }
-  static void register() {
-    Event<CreativeModeTabEvents.ModifyOutput> a = CreativeModeTabEvents.modifyOutputEvent(key("demo:functional"));
-    a.register(o -> o.accept(new DemoItem("lambda")));
-    Event<CreativeModeTabEvents.ModifyOutput> b = CreativeModeTabEvents.modifyOutputEvent(key("demo:combat"));
-    b.register(new ObjectListener());
-  }
-  public static void registerThenThrow() {
-    register();
-    CreativeModeTabEvents.modifyOutputEvent(key("demo:throws")).register(o -> { throw new IllegalStateException("boom"); });
-  }
-}
-"#;
+const ORACLE: &str = include_str!("fixtures/creative_tab_modify_output/java25.txt");
 
+fn oracle_rows() -> BTreeMap<&'static str, &'static str> {
+    ORACLE
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once('=')
+                .unwrap_or_else(|| panic!("bad oracle line: {line}"))
+        })
+        .collect()
+}
+
+/// Compile-only stubs mirroring the real Minecraft 26.3 + Fabric API 5.0.21 signatures.
+/// `javac_fixture::Fixture::build` ships only `demo/` classes into the jar, so every call
+/// into `net/minecraft/*` and `net/fabricmc/*` crosses the native host boundary.
 const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/resources/Identifier.java",
-        "package net.minecraft.resources; public final class Identifier { public static Identifier parse(String s){return null;} }",
+        r#"package net.minecraft.resources;
+public final class Identifier {
+    public static Identifier parse(String s) { throw new AssertionError(); }
+    public static Identifier fromNamespaceAndPath(String ns, String path) { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/minecraft/resources/ResourceKey.java",
-        "package net.minecraft.resources; public final class ResourceKey<T> { public static <T> ResourceKey<T> create(ResourceKey<?> r, Identifier i){return null;} public static <T> ResourceKey<T> createRegistryKey(Identifier i){return null;} }",
+        r#"package net.minecraft.resources;
+public final class ResourceKey<T> {
+    public static <T> ResourceKey<T> createRegistryKey(Identifier id) { throw new AssertionError(); }
+    public static <T> ResourceKey<T> create(ResourceKey<?> registry, Identifier id) { throw new AssertionError(); }
+}"#,
     ),
     (
-        "net/minecraft/world/item/CreativeModeTab.java",
-        "package net.minecraft.world.item; public final class CreativeModeTab {}",
+        "net/minecraft/core/registries/Registries.java",
+        r#"package net.minecraft.core.registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+public final class Registries {
+    public static final ResourceKey<Object> ITEM = null;
+    public static final ResourceKey<Object> BLOCK = null;
+    public static final ResourceKey<Object> CREATIVE_MODE_TAB = null;
+}"#,
     ),
     (
-        "net/minecraft/world/item/Item.java",
-        "package net.minecraft.world.item; public class Item {}",
+        "net/minecraft/core/Registry.java",
+        r#"package net.minecraft.core;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+public interface Registry<T> {
+    static <V, T extends V> T register(Registry<V> registry, Identifier id, T value) { throw new AssertionError(); }
+    static <V, T extends V> T register(Registry<V> registry, ResourceKey<V> key, T value) { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/core/DefaultedRegistry.java",
+        r#"package net.minecraft.core;
+public interface DefaultedRegistry<T> extends Registry<T> {}"#,
+    ),
+    (
+        "net/minecraft/core/registries/BuiltInRegistries.java",
+        r#"package net.minecraft.core.registries;
+import net.minecraft.core.DefaultedRegistry;
+import net.minecraft.core.Registry;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+public final class BuiltInRegistries {
+    public static final DefaultedRegistry<Block> BLOCK = null;
+    public static final DefaultedRegistry<Item> ITEM = null;
+    public static final Registry<CreativeModeTab> CREATIVE_MODE_TAB = null;
+}"#,
+    ),
+    (
+        "net/minecraft/network/chat/Component.java",
+        r#"package net.minecraft.network.chat;
+public interface Component {
+    static MutableComponent literal(String s) { throw new AssertionError(); }
+    String getString();
+}"#,
+    ),
+    (
+        "net/minecraft/network/chat/MutableComponent.java",
+        r#"package net.minecraft.network.chat;
+public interface MutableComponent extends Component {}"#,
+    ),
+    (
+        "net/minecraft/world/flag/FeatureFlag.java",
+        r#"package net.minecraft.world.flag;
+public class FeatureFlag {}"#,
+    ),
+    (
+        "net/minecraft/world/flag/FeatureFlagSet.java",
+        r#"package net.minecraft.world.flag;
+public final class FeatureFlagSet {
+    public static FeatureFlagSet of() { throw new AssertionError(); }
+    public static FeatureFlagSet of(FeatureFlag flag) { throw new AssertionError(); }
+    public static FeatureFlagSet of(FeatureFlag flag, FeatureFlag... otherFlags) { throw new AssertionError(); }
+    public boolean isEmpty() { throw new AssertionError(); }
+    public boolean contains(FeatureFlag flag) { throw new AssertionError(); }
+    public boolean isSubsetOf(FeatureFlagSet set) { throw new AssertionError(); }
+    public boolean intersects(FeatureFlagSet set) { throw new AssertionError(); }
+    public FeatureFlagSet join(FeatureFlagSet other) { throw new AssertionError(); }
+    public FeatureFlagSet subtract(FeatureFlagSet other) { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/flag/FeatureFlags.java",
+        r#"package net.minecraft.world.flag;
+public final class FeatureFlags {
+    public static final FeatureFlag VANILLA = null;
+    public static final FeatureFlag TRADE_REBALANCE = null;
+    public static final FeatureFlag REDSTONE_EXPERIMENTS = null;
+    public static final FeatureFlag MINECART_IMPROVEMENTS = null;
+    public static final FeatureFlagSet VANILLA_SET = null;
+    public static final FeatureFlagSet DEFAULT_FLAGS = null;
+}"#,
+    ),
+    (
+        "net/minecraft/world/flag/FeatureElement.java",
+        r#"package net.minecraft.world.flag;
+public interface FeatureElement {
+    FeatureFlagSet requiredFeatures();
+    default boolean isEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/minecraft/world/level/ItemLike.java",
-        "package net.minecraft.world.level; import net.minecraft.world.item.Item; public interface ItemLike { Item asItem(); }",
+        r#"package net.minecraft.world.level;
+import net.minecraft.world.item.Item;
+public interface ItemLike {
+    Item asItem();
+}"#,
+    ),
+    (
+        "net/minecraft/world/entity/EntityType.java",
+        r#"package net.minecraft.world.entity;
+public class EntityType<T> {}"#,
+    ),
+    (
+        "net/minecraft/world/level/block/state/BlockBehaviour.java",
+        r#"package net.minecraft.world.level.block.state;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.block.Block;
+public abstract class BlockBehaviour {
+    public static class Properties {
+        public static Properties of() { throw new AssertionError(); }
+        public Properties setId(ResourceKey<Block> id) { throw new AssertionError(); }
+    }
+}"#,
+    ),
+    (
+        "net/minecraft/world/level/block/Block.java",
+        r#"package net.minecraft.world.level.block;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.ItemLike;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public class Block extends BlockBehaviour implements ItemLike {
+    public Block(BlockBehaviour.Properties properties) {}
+    @Override public Item asItem() { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/item/Item.java",
+        r#"package net.minecraft.world.item;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.flag.FeatureElement;
+import net.minecraft.world.flag.FeatureFlag;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public class Item implements ItemLike, FeatureElement {
+    public static class Properties {
+        public Properties() {}
+        public Properties setId(ResourceKey<Item> id) { throw new AssertionError(); }
+        public Properties requiredFeatures(FeatureFlag... flags) { throw new AssertionError(); }
+        public Properties requiredFeatures(FeatureFlagSet flags) { throw new AssertionError(); }
+        public Properties spawnEgg(EntityType<?> entityType) { throw new AssertionError(); }
+    }
+    public Item(Properties properties) {}
+    @Override public Item asItem() { return this; }
+    @Override public final FeatureFlagSet requiredFeatures() { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/item/BlockItem.java",
+        r#"package net.minecraft.world.item;
+import net.minecraft.world.level.block.Block;
+public class BlockItem extends Item {
+    public BlockItem(Block block, Item.Properties properties) { super(properties); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/item/ItemStack.java",
+        r#"package net.minecraft.world.item;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.level.ItemLike;
+public final class ItemStack {
+    public static final ItemStack EMPTY = null;
+    public ItemStack(ItemLike item) {}
+    public ItemStack(ItemLike item, int count) {}
+    public boolean isEmpty() { throw new AssertionError(); }
+    public int getCount() { throw new AssertionError(); }
+    public Item getItem() { throw new AssertionError(); }
+    public boolean is(Item item) { throw new AssertionError(); }
+    public boolean isItemEnabled(FeatureFlagSet enabledFeatures) { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/item/CreativeModeTab.java",
+        r#"package net.minecraft.world.item;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.level.ItemLike;
+public class CreativeModeTab {
+    public enum TabVisibility {
+        PARENT_AND_SEARCH_TABS,
+        PARENT_TAB_ONLY,
+        SEARCH_TAB_ONLY
+    }
+    public interface Output {
+        void accept(ItemStack stack, TabVisibility visibility);
+        default void accept(ItemStack stack) { accept(stack, TabVisibility.PARENT_AND_SEARCH_TABS); }
+        default void accept(ItemLike item, TabVisibility visibility) { accept(new ItemStack(item), visibility); }
+        default void accept(ItemLike item) { accept(new ItemStack(item), TabVisibility.PARENT_AND_SEARCH_TABS); }
+    }
+    public static class Builder {
+        public Builder title(Component title) { throw new AssertionError(); }
+        public Builder alignedRight() { throw new AssertionError(); }
+        public CreativeModeTab build() { throw new AssertionError(); }
+    }
+    public Component getDisplayName() { throw new AssertionError(); }
+    public boolean isAlignedRight() { throw new AssertionError(); }
+}"#,
+    ),
+    (
+        "net/minecraft/world/item/CreativeModeTabs.java",
+        r#"package net.minecraft.world.item;
+import net.minecraft.resources.ResourceKey;
+public final class CreativeModeTabs {
+    public static final ResourceKey<CreativeModeTab> FUNCTIONAL_BLOCKS = null;
+    public static final ResourceKey<CreativeModeTab> COMBAT = null;
+    public static final ResourceKey<CreativeModeTab> HOTBAR = null;
+    public static final ResourceKey<CreativeModeTab> OP_BLOCKS = null;
+}"#,
     ),
     (
         "net/fabricmc/fabric/api/event/Event.java",
-        "package net.fabricmc.fabric.api.event; public interface Event<T> { void register(T listener); }",
+        r#"package net.fabricmc.fabric.api.event;
+import net.minecraft.resources.Identifier;
+public abstract class Event<T> {
+    public static final Identifier DEFAULT_PHASE = null;
+    public abstract void register(T listener);
+    public abstract void register(Identifier phase, T listener);
+    public abstract void addPhaseOrdering(Identifier firstPhase, Identifier secondPhase);
+}"#,
+    ),
+    (
+        "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTab.java",
+        r#"package net.fabricmc.fabric.api.creativetab.v1;
+import net.minecraft.world.item.CreativeModeTab;
+public final class FabricCreativeModeTab {
+    public static CreativeModeTab.Builder builder() { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput.java",
-        "package net.fabricmc.fabric.api.creativetab.v1; import net.minecraft.world.level.ItemLike; public class FabricCreativeModeTabOutput { public void accept(ItemLike i){} }",
+        r#"package net.fabricmc.fabric.api.creativetab.v1;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.ItemStack;
+public class FabricCreativeModeTabOutput implements CreativeModeTab.Output {
+    public FeatureFlagSet getEnabledFeatures() { throw new AssertionError(); }
+    public boolean shouldShowOpRestrictedItems() { throw new AssertionError(); }
+    @Override public void accept(ItemStack stack, CreativeModeTab.TabVisibility visibility) { throw new AssertionError(); }
+}"#,
     ),
     (
         "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.java",
-        "package net.fabricmc.fabric.api.creativetab.v1; import net.fabricmc.fabric.api.event.Event; import net.minecraft.resources.ResourceKey; import net.minecraft.world.item.CreativeModeTab; public final class CreativeModeTabEvents { public interface ModifyOutput { void modifyOutput(FabricCreativeModeTabOutput o); } public static Event<ModifyOutput> modifyOutputEvent(ResourceKey<CreativeModeTab> k){return null;} }",
+        r#"package net.fabricmc.fabric.api.creativetab.v1;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.item.CreativeModeTab;
+public final class CreativeModeTabEvents {
+    public static final Event<ModifyOutputAll> MODIFY_OUTPUT_ALL = null;
+    public interface ModifyOutput {
+        void modifyOutput(FabricCreativeModeTabOutput output);
+    }
+    public interface ModifyOutputAll {
+        void modifyOutput(CreativeModeTab tab, FabricCreativeModeTabOutput output);
+    }
+    public static Event<ModifyOutput> modifyOutputEvent(ResourceKey<CreativeModeTab> tabKey) { throw new AssertionError(); }
+}"#,
     ),
 ];
 
+const ORACLE_PROBE: &str = r##"
+package demo;
+
+import java.util.ArrayList;
+import java.util.List;
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.fabricmc.fabric.api.creativetab.v1.FabricCreativeModeTab;
+import net.fabricmc.fabric.api.creativetab.v1.FabricCreativeModeTabOutput;
+import net.fabricmc.fabric.api.event.Event;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.flag.FeatureFlagSet;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ItemLike;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+
+public final class Probe {
+    static Item enabledA;
+    static Item enabledB;
+    static Item enabledC;
+    static Block altarBlock;
+    static BlockItem altarItem;
+    static Item disabledItem;
+    static ItemLike customHolder;
+    static CreativeModeTab primaryTab;
+
+    static final List<String> order = new ArrayList<>();
+    static FabricCreativeModeTabOutput seenOutput;
+    static boolean sharedPerTab;
+    static boolean sharedAll;
+    static boolean tabSame;
+    static String tabTitle;
+    static boolean dynamicAdded;
+    static final String[] errs = new String[7];
+    static boolean out1EnabledMatchesVanilla;
+    static boolean out1ShowOp;
+    static String tradeCount2Err;
+    static String emptyFlagsEmptyStack;
+
+    static ResourceKey<CreativeModeTab> tabKey(String id) {
+        return ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse(id));
+    }
+
+    static String catchErr(Runnable r) {
+        try {
+            r.run();
+            return "NONE";
+        } catch (Throwable t) {
+            return t.getClass().getName() + ": " + t.getMessage();
+        }
+    }
+
+    static String catchClass(Runnable r) {
+        try {
+            r.run();
+            return "NONE";
+        } catch (Throwable t) {
+            return t.getClass().getName();
+        }
+    }
+
+    static final class CustomHolder implements ItemLike {
+        @Override
+        public Item asItem() {
+            return enabledC;
+        }
+    }
+
+    public static void setup() {
+        ResourceKey<Item> keyA = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:enabled_a"));
+        ResourceKey<Item> keyB = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:enabled_b"));
+        ResourceKey<Item> keyC = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:enabled_c"));
+        ResourceKey<Block> keyAltarBlock = ResourceKey.create(Registries.BLOCK, Identifier.parse("demo:altar"));
+        ResourceKey<Item> keyAltarItem = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:altar"));
+        ResourceKey<Item> keyDisabled = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:disabled_trade"));
+
+        enabledA = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:enabled_a"),
+                new Item(new Item.Properties().setId(keyA)));
+        enabledB = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:enabled_b"),
+                new Item(new Item.Properties().setId(keyB)));
+        enabledC = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:enabled_c"),
+                new Item(new Item.Properties().setId(keyC)));
+        altarBlock = Registry.register(BuiltInRegistries.BLOCK, Identifier.parse("demo:altar"),
+                new Block(BlockBehaviour.Properties.of().setId(keyAltarBlock)));
+        altarItem = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:altar"),
+                new BlockItem(altarBlock, new Item.Properties().setId(keyAltarItem)));
+        disabledItem = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:disabled_trade"),
+                new Item(new Item.Properties().setId(keyDisabled).requiredFeatures(FeatureFlags.TRADE_REBALANCE)));
+        customHolder = new CustomHolder();
+
+        ResourceKey<CreativeModeTab> primaryKey = tabKey("demo:primary");
+        primaryTab = FabricCreativeModeTab.builder().title(Component.literal("Primary Tab")).build();
+        Registry.register(BuiltInRegistries.CREATIVE_MODE_TAB, primaryKey, primaryTab);
+
+        Identifier earlyPhase = Identifier.parse("demo:early");
+        Identifier latePhase = Identifier.parse("demo:late");
+        Identifier dynamicPhase = Identifier.parse("demo:dynamic");
+        Identifier allLatePhase = Identifier.parse("demo:all_late");
+
+        Event<CreativeModeTabEvents.ModifyOutput> primaryEvent =
+                CreativeModeTabEvents.modifyOutputEvent(primaryKey);
+        primaryEvent.addPhaseOrdering(earlyPhase, Event.DEFAULT_PHASE);
+        primaryEvent.addPhaseOrdering(Event.DEFAULT_PHASE, latePhase);
+        primaryEvent.addPhaseOrdering(latePhase, dynamicPhase);
+
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.addPhaseOrdering(Event.DEFAULT_PHASE, allLatePhase);
+
+        // Register late BEFORE default and early to test phase ordering.
+        primaryEvent.register(latePhase, output -> {
+            order.add("late");
+            sharedPerTab = (output == seenOutput);
+            if (!dynamicAdded) {
+                dynamicAdded = true;
+                primaryEvent.register(dynamicPhase, o2 -> order.add("dynamic"));
+            }
+        });
+        primaryEvent.register(output -> {
+            order.add("default1");
+            output.accept(enabledA);
+            output.accept(customHolder, CreativeModeTab.TabVisibility.PARENT_TAB_ONLY);
+            output.accept(new ItemStack(altarItem), CreativeModeTab.TabVisibility.SEARCH_TAB_ONLY);
+            // Disabled item: silently skipped before checkStack and visibility check.
+            output.accept(disabledItem);
+            output.accept(new ItemStack(disabledItem, 2));
+            output.accept(new ItemStack(disabledItem, 2), null);
+        });
+        primaryEvent.register(output -> {
+            order.add("default2");
+            output.accept(altarBlock);
+            if (errs[0] == null) {
+                errs[0] = catchErr(() -> output.accept(new ItemStack(enabledA, 2)));
+                errs[1] = catchErr(() -> output.accept(ItemStack.EMPTY));
+                errs[2] = catchErr(() -> output.accept(new ItemStack(enabledA, 0)));
+                errs[3] = catchErr(() -> output.accept(new ItemStack(enabledA, -1)));
+                errs[4] = catchClass(() -> output.accept((ItemStack) null));
+                errs[5] = catchClass(() -> output.accept((ItemLike) null));
+                errs[6] = catchClass(() -> output.accept(new ItemStack(enabledA), null));
+            }
+        });
+        primaryEvent.register(earlyPhase, output -> {
+            order.add("early");
+            seenOutput = output;
+            out1EnabledMatchesVanilla = output.getEnabledFeatures().equals(FeatureFlags.VANILLA_SET);
+            out1ShowOp = output.shouldShowOpRestrictedItems();
+            output.accept(new ItemStack(enabledB));
+        });
+
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.register(allLatePhase, (tab, output) -> {
+            order.add("all_late");
+            sharedAll = (output == seenOutput);
+            tabSame = (tab == primaryTab);
+            output.accept(enabledC);
+        });
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.register((tab, output) -> {
+            order.add("all_default");
+            if (tab == primaryTab) {
+                tabTitle = tab.getDisplayName().getString();
+            }
+        });
+
+        // Trade-enabled tab: only accepts disabledItem and probes count=2 error.
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:trade_tab")).register(output -> {
+            output.accept(disabledItem);
+            tradeCount2Err = catchErr(() -> output.accept(new ItemStack(disabledItem, 2)));
+        });
+        // Empty-features tab: accepts ItemStack.EMPTY (must skip because Items.AIR requires VANILLA).
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:empty_flags_tab")).register(output -> {
+            emptyFlagsEmptyStack = catchErr(() -> output.accept(ItemStack.EMPTY));
+        });
+        // Unbuilt tab: never built, so its registration must remain in game_listeners().unsupported.
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:unbuilt")).register(output -> {
+            output.accept(enabledA);
+        });
+    }
+
+    public static void clearOrder() {
+        order.clear();
+    }
+
+    public static String orderJoined() {
+        return String.join(",", order);
+    }
+
+    public static String formatStack(ItemStack s) {
+        return s.toString() + "#" + s.getCount() + "#" + s.isEmpty() + "#" + s.getItem().toString();
+    }
+
+    public static String firing1Summary() {
+        return "firing1_order=" + String.join(",", order) + "\n"
+                + "firing1_shared=" + (sharedPerTab && sharedAll) + "\n"
+                + "firing1_tab_same=" + tabSame + "\n"
+                + "firing1_tab_title=" + tabTitle + "\n"
+                + "err_count2=" + errs[0] + "\n"
+                + "err_empty=" + errs[1] + "\n"
+                + "err_zero=" + errs[2] + "\n"
+                + "err_neg=" + errs[3] + "\n"
+                + "err_null_stack=" + errs[4] + "\n"
+                + "err_null_itemlike=" + errs[5] + "\n"
+                + "err_null_vis=" + errs[6];
+    }
+
+    public static String extraRows() {
+        FeatureFlagSet withTrade = FeatureFlagSet.of(FeatureFlags.VANILLA, FeatureFlags.TRADE_REBALANCE);
+        ItemStack stackA = new ItemStack(enabledA);
+        ItemStack stackZero = new ItemStack(enabledA, 0);
+        return "trade_count2_err=" + tradeCount2Err + "\n"
+                + "empty_flags_empty_stack=" + emptyFlagsEmptyStack + "\n"
+                + "stack_props="
+                + stackA.isEmpty() + "|"
+                + stackA.getCount() + "|"
+                + stackA.is(enabledA) + "|"
+                + stackA.is(enabledB) + "|"
+                + stackA.toString() + "|"
+                + stackZero.isEmpty() + "|"
+                + stackZero.getCount() + "|"
+                + stackZero.toString() + "\n"
+                + "flags_props="
+                + (FeatureFlags.VANILLA_SET == FeatureFlags.DEFAULT_FLAGS) + "|"
+                + FeatureFlags.VANILLA_SET.equals(FeatureFlagSet.of(FeatureFlags.VANILLA)) + "|"
+                + FeatureFlagSet.of().isEmpty() + "|"
+                + FeatureFlagSet.of().isSubsetOf(FeatureFlags.VANILLA_SET) + "|"
+                + FeatureFlags.VANILLA_SET.isSubsetOf(FeatureFlagSet.of()) + "|"
+                + withTrade.contains(FeatureFlags.TRADE_REBALANCE) + "|"
+                + disabledItem.isEnabled(FeatureFlags.VANILLA_SET) + "|"
+                + disabledItem.isEnabled(withTrade) + "|"
+                + out1EnabledMatchesVanilla + "|"
+                + out1ShowOp;
+    }
+}
+"##;
+
+const EDGE_PROBE: &str = r#"
+package demo;
+
+import net.fabricmc.fabric.api.creativetab.v1.CreativeModeTabEvents;
+import net.fabricmc.fabric.api.creativetab.v1.FabricCreativeModeTab;
+import net.fabricmc.fabric.api.creativetab.v1.FabricCreativeModeTabOutput;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.CreativeModeTabs;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+
+public final class EdgeProbe {
+    static boolean alignedRan;
+    static boolean hotbarRan;
+    static boolean opRan;
+    static boolean opShowFlag;
+    static boolean objectRan;
+    static boolean allObjectRan;
+
+    static final class TaggedItem extends Item {
+        final String label;
+        TaggedItem(Item.Properties properties, String label) {
+            super(properties);
+            this.label = label;
+        }
+        String label() {
+            return label;
+        }
+    }
+
+    static final class ObjectListener implements CreativeModeTabEvents.ModifyOutput {
+        final Item item;
+        ObjectListener(Item item) { this.item = item; }
+        @Override
+        public void modifyOutput(FabricCreativeModeTabOutput output) {
+            objectRan = true;
+            output.accept(item);
+        }
+    }
+
+    static final class AllObjectListener implements CreativeModeTabEvents.ModifyOutputAll {
+        @Override
+        public void modifyOutput(CreativeModeTab tab, FabricCreativeModeTabOutput output) {
+            allObjectRan = true;
+        }
+    }
+
+    static ResourceKey<CreativeModeTab> tabKey(String id) {
+        return ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.parse(id));
+    }
+
+    public static void setupEdgeCases() {
+        ResourceKey<Item> itemKey = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:obj_item"));
+        Item objItem = Registry.register(BuiltInRegistries.ITEM, Identifier.parse("demo:obj_item"),
+                new Item(new Item.Properties().setId(itemKey)));
+
+        CreativeModeTab rightTab = FabricCreativeModeTab.builder()
+                .title(Component.literal("Right"))
+                .alignedRight()
+                .build();
+        Registry.register(BuiltInRegistries.CREATIVE_MODE_TAB, tabKey("demo:right"), rightTab);
+
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:right")).register(o -> alignedRan = true);
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.HOTBAR).register(o -> hotbarRan = true);
+        CreativeModeTabEvents.modifyOutputEvent(CreativeModeTabs.OP_BLOCKS).register(o -> {
+            opRan = true;
+            opShowFlag = o.shouldShowOpRestrictedItems();
+        });
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:obj_tab")).register(new ObjectListener(objItem));
+        CreativeModeTabEvents.MODIFY_OUTPUT_ALL.register(new AllObjectListener());
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:throws")).register(o -> {
+            throw new IllegalStateException("boom");
+        });
+        CreativeModeTabEvents.modifyOutputEvent(tabKey("demo:unknown_features")).register(o -> {
+            // `new Item(null)` has unknown `requiredFeatures`, so `accept` must be counted.
+            o.accept(new Item(null));
+        });
+        // GC rooting: listener 1 creates an unrooted jar TaggedItem and accepts it;
+        // listener 2 allocates enough temporary objects to force a resident heap collection.
+        ResourceKey<CreativeModeTab> gcKey = tabKey("demo:gc_tab");
+        CreativeModeTabEvents.modifyOutputEvent(gcKey).register(o -> {
+            TaggedItem ephem = new TaggedItem(new Item.Properties(), "survived-gc");
+            o.accept(ephem);
+        });
+        CreativeModeTabEvents.modifyOutputEvent(gcKey).register(o -> {
+            for (int i = 0; i < 600; i++) {
+                new TaggedItem(new Item.Properties(), "garbage-" + i);
+            }
+        });
+    }
+
+    public static String edgeFlags() {
+        return alignedRan + "|" + hotbarRan + "|" + opRan + "|" + opShowFlag + "|" + objectRan + "|" + allObjectRan;
+    }
+
+    public static String readTaggedLabel(ItemStack stack) {
+        return ((TaggedItem) stack.getItem()).label();
+    }
+}
+"#;
+
+fn format_stacks_via_java(jar: &NativeJar, host: &mut StdHost, stacks: &[Value]) -> String {
+    stacks
+        .iter()
+        .map(|stack| {
+            let value = jar
+                .invoke_method_with_args(
+                    "demo/Probe",
+                    "formatStack",
+                    "(Lnet/minecraft/world/item/ItemStack;)Ljava/lang/String;",
+                    None,
+                    std::slice::from_ref(stack),
+                    host,
+                )
+                .unwrap();
+            match value {
+                Value::Ref(Some(text)) => text,
+                other => panic!("unexpected formatStack result: {other:?}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 #[test]
-fn javac_listeners_are_dispatched_per_tab_and_exceptions_propagate() {
-    let mut sources = vec![("demo/Probe.java", PROBE)];
+fn javac_creative_tab_modify_output_matches_java25_oracle() {
+    let mut sources = vec![("demo/Probe.java", ORACLE_PROBE)];
     sources.extend_from_slice(STUBS);
-    let fixture = javac_fixture::Fixture::build("creative-tab-modify-output", &sources);
+    let fixture = javac_fixture::Fixture::build("creative-tab-modify-output-oracle", &sources);
     let mut host = fixture.jar.seed_host(StdHost::new());
-    fixture
-        .jar
-        .invoke_method("demo/Probe", "register", "()V", None, &mut host)
-        .unwrap();
-    let contents = fixture.jar.creative_tab_contents(&mut host).unwrap();
-    let functional = "minecraft:creative_mode_tab:demo:functional";
-    let combat = "minecraft:creative_mode_tab:demo:combat";
-    assert_eq!(contents[functional].len(), 1);
-    assert_eq!(contents[combat].len(), 1);
-    assert!(matches!(contents[functional][0], Value::Host(_)));
+    let expected = oracle_rows();
 
     fixture
         .jar
-        .invoke_method("demo/Probe", "registerThenThrow", "()V", None, &mut host)
+        .invoke_method("demo/Probe", "setup", "()V", None, &mut host)
         .unwrap();
-    let error = fixture.jar.creative_tab_contents(&mut host).unwrap_err();
-    assert!(format!("{error:?}").contains("boom"));
+
+    // Before building any tab, every creative-tab registration MUST stay counted in `unsupported`.
+    let before = host.game_listeners(&fixture.jar, true);
+    assert!(before.listeners.is_empty());
+    let primary_source = "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:demo:primary";
+    let unbuilt_source = "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:demo:unbuilt";
+    let all_source =
+        "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.MODIFY_OUTPUT_ALL";
+    assert_eq!(before.unsupported.get(primary_source), Some(&4));
+    assert_eq!(before.unsupported.get(all_source), Some(&2));
+    assert_eq!(before.unsupported.get(unbuilt_source), Some(&1));
+
+    // Firing 1: build `demo:primary` with default vanilla features.
+    let contents1 = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:primary")
+        .unwrap();
+    let display1 = format_stacks_via_java(&fixture.jar, &mut host, &contents1.display_stacks);
+    let search1 = format_stacks_via_java(&fixture.jar, &mut host, &contents1.search_tab_stacks);
+    assert_eq!(display1, expected["firing1_display"]);
+    assert_eq!(search1, expected["firing1_search"]);
+
+    // Verify Rust inspection helpers agree with Java stack values.
+    let display_ids: Vec<_> = contents1
+        .display_stacks
+        .iter()
+        .map(|s| {
+            (
+                host.item_stack_item_id(s).unwrap(),
+                host.item_stack_count(s).unwrap(),
+                host.item_stack_is_empty(s).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        display_ids,
+        vec![
+            ("demo:enabled_b".to_owned(), 1, false),
+            ("demo:enabled_a".to_owned(), 1, false),
+            ("demo:enabled_c".to_owned(), 1, false),
+            ("demo:altar".to_owned(), 1, false),
+            ("demo:enabled_c".to_owned(), 1, false),
+        ]
+    );
+
+    let summary = fixture.text_on(&mut host, "firing1Summary");
+    for line in summary.lines() {
+        let (key, actual) = line.split_once('=').unwrap();
+        assert_eq!(actual, expected[key], "mismatch for {key}");
+    }
+
+    // After firing 1: initial primary + MODIFY_OUTPUT_ALL cleared; dynamic listener registered
+    // during firing 1 is still unfired (count 1); unbuilt tab still counted (count 1).
+    let after1 = host.game_listeners(&fixture.jar, true);
+    assert_eq!(after1.unsupported.get(primary_source), Some(&1));
+    assert_eq!(after1.unsupported.get(all_source), None);
+    assert_eq!(after1.unsupported.get(unbuilt_source), Some(&1));
+
+    // Firing 2: dynamic listener now runs in phase order.
+    fixture
+        .jar
+        .invoke_method("demo/Probe", "clearOrder", "()V", None, &mut host)
+        .unwrap();
+    let _contents2 = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:primary")
+        .unwrap();
+    assert_eq!(
+        fixture.text_on(&mut host, "orderJoined"),
+        expected["firing2_order"]
+    );
+    let after2 = host.game_listeners(&fixture.jar, true);
+    assert_eq!(after2.unsupported.get(primary_source), None);
+    assert_eq!(after2.unsupported.get(unbuilt_source), Some(&1));
+
+    // Firing 3: TRADE_REBALANCE enabled accepts `disabledItem` and throws exact count=2 error.
+    let trade_contents = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:trade_tab",
+            CreativeTabBuildContext {
+                enabled_features: (1 << 0) | (1 << 1),
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    // Note: MODIFY_OUTPUT_ALL also appended `enabledC`; check the first stack is `disabledItem`.
+    let trade_first =
+        format_stacks_via_java(&fixture.jar, &mut host, &trade_contents.display_stacks[..1]);
+    assert_eq!(trade_first, expected["trade_display"]);
+
+    // Firing 4: empty FeatureFlagSet skips `ItemStack.EMPTY` (Items.AIR requires VANILLA).
+    let empty_flags_contents = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "demo:empty_flags_tab",
+            CreativeTabBuildContext {
+                enabled_features: 0,
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    assert!(empty_flags_contents.display_stacks.is_empty());
+
+    let extra = fixture.text_on(&mut host, "extraRows");
+    for line in extra.lines() {
+        let (key, actual) = line.split_once('=').unwrap();
+        assert_eq!(actual, expected[key], "mismatch for {key}");
+    }
+
+    // Unbuilt tab is STILL counted in `unsupported`.
+    let final_listeners = host.game_listeners(&fixture.jar, true);
+    assert_eq!(final_listeners.unsupported.get(unbuilt_source), Some(&1));
+    assert_eq!(
+        host.unknown_host_calls(),
+        Vec::<(String, usize)>::new(),
+        "oracle fixture must run with zero counted unknown host calls"
+    );
+}
+
+#[test]
+fn alignment_op_blocks_object_listeners_exceptions_gc_roots_and_unknown_features() {
+    let mut sources = vec![("demo/EdgeProbe.java", EDGE_PROBE)];
+    sources.extend_from_slice(STUBS);
+    let fixture = javac_fixture::Fixture::build("creative-tab-modify-output-edges", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+
+    fixture
+        .jar
+        .invoke_method("demo/EdgeProbe", "setupEdgeCases", "()V", None, &mut host)
+        .unwrap();
+
+    // Aligned-right custom tab and vanilla `minecraft:hotbar` do not fire listeners.
+    assert!(
+        fixture
+            .jar
+            .creative_tab_contents(&mut host, "demo:right")
+            .unwrap()
+            .display_stacks
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .jar
+            .creative_tab_contents(&mut host, "minecraft:hotbar")
+            .unwrap()
+            .display_stacks
+            .is_empty()
+    );
+    // `minecraft:op_blocks` does not fire without permissions.
+    assert!(
+        fixture
+            .jar
+            .creative_tab_contents(&mut host, "minecraft:op_blocks")
+            .unwrap()
+            .display_stacks
+            .is_empty()
+    );
+    let edge_flags = |host: &mut StdHost| -> String {
+        match fixture
+            .jar
+            .invoke_method(
+                "demo/EdgeProbe",
+                "edgeFlags",
+                "()Ljava/lang/String;",
+                None,
+                host,
+            )
+            .unwrap()
+        {
+            Value::Ref(Some(text)) => text,
+            other => panic!("unexpected edgeFlags result: {other:?}"),
+        }
+    };
+    assert_eq!(edge_flags(&mut host), "false|false|false|false|false|false");
+
+    // `minecraft:op_blocks` fires when `has_permissions: true`.
+    let _ = fixture
+        .jar
+        .creative_tab_contents_with(
+            &mut host,
+            "minecraft:op_blocks",
+            CreativeTabBuildContext {
+                has_permissions: true,
+                ..CreativeTabBuildContext::default()
+            },
+        )
+        .unwrap();
+    // Object listener on `demo:obj_tab` fires too.
+    let obj_contents = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:obj_tab")
+        .unwrap();
+    assert_eq!(obj_contents.display_stacks.len(), 1);
+    assert_eq!(
+        host.item_stack_item_id(&obj_contents.display_stacks[0])
+            .as_deref(),
+        Some("demo:obj_item")
+    );
+    assert_eq!(edge_flags(&mut host), "false|false|true|true|true|true");
+
+    // Right-aligned unfired tabs remain counted in `game_listeners().unsupported`.
+    let listeners = host.game_listeners(&fixture.jar, true);
+    assert_eq!(
+        listeners
+            .unsupported
+            .get("net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:demo:right"),
+        Some(&1)
+    );
+    assert_eq!(
+        listeners
+            .unsupported
+            .get("net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:minecraft:hotbar"),
+        Some(&1)
+    );
+
+    // Exceptions propagate and clean up the active collector.
+    let error = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:throws")
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("boom"), "{error:?}");
+
+    // GC roots: unrooted jar Item accepted in listener 1 survives heap collection triggered by
+    // listener 2 on the shared collector.
+    let gc_contents = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:gc_tab")
+        .unwrap();
+    assert_eq!(gc_contents.display_stacks.len(), 1);
+    let survived = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/EdgeProbe",
+            "readTaggedLabel",
+            "(Lnet/minecraft/world/item/ItemStack;)Ljava/lang/String;",
+            None,
+            std::slice::from_ref(&gc_contents.display_stacks[0]),
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(survived, Value::Ref(Some("survived-gc".into())));
+
+    // Unknown `requiredFeatures` (`new Item(null)`) MUST be counted, never guessed.
+    let before_unknown = host.unknown_host_call_count();
+    let unknown_contents = fixture
+        .jar
+        .creative_tab_contents(&mut host, "demo:unknown_features")
+        .unwrap();
+    assert!(unknown_contents.display_stacks.is_empty());
+    assert!(
+        host.unknown_host_call_count() > before_unknown,
+        "accepting an item with unknown requiredFeatures must be counted"
+    );
 }
 
 #[test]
 fn real_runes_entrypoint_adds_items_to_both_tabs() {
-    let jar = horizon_native_java::NativeJar::from_path(Path::new(
-        "/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar",
-    ))
-    .unwrap();
-    let mut host = jar.seed_host(StdHost::new());
-    // The full entrypoint also initializes the optional Bundle API component;
-    // invoke its exact item-registration and two bytecode listener bodies so
-    // this test isolates the creative-tab boundary.
-    jar.invoke_method(
-        "net/runes/RunesMod",
-        "registerItems",
-        "()V",
-        None,
-        &mut host,
-    )
-    .unwrap();
-    let before_lambdas = host.unknown_host_call_count();
-    let functional_output =
-        host.begin_creative_tab_output("minecraft:creative_mode_tab:minecraft:functional_blocks");
-    jar.invoke_method_with_args(
-        "net/runes/fabric/FabricMod",
-        "lambda$onInitialize$1",
-        "(Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V",
-        None,
-        std::slice::from_ref(&functional_output),
-        &mut host,
-    )
-    .unwrap();
-    let combat_output =
-        host.begin_creative_tab_output("minecraft:creative_mode_tab:minecraft:combat");
-    jar.invoke_method_with_args(
-        "net/runes/fabric/FabricMod",
-        "lambda$onInitialize$2",
-        "(Lnet/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput;)V",
-        None,
-        std::slice::from_ref(&combat_output),
-        &mut host,
-    )
-    .unwrap();
-    let functional = host.take_creative_tab_output(&functional_output).unwrap();
-    let combat = host.take_creative_tab_output(&combat_output).unwrap();
-    let item_id = |value: &Value| {
-        host.registrations()
-            .iter()
-            .find(|r| r.registry == "minecraft:item" && r.value == *value)
-            .map(|r| r.id.as_str())
-            .unwrap()
+    let Some(jar_path) = std::env::var_os("RUNES_JAR") else {
+        eprintln!("RUNES_JAR is unset; real Runes test skipped");
+        return;
     };
-    assert_eq!(item_id(&functional[0]), "runes:crafting_altar");
-    let combat_ids: Vec<_> = combat.iter().map(item_id).collect();
-    assert_eq!(
-        combat_ids,
-        vec![
-            "runes:arcane_stone",
-            "runes:fire_stone",
-            "runes:frost_stone",
-            "runes:healing_stone",
-            "runes:lightning_stone",
-            "runes:soul_stone",
-        ]
+    // Run on a 16 MiB thread so unoptimised debug builds do not hit `frame_bound`'s
+    // 2 MiB test-thread stack floor when Runes initializes its nested `bundle-api` jar.
+    std::thread::Builder::new()
+        .name("real-runes-creative-tab".into())
+        .stack_size(16 << 20)
+        .spawn(move || run_real_runes_test(Path::new(&jar_path)))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn run_real_runes_test(jar_path: &Path) {
+    let jar = NativeJar::from_path(jar_path).unwrap();
+    let mut host = jar.seed_host(StdHost::new());
+
+    // Run every real `main` entrypoint declared in `fabric.mod.json` (registration included).
+    let entrypoints = jar.discover_entrypoints("main");
+    assert!(
+        !entrypoints.is_empty(),
+        "expected at least one main entrypoint in Runes jar"
     );
-    assert_eq!(functional.len(), 1);
-    assert_eq!(combat.len(), 6);
+    for entry in &entrypoints {
+        jar.execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+            .unwrap_or_else(|e| panic!("entrypoint {} failed: {e:?}", entry.class));
+    }
+
+    let functional_source = "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:minecraft:functional_blocks";
+    let combat_source = "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:minecraft:combat";
+    let before_build = host.game_listeners(&jar, true);
+    assert_eq!(
+        before_build.unsupported.get(functional_source),
+        Some(&1),
+        "functional_blocks listener must stay counted before tab build: {:?}",
+        before_build.unsupported
+    );
+    assert_eq!(
+        before_build.unsupported.get(combat_source),
+        Some(&1),
+        "combat listener must stay counted before tab build: {:?}",
+        before_build.unsupported
+    );
+
+    let before_tabs = host.unknown_host_call_count();
+    let functional = jar
+        .creative_tab_contents(&mut host, "minecraft:functional_blocks")
+        .unwrap();
+    let combat = jar
+        .creative_tab_contents(&mut host, "minecraft:combat")
+        .unwrap();
+    let after_tabs = host.unknown_host_call_count();
+
+    let inspect = |stacks: &[Value]| -> Vec<(String, i32, bool)> {
+        stacks
+            .iter()
+            .map(|stack| {
+                (
+                    host.item_stack_item_id(stack)
+                        .unwrap_or_else(|| panic!("missing item id for {stack:?}")),
+                    host.item_stack_count(stack)
+                        .unwrap_or_else(|| panic!("missing count for {stack:?}")),
+                    host.item_stack_is_empty(stack)
+                        .unwrap_or_else(|| panic!("missing isEmpty for {stack:?}")),
+                )
+            })
+            .collect()
+    };
+
+    // Runes bundles `META-INF/jars/bundle-api-5.0.0+26.3-fabric.jar`, so `BundleApiCompat`
+    // registers and appends the three rune pouches after the six rune stones.
+    let expected_functional = vec![("runes:crafting_altar".to_owned(), 1, false)];
+    let expected_combat = vec![
+        ("runes:arcane_stone".to_owned(), 1, false),
+        ("runes:fire_stone".to_owned(), 1, false),
+        ("runes:frost_stone".to_owned(), 1, false),
+        ("runes:healing_stone".to_owned(), 1, false),
+        ("runes:lightning_stone".to_owned(), 1, false),
+        ("runes:soul_stone".to_owned(), 1, false),
+        ("runes:small_rune_pouch".to_owned(), 1, false),
+        ("runes:medium_rune_pouch".to_owned(), 1, false),
+        ("runes:large_rune_pouch".to_owned(), 1, false),
+    ];
+
+    assert_eq!(inspect(&functional.display_stacks), expected_functional);
+    assert_eq!(inspect(&functional.search_tab_stacks), expected_functional);
+    assert_eq!(inspect(&combat.display_stacks), expected_combat);
+    assert_eq!(inspect(&combat.search_tab_stacks), expected_combat);
     assert_eq!(
         host.registrations()
             .iter()
             .filter(|r| r.registry == "minecraft:item")
             .count(),
-        7
+        10
     );
-    assert_eq!(host.unknown_host_call_count() - before_lambdas, 0);
+    assert_eq!(
+        after_tabs - before_tabs,
+        0,
+        "creative_tab_contents for both Runes tabs must have zero counted calls; unknown calls: {:?}",
+        host.unknown_host_calls()
+    );
+
+    // After building both tabs, both registrations must be cleared from `unsupported`.
+    let after_build = host.game_listeners(&jar, true);
+    assert_eq!(after_build.unsupported.get(functional_source), None);
+    assert_eq!(after_build.unsupported.get(combat_source), None);
 }

@@ -405,6 +405,11 @@ impl StdHost {
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
+        if let Some(stack) = self.jar_item_stacks.get(marker) {
+            for text in value_texts(&stack.item) {
+                out.push(text.to_owned());
+            }
+        }
         push(self.state_definition_builders.get(marker), out);
         if let Some((block, _)) = self.block_states.get(marker) {
             out.push(block.clone());
@@ -448,6 +453,8 @@ impl StdHost {
             .chain(self.constructed_items.iter())
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
+            .chain(self.jar_item_stacks.keys())
+            .chain(self.item_required_features.keys())
             .chain(self.block_state_properties.keys())
             .chain(self.state_definition_builders.keys())
             .chain(self.block_states.keys())
@@ -492,6 +499,8 @@ impl StdHost {
         self.constructed_items.retain(|key| keep(key));
         self.constructed_blocks.retain(|key| keep(key));
         self.block_items.retain(|key, _| keep(key));
+        self.jar_item_stacks.retain(|key, _| keep(key));
+        self.item_required_features.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
@@ -1710,6 +1719,8 @@ mod tests {
             "constructed_items",
             "constructed_blocks",
             "block_items",
+            "jar_item_stacks",
+            "item_required_features",
             "payload_registrations",
             "payload_bytes",
             "fabric_entrypoint_containers",
@@ -1845,6 +1856,7 @@ mod tests {
             "registry_lifecycles",
             "random_seed_uniquifier",
             "random_time_origin",
+            "fired_creative_tab_registrations",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
