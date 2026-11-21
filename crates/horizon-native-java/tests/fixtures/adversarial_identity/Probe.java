@@ -590,6 +590,70 @@ public class Probe {
       return "ex:" + e.getClass().getSimpleName();
     }
   }
+  @SuppressWarnings("unchecked")
+  static String reflectPutThenMapOfEntries() {
+    try {
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put("k", "old");
+      Map.Entry<String, String>[] a = new Map.Entry[] { m.entrySet().iterator().next() };
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", "fresh");
+      Map<String, String> copy = Map.ofEntries(a);
+      return copy == null ? "null" : String.valueOf(copy.get("k"));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenSetOfVarargs() {
+    try {
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put("k", "old");
+      Object[] a = new Object[] { m.entrySet().iterator().next(), Map.entry("k", "old") };
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", "fresh");
+      Set<Object> s = Set.of(a);
+      return s == null ? "null" : (s.size() + ":" + s.contains(Map.entry("k", "fresh")));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  @SuppressWarnings("unchecked")
+  static String reflectPutThenArrayUnpackers() {
+    try {
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put("k", "old");
+      Map.Entry<String, String>[] a = new Map.Entry[] { m.entrySet().iterator().next() };
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", "fresh");
+      List<Map.Entry<String, String>> l1 = List.of(a);
+      List<Map.Entry<String, String>> l2 = Arrays.asList(a);
+      Map.Entry<String, String>[] c = Arrays.copyOf(a, 1);
+      Stream<Map.Entry<String, String>> st = Arrays.stream(a);
+      List<Map.Entry<String, String>> dst = new ArrayList<>();
+      Collections.addAll(dst, a);
+      return (l1 == null ? "null" : l1.get(0).getValue())
+          + ":" + (l2 == null ? "null" : l2.get(0).getValue())
+          + ":" + (c == null ? "null" : c[0].getValue())
+          + ":" + (st == null ? "null" : String.valueOf(st.count()))
+          + ":" + (dst.isEmpty() ? "empty" : dst.get(0).getValue());
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  @SuppressWarnings("unchecked")
+  static String detachedSimpleEntryMapOfEntries() {
+    try {
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put("k", "old");
+      Map.Entry<String, String>[] detached = m.entrySet().toArray(new Map.Entry[0]);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", "fresh");
+      Map<String, String> copy = Map.ofEntries(detached);
+      return copy.get("k");
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -649,4 +713,8 @@ public class Probe {
   public static String unmodForEachSavedEntryToStringOut(){return unmodForEachSavedEntryToString();}
   public static String reflectPutThenEnumerationOut(){return reflectPutThenEnumeration();}
   public static String reflectPutThenStreamIteratorOut(){return reflectPutThenStreamIterator();}
+  public static String reflectPutThenMapOfEntriesOut(){return reflectPutThenMapOfEntries();}
+  public static String reflectPutThenSetOfVarargsOut(){return reflectPutThenSetOfVarargs();}
+  public static String reflectPutThenArrayUnpackersOut(){return reflectPutThenArrayUnpackers();}
+  public static String detachedSimpleEntryMapOfEntriesOut(){return detachedSimpleEntryMapOfEntries();}
 }

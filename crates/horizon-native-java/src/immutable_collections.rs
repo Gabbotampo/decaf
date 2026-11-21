@@ -312,6 +312,16 @@ impl<H: Host> Runtime<'_, H> {
         if depth >= MAX_SUPERCLASS_WALK {
             return None;
         }
+        match value {
+            Value::Void
+            | Value::Int(_)
+            | Value::Long(_)
+            | Value::Float(_)
+            | Value::Boxed(_)
+            | Value::Ref(None) => return None,
+            Value::Ref(Some(text)) if value_class::is_plain_string(text) => return None,
+            _ => {}
+        }
         if self.is_identity_collection(value) {
             return crate::jar_object::object_key(value).map(str::to_owned);
         }
@@ -410,9 +420,37 @@ impl<H: Host> Runtime<'_, H> {
         self.collection_uncertain(&root_value).then_some(root_value)
     }
 
+    /// Resolve an owned object array argument (recursively for nested arrays)
+    /// to the root identity collection of any uncertain identity handle inside
+    /// it. Primitive arrays carry no object references and return `None` in O(1).
+    fn uncertain_identity_in_array(
+        &self,
+        value: &Value,
+        r: &MethodRef,
+        depth: usize,
+    ) -> Option<Value> {
+        if depth >= 16 {
+            return None;
+        }
+        let key = crate::host_array::array_key(value)?;
+        let data = self.arrays.get(key)?;
+        for element in data.references() {
+            if let Some(root) = self.uncertain_identity_root(element, r) {
+                return Some(root);
+            }
+            if let Some(root) = self.uncertain_identity_in_array(element, r, depth + 1) {
+                return Some(root);
+            }
+        }
+        None
+    }
+
     /// Count a call dispatched against an uncertain identity collection or any
     /// handle derived from one (views, entries, iterators, spliterators,
-    /// streams, wrappers) before any model can answer from stale contents.
+    /// streams, wrappers), including when passed inside an array argument
+    /// (`Map.ofEntries`, varargs `List.of`/`Set.of`, `Arrays.asList`,
+    /// `Arrays.copyOf`, `Collections.addAll`, `Arrays.stream`, `Stream.of`,
+    /// etc.), before any model can answer from stale contents.
     #[inline(never)]
     pub(crate) fn count_if_uncertain_identity_operand(
         &mut self,
@@ -427,10 +465,31 @@ impl<H: Host> Runtime<'_, H> {
         {
             return self.count_identity_call(r, &root).map(Some);
         }
+        if r.name != "getClass"
+            && let Some(root) = args
+                .iter()
+                .find_map(|arg| self.uncertain_identity_in_array(arg, r, 0))
+        {
+            if matches!(
+                r.name.as_str(),
+                "putAll" | "addAll" | "removeAll" | "retainAll" | "<init>"
+            ) {
+                if let Some(receiver) = receiver {
+                    self.mark_collection_uncertain(receiver);
+                } else if r.name == "addAll"
+                    && let Some(target) = args.first()
+                {
+                    self.mark_collection_uncertain(target);
+                }
+            }
+            return self.count_identity_call(r, &root).map(Some);
+        }
         let reads_collection_arg = matches!(
             r.name.as_str(),
             "equals"
+                | "deepEquals"
                 | "hashCode"
+                | "deepHashCode"
                 | "hash"
                 | "putAll"
                 | "addAll"
@@ -438,6 +497,12 @@ impl<H: Host> Runtime<'_, H> {
                 | "removeAll"
                 | "retainAll"
                 | "copyOf"
+                | "copyOfRange"
+                | "asList"
+                | "ofEntries"
+                | "newArrayList"
+                | "newHashSet"
+                | "newLinkedHashSet"
                 | "<init>"
                 | "stream"
                 | "concat"
@@ -452,8 +517,9 @@ impl<H: Host> Runtime<'_, H> {
                 | "getOnlyElement"
                 | "getFirst"
                 | "getLast"
-        ) || (receiver.is_none()
-            && matches!(r.name.as_str(), "toString" | "valueOf"));
+                | "deepToString"
+        ) || (r.name == "of" && r.owner != "java/util/Optional")
+            || (receiver.is_none() && matches!(r.name.as_str(), "toString" | "valueOf"));
         if reads_collection_arg
             && let Some(root) = args
                 .iter()
@@ -1239,6 +1305,9 @@ impl<H: Host> Runtime<'_, H> {
                 for entry in &entries {
                     if *entry == Value::Ref(None) {
                         return Err(thrown("java/lang/NullPointerException", None));
+                    }
+                    if let Some(root) = self.uncertain_identity_root(entry, r) {
+                        return self.count_identity_call(r, &root).map(Some);
                     }
                     let Some((key, value)) = self.host.map_entry_parts(entry) else {
                         return Ok(None);

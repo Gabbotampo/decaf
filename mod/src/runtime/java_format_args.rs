@@ -67,6 +67,12 @@ impl<H: Host> Runtime<'_, H> {
     /// One element of the `Object[]`, classed as `Object.getClass` would
     /// class it (`class_of_value`).
     fn format_arg(&mut self, value: &Value) -> Result<Arg, NativeError> {
+        if self
+            .uncertain_identity_root(value, &crate::runtime::jar_text::object_to_string())
+            .is_some()
+        {
+            return Ok(Arg::Opaque);
+        }
         // Java dispatches %s on Formattable through the jar object's
         // formatTo(Formatter, flags, width, precision), not toString(). The
         // bounded runtime does not yet execute that callback, so refuse the

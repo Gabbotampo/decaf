@@ -101,6 +101,17 @@ fn adversarial_identity_review() {
         ("unmodForEachSavedEntryToStringOut", "k=2"),
         ("reflectPutThenEnumerationOut", "true"),
         ("reflectPutThenStreamIteratorOut", "true"),
+        // Round-8 finding: host operations unpacking array arguments (`Map.ofEntries`,
+        // varargs `Set.of`/`List.of`, `Arrays.asList`/`copyOf`/`stream`, `Collections.addAll`)
+        // must count any live uncertain identity handle inside the array while keeping
+        // detached `SimpleEntry` arrays exact.
+        ("reflectPutThenMapOfEntriesOut", "fresh"),
+        ("reflectPutThenSetOfVarargsOut", "2:true"),
+        (
+            "reflectPutThenArrayUnpackersOut",
+            "fresh:fresh:fresh:1:fresh",
+        ),
+        ("detachedSimpleEntryMapOfEntriesOut", "old"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -159,6 +170,10 @@ fn adversarial_identity_review() {
         "unmodForEachSavedEntryToStringOut",
         "reflectPutThenEnumerationOut",
         "reflectPutThenStreamIteratorOut",
+        "reflectPutThenMapOfEntriesOut",
+        "reflectPutThenSetOfVarargsOut",
+        "reflectPutThenArrayUnpackersOut",
+        "detachedSimpleEntryMapOfEntriesOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -442,6 +457,48 @@ fn adversarial_identity_review() {
                         .iter()
                         .any(|(call, _)| call == "java/util/Iterator#hasNext()Z"),
                     "reflectPutThenStreamIteratorOut must count Iterator#hasNext on stream iterator: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenMapOfEntriesOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/Map#ofEntries([Ljava/util/Map$Entry;)Ljava/util/Map;"),
+                    "reflectPutThenMapOfEntriesOut must count Map#ofEntries on live identity entry array: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenSetOfVarargsOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call
+                            == "java/util/Set#of([Ljava/lang/Object;)Ljava/util/Set;"),
+                    "reflectPutThenSetOfVarargsOut must count Set#of varargs on live identity entry array: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenArrayUnpackersOut" {
+                let calls = host.unknown_host_calls();
+                for expected in [
+                    "java/util/List#of([Ljava/lang/Object;)Ljava/util/List;",
+                    "java/util/Arrays#asList([Ljava/lang/Object;)Ljava/util/List;",
+                    "java/util/Arrays#copyOf([Ljava/lang/Object;I)[Ljava/lang/Object;",
+                    "java/util/Arrays#stream([Ljava/lang/Object;)Ljava/util/stream/Stream;",
+                    "java/util/Collections#addAll(Ljava/util/Collection;[Ljava/lang/Object;)Z",
+                ] {
+                    assert!(
+                        calls.iter().any(|(call, _)| call == expected),
+                        "reflectPutThenArrayUnpackersOut must count {expected}: {calls:?}"
+                    );
+                }
+            }
+            if method == "detachedSimpleEntryMapOfEntriesOut" {
+                let calls = host.unknown_host_calls();
+                assert_eq!(actual, expected, "{method}");
+                assert!(
+                    !calls.iter().any(|(call, _)| call
+                        == "java/util/Map#ofEntries([Ljava/util/Map$Entry;)Ljava/util/Map;"),
+                    "detached SimpleEntry array must stay exact and not count Map#ofEntries: {calls:?}"
                 );
             }
         } else if counted == 0 {

@@ -1951,6 +1951,13 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
     }
 
     fn map_entry_parts(&mut self, value: &Value) -> Option<(Value, Value)> {
+        if self
+            .runtime
+            .uncertain_identity_root(value, &crate::runtime::jar_text::object_to_string())
+            .is_some()
+        {
+            return None;
+        }
         self.runtime.host.map_entry_parts(value)
     }
 
