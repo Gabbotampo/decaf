@@ -1,10 +1,11 @@
 //! Vanilla registry `ResourceKey` constants used by 26.3 mod bootstrap.
 use crate::runtime::{MethodRef, Value};
 const ENCHANTMENTS: &str = "net/minecraft/world/item/enchantment/Enchantments";
+const CREATIVE_MODE_TABS: &str = "net/minecraft/world/item/CreativeModeTabs";
 const DAMAGE_TYPES: &str = "net/minecraft/world/damagesource/DamageTypes";
 const KEY: &str = "Lnet/minecraft/resources/ResourceKey;";
 fn captured(name: &str) -> Option<&'static str> {
-    include_str!("vanilla_enchantments_capture.txt")
+    crate::runtime::vanilla_registry_captures::ENCHANTMENTS
         .lines()
         .find_map(|l| {
             let (n, rest) = l.split_once('|')?;
@@ -16,7 +17,7 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         return None;
     }
     if r.owner == DAMAGE_TYPES {
-        let location = include_str!("vanilla_damage_types_capture.txt")
+        let location = crate::runtime::vanilla_registry_captures::DAMAGE_TYPES
             .lines()
             .find_map(|l| {
                 let (name, location) = l.split_once('|')?;
@@ -25,6 +26,31 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         return Some(crate::runtime::host_ids::resource_key_named(
             "minecraft:damage_type",
             location,
+        ));
+    }
+    if r.owner == CREATIVE_MODE_TABS {
+        // All 14 vanilla 26.3 `CreativeModeTabs` constants (`server-26.3.jar`
+        // `net.minecraft.world.item.CreativeModeTabs.<clinit>`).
+        let location = match r.name.as_str() {
+            "BUILDING_BLOCKS" => "building_blocks",
+            "COLORED_BLOCKS" => "colored_blocks",
+            "NATURAL_BLOCKS" => "natural_blocks",
+            "FUNCTIONAL_BLOCKS" => "functional_blocks",
+            "REDSTONE_BLOCKS" => "redstone_blocks",
+            "HOTBAR" => "hotbar",
+            "SEARCH" => "search",
+            "TOOLS_AND_UTILITIES" => "tools_and_utilities",
+            "COMBAT" => "combat",
+            "FOOD_AND_DRINKS" => "food_and_drinks",
+            "INGREDIENTS" => "ingredients",
+            "SPAWN_EGGS" => "spawn_eggs",
+            "OP_BLOCKS" => "op_blocks",
+            "INVENTORY" => "inventory",
+            _ => return None,
+        };
+        return Some(crate::runtime::host_ids::resource_key_named(
+            "minecraft:creative_mode_tab",
+            &format!("minecraft:{location}"),
         ));
     }
     if r.owner != ENCHANTMENTS {
@@ -65,7 +91,7 @@ mod captured_walk_tests {
         let mut correct = 0;
         let mut counted = 0;
         let mut wrong = 0;
-        for line in include_str!("vanilla_enchantments_capture.txt").lines() {
+        for line in crate::runtime::vanilla_registry_captures::ENCHANTMENTS.lines() {
             let mut p = line.split('|');
             let name = p.next().unwrap();
             let registry = p.next().unwrap();

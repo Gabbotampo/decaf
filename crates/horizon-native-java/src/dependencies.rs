@@ -59,6 +59,9 @@ pub struct LoadPlan {
     /// the transitive closure, because a dependency's own dependencies are on
     /// the class path of a real loader too.
     pub links: Vec<Vec<usize>>,
+    /// Fabric's resolver refuses a set with an occupied id or alias key. The
+    /// caller must refuse the run rather than silently choosing first-wins.
+    pub resolution_errors: Vec<String>,
 }
 
 impl LoadPlan {
@@ -181,9 +184,10 @@ fn fabric_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &
 ///   discovery pipeline as a mod file, so every `[[mods]]` `modId` of its
 ///   `META-INF/neoforge.mods.toml` is a mod.
 ///
-/// Not modelled: JarJar's version selection (`JarSelector.select` keeps one
-/// version per `group:artifact` and fails the launch on disjoint ranges);
-/// every named jar answers for its ids here. A named path that is missing
+/// JarJar's version selection (`JarSelector.select` keeps one
+/// version per `group:artifact` and fails the launch on disjoint ranges) is
+/// mirrored by the nested-jar loader. Every named jar answers for its ids
+/// here. A named path that is missing
 /// fails a NeoForge launch (`Mod file {} declares Jar-in-Jar {} but does not
 /// contain it`) and is skipped here.
 fn neoforge_provided(entry: &Entries<'_>, depth: usize, budget: &mut usize, ids: &mut Vec<String>) {
@@ -279,10 +283,72 @@ fn is_host_provided(id: &str) -> bool {
 
 /// Build the run order, link closure and missing-dependency rows for `jars`.
 pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
-    let mut provided: BTreeMap<String, usize> = BTreeMap::new();
+    let mut candidates: BTreeMap<String, Vec<(usize, bool, Option<String>, bool)>> =
+        BTreeMap::new();
+    let mut resolution_errors = Vec::new();
     for (index, (_, jar)) in jars.iter().enumerate() {
+        // Fabric inserts the root id and each provides alias into one map in
+        // sequence. This means duplicates within one metadata document are
+        // refusals too (including a repeated alias and an alias equal to id).
+        let mut own_keys = BTreeSet::new();
+        for id in [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+            .into_iter()
+            .flatten()
+            .chain(jar.fabric_provides.iter().map(String::as_str))
+        {
+            let key = id.to_ascii_lowercase();
+            if !own_keys.insert(key.clone()) {
+                resolution_errors.push(format!("duplicate mod {id}"));
+            }
+        }
+        for id in [jar.fabric_id.as_deref(), jar.neoforge_id.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            candidates
+                .entry(id.to_ascii_lowercase())
+                .or_default()
+                .push((
+                    index,
+                    true,
+                    jar.fabric_version.clone().or(jar.neoforge_version.clone()),
+                    false,
+                ));
+        }
+        for id in &jar.fabric_provides {
+            candidates
+                .entry(id.to_ascii_lowercase())
+                .or_default()
+                .push((
+                    index,
+                    true,
+                    jar.fabric_version.clone().or(jar.neoforge_version.clone()),
+                    true,
+                ));
+        }
         for id in mod_ids(jar) {
-            provided.entry(id).or_insert(index);
+            candidates
+                .entry(id)
+                .or_default()
+                .push((index, false, None, false));
+        }
+    }
+    let mut provided = BTreeMap::new();
+    for (id, mut rows) in candidates {
+        rows.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| crate::nested_jars::version_cmp(b.2.as_deref(), a.2.as_deref()))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let distinct: BTreeSet<_> = rows.iter().map(|row| row.0).collect();
+        let duplicate_key = distinct.len() > 1;
+        if duplicate_key {
+            // `ModResolver.selectMod` reports this as a duplicate id/alias
+            // instead of letting version ordering choose a provider.
+            resolution_errors.push(format!("duplicate mod {id}"));
+        }
+        if !duplicate_key && let Some((index, _, _, _)) = rows.first() {
+            provided.insert(id, *index);
         }
     }
 
@@ -345,6 +411,7 @@ pub fn plan(jars: &[(&str, &NativeJar)]) -> LoadPlan {
         order,
         missing,
         links,
+        resolution_errors,
     }
 }
 
@@ -411,6 +478,27 @@ mod tests {
         assert_eq!(plan.links_for(0), [1]);
         assert!(plan.links_for(1).is_empty());
         assert!(plan.missing.is_empty());
+    }
+
+    #[test]
+    fn duplicate_roots_are_resolution_errors() {
+        let old = NativeJar {
+            fabric_id: Some("dep".into()),
+            fabric_version: Some("1.0".into()),
+            ..NativeJar::default()
+        };
+        let new = NativeJar {
+            fabric_id: Some("dep".into()),
+            fabric_version: Some("2.0".into()),
+            ..NativeJar::default()
+        };
+        let consumer = jar("consumer", &["dep"]);
+        let plan = plan(&[
+            ("old.jar", &old),
+            ("new.jar", &new),
+            ("consumer.jar", &consumer),
+        ]);
+        assert_eq!(plan.resolution_errors, ["duplicate mod dep"]);
     }
 
     #[test]

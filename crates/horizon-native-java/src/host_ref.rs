@@ -336,8 +336,13 @@ pub enum HostKind {
     GuavaCacheBuilder,
     /// Guava `CacheLoader.from(function)`: key the function.
     GuavaCacheLoader,
+
     /// A Guava multimap or one of its live views: key its concrete class and serial.
     GuavaMultimap,
+    /// A HashBasedTable or one of its modeled live views (`guava_table.rs`).
+    GuavaTable,
+    /// A Table.Cell returned by the modeled `cellSet` (`guava_table.rs`).
+    GuavaCell,
     /// The thread callbacks run on (`host_jdk.rs`): key `main`.
     Thread,
     /// A logger: key `of_values([api, name])`.
@@ -618,6 +623,8 @@ pub enum HostKind {
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
+    /// Output collector passed to Fabric creative-tab modify callbacks.
+    CreativeModeTabOutput,
     /// Fabric's `BlockApiLookup`, one per (id, API class, context class) (`fabric_block_api.rs`).
     FabricBlockApiLookup,
     Url,
@@ -626,6 +633,34 @@ pub enum HostKind {
     /// A Fabric `BiomeModification` that `BiomeModifications.create` made
     /// (`fabric_biome_modifications.rs`).
     FabricBiomeModification,
+    /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
+    RecipeSerializer,
+    /// Opaque `Consumer<Component>` sink passed to `Item.appendHoverText`
+    /// (`client_surface.rs`), matching vanilla's `lines::add` invokedynamic lambda.
+    TooltipConsumer,
+    /// `net.minecraft.world.item.Item$TooltipContext` passed to tooltip hooks
+    /// (`client_surface.rs`).
+    TooltipContext,
+    /// `net.minecraft.world.item.component.TooltipDisplay` passed to
+    /// `Item.appendHoverText` (`client_surface.rs`).
+    TooltipDisplay,
+    /// `net.minecraft.world.item.TooltipFlag` passed to tooltip hooks when the
+    /// concrete runtime class is unknown (`client_surface.rs`).
+    TooltipFlag,
+    /// Concrete `net.minecraft.world.item.TooltipFlag$Default` record
+    /// (`TooltipFlag.NORMAL`, `TooltipFlag.ADVANCED`, `asCreative()`,
+    /// `client_surface.rs`).
+    TooltipFlagDefault,
+    /// A host-synthesized menu model object (`menu_models.rs`): key `<class>#menu<n>`,
+    /// kept out of `jar_object::parse_key` / `freed_objects` numeric ranges while
+    /// remaining a canonical non-`String` object handle.
+    MenuObject,
+    /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
+    ItemStack,
+    /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
+    FeatureFlag,
+    /// Vanilla `FeatureFlagSet` values (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
+    FeatureFlagSet,
 }
 
 /// How a kind's Java class follows from its key.
@@ -901,6 +936,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         &crate::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
     (HostKind::RandomSource, &crate::random_source::CLASS_SIDE),
+    (
+        HostKind::TooltipFlagDefault,
+        &crate::client_surface::TOOLTIP_FLAG_DEFAULT_CLASS_SIDE,
+    ),
 ];
 
 /// One row of the kind table.
@@ -940,6 +979,64 @@ pub(crate) fn instance_of_class(
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
+    if handle.kind() == HostKind::GuavaMultimap {
+        let class = handle.class()?;
+        let list = class.ends_with("$WrappedList") || class.ends_with("$RandomAccessWrappedList");
+        let set = class.ends_with("$WrappedSet")
+            || class.ends_with("$KeySet")
+            || class.ends_with("$SimpleEntrySet");
+        let collection = list
+            || set
+            || class.ends_with("$Values")
+            || class == "com/google/common/collect/AbstractMultimap$Values";
+        let map = class.ends_with("$AsMap");
+        let multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let list_multimap = matches!(
+            class,
+            "com/google/common/collect/ArrayListMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedListMultimap"
+        );
+        let set_multimap = matches!(
+            class,
+            "com/google/common/collect/HashMultimap"
+                | "com/google/common/collect/LinkedHashMultimap"
+                | "com/google/common/collect/Synchronized$SynchronizedMultimap"
+        );
+        if wanted == "java/lang/Object" {
+            return Some(true);
+        }
+        if wanted == "java/util/Collection" {
+            return Some(collection);
+        }
+        if wanted == "java/util/List" {
+            return Some(list);
+        }
+        if wanted == "java/util/Set" {
+            return Some(set);
+        }
+        if wanted == "java/util/Map" {
+            return Some(map);
+        }
+        if wanted == "com/google/common/collect/Multimap" {
+            return Some(multimap);
+        }
+        if wanted == "com/google/common/collect/ListMultimap" {
+            return Some(list_multimap);
+        }
+        if wanted == "com/google/common/collect/SetMultimap" {
+            return Some(set_multimap);
+        }
+        if wanted == "java/util/RandomAccess" {
+            return Some(class.ends_with("$RandomAccessWrappedList"));
+        }
+    }
     let declared = match handle.kind.info().class {
         ClassRule::Unknown { declared } => declared(handle.key()),
         _ => return hierarchy.is_instance(handle.class()?, wanted),
@@ -1669,6 +1766,24 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::jar_object::JAR_OBJECT,
     },
     KindInfo {
+        kind: HostKind::GuavaTable,
+        tag: "gtbl",
+        class: ClassRule::Unknown {
+            declared: crate::host_guava::table_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_executors::OBJECT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::GuavaCell,
+        tag: "gcell",
+        class: ClassRule::Unknown {
+            declared: crate::host_guava::cell_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::host_executors::OBJECT_METHODS,
+    },
+    KindInfo {
         kind: HostKind::Thread,
         tag: "thr",
         class: ClassRule::FromKey(|_| "java/lang/Thread"),
@@ -1870,8 +1985,8 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Unknown {
             declared: crate::host_neoforge_loader::world_version_types,
         },
-        // A new record per detection.
-        canonical: never_canonical,
+        // Version records are stored singletons in SharedConstants.
+        canonical: always_canonical,
         methods: &crate::host_neoforge_loader::WORLD_VERSION_METHODS,
     },
     // The command surface (`host_brigadier.rs`). An exact `getClass()` would
@@ -2678,9 +2793,20 @@ const KINDS: &[KindInfo] = &[
         kind: HostKind::CreativeModeTab,
         tag: "cmt",
         class: ClassRule::Fixed("net/minecraft/world/item/CreativeModeTab"),
-        canonical: never_canonical,
+        // Each `Builder.build()` uses a fresh serial (`t#<n>`) and each vanilla tab a unique id
+        // (`tab:<id>`), so equal keys are the same `CreativeModeTab` object.
+        canonical: always_canonical,
         // No overrides: identity `equals`, counted `hashCode`/`toString`.
         methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CreativeModeTabOutput,
+        tag: "ctout",
+        class: ClassRule::Fixed(
+            "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput",
+        ),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::OUTPUT_METHODS,
     },
     KindInfo {
         kind: HostKind::FabricBlockApiLookup,
@@ -2717,6 +2843,93 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         // It overrides nothing of `Object`: identity `equals`, `hashCode`/`toString` counted.
         methods: &crate::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeSerializer,
+        tag: "rser",
+        class: ClassRule::Fixed(crate::recipe_serializer::OWNER),
+        // A serial per `new RecipeSerializer` allocation: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::recipe_serializer::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipConsumer,
+        tag: "tcs",
+        // Hidden lambda class (`lines::add` in `ItemStack.getTooltipLines`): `getClass()` is
+        // counted and `instanceof` is exact (`Consumer` and `Object` only).
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_consumer_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::client_surface::TOOLTIP_CONSUMER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipContext,
+        tag: "ttctx",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_context_types,
+        },
+        canonical: crate::client_surface::tooltip_context_canonical,
+        methods: &crate::client_surface::TOOLTIP_CONTEXT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipDisplay,
+        tag: "ttdsp",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_display_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::client_surface::TOOLTIP_DISPLAY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlag,
+        tag: "ttflg",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_flag_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::client_surface::TOOLTIP_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlagDefault,
+        tag: "ttflgd",
+        class: ClassRule::FromKey(crate::client_surface::tooltip_flag_default_class),
+        canonical: crate::client_surface::tooltip_flag_default_canonical,
+        methods: &crate::client_surface::TOOLTIP_FLAG_DEFAULT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MenuObject,
+        tag: "menu",
+        class: ClassRule::FromKey(crate::jar_object::menu_object_class),
+        // Monotonic `#menu<n>` serial per host-synthesized menu object: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::jar_object::MENU_OBJECT,
+    },
+    KindInfo {
+        kind: HostKind::ItemStack,
+        tag: "istk",
+        // `FromKey` rather than `Fixed`: `ItemStack.EMPTY` (`GameValue`), client-frame stacks
+        // (`GameTransient`), and jar-allocated `new ItemStack(...)` (`JarObject`) are also
+        // `ItemStack` instances.
+        class: ClassRule::FromKey(crate::host_creative_tab::item_stack_class),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::ITEM_STACK_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlag,
+        tag: "fflg",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlag"),
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::FEATURE_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlagSet,
+        tag: "ffset",
+        class: ClassRule::Fixed("net/minecraft/world/flag/FeatureFlagSet"),
+        // `empty:0` is `EMPTY`, `vanilla:1` is `VANILLA_SET`/`DEFAULT_FLAGS`, and every `of(...)`/
+        // `join`/`subtract` allocation carries its own serial `n:<serial>:<mask>`.
+        canonical: always_canonical,
+        methods: &crate::host_creative_tab::FEATURE_FLAG_SET_METHODS,
     },
 ];
 
@@ -2804,7 +3017,7 @@ impl HostKind {
 impl HostRef {
     /// A handle with `key` as it is (a number, a name). A key that holds
     /// values is built with [`Self::of_values`].
-    pub(crate) fn new(kind: HostKind, key: impl Into<String>) -> Self {
+    pub fn new(kind: HostKind, key: impl Into<String>) -> Self {
         Self {
             kind,
             key: Arc::new(key.into()),

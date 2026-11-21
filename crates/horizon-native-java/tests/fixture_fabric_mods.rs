@@ -1,7 +1,8 @@
 //! `FabricLoader.getAllMods` and each container's own metadata
 //! (`fabric_mods.rs`), on jars compiled with `javac`.
 //!
-//! The run: `alpha` is the running jar and bundles `gamma` (a nested jar);
+//! The run: `alpha` is the running jar and bundles `gamma`, a nested jar it declares in its
+//! `jars` (Fabric Loader 0.19.5 loads only declared nested jars);
 //! `beta` is linked beside it. `alpha` declares a dependency on `absentdep`,
 //! which nothing ships.
 //!

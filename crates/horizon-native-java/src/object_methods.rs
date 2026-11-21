@@ -316,6 +316,10 @@ impl<H: Host> Runtime<'_, H> {
         if self.is_live_stream_value(value) {
             return Ok(None);
         }
+        if matches!(value, Value::Host(handle) if matches!(handle.kind(), crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell))
+        {
+            return self.guava_table_hash(value);
+        }
         // One level of a nested `hashCode` (#250): a list holding itself recurses on the JVM
         // too, and ends in a `StackOverflowError` the jar can catch.
         let _level = crate::host_recursion::enter()?;
@@ -512,6 +516,20 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `a.equals(b)` for a non-null `a`, as the JVM runs it.
     pub(crate) fn java_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
+        if matches!(a, Value::Host(handle) if matches!(handle.kind(), crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell))
+        {
+            return match self.guava_table_equals(a, b)? {
+                Some(equal) => Ok(equal),
+                None => {
+                    self.host.unknown_operand_call(&MethodRef {
+                        owner: "java/lang/Object".into(),
+                        name: "equals".into(),
+                        descriptor: EQUALS.into(),
+                    })?;
+                    Ok(false)
+                }
+            };
+        }
         // One level of a nested `equals` (#250).
         let _level = crate::host_recursion::enter()?;
         // A stream is an identity object. Its marker is an internal capability,
@@ -715,18 +733,141 @@ impl<H: Host> Runtime<'_, H> {
         if identical(a, b) {
             return Ok(true);
         }
-        let theirs = self.collection_elements(b)?;
-        if self.collection_elements(a)?.len() != theirs.len() {
+        let is_set = match self.host_collection_kind(b) {
+            Some(CollectionKind::Set) => Some(true),
+            Some(_) => Some(false),
+            None => self.known_instance_of(b, "java/util/Set"),
+        };
+        let Some(true) = is_set else {
+            if is_set.is_none() {
+                self.host.unknown_operand_call(&MethodRef {
+                    owner: "java/util/Set".into(),
+                    name: "equals".into(),
+                    descriptor: EQUALS.into(),
+                })?;
+            }
+            return Ok(false);
+        };
+        let size = |runtime: &mut Self, value: &Value| {
+            runtime.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Set",
+                "size",
+                "()I",
+                value,
+                &[],
+            )
+        };
+        let mine = match size(self, a)? {
+            Value::Int(size) => size,
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "Set.size answered {other:?}"
+                )));
+            }
+        };
+        let theirs = match size(self, b)? {
+            Value::Int(size) => size,
+            other => {
+                return Err(NativeError::Metadata(format!(
+                    "Set.size answered {other:?}"
+                )));
+            }
+        };
+        if mine != theirs {
             return Ok(false);
         }
-        for element in &theirs {
+        if self.host_collection_kind(b).is_some() {
+            // Host-backed JDK/Guava collections already expose their exact
+            // iteration order and contents.  Walking those values directly
+            // avoids turning an otherwise modelled `iterator()` into a
+            // counted call.  A jar Set takes the interpreter path below.
+            for element in self.collection_elements(b)? {
+                let found = self.call_virtual(
+                    crate::jdk_call::Site::Interface,
+                    "java/util/Set",
+                    "contains",
+                    "(Ljava/lang/Object;)Z",
+                    a,
+                    std::slice::from_ref(&element),
+                );
+                match found {
+                    Ok(Value::Int(0)) => return Ok(false),
+                    Ok(_) => {}
+                    Err(NativeError::UncaughtException { class, .. })
+                        if class == "java/lang/ClassCastException"
+                            || class == "java/lang/NullPointerException" =>
+                    {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(true);
+        }
+        let iterator = match self.call_virtual(
+            crate::jdk_call::Site::Interface,
+            "java/util/Set",
+            "iterator",
+            "()Ljava/util/Iterator;",
+            b,
+            &[],
+        ) {
+            Ok(iterator) => iterator,
+            Err(NativeError::UncaughtException { class, .. })
+                if class == "java/lang/ClassCastException"
+                    || class == "java/lang/NullPointerException" =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let iterator = iterator;
+        loop {
+            let has_next = match self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &iterator,
+                &[],
+            ) {
+                Ok(value) => value,
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            if !matches!(has_next, Value::Int(flag) if flag != 0) {
+                break;
+            }
+            let element = match self.call_virtual(
+                crate::jdk_call::Site::Interface,
+                "java/util/Iterator",
+                "next",
+                "()Ljava/lang/Object;",
+                &iterator,
+                &[],
+            ) {
+                Ok(value) => value,
+                Err(NativeError::UncaughtException { class, .. })
+                    if class == "java/lang/ClassCastException"
+                        || class == "java/lang/NullPointerException" =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
             let found = self.call_virtual(
                 crate::jdk_call::Site::Interface,
                 "java/util/Set",
                 "contains",
                 "(Ljava/lang/Object;)Z",
                 a,
-                std::slice::from_ref(element),
+                std::slice::from_ref(&element),
             );
             match found {
                 Ok(Value::Int(0)) => return Ok(false),
@@ -969,6 +1110,28 @@ impl<H: Host> Runtime<'_, H> {
         let Some(Value::Host(handle)) = receiver else {
             return Ok(None);
         };
+        // A tainted Guava multimap invalidates every derived handle before
+        // Object-method modelling gets a chance to return a stale snapshot.
+        if let Some(counted) = crate::guava_multimap::guard_tainted_call(self, r, receiver) {
+            return counted;
+        }
+        if matches!(
+            handle.kind(),
+            crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell
+        ) {
+            return match (r.name.as_str(), r.descriptor.as_str(), args) {
+                ("toString", "()Ljava/lang/String;", []) => Ok(self
+                    .guava_table_text(&Value::Host(handle.clone()))?
+                    .map(|text| Value::Ref(Some(text)))),
+                ("hashCode", "()I", []) => Ok(self
+                    .guava_table_hash(&Value::Host(handle.clone()))?
+                    .map(Value::Int)),
+                ("equals", "(Ljava/lang/Object;)Z", [other]) => Ok(self
+                    .guava_table_equals(&Value::Host(handle.clone()), other)?
+                    .map(|equal| Value::Int(i32::from(equal)))),
+                _ => Ok(None),
+            };
+        }
         // An object's methods are its class's: dispatched like any call.
         if !matches!(opcode, 0xb6 | 0xb9) || crate::jar_object::is_object_handle(handle) {
             return Ok(None);
@@ -976,6 +1139,30 @@ impl<H: Host> Runtime<'_, H> {
         // Annotation proxies dispatch their interface members through the reflection model,
         // which has the held annotation values and Java's proxy contract.
         if handle.kind() == crate::host_ref::HostKind::AnnotationProxy {
+            return Ok(None);
+        }
+        // SetFromMap's `equals` is AbstractSet.equals, including an argument
+        // that is a jar class implementing Set. Let the collection contract
+        // below run it instead of HostRef's concrete-kind equality gate.
+        if matches!(r.name.as_str(), "equals" | "hashCode")
+            && ((r.name == "equals"
+                && r.descriptor == EQUALS
+                && receiver.is_some_and(|value| {
+                    self.host.is_set_from_map(value)
+                        || matches!(
+                            self.host_collection_kind(value),
+                            Some(CollectionKind::List | CollectionKind::Set | CollectionKind::Map)
+                        )
+                }))
+                || (r.name == "hashCode"
+                    && r.descriptor == HASH_CODE
+                    && receiver.is_some_and(|value| {
+                        matches!(
+                            self.host_collection_kind(value),
+                            Some(CollectionKind::List | CollectionKind::Set | CollectionKind::Map)
+                        )
+                    })))
+        {
             return Ok(None);
         }
         if handle.kind() == crate::host_ref::HostKind::KotlinLazy
@@ -1048,6 +1235,12 @@ impl<H: Host> Runtime<'_, H> {
         }
         if let Some(text) = self.host.registry_text(&Value::Host(handle.clone())) {
             return Ok(Some(text));
+        }
+        if matches!(
+            handle.kind(),
+            crate::host_ref::HostKind::GuavaTable | crate::host_ref::HostKind::GuavaCell
+        ) {
+            return self.guava_table_text(&Value::Host(handle.clone()));
         }
         handle.to_string(&mut RuntimeNested {
             runtime: self,
@@ -1238,7 +1431,60 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(answer));
                 }
+                if contract == Contract::Set {
+                    let equal = self.abstract_set_equals(receiver, other)?;
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
+                if self.host_collection_kind(other) == Some(CollectionKind::List) {
+                    let equal = self.list_equals(receiver, other)?;
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
+                if matches!(contract, Contract::Set | Contract::Map)
+                    && self.host_collection_kind(other).is_some()
+                {
+                    let step = usize::from(contract == Contract::Map) + 1;
+                    let members = |values: Vec<Value>| {
+                        let mut rows = values
+                            .chunks(step)
+                            .map(|row| row.iter().map(crate::value_marker).collect::<Vec<_>>())
+                            .collect::<Vec<_>>();
+                        rows.sort();
+                        rows
+                    };
+                    let equal = members(self.collection_elements(receiver)?)
+                        == members(self.collection_elements(other)?);
+                    return Ok(Some(Value::Int(i32::from(equal))));
+                }
                 return self.host.invoke_instance(&typed, receiver, args).map(Some);
+            }
+            // A List/Collection-typed call still dispatches by the receiver's
+            // concrete class.  The host's immutable-member hook is reserved
+            // for immutable collections; mutable and view lists need the same
+            // list contract here, including pure host values.
+            if contract == Contract::List && is_collection_owner(&r.owner) {
+                let equal = self.list_equals(receiver, other)?;
+                return Ok(Some(Value::Int(i32::from(equal))));
+            }
+            if contract == Contract::Set && is_collection_owner(&r.owner) {
+                let equal = self.abstract_set_equals(receiver, other)?;
+                return Ok(Some(Value::Int(i32::from(equal))));
+            }
+            if contract == Contract::Map
+                && is_collection_owner(&r.owner)
+                && self.host_collection_kind(other).is_some()
+            {
+                let step = usize::from(contract == Contract::Map) + 1;
+                let members = |values: Vec<Value>| {
+                    let mut rows = values
+                        .chunks(step)
+                        .map(|row| row.iter().map(crate::value_marker).collect::<Vec<_>>())
+                        .collect::<Vec<_>>();
+                    rows.sort();
+                    rows
+                };
+                let equal = members(self.collection_elements(receiver)?)
+                    == members(self.collection_elements(other)?);
+                return Ok(Some(Value::Int(i32::from(equal))));
             }
         }
         // `o.equals(x)` on a JDK object a jar built, whatever class the call names

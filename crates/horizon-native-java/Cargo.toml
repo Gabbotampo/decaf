@@ -7,6 +7,7 @@ rust-version = "1.88"
 description = "Native Rust probe for a bounded Fabric/NeoForge Java bytecode subset"
 
 [dependencies]
+crc32fast = "=1.5.4"
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
 # Horizon's own lock version (`mod/` runs this crate inside the game, and a native mod may only
 # use crates the game resolves). zip 9 needs rustc 1.88 to build; Horizon's launcher ships 1.99.1.

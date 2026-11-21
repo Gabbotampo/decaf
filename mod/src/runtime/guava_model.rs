@@ -250,6 +250,12 @@ impl<H: Host> Runtime<'_, H> {
         receiver: Option<&Value>,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
+        // Guava-derived entries and iterators retain their source multimap in
+        // the structural model.  Check that source before any library path
+        // gets a chance to answer a live-view call.
+        if let Some(counted) = crate::runtime::guava_multimap::guard_tainted_call(self, r, receiver) {
+            return counted;
+        }
         // Guava's `Ordering.natural()` (the `NaturalOrdering.INSTANCE` singleton)
         // and its `reverse()` (the `ReverseNaturalOrdering.INSTANCE` singleton,
         // whose own `reverse()` is `natural()` again): operand-free composites,
@@ -331,6 +337,9 @@ impl<H: Host> Runtime<'_, H> {
             if self.bimap_handle_info(receiver).is_some() {
                 return self.invoke_bimap(r, Some(receiver), args);
             }
+        }
+        if let Some(value) = self.invoke_guava_table(r, receiver, args)? {
+            return Ok(Some(value));
         }
         if let Some(result) = sized_factory_class(r, args) {
             let class = result?;

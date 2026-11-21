@@ -255,6 +255,83 @@ public final class HostMapEntries {
     return entryRules(m, "a", "b");
   }
 
+  /** Hashtable removes null the node value, then a re-put makes a new node. */
+  public static String hashtableReput() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Map.Entry<String, Integer> old = h.entrySet().iterator().next();
+    h.remove("a"); h.put("a", 7);
+    Map.Entry<String, Integer> now = h.entrySet().iterator().next();
+    return String.valueOf(old.getValue()) + "," + (old == now) + "," + now + "," + h + "," + old.equals(now);
+  }
+
+  /** A remapping function that always answers null (a class, not a lambda, so it runs in the interpreter). */
+  static final class ToNull<A, B> implements java.util.function.BiFunction<A, B, Integer> {
+    @Override public Integer apply(A a, B b) { return null; }
+  }
+
+  /**
+   * computeIfPresent/merge returning null unlink the node without nulling its value.
+   * (`compute` does the same in Java, but Decaf counts `Hashtable.compute`, so it is not here.)
+   */
+  public static String hashtableComputeRemove() {
+    StringBuilder out = new StringBuilder();
+    for (String how : new String[] {"computeIfPresent", "merge"}) {
+      Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+      Map.Entry<String, Integer> e = h.entrySet().iterator().next();
+      switch (how) {
+        case "computeIfPresent" -> h.computeIfPresent("a", new ToNull<String, Integer>());
+        default -> h.merge("a", 2, new ToNull<Integer, Integer>());
+      }
+      out.append(how).append(':').append(e.getValue()).append(':').append(e).append(':').append(h).append(';');
+    }
+    return out.toString();
+  }
+
+  /** Hashtable.clear empties the buckets without nulling a held entry's value. */
+  public static String hashtableClear() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Map.Entry<String, Integer> e = h.entrySet().iterator().next(); h.clear();
+    return e.getValue() + "|" + e + "|" + h;
+  }
+
+  /** Hashtable put over a live key updates the same node. */
+  public static String hashtableLivePut() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Map.Entry<String, Integer> e = h.entrySet().iterator().next(); h.put("a", 5);
+    return e.getValue() + "|" + e + "|" + e.setValue(6) + "|" + h;
+  }
+
+  /** A Hashtable entry detached by remove has a nulled value and its object methods observe it. */
+  public static String hashtableDetachedMethods() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Map.Entry<String, Integer> e = h.entrySet().iterator().next(); h.remove("a");
+    return attempt(e::getValue) + "|" + attempt(e::toString) + "|" + attempt(e::hashCode) + "|"
+        + attempt(() -> e.equals(Map.entry("a", 1))) + "|" + attempt(() -> e.setValue(2));
+  }
+
+  /** Hashtable Enumerator.remove unlinks without nulling the entry value. */
+  public static String hashtableIteratorRemove() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    Iterator<Map.Entry<String, Integer>> it = h.entrySet().iterator();
+    Map.Entry<String, Integer> e = it.next(); it.remove();
+    return e.getValue() + "|" + e + "|" + h;
+  }
+
+  /** keys/elements use non-removable Enumerators; Collections.list only consumes them. */
+  public static String hashtableEnumerators() {
+    Hashtable<String, Integer> h = new Hashtable<>(); h.put("a", 1);
+    String keys = Collections.list(h.keys()).toString();
+    String values = Collections.list(h.elements()).toString();
+    return keys + "|" + values + "|" + h;
+  }
+
+  /** Properties uses its concurrent entry implementation for detached reads. */
+  public static String propertiesEntry() {
+    Properties p = new Properties(); p.put("a", 1);
+    Map.Entry<Object, Object> e = p.entrySet().iterator().next(); p.remove("a");
+    return e.getValue() + "|" + e + "|" + p;
+  }
+
   /** `WeakHashMap`: its nodes. */
   public static String weakEntries() {
     Map<String, Integer> m = new WeakHashMap<>();

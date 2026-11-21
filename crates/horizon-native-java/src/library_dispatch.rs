@@ -19,6 +19,150 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        // `EnumSet.allOf` is implemented by the JDK from the enum class's
+        // declared constants.  Jar enums are available in the class table;
+        // retain their declaration order in the mutable collection row so
+        // the ordinary collection/iterator/toString paths expose ordinal
+        // order just as `RegularEnumSet` does.
+        if r.owner == "java/util/EnumSet"
+            && r.name == "allOf"
+            && r.descriptor == "(Ljava/lang/Class;)Ljava/util/EnumSet;"
+        {
+            let Some(argument) = args.first() else {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            };
+            if matches!(argument, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: None,
+                    frame: None,
+                });
+            }
+            let Some(enum_class) = host_class::class_name(argument) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            let Some(file) = self.class(enum_class).cloned() else {
+                // The runtime has no JDK class files.  Only a skeleton chain
+                // that reaches Object/Record proves this is not an enum;
+                // every other platform class stays at the counted boundary.
+                if crate::jvm_dispatch::jdk_skeleton_proves_not_enum(enum_class) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!(
+                            "class {} not an enum",
+                            enum_class.replace('/', ".")
+                        )),
+                        frame: None,
+                    });
+                }
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            if file.super_name != "java/lang/Enum" {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/ClassCastException".into(),
+                    message: Some(format!(
+                        "class {} not an enum",
+                        enum_class.replace('/', ".")
+                    )),
+                    frame: None,
+                });
+            }
+            let values = self
+                .invoke(
+                    enum_class,
+                    "values",
+                    &format!("()[L{enum_class};"),
+                    None,
+                    &[],
+                )
+                .ok()
+                .and_then(|array| self.array(&array).ok().map(|values| values.into_owned()))
+                .filter(|values| !values.is_empty())
+                .unwrap_or_else(|| {
+                    file.fields
+                        .iter()
+                        .filter(|field| {
+                            field.is_static() && field.descriptor == format!("L{enum_class};")
+                        })
+                        .enumerate()
+                        .map(|(ordinal, field)| {
+                            self.static_fields
+                                .get(&format!("{enum_class}#{}{}", field.name, field.descriptor))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    crate::jar_object::handle(format!("{enum_class}#{ordinal}"))
+                                })
+                        })
+                        .collect()
+                });
+            let set = self.host.make_collection("java/util/EnumSet", values);
+            if let Some(set) = &set
+                && let Some(marker) = crate::jar_object::object_key(set)
+            {
+                self.fields.insert(
+                    format!("{marker}|enum-set-type"),
+                    Value::Ref(Some(enum_class.to_owned())),
+                );
+            }
+            return Ok(set);
+        }
+        // RegularEnumSet/JumboEnumSet.typeCheck is part of the public
+        // Collection contract: null is NPE and a constant from another enum
+        // is CCE. The host's generic collection row cannot enforce that
+        // element type, so enforce it at the model boundary before add.
+        if let Some(receiver) = receiver
+            && let Some(marker) = crate::jar_object::object_key(receiver)
+            && let Some(Value::Ref(Some(enum_class))) =
+                self.fields.get(&format!("{marker}|enum-set-type"))
+        {
+            // The bulk mutators need the exact Regular/Jumbo bit-vector
+            // paths to enforce their element type. Keep them COUNTED until
+            // those paths are modelled; never let the generic host list
+            // silently accept a foreign enum.
+            if matches!(
+                r.name.as_str(),
+                "addAll" | "retainAll" | "removeAll" | "removeIf"
+            ) {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
+            if r.name == "add" && r.descriptor == "(Ljava/lang/Object;)Z" {
+                let element = args.first().unwrap_or(&Value::Ref(None));
+                if matches!(element, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: None,
+                        frame: None,
+                    });
+                }
+                let Some(element_class) = crate::jar_object::object_class(element) else {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!("class java.lang.Object != class {enum_class}")),
+                        frame: None,
+                    });
+                };
+                let valid = element_class == enum_class
+                    || self
+                        .class(element_class)
+                        .is_some_and(|file| file.super_name == *enum_class);
+                if !valid {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/ClassCastException".into(),
+                        message: Some(format!(
+                            "class {} != class {}",
+                            element_class.replace('/', "."),
+                            enum_class.replace('/', ".")
+                        )),
+                        frame: None,
+                    });
+                }
+                return Ok(Some(self.host.invoke_instance(r, receiver, args)?));
+            }
+        }
         if let Some(receiver) = receiver
             && let Some(value) = crate::kotlin_stdlib::instance(self, r, receiver, args)
         {
@@ -122,11 +266,469 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_mapped_registry(r, receiver, args) {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_creative_tab_and_items(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
         // Gson's JSON tree, for a method reference and `String.valueOf`.
         if let Some(value) = self.invoke_gson_tree(r, receiver, args)? {
             return Ok(Some(value));
         }
         Ok(None)
+    }
+
+    /// Fabric creative-tab output collection, `ItemStack` constructors/`toString`/`isItemEnabled`,
+    /// `Item.Properties.requiredFeatures(FeatureFlag...)`, and `FeatureFlagSet.of(flag, flags...)`
+    /// where the interpreter owns array elements and jar overrides (`asItem`, `isEnabled`,
+    /// `toString`).
+    fn invoke_creative_tab_and_items(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        // `FeatureFlagSet.of(FeatureFlag, FeatureFlag...)` (`server-26.3.jar` offsets 0..40).
+        if receiver.is_none()
+            && r.owner == "net/minecraft/world/flag/FeatureFlagSet"
+            && r.name == "of"
+            && r.descriptor
+                == "(Lnet/minecraft/world/flag/FeatureFlag;[Lnet/minecraft/world/flag/FeatureFlag;)Lnet/minecraft/world/flag/FeatureFlagSet;"
+            && let [first, rest] = args
+        {
+            // Offset 1: `flags.length` throws NPE before `flag` is read.
+            if matches!(rest, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Cannot read the array length because \"flags\" is null".into()),
+                    frame: None,
+                });
+            }
+            let Ok(elements) = self.array(rest).map(std::borrow::Cow::into_owned) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            // Offset 2: `ifne 12`; empty `flags` reads `flag.mask` (offset 6),
+            // non-empty `flags` reads `flag.universe` first (offset 13).
+            if matches!(first, Value::Ref(None)) {
+                let field = if elements.is_empty() {
+                    "mask"
+                } else {
+                    "universe"
+                };
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(format!(
+                        "Cannot read field \"{field}\" because \"flag\" is null"
+                    )),
+                    frame: None,
+                });
+            }
+            let Some(mut mask) = crate::host_creative_tab::feature_flag_mask(first) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            for element in elements {
+                // `computeMask` offset 33: reads `f.universe` (slot 5 named `f`).
+                if matches!(element, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot read field \"universe\" because \"f\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                let Some(bit) = crate::host_creative_tab::feature_flag_mask(&element) else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                mask |= bit;
+            }
+            return match self.host.new_feature_flag_set(mask) {
+                Some(set) => Ok(Some(set)),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `Item$Properties.requiredFeatures(FeatureFlag...)` (`server-26.3.jar` offsets 0..12).
+        if let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/Item$Properties"
+            && r.name == "requiredFeatures"
+            && r.descriptor
+                == "([Lnet/minecraft/world/flag/FeatureFlag;)Lnet/minecraft/world/item/Item$Properties;"
+            && let [array_val] = args
+        {
+            if matches!(array_val, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Cannot read the array length because \"flags\" is null".into()),
+                    frame: None,
+                });
+            }
+            let mask = match self.array(array_val).map(std::borrow::Cow::into_owned) {
+                Ok(elements) => {
+                    let mut bits = 0u64;
+                    let mut all_known = true;
+                    for element in elements {
+                        if matches!(element, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: Some(
+                                    "Cannot read field \"universe\" because \"flag\" is null"
+                                        .into(),
+                                ),
+                                frame: None,
+                            });
+                        }
+                        match crate::host_creative_tab::feature_flag_mask(&element) {
+                            Some(bit) => bits |= bit,
+                            None => all_known = false,
+                        }
+                    }
+                    all_known.then_some(bits)
+                }
+                Err(_) => None,
+            };
+            self.host
+                .set_item_properties_required_features(receiver, mask);
+            return Ok(Some(receiver.clone()));
+        }
+        // `ItemStack.<init>(ItemLike)` / `<init>(ItemLike, int)` (`server-26.3.jar` offsets 0..14)
+        // outside client frames (client frames keep their own `client_surface.rs` stack table).
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "<init>"
+            && crate::jar_object::object_class(receiver)
+                == Some("net/minecraft/world/item/ItemStack")
+        {
+            let count = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => Some(1),
+                ("(Lnet/minecraft/world/level/ItemLike;I)V", [_, Value::Int(count)]) => {
+                    Some(*count)
+                }
+                _ => None,
+            };
+            if let Some(count) = count {
+                let Some(item) = self.resolve_item_like_value(&args[0])? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                if self.host.record_jar_item_stack(receiver, item, count) {
+                    return Ok(Some(Value::Void));
+                }
+                return self.host.unknown_operand_call(r).map(Some);
+            }
+        }
+        // `ItemStack.toString()` (`server-26.3.jar` offsets 0..16) on jar-allocated `ItemStack`
+        // outside client frames, honouring jar `Item.toString()` overrides.
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && args.is_empty()
+            && self.host.read_item_stack(receiver).is_some()
+        {
+            return match self.item_stack_to_string_opt(receiver, class, method)? {
+                Some(text) => Ok(Some(Value::Ref(Some(text)))),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..23):
+        // offsets 0..4 short-circuit to `true` when `this.isEmpty()` before touching `flags`;
+        // offsets 7..23 delegate to `this.getItem().isEnabled(flags)`.
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "isItemEnabled"
+            && r.descriptor == "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z"
+            && let [flags] = args
+            && let Some((item, _, is_empty)) = self.host.read_item_stack(receiver)
+        {
+            if is_empty {
+                return Ok(Some(Value::Int(1)));
+            }
+            return match self.item_is_enabled_value(&item, flags)? {
+                Some(enabled) => Ok(Some(Value::Int(i32::from(enabled)))),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `FabricCreativeModeTabOutput.accept(...)` (`fabric-creative-tab-api-v1` 5.0.21
+        // offsets 0..98, `checkStack` 0..42, and `CreativeModeTab$Output` defaults 0..17).
+        if let Some(receiver) = receiver
+            && r.name == "accept"
+            && let Some((enabled_features, _)) = self.host.creative_tab_output_context(receiver)
+        {
+            let (stack, visibility_arg) = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/item/ItemStack;)V", [stack]) => (stack.clone(), None),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [stack, vis],
+                ) => (stack.clone(), Some(vis)),
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [item_like]) => {
+                    let Some(item) = self.resolve_item_like_value(item_like)? else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    let Some(stack) = self.host.make_host_item_stack(item, 1) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    (stack, None)
+                }
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [item_like, vis],
+                ) => {
+                    let Some(item) = self.resolve_item_like_value(item_like)? else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    let Some(stack) = self.host.make_host_item_stack(item, 1) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    (stack, Some(vis))
+                }
+                _ => return Ok(None),
+            };
+            if matches!(stack, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.item.ItemStack.getItem()\" because \"stack\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            let Some((item, count, is_empty)) = self.host.read_item_stack(&stack) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            // Offsets 0..5: `if (!this.isEnabled(stack)) return;` (runs BEFORE `checkStack`).
+            let Some(is_enabled) = self.item_is_enabled_mask(&item, enabled_features)? else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            if !is_enabled {
+                return Ok(Some(Value::Void));
+            }
+            // Offsets 8..9 → `checkStack` offsets 0..16.
+            if is_empty {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some("Cannot add empty stack".into()),
+                    frame: None,
+                });
+            }
+            // `checkStack` offsets 17..41.
+            if count != 1 {
+                let Some(item_text) = self.item_to_string_opt(&item, false, class, method)? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "Stack size must be exactly 1 for stack: {count} {item_text}"
+                    )),
+                    frame: None,
+                });
+            }
+            // Offsets 12..98: `visibility.ordinal()` throws NPE on null, then appends by visibility.
+            let visibility = match visibility_arg {
+                None => crate::host_creative_tab::TabVisibility::ParentAndSearchTabs,
+                Some(Value::Ref(None)) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.item.CreativeModeTab$TabVisibility.ordinal()\" because \"visibility\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                Some(vis) => {
+                    let Some(parsed) = crate::host_creative_tab::TabVisibility::from_value(vis)
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    parsed
+                }
+            };
+            if self
+                .host
+                .creative_tab_output_accept_verified(receiver, stack, visibility.ordinal())
+            {
+                return Ok(Some(Value::Void));
+            }
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Resolve `ItemLike.asItem()` (`ItemStack.<init>(ItemLike)` offsets 0..14), invoking a jar's
+    /// own `asItem()` override when declared and otherwise asking the host.
+    fn resolve_item_like_value(&mut self, item_like: &Value) -> Result<Option<Value>, NativeError> {
+        if matches!(item_like, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some(
+                    "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                        .into(),
+                ),
+                frame: None,
+            });
+        }
+        if let Some(class) = crate::jar_object::object_class(item_like)
+            && self.class(class).is_some()
+            && let Some((owner, true)) =
+                self.member_owner(class, "asItem", "()Lnet/minecraft/world/item/Item;")
+        {
+            let item = self.invoke(
+                &owner,
+                "asItem",
+                "()Lnet/minecraft/world/item/Item;",
+                Some(item_like.clone()),
+                &[],
+            )?;
+            if matches!(item, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.item.Item.builtInRegistryHolder()\" because the return value of \"net.minecraft.world.level.ItemLike.asItem()\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            return Ok(Some(item));
+        }
+        Ok(self.host.resolve_host_item_like(item_like))
+    }
+
+    fn item_is_enabled_value(
+        &mut self,
+        item: &Value,
+        flags: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        if let Some(class) = crate::jar_object::object_class(item)
+            && self.class(class).is_some()
+            && let Some((owner, true)) = self.member_owner(
+                class,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+            )
+        {
+            let result = self.invoke(
+                &owner,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+                Some(item.clone()),
+                std::slice::from_ref(flags),
+            )?;
+            return Ok(match result {
+                Value::Int(v) => Some(v != 0),
+                _ => None,
+            });
+        }
+        let Some(req) = self.host.item_required_features_mask(item) else {
+            return Ok(None);
+        };
+        if req == 0 {
+            return Ok(Some(true));
+        }
+        if matches!(flags, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some("Cannot read field \"universe\" because \"set\" is null".into()),
+                frame: None,
+            });
+        }
+        let Some(enabled) = crate::host_creative_tab::feature_flag_set_mask(flags) else {
+            return Ok(None);
+        };
+        Ok(Some((req & !enabled) == 0))
+    }
+
+    fn item_is_enabled_mask(
+        &mut self,
+        item: &Value,
+        enabled_features: u64,
+    ) -> Result<Option<bool>, NativeError> {
+        if let Some(class) = crate::jar_object::object_class(item)
+            && self.class(class).is_some()
+            && let Some((owner, true)) = self.member_owner(
+                class,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+            )
+        {
+            let flags = if enabled_features == crate::host_creative_tab::FEATURE_VANILLA_SET {
+                crate::host_creative_tab::vanilla_feature_flag_set()
+            } else {
+                let Some(set) = self.host.new_feature_flag_set(enabled_features) else {
+                    return Ok(None);
+                };
+                set
+            };
+            let result = self.invoke(
+                &owner,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+                Some(item.clone()),
+                &[flags],
+            )?;
+            return Ok(match result {
+                Value::Int(v) => Some(v != 0),
+                _ => None,
+            });
+        }
+        Ok(self
+            .host
+            .item_required_features_mask(item)
+            .map(|req| (req & !enabled_features) == 0))
+    }
+
+    fn item_to_string_opt(
+        &mut self,
+        item: &Value,
+        is_empty: bool,
+        _class: &str,
+        _method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        if is_empty {
+            return Ok(Some("minecraft:air".to_owned()));
+        }
+        if let Some(item_class) = crate::jar_object::packaged_object_class(item)
+            && self.class(item_class).is_some()
+            && let Some((owner, true)) =
+                self.member_owner(item_class, "toString", "()Ljava/lang/String;")
+        {
+            return match self.invoke(
+                &owner,
+                "toString",
+                "()Ljava/lang/String;",
+                Some(item.clone()),
+                &[],
+            )? {
+                Value::Ref(Some(text)) => Ok(Some(text)),
+                Value::Ref(None) => Ok(Some("null".to_owned())),
+                _ => Ok(None),
+            };
+        }
+        Ok(self.host.registered_item_id(item))
+    }
+
+    /// `ItemStack.toString()` (`server-26.3.jar` offsets 0..16) for a tracked stack, also called
+    /// by `jar_text.rs::runtime_value_of` for `String.valueOf` / concat on `new ItemStack(...)`.
+    pub(crate) fn item_stack_to_string_opt(
+        &mut self,
+        stack: &Value,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        if self.host.in_client_frame() {
+            return Ok(None);
+        }
+        let Some((item, count, is_empty)) = self.host.read_item_stack(stack) else {
+            return Ok(None);
+        };
+        let Some(item_text) = self.item_to_string_opt(&item, is_empty, class, method)? else {
+            return Ok(None);
+        };
+        Ok(Some(format!("{count} {item_text}")))
     }
 
     /// A registry a mod constructs itself (`new MappedRegistry<>(key, ...)`,
@@ -188,6 +790,32 @@ impl<H: Host> Runtime<'_, H> {
     ) -> Result<Option<Value>, NativeError> {
         const SIMPLE: &str = "java/util/AbstractMap$SimpleEntry";
         const IMMUTABLE: &str = "java/util/AbstractMap$SimpleImmutableEntry";
+        if r.owner
+            .starts_with("it/unimi/dsi/fastutil/objects/Object2Boolean")
+            && matches!(r.name.as_str(), "getKey" | "getValue" | "getBooleanValue")
+        {
+            let method = if r.name == "getKey" {
+                "getKey"
+            } else {
+                "getValue"
+            };
+            let entry_receiver = receiver.expect("entry receiver");
+            let value = self.host.invoke_instance(
+                &MethodRef {
+                    owner: "java/util/Map$Entry".into(),
+                    name: method.into(),
+                    descriptor: "()Ljava/lang/Object;".into(),
+                },
+                entry_receiver,
+                args,
+            )?;
+            let answer = if r.name == "getBooleanValue" {
+                unbox_primitive("Z", &value)
+            } else {
+                value.clone()
+            };
+            return Ok(Some(answer));
+        }
         let Some(marker) = receiver
             .and_then(crate::jar_object::instance_key)
             .map(str::to_owned)
@@ -276,8 +904,28 @@ impl<H: Host> Runtime<'_, H> {
         let Some(receiver) = receiver.cloned() else {
             return Ok(None);
         };
+        if r.name == "<init>" {
+            if kind == "map" && crate::expect_ref(&receiver).is_some() {
+                self.host.register_mutable_collection(&receiver, kind);
+            }
+            return Ok(Some(Value::Void));
+        }
+        if kind == "map" && !self.host.holds_collection(&receiver) {
+            self.host.register_mutable_collection(&receiver, kind);
+        }
         let parameters = descriptor_arguments(&r.descriptor);
         let result = return_desc(&r.descriptor).to_owned();
+        if kind == "map"
+            && r.name == "object2BooleanEntrySet"
+            && (r.descriptor
+                == "()Lit/unimi/dsi/fastutil/objects/Object2BooleanSortedMap$FastSortedEntrySet;"
+                || r.descriptor == "()Ljava/lang/Iterable;")
+        {
+            return self
+                .host
+                .invoke_instance(&java_map_entry_set(), &receiver, &[])
+                .map(Some);
+        }
         let primitive = |descriptor: &str| descriptor.len() == 1 && descriptor != "V";
         if !parameters.iter().any(|parameter| primitive(parameter)) && !primitive(&result) {
             return Ok(None);
@@ -325,14 +973,21 @@ impl<H: Host> Runtime<'_, H> {
         let answer = match (kind, base, parameters.len()) {
             ("map", "put", 2) => {
                 let call = boxed(self, false)?;
-                self.host.invoke_instance(
-                    &java(
-                        "put",
-                        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                    ),
-                    &receiver,
-                    &call,
-                )?
+                if let Some(mut entries) = self.host.mutable_collection_entries(&receiver) {
+                    let old = entries.chunks(2).position(|p| p.first() == call.first());
+                    let previous = old
+                        .and_then(|i| entries.get(i * 2 + 1).cloned())
+                        .unwrap_or(Value::Ref(None));
+                    if let Some(i) = old {
+                        entries[i * 2 + 1] = call[1].clone();
+                    } else {
+                        entries.extend(call.clone());
+                    }
+                    self.host.replace_mutable_collection(&receiver, entries);
+                    previous
+                } else {
+                    return Ok(None);
+                }
             }
             ("map", "get" | "remove" | "containsKey" | "containsValue", 1) => {
                 let call = boxed(self, false)?;
@@ -499,6 +1154,9 @@ impl<H: Host> Runtime<'_, H> {
         // A handle answers by its kind's row; an object's "yes" is its
         // class's chain (a Mixin-added interface, a JDK supertype), and any
         // other answer goes on to the object paths below.
+        if let Some(instance) = self.host.map_entry_is_instance_of(value, wanted) {
+            return instance;
+        }
         if let Value::Host(handle) = value {
             let row = handle.instance_of(wanted, self) == Some(true);
             if row || !crate::jar_object::is_object_handle(handle) {
@@ -1606,6 +2264,14 @@ fn unboxed_to_string(r: &MethodRef, receiver: Option<&Value>) -> Option<Value> {
         Value::Int(number) => number.to_string(),
         _ => return None,
     })))
+}
+
+fn java_map_entry_set() -> MethodRef {
+    MethodRef {
+        owner: "java/util/Map".into(),
+        name: "entrySet".into(),
+        descriptor: "()Ljava/util/Set;".into(),
+    }
 }
 
 /// One boxed answer unboxed to `descriptor`, with fastutil's default return

@@ -191,6 +191,25 @@ impl<H: Host> Runtime<'_, H> {
         if *value == Value::Ref(None) || target == "java/lang/Object" {
             return Ok(());
         }
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
+            return match verdict {
+                Some(true) => Ok(()),
+                Some(false) => Err(class_cast_exception(
+                    crate::jar_object::object_class(value).unwrap_or_default(),
+                    target,
+                )),
+                None => self.count_cast(value, target),
+            };
+        }
+        if let Value::Ref(Some(marker)) = value
+            && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable
+            && crate::value_class::STRING_TYPES.contains(&target)
+        {
+            return self.count_cast(value, target);
+        }
         // A `String` spelling an object's key is a `String`, certainly: no
         // other value is that text (`jar_object.rs`).
         if let Value::Ref(Some(text)) = value
@@ -233,6 +252,15 @@ impl<H: Host> Runtime<'_, H> {
                 return Ok(());
             }
             return Err(class_cast_exception(class, target));
+        }
+        // A fastutil primitive entry is a host map-entry handle. Its exact map family
+        // determines whether the jar entry interface cast passes.
+        if let Some(instance) = self.host.map_entry_is_instance_of(value, target) {
+            if instance {
+                return Ok(());
+            }
+            self.count_cast(value, target)?;
+            return Err(cast_failed_counted(target));
         }
         // A host handle is its kind's class, and only a handle is one of a
         // handle kind's classes (`host_ref.rs`): `(String) Optional.empty()`
@@ -489,6 +517,11 @@ impl<H: Host> Runtime<'_, H> {
                 .filter(|_| handle.key().contains("#immutable"))
                 .map(|(class, _)| class.to_owned());
         }
+        if let Value::Host(handle) = value
+            && handle.kind() == crate::host_ref::HostKind::MenuObject
+        {
+            return Some(crate::jar_object::menu_object_class(handle.key()).to_owned());
+        }
         let marker = match value {
             Value::Host(handle) if crate::jar_object::is_object_handle(handle) => handle.key(),
             Value::Ref(Some(marker)) => marker,
@@ -513,6 +546,12 @@ impl<H: Host> Runtime<'_, H> {
     pub(super) fn known_instance_of(&self, value: &Value, target: &str) -> Option<bool> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
+        }
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
+            return verdict;
         }
         if let Value::Host(handle) = value
             && handle.kind() == HostKind::Callback
@@ -569,6 +608,12 @@ impl<H: Host> Runtime<'_, H> {
     /// #242). The JDK models answer for the JDK objects they build, and an
     /// opaque marker against a JDK interface is left for a later change.
     pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
+            return verdict.is_none();
+        }
         let marker = match value {
             Value::Ref(Some(marker)) => marker.as_str(),
             // An object: by its class's chain, below.
@@ -617,6 +662,12 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(_)) && crate::value_class::is_plain_string(marker) {
             return false;
         }
+        if matches!(value, Value::Ref(Some(_)))
+            && crate::value_class::string_shape(marker) == crate::value_class::Shape::Undecidable
+            && crate::value_class::STRING_TYPES.contains(&target)
+        {
+            return true;
+        }
         // An object a library model built itself: the model knows its whole
         // type, so its `false` is an answer.
         if crate::gson_tree::is_tree(value) {
@@ -629,6 +680,65 @@ impl<H: Host> Runtime<'_, H> {
         // known not to be a game or loader type; one whose chain reaches a
         // game class is not.
         !matches!(self.cast_verdict(value, target, None).0, Verdict::No)
+    }
+
+    /// The concrete class of a host collection is intentionally omitted for a
+    /// sub-list whose parent class is unknown. Its list interfaces remain
+    /// exact, while `RandomAccess` still depends on that omitted class.
+    fn collection_instance_of(&self, value: &Value, target: &str) -> Option<Option<bool>> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::Collection {
+            return None;
+        }
+        let key = handle.key();
+        let mapped_class = self.host.sub_list_class(value);
+        let unknown_sublist = mapped_class == Some(None);
+        let class = mapped_class
+            .as_ref()
+            .and_then(Option::as_deref)
+            .unwrap_or_else(|| crate::jar_object::collection_class(key));
+        let list = unknown_sublist
+            || crate::java_immutable::cast_supertypes(class).contains(&"java/util/List");
+        if !list {
+            return None;
+        }
+        match target {
+            "java/util/List"
+            | "java/util/Collection"
+            | "java/lang/Iterable"
+            | "java/util/SequencedCollection" => Some(Some(true)),
+            "java/util/RandomAccess" if unknown_sublist => Some(None),
+            "java/util/RandomAccess" => Some(Some(
+                crate::java_immutable::cast_supertypes(class).contains(&target),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Type verdict for a host-synthesized menu model object ([`HostKind::MenuObject`]):
+    /// exact for its known 26.3 supertypes, arrays, final JDK classes, non-interface
+    /// jar classes, and final host handle kinds; `Some(None)` (counted) otherwise.
+    fn menu_object_instance_of(&self, value: &Value, target: &str) -> Option<Option<bool>> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::MenuObject {
+            return None;
+        }
+        if let Some(answer) = handle.instance_of(target, self) {
+            return Some(Some(answer));
+        }
+        if let Some(file) = self.class(target)
+            && class_access(file).is_some_and(|access| access & ACC_INTERFACE == 0)
+        {
+            return Some(Some(false));
+        }
+        if HostKind::of_class(target).is_some() {
+            return Some(Some(false));
+        }
+        Some(None)
     }
 
     /// The held class of a jar object (an object handle) or of a jar enum

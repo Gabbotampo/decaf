@@ -211,6 +211,16 @@ impl<H: Host> Runtime<'_, H> {
                 crate::stream_pipeline::STREAM_TEXT.into(),
             ))));
         }
+        if let Some(text) = self.invoke_enum_set_text(
+            &crate::MethodRef {
+                owner: "java/util/EnumSet".into(),
+                name: "toString".into(),
+                descriptor: "()Ljava/lang/String;".into(),
+            },
+            Some(value),
+        )? {
+            return Ok(Some(text));
+        }
         // A host map entry prints `key=value` (`host_entry.rs`).
         if let Some(text) = self.host_entry_text(value, class, method)? {
             return Ok(Some(text));
@@ -227,6 +237,9 @@ impl<H: Host> Runtime<'_, H> {
         // (`jar_server_values.rs`). A subclass with its own `toString` is
         // not answered here and runs it below.
         if let Some(text) = self.jar_server_value_text(value) {
+            return Ok(Some(Value::Ref(Some(text))));
+        }
+        if let Some(text) = self.item_stack_to_string_opt(value, class, method)? {
             return Ok(Some(Value::Ref(Some(text))));
         }
         if let Some(text) = self.jar_to_string(value, class, method)? {

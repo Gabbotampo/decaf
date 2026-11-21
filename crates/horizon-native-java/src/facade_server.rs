@@ -431,9 +431,20 @@ pub(crate) fn answer(
             ("size", "()I") => Ok(Value::Int(i32::try_from(entries.len()).unwrap_or(i32::MAX))),
             ("containsKey", "(Lnet/minecraft/resources/Identifier;)Z") => {
                 let wanted = args.first().and_then(identifier_text);
-                Ok(Value::Int(i32::from(
-                    wanted.is_some_and(|wanted| entries.contains(&wanted)),
-                )))
+                match wanted {
+                    Some(wanted) if entries.contains(&wanted) => Ok(Value::Int(1)),
+                    Some(wanted) if id == "minecraft:block" => {
+                        let field = wanted
+                            .strip_prefix("minecraft:")
+                            .unwrap_or(&wanted)
+                            .to_ascii_uppercase();
+                        match crate::vanilla_blocks::field_id(&field) {
+                            Some(known) if known == wanted => Ok(Value::Int(1)),
+                            _ => refuse(r),
+                        }
+                    }
+                    Some(_) | None => refuse(r),
+                }
             }
             // `keySet()` is a host object ([`key_set`]).
             _ => refuse(r),
@@ -595,6 +606,8 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
+        class: &str,
+        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         if let Some(value) = self.invoke_saved_data(r, receiver, args)? {
             return Ok(Some(value));
@@ -603,7 +616,7 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             return Ok(Some(value));
         }
         // Chat components with style and arguments (`facade_text.rs`).
-        if let Some(value) = self.invoke_text(r, receiver, args)? {
+        if let Some(value) = self.invoke_text(r, receiver, args, class, method)? {
             return Ok(Some(value));
         }
         // `server.execute(task)` on the server thread: vanilla's
@@ -840,15 +853,14 @@ mod tests {
             .unwrap(),
             Value::Int(1)
         );
-        assert_eq!(
+        assert!(
             answer(
                 &facts,
                 &blocks,
                 &contains,
-                &[crate::host_ids::identifier_of_text("minecraft:glass")]
+                &[crate::host_ids::identifier_of_text("minecraft:not_a_block")]
             )
-            .unwrap(),
-            Value::Int(0)
+            .is_err()
         );
         // Biomes are a vanilla registry the game did not list here.
         assert!(
@@ -857,6 +869,52 @@ mod tests {
                 &access,
                 &lookup,
                 &[crate::host_ids::registry_key_of("minecraft:worldgen/biome")]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn block_contains_key_answers_observed_and_complete_vanilla_ids() {
+        let facts = ServerFacts {
+            registries: BTreeMap::from([(
+                "minecraft:block".into(),
+                Arc::new(BTreeSet::from(["minecraft:stone".into()])),
+            )]),
+            ..ServerFacts::default()
+        };
+        let contains = call(
+            "net/minecraft/core/Registry",
+            "containsKey",
+            "(Lnet/minecraft/resources/Identifier;)Z",
+        );
+        let registry = "game/registry/minecraft:block";
+        assert_eq!(
+            answer(
+                &facts,
+                registry,
+                &contains,
+                &[crate::host_ids::identifier_of_text("minecraft:stone")],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            answer(
+                &facts,
+                registry,
+                &contains,
+                &[crate::host_ids::identifier_of_text("minecraft:dirt")],
+            )
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert!(
+            answer(
+                &facts,
+                registry,
+                &contains,
+                &[crate::host_ids::identifier_of_text("minecraft:not_a_block")],
             )
             .is_err()
         );

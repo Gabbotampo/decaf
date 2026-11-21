@@ -862,9 +862,13 @@ impl<H: Host> GameHookHost<'_, H> {
                     Some(value) => {
                         match crate::runtime::facade_text::json_now(value, self.inner.component_states()) {
                             Some(json) => crate::runtime::facade_text::plain(&json),
-                            // A component no read resolves (past the bound, a cycle).
+                            // A component no read resolves (disallowed translation
+                            // argument, non-finite float in RFC 8259 JSON, cycle, or
+                            // past the bound): count through the host's operand path
+                            // and return its neutral result rather than failing with
+                            // `NativeError::Metadata`.
                             None if crate::runtime::host_component::is_component(value) => {
-                                return Err(unmodelled(marker, r));
+                                return self.inner.unknown_operand_call(r);
                             }
                             None => crate::runtime::game_object::text(value).cloned().unwrap_or_default(),
                         }
@@ -1263,6 +1267,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.sub_list_link(marker)
     }
 
+    fn is_detached_sub_list(&self, marker: &str) -> bool {
+        self.inner.is_detached_sub_list(marker)
+    }
+
     fn store_sub_list_link(&mut self, marker: &str, link: Option<mod_count::SubListLink>) {
         self.inner.store_sub_list_link(marker, link)
     }
@@ -1398,6 +1406,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn map_entry_parts(&self, value: &Value) -> Option<(Value, Value)> {
         self.inner.map_entry_parts(value)
+    }
+
+    fn map_entry_is_instance_of(&self, value: &Value, wanted: &str) -> Option<bool> {
+        self.inner.map_entry_is_instance_of(value, wanted)
     }
 
     fn mint_map_entry(
@@ -1618,6 +1630,23 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.is_jdk_list_of(marker)
     }
 
+    fn is_unmodifiable_collection(&self, marker: &str) -> bool {
+        self.inner.is_unmodifiable_collection(marker)
+    }
+
+    fn unmodifiable_member(
+        &mut self,
+        r: &MethodRef,
+        marker: &str,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        self.inner.unmodifiable_member(r, marker, args)
+    }
+
+    fn is_immutable_empty_sublist(&self, marker: &str) -> bool {
+        self.inner.is_immutable_empty_sublist(marker)
+    }
+
     fn service_providers(&self, service: &str) -> Vec<String> {
         self.inner.service_providers(service)
     }
@@ -1777,6 +1806,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
 
     fn counted_unknown_calls(&self) -> usize {
         self.inner.counted_unknown_calls()
+    }
+
+    fn supports_recipe_sync(&self) -> bool {
+        self.inner.supports_recipe_sync()
+    }
+
+    fn record_synced_recipe_serializer(&mut self, key: String, serializer: Value) {
+        self.inner.record_synced_recipe_serializer(key, serializer);
     }
 
     fn jar_module_descriptor(&self) -> Option<bool> {
@@ -2020,7 +2057,15 @@ impl NativeJar {
             string_builder_capacities: BTreeMap::new(),
 
             string_readers: BTreeMap::new(),
+            reader_positions_unknown: Default::default(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
             io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
             io_paths,
             io_files,
@@ -2272,6 +2317,44 @@ mod tests {
             panic!("not a handle")
         };
         assert_eq!(respawned.same_object(&event_respawned), Some(true));
+    }
+
+    #[test]
+    fn send_system_message_counts_unresolvable_component_instead_of_failing_with_metadata() {
+        let uuid = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let mut inner = StdHost::new();
+        let component = crate::runtime::host_component::translatable("k");
+        let bad_arg = crate::runtime::jar_object::handle("java/lang/Object#0".into());
+        crate::runtime::host_component::change(
+            &mut inner.component_states,
+            &component,
+            &crate::runtime::facade_text::argument,
+            |state| state.args = Some(vec![bad_arg]),
+        )
+        .unwrap();
+        let mut context = GameHookContext::default();
+        let player = context.insert(GameObject::player(uuid, "Alex"));
+        let model = MixinModel::default();
+        let r = MethodRef {
+            owner: "net/minecraft/server/level/ServerPlayer".into(),
+            name: "sendSystemMessage".into(),
+            descriptor: "(Lnet/minecraft/network/chat/Component;)V".into(),
+        };
+        let mut hook_host = GameHookHost {
+            inner: &mut inner,
+            context: &mut context,
+            model: &model,
+        };
+        let result = hook_host.invoke_instance(&r, &player, &[component]);
+        assert_eq!(result.unwrap(), Value::Void);
+        assert!(context.effects.is_empty());
+        assert_eq!(
+            inner.unknown_host_calls(),
+            vec![(
+                "net/minecraft/server/level/ServerPlayer#sendSystemMessage(Lnet/minecraft/network/chat/Component;)V".into(),
+                1
+            )]
+        );
     }
 
     fn hook_value(uuid: u128, life: u32) -> Value {

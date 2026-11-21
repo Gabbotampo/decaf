@@ -106,6 +106,9 @@ pub(crate) fn canonical_charset(name: &str) -> Option<&'static str> {
 }
 
 /// Whether `owner` is one of the logger interfaces this module answers for.
+/// How far `log4j_factory_logger` walks a factory's jar superclasses.
+const MAX_FACTORY_SUPERCLASSES: usize = 16;
+
 fn is_logger_owner(owner: &str) -> bool {
     matches!(
         owner,
@@ -199,6 +202,16 @@ fn long_arg(args: &[Value], index: usize) -> Option<i64> {
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
     if let Some(collector) = to_map_collector(r, args) {
         return Some(Ok(collector));
+    }
+    if r.owner == "java/util/stream/Collectors"
+        && r.name == "toCollection"
+        && r.descriptor == "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;"
+    {
+        return args.first().cloned().map(|supplier| {
+            Ok(crate::host_collector::collector(
+                crate::host_collector::Builtin::ToCollection { supplier },
+            ))
+        });
     }
     if let Some(comparator) = crate::jdk_stream::comparator_static(r, args) {
         return Some(comparator);
@@ -431,6 +444,18 @@ pub(crate) fn instance_call(
     if let Some(name) = crate::host_jdk::logger_name(receiver)
         && is_logger_owner(&r.owner)
     {
+        // A logger with a mod's own factory: the factory itself where Log4j keeps it as is
+        // (`getMessageFactory` on any other is counted). Everything else is any logger's
+        // `logger_call`: output methods are no-ops, as for every logger (whether Log4j would
+        // even build a message, through the factory or a `{}` argument's `toString`, depends on
+        // a logging configuration the host doesn't have), and level checks stay counted.
+        if let Some((exact, factory)) = crate::host_jdk::logger_factory(receiver)
+            && r.name == "getMessageFactory"
+        {
+            return (exact
+                && r.descriptor == "()Lorg/apache/logging/log4j/message/MessageFactory;")
+                .then_some(Ok(factory));
+        }
         return logger_call(r, &name);
     }
     if let Some(value) = crate::host_log4j_level::instance_call(r, receiver, args) {
@@ -556,6 +581,7 @@ pub(crate) struct ToMap {
     pub(crate) value_fn: Value,
     pub(crate) merge_fn: Option<Value>,
     guava: bool,
+    unmodifiable: bool,
     entries: Vec<(Value, Value)>,
     map: Option<Value>,
     /// The 4-argument form's map supplier (`TreeMap::new`, ...).
@@ -565,8 +591,11 @@ pub(crate) struct ToMap {
 impl ToMap {
     /// The state for a built-in `toMap` collector (`host_collector.rs`), `None` for any other.
     pub(crate) fn begin(collector: &Value) -> Result<Option<Self>, NativeError> {
-        let Some(crate::host_collector::Builtin::ToMap { guava, functions }) =
-            crate::host_collector::builtin(collector)
+        let Some(crate::host_collector::Builtin::ToMap {
+            guava,
+            unmodifiable,
+            functions,
+        }) = crate::host_collector::builtin(collector)
         else {
             return Ok(None);
         };
@@ -586,6 +615,7 @@ impl ToMap {
             value_fn,
             merge_fn,
             guava,
+            unmodifiable,
             entries: Vec::new(),
             map: None,
             supplier,
@@ -611,10 +641,11 @@ pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
     // Guava's immutable-map collectors (`ImmutableMap.toImmutableMap`,
     // `Maps.toImmutableEnumMap`, WorldEdit's platform table) collect the same
     // way; only a repeated key raises Guava's `IllegalArgumentException`.
-    let guava = match (r.owner.as_str(), r.name.as_str()) {
-        ("java/util/stream/Collectors", "toMap") => false,
+    let (guava, unmodifiable) = match (r.owner.as_str(), r.name.as_str()) {
+        ("java/util/stream/Collectors", "toMap") => (false, false),
+        ("java/util/stream/Collectors", "toUnmodifiableMap") => (false, true),
         ("com/google/common/collect/ImmutableMap", "toImmutableMap")
-        | ("com/google/common/collect/Maps", "toImmutableEnumMap") => true,
+        | ("com/google/common/collect/Maps", "toImmutableEnumMap") => (true, false),
         _ => return None,
     };
     let functions = match r.descriptor.as_str() {
@@ -639,6 +670,7 @@ pub(crate) fn to_map_collector(r: &MethodRef, args: &[Value]) -> Option<Value> {
     Some(crate::host_collector::collector(
         crate::host_collector::Builtin::ToMap {
             guava,
+            unmodifiable,
             functions: args.iter().take(functions).cloned().collect(),
         },
     ))
@@ -709,17 +741,20 @@ impl crate::StdHost {
     ) -> Result<Value, NativeError> {
         let from = super::expect_int(r, Self::argument(r, args, 0)?)?;
         let to = super::expect_int(r, Self::argument(r, args, 1)?)?;
+        let repeated = self.repeated_collections.get(marker).cloned();
         let values = self
             .mutable_collections
             .get(marker)
             .cloned()
+            .or_else(|| self.reversed_view_values(marker))
             .unwrap_or_default();
+        let logical_len = repeated.as_ref().map_or(values.len(), |(count, _)| *count);
         let failure = if from < 0 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("fromIndex = {from}"),
             ))
-        } else if to as i64 > values.len() as i64 {
+        } else if to as i64 > logical_len as i64 {
             Some((
                 "java/lang/IndexOutOfBoundsException",
                 format!("toIndex = {to}"),
@@ -739,8 +774,158 @@ impl crate::StdHost {
                 frame: None,
             });
         }
+        // Large `Collections.nCopies` rows stay compressed.  CopiesList's
+        // override returns another compressed CopiesList, so never expand a
+        // range that may contain billions of repeated elements.
+        if let Some((_, value)) = repeated {
+            let marker = crate::jar_object::collection_key_for(
+                "java/util/Collections$CopiesList",
+                crate::jar_object::CollectionFamily::Immutable,
+                self.next_unmodifiable_collection,
+            );
+            self.next_unmodifiable_collection += 1;
+            self.repeated_collections
+                .insert(marker.clone(), ((to - from) as usize, value));
+            self.unmodifiable_collections.insert(marker.clone(), None);
+            return Ok(crate::jar_object::collection(marker));
+        }
         let range = values[from as usize..to as usize].to_vec();
-        Ok(self.new_collection(super::stand_in_class("list"), range))
+        let parent_class = crate::jar_object::collection_class(marker).to_owned();
+        let immutable_jdk = self.jdk_list_of.contains(marker);
+        let immutable_owned = matches!(
+            parent_class.as_str(),
+            "java/util/Collections$EmptyList"
+                | "java/util/Collections$SingletonList"
+                | "java/util/Collections$CopiesList"
+                | "java/util/AbstractList$RandomAccessSubList"
+                | "com/google/common/collect/RegularImmutableList"
+                | "com/google/common/collect/SingletonImmutableList"
+                | "com/google/common/collect/ImmutableList$SubList"
+        );
+        let mut unknown_class = false;
+        let made_class = if immutable_jdk {
+            "java/util/ImmutableCollections$SubList"
+        } else if parent_class == "java/util/Collections$CopiesList" {
+            // CopiesList overrides subList and returns another CopiesList,
+            // preserving its own range and immutable checks.
+            "java/util/Collections$CopiesList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Collections$SynchronizedList"
+                | "java/util/Collections$SynchronizedRandomAccessList"
+        ) {
+            // SynchronizedList delegates to the wrapped list and wraps the
+            // result with the same synchronized class.  The view class is
+            // recorded on the host marker, so getClass().getName() remains
+            // the JDK 25 class even though the runtime is single-threaded.
+            if parent_class.ends_with("RandomAccessList") {
+                "java/util/Collections$SynchronizedRandomAccessList"
+            } else {
+                "java/util/Collections$SynchronizedList"
+            }
+        } else if parent_class == "java/util/ArrayList"
+            || parent_class == "java/util/ArrayList$SubList"
+        {
+            "java/util/ArrayList$SubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Vector" | "java/util/Stack"
+        ) {
+            // Vector overrides AbstractList.subList and synchronizes the
+            // resulting RandomAccess view.
+            "java/util/Collections$SynchronizedRandomAccessList"
+        } else if parent_class == "java/util/concurrent/CopyOnWriteArrayList" {
+            "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
+        } else if parent_class == "java/util/Arrays$ArrayList" {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/LinkedList" | "java/util/AbstractList" | "java/util/AbstractList$SubList"
+        ) {
+            "java/util/AbstractList$SubList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        ) {
+            "java/util/Collections$UnmodifiableRandomAccessList"
+        } else if parent_class == "java/util/Collections$UnmodifiableList" {
+            "java/util/Collections$UnmodifiableList"
+        } else if matches!(
+            parent_class.as_str(),
+            "java/util/ReverseOrderListView$Rand"
+                | "java/util/ReverseOrderListView$SubList"
+                | "java/util/ReverseOrderListView"
+                | "java/util/LinkedList$ReverseOrderLinkedListView"
+        ) {
+            "java/util/ReverseOrderListView"
+        } else if immutable_owned {
+            "java/util/AbstractList$RandomAccessSubList"
+        } else {
+            unknown_class = true;
+            super::stand_in_class("list")
+        };
+        let storage_class = if matches!(
+            made_class,
+            "java/util/ArrayList$SubList"
+                | "java/util/AbstractList$SubList"
+                | "java/util/concurrent/CopyOnWriteArrayList$COWSubList"
+        ) {
+            "java/util/ArrayList"
+        } else {
+            made_class
+        };
+        let made = self.new_collection(storage_class, range);
+        if (storage_class != made_class || unknown_class)
+            && let Some(key) = match &made {
+                crate::Value::Host(handle) => Some(handle.key().to_owned()),
+                crate::Value::Ref(Some(key)) => Some(key.clone()),
+                _ => None,
+            }
+        {
+            self.sub_list_class_names.insert(
+                key,
+                if unknown_class {
+                    String::new()
+                } else {
+                    made_class.to_owned()
+                },
+            );
+        }
+        // A sub-list of `List.of`/`List.copyOf` is an `ImmutableCollections`
+        // sub-list, and one of an unmodifiable view an `UnmodifiableList`:
+        // every mutator throws `UnsupportedOperationException` whatever the
+        // range, and the immutable one rejects null searches as its parent
+        // does (#558 review). `emptyList`/`singletonList`/`nCopies` sub-lists
+        // use AbstractList's range-sensitive mutator behavior.
+        let immutable_parent = immutable_jdk || immutable_owned;
+        let view_parent = matches!(self.unmodifiable_collections.get(marker), Some(Some(_)));
+        if immutable_parent || view_parent {
+            let key = match &made {
+                Value::Host(handle) => Some(handle.key().to_owned()),
+                Value::Ref(Some(made)) => Some(made.clone()),
+                _ => None,
+            };
+            if let Some(key) = key {
+                self.unmodifiable_collections.insert(key.clone(), None);
+                if immutable_jdk {
+                    self.jdk_list_of.insert(key);
+                }
+            }
+        }
+        // A detached copy: remember it, so `Collections.reverse` on it is counted
+        // (a write through it would not reach the parent, #496).
+        if made_class == "java/util/AbstractList$SubList" {
+            match &made {
+                Value::Host(handle) => {
+                    self.detached_sub_lists.insert(handle.key().to_owned());
+                }
+                Value::Ref(Some(marker)) => {
+                    self.detached_sub_lists.insert(marker.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(made)
     }
 }
 
@@ -964,6 +1149,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_list_sort(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        if let Some(value) = self.invoke_list_reverse(r, args)? {
             return Ok(Some(value));
         }
         if let Some(value) = self.invoke_identifier_runtime(r, receiver, args)? {
@@ -1203,12 +1391,19 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// (`Host::factory_collection`, #156 P14d2), counted on a host that makes
     /// none.
     pub(crate) fn finish_to_map(&mut self, state: ToMap) -> Result<Value, NativeError> {
+        let unmodifiable = state.unmodifiable;
         match state.finish() {
+            Ok(map) if unmodifiable => {
+                let entries = self.host.mutable_collection_values(&map).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?;
+                let made = self.host.factory_collection("java/util/stream/Collectors", "toUnmodifiableMap", "map", entries).ok_or_else(|| NativeError::UncaughtException { class: "java/lang/IllegalStateException".into(), message: None, frame: None })?;
+                self.host.mark_nondeterministic("java-random-immutable-iteration");
+                Ok(made)
+            }
             Ok(map) => Ok(map),
             Err(entries) => self.factory_or_count(
                 &crate::stream_pipeline::wanted(
-                    "com/google/common/collect/ImmutableMap",
-                    "toImmutableMap",
+                    if unmodifiable { "java/util/stream/Collectors" } else { "com/google/common/collect/ImmutableMap" },
+                    if unmodifiable { "toUnmodifiableMap" } else { "toImmutableMap" },
                     "(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;",
                 ),
                 "map",
@@ -1378,6 +1573,57 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
     /// `getName()`. A name the runtime cannot tell (a class it does not hold
     /// with a `$`, a value of unknown class, no caller frame) is counted and
     /// answered with the best name it has. `None` for any other call.
+    /// `LogManager.getLogger(String name, MessageFactory factory)` answered exactly: a null factory
+    /// is Log4j's default, the same logger as `getLogger(name)`; a mod's own factory object whose
+    /// class (and jar superclasses) declares no `equals`/`hashCode` keys the logger by identity
+    /// (`host_jdk::logger_factory_value`). `None` (counted) for a null or non-string name, a factory
+    /// the host made, or one that overrides `equals`/`hashCode` (the cache would run its code).
+    fn log4j_factory_logger(&self, api: &str, first: &str, args: &[Value]) -> Option<Value> {
+        if api != "log4j" || first != "Ljava/lang/String;" {
+            return None;
+        }
+        let [Value::Ref(Some(name)), factory] = args else {
+            return None;
+        };
+        if *factory == Value::Ref(None) {
+            return Some(logger_value("log4j", name));
+        }
+        let class = crate::class_of_value(factory)?;
+        let mut current = class.clone();
+        let mut exact = false;
+        for _ in 0..MAX_FACTORY_SUPERCLASSES {
+            if matches!(
+                current.as_str(),
+                "org/apache/logging/log4j/message/AbstractMessageFactory"
+                    | "org/apache/logging/log4j/message/FormattedMessageFactory"
+            ) {
+                exact = true;
+                break;
+            }
+            // Only the jar's own classes are walked; a library or JDK superclass ends it.
+            let Some(file) = self.class(&current) else {
+                break;
+            };
+            if file.methods.iter().any(|method| {
+                (method.name == "equals" && method.descriptor == "(Ljava/lang/Object;)Z")
+                    || (method.name == "hashCode" && method.descriptor == "()I")
+            }) {
+                return None;
+            }
+            if file.super_name.is_empty() || file.super_name == current {
+                break;
+            }
+            current = file.super_name.clone();
+        }
+        // A factory the host made (not a jar object) has no jar class to walk: counted.
+        self.class(&class)?;
+        Some(crate::host_jdk::logger_factory_value(
+            name,
+            factory.clone(),
+            exact,
+        ))
+    }
+
     pub(crate) fn invoke_logger_factory(
         &mut self,
         r: &MethodRef,
@@ -1419,6 +1665,9 @@ impl<H: crate::Host> crate::Runtime<'_, H> {
             [] => (api, None),
             [first] => (api, Some(first.as_str())),
             [first, factory] if factory == "Lorg/apache/logging/log4j/message/MessageFactory;" => {
+                if let Some(value) = self.log4j_factory_logger(api, first, args) {
+                    return Ok(Some(value));
+                }
                 self.host.unknown_operand_call(r)?;
                 ("log4j-factory", Some(first.as_str()))
             }

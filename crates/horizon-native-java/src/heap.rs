@@ -308,6 +308,15 @@ impl StdHost {
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
+        out.extend(self.block_state_properties.keys().map(String::as_str));
+        out.extend(self.state_definition_builders.keys().map(String::as_str));
+        out.extend(self.block_states.keys().map(String::as_str));
+        out.extend(self.block_default_states.keys().map(String::as_str));
+        out.extend(
+            self.unknown_block_state_definitions
+                .iter()
+                .map(String::as_str),
+        );
         // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
         // allocated mod objects. It is traced and pruned with the object
         // rather than becoming a lifetime root.
@@ -328,6 +337,10 @@ impl StdHost {
         for held in self.fabric_biome_modifications.values() {
             value(held, out);
         }
+        // Fabric synchronized recipe serializers (`fabric_api_slice2.rs`, static strong root).
+        for held in self.recipe_sync_serializers.values() {
+            value(held, out);
+        }
         // NeoForge attachment types and live values (`neoforge_attachments.rs`).
         self.neoforge_attachments.root_texts(out);
         // The objects the loader built and keeps (an entrypoint instance,
@@ -342,6 +355,9 @@ impl StdHost {
             }
         }
         out.extend(self.shared_empties.values().map(String::as_str));
+        // Table rows and iterators are host-owned roots. Their values may be
+        // jar objects, so the collector must see them across callbacks.
+        self.guava_tables.root_texts(out);
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -379,6 +395,7 @@ impl StdHost {
         push(self.view_copies.get(marker), out);
         push(self.sub_lists.get(marker), out);
         push(self.iterator_sources.get(marker), out);
+        push(self.iterator_last.get(marker), out);
         push(self.list_iterators.get(marker), out);
         push(self.iterator_guards.get(marker), out);
         push(self.collection_comparators.get(marker), out);
@@ -392,6 +409,15 @@ impl StdHost {
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
+        if let Some(stack) = self.jar_item_stacks.get(marker) {
+            for text in value_texts(&stack.item) {
+                out.push(text.to_owned());
+            }
+        }
+        push(self.state_definition_builders.get(marker), out);
+        if let Some((block, _)) = self.block_states.get(marker) {
+            out.push(block.clone());
+        }
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -400,6 +426,17 @@ impl StdHost {
             out.push(marker.to_owned());
         }
         push(self.ranged_attributes.get(marker), out);
+        if let Some(text) = crate::menu_models::keyed_text(&self.menu_states, marker) {
+            out.push(text);
+        }
+        if let Some(lines) = self.tooltip_sinks.get(marker) {
+            out.push(marker.to_owned());
+            for line in lines {
+                for text in value_texts(line) {
+                    out.push(text.to_owned());
+                }
+            }
+        }
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -428,9 +465,18 @@ impl StdHost {
             .chain(self.constructed_items.iter())
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
+            .chain(self.jar_item_stacks.keys())
+            .chain(self.item_required_features.keys())
+            .chain(self.block_state_properties.keys())
+            .chain(self.state_definition_builders.keys())
+            .chain(self.block_states.keys())
+            .chain(self.block_default_states.keys())
+            .chain(self.unknown_block_state_definitions.iter())
             .chain(self.array_view_markers())
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
+            .chain(self.menu_states.keys())
+            .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
     }
 
@@ -444,7 +490,9 @@ impl StdHost {
         self.view_copies.retain(|key, _| keep(key));
         self.view_kinds.retain(|key, _| keep(key));
         self.sub_lists.retain(|key, _| keep(key));
+        self.detached_sub_lists.retain(|key| keep(key));
         self.iterator_sources.retain(|key, _| keep(key));
+        self.iterator_last.retain(|key, _| keep(key));
         self.list_iterators.retain(|key, _| keep(key));
         self.iterator_guards.retain(|key, _| keep(key));
         self.collection_comparators.retain(|key, _| keep(key));
@@ -452,6 +500,11 @@ impl StdHost {
         self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
+        self.block_state_properties.retain(|key, _| keep(key));
+        self.state_definition_builders.retain(|key, _| keep(key));
+        self.block_states.retain(|key, _| keep(key));
+        self.block_default_states.retain(|key, _| keep(key));
+        self.unknown_block_state_definitions.retain(|key| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
         self.hash_tables.retain(|key, _| keep(key));
         self.red_black_trees.retain(|key, _| keep(key));
@@ -459,10 +512,14 @@ impl StdHost {
         self.constructed_items.retain(|key| keep(key));
         self.constructed_blocks.retain(|key| keep(key));
         self.block_items.retain(|key, _| keep(key));
+        self.jar_item_stacks.retain(|key, _| keep(key));
+        self.item_required_features.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
+        self.menu_states.retain(|key, _| keep(key));
+        self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
     }
@@ -496,11 +553,14 @@ fn collectable(marker: &str) -> bool {
     {
         return rest.ends_with(|c: char| c.is_ascii_digit());
     }
-    // A host map entry (`host_map_entry.rs`): `<class>#entry<n>`/`<class>#node<n>`.
+    // A host map entry (`host_map_entry.rs`): `<class>#entry<n>`/`<class>#node<n>`,
+    // or a host-synthesized menu model object (`menu_models.rs`): `<class>#menu<n>`.
+    // Non-numeric prefixes keep them out of `jar_object::parse_key` / `freed_objects`.
     if let Some((_, serial)) = marker.rsplit_once('#')
         && let Some(number) = serial
             .strip_prefix("entry")
             .or_else(|| serial.strip_prefix("node"))
+            .or_else(|| serial.strip_prefix("menu"))
     {
         return !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
     }
@@ -540,6 +600,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + heap.string_builders.len()
         + heap.enum_constants.len()
         + host.mutable_collections.len()
+        + host.repeated_collections.len()
         + host.set_from_map_views.len()
         + host.random_sources.len()
         + host.iterators.len()
@@ -548,6 +609,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.entity_registration.entry_count()
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
+        + host.guava_tables.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -631,6 +693,16 @@ impl FreedObjects {
             .and_then(|(_, number)| number.parse().ok())
             .is_some_and(|n| self.contains(n))
     }
+
+    /// Whether a host-synthesized menu object `key` (`class#menu<n>`) was collected.
+    pub(crate) fn holds_menu_key(&self, key: &str) -> bool {
+        if !collectable(key) {
+            return false;
+        }
+        crate::jar_object::menu_object_key(key)
+            .and_then(|(_, number)| number.parse().ok())
+            .is_some_and(|n| self.contains(n))
+    }
 }
 
 fn value_bytes(value: &Value) -> usize {
@@ -709,6 +781,11 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .map(|(key, elements)| key.len() + values(elements)),
         )
         .chain(
+            host.repeated_collections
+                .iter()
+                .map(|(key, (_, value))| key.len() + value_bytes(value)),
+        )
+        .chain(
             host.set_from_map_views
                 .iter()
                 .map(|(key, source)| key.len() + source.len()),
@@ -731,6 +808,7 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 + state.description_id.as_ref().map_or(0, String::len)
                 + 4 * std::mem::size_of::<f64>()
         }))
+        .chain(std::iter::once(host.guava_tables.estimated_bytes()))
         .sum()
 }
 
@@ -767,6 +845,27 @@ fn note_numbers(text: &str, out: &mut Vec<usize>) {
     }
 }
 
+/// Note the allocation number of every `#menu<digits>` in `text` so live
+/// host-synthesized menu objects stay out of `freed_menu_objects`.
+fn note_menu_numbers(text: &str, out: &mut Vec<usize>) {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while let Some(offset) = bytes[at..].windows(5).position(|w| w == b"#menu") {
+        let start = at + offset + 5;
+        let end = start
+            + bytes[start..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+        if end > start
+            && let Ok(number) = text[start..end].parse()
+        {
+            out.push(number);
+        }
+        at = end.max(start);
+    }
+}
+
 /// The collectable markers of a heap and the distinct lengths they come in,
 /// which is what [`scan`] tries at each digit-run end.
 struct Collectable {
@@ -788,6 +887,7 @@ impl Collectable {
             .chain(heap.string_builders.keys().map(String::as_str))
             .chain(heap.enum_constants.keys().map(String::as_str))
             .chain(host.mutable_collections.keys().map(String::as_str))
+            .chain(host.repeated_collections.keys().map(String::as_str))
             .chain(host.set_from_map_views.keys().map(String::as_str))
             .chain(host.random_sources.keys().map(String::as_str))
             .chain(host.iterators.keys().map(String::as_str))
@@ -875,6 +975,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     // Every allocation number a text the trace reaches names: the objects
     // found live, those without a row of their own included (`FreedObjects`).
     let mut live = Vec::new();
+    let mut live_menu = Vec::new();
     {
         let mut roots: Vec<&str> = extra.iter().map(String::as_str).collect();
         host.root_texts(&mut roots);
@@ -925,6 +1026,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             );
             collectable.scan(text, &mut pending);
             note_numbers(text, &mut live);
+            note_menu_numbers(text, &mut live_menu);
         }
     }
     // The objects any per-object table keeps a row for: only these need
@@ -959,11 +1061,17 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
             .into_iter()
             .flat_map(crate::array_data::ArrayData::references);
         let collections = host.mutable_collections.get(&marker).into_iter().flatten();
+        let repeated = host
+            .repeated_collections
+            .get(&marker)
+            .into_iter()
+            .map(|(_, value)| value);
         let iterators = host
             .iterators
             .get(&marker)
             .into_iter()
             .flat_map(|(elements, _)| elements);
+        let iterator_last = host.iterator_last.get(&marker);
         // An enumeration's iterator or vector (`host_iterator.rs`).
         let enumerations = host
             .enumerations
@@ -984,7 +1092,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         for value in fields
             .chain(arrays)
             .chain(collections)
+            .chain(repeated)
             .chain(iterators)
+            .chain(iterator_last)
             .chain(enumerations)
             .chain(components)
             .chain(entries)
@@ -999,11 +1109,13 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
+                note_menu_numbers(text, &mut live_menu);
             }
         }
         for cached in cached_for.get(&marker).into_iter().flatten() {
             collectable.scan(cached, &mut found);
             note_numbers(cached, &mut live);
+            note_menu_numbers(cached, &mut live_menu);
         }
         // What the host keeps for this object in a table keyed by it.
         if keyed_keys.contains(&marker) {
@@ -1019,6 +1131,7 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 );
                 collectable.scan(text, &mut found);
                 note_numbers(text, &mut live);
+                note_menu_numbers(text, &mut live_menu);
             }
         }
         pending.extend(found.drain(..).filter(|next| !reached.contains(next)));
@@ -1039,9 +1152,16 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
                 live.push(number);
             }
             limit = limit.max(number.saturating_add(1));
+        } else if let Some((_, number)) = crate::jar_object::menu_object_key(marker)
+            && let Ok(number) = number.parse::<usize>()
+            && reached.contains(marker)
+        {
+            live_menu.push(number);
         }
     }
     host.freed_objects.rebuild(limit, live);
+    host.freed_menu_objects
+        .rebuild(host.next_menu_object as usize, live_menu);
     // What the host keeps for an object with no row of its own (a
     // `ResourceLocation`'s id, a `UUID`'s bits, a `Locale`'s tags) goes with
     // it. These name no other object, so they are never edges.
@@ -1069,7 +1189,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     heap.string_builders.retain(|key, _| keep(key));
     heap.enum_constants.retain(|key, _| keep(key));
     host.mutable_collections.retain_markers(|key| keep(key));
+    host.repeated_collections.retain(|key, _| keep(key));
     host.iterators.retain(|key, _| keep(key));
+    host.iterator_last.retain(|key, _| keep(key));
     host.enumerations.retain(|key, _| keep(key));
     host.component_states.retain(|key, _| keep(key));
     host.map_entries.retain(keep);
@@ -1643,14 +1765,22 @@ mod tests {
             "resource_streams",
             "calls",
             "invocations",
+            "menu_states",
             "posted_events",
             "registrations",
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "block_state_properties",
+            "state_definition_builders",
+            "block_states",
+            "block_default_states",
+            "unknown_block_state_definitions",
             "constructed_items",
             "constructed_blocks",
             "block_items",
+            "jar_item_stacks",
+            "item_required_features",
             "payload_registrations",
             "payload_bytes",
             "fabric_entrypoint_containers",
@@ -1667,8 +1797,11 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "tooltip_sinks",
+            "repeated_collections",
             "set_from_map_views",
             "random_sources",
+            "guava_tables",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",
@@ -1689,10 +1822,13 @@ mod tests {
             "levels",
             "references",
             "iterators",
+            "iterator_last",
             "enumerations",
             "iterator_guards",
             "mod_stamps",
             "sub_lists",
+            "sub_list_class_names",
+            "detached_sub_lists",
             "list_iterators",
             "deque_layouts",
             "iterator_sources",
@@ -1708,6 +1844,7 @@ mod tests {
             "heap",
             "retained",
             "freed_objects",
+            "freed_menu_objects",
             "collections_paused",
             "threads",
             "game_event",
@@ -1722,12 +1859,14 @@ mod tests {
             "fabric_resource_conditions",
             "creative_tab",
             "fabric_biome_modifications",
+            "recipe_sync_serializers",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
             "next_unmodifiable_collection",
             "next_reversed_view",
             "next_ranged_attribute",
+            "next_menu_object",
             "properties",
             "environment",
             "resources",
@@ -1738,13 +1877,17 @@ mod tests {
             "game_block_classes",
             "service_providers",
             "current_time_millis",
+            "nano_time_origin",
             "mods",
             "neoforge_mod_files",
             "run_loader",
             "own_loader_classes",
             "own_mod_id",
             "fabric_metadata",
+            "fabric_aliases",
             "fabric_origins",
+            "fabric_resolution_errors",
+            "loaded_nested_hashes",
             "environment_type",
             "game_version",
             "development_environment",
@@ -1756,6 +1899,7 @@ mod tests {
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",
+            "next_block_state",
             "outgoing_payloads",
             "incoming_payloads",
             "level_resources",
@@ -1777,6 +1921,9 @@ mod tests {
             // Registry ids the jar built (`registry_contents.rs`): names, no objects.
             "jar_registries",
             "registry_lifecycles",
+            "random_seed_uniquifier",
+            "random_time_origin",
+            "fired_creative_tab_registrations",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
@@ -1799,6 +1946,256 @@ mod tests {
         assert!(
             stale.is_empty(),
             "classified fields the host lacks: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn unrooted_menu_states_are_pruned() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        for i in 0..256 {
+            let key = format!("demo/Menu#{i}");
+            host.menu_states.insert(
+                key,
+                crate::menu_models::Object::Menu(crate::menu_models::MenuState {
+                    menu_type: Value::Ref(None),
+                    container_id: i,
+                    slots: format!("slots#{i}"),
+                    last_slots: Vec::new(),
+                    container_listeners: Vec::new(),
+                    combiner: Some(crate::menu_models::CombinerState {
+                        input: format!("input#{i}"),
+                        result: format!("result#{i}"),
+                        definition: crate::menu_models::Definition {
+                            inputs: Vec::new(),
+                            result: crate::menu_models::SlotDef {
+                                index: 0,
+                                x: 0,
+                                y: 0,
+                                may_place: Value::Ref(None),
+                                empty: false,
+                            },
+                        },
+                        access: Value::Ref(None),
+                        player: Value::Ref(None),
+                    }),
+                    seq: i as u64,
+                }),
+            );
+        }
+        heap.next_object = 256;
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.menu_states.is_empty());
+    }
+
+    #[test]
+    fn menu_gc_does_not_mark_future_jar_objects_freed() {
+        // Finding 1 regression: building a menu with host-synthesized `#menu<n>` keys,
+        // running GC, then allocating and using a new jar object must never trip
+        // `freed_objects` ("collected while still reachable") and must never reuse
+        // pruned `#menu<n>` ids.
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap {
+            next_object: 10,
+            ..Default::default()
+        };
+
+        let builder = crate::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder_key = crate::expect_ref(&builder).unwrap().clone();
+        assert!(
+            builder_key.contains("#menu"),
+            "expected non-numeric #menu<n> key, got {builder_key:?}"
+        );
+        // Build an AbstractContainerMenu (mints NonNullList#menu<n> via next_menu_object).
+        let menu_val = crate::jar_object::handle("demo/TestMenu#3".into());
+        crate::menu_models::call_with_client_player(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: crate::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/inventory/MenuType;I)V".into(),
+            },
+            &menu_val,
+            &[Value::Ref(None), Value::Int(1)],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let before_next = host.next_menu_object;
+        assert!(before_next >= 2);
+
+        // Run GC: menu + builder are unrooted so both are collected, and limit stays at heap.next_object (10).
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.menu_states.contains_key(&builder_key));
+        assert!(!host.menu_states.contains_key("demo/TestMenu#3"));
+
+        // Allocating a brand-new jar object at heap.next_object (10, 11, 50) must NEVER be marked freed.
+        for id in [10usize, 11, 50] {
+            let fresh_key = format!("demo/AfterGc#{id}");
+            assert!(
+                !host.freed_objects.holds_key(&fresh_key),
+                "{fresh_key} was falsely marked freed after menu GC"
+            );
+        }
+
+        // Next menu allocation uses a strictly monotonic counter (never reuses pruned ids).
+        let builder2 = crate::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder2_key = crate::expect_ref(&builder2).unwrap().clone();
+        assert_ne!(builder2_key, builder_key);
+        assert!(host.next_menu_object > before_next);
+    }
+
+    #[test]
+    fn menu_object_handles_retain_across_gc_and_track_collection_separately() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap {
+            next_object: 10,
+            ..Default::default()
+        };
+
+        // Construct a menu and read its `slots` field (`NonNullList#menu<n>`).
+        let menu_val = crate::jar_object::handle("demo/TestMenu#3".into());
+        crate::menu_models::call_with_client_player(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: crate::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "<init>".into(),
+                descriptor: "(Lnet/minecraft/world/inventory/MenuType;I)V".into(),
+            },
+            &menu_val,
+            &[Value::Ref(None), Value::Int(1)],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let menu_slots = crate::menu_models::field(
+            &host.menu_states,
+            &menu_val,
+            &crate::MethodRef {
+                owner: crate::menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "slots".into(),
+                descriptor: "Lnet/minecraft/core/NonNullList;".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            &menu_slots,
+            Value::Host(handle) if handle.kind() == crate::host_ref::HostKind::MenuObject
+        ));
+        let slots_key = crate::jar_object::object_key(&menu_slots)
+            .expect("menu.slots must have an object_key")
+            .to_owned();
+        assert_eq!(
+            crate::jar_object::object_class(&menu_slots),
+            Some("net/minecraft/core/NonNullList")
+        );
+        assert_eq!(crate::jar_object::parse_key(&slots_key), None);
+
+        // Construct a second unrooted `#menu<n>` object.
+        let builder = crate::menu_models::static_call(
+            &mut host.menu_states,
+            &mut host.next_menu_object,
+            &crate::MethodRef {
+                owner: "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition".into(),
+                name: "create".into(),
+                descriptor:
+                    "()Lnet/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$Builder;"
+                        .into(),
+            },
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let builder_key = crate::jar_object::object_key(&builder)
+            .expect("builder must have an object_key")
+            .to_owned();
+
+        // `StdHost::retain(&menu_slots)` must pin `menu_slots` (not drop it as a plain String).
+        host.retain(&menu_slots);
+        assert_eq!(host.retained_count(), 1);
+
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.menu_states.contains_key(&slots_key));
+        assert!(!host.object_collected(&slots_key));
+        assert!(!host.menu_states.contains_key(&builder_key));
+        assert!(host.object_collected(&builder_key));
+        assert!(!host.freed_objects.holds_key("demo/AfterGc#10"));
+
+        // Releasing `menu_slots` allows the next collection to prune and mark it collected.
+        host.release(&menu_slots);
+        assert_eq!(host.retained_count(), 0);
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.menu_states.contains_key(&slots_key));
+        assert!(host.object_collected(&slots_key));
+    }
+
+    #[test]
+    fn synced_recipe_serializers_root_their_objects_and_held_codecs() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+
+        // A JarObject serializer reachable only from Fabric's static synced set.
+        let jar_ser = crate::jar_object::handle("demo/Serializer#1".into());
+        heap.fields
+            .insert(field("demo/Serializer#1", "delegate"), text("demo/Node#2"));
+        heap.fields
+            .insert(field("demo/Node#2", "tag"), Value::Int(42));
+        // An unreferenced node that must be swept.
+        heap.fields
+            .insert(field("demo/Node#3", "tag"), Value::Int(99));
+
+        // A RecipeSerializer record handle whose held codecs are JarObjects
+        // reachable only through the synced set.
+        let map_codec = crate::jar_object::handle("demo/MapCodec#4".into());
+        let stream_codec = crate::jar_object::handle("demo/StreamCodec#5".into());
+        heap.fields
+            .insert(field("demo/MapCodec#4", "name"), text("map"));
+        heap.fields
+            .insert(field("demo/StreamCodec#5", "name"), text("stream"));
+        let record_ser = crate::recipe_serializer::make(&map_codec, &stream_codec);
+
+        for serializer in [jar_ser, record_ser] {
+            let key = crate::fabric_api_slice2::canonical_serializer_key(&serializer).unwrap();
+            host.recipe_sync_serializers.insert(key, serializer);
+        }
+
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            [
+                "demo/MapCodec#4",
+                "demo/Node#2",
+                "demo/Serializer#1",
+                "demo/StreamCodec#5",
+            ]
         );
     }
 }

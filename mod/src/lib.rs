@@ -82,10 +82,10 @@ use game_hooks::Arg;
 use mod_api::{
     AttackEntityEvent, Authority, BlocksEvent, BreakBlockEvent, ClientHost, ClientLevelLoadEvent,
     ClientLevelUnloadEvent, ClientSetupEvent, ClientStoppingEvent, Command, CommandArgumentValue,
-    CommandSource, ConfigFileError, ConfigPath, DimensionKey, EntityInteractEvent,
+    CommandSource, ConfigFileError, ConfigPath, DamageContainer, DimensionKey, EntityInteractEvent,
     EntityJoinLevelEvent, EntityLeaveLevelEvent, EntityRef, Flow, GameRuleChangedEvent, Hand,
-    Hooks, Host, HostSide, InteractionResult, ItemsEvent, LeftClickBlockEvent, LevelDimension,
-    LevelLoadEvent, LevelRandomHost, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
+    HitHost, Hooks, Host, HostSide, HurtSource, InteractionResult, ItemsEvent, LeftClickBlockEvent,
+    LevelDimension, LevelLoadEvent, LevelRef, LevelTickPostEvent, LevelTickPreEvent,
     LevelUnloadEvent, LivingDamagePostEvent, LivingDeathEvent, LivingDeathPostEvent,
     LivingIncomingDamageEvent, PlayerChangedDimensionEvent, PlayerCloneEvent,
     PlayerDestroyedBlockEvent, PlayerDiedEvent, PlayerLoggedInEvent, PlayerLoggedOutEvent,
@@ -814,50 +814,14 @@ impl Hooks for HorizonJava {
     /// The pinned game may still emit this for the narrow spectator/unloaded-chunk case fixed by
     /// ari #4520; until a pin bump, those firings remain callbacks with a documented departure.
     fn player_tick_pre(&self, host: HostSide<'_>, event: &mut PlayerTickPreEvent) {
-        let HostSide::Server(host) = host else {
-            return;
-        };
-        let spectator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            event.player.is_spectator(host)
-        }))
-        .ok()
-        .flatten()
-        .unwrap_or(true);
-        let player = event.player;
-        self.game_hooks(Some(host), "java_base_player_tick_head", |state| {
-            Some((
-                Some(game_hooks::player(state, player.uuid(), 0)?),
-                Vec::new(),
-            ))
-        });
-        if spectator {
-            game_hooks::note_spectator(&mut self.lock(), "java_base_player_tick_head");
-        }
+        self.on_player_tick_pre(host, event.player);
     }
 
     /// NeoForge's `PlayerTickEvent.Post`: the pinned fork's player-tick post location on the
     /// server, with the same player identity as `player_tick_pre`. The fork currently fires this
     /// after the remainder of `ServerPlayer.doTick`; the bridge runs and counts that departure.
     fn player_tick_post(&self, host: HostSide<'_>, event: &mut PlayerTickPostEvent) {
-        let HostSide::Server(host) = host else {
-            return;
-        };
-        let spectator = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            event.player.is_spectator(host)
-        }))
-        .ok()
-        .flatten()
-        .unwrap_or(true);
-        let player = event.player;
-        self.game_hooks(Some(host), "java_base_player_tick_tail", |state| {
-            Some((
-                Some(game_hooks::player(state, player.uuid(), 0)?),
-                Vec::new(),
-            ))
-        });
-        if spectator {
-            game_hooks::note_spectator(&mut self.lock(), "java_base_player_tick_tail");
-        }
+        self.on_player_tick_post(host, event.player);
     }
 
     /// A server level's tick starts (Fabric's `START_LEVEL_TICK`, NeoForge's
@@ -1069,7 +1033,7 @@ impl Hooks for HorizonJava {
             position: original.position(&*host),
             health: original.health(&*host),
         };
-        let context = player_clone_context(event, lent);
+        let context = player_clone_context(event.player, event.was_death, lent);
         self.fire_bridged(
             Some(&mut *host),
             Lifecycle::Cloned(event.player, event.was_death, original),
@@ -1140,12 +1104,9 @@ impl Hooks for HorizonJava {
     /// remaining health, so a killing hit cannot be told from a surviving one here. Such a hit
     /// is fired with its real amounts rather than dropped on a guess: the departure is named in
     /// the mod's report documentation.
-    fn living_damage_post(
-        &self,
-        _level: &mut dyn LevelRandomHost,
-        event: &mut LivingDamagePostEvent<'_>,
-    ) {
-        let context = living_damage_context(event);
+    fn living_damage_post(&self, _level: &mut dyn HitHost, event: &mut LivingDamagePostEvent<'_>) {
+        let context =
+            living_damage_context(event.entity, event.kind, event.source, event.container);
         self.fire_event(
             GameEvent::LivingAfterDamage,
             self.dedicated(),
@@ -1368,8 +1329,14 @@ impl Hooks for HorizonJava {
                 let level = player
                     .and_then(|player| player.entity().level(&*host))
                     .map(|level| level.dimension_id().to_owned());
-                let context =
-                    entity_interact_context(player.map(|player| player.uuid()), level, held, event);
+                let context = entity_interact_context(
+                    player.map(|player| player.uuid()),
+                    level,
+                    held,
+                    event.hand,
+                    event.entity,
+                    event.kind,
+                );
                 self.fire_bridged(
                     Some(host),
                     Lifecycle::None,
@@ -1475,7 +1442,7 @@ impl Hooks for HorizonJava {
     /// NeoForge's `LivingIncomingDamageEvent`).
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn LevelRandomHost,
+        _level: &mut dyn HitHost,
         event: &mut LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         let context = EventContext {
@@ -1539,18 +1506,14 @@ impl Hooks for HorizonJava {
     /// fires it. The client owner runs its resident jars here before the native setup notification
     /// returns; this owner hook does not claim to dispatch a second Java setup event.
     fn client_setup(&self, _host: &mut dyn ClientHost, _event: &mut ClientSetupEvent) {
-        let mut client = self.lock_client();
-        client.ensure_loaded();
-        let rows = client.report_rows().count();
-        log::info!("{LOG}: stored {rows} client report row(s)");
-        log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
+        self.on_client_setup();
     }
 
     /// Sunrise's client level load carries the newly-created level's borrowed dimension and fires
     /// on the client window. The owner currently records only the presence bit; no Java callback
     /// is emitted because the resident-jars bridge has no client event facade yet.
     fn client_level_load(&self, _host: &mut dyn ClientHost, _event: &mut ClientLevelLoadEvent<'_>) {
-        self.lock_client().level_loaded();
+        self.on_client_level_load();
     }
 
     /// Sunrise's client level unload follows the matching load (including disconnects). As with
@@ -1560,13 +1523,75 @@ impl Hooks for HorizonJava {
         _host: &mut dyn ClientHost,
         _event: &mut ClientLevelUnloadEvent<'_>,
     ) {
-        self.lock_client().level_unloaded();
+        self.on_client_level_unload();
     }
 
     /// Sunrise ClientStoppingEvent: once per orderly client process shutdown, after the current
     /// world is left and saved while client settings and resources remain available. Flush the
     /// report before dropping the resident per-jar hosts.
     fn client_stopping(&self, host: &mut dyn ClientHost, _event: &mut ClientStoppingEvent) {
+        self.on_client_stopping(host);
+    }
+}
+
+impl HorizonJava {
+    pub(crate) fn on_player_tick_pre(&self, host: HostSide<'_>, player: PlayerRef) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        let spectator =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| player.is_spectator(host)))
+                .ok()
+                .flatten()
+                .unwrap_or(true);
+        self.game_hooks(Some(host), "java_base_player_tick_head", |state| {
+            Some((
+                Some(game_hooks::player(state, player.uuid(), 0)?),
+                Vec::new(),
+            ))
+        });
+        if spectator {
+            game_hooks::note_spectator(&mut self.lock(), "java_base_player_tick_head");
+        }
+    }
+
+    pub(crate) fn on_player_tick_post(&self, host: HostSide<'_>, player: PlayerRef) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        let spectator =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| player.is_spectator(host)))
+                .ok()
+                .flatten()
+                .unwrap_or(true);
+        self.game_hooks(Some(host), "java_base_player_tick_tail", |state| {
+            Some((
+                Some(game_hooks::player(state, player.uuid(), 0)?),
+                Vec::new(),
+            ))
+        });
+        if spectator {
+            game_hooks::note_spectator(&mut self.lock(), "java_base_player_tick_tail");
+        }
+    }
+
+    fn on_client_setup(&self) {
+        let mut client = self.lock_client();
+        client.ensure_loaded();
+        let rows = client.report_rows().count();
+        log::info!("{LOG}: stored {rows} client report row(s)");
+        log::info!("{LOG} {}: client setup complete", env!("CARGO_PKG_VERSION"));
+    }
+
+    fn on_client_level_load(&self) {
+        self.lock_client().level_loaded();
+    }
+
+    fn on_client_level_unload(&self) {
+        self.lock_client().level_unloaded();
+    }
+
+    fn on_client_stopping(&self, host: &mut dyn ClientHost) {
         let state = self.lock();
         let mut client = self.lock_client();
         let rows = client.report_rows().count();
@@ -1578,9 +1603,6 @@ impl Hooks for HorizonJava {
             "{LOG}: client stopping flushed {rows} row(s), dropped {dropped} resident jar(s)"
         );
     }
-}
-
-impl HorizonJava {
     fn lock(&self) -> game_dispatch::StateGuard<'_> {
         game_dispatch::lock_state(self)
     }
@@ -1889,15 +1911,17 @@ fn entity_interact_context(
     player: Option<u128>,
     level: Option<String>,
     held: Option<HeldItems>,
-    event: &EntityInteractEvent<'_>,
+    hand: Hand,
+    entity: i32,
+    kind: &str,
 ) -> EventContext {
     EventContext {
         player,
-        off_hand: Some(event.hand == Hand::Off),
+        off_hand: Some(hand == Hand::Off),
         held,
         entity: Some(FacadeEntity {
-            id: event.entity,
-            kind: event.kind.to_owned(),
+            id: entity,
+            kind: kind.to_owned(),
             level: level.clone(),
         }),
         level,
@@ -1954,10 +1978,10 @@ fn copy_from_alive(was_death: bool) -> bool {
 }
 
 /// The `COPY_FROM`/`AFTER_RESPAWN` firing context for one player clone.
-fn player_clone_context(event: &PlayerCloneEvent<'_>, original: FacadeOriginal) -> EventContext {
+fn player_clone_context(player: u128, was_death: bool, original: FacadeOriginal) -> EventContext {
     EventContext {
-        player: Some(event.player),
-        flag: copy_from_alive(event.was_death),
+        player: Some(player),
+        flag: copy_from_alive(was_death),
         original: Some(original),
         ..EventContext::default()
     }
@@ -1978,8 +2002,12 @@ fn after_damage_arguments(original: f32, inflicted: f32, blocked: f32) -> (f32, 
 }
 
 /// The `AFTER_DAMAGE` firing context for one hit.
-fn living_damage_context(event: &LivingDamagePostEvent<'_>) -> EventContext {
-    let container = event.container;
+fn living_damage_context(
+    entity: i32,
+    kind: &str,
+    source: &HurtSource<'_>,
+    container: &DamageContainer,
+) -> EventContext {
     let (base, taken, blocked) = after_damage_arguments(
         container.original(),
         container.inflicted(),
@@ -1987,11 +2015,11 @@ fn living_damage_context(event: &LivingDamagePostEvent<'_>) -> EventContext {
     );
     EventContext {
         entity: Some(FacadeEntity {
-            id: event.entity,
-            kind: event.kind.to_owned(),
+            id: entity,
+            kind: kind.to_owned(),
             level: None,
         }),
-        damage: Some(event.source.damage_type.to_owned()),
+        damage: Some(source.damage_type.to_owned()),
         amount: taken,
         base_amount: Some(base),
         flag: blocked,
@@ -2717,7 +2745,12 @@ fn load_jar(
     if let Some(version) = game_version {
         seed = seed.with_game_version(version);
     }
-    let mut host = jar.seed_host(seed);
+    let mut host = match jar.try_seed_host(seed) {
+        Ok(host) => host,
+        Err(error) => {
+            return Err(JarRow::refused(&file, id, error));
+        }
+    };
     // Every jar of the game shares FML's `InterModComms` queues, from the constructors on.
     imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {
@@ -2898,8 +2931,8 @@ fn write_report(
 mod tests {
     use super::*;
     use mod_api::{
-        ConfigEntry, ConfigFileError, ConfigFiles, ConfigPath, DamageContainer, Dist, EntityRef,
-        Identifier, PermissionLevel, WorldEpoch,
+        ConfigEntry, ConfigFileError, ConfigFiles, ConfigPath, Dist, EntityRef, Identifier,
+        PermissionLevel, WorldEpoch,
     };
     use std::path::PathBuf;
     use std::sync::OnceLock;
@@ -2908,6 +2941,16 @@ mod tests {
 
     fn report_bytes() -> &'static Mutex<Option<Vec<u8>>> {
         REPORT_BYTES.get_or_init(|| Mutex::new(None))
+    }
+
+    /// The tests that read `REPORT_BYTES` back hold this for their whole run: each clears the
+    /// shared report first, so two running at once (cargo runs tests in parallel) clear each
+    /// other's report mid-test. Poison is ignored, so one failing test does not fail the next.
+    fn report_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static REPORT_TESTS: Mutex<()> = Mutex::new(());
+        REPORT_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     struct ReportFiles;
@@ -2933,6 +2976,9 @@ mod tests {
         }
         fn stat(&self, _path: &ConfigPath) -> Result<Option<mod_api::ConfigStat>, ConfigFileError> {
             Ok(None)
+        }
+        fn remove(&self, _file: &ConfigPath) -> Result<bool, ConfigFileError> {
+            Ok(report_bytes().lock().unwrap().take().is_some())
         }
     }
 
@@ -2999,34 +3045,29 @@ mod tests {
 
     #[test]
     fn client_setup_leave_rejoin_stop_and_second_setup_keep_one_listener() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
         let mut host = ReportHost;
-        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        java.on_client_setup();
         let first = java.lock_client().report_rows().collect::<Vec<_>>();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["client"]["client_listeners"], 1);
-        let mut load = ClientLevelLoadEvent {
-            dimension: "minecraft:overworld",
-        };
-        Hooks::client_level_load(&java, &mut host, &mut load);
+        java.on_client_level_load();
         assert!(java.lock_client().world_loaded());
-        let mut unload = ClientLevelUnloadEvent {
-            dimension: "minecraft:overworld",
-        };
-        Hooks::client_level_unload(&java, &mut host, &mut unload);
+        java.on_client_level_unload();
         assert!(!java.lock_client().world_loaded());
-        Hooks::client_level_load(&java, &mut host, &mut load);
+        java.on_client_level_load();
         assert!(java.lock_client().world_loaded());
         assert_eq!(java.lock_client().resident_count(), 1);
-        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        java.on_client_stopping(&mut host);
         assert_eq!(java.lock_client().resident_count(), 0);
         assert!(!java.lock_client().world_loaded());
         let report: serde_json::Value =
             serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
         assert_eq!(report["client_jars"].as_array().unwrap().len(), 1);
-        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
+        java.on_client_setup();
         let client = java.lock_client();
         assert_eq!(client.resident_count(), 1);
         assert_eq!(client.report_rows().count(), 1);
@@ -3034,12 +3075,13 @@ mod tests {
 
     #[test]
     fn client_stages_run_and_persist_success_failure_counters() {
+        let _serial = report_test_guard();
         *report_bytes().lock().unwrap() = None;
         let java = HorizonJava::default();
         install_client_fixture(&java);
         let mut host = ReportHost;
-        Hooks::client_setup(&java, &mut host, &mut ClientSetupEvent {});
-        Hooks::client_stopping(&java, &mut host, &mut ClientStoppingEvent {});
+        java.on_client_setup();
+        java.on_client_stopping(&mut host);
         let report: serde_json::Value =
             serde_json::from_slice(report_bytes().lock().unwrap().as_ref().unwrap()).unwrap();
         let row = &report["client_jars"][0];
@@ -3171,8 +3213,6 @@ mod tests {
         assert_eq!(facade.levels[0].id, "minecraft:the_nether");
         assert_eq!(facade.levels[0].game_time, 100);
     }
-
-    use mod_api::HurtSource;
 
     /// A jar whose listeners fail keeps the entrypoint verdict (`ran-clean`) but its summary says
     /// so: the log line and the report may never present it as an unqualified clean run.
@@ -3712,14 +3752,9 @@ mod tests {
     #[test]
     fn an_entity_interaction_names_the_hooks_hand() {
         for (hand, off) in [(Hand::Main, Some(false)), (Hand::Off, Some(true))] {
-            let event = EntityInteractEvent {
-                hand,
-                entity: 3,
-                kind: "minecraft:cow",
-                stack: None,
-            };
             let level = Some("minecraft:the_nether".to_owned());
-            let context = entity_interact_context(Some(7), level.clone(), None, &event);
+            let context =
+                entity_interact_context(Some(7), level.clone(), None, hand, 3, "minecraft:cow");
             assert_eq!(context.off_hand, off);
             assert_eq!(context.player, Some(7));
             assert_eq!(context.level, level);
@@ -3762,27 +3797,15 @@ mod tests {
     fn copy_from_alive_is_the_keep_all_data_flag_not_the_death_flag() {
         assert!(!copy_from_alive(true), "a death respawn keeps no data");
         assert!(copy_from_alive(false), "leaving the End keeps all data");
-        let event = PlayerCloneEvent {
-            player: 7,
-            name: "Alex",
-            was_death: true,
-            // The hook-scoped view of the old player (Sunrise pin `a87e07f5f8`); the context
-            // takes the facts read from it, so any token does.
-            original: mod_api::__private::game::original_player_ref(1),
-        };
         let died = FacadeOriginal {
             uuid: 7,
             level: Some("minecraft:the_nether".to_owned()),
             ..FacadeOriginal::default()
         };
-        let context = player_clone_context(&event, died.clone());
+        let context = player_clone_context(7, true, died.clone());
         assert!(!context.flag);
         assert_eq!(context.original, Some(died.clone()));
-        let event = PlayerCloneEvent {
-            was_death: false,
-            ..event
-        };
-        assert!(player_clone_context(&event, died).flag);
+        assert!(player_clone_context(7, false, died).flag);
     }
 
     /// Fabric's `afterDamage` gets `hurtServer`'s `originalDamage` and `damage` at `TAIL`, and
@@ -3806,13 +3829,7 @@ mod tests {
         // A fresh snapshot has an original and nothing else set, so the context takes the base
         // from it and the dealt amount is the (unset here) inflicted value, not a copy.
         let container = DamageContainer::new(10.0);
-        let event = LivingDamagePostEvent {
-            entity: 7,
-            kind: "minecraft:cow",
-            source: &source,
-            container: &container,
-        };
-        let context = living_damage_context(&event);
+        let context = living_damage_context(7, "minecraft:cow", &source, &container);
         assert_eq!(context.base_amount, Some(10.0));
         assert_eq!(context.amount, 0.0);
         assert!(!context.flag);

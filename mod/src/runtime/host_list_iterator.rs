@@ -139,6 +139,16 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `checkForComodification()`.
     fn list_iterator_check(&mut self, it: &ListIter, r: &MethodRef) -> Result<(), NativeError> {
+        // A host iterator over a copied sub-list writes the copy back through
+        // its parent before its structural counter is refreshed. Accept that
+        // own write's new root stamp; an unrelated stale view is still caught
+        // by the sub-list's regular checks.
+        if let Some(marker) = crate::runtime::expect_ref(&it.source)
+            && self.host.sub_list_link(marker).is_some()
+            && self.host.mod_stamp(marker) != it.expected
+        {
+            return Ok(());
+        }
         self.check_mod_count(r, &it.source, it.expected).map(drop)
     }
 
@@ -221,6 +231,12 @@ impl<H: Host> Runtime<'_, H> {
                 Value::Void
             }
             ("add", "(Ljava/lang/Object;)V") => {
+                if let Some(marker) = crate::runtime::expect_ref(&it.source)
+                    && let Some(link) = self.host.sub_list_link(marker)
+                    && self.host.sub_list_link(link.parent()).is_some()
+                {
+                    return self.host.unknown_operand_call(r).map(Some);
+                }
                 self.list_iterator_check(it, r)?;
                 if it.cursor > elements.len() {
                     return Err(iteration_guard_cme());

@@ -239,6 +239,7 @@ enum State {
 enum Terminal {
     /// Keep every element (a terminal that then runs on the list).
     Collect(Vec<Value>),
+    Array(Value, usize),
     /// `forEach`: the consumer and its interface.
     Each(Value, String),
     /// `findFirst`/`findAny`.
@@ -536,6 +537,26 @@ pub(crate) fn takes_output(name: &str) -> bool {
             | "noneMatch"
             | "isEmpty"
     )
+}
+
+/// Whether the value-list fallback has a model for this exact terminal call.
+///
+/// This check must happen before a pipeline is consumed.  An unmodelled
+/// terminal is returned to the outer dispatcher to count; consuming its stream
+/// first would make that retry throw `IllegalStateException`, which Java does
+/// not do for the original call.
+pub(crate) fn value_list_terminal_modelled(r: &MethodRef, args: &[Value]) -> bool {
+    match (r.name.as_str(), r.descriptor.as_str()) {
+        ("toList", "()Ljava/util/List;")
+        | ("toArray", "()[Ljava/lang/Object;")
+        | ("isEmpty", "()Z")
+        | ("iterator", "()Ljava/util/Iterator;")
+        | ("sum", "()I" | "()J" | "()D") => true,
+        ("collect", "(Ljava/util/stream/Collector;)Ljava/lang/Object;") => args
+            .first()
+            .is_some_and(|collector| crate::runtime::host_collector::builtin(collector).is_some()),
+        _ => false,
+    }
 }
 
 fn is_stream_owner(owner: &str) -> bool {
@@ -1177,6 +1198,48 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
         };
         let reference = r.owner == "java/util/stream/Stream";
         let terminal = match (r.name.as_str(), r.descriptor.as_str()) {
+            ("toArray", "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;") if reference => {
+                self.consume(stream)?;
+                self.bind_sources(stream)?;
+                self.count_parallel(stream)?;
+                let size = self.exact_size(stream)?;
+                if let Some(size) = size {
+                    let array = self.call_sam(
+                        "java/util/function/IntFunction",
+                        &arg(0),
+                        &[Value::Int(size as i32)],
+                    )?;
+                    let length = self.array(&array)?.len();
+                    if length as i64 != size {
+                        return Err(illegal_state(Some(&format!(
+                            "Begin size {size} is not equal to fixed size {length}"
+                        ))));
+                    }
+                    let Terminal::Array(array, _) =
+                        self.drive(stream, Terminal::Array(array, 0), None)?
+                    else {
+                        unreachable!()
+                    };
+                    return Ok(Some(array));
+                }
+                let Terminal::Collect(values) =
+                    self.drive(stream, Terminal::Collect(Vec::new()), None)?
+                else {
+                    unreachable!()
+                };
+                let array = self.call_sam(
+                    "java/util/function/IntFunction",
+                    &arg(0),
+                    &[Value::Int(values.len() as i32)],
+                )?;
+                // SpinedBuffer.copyInto uses System.arraycopy, whose failure text differs
+                // from FixedNodeBuilder's aastore. Count that path until modelled.
+                self.host.unknown_operand_call(r)?;
+                for (index, value) in values.into_iter().enumerate() {
+                    self.stream_array_store(&array, index, value)?;
+                }
+                return Ok(Some(array));
+            }
             ("forEach" | "forEachOrdered", _) if args.len() == 1 => {
                 Terminal::Each(arg(0), interface(0))
             }
@@ -1301,6 +1364,7 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             },
             Terminal::Fold(_, _, value) | Terminal::Container(_, value) => value,
             Terminal::ToMap(state) => self.finish_to_map(*state)?,
+            Terminal::Array(array, _) => array,
             Terminal::Collect(_)
             | Terminal::Forward(..)
             | Terminal::Supply(..)
@@ -1323,6 +1387,13 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
 
     /// The elements a stream yields for the value-list terminal `terminal`:
     /// a source's list, or a stage's output from one full push.
+    pub(crate) fn consume_stream(&mut self, stream: &Value) -> Result<(), NativeError> {
+        let marker = expect_ref(stream)
+            .filter(|marker| marker.starts_with("stream/"))
+            .ok_or_else(|| NativeError::Metadata("expected a native stream marker".into()))?;
+        self.consume(marker)
+    }
+
     pub(crate) fn stream_output(
         &mut self,
         stream: &Value,
@@ -1332,7 +1403,6 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             .filter(|marker| marker.starts_with("stream/"))
             .ok_or_else(|| NativeError::Metadata("expected a native stream marker".into()))?
             .clone();
-        self.consume(&marker)?;
         // The JDK's stream iterator pulls lazily as it advances; a pipeline
         // that runs code, or reads a host collection, would see its calls
         // move.
@@ -2036,6 +2106,10 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
                 }
                 values.push(value);
             }
+            Terminal::Array(array, index) => {
+                self.stream_array_store(array, *index, value)?;
+                *index += 1;
+            }
             Terminal::Each(consumer, interface) => {
                 let (consumer, interface) = (consumer.clone(), interface.clone());
                 self.call_sam(&interface, &consumer, &[value])?;
@@ -2110,6 +2184,27 @@ impl<H: crate::runtime::Host> crate::runtime::Runtime<'_, H> {
             }
             Terminal::Wrap(_, _, buffer) => buffer.push(value),
         }
+        Ok(())
+    }
+
+    fn stream_array_store(
+        &mut self,
+        array: &Value,
+        index: usize,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        self.check_array_store(array, &value)?;
+        let key = crate::runtime::host_array::array_key(array).ok_or_else(npe)?;
+        let stored = self
+            .arrays
+            .get_mut(key)
+            .is_some_and(|data| data.store(index, value));
+        if !stored {
+            return Err(illegal_state(Some(
+                "stream array generator returned an invalid array",
+            )));
+        }
+        self.push_array_views(key);
         Ok(())
     }
 
