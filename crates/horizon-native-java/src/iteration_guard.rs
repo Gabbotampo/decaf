@@ -63,16 +63,6 @@ pub struct IteratorGuard {
     deque_cursor: Option<(usize, usize)>,
 }
 
-impl IteratorGuard {
-    pub(crate) fn source(&self) -> &str {
-        &self.source
-    }
-
-    pub(crate) fn root(&self) -> &str {
-        &self.root
-    }
-}
-
 /// How a fail-fast collection iterates.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FailFast {

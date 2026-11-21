@@ -257,6 +257,88 @@ public class Probe {
       return "ex:" + e.getClass().getSimpleName();
     }
   }
+  static final IdentityHashMap<String, Integer> TAINT_M = new IdentityHashMap<>();
+  static final String TAINT_K = new String("k");
+  static void taintMutate() { TAINT_M.put(TAINT_K, 2); }
+  static String staticReach() {
+    try {
+      TAINT_M.clear();
+      TAINT_M.put(TAINT_K, 1);
+      java.lang.reflect.Method f = Probe.class.getDeclaredMethod("taintMutate");
+      f.invoke(null);
+      return String.valueOf(TAINT_M.get(TAINT_K));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static final class Box { Object next; }
+  static void deepMutate(Box b) {
+    Object x = b;
+    for (int i = 0; i < 601; i++) x = ((Box) x).next;
+    @SuppressWarnings("unchecked")
+    IdentityHashMap<String, Integer> m = (IdentityHashMap<String, Integer>) x;
+    m.put(TAINT_K, 2);
+  }
+  static String deepReach() {
+    try {
+      TAINT_M.clear();
+      TAINT_M.put(TAINT_K, 1);
+      Box root = new Box(), p = root;
+      for (int i = 0; i < 600; i++) { p.next = new Box(); p = (Box) p.next; }
+      p.next = TAINT_M;
+      java.lang.reflect.Method f = Probe.class.getDeclaredMethod("deepMutate", Box.class);
+      f.invoke(null, root);
+      return String.valueOf(TAINT_M.get(TAINT_K));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static final class MutatingKey {
+    final IdentityHashMap<String, Integer> target;
+    final String key;
+    MutatingKey(IdentityHashMap<String, Integer> target, String key) {
+      this.target = target;
+      this.key = key;
+    }
+    @Override
+    public boolean equals(Object other) {
+      target.put(key, 2);
+      return false;
+    }
+  }
+  static String mutatingKeyDeepEquals() {
+    IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+    m.put("a", 1);
+    boolean eq = Objects.deepEquals(
+        new Object[] { new MutatingKey(m, "a") },
+        new Object[] { "other" });
+    return eq + ":" + m.get("a");
+  }
+  static String reflectStaticUncachedTaint() {
+    try {
+      TAINT_M.clear();
+      TAINT_M.put("a", 1);
+      java.lang.reflect.Method gc = System.class.getMethod("gc");
+      gc.invoke(null);
+      return String.valueOf(TAINT_M.get("a"));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectDeepChain600Taint() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Box root = new Box(), p = root;
+      for (int i = 0; i < 600; i++) { p.next = new Box(); p = (Box) p.next; }
+      p.next = m;
+      java.lang.reflect.Method hc = System.class.getMethod("identityHashCode", Object.class);
+      hc.invoke(null, root);
+      return String.valueOf(m.get("a"));
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -291,4 +373,9 @@ public class Probe {
   public static String reflectSetValueOnEntryOut(){return reflectSetValueOnEntry();}
   public static String reflectPutOnEmptyMapOut(){return reflectPutOnEmptyMap();}
   public static String reflectPutThenReadViaUnmodOut(){return reflectPutThenReadViaUnmod();}
+  public static String staticReachOut(){return staticReach();}
+  public static String deepReachOut(){return deepReach();}
+  public static String mutatingKeyDeepEqualsOut(){return mutatingKeyDeepEquals();}
+  public static String reflectStaticUncachedTaintOut(){return reflectStaticUncachedTaint();}
+  public static String reflectDeepChain600TaintOut(){return reflectDeepChain600Taint();}
 }

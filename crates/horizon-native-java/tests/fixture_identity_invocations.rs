@@ -64,6 +64,13 @@ fn adversarial_identity_review() {
         ("reflectSetValueOnEntryOut", "false:v"),
         ("reflectPutOnEmptyMapOut", "1:v"),
         ("reflectPutThenReadViaUnmodOut", "v:1"),
+        // Reviewer's TaintProbe (static map + 600-link deep chain) and
+        // MutatingKey.equals via Objects.deepEquals (no method-name allow-list):
+        ("staticReachOut", "2"),
+        ("deepReachOut", "2"),
+        ("mutatingKeyDeepEqualsOut", "false:2"),
+        ("reflectStaticUncachedTaintOut", "1"),
+        ("reflectDeepChain600TaintOut", "1"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -97,6 +104,11 @@ fn adversarial_identity_review() {
         "reflectSetValueOnEntryOut",
         "reflectPutOnEmptyMapOut",
         "reflectPutThenReadViaUnmodOut",
+        "staticReachOut",
+        "deepReachOut",
+        "mutatingKeyDeepEqualsOut",
+        "reflectStaticUncachedTaintOut",
+        "reflectDeepChain600TaintOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -223,6 +235,33 @@ fn adversarial_identity_review() {
                         .iter()
                         .any(|(call, _)| call == "java/util/Map#size()I"),
                     "reflectPutThenReadViaUnmodOut must count Map#size via unmodifiable view: {calls:?}"
+                );
+            }
+            if matches!(
+                method,
+                "staticReachOut"
+                    | "deepReachOut"
+                    | "reflectStaticUncachedTaintOut"
+                    | "reflectDeepChain600TaintOut"
+            ) {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#get(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "{method} must bump identity epoch and count IdentityHashMap#get: {calls:?}"
+                );
+            }
+            if method == "mutatingKeyDeepEqualsOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/Objects#deepEquals(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+                    "mutatingKeyDeepEqualsOut must count Objects#deepEquals: {calls:?}"
+                );
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#get(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "mutatingKeyDeepEqualsOut must bump identity epoch and count IdentityHashMap#get: {calls:?}"
                 );
             }
         } else if counted == 0 {

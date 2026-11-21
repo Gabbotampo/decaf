@@ -21701,7 +21701,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -21930,7 +21930,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -22115,7 +22115,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -24334,10 +24334,9 @@ struct Runtime<'a, H> {
     string_builders: BTreeMap<String, String>,
     /// Allocation keys of constructors whose String text is not modelled exactly.
     counted_strings: std::collections::BTreeSet<String>,
-    /// Known identity provenance for keys and values in identity-based collections,
-    /// stamped with the host collection generation so external mutations invalidate it.
-    identity_collection_keys:
-        std::collections::BTreeMap<String, immutable_collections::IdentityCollectionTokens>,
+    /// Runtime-wide identity epoch and per-collection provenance for
+    /// `IdentityHashMap` / `IdentityHashSet`.
+    identity_collections: immutable_collections::IdentityCollections,
     /// Runtime-local JVM string-pool observations for `String.intern()`.
     string_pool: reference_identity::StringPoolState,
     /// Allocation keys (or I/O sink keys) whose held text was written from a
@@ -32498,6 +32497,9 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.count_if_uncertain_identity_operand(r, op, receiver, args)? {
+            return Ok(Some(value));
+        }
         if let Some(value) = self.invoke_enum_set_text(r, receiver)? {
             return Ok(Some(value));
         }
@@ -35514,12 +35516,13 @@ impl<H: Host> Runtime<'_, H> {
                             );
                         }
                         if !jar_body
-                            && crate::immutable_collections::counted_call_may_mutate_identity(&r)
-                        {
-                            self.taint_reachable_identity_collections(
+                            && !self.counted_call_is_identity_inert(
+                                &r,
                                 taint_receiver.as_ref(),
                                 &args,
-                            );
+                            )
+                        {
+                            self.bump_identity_epoch();
                         }
                     }
                     let value = self.materialize_host_value(value);
@@ -40408,7 +40411,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -40494,7 +40497,7 @@ mod tests {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -47660,7 +47663,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -47888,7 +47891,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -48091,7 +48094,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -48470,7 +48473,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -48793,7 +48796,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -54074,7 +54077,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
@@ -54147,7 +54150,7 @@ mandatory = true
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),

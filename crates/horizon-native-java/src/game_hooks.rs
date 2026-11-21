@@ -2054,7 +2054,7 @@ impl NativeJar {
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
-            identity_collection_keys: std::collections::BTreeMap::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
             string_pool: Default::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
