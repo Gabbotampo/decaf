@@ -16,28 +16,43 @@ upstream and someone wanted Java mods in the official game; that side owns it (#
   before a build. Plain `vendor.py` and `vendor.py --check` touch `mod/` only, so no runtime PR has to
   regenerate or commit anything for this build.
 
+## The SDK and the lock
+
+Like `mod/` on Sunrise, `mod-horizon/` names the mod API by the path of the pinned build's signed SDK,
+`.horizon/sdk/api/crates/horizon-mod-api` (ignored by git): the official Horizon refuses every other
+form under `E_SDK_SOURCE` (horizon-rust/horizon `docs/modding/src/reference/sdk/03-in-a-project.md`).
+The `mod-horizon` CI job fetches it from the release `sdk-<pin>` and checks it as that project's
+`01-release.md` says (Horizon's signature on `SHA256SUMS`, `sdk.json` naming the pin, each file's size
+and SHA-256), then builds with the Rust release the SDK was compiled with (`toolchain.rust`).
+Locally, the same folder is what `cargo horizon-mod check` fetches when run in `mod-horizon/` (per that
+page), or the CI step can be run by hand.
+
+`Cargo.lock` is committed and the job builds `--locked`. Every registry package it shares with the
+game is at the version and checksum of Horizon's own `Cargo.lock` at the pin, so the mod brings no
+second copy of them.
+
 ## What differs from `mod/`
 
-Only the API's names and the pin. The bridge code (`src/*.rs`) is `mod/`'s, with:
+The bridge code (`src/*.rs`) is `mod/`'s, re-derived from it whenever `mod/` changes, with only:
 
 | `mod/` (Sunrise) | `mod-horizon/` (official Horizon) |
 |---|---|
 | `sunrise-mod.toml`, `[native] sunrise = …` | `horizon-mod.toml`, `[native] horizon = …` |
-| `sunrise-mod-api` from `https://github.com/sunrise-org/sunrise` | `horizon-mod-api` from `https://github.com/horizon-rust/horizon` |
+| `sunrise-mod-api` from `.sunrise/sdk/` | `horizon-mod-api` from `.horizon/sdk/` |
 | `#[mod_api::sunrise_mod]` | `#[mod_api::horizon_mod]` |
+| `HitHost` (damage hooks' level) | `LevelRandomHost` |
+| `BlocksEvent::register`, `ItemsEvent::register` (checked per entry) | `event.blocks.push`, `event.items.push` (the game's ownership fence refuses at start) |
+| Test fakes: `AttachmentHost::validate_attachment`, `ConfigFiles::remove`, `PlayerModesBackend` | Not in the official API; `player_is_spectator` is on `PlayersBackend` |
 
-The pin is a commit of horizon-rust/horizon `main` after #16941 (the merge commit itself does not
-build `horizon-mod-vocab`: a leftover `tools/native-hook-fragments/*.json` is refused, fixed on main by
-`3851860c`). At that pin `cargo check --all-targets`, clippy with `-D warnings` and `cargo test --lib`
-pass with the same code as `mod/`, so the hooks and host calls the bridge uses are the same in both
-APIs today.
+Everything else is the same code, `game_dispatch.rs` included: the bridge takes its state through the
+same `StateGuard` and dispatch gate as `mod/`, so Java callbacks re-enter the same way on both games.
+Comments that name the game say Horizon instead of Sunrise.
+
+The pin is `0a875da91d` (Nightly 2026-11-20), the newest build with a published `sdk-<sha>` release
+when this was written. At that pin `cargo check --all-targets`, clippy with `-D warnings` and
+`cargo test --lib` pass.
 
 ## What is not done yet
 
-- **No in-game proof.** A native mod builds against the prebuilt SDK of its pinned commit, and the
-  official project has published no Nightly (and so no `sdk-<sha>` release) since #16941 merged. When
-  one appears, the pin moves to that Nightly's commit, `Cargo.lock` is regenerated with
-  `horizon-launcher native-lock mod-horizon`, and the M0–M3b proof of [mod-plan.md](mod-plan.md) is
-  run with `horizon-launcher native-build mod-horizon --server-output …`.
-- **Registry lock.** `native-build` accepts the SDK git dependency only with a lock written by
-  `native-lock`; this folder has no `Cargo.lock` until the pin is a published build.
+- **No in-game proof.** The next step is the M0–M3b proof of [mod-plan.md](mod-plan.md) with the
+  official launcher's `native-build mod-horizon --server-output …` at this pin.
