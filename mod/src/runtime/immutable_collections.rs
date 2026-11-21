@@ -235,7 +235,6 @@ impl<H: Host> Runtime<'_, H> {
                     | Value::Int(_)
                     | Value::Long(_)
                     | Value::Float(_)
-                    | Value::Double(_)
                     | Value::Boxed(_)
                     | Value::Ref(None) => true,
                     Value::Ref(Some(text)) => value_class::is_plain_string(text),
@@ -798,20 +797,8 @@ impl<H: Host> Runtime<'_, H> {
             && r.name == "<init>"
             && let Some(receiver) = receiver
         {
-            let source_uncertain = r.descriptor == "(Ljava/util/Map;)V"
-                && args.first().is_some_and(|source| {
-                    let (root, _) = self.root_map_of_view(source.clone());
-                    self.collection_uncertain(&root)
-                });
-            if source_uncertain {
-                self.mark_collection_uncertain(receiver);
-                return self.count_identity_call(r, receiver).map(Some);
-            }
             self.note_fresh_identity_collection(receiver);
-            if r.descriptor == "(Ljava/util/Map;)V" {
-                return self.identity_map_member(r, receiver, args, identity_args);
-            }
-            return Ok(None);
+            return self.unordered_argument(r, args);
         }
         let Some(receiver) = receiver.filter(|_| matches!(opcode, 0xb6 | 0xb9)) else {
             return self.unordered_argument(r, args);

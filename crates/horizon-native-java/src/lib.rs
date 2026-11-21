@@ -22295,6 +22295,10 @@ impl NativeJar {
             pipelines: Default::default(),
             enum_constants: BTreeMap::new(),
             string_builders: BTreeMap::new(),
+            counted_strings: std::collections::BTreeSet::new(),
+            identity_collections: immutable_collections::IdentityCollections::default(),
+            string_pool: reference_identity::StringPoolState::default(),
+            counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
 
@@ -22309,6 +22313,7 @@ impl NativeJar {
             io_writer_bytes: BTreeMap::new(),
             io_stream_positions: BTreeMap::new(),
             io_writer_charsets: BTreeMap::new(),
+            io_writer_sinks: BTreeMap::new(),
             io_paths,
             io_files,
             io_file_bytes,
@@ -22324,6 +22329,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            next_frame_id: 0,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -25237,8 +25243,8 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Replace the value of one local store or load through the
-    /// `@ModifyVariable` callbacks bound to it. The returned boolean is `true`
-    /// when at least one modifier callback ran.
+    /// `@ModifyVariable` callbacks bound to it. Marks `frame_modified_identity`
+    /// when a modifier callback altered a reference local.
     fn dispatch_modify_variable(
         &mut self,
         anchor: VariableAnchor,
@@ -25249,27 +25255,31 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
-    ) -> Result<(Value, bool), NativeError> {
+        frame_modified_identity: &mut bool,
+    ) -> Result<Value, NativeError> {
         if self
             .modify_hooks
             .as_deref()
             .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
         {
-            return Ok((value, false));
+            return Ok(value);
         }
         let entries = match self.modify_hooks.as_deref_mut() {
             Some(hooks) => hooks.variable_candidates(anchor, slot, instruction_type),
-            None => return Ok((value, false)),
+            None => return Ok(value),
         };
         if entries.is_empty() {
-            return Ok((value, false));
+            return Ok(value);
         }
         self.set_modify_dispatching(true);
         let outcome = self.run_modify_variable_callbacks(&entries, value);
         self.set_modify_dispatching(false);
         let value = outcome?;
         self.record_modify_variable_site(class, method, pc);
-        Ok((value, true))
+        if instruction_type == "Ljava/lang/Object;" {
+            *frame_modified_identity = true;
+        }
+        Ok(value)
     }
 
     fn run_modify_variable_callbacks(
@@ -33736,6 +33746,279 @@ impl<H: Host> Runtime<'_, H> {
         self.host.note_entity_data_hierarchy(&entries);
     }
 
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn collect_identity_args(
+        &self,
+        frame_modified_identity: bool,
+        receiver: Option<&Value>,
+        args: &[Value],
+        modified_args: &[usize],
+        file: &ClassFile,
+        class: &str,
+        method: &str,
+        desc: &str,
+        is_static: bool,
+        code: &[u8],
+        frame_id: u64,
+        at: usize,
+    ) -> Vec<reference_identity::CallIdentity> {
+        if frame_modified_identity || !receiver.is_some_and(|recv| self.tracks_identity_args(recv))
+        {
+            return Vec::new();
+        }
+        args.iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if modified_args.contains(&index) {
+                    return None;
+                }
+                reference_identity::call_identity(
+                    file, class, method, desc, is_static, code, frame_id, at, index, value,
+                )
+            })
+            .collect()
+    }
+
+    #[inline(never)]
+    fn dispatch_counted_string_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if !self.contains_counted_string(receiver, args) {
+            return Ok(None);
+        }
+        let counted_write = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/io/Writer"
+                    | "java/io/BufferedWriter"
+                    | "java/io/FileWriter"
+                    | "java/io/OutputStreamWriter"
+                    | "java/io/StringWriter"
+                    | "java/io/PrintWriter"
+                    | "java/io/PrintStream"
+                    | "java/io/OutputStream",
+                "append" | "write" | "print" | "println" | "printf" | "format"
+            )
+        );
+        if counted_write
+            && let Some(receiver) = receiver
+            && let Some(marker) = jar_object::object_key(receiver)
+        {
+            self.mark_counted_io_sink(marker);
+        }
+        if r.owner == "java/util/StringJoiner"
+            && matches!(r.name.as_str(), "add" | "merge")
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        if r.owner == "java/util/Formatter"
+            && r.name == "format"
+            && let Some(receiver) = receiver
+        {
+            self.mark_counted_text_object(receiver);
+        }
+        let counted = self.counted_unknown(r)?;
+        // `append`/`insert` return their builder. The host's
+        // neutral result may be null, but Java still returns
+        // the receiver whose text is now opaque.
+        let builder_result = matches!(
+            (r.owner.as_str(), r.name.as_str()),
+            (
+                "java/lang/StringBuilder" | "java/lang/StringBuffer",
+                "append" | "insert"
+            )
+        );
+        // A text object constructed from a counted String
+        // (`new String(counted)`, `new StringBuilder(counted)`)
+        // has opaque text too. A constructor returns nothing,
+        // so its receiver is what must be tracked.
+        let text_constructor = r.name == "<init>"
+            && matches!(
+                r.owner.as_str(),
+                "java/lang/String" | "java/lang/StringBuilder" | "java/lang/StringBuffer"
+            );
+        if (builder_result || text_constructor)
+            && let Some(key) = receiver.and_then(jar_object::object_key)
+        {
+            self.counted_strings.insert(key.to_owned());
+        }
+        Ok(Some(if builder_result {
+            receiver.cloned().unwrap_or(counted)
+        } else {
+            counted
+        }))
+    }
+
+    #[inline(never)]
+    fn post_dispatch_counted_taint(
+        &mut self,
+        r: &MethodRef,
+        jar_body: bool,
+        taint_receiver: Option<&Value>,
+        args: &[Value],
+    ) {
+        if crate::guava_multimap::counted_call_may_mutate(r) {
+            crate::guava_multimap::taint_operands(self, taint_receiver, args);
+        }
+        if !jar_body && !self.counted_call_is_identity_inert(r, taint_receiver, args) {
+            self.bump_identity_epoch();
+        }
+    }
+
+    #[inline(never)]
+    fn count_if_acmp_counted_string(
+        &mut self,
+        lhs: &Value,
+        rhs: &Value,
+    ) -> Result<(), NativeError> {
+        if self.is_counted_string(lhs) || self.is_counted_string(rhs) {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "if_acmp".into(),
+                descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
+            })?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn invoke_string_or_builder(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        if let Some(value) = self.invoke_string_content_equals(r, receiver, args)? {
+            return Ok(Some(value));
+        }
+        self.invoke_string_builder(r, receiver, args)
+    }
+
+    #[inline(never)]
+    fn dispatch_string_concat_recipe(
+        &mut self,
+        descriptor: &str,
+        recipe: &str,
+        constants: &[String],
+        mut captured: Vec<Value>,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        // A String from a constructor Decaf counted counts on every
+        // later use (#423); its text is not known, so the whole
+        // concatenation is counted, never joined from its marker.
+        if captured.iter().any(|value| self.is_counted_string(value)) {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        let mut arguments = descriptor_arguments(descriptor);
+        // A `subList` operand's `toString` checks its list (`mod_count.rs`).
+        if let Some(answer) = self.sync_sub_list_operands(&captured)? {
+            return Ok(Some(answer));
+        }
+        if self.concat_object_texts(&mut captured, &mut arguments, class, method)? {
+            let counted = self.counted_unknown(&MethodRef {
+                owner: "java/lang/invoke/StringConcatFactory".into(),
+                name: "makeConcatWithConstants".into(),
+                descriptor: descriptor.to_owned(),
+            })?;
+            return Ok(Some(counted));
+        }
+        // A `StringBuilder` operand concatenates as its text
+        // (`String.valueOf` calls its `toString`), not as the
+        // builder's object marker.
+        for value in &mut captured {
+            if let Some(text) = self.builder_text(value) {
+                *value = Value::Ref(Some(text.clone()));
+            }
+        }
+        // An object a library model answers `toString` for (a
+        // Guava `TypeToken`, a proxy) concatenates as that text.
+        for value in &mut captured {
+            if let Some(text) = self.library_to_string(value, class, method)? {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // Every other model object prints its own `toString`
+        // too (`"" + id` is `a:x`, not the id's marker). A
+        // `String` operand is already its text.
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument != "Ljava/lang/String;"
+                && let Some(text) = self.host.modelled_to_string_checked(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        // A `Class` operand naming a class a family kind owns prints
+        // `Class.toString` or is counted (`owned_class.rs`).
+        for (value, argument) in captured.iter_mut().zip(&arguments) {
+            if argument == "Ljava/lang/Class;"
+                && let Some(text) = self.owned_class_text(value)?
+            {
+                *value = Value::Ref(Some(text));
+            }
+        }
+        let mut joined = String::new();
+        let (mut next_arg, mut next_constant) = (0, 0);
+        let mut expand = |placeholder: u8,
+                          joined: &mut String,
+                          next_arg: &mut usize,
+                          next_constant: &mut usize|
+         -> Result<(), NativeError> {
+            match placeholder {
+                1 => {
+                    let value = captured.get(*next_arg).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more arguments than captures".into(),
+                        )
+                    })?;
+                    let argument = arguments
+                        .get(*next_arg)
+                        .map_or("Ljava/lang/Object;", String::as_str);
+                    joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+                    *next_arg += 1;
+                }
+                _ => {
+                    let constant = constants.get(*next_constant).ok_or_else(|| {
+                        NativeError::Metadata(
+                            "concat recipe has more constants than the bootstrap".into(),
+                        )
+                    })?;
+                    joined.push_str(constant);
+                    *next_constant += 1;
+                }
+            }
+            Ok(())
+        };
+        if recipe.is_empty() {
+            for (position, value) in captured.iter().enumerate() {
+                let argument = arguments
+                    .get(position)
+                    .map_or("Ljava/lang/Object;", String::as_str);
+                joined.push_str(&java_value_text(&mut *self.host, value, argument)?);
+            }
+        } else {
+            for ch in recipe.chars() {
+                match ch {
+                    '\u{1}' | '\u{2}' => {
+                        expand(ch as u8, &mut joined, &mut next_arg, &mut next_constant)?
+                    }
+                    other => joined.push(other),
+                }
+            }
+        }
+        Ok((return_desc(descriptor) != "V").then_some(Value::Ref(Some(joined))))
+    }
+
     fn invoke_frame(
         &mut self,
         class: &str,
@@ -34005,7 +34288,7 @@ impl<H: Host> Runtime<'_, H> {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, modified) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         local_opcode_type(op - 0x15),
@@ -34014,11 +34297,8 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    if modified && op == 0x19 {
-                        frame_modified_identity = true;
-                    }
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x12 => {
                     let i = *code.get(pc).ok_or(NativeError::Truncated)? as u16;
@@ -34054,7 +34334,7 @@ impl<H: Host> Runtime<'_, H> {
                     match wide_op {
                         0x15..=0x19 => {
                             let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                            let (loaded, modified) = self.dispatch_modify_variable(
+                            stack.push(self.dispatch_modify_variable(
                                 VariableAnchor::Load,
                                 index,
                                 local_opcode_type(wide_op - 0x15),
@@ -34063,15 +34343,12 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
-                            )?;
-                            if modified && wide_op == 0x19 {
-                                frame_modified_identity = true;
-                            }
-                            stack.push(loaded);
+                                &mut frame_modified_identity,
+                            )?);
                         }
                         0x36..=0x3a => {
                             let value = pop(&mut stack, class, method, at)?;
-                            let (value, modified) = self.dispatch_modify_variable(
+                            let value = self.dispatch_modify_variable(
                                 VariableAnchor::Store,
                                 index,
                                 local_opcode_type(wide_op - 0x36),
@@ -34080,10 +34357,8 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
+                                &mut frame_modified_identity,
                             )?;
-                            if modified && wide_op == 0x3a {
-                                frame_modified_identity = true;
-                            }
                             if let Some(local) = locals.get_mut(index) {
                                 *local = value;
                             }
@@ -34355,7 +34630,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x1a..=0x1d => {
                     let index = (op - 0x1a) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, _) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "I",
@@ -34364,13 +34639,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x1e..=0x21 => {
                     let index = (op - 0x1e) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, _) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "J",
@@ -34379,13 +34654,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x22..=0x25 => {
                     let index = (op - 0x22) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, _) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "F",
@@ -34394,13 +34669,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x26..=0x29 => {
                     let index = (op - 0x26) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, _) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "D",
@@ -34409,13 +34684,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x2a..=0x2d => {
                     let index = (op - 0x2a) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    let (loaded, modified) = self.dispatch_modify_variable(
+                    stack.push(self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "Ljava/lang/Object;",
@@ -34424,16 +34699,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?;
-                    if modified {
-                        frame_modified_identity = true;
-                    }
-                    stack.push(loaded);
+                        &mut frame_modified_identity,
+                    )?);
                 }
                 0x3b..=0x3e => {
                     let index = (op - 0x3b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, _) = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "I",
@@ -34442,13 +34714,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x3f..=0x42 => {
                     let index = (op - 0x3f) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, _) = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "J",
@@ -34457,13 +34729,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x43..=0x46 => {
                     let index = (op - 0x43) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, _) = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "F",
@@ -34472,13 +34744,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x47..=0x4a => {
                     let index = (op - 0x47) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, _) = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "D",
@@ -34487,13 +34759,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    locals[index] = value;
                 }
                 0x4b..=0x4e => {
                     let index = (op - 0x4b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, modified) = self.dispatch_modify_variable(
+                    locals[index] = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "Ljava/lang/Object;",
@@ -34502,17 +34774,14 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    if modified {
-                        frame_modified_identity = true;
-                    }
-                    locals[index] = value;
                 }
                 0x36..=0x3a => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
                     let value = pop(&mut stack, class, method, at)?;
-                    let (value, modified) = self.dispatch_modify_variable(
+                    let value = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         local_opcode_type(op - 0x36),
@@ -34521,10 +34790,8 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
+                        &mut frame_modified_identity,
                     )?;
-                    if modified && op == 0x3a {
-                        frame_modified_identity = true;
-                    }
                     if let Some(local) = locals.get_mut(index) {
                         *local = value;
                     }
@@ -34653,13 +34920,7 @@ impl<H: Host> Runtime<'_, H> {
                     // A String from a constructor Decaf counted (an unmodelled
                     // charset, ...) counts on every later use, `==` included
                     // (#423): record the comparison before answering it.
-                    if self.is_counted_string(&lhs) || self.is_counted_string(&rhs) {
-                        self.host.unknown_operand_call(&MethodRef {
-                            owner: "java/lang/Object".into(),
-                            name: "if_acmp".into(),
-                            descriptor: "(Ljava/lang/Object;Ljava/lang/Object;)Z".into(),
-                        })?;
-                    }
+                    self.count_if_acmp_counted_string(&lhs, &rhs)?;
                     // Identity, not value equality, for boxes and strings
                     // (`reference_identity.rs`).
                     let same = self.same_reference(
@@ -35308,34 +35569,20 @@ impl<H: Host> Runtime<'_, H> {
                     // collections and their views. A modified argument or a
                     // frame whose reference locals were altered drops its
                     // static token so equal-content identity operations count.
-                    let identity_args = if !frame_modified_identity
-                        && receiver
-                            .as_ref()
-                            .is_some_and(|recv| self.tracks_identity_args(recv))
-                    {
-                        args.iter()
-                            .enumerate()
-                            .map(|(index, value)| {
-                                if modified_args.contains(&index) {
-                                    return None;
-                                }
-                                reference_identity::call_identity(
-                                    file,
-                                    class,
-                                    method,
-                                    desc,
-                                    target.is_static(),
-                                    code,
-                                    frame_id,
-                                    at,
-                                    index,
-                                    value,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
+                    let identity_args = self.collect_identity_args(
+                        frame_modified_identity,
+                        receiver.as_ref(),
+                        &args,
+                        &modified_args,
+                        file,
+                        class,
+                        method,
+                        desc,
+                        target.is_static(),
+                        code,
+                        frame_id,
+                        at,
+                    );
                     // A call that may move a host collection's `modCount`
                     // (`mod_count.rs`), checked and noted around the dispatch.
                     let mod_token = if anchor_replacement.is_none() {
@@ -35384,72 +35631,12 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && self.contains_counted_string(receiver.as_ref(), &args)
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.dispatch_counted_string_call(&r, receiver.as_ref(), &args)
+                        )
                     {
-                        let counted_write = matches!(
-                            (r.owner.as_str(), r.name.as_str()),
-                            (
-                                "java/io/Writer"
-                                    | "java/io/BufferedWriter"
-                                    | "java/io/FileWriter"
-                                    | "java/io/OutputStreamWriter"
-                                    | "java/io/StringWriter"
-                                    | "java/io/PrintWriter"
-                                    | "java/io/PrintStream"
-                                    | "java/io/OutputStream",
-                                "append" | "write" | "print" | "println" | "printf" | "format"
-                            )
-                        );
-                        if counted_write
-                            && let Some(receiver) = receiver.as_ref()
-                            && let Some(marker) = jar_object::object_key(receiver)
-                        {
-                            self.mark_counted_io_sink(marker);
-                        }
-                        if r.owner == "java/util/StringJoiner"
-                            && matches!(r.name.as_str(), "add" | "merge")
-                            && let Some(receiver) = receiver.as_ref()
-                        {
-                            self.mark_counted_text_object(receiver);
-                        }
-                        if r.owner == "java/util/Formatter"
-                            && r.name == "format"
-                            && let Some(receiver) = receiver.as_ref()
-                        {
-                            self.mark_counted_text_object(receiver);
-                        }
-                        let counted = invoke_or_catch!(at, self.counted_unknown(&r));
-                        // `append`/`insert` return their builder. The host's
-                        // neutral result may be null, but Java still returns
-                        // the receiver whose text is now opaque.
-                        let builder_result = matches!(
-                            (r.owner.as_str(), r.name.as_str()),
-                            (
-                                "java/lang/StringBuilder" | "java/lang/StringBuffer",
-                                "append" | "insert"
-                            )
-                        );
-                        // A text object constructed from a counted String
-                        // (`new String(counted)`, `new StringBuilder(counted)`)
-                        // has opaque text too. A constructor returns nothing,
-                        // so its receiver is what must be tracked.
-                        let text_constructor = r.name == "<init>"
-                            && matches!(
-                                r.owner.as_str(),
-                                "java/lang/String"
-                                    | "java/lang/StringBuilder"
-                                    | "java/lang/StringBuffer"
-                            );
-                        if (builder_result || text_constructor)
-                            && let Some(key) = receiver.as_ref().and_then(jar_object::object_key)
-                        {
-                            self.counted_strings.insert(key.to_owned());
-                        }
-                        dispatched = Some(if builder_result {
-                            receiver.clone().unwrap_or(counted)
-                        } else {
-                            counted
-                        });
+                        dispatched = Some(value);
                     }
                     // `StateDefinition.Builder.add(Property...)` inside a jar block's
                     // `createBlockStateDefinition`: each property is recorded for the block's
@@ -36434,21 +36621,10 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_string_content_equals(&r, receiver.as_ref(), &args)
+                            self.invoke_string_or_builder(&r, receiver.as_ref(), &args)
                         )
                     {
                         dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && let Some(value) = invoke_or_catch!(
-                            at,
-                            self.invoke_string_builder(&r, receiver.as_ref(), &args)
-                        )
-                    {
-                        dispatched = Some({
-                            // `jdk_string_builder.rs`: its index checks throw.
-                            value
-                        });
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
@@ -36695,22 +36871,12 @@ impl<H: Host> Runtime<'_, H> {
                     // Nested reach through arrays, collections, fields, or lambda captures is a
                     // known gap tracked separately for every host collection.
                     if self.host.counted_unknown_calls() > unknown_before {
-                        if crate::guava_multimap::counted_call_may_mutate(&r) {
-                            crate::guava_multimap::taint_operands(
-                                self,
-                                taint_receiver.as_ref(),
-                                &args,
-                            );
-                        }
-                        if !jar_body
-                            && !self.counted_call_is_identity_inert(
-                                &r,
-                                taint_receiver.as_ref(),
-                                &args,
-                            )
-                        {
-                            self.bump_identity_epoch();
-                        }
+                        self.post_dispatch_counted_taint(
+                            &r,
+                            jar_body,
+                            taint_receiver.as_ref(),
+                            &args,
+                        );
                     }
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host
@@ -36771,151 +36937,18 @@ impl<H: Host> Runtime<'_, H> {
                     // build keys, ids and exception messages through these
                     // sites, and a marker there is not the string Java returns.
                     if let Some((recipe, constants)) = file.string_concat_recipe(index) {
-                        // A String from a constructor Decaf counted counts on every
-                        // later use (#423); its text is not known, so the whole
-                        // concatenation is counted, never joined from its marker.
-                        if captured.iter().any(|value| self.is_counted_string(value)) {
-                            let counted = invoke_or_catch!(
-                                at,
-                                self.counted_unknown(&MethodRef {
-                                    owner: "java/lang/invoke/StringConcatFactory".into(),
-                                    name: "makeConcatWithConstants".into(),
-                                    descriptor: descriptor.clone(),
-                                })
-                            );
-                            stack.push(counted);
-                            continue;
-                        }
-                        let mut arguments = descriptor_arguments(&descriptor);
-                        // An object operand concatenates as its own
-                        // `toString` (`jar_text.rs`), then reads as a `String`.
-                        let mut captured = captured;
-                        // A `subList` operand's `toString` checks its list
-                        // (`mod_count.rs`).
-                        if let Some(answer) =
-                            invoke_or_catch!(at, self.sync_sub_list_operands(&captured))
-                        {
-                            stack.push(answer);
-                            continue;
-                        }
-                        let concat_counted = invoke_or_catch!(
+                        if let Some(answer) = invoke_or_catch!(
                             at,
-                            self.concat_object_texts(&mut captured, &mut arguments, class, method)
-                        );
-                        if concat_counted {
-                            let counted = invoke_or_catch!(
-                                at,
-                                self.counted_unknown(&MethodRef {
-                                    owner: "java/lang/invoke/StringConcatFactory".into(),
-                                    name: "makeConcatWithConstants".into(),
-                                    descriptor: descriptor.clone(),
-                                })
-                            );
-                            stack.push(counted);
-                            continue;
-                        }
-                        // A `StringBuilder` operand concatenates as its text
-                        // (`String.valueOf` calls its `toString`), not as the
-                        // builder's object marker.
-                        let captured = captured
-                            .into_iter()
-                            .map(|value| match self.builder_text(&value) {
-                                Some(text) => Value::Ref(Some(text.clone())),
-                                None => value,
-                            })
-                            .collect::<Vec<_>>();
-                        // An object a library model answers `toString` for (a
-                        // Guava `TypeToken`, a proxy) concatenates as that text.
-                        let mut captured = captured;
-                        for value in &mut captured {
-                            if let Some(text) = self.library_to_string(value, class, method)? {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // Every other model object prints its own `toString`
-                        // too (`"" + id` is `a:x`, not the id's marker). A
-                        // `String` operand is already its text.
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument != "Ljava/lang/String;"
-                                && let Some(text) = self.host.modelled_to_string_checked(value)?
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        // A `Class` operand naming a class a family kind owns prints
-                        // `Class.toString` or is counted (`owned_class.rs`).
-                        for (value, argument) in captured.iter_mut().zip(&arguments) {
-                            if argument == "Ljava/lang/Class;"
-                                && let Some(text) =
-                                    invoke_or_catch!(at, self.owned_class_text(value))
-                            {
-                                *value = Value::Ref(Some(text));
-                            }
-                        }
-                        let mut joined = String::new();
-                        let (mut next_arg, mut next_constant) = (0, 0);
-                        let mut expand = |placeholder: u8,
-                                          joined: &mut String,
-                                          next_arg: &mut usize,
-                                          next_constant: &mut usize|
-                         -> Result<(), NativeError> {
-                            match placeholder {
-                                1 => {
-                                    let value = captured.get(*next_arg).ok_or_else(|| {
-                                        NativeError::Metadata(
-                                            "concat recipe has more arguments than captures".into(),
-                                        )
-                                    })?;
-                                    let argument = arguments
-                                        .get(*next_arg)
-                                        .map_or("Ljava/lang/Object;", String::as_str);
-                                    joined.push_str(&java_value_text(
-                                        &mut *self.host,
-                                        value,
-                                        argument,
-                                    )?);
-                                    *next_arg += 1;
-                                }
-                                _ => {
-                                    let constant =
-                                        constants.get(*next_constant).ok_or_else(|| {
-                                            NativeError::Metadata(
-                                            "concat recipe has more constants than the bootstrap"
-                                                .into(),
-                                        )
-                                        })?;
-                                    joined.push_str(constant);
-                                    *next_constant += 1;
-                                }
-                            }
-                            Ok(())
-                        };
-                        if recipe.is_empty() {
-                            for (position, value) in captured.iter().enumerate() {
-                                let argument = arguments
-                                    .get(position)
-                                    .map_or("Ljava/lang/Object;", String::as_str);
-                                joined.push_str(&java_value_text(
-                                    &mut *self.host,
-                                    value,
-                                    argument,
-                                )?);
-                            }
-                        } else {
-                            for ch in recipe.chars() {
-                                match ch {
-                                    '\u{1}' | '\u{2}' => expand(
-                                        ch as u8,
-                                        &mut joined,
-                                        &mut next_arg,
-                                        &mut next_constant,
-                                    )?,
-                                    other => joined.push(other),
-                                }
-                            }
-                        }
-                        if return_desc(&descriptor) != "V" {
-                            stack.push(Value::Ref(Some(joined)));
+                            self.dispatch_string_concat_recipe(
+                                &descriptor,
+                                &recipe,
+                                &constants,
+                                captured,
+                                class,
+                                method,
+                            )
+                        ) {
+                            stack.push(answer);
                         }
                         continue;
                     }
