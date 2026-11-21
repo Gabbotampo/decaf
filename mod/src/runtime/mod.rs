@@ -228,6 +228,7 @@ mod optionull;
 mod owned_class;
 mod parked_threads;
 mod scanner_model;
+pub mod screen_models;
 mod server_values;
 mod tool_material;
 mod vanilla_entity_data_pool;
@@ -2409,6 +2410,8 @@ pub trait Host {
     fn menu_field(&mut self, _receiver: &Value, _r: &MethodRef) -> Option<Value> {
         None
     }
+
+    fn menu_field_set(&mut self, _receiver: &Value, _r: &MethodRef, _value: &Value) {}
 
     /// Record one property added to a `StateDefinition.Builder` while a block
     /// constructor's virtual `createBlockStateDefinition` runs.
@@ -6109,6 +6112,10 @@ impl Host for StdHost {
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
         menu_models::field(&self.menu_states, receiver, r)
+    }
+
+    fn menu_field_set(&mut self, receiver: &Value, r: &MethodRef, value: &Value) {
+        menu_models::set_field(&mut self.menu_states, receiver, r, value);
     }
 
     fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
@@ -33022,6 +33029,7 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal
                         && let Some(key) = instance_field_key(&receiver, &r)
                     {
+                        self.host.menu_field_set(&receiver, &r, &value);
                         if !self.fields.contains_key(&key) {
                             self.refuse_collected(&receiver, &r)?;
                         }

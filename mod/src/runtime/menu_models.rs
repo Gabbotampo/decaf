@@ -54,6 +54,21 @@ pub(crate) struct MenuState {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ScreenState {
+    pub menu: Value,
+    pub title: Value,
+    pub image_width: i32,
+    pub image_height: i32,
+    pub title_label_x: i32,
+    pub title_label_y: i32,
+    pub inventory_label_x: i32,
+    pub inventory_label_y: i32,
+    pub left_pos: i32,
+    pub top_pos: i32,
+    pub menu_resource: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub enum MenuAction {
     SlotsChanged { menu: Value, container: Value },
     CreateResult { menu: Value },
@@ -63,6 +78,7 @@ pub enum MenuAction {
 #[derive(Clone, Debug)]
 pub(crate) enum Object {
     Menu(MenuState),
+    Screen(ScreenState),
     Inventory {
         player: Value,
     },
@@ -89,6 +105,56 @@ pub(crate) enum Object {
 
 pub(crate) type States = BTreeMap<String, Object>;
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenLayout {
+    pub image_width: i32,
+    pub image_height: i32,
+    pub title_label: [i32; 2],
+    pub inventory_label: [i32; 2],
+    pub left_pos: i32,
+    pub top_pos: i32,
+    pub menu_resource: Option<String>,
+    pub slots: Vec<[i32; 3]>,
+}
+
+pub(crate) fn screen_layout(states: &States, screen: &Value) -> Option<ScreenLayout> {
+    let key = expect_ref(screen)?;
+    let Object::Screen(state) = states.get(key)? else {
+        return None;
+    };
+    let slots = match states.get(expect_ref(&state.menu)?)? {
+        Object::Menu(menu) => states.get(&menu.slots).and_then(|object| match object {
+            Object::SlotList { slots } => Some(
+                slots
+                    .iter()
+                    .filter_map(|slot| match states.get(slot) {
+                        Some(Object::Slot(slot)) => Some([slot.index, slot.x, slot.y]),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })?,
+        _ => Vec::new(),
+    };
+    Some(ScreenLayout {
+        image_width: state.image_width,
+        image_height: state.image_height,
+        title_label: [state.title_label_x, state.title_label_y],
+        inventory_label: [state.inventory_label_x, state.inventory_label_y],
+        left_pos: state.left_pos,
+        top_pos: state.top_pos,
+        menu_resource: state.menu_resource.clone(),
+        slots,
+    })
+}
+
+pub(crate) fn first_menu(states: &States) -> Option<Value> {
+    states
+        .iter()
+        .find_map(|(key, object)| matches!(object, Object::Menu(_)).then(|| marker(key.clone())))
+}
+
 pub(crate) fn is_menu_class(owner: &str) -> bool {
     matches!(
         owner,
@@ -104,6 +170,8 @@ pub(crate) fn is_menu_class(owner: &str) -> bool {
             | "net/minecraft/world/inventory/Slot"
             | "net/minecraft/world/inventory/ContainerLevelAccess"
             | "java/util/function/Predicate"
+            | "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen"
+            | "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen"
     )
 }
 
@@ -129,6 +197,30 @@ fn next_key(states: &States, prefix: &str) -> String {
 
 /// Resolve fields javac names through a jar subclass to the vanilla declaration.
 pub(crate) fn field_owner(owner: &str, name: &str, descriptor: &str) -> Option<&'static str> {
+    if owner == "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen" {
+        return matches!(
+            (name, descriptor),
+            ("imageWidth", "I")
+                | ("imageHeight", "I")
+                | ("titleLabelX", "I")
+                | ("titleLabelY", "I")
+                | ("inventoryLabelX", "I")
+                | ("inventoryLabelY", "I")
+                | ("leftPos", "I")
+                | ("topPos", "I")
+                | (
+                    "menu",
+                    "Lnet/minecraft/world/inventory/AbstractContainerMenu;"
+                )
+                | ("title", "Lnet/minecraft/network/chat/Component;")
+        )
+        .then_some("net/minecraft/client/gui/screens/inventory/AbstractContainerScreen");
+    }
+    if owner == "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen"
+        && name == "menuResource"
+    {
+        return Some("net/minecraft/client/gui/screens/inventory/ItemCombinerScreen");
+    }
     if owner != "net/minecraft/world/inventory/ItemCombinerMenu" {
         return None;
     }
@@ -169,7 +261,42 @@ pub(crate) fn field(states: &States, receiver: &Value, r: &MethodRef) -> Option<
         (Object::Slot(slot), "net/minecraft/world/inventory/Slot", "index") => {
             Some(Value::Int(slot.index))
         }
+        (Object::Screen(state), _, "imageWidth") => Some(Value::Int(state.image_width)),
+        (Object::Screen(state), _, "imageHeight") => Some(Value::Int(state.image_height)),
+        (Object::Screen(state), _, "titleLabelX") => Some(Value::Int(state.title_label_x)),
+        (Object::Screen(state), _, "titleLabelY") => Some(Value::Int(state.title_label_y)),
+        (Object::Screen(state), _, "inventoryLabelX") => Some(Value::Int(state.inventory_label_x)),
+        (Object::Screen(state), _, "inventoryLabelY") => Some(Value::Int(state.inventory_label_y)),
+        (Object::Screen(state), _, "leftPos") => Some(Value::Int(state.left_pos)),
+        (Object::Screen(state), _, "topPos") => Some(Value::Int(state.top_pos)),
+        (Object::Screen(state), _, "menu") => Some(state.menu.clone()),
+        (Object::Screen(state), _, "title") => Some(state.title.clone()),
+        (Object::Screen(state), _, "menuResource") => state
+            .menu_resource
+            .as_ref()
+            .map(|s| Value::Ref(Some(s.clone()))),
         _ => None,
+    }
+}
+
+pub(crate) fn set_field(states: &mut States, receiver: &Value, r: &MethodRef, value: &Value) {
+    let Some(key) = expect_ref(receiver).cloned() else {
+        return;
+    };
+    let Some(Object::Screen(state)) = states.get_mut(&key) else {
+        return;
+    };
+    let Value::Int(value) = value else { return };
+    match r.name.as_str() {
+        "imageWidth" => state.image_width = *value,
+        "imageHeight" => state.image_height = *value,
+        "titleLabelX" => state.title_label_x = *value,
+        "titleLabelY" => state.title_label_y = *value,
+        "inventoryLabelX" => state.inventory_label_x = *value,
+        "inventoryLabelY" => state.inventory_label_y = *value,
+        "leftPos" => state.left_pos = *value,
+        "topPos" => state.top_pos = *value,
+        _ => {}
     }
 }
 
@@ -228,6 +355,38 @@ pub(crate) fn call(
     args: &[Value],
 ) -> Option<Result<Value, NativeError>> {
     let key = expect_ref(receiver)?.to_owned();
+
+    if r.name == "<init>"
+        && matches!(
+            r.owner.as_str(),
+            "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen"
+                | "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen"
+        )
+    {
+        let menu = args.first().cloned().unwrap_or(Value::Ref(None));
+        let title = args.last().cloned().unwrap_or(Value::Ref(None));
+        let texture = args
+            .get(3)
+            .and_then(crate::runtime::host_ids::identifier_key)
+            .map(str::to_owned);
+        states.insert(
+            key,
+            Object::Screen(ScreenState {
+                menu,
+                title,
+                image_width: 176,
+                image_height: 166,
+                title_label_x: 8,
+                title_label_y: 6,
+                inventory_label_x: 8,
+                inventory_label_y: 72,
+                left_pos: 0,
+                top_pos: 0,
+                menu_resource: texture,
+            }),
+        );
+        return Some(Ok(Value::Void));
+    }
 
     if r.owner == "net/minecraft/world/inventory/ContainerLevelAccess"
         && key == "container-level-access/null"

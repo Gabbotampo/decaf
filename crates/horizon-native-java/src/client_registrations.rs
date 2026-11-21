@@ -54,6 +54,20 @@ pub(crate) enum Registration {
     },
 }
 
+pub(crate) fn menu_constructor(state: &State, menu: &Value) -> Option<Value> {
+    state
+        .registrations
+        .iter()
+        .rev()
+        .find_map(|registration| match registration {
+            Registration::MenuScreen {
+                menu: registered,
+                constructor,
+            } if registered == menu => Some(constructor.clone()),
+            _ => None,
+        })
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct State {
     pub(crate) registrations: Vec<Registration>,

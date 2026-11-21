@@ -529,6 +529,14 @@ pub enum DrawOp {
         rect: [f32; 4],
         argb: u32,
     },
+    /// A texture blit with explicit source and destination rectangles.
+    Blit {
+        texture: String,
+        src: [i32; 4],
+        dst: [f32; 4],
+        tex_size: [i32; 2],
+        tint: u32,
+    },
 }
 
 /// A chat line or action-bar message a mod sent.
@@ -992,6 +1000,51 @@ impl StdHost {
     /// Registration-only client APIs, in the order the jar called them.
     pub fn client_registration_summary(&self) -> serde_json::Value {
         client_registrations::summary(&self.client.registrations)
+    }
+
+    pub(crate) fn client_menu_constructor(&self, menu: &Value) -> Option<Value> {
+        client_registrations::menu_constructor(&self.client.registrations, menu)
+    }
+
+    pub(crate) fn client_screen_layout(
+        &self,
+        screen: &Value,
+    ) -> Option<crate::menu_models::ScreenLayout> {
+        crate::menu_models::screen_layout(&self.menu_states, screen)
+    }
+
+    pub(crate) fn client_draws(&self) -> &[DrawOp] {
+        &self.client.draws
+    }
+
+    pub(crate) fn client_frame_active(&self) -> bool {
+        self.client.frame.is_some()
+    }
+
+    pub(crate) fn client_menu_value(&self) -> Option<Value> {
+        crate::menu_models::first_menu(&self.menu_states)
+    }
+
+    pub(crate) fn client_default_screen_bg(&mut self, screen: &Value) -> Result<(), NativeError> {
+        let layout = self
+            .client_screen_layout(screen)
+            .ok_or_else(|| NativeError::Metadata("screen layout is unavailable".into()))?;
+        let texture = layout
+            .menu_resource
+            .ok_or_else(|| NativeError::Metadata("screen has no menu texture".into()))?;
+        self.client.draws.push(DrawOp::Blit {
+            texture,
+            src: [0, 0, layout.image_width, layout.image_height],
+            dst: [
+                layout.left_pos as f32,
+                layout.top_pos as f32,
+                (layout.left_pos + layout.image_width) as f32,
+                (layout.top_pos + layout.image_height) as f32,
+            ],
+            tex_size: [256, 256],
+            tint: u32::MAX,
+        });
+        Ok(())
     }
 
     /// The key mappings this host's jar registered, in order.
@@ -2190,6 +2243,13 @@ impl StdHost {
                 };
                 let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
                 state.draw(DrawOp::Sprite { sprite, rect, argb })
+            }
+            ("blit", descriptor) if descriptor.contains("Lnet/minecraft/resources/Identifier;") => {
+                let texture = crate::host_ids::identifier_key(args.first()?)?.to_owned();
+                let v = ints(1, 8)?;
+                let tint = args.get(9).and_then(|v| int_arg(std::slice::from_ref(v), 0)).unwrap_or(-1) as u32;
+                let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
+                state.draw(DrawOp::Blit { texture, src: [v[4], v[5], v[6], v[7]], dst: rect, tex_size: [v[6], v[7]], tint })
             }
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
