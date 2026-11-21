@@ -418,7 +418,7 @@ fn a_javac_item_combiner_screen_exposes_layout_and_background() {
     let draws = jar
         .draw_client_screen_bg(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
         .unwrap();
-    // ItemCombinerScreen.extractBackground javap offsets 1863-1895 uses UV 0/0,
+    // ItemCombinerScreen.extractBackground bytecode offsets 9-41 use UV 0/0,
     // image dimensions, and texture size 256/256 before extractErrorIcon.
     assert!(draws.iter().any(|draw| matches!(draw, DrawOp::Blit { texture, tex_size: [256, 256], .. } if texture == "demo:textures/gui/test.png")));
     assert!(host.unknown_host_calls().is_empty());
@@ -473,7 +473,7 @@ fn a_real_runes_client_registers_its_container_screen() {
     let layout = jar
         .open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
         .unwrap();
-    // AbstractContainerScreen.<init> offsets 0-12 and ItemCombinerScreen.extractBackground 1863-1895.
+    // AbstractContainerScreen.<init> offsets 0-12 and ItemCombinerScreen.extractBackground offsets 9-41, then extractErrorIcon at 44.
     assert_eq!(layout.layout.image_width, 176);
     assert_eq!(layout.layout.image_height, 166);
     assert_eq!(layout.layout.title_label, [60, 18]);

@@ -1036,7 +1036,10 @@ impl StdHost {
         let texture = layout
             .menu_resource
             .ok_or_else(|| NativeError::Metadata("screen has no menu texture".into()))?;
-        // 26.3 ItemCombinerScreen.extractBackground javap offsets 1863-1895:
+        // 26.3 ItemCombinerScreen.extractBackground (client jar, javap -c). Offset 6
+        // calls super.extractBackground, i.e. Screen's backdrop (transparent dim, or
+        // panorama/blur/menu background): the host screen draws that, so it isn't
+        // recorded here. Offsets 9-41:
         // blit(pipeline, menuResource, leftPos, topPos, 0F, 0F, imageWidth,
         // imageHeight, 256, 256), then extractErrorIcon(leftPos, topPos).
         self.client.draws.push(DrawOp::Blit {
