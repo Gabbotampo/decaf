@@ -32,6 +32,9 @@ struct Cli {
     game_version: Option<String>,
     /// `--game-block-classes <path>`: the exact prepared 26.3 closure table.
     game_block_classes: Option<String>,
+    /// `--client-role`: run the requested Fabric stages in the physical client
+    /// environment, including a client-only mod's `main` stage.
+    client_role: bool,
     path: String,
     kind: Option<String>,
     class: Option<String>,
@@ -45,6 +48,7 @@ impl Cli {
         let mut links = Vec::new();
         let mut game_version = None;
         let mut game_block_classes = None;
+        let mut client_role = false;
         let mut positional = Vec::new();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -61,6 +65,8 @@ impl Cli {
                 game_version = Some(args.next()?);
             } else if arg == "--game-block-classes" {
                 game_block_classes = Some(args.next()?);
+            } else if arg == "--client-role" {
+                client_role = true;
             } else {
                 positional.push(arg);
             }
@@ -73,6 +79,7 @@ impl Cli {
             links,
             game_version,
             game_block_classes,
+            client_role,
             path: positional.next()?,
             kind: positional.next(),
             class: positional.next(),
@@ -743,7 +750,7 @@ fn main() -> ExitCode {
     let Some(cli) = Cli::parse(std::env::args().skip(1)) else {
         eprintln!(
             "usage: horizon-native-java [--json] [--mixin-plans] [--weave <out.jar>] \
-             [--link <jar>]... [--game-version <version>] [--game-block-classes <path>] <mod.jar> \
+             [--link <jar>]... [--game-version <version>] [--game-block-classes <path>] [--client-role] <mod.jar> \
              [main|client|server|neoforge] [class]"
         );
         return ExitCode::FAILURE;
@@ -755,6 +762,7 @@ fn main() -> ExitCode {
         links,
         game_version,
         game_block_classes,
+        client_role,
         path,
         kind: requested_kind,
         class: explicit_class,
@@ -766,8 +774,8 @@ fn main() -> ExitCode {
     }
     let mut kind = requested_kind.clone().unwrap_or_else(|| "main".to_owned());
     // The census can ask for NeoForge's physical client side explicitly.
-    let force_client = kind == "neoforge-client";
-    if force_client {
+    let force_client = kind == "neoforge-client" || client_role;
+    if kind == "neoforge-client" {
         kind = "neoforge".to_owned();
     }
     let requested_kind = requested_kind.map(|k| {
@@ -823,7 +831,7 @@ fn main() -> ExitCode {
         // Every stage's own side is a server unless it is `client`.
         let mut entries = Vec::new();
         for stage in &requested_stages {
-            let side = if stage == "client" {
+            let side = if client_role || stage == "client" {
                 "CLIENT"
             } else {
                 "SERVER"
@@ -896,7 +904,20 @@ fn main() -> ExitCode {
             }
         };
     }
-    let mut host = jar.seed_host(seed);
+    let mut host = match jar.try_seed_host(seed) {
+        Ok(host) => host,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"status": "error", "stage": "load", "error": error})
+                );
+            } else {
+                eprintln!("error loading jar: {error}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
     for link in &links {
         let dependency = match NativeJar::from_path(&PathBuf::from(link)) {
             Ok(dependency) => dependency,
@@ -1305,6 +1326,7 @@ mod tests {
             links: Vec::new(),
             game_version: None,
             game_block_classes: None,
+            client_role: false,
             path: "mod.jar".into(),
             kind: Some("client".into()),
             class: Some("demo.Main".into()),
@@ -1317,6 +1339,21 @@ mod tests {
             parse(&["mod.jar", "--json", "client", "demo.Main"]),
             Some(expected)
         );
+        assert_eq!(
+            parse(&["--client-role", "mod.jar", "main"]),
+            Some(Cli {
+                json: false,
+                mixin_plans: false,
+                weave: None,
+                links: Vec::new(),
+                game_version: None,
+                game_block_classes: None,
+                client_role: true,
+                path: "mod.jar".into(),
+                kind: Some("main".into()),
+                class: None,
+            })
+        );
     }
 
     #[test]
@@ -1328,6 +1365,7 @@ mod tests {
             links: Vec::new(),
             game_version: None,
             game_block_classes: None,
+            client_role: false,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1345,6 +1383,7 @@ mod tests {
             links: Vec::new(),
             game_version: None,
             game_block_classes: None,
+            client_role: false,
             path: "mod.jar".into(),
             kind: None,
             class: None,
@@ -1367,6 +1406,7 @@ mod tests {
             links: vec!["a.jar".into(), "b.jar".into()],
             game_version: Some("26.3".into()),
             game_block_classes: None,
+            client_role: false,
             path: "mod.jar".into(),
             kind: Some("neoforge".into()),
             class: None,
@@ -1398,6 +1438,7 @@ mod tests {
             links: Vec::new(),
             game_version: None,
             game_block_classes: Some("classes.json".into()),
+            client_role: false,
             path: "mod.jar".into(),
             kind: Some("server".into()),
             class: None,
@@ -1420,6 +1461,7 @@ mod tests {
                 links: Vec::new(),
                 game_version: None,
                 game_block_classes: None,
+                client_role: false,
                 path: "mod.jar".into(),
                 kind: None,
                 class: None,

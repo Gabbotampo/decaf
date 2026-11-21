@@ -1804,6 +1804,14 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.counted_unknown_calls()
     }
 
+    fn supports_recipe_sync(&self) -> bool {
+        self.inner.supports_recipe_sync()
+    }
+
+    fn record_synced_recipe_serializer(&mut self, key: String, serializer: Value) {
+        self.inner.record_synced_recipe_serializer(key, serializer);
+    }
+
     fn jar_module_descriptor(&self) -> Option<bool> {
         self.inner.jar_module_descriptor()
     }

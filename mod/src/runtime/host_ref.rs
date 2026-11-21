@@ -633,6 +633,8 @@ pub enum HostKind {
     /// A Fabric `BiomeModification` that `BiomeModifications.create` made
     /// (`fabric_biome_modifications.rs`).
     FabricBiomeModification,
+    /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
+    RecipeSerializer,
     /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
     ItemStack,
     /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
@@ -2817,6 +2819,14 @@ const KINDS: &[KindInfo] = &[
         canonical: never_canonical,
         // It overrides nothing of `Object`: identity `equals`, `hashCode`/`toString` counted.
         methods: &crate::runtime::host_events::DECLARED_TYPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeSerializer,
+        tag: "rser",
+        class: ClassRule::Fixed(crate::runtime::recipe_serializer::OWNER),
+        // A serial per `new RecipeSerializer` allocation: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_serializer::METHODS,
     },
     KindInfo {
         kind: HostKind::ItemStack,
