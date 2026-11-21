@@ -2899,6 +2899,11 @@ pub trait Host {
         None
     }
 
+    /// The collection a `List.reversed()` view reads, by the view's marker.
+    fn reversed_view_source(&self, _marker: &str) -> Option<String> {
+        None
+    }
+
     fn is_unmodifiable_collection(&self, _marker: &str) -> bool {
         false
     }
@@ -2946,6 +2951,27 @@ pub trait Host {
     fn collection_generation(&self, _marker: &str) -> Option<u64> {
         None
     }
+
+    /// Allocate a fresh invocation run id for identity-epoch tracking.
+    fn next_identity_run(&mut self) -> u64 {
+        0
+    }
+
+    /// Clear per-collection identity-epoch entries after an epoch bump.
+    fn clear_identity_known_epochs(&mut self) {}
+
+    /// `(run_id, epoch)` at which `marker`'s identity-collection contents were
+    /// last known, if recorded.
+    fn identity_known_epoch(&self, _marker: &str) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Record the `(run_id, epoch)` at which `marker` was freshly constructed.
+    fn set_identity_known_epoch(&mut self, _marker: &str, _run_id: u64, _epoch: u64) {}
+
+    /// Record the current length of the runtime's identity-token table for
+    /// bounded-growth diagnostics.
+    fn note_identity_token_table_len(&mut self, _len: usize) {}
 
     /// The list the host keeps for `marker`, borrowed; `None` as for
     /// [`Self::collection_generation`].
@@ -3086,6 +3112,11 @@ pub trait Host {
         None
     }
 
+    /// The collection or iterator handle held by enumeration `marker`.
+    fn enumeration_source(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
     fn store_enumeration(&mut self, _marker: &str, _over: host_iterator::EnumerationOver) {}
 
     fn new_list_iterator(&mut self, _state: host_list_iterator::ListIter) -> Option<String> {
@@ -3094,6 +3125,11 @@ pub trait Host {
 
     /// A host list iterator's state, by marker.
     fn list_iterator(&self, _marker: &str) -> Option<host_list_iterator::ListIter> {
+        None
+    }
+
+    /// The list handle held by list iterator `marker`.
+    fn list_iterator_source(&self, _marker: &str) -> Option<Value> {
         None
     }
 
@@ -3138,6 +3174,14 @@ pub trait Host {
     }
 
     fn set_host_iterator_source(&mut self, _marker: &str, _source: String) {}
+
+    /// The originating collection or stream root handle for host iterator `marker`.
+    fn host_iterator_origin(&self, _marker: &str) -> Option<Value> {
+        None
+    }
+
+    /// Attach an originating collection or stream root handle to host iterator `marker`.
+    fn set_host_iterator_origin(&mut self, _marker: &str, _origin: Value) {}
 
     /// The provider classes explicitly seeded for one `ServiceLoader` key.
     /// An unseeded service answers an empty list, never a classpath scan.
@@ -3909,7 +3953,9 @@ pub struct StdHost {
     /// The referent of every `java.lang.ref.Reference` a jar built, keyed by
     /// its object marker ([`references`]).
     references: BTreeMap<String, Value>,
-    iterators: BTreeMap<String, (Vec<Value>, usize)>,
+    iterators: BTreeMap<String, HostIterator>,
+    /// Peak length observed for `Runtime::identity_collections.tokens`.
+    peak_identity_tokens: usize,
     /// The last value returned by each generic iterator, for Iterator.remove.
     iterator_last: BTreeMap<String, Value>,
     /// The enumerations `Collections.enumeration`/`Vector.elements()` made, by key
@@ -4167,6 +4213,7 @@ impl StdHost {
             levels: Vec::new(),
             references: BTreeMap::new(),
             iterators: BTreeMap::new(),
+            peak_identity_tokens: 0,
             iterator_last: BTreeMap::new(),
             enumerations: BTreeMap::new(),
             iterator_guards: BTreeMap::new(),
@@ -4868,7 +4915,8 @@ impl StdHost {
             .resource(name)
             .map(|value| vec![Value::Ref(Some(value.to_owned()))])
             .unwrap_or_default();
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         host_iterator::enumeration(marker)
     }
 
@@ -7576,6 +7624,12 @@ impl Host for StdHost {
         self.unmodifiable_collections.get(marker).cloned().flatten()
     }
 
+    fn reversed_view_source(&self, marker: &str) -> Option<String> {
+        self.reversed_views
+            .get(marker)
+            .map(|(base, _)| base.clone())
+    }
+
     fn mark_unmodifiable_collection(&mut self, marker: &str) {
         self.unmodifiable_collections
             .entry(marker.to_owned())
@@ -7624,6 +7678,27 @@ impl Host for StdHost {
     fn collection_generation(&self, marker: &str) -> Option<u64> {
         let marker = self.direct_collection(marker)?;
         Some(self.mutable_collections.generation(marker))
+    }
+
+    fn next_identity_run(&mut self) -> u64 {
+        self.mutable_collections.next_identity_run()
+    }
+
+    fn clear_identity_known_epochs(&mut self) {
+        self.mutable_collections.clear_identity_epochs();
+    }
+
+    fn identity_known_epoch(&self, marker: &str) -> Option<(u64, u64)> {
+        self.mutable_collections.collection_identity_epoch(marker)
+    }
+
+    fn set_identity_known_epoch(&mut self, marker: &str, run_id: u64, epoch: u64) {
+        self.mutable_collections
+            .set_collection_identity_epoch(marker.to_owned(), run_id, epoch);
+    }
+
+    fn note_identity_token_table_len(&mut self, len: usize) {
+        self.peak_identity_tokens = self.peak_identity_tokens.max(len);
     }
 
     fn collection_slice(&self, marker: &str) -> Option<&[Value]> {
@@ -7768,21 +7843,21 @@ impl Host for StdHost {
     }
 
     fn iterator_cursor(&self, marker: &str) -> Option<usize> {
-        self.iterators.get(marker).map(|(_, index)| *index)
+        self.iterators.get(marker).map(|entry| entry.index)
     }
 
     fn empty_iterator(&mut self) -> Value {
         // A shared singleton: one row, which stays empty.
         self.iterators
             .entry(host_iterator::EMPTY_ITERATOR.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::iterator(host_iterator::EMPTY_ITERATOR.to_owned())
     }
 
     fn empty_enumeration(&mut self) -> Value {
         self.iterators
             .entry(host_iterator::EMPTY_ENUMERATION.to_owned())
-            .or_insert((Vec::new(), 0));
+            .or_insert_with(|| HostIterator::new(Vec::new(), None));
         host_iterator::enumeration(host_iterator::EMPTY_ENUMERATION.to_owned())
     }
 
@@ -7795,6 +7870,12 @@ impl Host for StdHost {
 
     fn enumeration_over(&self, marker: &str) -> Option<host_iterator::EnumerationOver> {
         self.enumerations.get(marker).cloned()
+    }
+
+    fn enumeration_source(&self, marker: &str) -> Option<Value> {
+        self.enumerations
+            .get(marker)
+            .map(|over| over.held().clone())
     }
 
     fn store_enumeration(&mut self, marker: &str, over: host_iterator::EnumerationOver) {
@@ -7812,46 +7893,52 @@ impl Host for StdHost {
         self.list_iterators.get(marker).cloned()
     }
 
+    fn list_iterator_source(&self, marker: &str) -> Option<Value> {
+        self.list_iterators
+            .get(marker)
+            .map(|state| state.source().clone())
+    }
+
     fn store_list_iterator(&mut self, marker: &str, state: host_list_iterator::ListIter) {
         self.list_iterators.insert(marker.to_owned(), state);
     }
 
     fn host_iterator(&self, marker: &str) -> Option<(usize, usize, Option<String>)> {
-        let (values, index) = self.iterators.get(marker)?;
+        let entry = self.iterators.get(marker)?;
         Some((
-            *index,
-            values.len(),
+            entry.index,
+            entry.values.len(),
             self.iterator_sources.get(marker).cloned(),
         ))
     }
 
     fn host_iterator_next(&mut self, marker: &str) -> Result<Value, NativeError> {
-        let (values, index) = self
+        let entry = self
             .iterators
             .get_mut(marker)
             .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
-        let value = values
-            .get(*index)
-            .cloned()
-            .ok_or_else(|| NativeError::UncaughtException {
+        let value = entry.values.get(entry.index).cloned().ok_or_else(|| {
+            NativeError::UncaughtException {
                 class: "java/util/NoSuchElementException".into(),
                 message: None,
                 frame: None,
-            })?;
-        *index += 1;
+            }
+        })?;
+        entry.index += 1;
         Ok(value)
     }
 
     fn set_host_iterator_cursor(&mut self, marker: &str, cursor: usize) {
-        if let Some((values, index)) = self.iterators.get_mut(marker) {
-            *index = cursor.min(values.len());
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.index = cursor.min(entry.values.len());
         }
     }
 
     fn new_host_iterator(&mut self, values: Vec<Value>, source: Option<String>) -> Option<Value> {
         let marker = format!("iterator/{}", self.next_iterator);
         self.next_iterator = self.next_iterator.saturating_add(1);
-        self.iterators.insert(marker.clone(), (values, 0));
+        self.iterators
+            .insert(marker.clone(), HostIterator::new(values, None));
         if let Some(source) = source {
             self.iterator_sources.insert(marker.clone(), source);
         }
@@ -7859,11 +7946,23 @@ impl Host for StdHost {
     }
 
     fn host_iterator_values(&self, marker: &str) -> Option<Vec<Value>> {
-        self.iterators.get(marker).map(|(values, _)| values.clone())
+        self.iterators.get(marker).map(|entry| entry.values.clone())
     }
 
     fn set_host_iterator_source(&mut self, marker: &str, source: String) {
         self.iterator_sources.insert(marker.to_owned(), source);
+    }
+
+    fn host_iterator_origin(&self, marker: &str) -> Option<Value> {
+        self.iterators
+            .get(marker)
+            .and_then(|entry| entry.origin.clone())
+    }
+
+    fn set_host_iterator_origin(&mut self, marker: &str, origin: Value) {
+        if let Some(entry) = self.iterators.get_mut(marker) {
+            entry.origin = Some(origin);
+        }
     }
 
     fn immutable_collection(&mut self, kind: &str, values: Vec<Value>) -> Option<Value> {
@@ -11980,7 +12079,8 @@ impl Host for StdHost {
                 }
                 let iterator = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(iterator.clone(), (Vec::new(), 0));
+                self.iterators
+                    .insert(iterator.clone(), HostIterator::new(Vec::new(), None));
                 return Ok(host_iterator::iterator(iterator));
             }
             if r.name == "findFirst"
@@ -12003,8 +12103,10 @@ impl Host for StdHost {
         if r.owner == "java/util/Enumeration"
             && matches!(r.descriptor.as_str(), "()Z" | "()Ljava/lang/Object;")
             && let Some(marker) = receiver_marker.as_deref()
-            && let Some((values, index)) = self.iterators.get_mut(marker)
+            && let Some(entry) = self.iterators.get_mut(marker)
         {
+            let values = &entry.values;
+            let index = &mut entry.index;
             match (r.name.as_str(), r.descriptor.as_str()) {
                 ("hasMoreElements", "()Z") => {
                     return Ok(Value::Int((*index < values.len()) as i32));
@@ -12053,7 +12155,10 @@ impl Host for StdHost {
             let values = host_collection_values(self, receiver)?;
             let marker = format!("iterator/{}", self.next_iterator);
             self.next_iterator = self.next_iterator.saturating_add(1);
-            self.iterators.insert(marker.clone(), (values, 0));
+            self.iterators.insert(
+                marker.clone(),
+                HostIterator::new(values, Some(receiver.clone())),
+            );
             if let Some(source) = expect_ref(receiver).and_then(|source| iterated_kind(source)) {
                 self.iterator_sources.insert(marker.clone(), source);
             }
@@ -12087,11 +12192,11 @@ impl Host for StdHost {
             if r.name == "forEachRemaining" && r.descriptor == "(Ljava/util/function/Consumer;)V" {
                 let callback = Self::argument(r, args, 0)?.clone();
                 let remaining = {
-                    let (values, index) = self.iterators.get_mut(marker).ok_or_else(|| {
+                    let entry = self.iterators.get_mut(marker).ok_or_else(|| {
                         NativeError::Metadata("unknown java/util/Iterator marker".into())
                     })?;
-                    let remaining = values.get(*index..).unwrap_or_default().to_vec();
-                    *index = values.len();
+                    let remaining = entry.values.get(entry.index..).unwrap_or_default().to_vec();
+                    entry.index = entry.values.len();
                     remaining
                 };
                 for value in remaining {
@@ -12107,10 +12212,12 @@ impl Host for StdHost {
                 }
                 return Ok(Value::Void);
             }
-            let (values, index) = self
+            let entry = self
                 .iterators
                 .get_mut(marker)
                 .ok_or_else(|| NativeError::Metadata("unknown java/util/Iterator marker".into()))?;
+            let values = &entry.values;
+            let index = &mut entry.index;
             if r.name == "remove" && r.descriptor == "()V" {
                 let source = self.iterator_sources.get(marker).cloned();
                 if source.as_deref().is_some_and(|source| {
@@ -13792,7 +13899,8 @@ impl Host for StdHost {
                 let values = registry_contents::values(self, &id);
                 let marker = format!("iterator/{}", self.next_iterator);
                 self.next_iterator = self.next_iterator.saturating_add(1);
-                self.iterators.insert(marker.clone(), (values, 0));
+                self.iterators
+                    .insert(marker.clone(), HostIterator::new(values, None));
                 Ok(host_iterator::iterator(marker))
             }
             // A `ResourceKey` or `TagKey` handle (`host_ids.rs`); `toString`/
@@ -25006,6 +25114,33 @@ fn parse_value_marker(marker: &str) -> Result<Value, NativeError> {
 /// the wild are kilobytes; a crafted one must not grow host memory.
 const MAX_GSON_JSON_BYTES: usize = 1024 * 1024;
 
+/// A host-owned iterator snapshot together with its cursor and originating
+/// collection/stream handle (used for identity-collection invalidation and GC).
+#[derive(Clone, Debug)]
+pub(crate) struct HostIterator {
+    pub(crate) values: Vec<Value>,
+    pub(crate) index: usize,
+    pub(crate) origin: Option<Value>,
+}
+
+impl HostIterator {
+    fn new(values: Vec<Value>, origin: Option<Value>) -> Self {
+        Self {
+            values,
+            index: 0,
+            origin,
+        }
+    }
+}
+
+/// A runtime-owned value-list stream together with its originating collection
+/// handle (recorded when minted so derived-handle lookup needs no side map).
+#[derive(Clone, Debug)]
+pub(crate) struct StreamEntry {
+    pub(crate) values: Vec<Value>,
+    pub(crate) origin: Option<Value>,
+}
+
 struct Runtime<'a, H> {
     classes: &'a BTreeMap<String, ClassFile>,
     /// Each class a jar `@Mixin` targets, with the mixin classes naming it,
@@ -25029,7 +25164,7 @@ struct Runtime<'a, H> {
     arrays: BTreeMap<String, ArrayData>,
     next_array: usize,
     next_object: usize,
-    streams: BTreeMap<String, Vec<Value>>,
+    streams: BTreeMap<String, StreamEntry>,
     next_stream: usize,
     /// Lazy stream stages and builders (`stream_pipeline.rs`).
     pipelines: stream_pipeline::Pipelines,
@@ -32533,7 +32668,13 @@ impl<H: Host> Runtime<'_, H> {
     fn new_stream(&mut self, class: &str, method: &str, values: Vec<Value>) -> Value {
         let marker = stream_pipeline::stream_marker(class, method, self.next_stream);
         self.next_stream += 1;
-        self.streams.insert(marker.clone(), values);
+        self.streams.insert(
+            marker.clone(),
+            StreamEntry {
+                values,
+                origin: None,
+            },
+        );
         Value::Ref(Some(marker))
     }
 
@@ -32801,7 +32942,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
             }
             ("isEmpty", "()Z") => Value::Int(values.is_empty() as i32),
-            _ => return self.more_stream_stages(r, &values),
+            _ => return self.more_stream_stages(r, receiver, &values),
         };
         Ok(Some(result))
     }
@@ -37394,13 +37535,6 @@ impl<H: Host> Runtime<'_, H> {
                         );
                     }
                     let value = self.materialize_host_value(value);
-                    self.record_identity_derivation(
-                        &r,
-                        jar_body,
-                        taint_receiver.as_ref(),
-                        &args,
-                        &value,
-                    );
                     // No JDK or library API answers a `null` Optional: a host
                     // answer of null for one is its empty value.
                     let value = match empty_optional_for(&r.descriptor) {

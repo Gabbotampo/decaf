@@ -347,7 +347,6 @@ impl<H: Host> Runtime<'_, H> {
             return Ok(value);
         }
         if let Some(value) = self.invoke_jdk_skeleton(&r, opcode, Some(receiver), args)? {
-            self.record_identity_derivation(&r, false, Some(receiver), args, &value);
             return Ok(value);
         }
         let mut values = Vec::with_capacity(args.len() + 1);

@@ -92,6 +92,15 @@ fn adversarial_identity_review() {
         ("reflectPutThenSpliteratorOut", "n=2"),
         ("reflectPutThenStreamSupportOut", "n=2"),
         ("reflectPutThenIterSpliteratorOut", "CME"),
+        // Round-6 findings: live entries escaped through `entrySet().forEach(...)`
+        // (and unmodifiable wrappers), enumerations, and stream iterators resolve
+        // their root directly from host/runtime state (no `derived_roots` side map).
+        ("forEachSavedEntryToStringOut", "k=2"),
+        ("forEachSavedEntryEqualsOut", "false:true:false:true"),
+        ("forEachSavedEntryConcatOut", "e=k=2"),
+        ("unmodForEachSavedEntryToStringOut", "k=2"),
+        ("reflectPutThenEnumerationOut", "true"),
+        ("reflectPutThenStreamIteratorOut", "true"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -144,6 +153,12 @@ fn adversarial_identity_review() {
         "reflectPutThenSpliteratorOut",
         "reflectPutThenStreamSupportOut",
         "reflectPutThenIterSpliteratorOut",
+        "forEachSavedEntryToStringOut",
+        "forEachSavedEntryEqualsOut",
+        "forEachSavedEntryConcatOut",
+        "unmodForEachSavedEntryToStringOut",
+        "reflectPutThenEnumerationOut",
+        "reflectPutThenStreamIteratorOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -160,6 +175,7 @@ fn adversarial_identity_review() {
             .unwrap();
         let actual = match value {
             Value::Ref(Some(s)) => s,
+            Value::Ref(None) if must_count.contains(&method) => "null".to_owned(),
             other => panic!("{method}: {other:?}"),
         };
         let counted = host.unknown_host_call_count();
@@ -372,6 +388,60 @@ fn adversarial_identity_review() {
                     calls.iter().any(|(call, _)| call
                         == "java/util/Spliterator#forEachRemaining(Ljava/util/function/Consumer;)V"),
                     "{method} must count Spliterator#forEachRemaining after epoch bump: {calls:?}"
+                );
+            }
+            if matches!(
+                method,
+                "forEachSavedEntryToStringOut" | "unmodForEachSavedEntryToStringOut"
+            ) {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Map$Entry#toString()Ljava/lang/String;"),
+                    "{method} must count Map$Entry#toString after reflective put: {calls:?}"
+                );
+            }
+            if method == "forEachSavedEntryEqualsOut" {
+                let calls = host.unknown_host_calls();
+                let equals_count: usize = calls
+                    .iter()
+                    .filter(|(call, _)| call == "java/util/Map$Entry#equals(Ljava/lang/Object;)Z")
+                    .map(|(_, count)| *count)
+                    .sum();
+                assert!(
+                    equals_count >= 4,
+                    "forEachSavedEntryEqualsOut must count all four Map$Entry#equals calls (both directions), got {equals_count}: {calls:?}"
+                );
+            }
+            if method == "forEachSavedEntryConcatOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| {
+                        call == "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;"
+                            || call.starts_with(
+                                "java/lang/invoke/StringConcatFactory#makeConcatWithConstants(",
+                            )
+                    }),
+                    "forEachSavedEntryConcatOut must count String#valueOf or StringConcatFactory#makeConcatWithConstants: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenEnumerationOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Enumeration#hasMoreElements()Z"),
+                    "reflectPutThenEnumerationOut must count Enumeration#hasMoreElements: {calls:?}"
+                );
+            }
+            if method == "reflectPutThenStreamIteratorOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Iterator#hasNext()Z"),
+                    "reflectPutThenStreamIteratorOut must count Iterator#hasNext on stream iterator: {calls:?}"
                 );
             }
         } else if counted == 0 {
@@ -689,5 +759,159 @@ public abstract class IdentityMixin {
         calls.iter().any(|(call, _)| call
             == "java/util/IdentityHashMap#get(Ljava/lang/Object;)Ljava/lang/Object;"),
         "@ModifyVariable(LOAD) swapping equal-text String must count IdentityHashMap#get: {calls:?}"
+    );
+}
+
+#[test]
+fn hundred_thousand_iterators_and_streams_do_not_grow_identity_tables() {
+    let probe = r#"package demo;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.stream.*;
+public final class Probe {
+    static IdentityHashMap<Object, Integer> LIVE_AFTER_BUMP;
+    static final Object LIVE_KEY = new Object();
+    static int runLoop(int iterations) {
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put("k", 1);
+        Set<String> ks = m.keySet();
+        int touched = 0;
+        for (int i = 0; i < iterations; i++) {
+            Iterator<String> it = ks.iterator();
+            Stream<String> st = ks.stream();
+            if (it != null && st != null) {
+                touched++;
+            }
+        }
+        return touched;
+    }
+    public static int cleanLoop100k() {
+        return runLoop(100_000);
+    }
+    public static int postBumpLoop() throws Exception {
+        Method gc = System.class.getMethod("gc");
+        gc.invoke(null);
+        return runLoop(2_000);
+    }
+    public static int bumpAndAllocateMany() throws Exception {
+        Method gc = System.class.getMethod("gc");
+        gc.invoke(null);
+        LIVE_AFTER_BUMP = new IdentityHashMap<>();
+        LIVE_AFTER_BUMP.put(LIVE_KEY, 42);
+        int sum = 0;
+        for (int i = 0; i < 2_000; i++) {
+            IdentityHashMap<String, Integer> tmp = new IdentityHashMap<>();
+            tmp.put("k", i);
+            sum += tmp.size();
+        }
+        return sum;
+    }
+    public static int triggerGc() {
+        int s = 0;
+        for (int i = 0; i < 6_000; i++) {
+            s += new int[1].length;
+        }
+        return s;
+    }
+    public static String checkLive() {
+        return String.valueOf(LIVE_AFTER_BUMP.get(LIVE_KEY));
+    }
+}"#;
+    let fixture = Fixture::build("identity-loop-bounded", &[("demo/Probe.java", probe)]);
+
+    // 100,000 iterators and 100,000 streams in a single invocation before any epoch bump:
+    // identity tables stay bounded (no per-handle derived_roots table exists).
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let result = fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "cleanLoop100k", "()I", None, &[], &mut host)
+        .unwrap();
+    assert_eq!(result, Value::Int(100_000));
+    assert_eq!(
+        host.unknown_host_call_count(),
+        0,
+        "cleanLoop100k counted: {:?}",
+        host.unknown_host_calls()
+    );
+    assert!(
+        host.identity_epoch_count() <= 1,
+        "expected <= 1 identity_epochs entry, got {}",
+        host.identity_epoch_count()
+    );
+    assert!(
+        host.peak_identity_token_count() <= 1,
+        "expected <= 1 identity token entry, got {}",
+        host.peak_identity_token_count()
+    );
+
+    // Same iterator+stream loop AFTER an epoch bump so `CollectionStore::identity_epochs`
+    // records the freshly constructed map: still bounded at 1 entry.
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let result = fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "postBumpLoop", "()I", None, &[], &mut host)
+        .unwrap();
+    assert_eq!(result, Value::Int(2_000));
+    assert!(
+        host.identity_epoch_count() <= 1,
+        "expected <= 1 identity_epochs entry after bump + loop, got {}",
+        host.identity_epoch_count()
+    );
+    assert!(
+        host.peak_identity_token_count() <= 1,
+        "expected <= 1 identity token entry after bump + loop, got {}",
+        host.peak_identity_token_count()
+    );
+
+    // 2,000 transient IdentityHashMaps allocated after an epoch bump alongside one
+    // live static IdentityHashMap: once the call log is rewound and GC runs without
+    // another epoch bump, `CollectionStore::retain_markers` prunes every unreachable
+    // map's `identity_epochs` entry down to the 1 live map.
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let mark = host.call_log_mark();
+    let sum = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "bumpAndAllocateMany",
+            "()I",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(sum, Value::Int(2_000));
+    host.rewind_call_log(mark);
+    let _ = fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "triggerGc", "()I", None, &[], &mut host)
+        .unwrap();
+    assert!(
+        host.freed_object_ranges() > 0,
+        "expected resident-heap GC to run after allocating 2,000 transient IdentityHashMaps"
+    );
+    assert_eq!(
+        host.identity_epoch_count(),
+        1,
+        "expected GC to prune all 2,000 transient identity_epochs down to the 1 live static map"
+    );
+    let counted_after_alloc = host.unknown_host_call_count();
+    let live = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "checkLive",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(live, Value::Ref(Some("42".into())));
+    assert_eq!(
+        host.unknown_host_call_count(),
+        counted_after_alloc,
+        "live map should stay readable with zero extra counted calls: {:?}",
+        host.unknown_host_calls()
     );
 }

@@ -78,7 +78,11 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<String>, NativeError> {
-        if self.is_counted_string(value) {
+        if self.is_counted_string(value)
+            || self
+                .uncertain_identity_root(value, &object_to_string())
+                .is_some()
+        {
             return Ok(None);
         }
         if matches!(value, Value::Ref(Some(_))) || crate::runtime::jar_object::is_object(value) {
@@ -217,6 +221,15 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<Option<Value>, NativeError> {
+        if self
+            .uncertain_identity_root(value, &object_to_string())
+            .is_some()
+        {
+            return self
+                .host
+                .unknown_operand_call(&object_to_string())
+                .map(Some);
+        }
         // A host handle prints its kind's `toString` (`host_ref.rs`); one
         // whose held value has no text here is counted.
         if let Value::Host(handle) = value
@@ -310,6 +323,13 @@ impl<H: Host> Runtime<'_, H> {
         class: &str,
         method: &str,
     ) -> Result<String, NativeError> {
+        if self
+            .uncertain_identity_root(value, &object_to_string())
+            .is_some()
+        {
+            self.host.unknown_operand_call(&object_to_string())?;
+            return Ok("null".into());
+        }
         if let Value::Host(handle) = value
             && !crate::runtime::jar_object::is_object_handle(handle)
         {
@@ -447,7 +467,11 @@ impl<H: Host> Runtime<'_, H> {
         if self.builder_text(value).is_some() {
             return Ok(None);
         }
-        if self.is_counted_string(value) {
+        if self.is_counted_string(value)
+            || self
+                .uncertain_identity_root(value, &object_to_string())
+                .is_some()
+        {
             return self.counted_unknown(r).map(Some);
         }
         let Some(text) = self.runtime_value_of(value, class, method)? else {

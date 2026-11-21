@@ -84,14 +84,6 @@ pub(crate) struct IdentityCollectionTokens {
     values: Vec<reference_identity::CallIdentity>,
 }
 
-/// Unique key for a runtime handle (collection, view, wrapper, entry,
-/// iterator, spliterator, stream, etc.) in `IdentityCollections::derived_roots`.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum IdentityHandleKey {
-    Host(crate::runtime::host_ref::HostKind, String),
-    RefMarker(String),
-}
-
 /// Classification of an identity collection or view over one for exact
 /// `equals`/`hashCode` semantics.
 enum IdentityCollectionKind {
@@ -108,21 +100,21 @@ enum IdentityCollectionKind {
     Values(Value),
 }
 
-/// Runtime-wide identity epoch, per-collection provenance, and derived-handle
-/// root map for `IdentityHashMap` / `IdentityHashSet`.
+/// Per-invocation identity epoch and allocation provenance for
+/// `IdentityHashMap` / `IdentityHashSet`.
 ///
 /// Any counted unknown call that is not provably unable to run jar code or
-/// touch Java state bumps `epoch`. Every identity collection records the epoch
-/// at which its contents were last fully known (defaulting to `0` for
-/// pre-existing/static/unseen collections); whenever `known < epoch`, every
-/// operation on the collection or any handle derived from it (views, entries,
-/// iterators, spliterators, streams and their stages, wrappers) is counted.
+/// touch Java state bumps `epoch`. Each freshly constructed identity
+/// collection stores its `(run_id, known_epoch)` inside `CollectionStore` so
+/// removal, epoch bumps, and GC prune it automatically; derived handles
+/// (views, live entries, iterators, list iterators, enumerations, spliterators,
+/// streams and their stages) resolve their root directly from their own
+/// host/runtime state with no separate side map.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IdentityCollections {
+    run_id: u64,
     epoch: u64,
-    known_epochs: std::collections::BTreeMap<String, u64>,
     tokens: std::collections::BTreeMap<String, IdentityCollectionTokens>,
-    derived_roots: std::collections::BTreeMap<IdentityHandleKey, String>,
 }
 
 fn same_handle(a: &Value, b: &Value) -> bool {
@@ -189,22 +181,36 @@ impl<H: Host> Runtime<'_, H> {
         ) && !self.host.is_set_from_map(collection)
     }
 
+    fn collection_known_epoch(&self, marker: &str) -> u64 {
+        self.host
+            .identity_known_epoch(marker)
+            .filter(|&(run_id, _)| run_id == self.identity_collections.run_id)
+            .map_or(0, |(_, epoch)| epoch)
+    }
+
     /// Record that a freshly constructed identity collection starts with fully
     /// known contents at the current runtime epoch.
     pub(crate) fn note_fresh_identity_collection(&mut self, collection: &Value) {
         if let Some(marker) = crate::runtime::jar_object::object_key(collection) {
-            self.identity_collections
-                .known_epochs
-                .insert(marker.to_owned(), self.identity_collections.epoch);
+            let epoch = self.identity_collections.epoch;
+            if epoch > 0 {
+                self.host
+                    .set_identity_known_epoch(marker, self.identity_collections.run_id, epoch);
+            }
             self.identity_collections.tokens.remove(marker);
         }
     }
 
-    /// Advance the runtime-wide identity epoch after a counted unknown call
+    /// Advance the invocation's identity epoch after a counted unknown call
     /// that could have run jar bytecode or mutated Java state, invalidating
     /// every pre-existing identity collection (static, deep, captured, or
     /// host-held) without any reachability walk.
     pub(crate) fn bump_identity_epoch(&mut self) {
+        if self.identity_collections.run_id == 0 {
+            self.identity_collections.run_id = self.host.next_identity_run();
+        } else {
+            self.host.clear_identity_known_epochs();
+        }
         self.identity_collections.epoch = self.identity_collections.epoch.saturating_add(1);
         self.identity_collections.tokens.clear();
     }
@@ -283,155 +289,106 @@ impl<H: Host> Runtime<'_, H> {
         if Self::uncertain_key(collection).is_some_and(|key| self.fields.contains_key(&key)) {
             return true;
         }
-        if self.identity_collections.epoch == 0 || !self.is_identity_collection(collection) {
+        let current_epoch = self.identity_collections.epoch;
+        if current_epoch == 0 || !self.is_identity_collection(collection) {
             return false;
         }
         let known = crate::runtime::jar_object::object_key(collection)
-            .and_then(|marker| self.identity_collections.known_epochs.get(marker).copied())
+            .map(|marker| self.collection_known_epoch(marker))
             .unwrap_or(0);
-        known < self.identity_collections.epoch
-    }
-
-    fn identity_handle_key(&self, value: &Value) -> Option<IdentityHandleKey> {
-        match value {
-            Value::Host(handle) => Some(IdentityHandleKey::Host(
-                handle.kind(),
-                handle.key().to_owned(),
-            )),
-            Value::Ref(Some(text))
-                if stream_pipeline::is_stream_marker(text)
-                    || !value_class::is_plain_string(text) =>
-            {
-                Some(IdentityHandleKey::RefMarker(text.clone()))
-            }
-            _ => None,
-        }
+        known < current_epoch
     }
 
     /// Resolve an identity collection or ANY handle derived from one (views,
-    /// entries, iterators, list/set iterators, spliterators, streams and their
-    /// intermediate stages, `Collections.unmodifiable*`/`synchronized*`
-    /// wrappers, Guava wrappers) to its root identity collection marker.
+    /// live/wrapped entries, iterators, list iterators, enumerations,
+    /// spliterators, streams and their intermediate stages,
+    /// `Collections.unmodifiable*`/`synchronized*`/`reversed`/`subList`
+    /// wrappers) directly from the handle's own host/runtime state.
     pub(crate) fn identity_root_marker(&self, value: &Value) -> Option<String> {
+        self.identity_root_marker_depth(value, 0)
+    }
+
+    fn identity_root_marker_depth(&self, value: &Value, depth: usize) -> Option<String> {
+        if depth >= MAX_SUPERCLASS_WALK {
+            return None;
+        }
         if self.is_identity_collection(value) {
             return crate::runtime::jar_object::object_key(value).map(str::to_owned);
         }
-        self.identity_handle_key(value)
-            .and_then(|key| self.identity_collections.derived_roots.get(&key).cloned())
-    }
-
-    /// Structurally record the root identity collection of any derived handle
-    /// produced by a non-jar call whose receiver or arguments already belong
-    /// to an identity collection.
-    #[inline(never)]
-    pub(crate) fn record_identity_derivation(
-        &mut self,
-        r: &MethodRef,
-        jar_body: bool,
-        receiver: Option<&Value>,
-        args: &[Value],
-        result: &Value,
-    ) {
-        if jar_body || matches!(result, Value::Void | Value::Ref(None)) {
-            return;
+        // Live or wrapped `Map.Entry` handles (from `forEach`, `iterator().next()`,
+        // `toArray(T[])`, `compute`/`merge`, etc.). Detached copies (`SimpleEntry`,
+        // `SimpleImmutableEntry`, `KeyValueHolder`) have neither link and return `None`.
+        if let Some(inner) = self.host.unwrapped_view_entry(value) {
+            return self.identity_root_marker_depth(&inner, depth + 1);
         }
-        let Some(root) = receiver
-            .and_then(|value| self.identity_root_marker(value))
-            .or_else(|| {
-                args.iter()
-                    .find_map(|value| self.identity_root_marker(value))
-            })
-        else {
-            return;
-        };
-        // `toArray` on a view like `unmodifiableMap(idMap).entrySet().toArray(new Map.Entry[0])`
-        // returns a detached array whose elements may still be live entries (`UnmodifiableEntry`).
-        // Link any live entries inside the array without tainting detached `SimpleEntry` copies.
-        if matches!(
-            result,
-            Value::Host(handle) if handle.kind() == crate::runtime::host_ref::HostKind::Array
-        ) {
-            let live_keys: Vec<IdentityHandleKey> = self
-                .owned_array(result)
-                .map(|elements| {
-                    elements
-                        .iter()
-                        .filter(|el| {
-                            self.host.map_entry_source(el).is_some()
-                                || self.host.unwrapped_view_entry(el).is_some()
-                        })
-                        .filter_map(|el| self.identity_handle_key(el))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for key in live_keys {
-                self.identity_collections
-                    .derived_roots
-                    .insert(key, root.clone());
+        if let Some(map_marker) = self.host.map_entry_source(value) {
+            return self.identity_root_marker_depth(
+                &crate::runtime::jar_object::stored_value(&map_marker),
+                depth + 1,
+            );
+        }
+        if let Value::Host(handle) = value {
+            match handle.kind() {
+                crate::runtime::host_ref::HostKind::Iterator => {
+                    let origin = self.host.host_iterator_origin(handle.key())?;
+                    return self.identity_root_marker_depth(&origin, depth + 1);
+                }
+                crate::runtime::host_ref::HostKind::ListIterator => {
+                    let origin = self.host.list_iterator_source(handle.key())?;
+                    return self.identity_root_marker_depth(&origin, depth + 1);
+                }
+                crate::runtime::host_ref::HostKind::Enumeration => {
+                    let origin = self.host.enumeration_source(handle.key())?;
+                    return self.identity_root_marker_depth(&origin, depth + 1);
+                }
+                crate::runtime::host_ref::HostKind::Spliterator => {
+                    let origin = self.pipelines.splits.source_of(handle.key())?;
+                    return self.identity_root_marker_depth(&origin, depth + 1);
+                }
+                _ => {}
             }
-            return;
         }
-        if self.is_identity_collection(result) {
-            return;
+        if let Some(wrapped) = self.host.synchronized_wrapped(value) {
+            return self.identity_root_marker_depth(&wrapped, depth + 1);
         }
-        if let Value::Host(handle) = result {
-            if matches!(
-                handle.kind(),
-                crate::runtime::host_ref::HostKind::Class | crate::runtime::host_ref::HostKind::Array
-            ) {
-                return;
+        if let Some(source_map) = self.host.set_from_map_source(value) {
+            return self.identity_root_marker_depth(&source_map, depth + 1);
+        }
+        let marker = expect_ref(value)?;
+        if let Some(inner) = self.host.unmodifiable_view_source(marker) {
+            return self
+                .identity_root_marker_depth(&crate::runtime::jar_object::stored_value(&inner), depth + 1);
+        }
+        if let Some(source) = self.host.view_copy_source(marker) {
+            return self
+                .identity_root_marker_depth(&crate::runtime::jar_object::stored_value(&source), depth + 1);
+        }
+        if let Some(base) = self.host.reversed_view_source(marker) {
+            return self
+                .identity_root_marker_depth(&crate::runtime::jar_object::stored_value(&base), depth + 1);
+        }
+        if let Some(link) = self.host.sub_list_link(marker) {
+            return self.identity_root_marker_depth(
+                &crate::runtime::jar_object::stored_value(link.parent()),
+                depth + 1,
+            );
+        }
+        if self.is_live_stream(marker) {
+            let root = self.pipelines.root_stream(marker);
+            for origin in self.pipelines.source_origins(root).into_iter().flatten() {
+                if let Some(found) = self.identity_root_marker_depth(&origin, depth + 1) {
+                    return Some(found);
+                }
             }
-            if matches!(
-                handle.kind(),
-                crate::runtime::host_ref::HostKind::MapEntry | crate::runtime::host_ref::HostKind::OpaqueMapEntry
-            ) && self.host.map_entry_source(result).is_none()
-                && self.host.unwrapped_view_entry(result).is_none()
+            if let Some(origin) = self
+                .streams
+                .get(root)
+                .and_then(|entry| entry.origin.as_ref())
             {
-                // Detached `SimpleEntry` / `SimpleImmutableEntry` / `KeyValueHolder`.
-                return;
+                return self.identity_root_marker_depth(origin, depth + 1);
             }
         }
-        // Element-extraction calls return stored keys/values rather than live
-        // handles derived from the collection, except `next`/`previous` when
-        // returning a live `Map.Entry` backed by the map.
-        if matches!(r.name.as_str(), "next" | "previous") {
-            let live_entry = self.host.map_entry_source(result).is_some()
-                || self.host.unwrapped_view_entry(result).is_some();
-            if !live_entry {
-                return;
-            }
-        } else if matches!(
-            r.name.as_str(),
-            "get"
-                | "getOrDefault"
-                | "put"
-                | "putIfAbsent"
-                | "remove"
-                | "replace"
-                | "merge"
-                | "compute"
-                | "computeIfAbsent"
-                | "computeIfPresent"
-                | "getKey"
-                | "getValue"
-                | "setValue"
-                | "toArray"
-                | "toList"
-                | "collect"
-                | "reduce"
-                | "findFirst"
-                | "findAny"
-                | "min"
-                | "max"
-                | "getFirst"
-                | "getLast"
-                | "getOnlyElement"
-        ) {
-            return;
-        }
-        if let Some(key) = self.identity_handle_key(result) {
-            self.identity_collections.derived_roots.insert(key, root);
-        }
+        None
     }
 
     /// Resolve `value` (an identity collection or ANY handle derived from one)
@@ -981,14 +938,10 @@ impl<H: Host> Runtime<'_, H> {
         let Some(marker) = marker else {
             return (vec![None; len], vec![None; len]);
         };
-        if self.identity_collections.epoch > 0 {
-            let known = self
-                .identity_collections
-                .known_epochs
-                .get(marker)
-                .copied()
-                .unwrap_or(0);
-            if known < self.identity_collections.epoch {
+        let current_epoch = self.identity_collections.epoch;
+        if current_epoch > 0 {
+            let known = self.collection_known_epoch(marker);
+            if known < current_epoch {
                 return (vec![None; len], vec![None; len]);
             }
         }
@@ -1025,6 +978,8 @@ impl<H: Host> Runtime<'_, H> {
                 values,
             },
         );
+        self.host
+            .note_identity_token_table_len(self.identity_collections.tokens.len());
     }
 
     /// Count `r`, an identity-collection call whose answer depends on an identity the runtime

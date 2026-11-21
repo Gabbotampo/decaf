@@ -507,6 +507,89 @@ public class Probe {
       return "ex:" + e.getClass().getSimpleName();
     }
   }
+  static String forEachSavedEntryToString() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("k", 1);
+      @SuppressWarnings("unchecked")
+      Map.Entry<String, Integer>[] saved = new Map.Entry[1];
+      m.entrySet().forEach(e -> saved[0] = e);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", 2);
+      return saved[0].toString();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String forEachSavedEntryEquals() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("k", 1);
+      @SuppressWarnings("unchecked")
+      Map.Entry<String, Integer>[] saved = new Map.Entry[1];
+      m.entrySet().forEach(e -> saved[0] = e);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", 2);
+      return saved[0].equals(Map.entry("k", 1))
+          + ":" + saved[0].equals(Map.entry("k", 2))
+          + ":" + Map.entry("k", 1).equals(saved[0])
+          + ":" + Map.entry("k", 2).equals(saved[0]);
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String forEachSavedEntryConcat() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("k", 1);
+      @SuppressWarnings("unchecked")
+      Map.Entry<String, Integer>[] saved = new Map.Entry[1];
+      m.entrySet().forEach(e -> saved[0] = e);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", 2);
+      return "e=" + saved[0];
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String unmodForEachSavedEntryToString() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("k", 1);
+      @SuppressWarnings("unchecked")
+      Map.Entry<String, Integer>[] saved = new Map.Entry[1];
+      Collections.unmodifiableMap(m).entrySet().forEach(e -> saved[0] = e);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "k", 2);
+      return saved[0].toString();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenEnumeration() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Enumeration<String> en = Collections.enumeration(m.keySet());
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      return String.valueOf(en.hasMoreElements());
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenStreamIterator() {
+    try {
+      IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+      m.put("a", 1);
+      Iterator<String> it = m.keySet().stream().iterator();
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, "b", 2);
+      return String.valueOf(it.hasNext());
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -560,4 +643,10 @@ public class Probe {
   public static String reflectPutThenSpliteratorOut(){return reflectPutThenSpliterator();}
   public static String reflectPutThenStreamSupportOut(){return reflectPutThenStreamSupport();}
   public static String reflectPutThenIterSpliteratorOut(){return reflectPutThenIterSpliterator();}
+  public static String forEachSavedEntryToStringOut(){return forEachSavedEntryToString();}
+  public static String forEachSavedEntryEqualsOut(){return forEachSavedEntryEquals();}
+  public static String forEachSavedEntryConcatOut(){return forEachSavedEntryConcat();}
+  public static String unmodForEachSavedEntryToStringOut(){return unmodForEachSavedEntryToString();}
+  public static String reflectPutThenEnumerationOut(){return reflectPutThenEnumeration();}
+  public static String reflectPutThenStreamIteratorOut(){return reflectPutThenStreamIterator();}
 }
