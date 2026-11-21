@@ -618,8 +618,18 @@ pub enum HostKind {
     /// A `java.util.regex.Matcher` from `Pattern.matcher(input)`: a serial (one
     /// object per call), the pattern text and the input (`host_jdk_constant.rs`).
     RegexMatcher,
-    /// Vanilla's ItemStackTemplate built by `fromNonEmptyStack` (`host_item_stack_template.rs`).
+    /// Vanilla's ItemStackTemplate (`host_item_stack_template.rs`).
     ItemStackTemplate,
+    /// Vanilla's `DataComponentPatch` (`recipe_models.rs`).
+    DataComponentPatch,
+    /// Vanilla's `DataComponentPatch$Builder` (`recipe_models.rs`).
+    DataComponentPatchBuilder,
+    /// Vanilla's `Ingredient` (`recipe_models.rs`).
+    Ingredient,
+    /// Vanilla's `Recipe$CommonInfo` (`recipe_models.rs`).
+    RecipeCommonInfo,
+    /// Vanilla's `RecipeHolder` (`recipe_models.rs`).
+    RecipeHolder,
     /// Fabric CreativeModeTab builder and built tab handles.
     CreativeModeTabBuilder,
     CreativeModeTab,
@@ -2777,9 +2787,44 @@ const KINDS: &[KindInfo] = &[
     KindInfo {
         kind: HostKind::ItemStackTemplate,
         tag: "ist",
-        class: ClassRule::Fixed("net/minecraft/world/item/ItemStackTemplate"),
+        class: ClassRule::FromKey(|_| "net/minecraft/world/item/ItemStackTemplate"),
         canonical: always_canonical,
         methods: &crate::runtime::host_item_stack_template::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DataComponentPatch,
+        tag: "dcp",
+        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::DATA_COMPONENT_PATCH),
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_models::PATCH_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::DataComponentPatchBuilder,
+        tag: "dcpb",
+        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::DATA_COMPONENT_PATCH_BUILDER),
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_models::PATCH_BUILDER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Ingredient,
+        tag: "ingr",
+        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::INGREDIENT),
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_models::INGREDIENT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeCommonInfo,
+        tag: "rci",
+        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::RECIPE_COMMON_INFO),
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_models::COMMON_INFO_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::RecipeHolder,
+        tag: "rhld",
+        class: ClassRule::FromKey(|_| crate::runtime::recipe_models::RECIPE_HOLDER),
+        canonical: always_canonical,
+        methods: &crate::runtime::recipe_models::HOLDER_METHODS,
     },
     KindInfo {
         kind: HostKind::CreativeModeTabBuilder,

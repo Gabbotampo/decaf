@@ -223,6 +223,7 @@ mod object_methods;
 mod open_options;
 mod optionull;
 mod owned_class;
+mod pack_order;
 mod parked_threads;
 mod recipe_serializer;
 mod scanner_model;
@@ -245,6 +246,7 @@ mod random_source;
 #[cfg(test)]
 #[path = "random_source_tests.rs"]
 mod random_source_tests;
+mod recipe_models;
 mod reference_identity;
 mod references;
 mod reflect_constructors;
@@ -279,6 +281,7 @@ mod vanilla_blocks;
 mod vanilla_entity_types;
 mod vanilla_holders;
 mod vanilla_holders_table;
+mod vanilla_item_data;
 mod vanilla_items;
 mod vanilla_registries;
 mod vanilla_registry_keys;
@@ -2678,6 +2681,16 @@ pub trait Host {
         None
     }
 
+    #[doc(hidden)]
+    fn as_std_host(&self) -> Option<&StdHost> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn as_std_host_mut(&mut self) -> Option<&mut StdHost> {
+        None
+    }
+
     /// Count `r` as an unknown host call and answer its neutral default:
     /// a model was handed a jar object it holds no state for
     /// (`jar_operands.rs`). A host that counts nothing errors instead.
@@ -3631,6 +3644,19 @@ pub struct StdHost {
     /// Bounded bytes for resources explicitly supplied by a loaded jar or
     /// adapter. Marker-only resources keep an empty stream.
     resource_bytes: BTreeMap<String, Vec<u8>>,
+    /// `data/` resources seeded directly on this host (`seed_host` / `with_resource_bytes`),
+    /// kept separate from `resource_bytes` (which also merges linked-jar classpath resources
+    /// first-wins for `ClassLoader.getResourceAsStream`).
+    primary_data_layer: BTreeMap<String, Vec<u8>>,
+    /// Scanner tracking `data/` namespaces (and malformed/conflicting entries) on the primary
+    /// seeded jar or direct `with_resource_bytes` entries.
+    primary_data_scanner: pack_order::DataNamespaceScanner,
+    /// Ordered explicit datapack layers stacked above all loaded jars (lowest -> highest).
+    data_pack_layers: Vec<(String, BTreeMap<String, Vec<u8>>)>,
+    /// Monotonic counter bumped whenever resources, linked jars, or datapack layers change.
+    resource_generation: u64,
+    /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
+    pending_container_clamp: Option<menu_models::ContainerClamp>,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -3653,8 +3679,6 @@ pub struct StdHost {
     /// included), so `asItem()` answers only blocks it knows.
     constructed_blocks: BTreeSet<String>,
     block_items: BTreeMap<String, Value>,
-    /// Jar-allocated `new ItemStack(...)` payloads outside client frames, keyed by allocation key.
-    jar_item_stacks: BTreeMap<String, host_creative_tab::ItemStackData>,
     /// `requiredFeatures` bitmask (`None` = unknown, so `isEnabled` is counted) tracked on
     /// `Item.Properties` builders and propagated to constructed `Item` / `BlockItem` instances.
     item_required_features: BTreeMap<String, Option<u64>>,
@@ -3803,6 +3827,7 @@ pub struct StdHost {
     /// runs, keyed by `HostKind::TooltipConsumer` handle key.
     tooltip_sinks: BTreeMap<String, Vec<Value>>,
     guava_tables: guava_table::Store,
+    pub(crate) recipes: recipe_models::RecipeState,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
     repeated_collections: BTreeMap<String, (usize, Value)>,
     /// Keys of detached `subList` copies (`jdk_model.rs::sub_list`, #496).
@@ -4028,6 +4053,11 @@ impl StdHost {
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
             resource_bytes: BTreeMap::new(),
+            primary_data_layer: BTreeMap::new(),
+            primary_data_scanner: pack_order::DataNamespaceScanner::new(MAX_DATA_NAMESPACES),
+            data_pack_layers: Vec::new(),
+            resource_generation: 0,
+            pending_container_clamp: None,
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -4036,7 +4066,6 @@ impl StdHost {
             constructed_items: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
-            jar_item_stacks: BTreeMap::new(),
             item_required_features: BTreeMap::new(),
             fired_creative_tab_registrations: BTreeSet::new(),
             service_providers: BTreeMap::new(),
@@ -4098,6 +4127,7 @@ impl StdHost {
             mutable_collections: collection_store::CollectionStore::default(),
             tooltip_sinks: BTreeMap::new(),
             guava_tables: guava_table::Store::default(),
+            recipes: recipe_models::RecipeState::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
             sub_list_class_names: BTreeMap::new(),
@@ -4253,6 +4283,145 @@ impl StdHost {
     /// Named DFU construction refusals for the current jar.
     pub fn dfu_codec_refusals(&self) -> &[String] {
         &self.dfu_codec_refusals
+    }
+
+    /// Recipe ids loaded through mod-registered `RecipeSerializer` codecs so far.
+    pub fn loaded_recipe_ids(&self) -> Vec<String> {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| cache.recipes.iter().map(|r| r.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `(recipe_id, source_pack)` pairs for recipes decoded through mod-registered serializers.
+    pub fn loaded_recipe_sources(&self) -> Vec<(String, String)> {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .recipes
+                    .iter()
+                    .map(|r| (r.id.clone(), r.source_pack.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Recipe JSON decode errors captured when loading mod-registered recipe types.
+    pub fn recipe_decode_errors(&self) -> &[(String, String)] {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| cache.errors.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn in_client_frame(&self) -> bool {
+        self.client.frame.is_some()
+    }
+
+    pub(crate) fn block_item_for_block_key(&self, key: &str) -> Option<&Value> {
+        self.block_items.get(key)
+    }
+
+    pub(crate) fn item_properties_for_marker(
+        &self,
+        marker: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.item_property_builders.get(marker)
+    }
+
+    pub(crate) fn is_constructed_item_marker(&self, marker: &str) -> bool {
+        self.constructed_items.contains(marker)
+    }
+
+    pub(crate) fn resource_generation(&self) -> u64 {
+        self.resource_generation
+            .wrapping_add(self.linked_classes.data_layer_entry_count() as u64)
+            .wrapping_add((self.linked_classes.data_layers().len() as u64) << 32)
+            .wrapping_add((self.primary_data_layer.len() as u64) << 16)
+            .wrapping_add(self.primary_data_scanner.fingerprint() << 8)
+    }
+
+    /// Stack an explicit datapack layer (e.g. a world datapack or test override) above all
+    /// loaded jars and earlier datapack layers. Later layers override earlier ones.
+    pub fn add_data_pack_layer(
+        &mut self,
+        id: impl Into<String>,
+        resources: BTreeMap<String, Vec<u8>>,
+    ) {
+        let normalized = resources
+            .into_iter()
+            .map(|(k, v)| (k.trim_start_matches('/').to_owned(), v))
+            .collect();
+        self.data_pack_layers.push((id.into(), normalized));
+        self.resource_generation = self.resource_generation.wrapping_add(1);
+    }
+
+    /// Builder form of [`Self::add_data_pack_layer`].
+    pub fn with_data_pack_layer(
+        mut self,
+        id: impl Into<String>,
+        resources: BTreeMap<String, Vec<u8>>,
+    ) -> Self {
+        self.add_data_pack_layer(id, resources);
+        self
+    }
+
+    /// Ordered `data/` resource layers from lowest priority to highest priority (above vanilla),
+    /// following Minecraft 26.3 `PackRepository` + `fabric-resource-loader-v1` 3.1.0 (`pack_order.rs`):
+    /// 1. Fabric mod packs (primary seeded jar, linked jars, and nested JiJ jars) via
+    ///    `ModPackResourcesUtil.getModResourcePacks` / `ModPackResourcesSorter` / `NodeSorting`
+    ///    and MC 26.3 `PackRepository.discoverAvailable` + `refreshAutoEnabledPacks`.
+    /// 2. Non-Fabric / bare `with_resource_bytes` layers (when no Fabric mod metadata exists).
+    /// 3. Explicit world/external datapack layers added via `add_data_pack_layer`.
+    pub(crate) fn ordered_data_packs(&self) -> pack_order::OrderedDataPacks<'_> {
+        let primary_mod_id = self
+            .own_mod_id
+            .as_deref()
+            .filter(|id| self.fabric_metadata.contains_key(*id));
+        let primary_load_order = primary_mod_id
+            .and_then(|id| self.fabric_metadata.get(id))
+            .and_then(|doc| doc.get("custom"))
+            .and_then(|custom| custom.get("fabric:resource_load_order"));
+        let mut all_loaded_mod_ids: BTreeSet<String> = self
+            .fabric_metadata
+            .keys()
+            .chain(self.mods.keys())
+            .cloned()
+            .collect();
+        for builtin in ["java", "minecraft", "fabricloader", "mixinextras"] {
+            all_loaded_mod_ids.insert(builtin.to_owned());
+        }
+        for provided in dependencies::HOST_PROVIDED_MODS {
+            if !matches!(*provided, "neoforge" | "forge") {
+                all_loaded_mod_ids.insert((*provided).to_owned());
+            }
+        }
+        let primary_ns_unknown = self.primary_data_scanner.is_unknown();
+        let primary_namespaces = self.primary_data_scanner.namespaces();
+        pack_order::resolve_data_pack_order(
+            self.linked_classes.data_layers(),
+            primary_mod_id,
+            primary_load_order,
+            &self.primary_data_layer,
+            &primary_namespaces,
+            primary_ns_unknown,
+            &all_loaded_mod_ids,
+            &self.data_pack_layers,
+        )
+    }
+
+    pub(crate) fn ordered_data_layers(&self) -> Vec<(&str, &BTreeMap<String, Vec<u8>>)> {
+        self.ordered_data_packs().layers
+    }
+
+    /// Stage-1 `ModPackResourcesUtil.getModResourcePacks` / `ModPackResourcesSorter` mod order
+    /// (lowest -> highest priority) for the currently seeded/linked Fabric mods.
+    pub fn mod_pack_sorter_order(&self) -> Vec<String> {
+        self.ordered_data_packs().sorter_mod_order
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -4650,15 +4819,21 @@ impl StdHost {
     /// Seed bounded bytes for an explicitly supplied resource. This never
     /// opens a host path or consults a process classpath.
     pub fn with_resource_bytes(mut self, name: impl Into<String>, bytes: Vec<u8>) -> Self {
-        let name = name.into().trim_start_matches('/').to_owned();
+        let raw_name = name.into();
+        self.primary_data_scanner.record_entry(&raw_name);
+        let name = raw_name.trim_start_matches('/').to_owned();
         let marker = self
             .resources
             .get(&name)
             .cloned()
             .unwrap_or_else(|| format!("resource-bytes/{name}"));
         self.resources.insert(name.clone(), marker.clone());
+        if name.starts_with("data/") {
+            self.primary_data_layer.insert(name.clone(), bytes.clone());
+        }
         self.resource_bytes.insert(name, bytes.clone());
         self.resource_streams.insert(marker, (bytes, 0));
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         self
     }
 
@@ -4748,6 +4923,7 @@ impl StdHost {
                 return Err(NativeError::Metadata(error));
             }
         }
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         Ok(added)
     }
 
@@ -4932,6 +5108,7 @@ impl StdHost {
     /// per host otherwise, which doubles the class bytes of a whole pack).
     pub fn with_linked_class_table(mut self, table: Arc<LinkedClassTable>) -> Self {
         self.linked_classes = table;
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         self
     }
 
@@ -5400,16 +5577,25 @@ impl StdHost {
         if game_object::handle_key(stack) == Some("client/stack/empty") {
             return Some((host_creative_tab::air_item_value(), 0, true));
         }
-        let data = host_creative_tab::host_item_stack_data(stack).or_else(|| {
-            let key = jar_object::object_key(stack)?;
-            self.jar_item_stacks.get(key).cloned()
-        })?;
-        // `ItemStack.isEmpty` (0..34), `getCount` (0..15), `getItem` (0..12 via `typeHolder` 0..20).
-        if host_creative_tab::is_empty_stack_data(&data.item, data.count) {
-            Some((host_creative_tab::air_item_value(), 0, true))
-        } else {
-            Some((data.item, data.count, false))
+        if let Value::Host(handle) = stack
+            && handle.kind() == HostKind::ItemStack
+        {
+            if let Some(live) = self.recipes.stacks.get(handle.key()) {
+                return if live.is_empty() {
+                    Some((host_creative_tab::air_item_value(), 0, true))
+                } else {
+                    Some((live.effective_item_value(self), live.count, false))
+                };
+            }
+            if let Some(data) = host_creative_tab::host_item_stack_data(stack) {
+                return if host_creative_tab::is_empty_stack_data(&data.item, data.count) {
+                    Some((host_creative_tab::air_item_value(), 0, true))
+                } else {
+                    Some((data.item, data.count, false))
+                };
+            }
         }
+        None
     }
 
     fn registered_item_id_impl(&self, item: &Value) -> Option<String> {
@@ -5419,6 +5605,12 @@ impl StdHost {
                 .or_else(|| key.strip_prefix("client/item/"))
         {
             return Some(id.to_owned());
+        }
+        if let Some(key) = jar_object::object_key(item)
+            && let Some(field) =
+                key.strip_prefix("net/minecraft/world/item/Item#net/minecraft/world/item/Items.")
+        {
+            return vanilla_items::field_id(field);
         }
         self.registrations
             .iter()
@@ -5437,10 +5629,17 @@ impl StdHost {
                 .then_some(host_creative_tab::FEATURE_VANILLA_SET);
         }
         let marker = jar_object::object_key(item)?;
+        if let Some(field) =
+            marker.strip_prefix("net/minecraft/world/item/Item#net/minecraft/world/item/Items.")
+            && let Some(id) = vanilla_items::field_id(field)
+        {
+            return vanilla_items::is_vanilla_item_id(&id)
+                .then_some(host_creative_tab::FEATURE_VANILLA_SET);
+        }
         self.item_required_features.get(marker).copied().flatten()
     }
 
-    fn resolve_host_item_like_impl(&self, value: &Value) -> Option<Value> {
+    pub(crate) fn resolve_host_item_like_impl(&self, value: &Value) -> Option<Value> {
         if let Some(key) = game_object::handle_key(value) {
             if key.starts_with("game/item/") || key.starts_with("client/item/") {
                 return Some(value.clone());
@@ -5536,34 +5735,6 @@ impl StdHost {
                 _ => {}
             }
         }
-        // `ItemStack.<init>(ItemLike)` / `<init>(ItemLike, int)` when called without Runtime
-        // (Runtime handles jar `asItem()` overrides first in `library_dispatch.rs`).
-        if r.owner == "net/minecraft/world/item/ItemStack"
-            && r.name == "<init>"
-            && jar_object::object_class(receiver) == Some("net/minecraft/world/item/ItemStack")
-        {
-            let count = match (r.descriptor.as_str(), args) {
-                ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => 1,
-                ("(Lnet/minecraft/world/level/ItemLike;I)V", [_, Value::Int(count)]) => *count,
-                _ => return None,
-            };
-            let item_like = args.first()?;
-            if matches!(item_like, Value::Ref(None)) {
-                return Some(Err(NativeError::UncaughtException {
-                    class: "java/lang/NullPointerException".into(),
-                    message: Some(
-                        "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
-                            .into(),
-                    ),
-                    frame: None,
-                }));
-            }
-            let item = self.resolve_host_item_like_impl(item_like)?;
-            let key = jar_object::object_key(receiver)?.to_owned();
-            self.jar_item_stacks
-                .insert(key, host_creative_tab::ItemStackData { item, count });
-            return Some(Ok(Value::Void));
-        }
         // `Item.requiredFeatures()`, `FeatureElement.isEnabled(FeatureFlagSet)`, `Item.toString()`.
         if matches!(
             r.owner.as_str(),
@@ -5634,8 +5805,8 @@ impl StdHost {
                         }));
                     }
                     let item = self.resolve_host_item_like_impl(item_like)?;
-                    let stack =
-                        host_creative_tab::new_host_item_stack(&mut self.creative_tab, item, 1);
+                    let live = recipe_models::LiveStack::from_item_value(self, item, 1);
+                    let stack = self.recipes.alloc_stack(live);
                     (stack, None)
                 }
                 (
@@ -5653,8 +5824,8 @@ impl StdHost {
                         }));
                     }
                     let item = self.resolve_host_item_like_impl(item_like)?;
-                    let stack =
-                        host_creative_tab::new_host_item_stack(&mut self.creative_tab, item, 1);
+                    let live = recipe_models::LiveStack::from_item_value(self, item, 1);
+                    let stack = self.recipes.alloc_stack(live);
                     (stack, Some(vis))
                 }
                 _ => return None,
@@ -6759,6 +6930,34 @@ pub(crate) fn check_jdk_capacity(r: &MethodRef, args: &[Value]) -> Result<(), Na
     Ok(())
 }
 
+impl menu_models::StackOps for StdHost {
+    fn is_empty(&self, value: &Value) -> Option<bool> {
+        recipe_models::stack_is_empty(self, value).or_else(|| self.client_stack_is_empty(value))
+    }
+
+    fn max_stack_size(&self, value: &Value) -> Option<i32> {
+        recipe_models::stack_max_stack_size(self, value)
+            .or_else(|| self.client_stack_max_stack_size(value))
+    }
+
+    fn clamp_for_container(&mut self, value: &Value, max: i32) -> Option<()> {
+        if let Some(()) = recipe_models::limit_stack_for_container(self, value, max) {
+            return Some(());
+        }
+        let item_max = self.client_stack_max_stack_size(value)?;
+        self.client_stack_limit_exact(value, max.min(item_max))
+    }
+
+    fn clamp_exact(&mut self, value: &Value, limit: i32) -> Option<()> {
+        recipe_models::limit_stack_exact(self, value, limit)
+            .or_else(|| self.client_stack_limit_exact(value, limit))
+    }
+
+    fn take_pending_clamp(&mut self) -> Option<menu_models::ContainerClamp> {
+        self.pending_container_clamp.take()
+    }
+}
+
 impl Host for StdHost {
     fn menu_instance_call(
         &mut self,
@@ -6772,14 +6971,20 @@ impl Host for StdHost {
         let client_player = self
             .client_has_player()
             .then(|| crate::game_object::client_value("client/player".into()));
-        menu_models::call_with_client_player(
-            &mut self.menu_states,
-            &mut self.next_menu_object,
+        let mut states = std::mem::take(&mut self.menu_states);
+        let mut next_id = self.next_menu_object;
+        let result = menu_models::call_with_stacks_and_client_player(
+            &mut states,
+            &mut next_id,
             r,
             receiver,
             args,
+            self,
             client_player,
-        )
+        );
+        self.menu_states = states;
+        self.next_menu_object = next_id;
+        result
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
@@ -7702,6 +7907,14 @@ impl Host for StdHost {
         Some(&mut self.guava_tables)
     }
 
+    fn as_std_host(&self) -> Option<&StdHost> {
+        Some(self)
+    }
+
+    fn as_std_host_mut(&mut self) -> Option<&mut StdHost> {
+        Some(self)
+    }
+
     fn array_view(
         &mut self,
         array: &str,
@@ -8007,6 +8220,9 @@ impl Host for StdHost {
         if let Some(value) = dfu_codec::static_field(r) {
             return Ok(value);
         }
+        if let Some(value) = recipe_models::static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = attachment_codec::codec_static(r) {
             return Ok(value);
         }
@@ -8081,6 +8297,14 @@ impl Host for StdHost {
         {
             return match crate::vanilla_blocks::field_id(&r.name) {
                 Some(id) => Ok(crate::game_object::server_value(format!("game/block/{id}"))),
+                None => self.unknown_host_call(r),
+            };
+        }
+        if r.owner == "net/minecraft/world/item/Items"
+            && r.descriptor == "Lnet/minecraft/world/item/Item;"
+        {
+            return match crate::vanilla_items::field_id(&r.name) {
+                Some(id) => Ok(crate::game_object::server_value(format!("game/item/{id}"))),
                 None => self.unknown_host_call(r),
             };
         }
@@ -8260,7 +8484,9 @@ impl Host for StdHost {
     }
 
     fn random_new(&mut self, class: &str) -> Option<Value> {
-        vanilla_values::random_new(self, class).or_else(|| StdHost::random_new(self, class))
+        recipe_models::random_new(self, class)
+            .or_else(|| vanilla_values::random_new(self, class))
+            .or_else(|| StdHost::random_new(self, class))
     }
 
     fn note_entity_data_hierarchy(&mut self, entries: &[(String, String)]) {
@@ -8295,22 +8521,19 @@ impl Host for StdHost {
     }
 
     fn record_jar_item_stack(&mut self, receiver: &Value, item: Value, count: i32) -> bool {
-        let Some(key) = jar_object::object_key(receiver) else {
-            return false;
-        };
-        self.jar_item_stacks.insert(
-            key.to_owned(),
-            host_creative_tab::ItemStackData { item, count },
-        );
-        true
+        if let Value::Host(handle) = receiver
+            && handle.kind() == HostKind::ItemStack
+        {
+            let live = recipe_models::LiveStack::from_item_value(self, item, count);
+            self.recipes.stacks.insert(handle.key().to_owned(), live);
+            return true;
+        }
+        false
     }
 
     fn make_host_item_stack(&mut self, item: Value, count: i32) -> Option<Value> {
-        Some(host_creative_tab::new_host_item_stack(
-            &mut self.creative_tab,
-            item,
-            count,
-        ))
+        let live = recipe_models::LiveStack::from_item_value(self, item, count);
+        Some(self.recipes.alloc_stack(live))
     }
 
     fn read_item_stack(&self, stack: &Value) -> Option<(Value, i32, bool)> {
@@ -8497,7 +8720,10 @@ impl Host for StdHost {
             }
             _ => {}
         }
-        if let Some(value) = host_item_stack_template::static_call(r, args) {
+        if let Some(value) = host_item_stack_template::static_call(self, r, args) {
+            return value;
+        }
+        if let Some(value) = recipe_models::static_call(self, r, args) {
             return value;
         }
         if let Some(value) = java_numbers::static_call(r, args) {
@@ -9789,10 +10015,13 @@ impl Host for StdHost {
         {
             return value;
         }
-        if let Some(value) = self.item_stack_and_item_instance_call(r, receiver, args) {
+        if let Some(value) = host_item_stack_template::instance_call(self, r, receiver, args) {
             return value;
         }
-        if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
+        if let Some(value) = recipe_models::instance_call(self, r, receiver, args) {
+            return value;
+        }
+        if let Some(value) = self.item_stack_and_item_instance_call(r, receiver, args) {
             return value;
         }
         if let Some(value) =
@@ -15123,6 +15352,19 @@ fn item_builder_settings(
                 _ => "true".to_owned(),
             }),
         ),
+        "component"
+            if first
+                .and_then(game_object::handle_key)
+                .is_some_and(|key| key == "game/data-component-type/minecraft:max_stack_size") =>
+        {
+            (
+                "stacksTo",
+                args.get(1).and_then(|value| match value {
+                    Value::Int(n) | Value::Boxed(Boxed::Integer(n)) => Some(n.to_string()),
+                    _ => None,
+                }),
+            )
+        }
         _ => return Vec::new(),
     };
     setting
@@ -15700,6 +15942,41 @@ impl StdHost {
         {
             self.unknown_host_call(r)?;
             return Ok(Value::Int(1));
+        }
+        if handle.kind() == HostKind::ItemStack && r.name == "toString" {
+            let answer = (!self.in_client_frame())
+                .then(|| {
+                    let (item, count, is_empty) =
+                        self.read_item_stack_impl(&Value::Host(handle.clone()))?;
+                    let item_text = if is_empty {
+                        "minecraft:air".to_owned()
+                    } else {
+                        self.registered_item_id_impl(&item)?
+                    };
+                    Some(Value::Ref(Some(format!("{count} {item_text}"))))
+                })
+                .flatten();
+            return match answer {
+                Some(answer) => Ok(answer),
+                None => self.unknown_host_call(r),
+            };
+        }
+        if recipe_models::is_recipe_object_kind(handle.kind()) {
+            let answer = match r.name.as_str() {
+                "toString" => recipe_models::object_to_string(self, &handle)
+                    .map(|text| Value::Ref(Some(text))),
+                "hashCode" => recipe_models::object_hash_code(self, &handle).map(Value::Int),
+                "equals" => {
+                    let other = Self::argument(r, args, 0)?;
+                    recipe_models::host_object_equals(self, &handle, other)
+                        .map(|equal| Value::Int(i32::from(equal)))
+                }
+                _ => None,
+            };
+            return match answer {
+                Some(answer) => Ok(answer),
+                None => self.unknown_host_call(r),
+            };
         }
         let answer = match r.name.as_str() {
             // A callback's text: counted, a text answered, never its key.
@@ -18684,6 +18961,8 @@ pub struct LinkedClassTable {
     /// Each linked jar's resources by name, with the marker the host answers
     /// for them (`linked_resources.rs`).
     resources: BTreeMap<String, (String, Vec<u8>)>,
+    /// Per-jar `data/` resource layers with Fabric metadata for datapack recipe/tag ordering.
+    data_layers: Vec<pack_order::JarDataLayer>,
 }
 
 impl LinkedClassTable {
@@ -18710,8 +18989,9 @@ impl LinkedClassTable {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        let added = self.link_classes(id, jar.classes.values().cloned())?;
-        self.link_resources(jar);
+        let id = id.into();
+        let added = self.link_classes(id.clone(), jar.classes.values().cloned())?;
+        self.link_resources(&id, jar);
         self.link_services(jar);
         Ok(added)
     }
@@ -18870,6 +19150,13 @@ pub struct NativeJar {
     /// resolve the same resource names it would see on the jar classpath.
     resources: BTreeMap<String, String>,
     resource_bytes: BTreeMap<String, Vec<u8>>,
+    /// Valid immediate `data/<ns>/` namespace directories discovered in the jar (including empty
+    /// `data/<ns>/` directory entries with no files inside, matching `ModNioPackResources.readNamespaces`).
+    data_namespaces: BTreeSet<String>,
+    /// True when the jar contains `.`/`..` entry segments, non-canonical `/` paths under `data`,
+    /// or regular-file `data` / `data/<ns>` entries conflicting with child entries (causing
+    /// `ModNioPackResources.readNamespaces` to be counted rather than guessed).
+    data_namespaces_unknown: bool,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
     /// Aliases declared by Fabric metadata's `provides` array.
@@ -18912,6 +19199,7 @@ static EMPTY_ARRAY_DATA: ArrayData = ArrayData::Ref(Vec::new());
 
 const MAX_RESOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESOURCE_TOTAL: usize = 32 * 1024 * 1024;
+const MAX_DATA_NAMESPACES: usize = 4096;
 /// Mixin JSON configs one jar may declare. Configs past this bound are
 /// reported through [`NativeJar::mixin_config_errors`] instead of growing the
 /// report.
@@ -20493,6 +20781,7 @@ impl NativeJar {
         let mut classes = Vec::new();
         let mut resources = BTreeMap::new();
         let mut resource_bytes = BTreeMap::new();
+        let mut data_ns_scanner = pack_order::DataNamespaceScanner::new(MAX_DATA_NAMESPACES);
         let mut resource_total = 0usize;
         let mut neoforge_entrypoints = Vec::new();
         let mut metadata = None;
@@ -20508,6 +20797,11 @@ impl NativeJar {
                 .name()
                 .map_err(|e| NativeError::Zip(e.to_string()))?
                 .into_owned();
+            // Scan every raw ZIP entry name (including directory entries, `.class` files, and
+            // bare `data`/`data/<ns>` regular files) before filters run, matching Fabric's
+            // `ModNioPackResources.readNamespaces` on JDK 25 `ZipFileSystem` and flagging
+            // malformed `.`/`..` or conflicting file/directory entries as unknown.
+            data_ns_scanner.record_entry(&name);
             // A module descriptor's name is kept (not its bytes): it decides
             // the jar's module under NeoForge (`reflect_override`).
             if reflect_override::is_module_descriptor(&name) {
@@ -20633,8 +20927,11 @@ impl NativeJar {
         let native_declarations =
             declarations_content::with_data_recipes(&mut zip, native_declarations);
         let mut jar = Self::from_classes(classes);
+        let (data_namespaces, data_namespaces_unknown) = data_ns_scanner.finish();
         jar.resources = resources;
         jar.resource_bytes = resource_bytes;
+        jar.data_namespaces = data_namespaces;
+        jar.data_namespaces_unknown = data_namespaces_unknown;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
         jar.fabric_provides = jar
@@ -21791,6 +22088,11 @@ impl NativeJar {
             if let Some(bytes) = self.resource_bytes.get(name) {
                 host = host.with_resource_bytes(name, bytes.clone());
             }
+        }
+        if !self.data_namespaces.is_empty() || self.data_namespaces_unknown {
+            host.primary_data_scanner
+                .merge_scan(&self.data_namespaces, self.data_namespaces_unknown);
+            host.resource_generation = host.resource_generation.wrapping_add(1);
         }
         // The jar's own `META-INF/services` files are what a real
         // `ServiceLoader` reads from its class path. Seeding them here keeps
@@ -33065,7 +33367,116 @@ impl<H: Host> Runtime<'_, H> {
         receiver: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let Some(result) = self.host.menu_instance_call(r, receiver, args) else {
+        let receiver_class = jar_object::object_class(receiver)
+            .map(str::to_owned)
+            .or_else(|| {
+                crate::expect_ref(receiver)
+                    .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+            });
+        let is_container_owner = matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/Container"
+                | "net/minecraft/world/SimpleContainer"
+                | "net/minecraft/world/inventory/ResultContainer"
+                | "net/minecraft/world/inventory/RecipeCraftingHolder"
+        ) || self
+            .jar_extends(&r.owner, "net/minecraft/world/SimpleContainer")
+            || self.jar_extends(&r.owner, "net/minecraft/world/inventory/ResultContainer");
+
+        // Canonicalize inherited calls on a jar subclass of SimpleContainer / ResultContainer
+        // (never `<init>`) so `menu_models` recognizes the vanilla container surface.
+        let canonical;
+        let effective_ref =
+            if !menu_models::is_menu_class(&r.owner) && is_container_owner && r.name != "<init>" {
+                let owner = if self
+                    .jar_extends(&r.owner, "net/minecraft/world/inventory/ResultContainer")
+                {
+                    "net/minecraft/world/inventory/ResultContainer"
+                } else {
+                    "net/minecraft/world/SimpleContainer"
+                };
+                canonical = MethodRef {
+                    owner: owner.to_owned(),
+                    name: r.name.clone(),
+                    descriptor: r.descriptor.clone(),
+                };
+                &canonical
+            } else {
+                r
+            };
+
+        // For `SimpleContainer.setItem(int, ItemStack)`, resolve the container's real
+        // `getMaxStackSize(...)` virtually when a mod subclass overrides it, matching MC 26.3's
+        // `stack.limitSize(this.getMaxStackSize(stack))` (default container limit 99).
+        let mut custom_clamp: Option<menu_models::ContainerClamp> = None;
+        if is_container_owner
+            && effective_ref.owner != "net/minecraft/world/inventory/ResultContainer"
+            && effective_ref.name == "setItem"
+            && effective_ref.descriptor == "(ILnet/minecraft/world/item/ItemStack;)V"
+            && let Some(class) = receiver_class.as_deref()
+            && !self.jar_extends(class, "net/minecraft/world/inventory/ResultContainer")
+            && let Some(stack_arg) = args.get(1)
+            && !matches!(stack_arg, Value::Ref(None))
+        {
+            if self
+                .jar_method_owner(
+                    class,
+                    "getMaxStackSize",
+                    "(Lnet/minecraft/world/item/ItemStack;)I",
+                )
+                .is_some()
+            {
+                let before = self.host.counted_unknown_calls();
+                let limit_val = self.call_virtual(
+                    jdk_call::Site::Virtual,
+                    "net/minecraft/world/Container",
+                    "getMaxStackSize",
+                    "(Lnet/minecraft/world/item/ItemStack;)I",
+                    receiver,
+                    std::slice::from_ref(stack_arg),
+                )?;
+                if self.host.counted_unknown_calls() != before {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                }
+                let Value::Int(limit) = limit_val else {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                };
+                custom_clamp = Some(menu_models::ContainerClamp::Exact(limit));
+            } else if self
+                .jar_method_owner(class, "getMaxStackSize", "()I")
+                .is_some()
+            {
+                let before = self.host.counted_unknown_calls();
+                let max_val = self.call_virtual(
+                    jdk_call::Site::Virtual,
+                    "net/minecraft/world/Container",
+                    "getMaxStackSize",
+                    "()I",
+                    receiver,
+                    &[],
+                )?;
+                if self.host.counted_unknown_calls() != before {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                }
+                let Value::Int(container_max) = max_val else {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                };
+                custom_clamp = Some(menu_models::ContainerClamp::ContainerMax(container_max));
+            }
+        }
+
+        if let Some(std_host) = self.host.as_std_host_mut() {
+            std_host.pending_container_clamp = custom_clamp;
+        }
+        let result = self.host.menu_instance_call(effective_ref, receiver, args);
+        if let Some(std_host) = self.host.as_std_host_mut() {
+            std_host.pending_container_clamp = None;
+        }
+        let Some(result) = result else {
             return Ok(None);
         };
         let mut value = result?;
@@ -35534,6 +35945,28 @@ impl<H: Host> Runtime<'_, H> {
                         && let Some(value) = invoke_or_catch!(
                             at,
                             dfu_codec::runtime_instance_call(self, &r, receiver.as_ref(), &args)
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            recipe_models::runtime_recipe_manager_call(
+                                self,
+                                &r,
+                                receiver.as_ref(),
+                                &args
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && receiver.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            recipe_models::runtime_static_call(self, &r, &args)
                         )
                     {
                         dispatched = Some(value);
