@@ -2078,6 +2078,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget,
         };
         // `game_hook_callback_values` answers whether the callback is an

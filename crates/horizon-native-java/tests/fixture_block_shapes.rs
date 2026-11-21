@@ -1823,6 +1823,443 @@ public final class Probe implements ModInitializer {
     assert_eq!(answer, Value::Ref(Some(expected)));
 }
 
+/// Round-3 Findings 1 & 2: structural allow-list for `HostKind::ShapeProbe` — every escape route
+/// (`synchronized`, static field, instance field, host collection `add`, array store, lambda
+/// capture, string concat, jar helper call, `ifnull`, return-the-probe, throw-the-probe, and
+/// swapped-slot forwarding) must count as unknown and refuse exporting the block's shape.
+#[test]
+fn shape_probe_allow_list_counts_every_escape_route() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/SyncBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class SyncBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public SyncBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        synchronized (level) {
+            return SLAB;
+        }
+    }
+}"#,
+        ),
+        (
+            "demo/StaticFieldBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class StaticFieldBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public static Object LEAKED;
+    public StaticFieldBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        LEAKED = level;
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/InstanceFieldBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class InstanceFieldBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    private Object leaked;
+    public InstanceFieldBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        this.leaked = pos;
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/ListAddBlock.java",
+            r#"package demo;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ListAddBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    private static final List<Object> SEEN = new ArrayList<>();
+    public ListAddBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        SEEN.add(level);
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/ArrayStoreBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ArrayStoreBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    private static final Object[] ARR = new Object[1];
+    public ArrayStoreBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        ARR[0] = pos;
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/LambdaCaptureBlock.java",
+            r#"package demo;
+import java.util.function.Supplier;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LambdaCaptureBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public static Supplier<Object> CAPTURED;
+    public LambdaCaptureBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        CAPTURED = () -> context;
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/StringConcatBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class StringConcatBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public StringConcatBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        String s = "p=" + level;
+        return s.length() > 0 ? SLAB : SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/JarHelperBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class JarHelperBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public JarHelperBlock(Properties p) { super(p); }
+    private static VoxelShape helper(BlockGetter level) {
+        return SLAB;
+    }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return helper(level);
+    }
+}"#,
+        ),
+        (
+            "demo/NullCheckBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class NullCheckBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public NullCheckBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return level == null ? Shapes.empty() : SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/ReturnProbeBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ReturnProbeBlock extends Block {
+    public ReturnProbeBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        Object o = level;
+        return (VoxelShape) o;
+    }
+}"#,
+        ),
+        (
+            "demo/ThrowProbeBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ThrowProbeBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public ThrowProbeBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        try {
+            Object o = level;
+            throw (RuntimeException) o;
+        } catch (Throwable ignored) {
+            return SLAB;
+        }
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Probe implements ModInitializer {
+    private static Identifier id(String path) { return Identifier.fromNamespaceAndPath("fixture", path); }
+    @Override
+    public void onInitialize() {
+        Registry.register(BuiltInRegistries.BLOCK, id("sync"), new SyncBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("static_field"), new StaticFieldBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("instance_field"), new InstanceFieldBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("list_add"), new ListAddBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("array_store"), new ArrayStoreBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("lambda_capture"), new LambdaCaptureBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("string_concat"), new StringConcatBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("jar_helper"), new JarHelperBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("null_check"), new NullCheckBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("return_probe"), new ReturnProbeBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("throw_probe"), new ThrowProbeBlock(BlockBehaviour.Properties.of()));
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-probe-escapes", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    let escape_cases = [
+        ("fixture:sync", "java/lang/Object#<monitorenter>()V"),
+        ("fixture:static_field", "java/lang/Object#<putstatic>()V"),
+        ("fixture:instance_field", "java/lang/Object#<putfield>()V"),
+        (
+            "fixture:list_add",
+            "java/util/List#add(Ljava/lang/Object;)Z",
+        ),
+        ("fixture:array_store", "java/lang/Object#<aastore>()V"),
+        (
+            "fixture:lambda_capture",
+            "java/lang/Object#<invokedynamic>()V",
+        ),
+        (
+            "fixture:string_concat",
+            "java/lang/String#valueOf(Ljava/lang/Object;)Ljava/lang/String;",
+        ),
+        (
+            "fixture:jar_helper",
+            "demo/JarHelperBlock#helper(Lnet/minecraft/world/level/BlockGetter;)Lnet/minecraft/world/phys/shapes/VoxelShape;",
+        ),
+        ("fixture:null_check", "java/lang/Object#<ifnonnull>()V"),
+        ("fixture:return_probe", "java/lang/Object#<areturn>()V"),
+        ("fixture:throw_probe", "java/lang/Object#<athrow>()V"),
+    ];
+    for (id, expected_call) in escape_cases {
+        let blk = registration_value(&host, id);
+        let before = host.unknown_host_call_count();
+        let before_count = host
+            .unknown_host_calls()
+            .into_iter()
+            .find_map(|(name, count)| (name == expected_call).then_some(count))
+            .unwrap_or(0);
+        let res = fixture.jar.block_shapes(&mut host, &blk).unwrap();
+        let after_count = host
+            .unknown_host_calls()
+            .into_iter()
+            .find_map(|(name, count)| (name == expected_call).then_some(count))
+            .unwrap_or(0);
+        assert!(
+            host.unknown_host_call_count() > before,
+            "{id}: probe escape must increment unknown_host_call_count"
+        );
+        assert!(
+            after_count > before_count,
+            "{id}: expected choke-point unknown call {expected_call} to increment (got calls: {:?})",
+            host.unknown_host_calls()
+        );
+        assert!(res.states.is_none(), "{id}: shape must not resolve");
+        assert_eq!(res.to_content_export(), (None, None), "{id}");
+    }
+
+    fixture
+        .jar
+        .populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    let exported: BTreeMap<String, serde_json::Value> = content::declarations(host.registrations())
+        .into_iter()
+        .map(|decl| (decl.id().to_owned(), decl.file_json()))
+        .collect();
+    for (id, _) in escape_cases {
+        assert!(
+            exported[id].get("shapes").is_none(),
+            "{id} must not export shapes"
+        );
+        assert!(
+            exported[id].get("collision_shapes").is_none(),
+            "{id} must not export collision_shapes"
+        );
+    }
+}
+
+/// Round-3 Finding 3: canonical `BlockState` markers stay registered in `StdHost.block_states`
+/// across shape extractions, so if `getShape` stores `state` in a static field, a later call
+/// reading `getValue` / `getBlock` / `==` on that stored state gets the exact Java answer with
+/// zero counted calls.
+#[test]
+fn canonical_block_states_survive_shape_extraction_when_stored_in_static() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/CachingStateBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CachingStateBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public static BlockState LAST_EAST_STATE;
+    public CachingStateBlock(Properties p) { super(p); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.HORIZONTAL_FACING);
+    }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (state.getValue(BlockStateProperties.HORIZONTAL_FACING) == Direction.EAST) {
+            LAST_EAST_STATE = state;
+        }
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class Probe implements ModInitializer {
+    private static CachingStateBlock BLOCK;
+    @Override
+    public void onInitialize() {
+        BLOCK = Registry.register(
+            BuiltInRegistries.BLOCK,
+            Identifier.fromNamespaceAndPath("fixture", "caching_state"),
+            new CachingStateBlock(BlockBehaviour.Properties.of())
+        );
+    }
+
+    public static String readStoredState() {
+        BlockState stored = CachingStateBlock.LAST_EAST_STATE;
+        Direction facing = stored.getValue(BlockStateProperties.HORIZONTAL_FACING);
+        boolean sameBlock = stored.getBlock() == BLOCK;
+        boolean sameCanonical = stored == BLOCK.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+        return facing.name() + "|" + sameBlock + "|" + sameCanonical;
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-stored-state", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    let before = host.unknown_host_call_count();
+    fixture
+        .jar
+        .populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    assert_eq!(host.unknown_host_call_count(), before);
+
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "readStoredState",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert_eq!(answer, Value::Ref(Some("EAST|true|true".to_owned())));
+}
+
 /// Real-jar verification against `runes-fabric-1.3.2+26.3.jar`:
 ///
 /// `net/runes/block/RuneCraftingBlock` (`runes-javap.txt` lines 1113-1116, 1196-1232):

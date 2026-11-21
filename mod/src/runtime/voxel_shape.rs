@@ -2152,12 +2152,8 @@ impl NativeJar {
         let ctx = probe_collision_context();
 
         let mut results = Vec::with_capacity(state_combos.len());
-        let mut synthetic_states = Vec::with_capacity(state_combos.len());
         for state_map in state_combos {
-            let (state_val, inserted) = host.mint_block_state(marker, state_map.clone());
-            if inserted && let Some(state_marker) = expect_ref(&state_val) {
-                synthetic_states.push(state_marker.clone());
-            }
+            let state_val = host.mint_block_state(marker, state_map.clone());
             let unknown_before = host.unknown_host_call_count();
             let args = [state_val, level.clone(), pos.clone(), ctx.clone()];
             let call = self.invoke_persistent(target, Some(block.clone()), &args, host, budget);
@@ -2165,14 +2161,12 @@ impl NativeJar {
             match call {
                 Ok(value) => {
                     if unknown_after > unknown_before {
-                        host.remove_block_states(&synthetic_states);
                         return Ok(None);
                     }
                     let Some(shape) = shape_data(host, &value) else {
                         if !matches!(value, Value::Ref(None)) {
                             let _ = host.unknown_host_call(target);
                         }
-                        host.remove_block_states(&synthetic_states);
                         return Ok(None);
                     };
                     results.push(BlockStateShape {
@@ -2181,7 +2175,6 @@ impl NativeJar {
                     });
                 }
                 Err(err) => {
-                    host.remove_block_states(&synthetic_states);
                     if unknown_after > unknown_before
                         && matches!(err, NativeError::UncaughtException { .. })
                     {
@@ -2193,7 +2186,6 @@ impl NativeJar {
                 }
             }
         }
-        host.remove_block_states(&synthetic_states);
         Ok(Some(results))
     }
 

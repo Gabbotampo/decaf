@@ -5836,13 +5836,14 @@ impl StdHost {
     /// `StateDefinition` maps 1-to-1 to a single canonical object (matching MC 26.3
     /// `StateHolder.setValueInternal` returning `this.neighbors[propIndex][valIndex]`).
     ///
-    /// Returns `(state_value, inserted)` where `inserted` is `true` iff this call added a new
-    /// entry to `self.block_states`.
+    /// Canonical state markers are a bounded finite set per block and stay registered in
+    /// `self.block_states` for the life of the runtime so any state stored during `getShape`
+    /// keeps its metadata and `==` identity across calls.
     pub(crate) fn canonical_block_state(
         &mut self,
         block_marker: &str,
         mut values: BTreeMap<String, String>,
-    ) -> (Value, bool) {
+    ) -> Value {
         if let Some(props) = self.block_state_properties.get(block_marker) {
             for (name, info) in props {
                 if !values.contains_key(name)
@@ -5857,28 +5858,18 @@ impl StdHost {
             }
         }
         let key = Self::canonical_block_state_marker(block_marker, &values);
-        let inserted = match self.block_states.entry(key.clone()) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert((block_marker.to_owned(), values));
-                true
-            }
-            std::collections::btree_map::Entry::Occupied(_) => false,
-        };
-        (Value::Ref(Some(key)), inserted)
+        self.block_states
+            .entry(key.clone())
+            .or_insert_with(|| (block_marker.to_owned(), values));
+        Value::Ref(Some(key))
     }
 
     pub(crate) fn mint_block_state(
         &mut self,
         block_marker: &str,
         values: BTreeMap<String, String>,
-    ) -> (Value, bool) {
+    ) -> Value {
         self.canonical_block_state(block_marker, values)
-    }
-
-    pub(crate) fn remove_block_states(&mut self, markers: &[String]) {
-        for marker in markers {
-            self.block_states.remove(marker);
-        }
     }
 
     pub(crate) fn block_has_collision_by_marker(&self, block_marker: &str) -> Option<bool> {
@@ -6662,7 +6653,7 @@ impl StdHost {
                     values.insert(name.clone(), value.clone());
                 }
             }
-            return Ok(Some(self.canonical_block_state(marker, values).0));
+            return Ok(Some(self.canonical_block_state(marker, values)));
         }
         if marker.starts_with("blockstate/") {
             let Some((block, values)) = self.block_states.get(marker).cloned() else {
@@ -7033,7 +7024,7 @@ impl StdHost {
                     };
                     let mut values = values;
                     values.insert(prop_name, value);
-                    return Ok(Some(self.canonical_block_state(&block, values).0));
+                    return Ok(Some(self.canonical_block_state(&block, values)));
                 }
                 _ => {}
             }
@@ -22737,6 +22728,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget,
         };
         if !runtime.classes.contains_key(&class_name) {
@@ -22960,6 +22952,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget,
         };
         // The callback sees the objects its entrypoint built, and the next
@@ -23047,6 +23040,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -23214,6 +23208,7 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let resident = runtime.adopt_resident_heap();
@@ -25473,6 +25468,10 @@ struct Runtime<'a, H> {
     /// thread's stack (`frame_bound.rs`) in [`Runtime::invoke`] before a frame
     /// starts.
     depth: usize,
+    /// True while a `Block.getShape` / `getCollisionShape` extraction with
+    /// `HostKind::ShapeProbe` arguments is active; enables the structural
+    /// per-instruction probe allow-list in [`Runtime::invoke_frame`].
+    shape_extraction: bool,
     /// The wall-clock budget this execution honours, checked with
     /// [`BUDGET_CHECK_INSTRUCTIONS`] and in [`Runtime::invoke`].
     budget: &'a ExecutionBudget,
@@ -25486,6 +25485,11 @@ enum Assignable {
     Counted,
     /// A name the runtime does not know: the host's nominal answer.
     Host,
+}
+
+/// Whether `value` is an opaque shape-extraction probe (`HostKind::ShapeProbe`).
+fn is_shape_probe(value: &Value) -> bool {
+    matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
 }
 
 /// Whether `file` itself declares `field` (name and descriptor).
@@ -34052,9 +34056,14 @@ impl<H: Host> Runtime<'_, H> {
             jar_throwables::start_execution();
         }
         self.depth += 1;
+        let prev_shape_extraction = self.shape_extraction;
+        if receiver.as_ref().is_some_and(is_shape_probe) || args.iter().any(is_shape_probe) {
+            self.shape_extraction = true;
+        }
         stack_walk::enter(class, method);
         let result = self.invoke_frame(class, method, desc, receiver, args);
         stack_walk::leave();
+        self.shape_extraction = prev_shape_extraction;
         self.depth -= 1;
         // An execution's end: a host walk's refusal no jar frame saw (the entrypoint's own
         // host call, or one that left uncaught) is counted too.
@@ -34073,6 +34082,176 @@ impl<H: Host> Runtime<'_, H> {
             instructions: self.instructions,
             instruction_limit: self.budget.instruction_limit(),
         }
+    }
+
+    fn count_shape_probe_use(&mut self, op: u8) -> Result<(), NativeError> {
+        let name = match op {
+            0x4f..=0x56 => "<aastore>",
+            0xac..=0xb0 => "<areturn>",
+            0xb3 => "<putstatic>",
+            0xb4 => "<getfield>",
+            0xb5 => "<putfield>",
+            0xba => "<invokedynamic>",
+            0xbf => "<athrow>",
+            0xc2 => "<monitorenter>",
+            0xc3 => "<monitorexit>",
+            0xc6 => "<ifnull>",
+            0xc7 => "<ifnonnull>",
+            _ => "<shape_probe>",
+        };
+        self.host
+            .unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: name.into(),
+                descriptor: "()V".into(),
+            })
+            .map(|_| ())
+    }
+
+    /// Structural allow-list enforced on every bytecode instruction while a
+    /// `Block.getShape` / `getCollisionShape` extraction is active (`self.shape_extraction`):
+    /// a `HostKind::ShapeProbe` may only move between locals and the operand stack
+    /// (loads/stores/dup/pop/swap) or be forwarded to the exact free-forwarding targets in
+    /// [`Self::is_allowed_shape_probe_invoke`]. Every other use (`monitorenter`/`monitorexit`,
+    /// `putstatic`, `putfield`, `getfield`, `aastore`, `areturn`, `athrow`, `ifnull`/`ifnonnull`,
+    /// etc.) counts as unknown.
+    fn check_shape_probe_opcode(
+        &mut self,
+        op: u8,
+        code: &[u8],
+        pc: usize,
+        stack: &[Value],
+    ) -> Result<(), NativeError> {
+        match op {
+            // (a) Opcodes that pop nothing or only shuffle/move references between locals & stack.
+            0x00..=0x2d
+            | 0x3a
+            | 0x4b..=0x4e
+            | 0x57..=0x5f
+            | 0x84
+            | 0xa7
+            | 0xb1
+            | 0xb2
+            | 0xbb
+            | 0xc8 => return Ok(()),
+            0xc4 => {
+                if let Some(&wide_op) = code.get(pc)
+                    && matches!(wide_op, 0x15..=0x19 | 0x3a | 0x84)
+                {
+                    return Ok(());
+                }
+            }
+            // Checked in `0xb6..=0xb9` (`is_allowed_shape_probe_invoke`), `0xba` (captured args),
+            // and in `same_reference` / `checkcast` / `instanceof` (exact target-named counts).
+            0xa5 | 0xa6 | 0xb6..=0xba | 0xc0 | 0xc1 => return Ok(()),
+            _ => {}
+        }
+        let read_slots = match op {
+            0x4f..=0x56 => 3,
+            0x2e..=0x35 | 0x60..=0x73 | 0x78..=0x83 | 0x94..=0x98 | 0x9f..=0xa4 | 0xb5 => 2,
+            0xc5 => code.get(pc + 2).copied().map_or(stack.len(), usize::from),
+            _ => 1,
+        };
+        let tail_start = stack.len().saturating_sub(read_slots);
+        if stack[tail_start..].iter().any(is_shape_probe) {
+            self.count_shape_probe_use(op)?;
+        }
+        Ok(())
+    }
+
+    /// Walk `start_class` up the jar/linked hierarchy looking for `(name, GET_SHAPE_DESC)`.
+    /// Returns `(true, _)` if a jar class defines it (so it executes under the same allow-list),
+    /// or `(false, external_super)` at the first external superclass.
+    fn resolve_shape_method_chain(&self, start_class: &str, name: &str) -> (bool, String) {
+        let mut cur = start_class.to_owned();
+        for _ in 0..64 {
+            let Some(file) = self.class(&cur) else {
+                return (false, cur);
+            };
+            if file.method(name, voxel_shape::GET_SHAPE_DESC).is_some() {
+                return (true, cur);
+            }
+            if file.super_name.is_empty() {
+                return (false, cur);
+            }
+            cur = file.super_name.clone();
+        }
+        (false, cur)
+    }
+
+    /// Exact allow-list of method invocations that may receive `HostKind::ShapeProbe` arguments
+    /// during shape extraction without being immediately counted as unknown.
+    fn is_allowed_shape_probe_invoke(
+        &self,
+        op: u8,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) -> bool {
+        let Some(receiver) = receiver else {
+            return false;
+        };
+        if is_shape_probe(receiver) {
+            return false;
+        }
+        let probe_in_slot = |value: &Value, expected_key: &str| {
+            !is_shape_probe(value)
+                || matches!(
+                    value,
+                    Value::Host(h) if h.kind() == HostKind::ShapeProbe && h.key() == expected_key
+                )
+        };
+        // (b1) `state.getShape(level, pos[, ctx])` on a tracked jar BlockState with probes in
+        // their original argument positions.
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && ((r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                && args.len() == 2
+                && probe_in_slot(&args[0], "block-getter")
+                && probe_in_slot(&args[1], "block-pos"))
+                || (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC
+                    && args.len() == 3
+                    && probe_in_slot(&args[0], "block-getter")
+                    && probe_in_slot(&args[1], "block-pos")
+                    && probe_in_slot(&args[2], "collision-context")))
+            && let Some(state_block) = self.host.block_state_block(receiver)
+            && let Some(block_class) = jar_object::object_class(&state_block)
+        {
+            let (in_jar, external) = self.resolve_shape_method_chain(block_class, "getShape");
+            return in_jar || vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+        }
+        // (b2) `super.getShape` / `this.getShape` / `super.getCollisionShape` /
+        // `this.getCollisionShape` with probes in their original positions (1=block-getter,
+        // 2=block-pos, 3=collision-context).
+        if matches!(op, 0xb6 | 0xb7)
+            && matches!(r.name.as_str(), "getShape" | "getCollisionShape")
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && args.len() == 4
+            && !is_shape_probe(&args[0])
+            && probe_in_slot(&args[1], "block-getter")
+            && probe_in_slot(&args[2], "block-pos")
+            && probe_in_slot(&args[3], "collision-context")
+            && let Some(recv_class) = jar_object::object_class(receiver)
+        {
+            let start = if op == 0xb7 {
+                r.owner.as_str()
+            } else {
+                recv_class
+            };
+            let (in_jar, external) = self.resolve_shape_method_chain(start, &r.name);
+            if in_jar {
+                return true;
+            }
+            if r.name == "getShape" {
+                return vanilla_block_shapes::inherits_block_behaviour_get_shape(&external);
+            }
+            return vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&external)
+                && self.host.block_has_collision(receiver).is_some();
+        }
+        false
     }
 
     fn invoke_bigdecimal_static(
@@ -34593,6 +34772,9 @@ impl<H: Host> Runtime<'_, H> {
             let at = pc;
             let op = code[pc];
             pc += 1;
+            if self.shape_extraction {
+                invoke_or_catch!(at, self.check_shape_probe_opcode(op, code, pc, &stack));
+            }
             match op {
                 0x00 => {}
                 0x01 => stack.push(Value::Ref(None)),
@@ -35792,6 +35974,17 @@ impl<H: Host> Runtime<'_, H> {
                     // a redirect that replaces the whole call sees (and then
                     // discards) the modified value, deterministically.
                     self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    if self.shape_extraction
+                        && (receiver.as_ref().is_some_and(is_shape_probe)
+                            || args.iter().any(is_shape_probe))
+                        && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
+                    {
+                        let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
+                        if value != Value::Void {
+                            stack.push(value);
+                        }
+                        continue;
+                    }
                     // A cancelled `new` left a null reference behind; its
                     // matching `<init>` is skipped so the construction has no
                     // side effect.  The LIFO check keeps a constructor
@@ -37166,6 +37359,9 @@ impl<H: Host> Runtime<'_, H> {
                         .map(|_| pop(&mut stack, class, method, at))
                         .collect::<Result<Vec<_>, _>>()?;
                     captured.reverse();
+                    if self.shape_extraction && captured.iter().any(is_shape_probe) {
+                        invoke_or_catch!(at, self.count_shape_probe_use(op));
+                    }
                     // A pattern-matching `switch` site answers the matching
                     // label's index (`type_switch`).
                     if let Some(labels) = file.type_switch_labels(index)
@@ -42009,6 +42205,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -42089,6 +42286,7 @@ mod tests {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let method = MethodRef {
@@ -49249,6 +49447,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let first = runtime.new_object("demo/Fields");
@@ -49471,6 +49670,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let new_instance = MethodRef {
@@ -49668,6 +49868,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         // A stream takes one stage or terminal (`linkedOrConsumed`): each
@@ -50041,6 +50242,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let lookup = MethodRef {
@@ -50358,6 +50560,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let class = host_class::class_value("demo/ReflectiveFields");
@@ -55633,6 +55836,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let grid = runtime.new_multidim_array("[[I", &[2, 3]).unwrap();
@@ -55700,6 +55904,7 @@ mandatory = true
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: false,
             budget: &ExecutionBudget::UNBOUNDED,
         };
         let error = runtime
