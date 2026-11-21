@@ -168,6 +168,29 @@ pub(crate) const JDK_SKELETONS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// Whether the known JDK skeleton chain proves that `class` is not an enum.
+///
+/// A class absent from this table is deliberately unknown: the runtime has no
+/// JDK class files and must leave contracts such as `EnumSet.allOf` counted.
+pub(crate) fn jdk_skeleton_proves_not_enum(class: &str) -> bool {
+    let mut current = class;
+    let mut known = false;
+    for _ in 0..=JDK_SKELETONS.len() {
+        if matches!(current, "java/lang/Object" | "java/lang/Record") {
+            return known;
+        }
+        let Some((_, superclass, _)) = JDK_SKELETONS
+            .iter()
+            .find(|(skeleton, _, _)| *skeleton == current)
+        else {
+            return false;
+        };
+        known = true;
+        current = superclass;
+    }
+    false
+}
+
 /// Whether the JDK class `class`, or a JDK superclass of it, declares the
 /// instance method `name descriptor` itself, so that it is selected before
 /// any superinterface default. `None` when the runtime does not know the
