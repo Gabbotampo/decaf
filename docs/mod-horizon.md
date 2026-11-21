@@ -114,6 +114,19 @@ software renderer) with `--server 127.0.0.1:25599 --name Prova`, and driven thro
   - `copyfrom_fixture` ran 2, `COPY_FROM` and `AFTER_RESPAWN`.
   - `m2c_fixture`'s total reached 1992 with the player's ticks.
 
+**Real mods.** Five Fabric jars from the local corpus, on the same build with no other jars. None
+runs clean yet. These are runtime gaps, not this bridge's: the same runtime runs in `mod/`.
+
+| Jar | Verdict | Why |
+|---|---|---|
+| fabric-carpet 26.3+v260915 | `ran-partial` | `CarpetRulePrinter.onInitializeServer`: NPE on `joptsimple.OptionSpecBuilder.withRequiredArg()`; 11 unknown host calls; `/carpet` is not registered |
+| FarmersDelight 3.6.30 | `refused` | `ExceptionInInitializerError` in `AbstractStoveBlock.<init>`, caused by an NPE on `StateDefinition.any()` |
+| mcw-fences 1.2.1 | `refused` | the same `StateDefinition.any()` NPE in `FenceHitbox.<init>` |
+| toms_storage 2.12.2 | `refused` | NPE on `BlockState.setValue` in `AbstractStorageTerminalBlock.<init>` |
+| Clumps 26.3.2 | `refused` | no main, server or NeoForge entrypoint |
+
+The three block-state failures are the area of #581 (block state properties).
+
 ## What is not done yet
 
 - **The mod's log lines don't reach the game's log.** The mod compiles its own copy of the `log`
