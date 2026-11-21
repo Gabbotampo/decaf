@@ -197,7 +197,10 @@ impl<H: Host> Runtime<'_, H> {
         if target == "java/lang/Object" {
             return Ok(());
         }
-        if let Some(verdict) = self.collection_instance_of(value, target) {
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
             return match verdict {
                 Some(true) => Ok(()),
                 Some(false) => Err(class_cast_exception(
@@ -520,6 +523,11 @@ impl<H: Host> Runtime<'_, H> {
                 .filter(|_| handle.key().contains("#immutable"))
                 .map(|(class, _)| class.to_owned());
         }
+        if let Value::Host(handle) = value
+            && handle.kind() == crate::host_ref::HostKind::MenuObject
+        {
+            return Some(crate::jar_object::menu_object_class(handle.key()).to_owned());
+        }
         let marker = match value {
             Value::Host(handle) if crate::jar_object::is_object_handle(handle) => handle.key(),
             Value::Ref(Some(marker)) => marker,
@@ -545,7 +553,10 @@ impl<H: Host> Runtime<'_, H> {
         if matches!(value, Value::Ref(None)) {
             return Some(false);
         }
-        if let Some(verdict) = self.collection_instance_of(value, target) {
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
             return verdict;
         }
         if let Value::Host(handle) = value
@@ -603,7 +614,10 @@ impl<H: Host> Runtime<'_, H> {
     /// #242). The JDK models answer for the JDK objects they build, and an
     /// opaque marker against a JDK interface is left for a later change.
     pub(super) fn instance_of_is_guess(&self, value: &Value, target: &str) -> bool {
-        if let Some(verdict) = self.collection_instance_of(value, target) {
+        if let Some(verdict) = self
+            .collection_instance_of(value, target)
+            .or_else(|| self.menu_object_instance_of(value, target))
+        {
             return verdict.is_none();
         }
         let marker = match value {
@@ -707,6 +721,30 @@ impl<H: Host> Runtime<'_, H> {
             )),
             _ => None,
         }
+    }
+
+    /// Type verdict for a host-synthesized menu model object ([`HostKind::MenuObject`]):
+    /// exact for its known 26.3 supertypes, arrays, final JDK classes, non-interface
+    /// jar classes, and final host handle kinds; `Some(None)` (counted) otherwise.
+    fn menu_object_instance_of(&self, value: &Value, target: &str) -> Option<Option<bool>> {
+        let Value::Host(handle) = value else {
+            return None;
+        };
+        if handle.kind() != HostKind::MenuObject {
+            return None;
+        }
+        if let Some(answer) = handle.instance_of(target, self) {
+            return Some(Some(answer));
+        }
+        if let Some(file) = self.class(target)
+            && class_access(file).is_some_and(|access| access & ACC_INTERFACE == 0)
+        {
+            return Some(Some(false));
+        }
+        if HostKind::of_class(target).is_some() {
+            return Some(Some(false));
+        }
+        Some(None)
     }
 
     /// The held class of a jar object (an object handle) or of a jar enum

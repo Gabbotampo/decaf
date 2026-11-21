@@ -41,7 +41,7 @@
 //! key is a `String`.
 
 use crate::runtime::Value;
-use crate::runtime::host_ref::{HostKind, HostRef, Methods, instance_of_class};
+use crate::runtime::host_ref::{ClassHierarchy, HostKind, HostRef, Methods, instance_of_class};
 
 /// A jar object's handle for an allocation key `class#n`.
 pub(crate) fn handle(key: String) -> Value {
@@ -66,6 +66,9 @@ pub(crate) fn stored(key: &str) -> Value {
     if collection_key(key).is_some() {
         return collection(key.to_owned());
     }
+    if menu_object_key(key).is_some() {
+        return menu_object(key.to_owned());
+    }
     if matches!(
         key_class(key),
         Some(
@@ -87,11 +90,94 @@ pub(crate) fn stored(key: &str) -> Value {
 /// (`expect_ref` of one), never a jar's: no `Ref` is an object, so a key the
 /// runtime holds is an object's.
 pub(crate) fn stored_value(text: &str) -> Value {
-    if parse_key(text).is_some() || collection_key(text).is_some() {
+    if parse_key(text).is_some()
+        || collection_key(text).is_some()
+        || menu_object_key(text).is_some()
+    {
         stored(text)
     } else {
         Value::Ref(Some(text.to_owned()))
     }
+}
+
+/// A host-synthesized menu-model object's handle for its key (`<class>#menu<n>`).
+pub(crate) fn menu_object(key: String) -> Value {
+    debug_assert!(
+        menu_object_key(&key).is_some(),
+        "{key:?} is no menu object key"
+    );
+    Value::Host(HostRef::new(HostKind::MenuObject, key))
+}
+
+/// A host-synthesized menu-model object's key: `(class, n)` for `<class>#menu<n>`,
+/// a class with no `#`, `:`, space, `.`, `,` or `\`. `parse_key` still returns `None`
+/// for this shape so `#menu<n>` ids stay out of `freed_objects` numeric ranges, while
+/// `spells_key_text` keeps any Java `String` literal with this text as a plain `String`.
+pub(crate) fn menu_object_key(text: &str) -> Option<(&str, &str)> {
+    let (class, rest) = text.split_once('#')?;
+    let number = rest.strip_prefix("menu")?;
+    (!class.is_empty()
+        && !class.contains([':', ' ', '.', ',', '\\'])
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some((class, number))
+}
+
+/// `ClassRule::FromKey` of a host-synthesized menu object: the class before `#menu<n>`.
+pub(crate) fn menu_object_class(key: &str) -> &str {
+    key.split_once('#').map_or(key, |(class, _)| class)
+}
+
+/// Known 26.3 supertypes of host-synthesized `#menu<n>` classes (`javap` on 26.3).
+fn menu_object_supertypes(class: &str) -> &'static [&'static str] {
+    const RESULT_CONTAINER: &[&str] = &[
+        "net/minecraft/world/inventory/ResultContainer",
+        "net/minecraft/world/Container",
+        "net/minecraft/world/Clearable",
+        "java/lang/Iterable",
+        "net/minecraft/world/entity/SlotProvider",
+        "net/minecraft/world/inventory/RecipeCraftingHolder",
+    ];
+    const SIMPLE_CONTAINER: &[&str] = &[
+        "net/minecraft/world/SimpleContainer",
+        "net/minecraft/world/Container",
+        "net/minecraft/world/Clearable",
+        "java/lang/Iterable",
+        "net/minecraft/world/entity/SlotProvider",
+        "net/minecraft/world/inventory/StackedContentsCompatible",
+    ];
+    const SLOT: &[&str] = &["net/minecraft/world/inventory/Slot"];
+    const RECORD: &[&str] = &["java/lang/Record"];
+    match class {
+        "net/minecraft/core/NonNullList" => crate::runtime::java_immutable::cast_supertypes(class),
+        "net/minecraft/world/inventory/ItemCombinerMenu$1" => RESULT_CONTAINER,
+        "net/minecraft/world/inventory/ItemCombinerMenu$4" => SIMPLE_CONTAINER,
+        "net/minecraft/world/inventory/ItemCombinerMenu$2"
+        | "net/minecraft/world/inventory/ItemCombinerMenu$3" => SLOT,
+        "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition$SlotDefinition" => RECORD,
+        _ => &[],
+    }
+}
+
+fn menu_object_instance_of(
+    handle: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    let class = menu_object_class(handle.key());
+    if wanted == "java/lang/Object"
+        || class == wanted
+        || menu_object_supertypes(class).contains(&wanted)
+    {
+        return Some(true);
+    }
+    if wanted.starts_with('[') {
+        return Some(false);
+    }
+    if class == "net/minecraft/core/NonNullList" && wanted == "java/util/RandomAccess" {
+        return Some(false);
+    }
+    hierarchy.is_instance(class, wanted)
 }
 
 /// A host-made collection's handle for its key (`<class>#neutral<n>`,
@@ -172,17 +258,18 @@ pub(crate) fn spells_key(value: &Value) -> bool {
 
 /// [`spells_key`] of a reference's text.
 pub(crate) fn spells_key_text(text: &str) -> bool {
-    parse_key(text).is_some() || collection_key(text).is_some()
+    parse_key(text).is_some() || collection_key(text).is_some() || menu_object_key(text).is_some()
 }
 
-/// Whether `handle` is an allocated object: a jar's (or a model's) `new`, or
-/// a collection the host made.
+/// Whether `handle` is an allocated object: a jar's (or a model's) `new`, a
+/// host-made collection, or a host-synthesized menu object.
 pub(crate) fn is_object_handle(handle: &HostRef) -> bool {
     matches!(
         handle.kind(),
         HostKind::JarObject
             | HostKind::Writer
             | HostKind::Collection
+            | HostKind::MenuObject
             | HostKind::GuavaMultimap
             | HostKind::RenderObject
     )
@@ -209,6 +296,13 @@ pub(crate) const JAR_OBJECT: Methods = Methods {
     // `compareTo` dispatches to the class's own body like any method; a
     // caller that only has the row (a host sort) counts it.
     compare_to: None,
+};
+
+/// Row for [`HostKind::MenuObject`]: shares `JAR_OBJECT`'s `Object` dispatch
+/// while using the 26.3 menu-object supertype table for `instanceof` / `checkcast`.
+pub(crate) const MENU_OBJECT: Methods = Methods {
+    instance_of: menu_object_instance_of,
+    ..JAR_OBJECT
 };
 
 /// A handle's key `class#n`: `(class, n)`. The runtime wrote it
@@ -296,6 +390,9 @@ pub(crate) fn object_class(value: &Value) -> Option<&str> {
         Value::Host(handle) if handle.kind() == HostKind::Collection => {
             Some(collection_class(handle.key()))
         }
+        Value::Host(handle) if handle.kind() == HostKind::MenuObject => {
+            Some(menu_object_class(handle.key()))
+        }
         _ => key_class(object_key(value)?),
     }
 }
@@ -345,6 +442,7 @@ mod tests {
             "demo/Foo#3a",
             "java/util/ArrayList#immutable3",
             "demo/Foo#bar",
+            "net/minecraft/core/NonNullList#menu0",
             "[I#0",
             "a b#3",
             "minecraft:stone#3",
