@@ -53,8 +53,8 @@ impl State {
     }
 }
 
-/// Methods on FabricCreativeModeTabOutput which the collector handles. Other
-/// output methods remain counted by the normal host boundary.
+/// The collector handles only the two one-argument `accept` forms. Visibility
+/// and placement overloads need vanilla tab contents and remain counted.
 fn output_instance_of(_: &HostRef, wanted: &str, _: &dyn ClassHierarchy) -> Option<bool> {
     Some(matches!(
         wanted,
@@ -194,12 +194,18 @@ pub(crate) fn instance_call(
         HostKind::CreativeModeTabOutput => {
             let values = state.outputs.get_mut(h.key())?;
             let value = args.first()?.clone();
-            match r.name.as_str() {
-                "accept" => values.push(value),
-                "prepend" => values.insert(0, value),
-                _ => return None,
+            if r.name == "accept"
+                && matches!(
+                    r.descriptor.as_str(),
+                    "(Lnet/minecraft/world/item/ItemStack;)V"
+                        | "(Lnet/minecraft/world/level/ItemLike;)V"
+                )
+            {
+                values.push(value);
+                Some(Ok(Value::Void))
+            } else {
+                None
             }
-            Some(Ok(Value::Void))
         }
         _ => None,
     }
@@ -210,7 +216,7 @@ mod output_tests {
     use super::*;
 
     #[test]
-    fn output_records_accept_and_prepend_in_order() {
+    fn output_records_accept_in_order_without_copying_values() {
         let mut state = State::default();
         let output = begin_output(&mut state, "minecraft:combat");
         let first = Value::Host(HostRef::new(
@@ -235,12 +241,12 @@ mod output_tests {
             &mut state,
             &MethodRef {
                 owner: "net/fabricmc/fabric/api/creativetab/v1/FabricCreativeModeTabOutput".into(),
-                name: "prepend".into(),
+                name: "accept".into(),
                 descriptor: "(Lnet/minecraft/world/level/ItemLike;)V".into(),
             },
             &output,
             std::slice::from_ref(&second),
         );
-        assert_eq!(take_output(&mut state, &output), Some(vec![second, first]));
+        assert_eq!(take_output(&mut state, &output), Some(vec![first, second]));
     }
 }

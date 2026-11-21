@@ -65,9 +65,8 @@ fn creative_tab_registration_matches_java25_capture_and_is_unfired() {
     );
     let listeners = host.game_listeners(&fixture.jar, true);
     assert!(listeners.listeners.is_empty());
-    assert!(
-        listeners.unsupported.values().sum::<usize>() >= 1,
-        "registration must be reported unfired: {:?}",
-        listeners.unsupported
-    );
+    assert!(listeners.unsupported.is_empty());
+    let contents = fixture.jar.creative_tab_contents(&mut host).unwrap();
+    assert_eq!(contents.len(), 1);
+    assert!(contents.contains_key("minecraft:creative_mode_tab:spell_engine:main"));
 }
