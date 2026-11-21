@@ -35505,10 +35505,22 @@ impl<H: Host> Runtime<'_, H> {
                     // operand.  Read-only JDK operations retain exact later multimap reads.
                     // Nested reach through arrays, collections, fields, or lambda captures is a
                     // known gap tracked separately for every host collection.
-                    if self.host.counted_unknown_calls() > unknown_before
-                        && crate::guava_multimap::counted_call_may_mutate(&r)
-                    {
-                        crate::guava_multimap::taint_operands(self, taint_receiver.as_ref(), &args);
+                    if self.host.counted_unknown_calls() > unknown_before {
+                        if crate::guava_multimap::counted_call_may_mutate(&r) {
+                            crate::guava_multimap::taint_operands(
+                                self,
+                                taint_receiver.as_ref(),
+                                &args,
+                            );
+                        }
+                        if !jar_body
+                            && crate::immutable_collections::counted_call_may_mutate_identity(&r)
+                        {
+                            self.taint_reachable_identity_collections(
+                                taint_receiver.as_ref(),
+                                &args,
+                            );
+                        }
                     }
                     let value = self.materialize_host_value(value);
                     // No JDK or library API answers a `null` Optional: a host

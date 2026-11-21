@@ -50,6 +50,37 @@ public final class Probe {
     ((java.util.Map.Entry<String,String>) m.entrySet().toArray()[0]).setValue(fresh);
     return m.remove(k, old) + ":" + m.get(k);
   }
+  @SuppressWarnings("unchecked")
+  public static String unmodEntryToArrayFn() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String,String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    java.util.Map<String,String> u = java.util.Collections.unmodifiableMap(m);
+    java.util.Map.Entry<String,String>[] arr = u.entrySet().toArray(java.util.Map.Entry[]::new);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  public static String unmodSyncEntryToArrayFn() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String,String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    java.util.Map<String,String> u =
+        java.util.Collections.unmodifiableMap(java.util.Collections.synchronizedMap(m));
+    java.util.Map.Entry<String,String>[] arr = u.entrySet().toArray(java.util.Map.Entry[]::new);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
   public static void main(String[] args) {
     System.out.println(rows());
     System.out.println(sameReference());
@@ -57,5 +88,7 @@ public final class Probe {
     System.out.println(stringValueOfIdentity());
     System.out.println(entrySetValue());
     System.out.println(entryToArraySetValue());
+    System.out.println(unmodEntryToArrayFn());
+    System.out.println(unmodSyncEntryToArrayFn());
   }
 }

@@ -525,15 +525,21 @@ impl StdHost {
         }
     }
 
-    /// The map an unmodifiable view reads, through any chain of views; `None` for a map that
-    /// is no unmodifiable view. Bounded by the view table (a cycle cannot be built, but the
-    /// walk never trusts that).
+    /// The map an unmodifiable view reads, through any chain of unmodifiable and synchronized
+    /// views; `None` for a map that is no unmodifiable view. Bounded by the view tables (a cycle
+    /// cannot be built, but the walk never trusts that).
     fn view_root(&self, map: &str) -> Option<String> {
         let mut source = crate::Host::unmodifiable_view_source(self, map)?;
-        for _ in 0..self.unmodifiable_collections.len() {
-            match crate::Host::unmodifiable_view_source(self, &source) {
+        let limit = self
+            .unmodifiable_collections
+            .len()
+            .saturating_add(self.synchronized_views.len())
+            .saturating_add(1);
+        for _ in 0..limit {
+            let target = self.synchronized_target(&source).to_owned();
+            match crate::Host::unmodifiable_view_source(self, &target) {
                 Some(next) => source = next,
-                None => return Some(source),
+                None => return Some(target),
             }
         }
         None

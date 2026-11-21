@@ -19,6 +19,8 @@ fn identity_map_distinguishes_literals_and_string_copies() {
         "stringValueOfIdentity",
         "entrySetValue",
         "entryToArraySetValue",
+        "unmodEntryToArrayFn",
+        "unmodSyncEntryToArrayFn",
     ]
     .iter()
     .map(|method| fixture.text_on(&mut host, method))

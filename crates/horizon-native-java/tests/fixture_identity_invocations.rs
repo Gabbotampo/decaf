@@ -50,6 +50,20 @@ fn adversarial_identity_review() {
         ("entryToArraySetValueOut", "true:null"),
         ("replaceAllValueOut", "false:v"),
         ("entryIterRemoveOut", "0:null"),
+        // Unmodifiable / synchronized chains over IdentityHashMap: entrySet().toArray(IntFunction)
+        // hands out detached AbstractMap$SimpleEntry copies (not live nodes), while toArray(T[])
+        // keeps UnmodifiableEntry wrappers.
+        ("unmodEntryToArrayFnOut", "no:true:null"),
+        ("unmodEntryToArrayTypedOut", "uoe:true:null"),
+        ("unmodSyncEntryToArrayFnOut", "no:true:null"),
+        ("unmodUnmodEntryToArrayFnOut", "no:true:null"),
+        // Counted reflective mutators taint every reachable IdentityHashMap so
+        // later reads and removals are counted rather than trusting stale contents.
+        ("reflectPutThenLookupOut", "false:v"),
+        ("reflectPutViaSyncViewOut", "false:v"),
+        ("reflectSetValueOnEntryOut", "false:v"),
+        ("reflectPutOnEmptyMapOut", "1:v"),
+        ("reflectPutThenReadViaUnmodOut", "v:1"),
     ];
     let exact = [
         "sameClassCallsOut",
@@ -64,6 +78,10 @@ fn adversarial_identity_review() {
         "entrySetValueOut",
         "entryToArraySetValueOut",
         "entryIterRemoveOut",
+        "unmodEntryToArrayFnOut",
+        "unmodEntryToArrayTypedOut",
+        "unmodSyncEntryToArrayFnOut",
+        "unmodUnmodEntryToArrayFnOut",
     ];
     let must_count = [
         "loopAllocOut",
@@ -74,6 +92,11 @@ fn adversarial_identity_review() {
         "integerAbove127MapOut",
         "entrySetValueOpaqueOut",
         "replaceAllValueOut",
+        "reflectPutThenLookupOut",
+        "reflectPutViaSyncViewOut",
+        "reflectSetValueOnEntryOut",
+        "reflectPutOnEmptyMapOut",
+        "reflectPutThenReadViaUnmodOut",
     ];
     for (method, expected) in cases {
         let mut host = fixture.jar.seed_host(StdHost::new());
@@ -149,6 +172,57 @@ fn adversarial_identity_review() {
                     calls.iter().any(|(call, _)| call
                         == "java/util/IdentityHashMap#replaceAll(Ljava/util/function/BiFunction;)V"),
                     "replaceAllValueOut must count IdentityHashMap#replaceAll: {calls:?}"
+                );
+            }
+            if matches!(
+                method,
+                "reflectPutThenLookupOut"
+                    | "reflectPutViaSyncViewOut"
+                    | "reflectSetValueOnEntryOut"
+            ) {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/lang/reflect/Method#invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "{method} must count Method#invoke: {calls:?}"
+                );
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#remove(Ljava/lang/Object;Ljava/lang/Object;)Z"),
+                    "{method} must taint map and count IdentityHashMap#remove: {calls:?}"
+                );
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#get(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "{method} must taint map and count IdentityHashMap#get: {calls:?}"
+                );
+            }
+            if method == "reflectPutOnEmptyMapOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/IdentityHashMap#size()I"),
+                    "reflectPutOnEmptyMapOut must taint empty map and count size(): {calls:?}"
+                );
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/IdentityHashMap#get(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "reflectPutOnEmptyMapOut must taint empty map and count get(): {calls:?}"
+                );
+            }
+            if method == "reflectPutThenReadViaUnmodOut" {
+                let calls = host.unknown_host_calls();
+                assert!(
+                    calls.iter().any(|(call, _)| call
+                        == "java/util/Map#get(Ljava/lang/Object;)Ljava/lang/Object;"),
+                    "reflectPutThenReadViaUnmodOut must count Map#get via unmodifiable view: {calls:?}"
+                );
+                assert!(
+                    calls
+                        .iter()
+                        .any(|(call, _)| call == "java/util/Map#size()I"),
+                    "reflectPutThenReadViaUnmodOut must count Map#size via unmodifiable view: {calls:?}"
                 );
             }
         } else if counted == 0 {

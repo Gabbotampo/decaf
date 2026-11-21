@@ -129,6 +129,66 @@ fn mutates(name: &str) -> bool {
     )
 }
 
+/// Whether a call that was counted as unknown may have mutated a reachable
+/// identity collection. Only proven read-only query methods return `false`;
+/// reflection (`Method.invoke`), method handles, mutators, and arbitrary
+/// unmodelled library/JDK calls return `true` so reachable identity
+/// collections are tainted uncertain instead of trusting stale contents.
+pub(crate) fn counted_call_may_mutate_identity(r: &MethodRef) -> bool {
+    let read_only = matches!(
+        (r.owner.as_str(), r.name.as_str()),
+        (
+            "java/lang/Object",
+            "getClass" | "hashCode" | "toString" | "equals"
+        ) | ("java/lang/System", "identityHashCode")
+            | (
+                "java/util/Objects",
+                "equals" | "deepEquals" | "hashCode" | "hash" | "toString"
+            )
+            | (
+                "java/util/Map$Entry",
+                "getKey" | "getValue" | "equals" | "hashCode" | "toString"
+            )
+            | (
+                "java/util/Iterator" | "java/util/ListIterator",
+                "hasNext" | "next"
+            )
+    ) || (is_map_owner(&r.owner)
+        && matches!(
+            r.name.as_str(),
+            "get"
+                | "getOrDefault"
+                | "containsKey"
+                | "containsValue"
+                | "size"
+                | "isEmpty"
+                | "keySet"
+                | "values"
+                | "entrySet"
+                | "equals"
+                | "hashCode"
+                | "toString"
+        ))
+        || (is_collection_owner(&r.owner)
+            && !is_map_owner(&r.owner)
+            && matches!(
+                r.name.as_str(),
+                "contains"
+                    | "containsAll"
+                    | "size"
+                    | "isEmpty"
+                    | "iterator"
+                    | "spliterator"
+                    | "stream"
+                    | "parallelStream"
+                    | "toArray"
+                    | "equals"
+                    | "hashCode"
+                    | "toString"
+            ));
+    !read_only
+}
+
 impl<H: Host> Runtime<'_, H> {
     fn uncertain_key(collection: &Value) -> Option<String> {
         expect_ref(collection).map(|marker| format!("{marker}|{UNCERTAIN_FIELD}"))
@@ -137,6 +197,147 @@ impl<H: Host> Runtime<'_, H> {
     /// Whether a counted call may have changed `collection` (#464).
     pub(crate) fn collection_uncertain(&self, collection: &Value) -> bool {
         Self::uncertain_key(collection).is_some_and(|key| self.fields.contains_key(&key))
+    }
+
+    /// Mark `collection` uncertain and drop any tracked identity provenance
+    /// tokens so every later read or write on it is counted.
+    pub(crate) fn mark_collection_uncertain(&mut self, collection: &Value) {
+        if let Some(key) = Self::uncertain_key(collection) {
+            self.fields.insert(key, Value::Int(1));
+        }
+        if let Some(marker) = crate::jar_object::object_key(collection) {
+            self.identity_collection_keys.remove(marker);
+        }
+    }
+
+    /// Walk through any chain of `Collections.unmodifiable*` and
+    /// `Collections.synchronized*` wrappers to the underlying root map.
+    /// Also reports whether any unmodifiable wrapper was traversed.
+    pub(crate) fn root_map_of_view(&self, mut map: Value) -> (Value, bool) {
+        let mut saw_unmodifiable = false;
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            if let Some(wrapped) = self.host.synchronized_wrapped(&map) {
+                map = wrapped;
+                continue;
+            }
+            if let Some(marker) = expect_ref(&map)
+                && let Some(inner) = self.host.unmodifiable_view_source(marker)
+            {
+                saw_unmodifiable = true;
+                map = crate::jar_object::stored_value(&inner);
+                continue;
+            }
+            break;
+        }
+        (map, saw_unmodifiable)
+    }
+
+    /// Concrete class name of a root map behind an `entrySet` view, including
+    /// non-`java/util` maps such as Gson's `LinkedTreeMap` and Guava's maps.
+    pub(crate) fn map_root_class(&self, map: &Value) -> Option<String> {
+        self.host_collection_class(map).or_else(|| {
+            let marker = expect_ref(map)?;
+            let class = crate::jar_object::key_class(marker)
+                .or_else(|| marker.split_once('#').map(|(class, _)| class))?;
+            (!class.is_empty()).then(|| class.to_owned())
+        })
+    }
+
+    /// Mark every identity collection (`IdentityHashMap` / `IdentityHashSet`)
+    /// reachable from `receiver` or `args` uncertain after a counted unknown
+    /// call (such as `Method.invoke` on `Map.put` or an unmodelled mutator).
+    pub(crate) fn taint_reachable_identity_collections(
+        &mut self,
+        receiver: Option<&Value>,
+        args: &[Value],
+    ) {
+        const MAX_TAINT_VISIT: usize = 512;
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::BTreeSet::new();
+        if let Some(value) = receiver {
+            queue.push_back(value.clone());
+        }
+        for value in args {
+            queue.push_back(value.clone());
+        }
+        let mut to_taint = Vec::new();
+        while let Some(value) = queue.pop_front() {
+            if visited.len() >= MAX_TAINT_VISIT {
+                break;
+            }
+            let visit_key = match &value {
+                Value::Ref(Some(text)) if !value_class::is_plain_string(text) => {
+                    format!("r:{text}")
+                }
+                Value::Host(handle) => format!("h:{:?}:{}", handle.kind(), handle.key()),
+                _ => continue,
+            };
+            if !visited.insert(visit_key) {
+                continue;
+            }
+            if matches!(
+                self.host_collection_class(&value).as_deref(),
+                Some(IDENTITY_MAP | IDENTITY_SET)
+            ) && !self.host.is_set_from_map(&value)
+            {
+                to_taint.push(value.clone());
+            }
+            if let Some(wrapped) = self.host.synchronized_wrapped(&value) {
+                queue.push_back(wrapped);
+            }
+            if let Some(marker) = expect_ref(&value) {
+                if let Some(source) = self.host.unmodifiable_view_source(marker) {
+                    queue.push_back(crate::jar_object::stored_value(&source));
+                }
+                if let Some(source) = self.host.view_copy_source(marker) {
+                    queue.push_back(crate::jar_object::stored_value(&source));
+                }
+            }
+            if let Some(inner) = self.host.unwrapped_view_entry(&value) {
+                queue.push_back(inner);
+            }
+            if let Some(map_marker) = self.host.map_entry_source(&value) {
+                queue.push_back(crate::jar_object::stored_value(&map_marker));
+            }
+            if let Some(it_marker) = crate::host_iterator::marker(&value) {
+                if let Some(guard) = self.host.iterator_guard(it_marker) {
+                    queue.push_back(crate::jar_object::stored_value(guard.source()));
+                    queue.push_back(crate::jar_object::stored_value(guard.root()));
+                }
+                if let Some((_, _, Some(source))) = self.host.host_iterator(it_marker) {
+                    let source = source.strip_prefix("map-entry/").unwrap_or(&source);
+                    queue.push_back(crate::jar_object::stored_value(source));
+                }
+                if let Some(items) = self.host.host_iterator_values(it_marker) {
+                    queue.extend(items);
+                }
+            }
+            if let Some(array_key) = crate::host_array::array_key(&value)
+                && let Some(crate::array_data::ArrayData::Ref(items)) = self.arrays.get(array_key)
+            {
+                queue.extend(items.iter().cloned());
+            }
+            if let Some(entries) = self.host.mutable_collection_entries(&value) {
+                queue.extend(entries);
+            } else if self.host_collection_kind(&value).is_some()
+                && let Ok(entries) = self.collection_elements(&value)
+            {
+                queue.extend(entries);
+            }
+            if let Some(obj_key) = crate::jar_object::object_key(&value) {
+                let prefix = format!("{obj_key}|");
+                for (_, field_val) in self
+                    .fields
+                    .range(prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&prefix))
+                {
+                    queue.push_back(field_val.clone());
+                }
+            }
+        }
+        for collection in to_taint {
+            self.mark_collection_uncertain(&collection);
+        }
     }
 
     /// Load `(key_tokens, value_tokens)` for `marker`, padded to `len`. Drops
@@ -535,6 +736,10 @@ impl<H: Host> Runtime<'_, H> {
         if self.collection_uncertain(receiver) {
             return self.count_identity_call(r, receiver).map(Some);
         }
+        let (root_view, saw_unmodifiable) = self.root_map_of_view(receiver.clone());
+        if saw_unmodifiable && self.collection_uncertain(&root_view) {
+            return self.count_identity_call(r, &root_view).map(Some);
+        }
         // SetFromMap is a live mutable view; its retain/remove operations must
         // reach the backing map through hash collection dispatch.
         if self.host.is_set_from_map(receiver) {
@@ -544,6 +749,16 @@ impl<H: Host> Runtime<'_, H> {
             && let Some(answer) = self.identity_entry_member(r, receiver, args, identity_args)?
         {
             return Ok(Some(answer));
+        }
+        if r.name != "setValue"
+            && let Some(inner) = self.host.unwrapped_view_entry(receiver)
+            && crate::host_map_entry::is_identity_entry(&inner)
+            && let Some(map_marker) = self.host.map_entry_source(&inner)
+        {
+            let map_value = crate::jar_object::stored_value(&map_marker);
+            if self.collection_uncertain(&map_value) {
+                return self.count_identity_call(r, &map_value).map(Some);
+            }
         }
         if let ("equals", "(Ljava/lang/Object;)Z", [other]) =
             (r.name.as_str(), r.descriptor.as_str(), args)
@@ -953,8 +1168,8 @@ impl<H: Host> Runtime<'_, H> {
         expect_ref(receiver)
             .and_then(|view| self.host.view_copy_source(view))
             .is_some_and(|source| {
-                let source = crate::jar_object::stored_value(&source);
-                self.host_collection_class(&source).as_deref() == Some(IDENTITY_MAP)
+                let (root, _) = self.root_map_of_view(crate::jar_object::stored_value(&source));
+                self.host_collection_class(&root).as_deref() == Some(IDENTITY_MAP)
             })
     }
 
@@ -1274,7 +1489,8 @@ impl<H: Host> Runtime<'_, H> {
         let Some(source) = self.host.view_copy_source(view) else {
             return Ok(None);
         };
-        let source = crate::jar_object::stored_value(&source);
+        let (source, saw_unmodifiable) =
+            self.root_map_of_view(crate::jar_object::stored_value(&source));
         if self.host_collection_class(&source).as_deref() != Some(IDENTITY_MAP) {
             return Ok(None);
         }
@@ -1346,7 +1562,7 @@ impl<H: Host> Runtime<'_, H> {
                 .count_identity_call(r, &source)
                 .map(|value| Some(Some(value)));
         }
-        if mutates(&r.name) && !matches!(r.name.as_str(), "add" | "addAll") {
+        if !saw_unmodifiable && mutates(&r.name) && !matches!(r.name.as_str(), "add" | "addAll") {
             if let Some(marker) = source_marker.as_deref() {
                 self.identity_collection_keys.remove(marker);
             }

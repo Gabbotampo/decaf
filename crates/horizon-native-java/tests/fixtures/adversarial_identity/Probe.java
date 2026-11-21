@@ -135,6 +135,128 @@ public class Probe {
     it.remove();
     return m.size() + ":" + m.get(k);
   }
+  @SuppressWarnings("unchecked")
+  static String unmodEntryToArrayFn() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    Map<String, String> u = Collections.unmodifiableMap(m);
+    Map.Entry<String, String>[] arr = u.entrySet().toArray(Map.Entry[]::new);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  static String unmodEntryToArrayTyped() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    Map<String, String> u = Collections.unmodifiableMap(m);
+    Map.Entry<String, String>[] arr = u.entrySet().toArray(new Map.Entry[0]);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  static String unmodSyncEntryToArrayFn() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    Map<String, String> u = Collections.unmodifiableMap(Collections.synchronizedMap(m));
+    Map.Entry<String, String>[] arr = u.entrySet().toArray(Map.Entry[]::new);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
+  @SuppressWarnings("unchecked")
+  static String unmodUnmodEntryToArrayFn() {
+    String k = new String("k"), old = new String("v"), fresh = new String("v");
+    IdentityHashMap<String, String> m = new IdentityHashMap<>();
+    m.put(k, old);
+    Map<String, String> u = Collections.unmodifiableMap(Collections.unmodifiableMap(m));
+    Map.Entry<String, String>[] arr = u.entrySet().toArray(Map.Entry[]::new);
+    String threw = "no";
+    try {
+      arr[0].setValue(fresh);
+    } catch (UnsupportedOperationException e) {
+      threw = "uoe";
+    }
+    return threw + ":" + m.remove(k, old) + ":" + m.get(k);
+  }
+  static String reflectPutThenLookup() {
+    try {
+      String k = new String("k"), old = new String("v"), fresh = new String("v");
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put(k, old);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, k, fresh);
+      return m.remove(k, old) + ":" + m.get(k);
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutViaSyncView() {
+    try {
+      String k = new String("k"), old = new String("v"), fresh = new String("v");
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put(k, old);
+      Map<String, String> s = Collections.synchronizedMap(m);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(s, k, fresh);
+      return m.remove(k, old) + ":" + m.get(k);
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectSetValueOnEntry() {
+    try {
+      String k = new String("k"), old = new String("v"), fresh = new String("v");
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put(k, old);
+      Map.Entry<String, String> e = m.entrySet().iterator().next();
+      java.lang.reflect.Method setValue = Map.Entry.class.getMethod("setValue", Object.class);
+      setValue.invoke(e, fresh);
+      return m.remove(k, old) + ":" + m.get(k);
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutOnEmptyMap() {
+    try {
+      String k = new String("k"), v = new String("v");
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, k, v);
+      return m.size() + ":" + m.get(k);
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
+  static String reflectPutThenReadViaUnmod() {
+    try {
+      String k = new String("k"), old = new String("v"), fresh = new String("v");
+      IdentityHashMap<String, String> m = new IdentityHashMap<>();
+      m.put(k, old);
+      Map<String, String> u = Collections.unmodifiableMap(m);
+      java.lang.reflect.Method put = Map.class.getMethod("put", Object.class, Object.class);
+      put.invoke(m, k, fresh);
+      return u.get(k) + ":" + u.size();
+    } catch (Exception e) {
+      return "ex:" + e.getClass().getSimpleName();
+    }
+  }
   public static String sameClassCallsOut(){return sameClassCalls();}
   public static String computeCallsOut(){return computeCalls();}
   public static String classCallsOut(){return classCalls();}
@@ -160,4 +282,13 @@ public class Probe {
   public static String entryToArraySetValueOut(){return entryToArraySetValue();}
   public static String replaceAllValueOut(){return replaceAllValue();}
   public static String entryIterRemoveOut(){return entryIterRemove();}
+  public static String unmodEntryToArrayFnOut(){return unmodEntryToArrayFn();}
+  public static String unmodEntryToArrayTypedOut(){return unmodEntryToArrayTyped();}
+  public static String unmodSyncEntryToArrayFnOut(){return unmodSyncEntryToArrayFn();}
+  public static String unmodUnmodEntryToArrayFnOut(){return unmodUnmodEntryToArrayFn();}
+  public static String reflectPutThenLookupOut(){return reflectPutThenLookup();}
+  public static String reflectPutViaSyncViewOut(){return reflectPutViaSyncView();}
+  public static String reflectSetValueOnEntryOut(){return reflectSetValueOnEntry();}
+  public static String reflectPutOnEmptyMapOut(){return reflectPutOnEmptyMap();}
+  public static String reflectPutThenReadViaUnmodOut(){return reflectPutThenReadViaUnmod();}
 }
