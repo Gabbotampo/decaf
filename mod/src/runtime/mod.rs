@@ -227,6 +227,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod recipe_serializer;
 mod scanner_model;
 mod server_values;
 mod tool_material;
@@ -289,6 +290,7 @@ pub mod verdict;
 mod watch_service;
 pub mod weaver;
 
+pub use events::{CreativeTabBuildContext, CreativeTabContents, CreativeTabListener};
 pub use facade_server::{GameRuleValue, ServerFacts};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,
@@ -2477,6 +2479,74 @@ pub trait Host {
     }
     fn note_entity_data_hierarchy(&mut self, _entries: &[(String, String)]) {}
 
+    /// Whether a client-surface frame (`client_surface.rs`) is currently active.
+    fn in_client_frame(&self) -> bool {
+        false
+    }
+
+    /// Record `requiredFeatures` on an `Item.Properties` builder (`Some(mask)` or `None` when unknown).
+    fn set_item_properties_required_features(
+        &mut self,
+        _receiver: &Value,
+        _mask: Option<u64>,
+    ) -> bool {
+        false
+    }
+
+    /// Allocate a host `FeatureFlagSet` for `mask`.
+    fn new_feature_flag_set(&mut self, _mask: u64) -> Option<Value> {
+        None
+    }
+
+    /// Resolve a host-known `ItemLike` (constructed `Item`, `Block` with `BlockItem`, or vanilla
+    /// `Item`/`Block` handle) to its `Item` value without invoking jar bytecode.
+    fn resolve_host_item_like(&self, _value: &Value) -> Option<Value> {
+        None
+    }
+
+    /// Record `(item, count)` for a jar-allocated `new ItemStack(...)` receiver.
+    fn record_jar_item_stack(&mut self, _receiver: &Value, _item: Value, _count: i32) -> bool {
+        false
+    }
+
+    /// Allocate a host `ItemStack` handle (for `CreativeModeTab$Output.accept(ItemLike)`).
+    fn make_host_item_stack(&mut self, _item: Value, _count: i32) -> Option<Value> {
+        None
+    }
+
+    /// Read `(effective_item, effective_count, is_empty)` for a tracked `ItemStack`
+    /// (`ItemStack.EMPTY`, `HostKind::ItemStack`, or jar-allocated `new ItemStack(...)`).
+    fn read_item_stack(&self, _stack: &Value) -> Option<(Value, i32, bool)> {
+        None
+    }
+
+    /// Known `Item.requiredFeatures()` bitmask (`None` when unknown, so callers count).
+    fn item_required_features_mask(&self, _item: &Value) -> Option<u64> {
+        None
+    }
+
+    /// Registered `minecraft:item` id (or vanilla item id) for `Item.toString()`.
+    fn registered_item_id(&self, _item: &Value) -> Option<String> {
+        None
+    }
+
+    /// `(enabled_features, has_permissions)` for an active `FabricCreativeModeTabOutput`.
+    fn creative_tab_output_context(&self, _output: &Value) -> Option<(u64, bool)> {
+        None
+    }
+
+    /// Append an already-enabled, checked `ItemStack` to an active `FabricCreativeModeTabOutput`.
+    /// `visibility_ordinal`: `0` = `PARENT_AND_SEARCH_TABS`, `1` = `PARENT_TAB_ONLY`,
+    /// `2` = `SEARCH_TAB_ONLY`.
+    fn creative_tab_output_accept_verified(
+        &mut self,
+        _output: &Value,
+        _stack: Value,
+        _visibility_ordinal: u8,
+    ) -> bool {
+        false
+    }
+
     fn invoke(&mut self, r: &MethodRef, _: &[Value]) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
@@ -3321,6 +3391,14 @@ pub trait Host {
         0
     }
 
+    /// Whether this host models Fabric's `RecipeSynchronization.synchronizeRecipeSerializer`.
+    fn supports_recipe_sync(&self) -> bool {
+        false
+    }
+
+    /// Record a canonical serializer identity and value registered for client recipe sync.
+    fn record_synced_recipe_serializer(&mut self, _key: String, _serializer: Value) {}
+
     /// Whether the running jar ships a `module-info.class` (`reflect_override`
     /// reads it to know the jar's module is unnamed or automatic). `None` when
     /// this host does not know the jar.
@@ -3479,6 +3557,15 @@ pub struct StdHost {
     /// included), so `asItem()` answers only blocks it knows.
     constructed_blocks: BTreeSet<String>,
     block_items: BTreeMap<String, Value>,
+    /// Jar-allocated `new ItemStack(...)` payloads outside client frames, keyed by allocation key.
+    jar_item_stacks: BTreeMap<String, host_creative_tab::ItemStackData>,
+    /// `requiredFeatures` bitmask (`None` = unknown, so `isEnabled` is counted) tracked on
+    /// `Item.Properties` builders and propagated to constructed `Item` / `BlockItem` instances.
+    item_required_features: BTreeMap<String, Option<u64>>,
+    /// Invocation indices of creative-tab `Event.register` calls that have actually fired during
+    /// `NativeJar::creative_tab_contents*`. Unfired registrations stay counted in
+    /// `game_listeners().unsupported`.
+    fired_creative_tab_registrations: BTreeSet<usize>,
     /// Explicitly seeded Java service providers. Native execution never scans
     /// the host classpath; callers must supply the service and provider class
     /// names they want visible to `ServiceLoader`.
@@ -3505,6 +3592,14 @@ pub struct StdHost {
     own_mod_id: Option<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric provides aliases resolve to a container but are not separate containers.
+    fabric_aliases: BTreeMap<String, String>,
+    /// Duplicate ids/aliases are loader resolution errors, never first-wins.
+    fabric_resolution_errors: Vec<String>,
+    /// Hashes of nested jars already discovered through this host's class
+    /// path. Fabric's discovery map shares one candidate when the same
+    /// `(CRC-32, size)` nested entry is reached from several parents.
+    loaded_nested_hashes: BTreeSet<u64>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
     /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
     fabric_origins: BTreeMap<String, (String, String)>,
@@ -3785,6 +3880,10 @@ pub struct StdHost {
     creative_tab: host_creative_tab::State,
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
+    /// Recipe serializers registered with Fabric's recipe synchronization API,
+    /// keyed by canonical identity (`HostRef::encode()`) and holding the value
+    /// as a static strong GC root (`fabric_api_slice2.rs`).
+    recipe_sync_serializers: BTreeMap<String, Value>,
     vec2: vec2::State,
     menu_states: menu_models::States,
 }
@@ -3836,6 +3935,9 @@ impl StdHost {
             constructed_items: BTreeSet::new(),
             constructed_blocks: BTreeSet::new(),
             block_items: BTreeMap::new(),
+            jar_item_stacks: BTreeMap::new(),
+            item_required_features: BTreeMap::new(),
+            fired_creative_tab_registrations: BTreeSet::new(),
             service_providers: BTreeMap::new(),
             current_time_millis: 0,
             nano_time_origin: Instant::now(),
@@ -3845,6 +3947,9 @@ impl StdHost {
             own_loader_classes: BTreeSet::new(),
             own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
+            fabric_aliases: BTreeMap::new(),
+            fabric_resolution_errors: Vec::new(),
+            loaded_nested_hashes: BTreeSet::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
@@ -3970,6 +4075,7 @@ impl StdHost {
             fabric_resource_conditions: fabric_resource_conditions::State::default(),
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            recipe_sync_serializers: BTreeMap::new(),
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
         }
@@ -4011,6 +4117,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Serializer object identities registered for client recipe synchronization.
+    pub fn synced_recipe_serializers(&self) -> Vec<String> {
+        self.recipe_sync_serializers.keys().cloned().collect()
     }
 
     /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
@@ -4500,37 +4611,81 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        let id = id.into();
-        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
-        self.record_loaded_mod(jar);
-        // A loader also puts the linked jar's bundled jars
-        // (`META-INF/jars/*.jar`) on the class path: a dependency such as
-        // `libjf` keeps its classes there, and its dependents call them.
-        // Fabric loads each of them as a mod of its own.
-        for (entry, nested) in nested_jars::parsed(jar) {
-            let _ =
-                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
-            self.record_loaded_mod(&nested);
-            if let Some(nested_id) = nested.fabric_id.as_deref() {
-                let parent = jar
-                    .fabric_id
-                    .as_deref()
-                    .or(jar.neoforge_id.as_deref())
-                    .unwrap_or("jar");
-                let sublocation = entry.clone();
-                self.fabric_origins.insert(
-                    nested_id.to_owned(),
-                    ("nested".into(), format!("{parent}|{sublocation}")),
-                );
+        let added = self.link_jar_with_nesting(id, jar, false)?;
+        for nested in nested_jars::link_nested_jars(self, jar) {
+            if let Err(error) = nested.result {
+                return Err(NativeError::Metadata(error));
             }
         }
         Ok(added)
     }
 
+    fn link_jar_with_nesting(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+        nested: bool,
+    ) -> Result<usize, NativeError> {
+        let id = id.into();
+        self.try_record_loaded_mod(jar, nested)?;
+        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        // A real loader's class path also resolves resources and service
+        // descriptors from the selected sibling. Merge each once in class
+        // path order; unselected Jar-in-Jar copies never reach this method.
+        for (name, marker) in &jar.resources {
+            self.resources
+                .entry(name.clone())
+                .or_insert_with(|| marker.clone());
+        }
+        for (name, bytes) in &jar.resource_bytes {
+            self.resource_bytes
+                .entry(name.clone())
+                .or_insert_with(|| bytes.clone());
+            if let Some(service) = name.strip_prefix("META-INF/services/")
+                && !service.is_empty()
+                && !service.contains('/')
+            {
+                for line in String::from_utf8_lossy(bytes).lines() {
+                    let provider = line.split_once('#').map_or(line, |(line, _)| line).trim();
+                    if !provider.is_empty() {
+                        self.service_providers
+                            .entry(service.replace('.', "/"))
+                            .or_default()
+                            .push(provider.replace('.', "/"));
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
+    /// Link one Fabric/NeoForge nested candidate. Unlike [`Self::link_jar`],
+    /// this participates in the loader's global nested-candidate identity
+    /// map, so a shared library reached through multiple parents is recorded
+    /// and put on the class path once.
+    pub(crate) fn link_nested_jar(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+    ) -> Result<usize, NativeError> {
+        let id = id.into();
+        if jar.fabric_id.is_some() {
+            let hash = nested_jars::identity(jar);
+            if !self.loaded_nested_hashes.insert(hash) {
+                return Ok(0);
+            }
+        }
+        if let Some(nested_id) = jar.fabric_id.as_deref() {
+            self.fabric_origins
+                .insert(nested_id.to_owned(), ("nested".into(), id.clone()));
+        }
+        self.link_jar_with_nesting(id, jar, true)
+    }
+
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
-    fn record_loaded_mod(&mut self, jar: &NativeJar) {
-        self.record_fabric_metadata(jar);
+    fn try_record_loaded_mod(&mut self, jar: &NativeJar, nested: bool) -> Result<(), NativeError> {
+        self.try_record_fabric_metadata(jar, nested)?;
         if let Some(toml) = neoforge_loader::mods_toml(&jar.resource_bytes) {
             let entries = neoforge_loader::mod_file_entries(toml, jar.neoforge_version.as_deref());
             if let Some((first, first_version)) = entries.first().cloned() {
@@ -4559,6 +4714,7 @@ impl StdHost {
                 *known = version.unwrap_or("unknown").to_owned();
             }
         }
+        Ok(())
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -5050,6 +5206,367 @@ impl StdHost {
 
     pub fn invocations(&self) -> &[HostInvocation] {
         &self.invocations
+    }
+
+    /// Create the output collector used when a Fabric creative-tab callback fires.
+    pub fn begin_creative_tab_output(&mut self, tab: &str) -> Value {
+        host_creative_tab::begin_output(&mut self.creative_tab, tab)
+    }
+
+    pub(crate) fn begin_creative_tab_output_with(
+        &mut self,
+        tab: &str,
+        enabled_features: u64,
+        has_permissions: bool,
+    ) -> Value {
+        host_creative_tab::begin_output_with(
+            &mut self.creative_tab,
+            tab,
+            enabled_features,
+            has_permissions,
+        )
+    }
+
+    /// Finish a creative-tab callback and return the display stacks in their recorded order.
+    pub fn take_creative_tab_output(&mut self, output: &Value) -> Option<Vec<Value>> {
+        host_creative_tab::take_output(&mut self.creative_tab, output)
+    }
+
+    pub(crate) fn take_creative_tab_output_lists(
+        &mut self,
+        output: &Value,
+    ) -> Option<(Vec<Value>, Vec<Value>)> {
+        host_creative_tab::take_output_lists(&mut self.creative_tab, output)
+    }
+
+    pub(crate) fn mark_creative_tab_registration_fired(&mut self, invocation_index: usize) {
+        self.fired_creative_tab_registrations
+            .insert(invocation_index);
+    }
+
+    /// The effective `Item` of a modelled `ItemStack` (`ItemStack.getItem()`, `Items.AIR` if empty).
+    pub fn item_stack_item(&self, stack: &Value) -> Option<Value> {
+        self.read_item_stack_impl(stack).map(|(item, _, _)| item)
+    }
+
+    /// The effective count of a modelled `ItemStack` (`ItemStack.getCount()`, `0` if empty).
+    pub fn item_stack_count(&self, stack: &Value) -> Option<i32> {
+        self.read_item_stack_impl(stack).map(|(_, count, _)| count)
+    }
+
+    /// Whether a modelled `ItemStack` is empty (`ItemStack.isEmpty()`).
+    pub fn item_stack_is_empty(&self, stack: &Value) -> Option<bool> {
+        self.read_item_stack_impl(stack).map(|(_, _, empty)| empty)
+    }
+
+    /// The registered `minecraft:item` id (or vanilla item id) of a modelled `ItemStack`'s item.
+    pub fn item_stack_item_id(&self, stack: &Value) -> Option<String> {
+        let (item, _, _) = self.read_item_stack_impl(stack)?;
+        self.registered_item_id_impl(&item)
+    }
+
+    fn read_item_stack_impl(&self, stack: &Value) -> Option<(Value, i32, bool)> {
+        if game_object::handle_key(stack) == Some("client/stack/empty") {
+            return Some((host_creative_tab::air_item_value(), 0, true));
+        }
+        let data = host_creative_tab::host_item_stack_data(stack).or_else(|| {
+            let key = jar_object::object_key(stack)?;
+            self.jar_item_stacks.get(key).cloned()
+        })?;
+        // `ItemStack.isEmpty` (0..34), `getCount` (0..15), `getItem` (0..12 via `typeHolder` 0..20).
+        if host_creative_tab::is_empty_stack_data(&data.item, data.count) {
+            Some((host_creative_tab::air_item_value(), 0, true))
+        } else {
+            Some((data.item, data.count, false))
+        }
+    }
+
+    fn registered_item_id_impl(&self, item: &Value) -> Option<String> {
+        if let Some(key) = game_object::handle_key(item)
+            && let Some(id) = key
+                .strip_prefix("game/item/")
+                .or_else(|| key.strip_prefix("client/item/"))
+        {
+            return Some(id.to_owned());
+        }
+        self.registrations
+            .iter()
+            .rev()
+            .find(|entry| entry.registry == "minecraft:item" && entry.value == *item)
+            .map(|entry| entry.id.clone())
+    }
+
+    fn item_required_features_mask_impl(&self, item: &Value) -> Option<u64> {
+        if let Some(key) = game_object::handle_key(item)
+            && let Some(id) = key
+                .strip_prefix("game/item/")
+                .or_else(|| key.strip_prefix("client/item/"))
+        {
+            return vanilla_items::is_vanilla_item_id(id)
+                .then_some(host_creative_tab::FEATURE_VANILLA_SET);
+        }
+        let marker = jar_object::object_key(item)?;
+        self.item_required_features.get(marker).copied().flatten()
+    }
+
+    fn resolve_host_item_like_impl(&self, value: &Value) -> Option<Value> {
+        if let Some(key) = game_object::handle_key(value) {
+            if key.starts_with("game/item/") || key.starts_with("client/item/") {
+                return Some(value.clone());
+            }
+            if let Some(block_id) = key.strip_prefix("game/block/") {
+                let item_id = vanilla_block_items::item_id(block_id)?;
+                return Some(game_object::server_value(format!("game/item/{item_id}")));
+            }
+            if let Some(block_id) = key.strip_prefix("client/block/") {
+                let item_id = vanilla_block_items::item_id(block_id)?;
+                return Some(game_object::client_value(format!("client/item/{item_id}")));
+            }
+        }
+        let marker = jar_object::object_key(value)?;
+        if self.constructed_items.contains(marker)
+            || marker.starts_with("net/minecraft/world/item/Item#net/minecraft/world/item/Items.")
+        {
+            return Some(value.clone());
+        }
+        if self.constructed_blocks.contains(marker) {
+            return self.block_items.get(marker).cloned();
+        }
+        None
+    }
+
+    /// Host-side dispatch for `ItemStack`, `Item` (`requiredFeatures`/`isEnabled`/`toString`),
+    /// and fallback `FabricCreativeModeTabOutput.accept` outside a client frame.
+    fn item_stack_and_item_instance_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        if self.client.frame.is_some() {
+            return None;
+        }
+        // `ItemStack` methods (on `ItemStack.EMPTY`, `HostKind::ItemStack`, and jar-allocated
+        // `new ItemStack(...)`).
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/item/ItemStack"
+                | "net/minecraft/world/item/ItemInstance"
+                | "java/lang/Object"
+        ) && let Some((item, count, is_empty)) = self.read_item_stack_impl(receiver)
+        {
+            match (r.name.as_str(), r.descriptor.as_str(), args) {
+                // `ItemStack.isEmpty()` (`server-26.3.jar` offsets 0..34).
+                ("isEmpty", "()Z", []) => return Some(Ok(Value::Int(i32::from(is_empty)))),
+                // `ItemStack.getCount()` (`server-26.3.jar` offsets 0..15).
+                ("getCount", "()I", []) => return Some(Ok(Value::Int(count))),
+                // `ItemStack.getItem()` (`server-26.3.jar` offsets 0..12 via `typeHolder` 0..20).
+                ("getItem", "()Lnet/minecraft/world/item/Item;", []) => return Some(Ok(item)),
+                // `ItemStack.is(Item)` (`server-26.3.jar` offsets 0..12): `this.getItem() == item`.
+                ("is", "(Lnet/minecraft/world/item/Item;)Z", [other]) => {
+                    let same = match (&item, other) {
+                        (Value::Host(a), Value::Host(b)) => a.same_object(b)?,
+                        (_, Value::Ref(None)) => false,
+                        _ => item == *other,
+                    };
+                    return Some(Ok(Value::Int(i32::from(same))));
+                }
+                // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..23):
+                // offsets 0..4 return `true` when `isEmpty()` before reading `flags`.
+                ("isItemEnabled", "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z", [flags]) => {
+                    if is_empty {
+                        return Some(Ok(Value::Int(1)));
+                    }
+                    let req = self.item_required_features_mask_impl(&item)?;
+                    if req == 0 {
+                        return Some(Ok(Value::Int(1)));
+                    }
+                    if matches!(flags, Value::Ref(None)) {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot read field \"universe\" because \"set\" is null".into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    let enabled = host_creative_tab::feature_flag_set_mask(flags)?;
+                    return Some(Ok(Value::Int(i32::from((req & !enabled) == 0))));
+                }
+                // `ItemStack.toString()` (`server-26.3.jar` offsets 0..16).
+                ("toString", "()Ljava/lang/String;", []) => {
+                    let item_text = if is_empty {
+                        "minecraft:air".to_owned()
+                    } else {
+                        self.registered_item_id_impl(&item)?
+                    };
+                    return Some(Ok(Value::Ref(Some(format!("{count} {item_text}")))));
+                }
+                _ => {}
+            }
+        }
+        // `ItemStack.<init>(ItemLike)` / `<init>(ItemLike, int)` when called without Runtime
+        // (Runtime handles jar `asItem()` overrides first in `library_dispatch.rs`).
+        if r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "<init>"
+            && jar_object::object_class(receiver) == Some("net/minecraft/world/item/ItemStack")
+        {
+            let count = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => 1,
+                ("(Lnet/minecraft/world/level/ItemLike;I)V", [_, Value::Int(count)]) => *count,
+                _ => return None,
+            };
+            let item_like = args.first()?;
+            if matches!(item_like, Value::Ref(None)) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                }));
+            }
+            let item = self.resolve_host_item_like_impl(item_like)?;
+            let key = jar_object::object_key(receiver)?.to_owned();
+            self.jar_item_stacks
+                .insert(key, host_creative_tab::ItemStackData { item, count });
+            return Some(Ok(Value::Void));
+        }
+        // `Item.requiredFeatures()`, `FeatureElement.isEnabled(FeatureFlagSet)`, `Item.toString()`.
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/item/Item"
+                | "net/minecraft/world/item/BlockItem"
+                | "net/minecraft/world/flag/FeatureElement"
+                | "java/lang/Object"
+        ) {
+            match (r.name.as_str(), r.descriptor.as_str(), args) {
+                // `Item.requiredFeatures()` (`server-26.3.jar` offsets 0..4, `final`).
+                ("requiredFeatures", "()Lnet/minecraft/world/flag/FeatureFlagSet;", []) => {
+                    let mask = self.item_required_features_mask_impl(receiver)?;
+                    let set = if mask == host_creative_tab::FEATURE_VANILLA_SET {
+                        host_creative_tab::vanilla_feature_flag_set()
+                    } else {
+                        host_creative_tab::new_feature_flag_set(&mut self.creative_tab, mask)
+                    };
+                    return Some(Ok(set));
+                }
+                // `FeatureElement.isEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..10).
+                ("isEnabled", "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z", [flags]) => {
+                    let req = self.item_required_features_mask_impl(receiver)?;
+                    if req == 0 {
+                        return Some(Ok(Value::Int(1)));
+                    }
+                    if matches!(flags, Value::Ref(None)) {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot read field \"universe\" because \"set\" is null".into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    let enabled = host_creative_tab::feature_flag_set_mask(flags)?;
+                    return Some(Ok(Value::Int(i32::from((req & !enabled) == 0))));
+                }
+                // `Item.toString()` (`server-26.3.jar` offsets 0..14):
+                // `BuiltInRegistries.ITEM.wrapAsHolder(this).getRegisteredName()`.
+                ("toString", "()Ljava/lang/String;", []) => {
+                    if let Some(id) = self.registered_item_id_impl(receiver) {
+                        return Some(Ok(Value::Ref(Some(id))));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Fallback `FabricCreativeModeTabOutput.accept(...)` for direct host callers without Runtime.
+        if let Some((enabled_features, _)) =
+            host_creative_tab::output_context(&self.creative_tab, receiver)
+            && r.name == "accept"
+        {
+            let (stack, visibility_arg) = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/item/ItemStack;)V", [stack]) => (stack.clone(), None),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [stack, vis],
+                ) => (stack.clone(), Some(vis)),
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [item_like]) => {
+                    if matches!(item_like, Value::Ref(None)) {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                                    .into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    let item = self.resolve_host_item_like_impl(item_like)?;
+                    let stack =
+                        host_creative_tab::new_host_item_stack(&mut self.creative_tab, item, 1);
+                    (stack, None)
+                }
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [item_like, vis],
+                ) => {
+                    if matches!(item_like, Value::Ref(None)) {
+                        return Some(Err(NativeError::UncaughtException {
+                            class: "java/lang/NullPointerException".into(),
+                            message: Some(
+                                "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                                    .into(),
+                            ),
+                            frame: None,
+                        }));
+                    }
+                    let item = self.resolve_host_item_like_impl(item_like)?;
+                    let stack =
+                        host_creative_tab::new_host_item_stack(&mut self.creative_tab, item, 1);
+                    (stack, Some(vis))
+                }
+                _ => return None,
+            };
+            if matches!(stack, Value::Ref(None)) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.item.ItemStack.getItem()\" because \"stack\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                }));
+            }
+            let (item, count, is_empty) = self.read_item_stack_impl(&stack)?;
+            let req = self.item_required_features_mask_impl(&item)?;
+            let is_enabled = (req & !enabled_features) == 0;
+            let visibility = match visibility_arg {
+                None => Some(host_creative_tab::TabVisibility::ParentAndSearchTabs),
+                Some(Value::Ref(None)) => None,
+                Some(v) => Some(host_creative_tab::TabVisibility::from_value(v)?),
+            };
+            let stack_text = if is_enabled && !is_empty && count != 1 {
+                Some(format!("{count} {}", self.registered_item_id_impl(&item)?))
+            } else {
+                None
+            };
+            return match host_creative_tab::accept_checked_stack(
+                &mut self.creative_tab,
+                receiver,
+                stack,
+                is_empty,
+                count,
+                is_enabled,
+                stack_text.as_deref(),
+                visibility,
+            ) {
+                Ok(true) => Some(Ok(Value::Void)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            };
+        }
+        None
     }
 
     /// Events posted through the bounded NeoForge event-bus contract, in
@@ -5914,6 +6431,43 @@ impl StdHost {
         match r.owner.as_str() {
             ITEM_PROPERTIES_CLASS | BLOCK_PROPERTIES_CLASS => {
                 let item = r.owner == ITEM_PROPERTIES_CLASS;
+                if item {
+                    // `Item$Properties.<init>` (`server-26.3.jar` offsets 13..17):
+                    // `this.requiredFeatures = FeatureFlags.VANILLA_SET`.
+                    if r.name == "<init>" {
+                        self.item_required_features.insert(
+                            marker.to_owned(),
+                            Some(host_creative_tab::FEATURE_VANILLA_SET),
+                        );
+                    } else if r.name == "requiredFeatures"
+                        && r.descriptor
+                            == "(Lnet/minecraft/world/flag/FeatureFlagSet;)Lnet/minecraft/world/item/Item$Properties;"
+                    {
+                        // `Item$Properties.requiredFeatures(FeatureFlagSet)` (offsets 0..27).
+                        let Some(arg) = args.first() else {
+                            return Ok(None);
+                        };
+                        if matches!(arg, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: Some(
+                                    "Cannot invoke \"net.minecraft.world.flag.FeatureFlagSet.isSubsetOf(net.minecraft.world.flag.FeatureFlagSet)\" because \"set\" is null"
+                                        .into(),
+                                ),
+                                frame: None,
+                            });
+                        }
+                        self.item_required_features.insert(
+                            marker.to_owned(),
+                            host_creative_tab::feature_flag_set_mask(arg),
+                        );
+                    } else if r.name == "spawnEgg" {
+                        // `Item$Properties.spawnEgg(EntityType<?>)` (offsets 0..25) copies
+                        // `entityType.requiredFeatures()`, which is not modelled for arbitrary
+                        // entities: mark unknown (`None`) so `isEnabled` is counted.
+                        self.item_required_features.insert(marker.to_owned(), None);
+                    }
+                }
                 let builders = if item {
                     &mut self.item_property_builders
                 } else {
@@ -5981,10 +6535,38 @@ impl StdHost {
             {
                 self.unknown_host_call(r).map(Some)
             }
+            "net/minecraft/world/item/BlockItem" if r.name == "<init>" => {
+                // `BlockItem.<init>(Block, Item$Properties)` (`server-26.3.jar` offsets 0..10):
+                // forwards `args[1]` directly to `Item.<init>(Item$Properties)`.
+                let Some(builder) = args.get(1).and_then(expect_ref) else {
+                    return Ok(None);
+                };
+                if let Some(&features) = self.item_required_features.get(builder) {
+                    self.item_required_features
+                        .insert(marker.to_owned(), features);
+                }
+                let Some(properties) = self.item_property_builders.get(builder).cloned() else {
+                    return Ok(None);
+                };
+                if self.item_property_builders.contains_key(marker)
+                    || self.item_property_builders.len() < MAX_PROPERTY_BUILDERS
+                {
+                    self.item_property_builders
+                        .insert(marker.to_owned(), properties);
+                }
+                Ok(Some(Value::Void))
+            }
             ITEM_CLASS | BLOCK_CLASS if r.name == "<init>" => {
                 let Some(builder) = args.first().and_then(expect_ref) else {
                     return Ok(None);
                 };
+                if r.owner == ITEM_CLASS
+                    && let Some(&features) = self.item_required_features.get(builder)
+                {
+                    // `Item.<init>(Item$Properties)` (`server-26.3.jar` offsets 60..65).
+                    self.item_required_features
+                        .insert(marker.to_owned(), features);
+                }
                 let builders = if r.owner == ITEM_CLASS {
                     &mut self.item_property_builders
                 } else {
@@ -6207,6 +6789,14 @@ impl Host for StdHost {
 
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
+    }
+
+    fn supports_recipe_sync(&self) -> bool {
+        true
+    }
+
+    fn record_synced_recipe_serializer(&mut self, key: String, serializer: Value) {
+        self.recipe_sync_serializers.insert(key, serializer);
     }
 
     fn mark_nondeterministic(&mut self, marker: &str) {
@@ -7095,6 +7685,9 @@ impl Host for StdHost {
         self.record(r, None, &[]);
         // `ModEnvironment` and `CustomValue.CvType` (`fabric_mods.rs`).
         // ModOrigin.Kind constants (mod_origin.rs).
+        if let Some(value) = host_creative_tab::feature_flag_static_field(r) {
+            return Ok(value);
+        }
         if let Some(value) = vanilla_static::static_field(r) {
             return Ok(value);
         }
@@ -7384,6 +7977,81 @@ impl Host for StdHost {
 
     fn note_entity_data_hierarchy(&mut self, entries: &[(String, String)]) {
         entity_registration::note_hierarchy(&mut self.entity_registration, entries);
+    }
+
+    fn in_client_frame(&self) -> bool {
+        self.client.frame.is_some()
+    }
+
+    fn set_item_properties_required_features(
+        &mut self,
+        receiver: &Value,
+        mask: Option<u64>,
+    ) -> bool {
+        let Some(marker) = expect_ref(receiver) else {
+            return false;
+        };
+        self.item_required_features.insert(marker.to_owned(), mask);
+        true
+    }
+
+    fn new_feature_flag_set(&mut self, mask: u64) -> Option<Value> {
+        Some(host_creative_tab::new_feature_flag_set(
+            &mut self.creative_tab,
+            mask,
+        ))
+    }
+
+    fn resolve_host_item_like(&self, value: &Value) -> Option<Value> {
+        self.resolve_host_item_like_impl(value)
+    }
+
+    fn record_jar_item_stack(&mut self, receiver: &Value, item: Value, count: i32) -> bool {
+        let Some(key) = jar_object::object_key(receiver) else {
+            return false;
+        };
+        self.jar_item_stacks.insert(
+            key.to_owned(),
+            host_creative_tab::ItemStackData { item, count },
+        );
+        true
+    }
+
+    fn make_host_item_stack(&mut self, item: Value, count: i32) -> Option<Value> {
+        Some(host_creative_tab::new_host_item_stack(
+            &mut self.creative_tab,
+            item,
+            count,
+        ))
+    }
+
+    fn read_item_stack(&self, stack: &Value) -> Option<(Value, i32, bool)> {
+        self.read_item_stack_impl(stack)
+    }
+
+    fn item_required_features_mask(&self, item: &Value) -> Option<u64> {
+        self.item_required_features_mask_impl(item)
+    }
+
+    fn registered_item_id(&self, item: &Value) -> Option<String> {
+        self.registered_item_id_impl(item)
+    }
+
+    fn creative_tab_output_context(&self, output: &Value) -> Option<(u64, bool)> {
+        host_creative_tab::output_context(&self.creative_tab, output)
+    }
+
+    fn creative_tab_output_accept_verified(
+        &mut self,
+        output: &Value,
+        stack: Value,
+        visibility_ordinal: u8,
+    ) -> bool {
+        let Some(visibility) = host_creative_tab::TabVisibility::from_ordinal(visibility_ordinal)
+        else {
+            return false;
+        };
+        host_creative_tab::accept_verified_stack(&mut self.creative_tab, output, stack, visibility)
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
@@ -8818,6 +9486,9 @@ impl Host for StdHost {
         {
             return value;
         }
+        if let Some(value) = self.item_stack_and_item_instance_call(r, receiver, args) {
+            return value;
+        }
         if let Some(value) = host_item_stack_template::instance_call(r, receiver) {
             return value;
         }
@@ -9034,6 +9705,9 @@ impl Host for StdHost {
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
             return value;
         }
+        if let Some(value) = recipe_serializer::instance_call(r, receiver, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.item_like_call(r, receiver, args) {
             return Ok(value);
         }
@@ -9175,6 +9849,31 @@ impl Host for StdHost {
         }
         if let Some(value) = self.registry_register(r, Some(receiver), args) {
             return Ok(value);
+        }
+        if r.owner == "net/minecraft/world/level/block/CraftingTableBlock"
+            && r.name == "<init>"
+            && r.descriptor
+                == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+        {
+            let Some(builder) = args.first().and_then(expect_ref) else {
+                return Ok(Value::Void);
+            };
+            let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
+                return Ok(Value::Void);
+            };
+            let marker = jar_object::instance_key(receiver).unwrap_or_default();
+            if jar_object::key_class(marker)
+                == Some("net/minecraft/world/level/block/CraftingTableBlock")
+            {
+                properties.insert("__template".into(), "minecraft:crafting_table".into());
+            }
+            if self.block_property_builders.contains_key(marker)
+                || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+            {
+                self.block_property_builders
+                    .insert(marker.to_owned(), properties);
+            }
+            return Ok(Value::Void);
         }
         if let Some(value) = self.property_builder_call(r, receiver, args)? {
             return Ok(value);
@@ -14295,6 +14994,12 @@ fn game_enum_constants(owner: &str) -> Option<&'static [&'static str]> {
         "net/minecraft/core/Direction$Axis" => &["X", "Y", "Z"],
         "net/minecraft/core/Direction$AxisDirection" => &["POSITIVE", "NEGATIVE"],
         "net/minecraft/world/InteractionHand" => &["MAIN_HAND", "OFF_HAND"],
+        // `CreativeModeTab$TabVisibility` (`server-26.3.jar` `<clinit>` offsets 0..45).
+        "net/minecraft/world/item/CreativeModeTab$TabVisibility" => &[
+            "PARENT_AND_SEARCH_TABS",
+            "PARENT_TAB_ONLY",
+            "SEARCH_TAB_ONLY",
+        ],
         "net/minecraft/sounds/SoundSource" => &[
             "MASTER", "MUSIC", "RECORDS", "WEATHER", "BLOCKS", "HOSTILE", "NEUTRAL", "PLAYERS",
             "AMBIENT", "VOICE", "UI",
@@ -17892,6 +18597,8 @@ pub struct NativeJar {
     resource_bytes: BTreeMap<String, Vec<u8>>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
+    /// Aliases declared by Fabric metadata's `provides` array.
+    pub fabric_provides: Vec<String>,
     /// The first mod's id/version from Forge or NeoForge `mods.toml`.
     /// These loaders do not put these in a JSON entrypoint declaration, so
     /// the native launcher keeps them beside the Fabric metadata fields.
@@ -17905,6 +18612,14 @@ pub struct NativeJar {
     pub client_side_only: bool,
     pub fabric_entrypoints: BTreeMap<String, Vec<Entrypoint>>,
     pub neoforge_entrypoints: Vec<String>,
+    /// The exact `(CRC-32, size)` identity of bytes passed to `from_bytes`.
+    /// Fabric uses this key for nested Jar-in-Jar discovery; path-loaded roots
+    /// do not need it because only nested entries are deduplicated.
+    source_hash: Option<u64>,
+    /// Stable identity of a path-loaded top-level jar. Nested class-path ids
+    /// include this root so two physical jars that contain the same entry do
+    /// not collide (`path-a.jar!META-INF/jars/lib.jar` vs path-b.jar...).
+    source_path: Option<String>,
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
@@ -19474,19 +20189,25 @@ impl NativeJar {
     /// annotation.
     pub fn from_path_metadata(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, false)
+        let mut jar = Self::read(file, false)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, true)
+        let mut jar = Self::read(file, true)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     /// Reads a jar this process already holds in memory, the way [`Self::from_path`] reads one
     /// from disk. A host that hands a mod its files as bytes (Horizon's `Host::config_files`)
     /// runs them without staging a copy on the file system first.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeError> {
-        Self::read(std::io::Cursor::new(bytes), true)
+        let mut jar = Self::read(std::io::Cursor::new(bytes), true)?;
+        jar.source_hash = Some((u64::from(crc32fast::hash(bytes)) << 32) | bytes.len() as u64);
+        Ok(jar)
     }
 
     fn read<R: std::io::Read + std::io::Seek>(
@@ -19641,6 +20362,20 @@ impl NativeJar {
         jar.resource_bytes = resource_bytes;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
+        jar.fabric_provides = jar
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .map(|v| {
+                v.get("provides")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         jar.neoforge_id = neoforge_id;
         jar.neoforge_version = neoforge_version;
         jar.client_side_only = client_side_only || fabric_client_only;
@@ -20813,8 +21548,22 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
-        host.record_fabric_metadata(self);
-        let _nested = nested_jars::link_nested_jars(&mut host, self);
+        if let Err(error) = host.try_record_fabric_metadata(self, false) {
+            // Keep the compatibility wrapper usable by existing probes, but
+            // retain the loader's exact refusal so the checked load path below
+            // can return Fabric's resolution message instead of first-wins.
+            let message = match error {
+                NativeError::Metadata(message) => message,
+                other => other.to_string(),
+            };
+            host.fabric_resolution_errors.push(message);
+        }
+        let nested = nested_jars::link_nested_jars(&mut host, self);
+        for nested in nested {
+            if let Err(error) = nested.result {
+                host.fabric_resolution_errors.push(error);
+            }
+        }
         host = host.with_run_loader(self.run_loader());
         host.own_loader_classes = self.loader_namespace_classes();
         host.own_mod_id = self.fabric_id.clone().or_else(|| self.neoforge_id.clone());
@@ -20850,6 +21599,16 @@ impl NativeJar {
         host
     }
 
+    /// The native load path: unlike the legacy probe wrapper, a metadata or
+    /// nested-jar resolution failure refuses the load with Fabric's message.
+    pub fn try_seed_host(&self, host: StdHost) -> Result<StdHost, String> {
+        let host = self.seed_host(host);
+        host.fabric_resolution_errors
+            .first()
+            .cloned()
+            .map_or(Ok(host), Err)
+    }
+
     /// Seed a game host from the same prepared 26.3 resource root used by the
     /// Horizon game. This keeps the game and census paths on one exact table;
     /// callers that do not have prepared resources retain the counted default.
@@ -20859,7 +21618,7 @@ impl NativeJar {
         root: impl AsRef<Path>,
     ) -> Result<StdHost, String> {
         let host = host.with_prepared_game_block_classes(root)?;
-        Ok(self.seed_host(host))
+        self.try_seed_host(host)
     }
 
     /// Return the resource paths discovered in the jar in deterministic order.
@@ -24837,6 +25596,15 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(value));
                 }
+                if let Some(value) = fabric_api_slice2::invoke_recipe_sync(
+                    self,
+                    &callback.target,
+                    0xb8,
+                    None,
+                    &values,
+                )? {
+                    return Ok(Some(value));
+                }
                 // A library the interpreter models (Guava, proxies, the JDK
                 // shapes in `library_dispatch`) answers a method reference
                 // to it the way it answers the direct call.
@@ -24874,6 +25642,11 @@ impl<H: Host> Runtime<'_, H> {
                 // other `String::new` is counted (`string_constructors.rs`).
                 if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
                     return Ok(Some(Value::Ref(Some(text))));
+                }
+                if let Some(serializer) =
+                    recipe_serializer::construct(self, &callback.target, &values)
+                {
+                    return Ok(Some(serializer));
                 }
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
@@ -33788,6 +34561,33 @@ impl<H: Host> Runtime<'_, H> {
                                 &args,
                                 &mut stack,
                                 &mut locals,
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = recipe_serializer::runtime_call(
+                            self,
+                            &r,
+                            op,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            fabric_api_slice2::invoke_recipe_sync(
+                                self,
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
                             )
                         )
                     {

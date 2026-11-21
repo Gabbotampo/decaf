@@ -1,0 +1,3 @@
+# Captured with ModPrioSorterOracle on Fabric Loader 0.19.5 / JDK 25, CLIENT.
+scribble|jar=corpus-xl/scribble-2.1.0-beta1+mc26.3.jar
+gallery|jar=corpus-xl/screenshotgallery-fabric-2.1.jar

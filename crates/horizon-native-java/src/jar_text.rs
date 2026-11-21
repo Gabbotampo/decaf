@@ -276,6 +276,9 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(text) = self.jar_server_value_text(value) {
             return Ok(Some(Value::Ref(Some(text))));
         }
+        if let Some(text) = self.item_stack_to_string_opt(value, class, method)? {
+            return Ok(Some(Value::Ref(Some(text))));
+        }
         if let Some(text) = self.jar_to_string(value, class, method)? {
             // `String.valueOf` returns what `toString` returned, even `null`.
             return Ok(Some(text));

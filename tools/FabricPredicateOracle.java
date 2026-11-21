@@ -3,19 +3,48 @@ import java.io.InputStreamReader;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import net.fabricmc.loader.api.SemanticVersion;
+import net.fabricmc.loader.api.Version;
 import net.fabricmc.loader.api.metadata.version.VersionPredicate;
 
 /** Batch oracle for Fabric Loader 0.19.5 dependency predicates. */
 public final class FabricPredicateOracle {
     private static final Pattern FIELD = Pattern.compile("\\\"(predicate|version)\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"");
 
+    /** Decodes the JSON string escapes this oracle's input and output use. */
     private static String unescape(String value) {
-        return value.replace("\\\\", "\\").replace("\\\"", "\"").replace("\\n", "\n");
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != '\\' || i + 1 == value.length()) {
+                out.append(c);
+                continue;
+            }
+            char e = value.charAt(++i);
+            switch (e) {
+                case 'n' -> out.append('\n');
+                case 't' -> out.append('\t');
+                case 'r' -> out.append('\r');
+                case 'b' -> out.append('\b');
+                case 'f' -> out.append('\f');
+                case 'u' -> {
+                    out.append((char) Integer.parseInt(value.substring(i + 1, i + 5), 16));
+                    i += 4;
+                }
+                default -> out.append(e);
+            }
+        }
+        return out.toString();
     }
 
+    /** JSON-quotes a string, escaping every control character so rows stay valid JSON. */
     private static String quote(String value) {
-        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
+        StringBuilder out = new StringBuilder("\"");
+        for (char c : value.toCharArray()) {
+            if (c == '\\' || c == '"') out.append('\\').append(c);
+            else if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+            else out.append(c);
+        }
+        return out.append('"').toString();
     }
 
     public static void main(String[] args) throws Exception {
@@ -37,7 +66,7 @@ public final class FabricPredicateOracle {
                     continue;
                 }
                 try {
-                    boolean result = VersionPredicate.parse(predicate).test(SemanticVersion.parse(version));
+                    boolean result = VersionPredicate.parse(predicate).test(Version.parse(version));
                     System.out.println("{\"predicate\":" + quote(predicate)
                             + ",\"version\":" + quote(version)
                             + ",\"ok\":" + result + "}");

@@ -266,11 +266,469 @@ impl<H: Host> Runtime<'_, H> {
         if let Some(value) = self.invoke_mapped_registry(r, receiver, args) {
             return Ok(Some(value));
         }
+        if let Some(value) = self.invoke_creative_tab_and_items(r, receiver, args, class, method)? {
+            return Ok(Some(value));
+        }
         // Gson's JSON tree, for a method reference and `String.valueOf`.
         if let Some(value) = self.invoke_gson_tree(r, receiver, args)? {
             return Ok(Some(value));
         }
         Ok(None)
+    }
+
+    /// Fabric creative-tab output collection, `ItemStack` constructors/`toString`/`isItemEnabled`,
+    /// `Item.Properties.requiredFeatures(FeatureFlag...)`, and `FeatureFlagSet.of(flag, flags...)`
+    /// where the interpreter owns array elements and jar overrides (`asItem`, `isEnabled`,
+    /// `toString`).
+    fn invoke_creative_tab_and_items(
+        &mut self,
+        r: &MethodRef,
+        receiver: Option<&Value>,
+        args: &[Value],
+        class: &str,
+        method: &str,
+    ) -> Result<Option<Value>, NativeError> {
+        // `FeatureFlagSet.of(FeatureFlag, FeatureFlag...)` (`server-26.3.jar` offsets 0..40).
+        if receiver.is_none()
+            && r.owner == "net/minecraft/world/flag/FeatureFlagSet"
+            && r.name == "of"
+            && r.descriptor
+                == "(Lnet/minecraft/world/flag/FeatureFlag;[Lnet/minecraft/world/flag/FeatureFlag;)Lnet/minecraft/world/flag/FeatureFlagSet;"
+            && let [first, rest] = args
+        {
+            // Offset 1: `flags.length` throws NPE before `flag` is read.
+            if matches!(rest, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Cannot read the array length because \"flags\" is null".into()),
+                    frame: None,
+                });
+            }
+            let Ok(elements) = self.array(rest).map(std::borrow::Cow::into_owned) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            // Offset 2: `ifne 12`; empty `flags` reads `flag.mask` (offset 6),
+            // non-empty `flags` reads `flag.universe` first (offset 13).
+            if matches!(first, Value::Ref(None)) {
+                let field = if elements.is_empty() {
+                    "mask"
+                } else {
+                    "universe"
+                };
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(format!(
+                        "Cannot read field \"{field}\" because \"flag\" is null"
+                    )),
+                    frame: None,
+                });
+            }
+            let Some(mut mask) = crate::runtime::host_creative_tab::feature_flag_mask(first) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            for element in elements {
+                // `computeMask` offset 33: reads `f.universe` (slot 5 named `f`).
+                if matches!(element, Value::Ref(None)) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot read field \"universe\" because \"f\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                let Some(bit) = crate::runtime::host_creative_tab::feature_flag_mask(&element) else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                mask |= bit;
+            }
+            return match self.host.new_feature_flag_set(mask) {
+                Some(set) => Ok(Some(set)),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `Item$Properties.requiredFeatures(FeatureFlag...)` (`server-26.3.jar` offsets 0..12).
+        if let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/Item$Properties"
+            && r.name == "requiredFeatures"
+            && r.descriptor
+                == "([Lnet/minecraft/world/flag/FeatureFlag;)Lnet/minecraft/world/item/Item$Properties;"
+            && let [array_val] = args
+        {
+            if matches!(array_val, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some("Cannot read the array length because \"flags\" is null".into()),
+                    frame: None,
+                });
+            }
+            let mask = match self.array(array_val).map(std::borrow::Cow::into_owned) {
+                Ok(elements) => {
+                    let mut bits = 0u64;
+                    let mut all_known = true;
+                    for element in elements {
+                        if matches!(element, Value::Ref(None)) {
+                            return Err(NativeError::UncaughtException {
+                                class: "java/lang/NullPointerException".into(),
+                                message: Some(
+                                    "Cannot read field \"universe\" because \"flag\" is null"
+                                        .into(),
+                                ),
+                                frame: None,
+                            });
+                        }
+                        match crate::runtime::host_creative_tab::feature_flag_mask(&element) {
+                            Some(bit) => bits |= bit,
+                            None => all_known = false,
+                        }
+                    }
+                    all_known.then_some(bits)
+                }
+                Err(_) => None,
+            };
+            self.host
+                .set_item_properties_required_features(receiver, mask);
+            return Ok(Some(receiver.clone()));
+        }
+        // `ItemStack.<init>(ItemLike)` / `<init>(ItemLike, int)` (`server-26.3.jar` offsets 0..14)
+        // outside client frames (client frames keep their own `client_surface.rs` stack table).
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "<init>"
+            && crate::runtime::jar_object::object_class(receiver)
+                == Some("net/minecraft/world/item/ItemStack")
+        {
+            let count = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [_]) => Some(1),
+                ("(Lnet/minecraft/world/level/ItemLike;I)V", [_, Value::Int(count)]) => {
+                    Some(*count)
+                }
+                _ => None,
+            };
+            if let Some(count) = count {
+                let Some(item) = self.resolve_item_like_value(&args[0])? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                if self.host.record_jar_item_stack(receiver, item, count) {
+                    return Ok(Some(Value::Void));
+                }
+                return self.host.unknown_operand_call(r).map(Some);
+            }
+        }
+        // `ItemStack.toString()` (`server-26.3.jar` offsets 0..16) on jar-allocated `ItemStack`
+        // outside client frames, honouring jar `Item.toString()` overrides.
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "toString"
+            && r.descriptor == "()Ljava/lang/String;"
+            && args.is_empty()
+            && self.host.read_item_stack(receiver).is_some()
+        {
+            return match self.item_stack_to_string_opt(receiver, class, method)? {
+                Some(text) => Ok(Some(Value::Ref(Some(text)))),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `ItemStack.isItemEnabled(FeatureFlagSet)` (`server-26.3.jar` offsets 0..23):
+        // offsets 0..4 short-circuit to `true` when `this.isEmpty()` before touching `flags`;
+        // offsets 7..23 delegate to `this.getItem().isEnabled(flags)`.
+        if !self.host.in_client_frame()
+            && let Some(receiver) = receiver
+            && r.owner == "net/minecraft/world/item/ItemStack"
+            && r.name == "isItemEnabled"
+            && r.descriptor == "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z"
+            && let [flags] = args
+            && let Some((item, _, is_empty)) = self.host.read_item_stack(receiver)
+        {
+            if is_empty {
+                return Ok(Some(Value::Int(1)));
+            }
+            return match self.item_is_enabled_value(&item, flags)? {
+                Some(enabled) => Ok(Some(Value::Int(i32::from(enabled)))),
+                None => self.host.unknown_operand_call(r).map(Some),
+            };
+        }
+        // `FabricCreativeModeTabOutput.accept(...)` (`fabric-creative-tab-api-v1` 5.0.21
+        // offsets 0..98, `checkStack` 0..42, and `CreativeModeTab$Output` defaults 0..17).
+        if let Some(receiver) = receiver
+            && r.name == "accept"
+            && let Some((enabled_features, _)) = self.host.creative_tab_output_context(receiver)
+        {
+            let (stack, visibility_arg) = match (r.descriptor.as_str(), args) {
+                ("(Lnet/minecraft/world/item/ItemStack;)V", [stack]) => (stack.clone(), None),
+                (
+                    "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [stack, vis],
+                ) => (stack.clone(), Some(vis)),
+                ("(Lnet/minecraft/world/level/ItemLike;)V", [item_like]) => {
+                    let Some(item) = self.resolve_item_like_value(item_like)? else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    let Some(stack) = self.host.make_host_item_stack(item, 1) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    (stack, None)
+                }
+                (
+                    "(Lnet/minecraft/world/level/ItemLike;Lnet/minecraft/world/item/CreativeModeTab$TabVisibility;)V",
+                    [item_like, vis],
+                ) => {
+                    let Some(item) = self.resolve_item_like_value(item_like)? else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    let Some(stack) = self.host.make_host_item_stack(item, 1) else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    (stack, Some(vis))
+                }
+                _ => return Ok(None),
+            };
+            if matches!(stack, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.item.ItemStack.getItem()\" because \"stack\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            let Some((item, count, is_empty)) = self.host.read_item_stack(&stack) else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            // Offsets 0..5: `if (!this.isEnabled(stack)) return;` (runs BEFORE `checkStack`).
+            let Some(is_enabled) = self.item_is_enabled_mask(&item, enabled_features)? else {
+                return self.host.unknown_operand_call(r).map(Some);
+            };
+            if !is_enabled {
+                return Ok(Some(Value::Void));
+            }
+            // Offsets 8..9 → `checkStack` offsets 0..16.
+            if is_empty {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some("Cannot add empty stack".into()),
+                    frame: None,
+                });
+            }
+            // `checkStack` offsets 17..41.
+            if count != 1 {
+                let Some(item_text) = self.item_to_string_opt(&item, false, class, method)? else {
+                    return self.host.unknown_operand_call(r).map(Some);
+                };
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: Some(format!(
+                        "Stack size must be exactly 1 for stack: {count} {item_text}"
+                    )),
+                    frame: None,
+                });
+            }
+            // Offsets 12..98: `visibility.ordinal()` throws NPE on null, then appends by visibility.
+            let visibility = match visibility_arg {
+                None => crate::runtime::host_creative_tab::TabVisibility::ParentAndSearchTabs,
+                Some(Value::Ref(None)) => {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot invoke \"net.minecraft.world.item.CreativeModeTab$TabVisibility.ordinal()\" because \"visibility\" is null"
+                                .into(),
+                        ),
+                        frame: None,
+                    });
+                }
+                Some(vis) => {
+                    let Some(parsed) = crate::runtime::host_creative_tab::TabVisibility::from_value(vis)
+                    else {
+                        return self.host.unknown_operand_call(r).map(Some);
+                    };
+                    parsed
+                }
+            };
+            if self
+                .host
+                .creative_tab_output_accept_verified(receiver, stack, visibility.ordinal())
+            {
+                return Ok(Some(Value::Void));
+            }
+            return self.host.unknown_operand_call(r).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Resolve `ItemLike.asItem()` (`ItemStack.<init>(ItemLike)` offsets 0..14), invoking a jar's
+    /// own `asItem()` override when declared and otherwise asking the host.
+    fn resolve_item_like_value(&mut self, item_like: &Value) -> Result<Option<Value>, NativeError> {
+        if matches!(item_like, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some(
+                    "Cannot invoke \"net.minecraft.world.level.ItemLike.asItem()\" because \"item\" is null"
+                        .into(),
+                ),
+                frame: None,
+            });
+        }
+        if let Some(class) = crate::runtime::jar_object::object_class(item_like)
+            && self.class(class).is_some()
+            && let Some((owner, true)) =
+                self.member_owner(class, "asItem", "()Lnet/minecraft/world/item/Item;")
+        {
+            let item = self.invoke(
+                &owner,
+                "asItem",
+                "()Lnet/minecraft/world/item/Item;",
+                Some(item_like.clone()),
+                &[],
+            )?;
+            if matches!(item, Value::Ref(None)) {
+                return Err(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(
+                        "Cannot invoke \"net.minecraft.world.item.Item.builtInRegistryHolder()\" because the return value of \"net.minecraft.world.level.ItemLike.asItem()\" is null"
+                            .into(),
+                    ),
+                    frame: None,
+                });
+            }
+            return Ok(Some(item));
+        }
+        Ok(self.host.resolve_host_item_like(item_like))
+    }
+
+    fn item_is_enabled_value(
+        &mut self,
+        item: &Value,
+        flags: &Value,
+    ) -> Result<Option<bool>, NativeError> {
+        if let Some(class) = crate::runtime::jar_object::object_class(item)
+            && self.class(class).is_some()
+            && let Some((owner, true)) = self.member_owner(
+                class,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+            )
+        {
+            let result = self.invoke(
+                &owner,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+                Some(item.clone()),
+                std::slice::from_ref(flags),
+            )?;
+            return Ok(match result {
+                Value::Int(v) => Some(v != 0),
+                _ => None,
+            });
+        }
+        let Some(req) = self.host.item_required_features_mask(item) else {
+            return Ok(None);
+        };
+        if req == 0 {
+            return Ok(Some(true));
+        }
+        if matches!(flags, Value::Ref(None)) {
+            return Err(NativeError::UncaughtException {
+                class: "java/lang/NullPointerException".into(),
+                message: Some("Cannot read field \"universe\" because \"set\" is null".into()),
+                frame: None,
+            });
+        }
+        let Some(enabled) = crate::runtime::host_creative_tab::feature_flag_set_mask(flags) else {
+            return Ok(None);
+        };
+        Ok(Some((req & !enabled) == 0))
+    }
+
+    fn item_is_enabled_mask(
+        &mut self,
+        item: &Value,
+        enabled_features: u64,
+    ) -> Result<Option<bool>, NativeError> {
+        if let Some(class) = crate::runtime::jar_object::object_class(item)
+            && self.class(class).is_some()
+            && let Some((owner, true)) = self.member_owner(
+                class,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+            )
+        {
+            let flags = if enabled_features == crate::runtime::host_creative_tab::FEATURE_VANILLA_SET {
+                crate::runtime::host_creative_tab::vanilla_feature_flag_set()
+            } else {
+                let Some(set) = self.host.new_feature_flag_set(enabled_features) else {
+                    return Ok(None);
+                };
+                set
+            };
+            let result = self.invoke(
+                &owner,
+                "isEnabled",
+                "(Lnet/minecraft/world/flag/FeatureFlagSet;)Z",
+                Some(item.clone()),
+                &[flags],
+            )?;
+            return Ok(match result {
+                Value::Int(v) => Some(v != 0),
+                _ => None,
+            });
+        }
+        Ok(self
+            .host
+            .item_required_features_mask(item)
+            .map(|req| (req & !enabled_features) == 0))
+    }
+
+    fn item_to_string_opt(
+        &mut self,
+        item: &Value,
+        is_empty: bool,
+        _class: &str,
+        _method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        if is_empty {
+            return Ok(Some("minecraft:air".to_owned()));
+        }
+        if let Some(item_class) = crate::runtime::jar_object::packaged_object_class(item)
+            && self.class(item_class).is_some()
+            && let Some((owner, true)) =
+                self.member_owner(item_class, "toString", "()Ljava/lang/String;")
+        {
+            return match self.invoke(
+                &owner,
+                "toString",
+                "()Ljava/lang/String;",
+                Some(item.clone()),
+                &[],
+            )? {
+                Value::Ref(Some(text)) => Ok(Some(text)),
+                Value::Ref(None) => Ok(Some("null".to_owned())),
+                _ => Ok(None),
+            };
+        }
+        Ok(self.host.registered_item_id(item))
+    }
+
+    /// `ItemStack.toString()` (`server-26.3.jar` offsets 0..16) for a tracked stack, also called
+    /// by `jar_text.rs::runtime_value_of` for `String.valueOf` / concat on `new ItemStack(...)`.
+    pub(crate) fn item_stack_to_string_opt(
+        &mut self,
+        stack: &Value,
+        class: &str,
+        method: &str,
+    ) -> Result<Option<String>, NativeError> {
+        if self.host.in_client_frame() {
+            return Ok(None);
+        }
+        let Some((item, count, is_empty)) = self.host.read_item_stack(stack) else {
+            return Ok(None);
+        };
+        let Some(item_text) = self.item_to_string_opt(&item, is_empty, class, method)? else {
+            return Ok(None);
+        };
+        Ok(Some(format!("{count} {item_text}")))
     }
 
     /// A registry a mod constructs itself (`new MappedRegistry<>(key, ...)`,

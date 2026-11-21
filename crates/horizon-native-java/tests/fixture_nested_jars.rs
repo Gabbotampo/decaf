@@ -65,6 +65,16 @@ fn files_under(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn metadata_jar(metadata: &str) -> NativeJar {
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(&mut bytes);
+    zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(metadata.as_bytes()).unwrap();
+    zip.finish().unwrap();
+    NativeJar::from_bytes(&bytes.into_inner()).unwrap()
+}
+
 /// Compile `sources` under `root/src` into `root/classes`.
 fn compile(root: &Path, classpath: Option<&Path>, sources: &[(&str, &str)]) {
     let classes = root.join("classes");
@@ -140,7 +150,11 @@ impl Fixture {
         let inner = jar_from(
             &inner_root,
             "demo",
-            Some(r#"{"schemaVersion":1,"id":"inner-lib","version":"1.0"}"#),
+            if nested_dir.starts_with("META-INF/jarjar/") {
+                None
+            } else {
+                Some(r#"{"schemaVersion":1,"id":"inner-lib","version":"1.0"}"#)
+            },
         );
 
         let outer_root = fixture.root.join("outer");
@@ -156,12 +170,28 @@ impl Fixture {
         let nested_entry = format!("{nested_dir}inner.jar");
         let jar_path = outer_root.join("outer.jar");
         let mut zip = zip::ZipWriter::new(fs::File::create(&jar_path).unwrap());
-        zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+        if nested_dir.starts_with("META-INF/jarjar/") {
+            zip.start_file("META-INF/neoforge.mods.toml", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"modLoader = \"javafml\"\n[[mods]]\nmodId = \"outer-fixture\"\nversion = \"1.0\"\n")
+                .unwrap();
+            zip.start_file(
+                "META-INF/jarjar/metadata.json",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
-        let metadata = format!(
-            r#"{{"schemaVersion":1,"id":"outer-fixture","version":"1.0","entrypoints":{{"main":"demo.Entry"}},"depends":{{"inner-lib":">=1"}},"jars":[{{"file":"{nested_entry}"}}]}}"#,
-        );
-        zip.write_all(metadata.as_bytes()).unwrap();
+            let metadata = format!(
+                r#"{{"jars":[{{"path":"{nested_entry}","identifier":{{"group":"demo","artifact":"inner"}},"version":{{"range":"[1,2)","artifactVersion":"1.0"}}}}]}}"#,
+            );
+            zip.write_all(metadata.as_bytes()).unwrap();
+        } else {
+            zip.start_file("fabric.mod.json", SimpleFileOptions::default())
+                .unwrap();
+            let metadata = format!(
+                r#"{{"schemaVersion":1,"id":"outer-fixture","version":"1.0","entrypoints":{{"main":"demo.Entry"}},"depends":{{"inner-lib":">=1"}},"jars":[{{"file":"{nested_entry}"}}]}}"#,
+            );
+            zip.write_all(metadata.as_bytes()).unwrap();
+        }
         zip.start_file(&nested_entry, SimpleFileOptions::default())
             .unwrap();
         zip.write_all(&inner).unwrap();
@@ -247,4 +277,102 @@ fn a_bundle_provides_the_mod_ids_of_its_bundled_jars() {
 fn a_neoforge_jarjar_library_is_on_the_outer_jar_s_class_path() {
     let fixture = Fixture::build_jarjar("jarjar-classpath");
     assert_eq!(fixture.printed_jarjar().trim(), "from-inner");
+}
+
+#[test]
+fn fabric_accepts_a_dotdot_nested_entry_name() {
+    let fixture = Fixture::build_with_layout("dotdot", "../");
+    assert_eq!(fixture.printed().trim(), "from-inner");
+}
+
+#[test]
+fn duplicate_fabric_ids_and_aliases_refuse_with_fabric_message() {
+    let first = metadata_jar(r#"{"schemaVersion":1,"id":"duplicate","version":"1"}"#);
+    let second = metadata_jar(r#"{"schemaVersion":1,"id":"duplicate","version":"2"}"#);
+    let host = first.try_seed_host(StdHost::new()).unwrap();
+    let error = second.try_seed_host(host).unwrap_err();
+    assert_eq!(error.to_string(), "duplicate mod duplicate");
+
+    let repeated_alias = metadata_jar(
+        r#"{"schemaVersion":1,"id":"alias-owner","version":"1","provides":["alias","alias"]}"#,
+    );
+    let error = repeated_alias.try_seed_host(StdHost::new()).unwrap_err();
+    assert_eq!(error.to_string(), "duplicate mod alias");
+}
+
+#[test]
+fn unlisted_and_explicitly_empty_fabric_jars_do_not_leak_mods() {
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut bytes);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap();
+        bytes.into_inner()
+    }
+    let child = zip(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"child","version":"1"}"#,
+    )]);
+    let outer = |jars: &str| {
+        NativeJar::from_bytes(&zip(&[
+            ("fabric.mod.json", jars.as_bytes()),
+            ("META-INF/jars/child.jar", &child),
+        ]))
+        .unwrap()
+    };
+    let dependent = NativeJar::from_bytes(&zip(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"dependent","version":"1","depends":{"child":">=1"}}"#,
+    )]))
+    .unwrap();
+    let unlisted = outer(r#"{"schemaVersion":1,"id":"outer","version":"1"}"#);
+    let explicit_empty = outer(r#"{"schemaVersion":1,"id":"outer","version":"1","jars":[]}"#);
+    for outer in [&unlisted, &explicit_empty] {
+        let plan = dependencies::plan(&[("dependent.jar", &dependent), ("outer.jar", outer)]);
+        assert_eq!(plan.missing.get(&0), Some(&vec!["child".to_owned()]));
+    }
+    let listed = outer(
+        r#"{"schemaVersion":1,"id":"outer","version":"1","jars":[{"file":"META-INF/jars/child.jar"}]}"#,
+    );
+    let plan = dependencies::plan(&[("dependent.jar", &dependent), ("outer.jar", &listed)]);
+    assert!(plan.missing.is_empty(), "missing: {:?}", plan.missing);
+}
+
+#[test]
+fn outer_resource_wins_over_a_nested_resource_with_the_same_name() {
+    fn zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(&mut bytes);
+        for (name, content) in entries {
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(content).unwrap();
+        }
+        writer.finish().unwrap();
+        bytes.into_inner()
+    }
+    let nested = zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"id":"nested-resource","version":"1"}"#,
+        ),
+        ("shared.txt", b"nested"),
+    ]);
+    let outer = NativeJar::from_bytes(&zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"id":"outer-resource","version":"1","jars":[{"file":"META-INF/jars/nested.jar"}]}"#,
+        ),
+        ("shared.txt", b"outer"),
+        ("META-INF/jars/nested.jar", &nested),
+    ]))
+    .unwrap();
+    let host = outer.seed_host(StdHost::new());
+    assert_eq!(host.resource("shared.txt"), Some("jar-resource/shared.txt"));
 }
