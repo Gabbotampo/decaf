@@ -28,7 +28,15 @@ pub(crate) const METHODS: Methods = Methods {
 };
 pub(crate) fn static_call(r: &MethodRef, args: &[Value]) -> Option<Result<Value, NativeError>> {
     if r.owner == "net/minecraft/world/item/ItemStackTemplate" && r.name == "fromNonEmptyStack" {
-        let key = jar_object::instance_key(args.first()?)?.to_owned();
+        let arg = args.first()?;
+        let key = jar_object::instance_key(arg)
+            .map(str::to_owned)
+            .or_else(|| match arg {
+                Value::Host(handle) if handle.kind() == HostKind::ItemStack => {
+                    Some(handle.key().to_owned())
+                }
+                _ => None,
+            })?;
         return Some(Ok(Value::Host(HostRef::new(
             HostKind::ItemStackTemplate,
             key,
