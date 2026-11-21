@@ -396,7 +396,6 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (false, "stack") => &["net/minecraft/world/item/ItemStack"],
         (false, "damage") => &["net/minecraft/world/damagesource/DamageSource"],
         (_, "block-pos") => &["net/minecraft/core/BlockPos"],
-        (_, "shape-probe") => &["net/minecraft/world/level/BlockGetter"],
         (_, "level-resource") => &["net/minecraft/world/level/storage/LevelResource"],
         (_, "game-rule") => &["net/minecraft/world/level/gamerules/GameRule"],
         (_, "sound-event") => &["net/minecraft/sounds/SoundEvent"],
@@ -559,6 +558,9 @@ pub(crate) const VALUE_METHODS: Methods = Methods {
             .or_else(|| crate::runtime::server_values::hash_code(key)))
     },
     equals: |handle, other, nested| {
+        if matches!(other, Value::Host(h) if h.kind() == HostKind::ShapeProbe) {
+            return Ok(None);
+        }
         if let Value::Host(other) = other
             && other.kind() == HostKind::GameValue
             && let Some(result) = crate::runtime::sound_event::equals_keys(handle.key(), other.key())

@@ -3665,7 +3665,6 @@ pub struct StdHost {
     block_states: BTreeMap<String, (String, BTreeMap<String, String>)>,
     block_default_states: BTreeMap<String, BTreeMap<String, String>>,
     unknown_block_state_definitions: BTreeSet<String>,
-    next_block_state: usize,
     /// Marker counter for a property builder made by a static factory
     /// (`BlockBehaviour.Properties.of()`), which has no `new` site to name it.
     next_property_builder: usize,
@@ -3995,7 +3994,6 @@ impl StdHost {
             block_states: BTreeMap::new(),
             block_default_states: BTreeMap::new(),
             unknown_block_state_definitions: BTreeSet::new(),
-            next_block_state: 0,
             next_property_builder: 0,
             payload_registrations: Vec::new(),
             outgoing_payloads: Vec::new(),
@@ -5705,16 +5703,65 @@ impl StdHost {
         Some((names, combos))
     }
 
+    fn canonical_block_state_marker(
+        block_marker: &str,
+        values: &BTreeMap<String, String>,
+    ) -> String {
+        let mut out = format!("blockstate/{block_marker}[");
+        for (i, (k, v)) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(k);
+            out.push('=');
+            out.push_str(v);
+        }
+        out.push(']');
+        out
+    }
+
+    /// Return the canonical `BlockState` marker for `(block_marker, values)`, populating any
+    /// missing captured properties with their default/first value so every state in a block's
+    /// `StateDefinition` maps 1-to-1 to a single canonical object (matching MC 26.3
+    /// `StateHolder.setValueInternal` returning `this.neighbors[propIndex][valIndex]`).
+    ///
+    /// Returns `(state_value, inserted)` where `inserted` is `true` iff this call added a new
+    /// entry to `self.block_states`.
+    pub(crate) fn canonical_block_state(
+        &mut self,
+        block_marker: &str,
+        mut values: BTreeMap<String, String>,
+    ) -> (Value, bool) {
+        if let Some(props) = self.block_state_properties.get(block_marker) {
+            for (name, info) in props {
+                if !values.contains_key(name)
+                    && let Some(val) = self
+                        .block_default_states
+                        .get(block_marker)
+                        .and_then(|d| d.get(name))
+                        .or_else(|| info.values.first())
+                {
+                    values.insert(name.clone(), val.clone());
+                }
+            }
+        }
+        let key = Self::canonical_block_state_marker(block_marker, &values);
+        let inserted = match self.block_states.entry(key.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert((block_marker.to_owned(), values));
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        };
+        (Value::Ref(Some(key)), inserted)
+    }
+
     pub(crate) fn mint_block_state(
         &mut self,
         block_marker: &str,
         values: BTreeMap<String, String>,
-    ) -> Value {
-        let state = format!("blockstate/{block_marker}/{}", self.next_block_state);
-        self.next_block_state = self.next_block_state.saturating_add(1);
-        self.block_states
-            .insert(state.clone(), (block_marker.to_owned(), values));
-        Value::Ref(Some(state))
+    ) -> (Value, bool) {
+        self.canonical_block_state(block_marker, values)
     }
 
     pub(crate) fn remove_block_states(&mut self, markers: &[String]) {
@@ -6504,11 +6551,7 @@ impl StdHost {
                     values.insert(name.clone(), value.clone());
                 }
             }
-            let state = format!("blockstate/{}/{}", marker, self.next_block_state);
-            self.next_block_state = self.next_block_state.saturating_add(1);
-            self.block_states
-                .insert(state.clone(), (marker.to_owned(), values));
-            return Ok(Some(Value::Ref(Some(state))));
+            return Ok(Some(self.canonical_block_state(marker, values).0));
         }
         if marker.starts_with("blockstate/") {
             let Some((block, values)) = self.block_states.get(marker).cloned() else {
@@ -6531,6 +6574,9 @@ impl StdHost {
                     if self.unknown_block_state_definitions.contains(&block) {
                         return Ok(None);
                     }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(Value::Int(0)));
+                    }
                     let Some(field) = args
                         .first()
                         .and_then(expect_ref)
@@ -6550,6 +6596,16 @@ impl StdHost {
                 ) => {
                     if self.unknown_block_state_definitions.contains(&block) {
                         return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
                     }
                     let Some(field) = args
                         .first()
@@ -6598,6 +6654,9 @@ impl StdHost {
                 ) => {
                     if self.unknown_block_state_definitions.contains(&block) {
                         return Ok(None);
+                    }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        return Ok(Some(empty_optional()));
                     }
                     let Some(field) = args
                         .first()
@@ -6671,6 +6730,19 @@ impl StdHost {
                     if self.unknown_block_state_definitions.contains(&block) {
                         return Ok(None);
                     }
+                    if matches!(args.first(), None | Some(Value::Ref(None))) {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
+                        }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property null as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    }
                     let Some(field) = args
                         .first()
                         .and_then(expect_ref)
@@ -6700,58 +6772,157 @@ impl StdHost {
                             frame: None,
                         });
                     };
+                    // Exact MC 26.3 `StateHolder.setValueInternal` -> `Property.getInternalIndex(Comparable)`
+                    // bridge-method order: checkcast first (`ClassCastException` on wrong type), then
+                    // unbox / `Enum.ordinal()` (`NullPointerException` on null), then range/membership
+                    // check (`IllegalArgumentException` for real out-of-range values).
+                    let runtime_class_for_cast = |v: &Value| -> Option<String> {
+                        if let Value::Ref(Some(text)) = v
+                            && value_class::is_plain_string(text)
+                        {
+                            return Some("java/lang/String".to_owned());
+                        }
+                        class_of_value(v)
+                    };
                     let arg = args.get(1);
-                    let parsed = match info.kind.as_str() {
+                    let value = match info.kind.as_str() {
                         "boolean" => match arg {
-                            Some(Value::Int(v)) => {
-                                Some(if *v != 0 { "true" } else { "false" }.to_owned())
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Boolean.booleanValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
                             }
-                            Some(Value::Boxed(Boxed::Boolean(b))) => Some(b.to_string()),
-                            _ => None,
+                            Some(Value::Boxed(Boxed::Boolean(b))) => b.to_string(),
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Boolean",
+                                ));
+                            }
                         },
                         "integer" => match arg {
-                            Some(Value::Int(n)) => Some(n.to_string()),
-                            Some(Value::Boxed(Boxed::Integer(n))) => Some(n.to_string()),
-                            _ => None,
-                        }
-                        .filter(|s| info.values.iter().any(|allowed| allowed == s)),
-                        "enum" => match arg {
-                            Some(Value::Ref(Some(marker))) => {
-                                vanilla_block_state_properties::enum_serialized_name(field, marker)
-                                    .filter(|s| info.values.iter().any(|allowed| allowed == s))
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Integer.intValue()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
                             }
-                            _ => None,
+                            Some(Value::Boxed(Boxed::Integer(n)) | Value::Int(n)) => {
+                                let s = n.to_string();
+                                if !info.values.iter().any(|allowed| allowed == &s) {
+                                    let owner_str = self.block_to_string(&block);
+                                    return Err(NativeError::UncaughtException {
+                                        class: "java/lang/IllegalArgumentException".into(),
+                                        message: Some(format!(
+                                            "Cannot set property {prop_str} to {s} on {owner_str}, it is not an allowed value"
+                                        )),
+                                        frame: None,
+                                    });
+                                }
+                                s
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Integer",
+                                ));
+                            }
                         },
-                        _ => None,
-                    };
-                    let Some(value) = parsed else {
-                        let val_str = match arg {
-                            None | Some(Value::Ref(None)) => "null".to_owned(),
-                            Some(Value::Boxed(Boxed::Boolean(b))) => b.to_string(),
-                            Some(Value::Boxed(Boxed::Integer(n))) => n.to_string(),
-                            Some(Value::Int(n)) if info.kind == "boolean" => (*n != 0).to_string(),
-                            Some(Value::Int(n)) => n.to_string(),
-                            Some(Value::Ref(Some(marker))) => {
-                                vanilla_block_state_properties::enum_value_to_string(marker)
-                                    .unwrap_or_else(|| marker.clone())
+                        "enum" => match arg {
+                            None | Some(Value::Ref(None)) => {
+                                return Err(NativeError::UncaughtException {
+                                    class: "java/lang/NullPointerException".into(),
+                                    message: Some(
+                                        "Cannot invoke \"java.lang.Enum.ordinal()\" because \"value\" is null"
+                                            .into(),
+                                    ),
+                                    frame: None,
+                                });
                             }
-                            Some(other) => format!("{other:?}"),
-                        };
-                        let owner_str = self.block_to_string(&block);
-                        return Err(NativeError::UncaughtException {
-                            class: "java/lang/IllegalArgumentException".into(),
-                            message: Some(format!(
-                                "Cannot set property {prop_str} to {val_str} on {owner_str}, it is not an allowed value"
-                            )),
-                            frame: None,
-                        });
+                            Some(Value::Ref(Some(enum_marker)))
+                                if enum_marker.starts_with("enum/")
+                                    && !enum_marker
+                                        .starts_with("enum/java/lang/StackWalker$Option/") =>
+                            {
+                                let Some((enum_cls, _)) = enum_marker
+                                    .strip_prefix("enum/")
+                                    .and_then(|rest| rest.rsplit_once('/'))
+                                else {
+                                    return Ok(None);
+                                };
+                                if vanilla_block_state_properties::enum_property_class(field)
+                                    != Some(enum_cls)
+                                {
+                                    // Cross-enum raw call indexes `ordinalToIndex[value.ordinal()]`;
+                                    // leave counted rather than guessing across unrelated enums.
+                                    return Ok(None);
+                                }
+                                match vanilla_block_state_properties::enum_serialized_name(
+                                    field,
+                                    enum_marker,
+                                )
+                                .filter(|s| info.values.iter().any(|allowed| allowed == s))
+                                {
+                                    Some(s) => s,
+                                    None => {
+                                        let val_str =
+                                            vanilla_block_state_properties::enum_value_to_string(
+                                                enum_marker,
+                                            )
+                                            .unwrap_or_else(|| enum_marker.clone());
+                                        let owner_str = self.block_to_string(&block);
+                                        return Err(NativeError::UncaughtException {
+                                            class: "java/lang/IllegalArgumentException".into(),
+                                            message: Some(format!(
+                                                "Cannot set property {prop_str} to {val_str} on {owner_str}, it is not an allowed value"
+                                            )),
+                                            frame: None,
+                                        });
+                                    }
+                                }
+                            }
+                            // A jar object or enum host handle could be a `java.lang.Enum`
+                            // subclass (which passes `checkcast java/lang/Enum`). Count it.
+                            Some(Value::Host(h))
+                                if matches!(
+                                    h.kind(),
+                                    HostKind::JarObject
+                                        | HostKind::MobEffectCategory
+                                        | HostKind::MixinSide
+                                ) =>
+                            {
+                                return Ok(None);
+                            }
+                            Some(other) => {
+                                let Some(cls) = runtime_class_for_cast(other) else {
+                                    return Ok(None);
+                                };
+                                return Err(checkcast::class_cast_exception(
+                                    &cls,
+                                    "java/lang/Enum",
+                                ));
+                            }
+                        },
+                        _ => return Ok(None),
                     };
-                    let state = format!("blockstate/{}/{}", block, self.next_block_state);
-                    self.next_block_state = self.next_block_state.saturating_add(1);
                     let mut values = values;
                     values.insert(prop_name, value);
-                    self.block_states.insert(state.clone(), (block, values));
-                    return Ok(Some(Value::Ref(Some(state))));
+                    return Ok(Some(self.canonical_block_state(&block, values).0));
                 }
                 _ => {}
             }
@@ -9330,13 +9501,21 @@ impl Host for StdHost {
                     None => Value::Ref(None),
                 })
             }
-            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => Ok(
-                Value::Int((Self::argument(r, args, 0)? == Self::argument(r, args, 1)?) as i32),
-            ),
+            ("java/util/Objects", "equals", "(Ljava/lang/Object;Ljava/lang/Object;)Z") => {
+                let left = Self::argument(r, args, 0)?;
+                let right = Self::argument(r, args, 1)?;
+                if matches!(left, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || matches!(right, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                {
+                    return self.unknown_host_call(r);
+                }
+                Ok(Value::Int((left == right) as i32))
+            }
             ("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I") => {
                 let value = Self::argument(r, args, 0)?;
-                if expect_ref(value)
-                    .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
+                if matches!(value, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                    || expect_ref(value)
+                        .is_some_and(|marker| crate::stream_pipeline::is_stream_marker(marker))
                 {
                     return self.unknown_host_call(r);
                 }
@@ -9818,6 +9997,17 @@ impl Host for StdHost {
             (BLOCK_PROPERTIES_CLASS, "of" | "ofFullCopy" | "copy" | "ofLegacyCopy", descriptor)
                 if descriptor.ends_with(BLOCK_PROPERTIES_DESC) =>
             {
+                // MC 26.3 `ofFullCopy` calls `ofLegacyCopy` (offset 1), which reads
+                // `block.properties` (offset 8), throwing a helpful NPE on `null`.
+                if r.name != "of" && matches!(args.first(), None | Some(Value::Ref(None))) {
+                    return Err(NativeError::UncaughtException {
+                        class: "java/lang/NullPointerException".into(),
+                        message: Some(
+                            "Cannot read field \"properties\" because \"block\" is null".into(),
+                        ),
+                        frame: None,
+                    });
+                }
                 let marker = format!("block/properties/{}", self.next_property_builder);
                 self.next_property_builder = self.next_property_builder.saturating_add(1);
                 open_inferred_builder(&mut self.block_property_builders, &marker);
@@ -9986,6 +10176,7 @@ impl Host for StdHost {
         if r.name == "getShape"
             && r.descriptor == voxel_shape::GET_SHAPE_DESC
             && vanilla_block_shapes::inherits_block_behaviour_get_shape(&r.owner)
+            && jar_object::object_class(receiver).is_some()
         {
             return Ok(voxel_shape::block_shape());
         }
@@ -14542,6 +14733,9 @@ fn class_of_value(value: &Value) -> Option<String> {
 /// [`class_of_value`] of a reference's text, without building a `Value` (it
 /// runs inside `is_plain_string`, on every array store of a string).
 fn class_of_text(marker: &str) -> Option<String> {
+    if marker.starts_with("blockstate/") {
+        return Some("net/minecraft/world/level/block/state/BlockState".into());
+    }
     // A text spelling an object's key (a host-made collection's included,
     // P14c) is a `String` (`jar_object.rs`).
     if jar_object::spells_key_text(marker) {
@@ -27695,6 +27889,11 @@ impl<H: Host> Runtime<'_, H> {
         {
             let receiver = receiver.unwrap_or(&Value::Ref(None));
             let other = StdHost::argument(r, args, 0)?;
+            if matches!(receiver, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+                || matches!(other, Value::Host(h) if h.kind() == HostKind::ShapeProbe)
+            {
+                return self.host.unknown_operand_call(r).map(Some);
+            }
             return Ok(Some(Value::Int(
                 (value_marker(receiver) == value_marker(other)) as i32,
             )));
@@ -29000,8 +29199,10 @@ impl<H: Host> Runtime<'_, H> {
             if !has_collision {
                 return Ok(Some(voxel_shape::empty_shape()));
             }
-            if let Some(block_class) = jar_object::object_class(block_val) {
-                let state_val = args.first().cloned().unwrap_or(Value::Ref(None));
+            let state_val = args.first().cloned().unwrap_or(Value::Ref(None));
+            if let Some(state_block) = self.host.block_state_block(&state_val)
+                && let Some(block_class) = jar_object::object_class(&state_block)
+            {
                 let level = args.get(1).cloned().unwrap_or(Value::Ref(None));
                 let pos = args.get(2).cloned().unwrap_or(Value::Ref(None));
                 let ctx = voxel_shape::empty_collision_context();
@@ -29029,7 +29230,7 @@ impl<H: Host> Runtime<'_, H> {
                             &owner,
                             "getShape",
                             voxel_shape::GET_SHAPE_DESC,
-                            Some(block_val.clone()),
+                            Some(state_block),
                             &[state_val, level, pos, ctx],
                         )
                         .map(Some);

@@ -197,6 +197,7 @@ import net.minecraft.core.Direction;
 public final class BlockStateProperties {
     public static final EnumProperty<Direction> HORIZONTAL_FACING = null;
     public static final BooleanProperty LIT = null;
+    public static final BooleanProperty WATERLOGGED = null;
     public static final IntegerProperty AGE_3 = null;
 }"#,
         ),
@@ -244,6 +245,7 @@ public abstract class BlockBehaviour {
     public static class Properties {
         public static Properties of() { return new Properties(); }
         public static Properties ofFullCopy(BlockBehaviour other) { return new Properties(); }
+        public static Properties ofLegacyCopy(BlockBehaviour other) { return new Properties(); }
         public Properties noCollision() { return this; }
         public Properties noOcclusion() { return this; }
     }
@@ -1271,6 +1273,554 @@ public final class Probe implements ModInitializer {
                 .to_owned()
         ))
     );
+}
+
+/// Round-2 Finding 1: opaque `BlockGetter` / `BlockPos` / `CollisionContext` probes must count
+/// EVERY observation (`equals`, `instanceof`, `checkcast`, `==`, `getClass`, `Objects.equals`) and
+/// refuse static shape export, while forwarding probes through `super.getCollisionShape` /
+/// `state.getShape` still exports cleanly with zero counted calls.
+#[test]
+fn opaque_probes_count_every_observation_and_refuse_export() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/LevelEqualsNullBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LevelEqualsNullBlock extends Block {
+    public LevelEqualsNullBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return level.equals(null) ? Shapes.empty() : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/LevelEqualsSelfBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LevelEqualsSelfBlock extends Block {
+    public LevelEqualsSelfBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return level.equals(level) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/LevelInstanceOfBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LevelInstanceOfBlock extends Block {
+    public LevelInstanceOfBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return (level instanceof BlockGetter) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/LevelCheckCastBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LevelCheckCastBlock extends Block {
+    public LevelCheckCastBlock(Properties p) { super(p); }
+    private static Object erase(Object o) { return o; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        BlockGetter g = (BlockGetter) erase(level);
+        return g == null ? Block.box(0, 0, 0, 16, 4, 16) : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/PosInstanceOfBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class PosInstanceOfBlock extends Block {
+    public PosInstanceOfBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return (pos instanceof BlockPos) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/PosCheckCastBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class PosCheckCastBlock extends Block {
+    public PosCheckCastBlock(Properties p) { super(p); }
+    private static Object erase(Object o) { return o; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        BlockPos p = (BlockPos) erase(pos);
+        return p == null ? Block.box(0, 0, 0, 16, 4, 16) : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/ContextInstanceOfBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ContextInstanceOfBlock extends Block {
+    public ContextInstanceOfBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return (context instanceof CollisionContext) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/ContextCheckCastBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ContextCheckCastBlock extends Block {
+    public ContextCheckCastBlock(Properties p) { super(p); }
+    private static Object erase(Object o) { return o; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        CollisionContext c = (CollisionContext) erase(context);
+        return c == null ? Block.box(0, 0, 0, 16, 4, 16) : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/ContextGetClassBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ContextGetClassBlock extends Block {
+    public ContextGetClassBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return ((Object) context.getClass()) == Object.class ? Shapes.empty() : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/ObjectsEqualsNullBlock.java",
+            r#"package demo;
+import java.util.Objects;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ObjectsEqualsNullBlock extends Block {
+    public ObjectsEqualsNullBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return Objects.equals(level, null) ? Shapes.empty() : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/ObjectsEqualsSelfBlock.java",
+            r#"package demo;
+import java.util.Objects;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ObjectsEqualsSelfBlock extends Block {
+    public ObjectsEqualsSelfBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return Objects.equals(level, level) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/ContextRefEqBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ContextRefEqBlock extends Block {
+    public ContextRefEqBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return context == CollisionContext.empty() ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/LevelRefEqOtherBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LevelRefEqOtherBlock extends Block {
+    public LevelRefEqOtherBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return level == (Object) "x" ? Shapes.empty() : Block.box(0, 0, 0, 16, 8, 16);
+    }
+}"#,
+        ),
+        (
+            "demo/CleanForwardingBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CleanForwardingBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public CleanForwardingBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return SLAB;
+    }
+    @Override
+    protected VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return super.getCollisionShape(state, level, pos, context);
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Probe implements ModInitializer {
+    private static Identifier id(String path) { return Identifier.fromNamespaceAndPath("fixture", path); }
+    @Override
+    public void onInitialize() {
+        Registry.register(BuiltInRegistries.BLOCK, id("level_eq_null"), new LevelEqualsNullBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("level_eq_self"), new LevelEqualsSelfBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("level_instanceof"), new LevelInstanceOfBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("level_checkcast"), new LevelCheckCastBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("pos_instanceof"), new PosInstanceOfBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("pos_checkcast"), new PosCheckCastBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("context_instanceof"), new ContextInstanceOfBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("context_checkcast"), new ContextCheckCastBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("context_getclass"), new ContextGetClassBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("objects_eq_null"), new ObjectsEqualsNullBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("objects_eq_self"), new ObjectsEqualsSelfBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("context_ref_eq"), new ContextRefEqBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("level_ref_eq_other"), new LevelRefEqOtherBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("clean_forwarding"), new CleanForwardingBlock(BlockBehaviour.Properties.of()));
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-opaque-probes", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    let refused_ids = [
+        "fixture:level_eq_null",
+        "fixture:level_eq_self",
+        "fixture:level_instanceof",
+        "fixture:level_checkcast",
+        "fixture:pos_instanceof",
+        "fixture:pos_checkcast",
+        "fixture:context_instanceof",
+        "fixture:context_checkcast",
+        "fixture:context_getclass",
+        "fixture:objects_eq_null",
+        "fixture:objects_eq_self",
+        "fixture:context_ref_eq",
+        "fixture:level_ref_eq_other",
+    ];
+    for id in refused_ids {
+        let blk = registration_value(&host, id);
+        let before = host.unknown_host_call_count();
+        let res = fixture.jar.block_shapes(&mut host, &blk).unwrap();
+        assert!(
+            host.unknown_host_call_count() > before,
+            "{id}: probe observation must increment unknown_host_call_count"
+        );
+        assert!(
+            res.states.is_none(),
+            "{id}: shape must not resolve when probe was inspected"
+        );
+        assert_eq!(res.to_content_export(), (None, None), "{id}");
+    }
+
+    // Forwarding probes through `super.getCollisionShape` incurs 0 counted calls and exports cleanly.
+    let clean_blk = registration_value(&host, "fixture:clean_forwarding");
+    let before = host.unknown_host_call_count();
+    let clean = fixture.jar.block_shapes(&mut host, &clean_blk).unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert!(clean.states.is_some());
+    assert_eq!(clean.states, clean.collision_states);
+
+    fixture
+        .jar
+        .populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    let exported: BTreeMap<String, serde_json::Value> = content::declarations(host.registrations())
+        .into_iter()
+        .map(|decl| (decl.id().to_owned(), decl.file_json()))
+        .collect();
+    for id in refused_ids {
+        assert!(
+            exported[id].get("shapes").is_none(),
+            "{id} must not export shapes"
+        );
+        assert!(
+            exported[id].get("collision_shapes").is_none(),
+            "{id} must not export collision_shapes"
+        );
+    }
+    assert_eq!(
+        exported["fixture:clean_forwarding"]["shapes"],
+        json!({ "default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]] })
+    );
+    assert!(
+        exported["fixture:clean_forwarding"]
+            .get("collision_shapes")
+            .is_none()
+    );
+}
+
+/// Round-2 Findings 2, 3, and 4:
+/// * Canonical `StateHolder.setValue` / `trySetValue` identity (`==` matches MC 26.3 `neighbors`
+///   table: setting current value returns `this`, repeated/round-trip/commuted transitions return
+///   the exact same object).
+/// * Exact bridge-method validation order (`checkcast` -> `ClassCastException`, null -> helpful
+///   `NullPointerException`, real out-of-range -> `IllegalArgumentException`, and null property).
+/// * `BlockBehaviour.Properties.ofFullCopy(null)` / `ofLegacyCopy(null)` throw the exact JDK 25
+///   helpful `NullPointerException`.
+#[test]
+fn block_state_canonical_identity_type_checks_and_properties_copy_null() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/IdentityBlock.java",
+            r#"package demo;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class IdentityBlock extends Block {
+    public IdentityBlock(Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(
+            BlockStateProperties.HORIZONTAL_FACING,
+            BlockStateProperties.LIT,
+            BlockStateProperties.AGE_3
+        );
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.Property;
+public final class Probe implements ModInitializer {
+    private static IdentityBlock BLOCK;
+    @Override
+    public void onInitialize() {
+        BLOCK = Registry.register(
+            BuiltInRegistries.BLOCK,
+            Identifier.fromNamespaceAndPath("fixture", "identity_block"),
+            new IdentityBlock(BlockBehaviour.Properties.of())
+        );
+    }
+
+    private static String catchText(Runnable r) {
+        try {
+            r.run();
+            return "OK";
+        } catch (Throwable t) {
+            return t.getClass().getName() + ":" + t.getMessage();
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static String check() {
+        StringBuilder out = new StringBuilder();
+        BlockState s0 = BLOCK.defaultBlockState();
+        // Finding 2: canonical state identity (`==`)
+        out.append("defSame=").append(s0 == BLOCK.defaultBlockState()).append('|');
+        out.append("sameFacing=").append(s0.setValue(BlockStateProperties.HORIZONTAL_FACING, s0.getValue(BlockStateProperties.HORIZONTAL_FACING)) == s0).append('|');
+        out.append("sameLit=").append(s0.setValue(BlockStateProperties.LIT, s0.getValue(BlockStateProperties.LIT)) == s0).append('|');
+        BlockState litA = s0.setValue(BlockStateProperties.LIT, Boolean.FALSE);
+        BlockState litB = s0.setValue(BlockStateProperties.LIT, Boolean.FALSE);
+        out.append("repeat=").append(litA == litB).append('|');
+        out.append("objRepeat=").append(((Object) litA) == ((Object) litB)).append('|');
+        out.append("roundtrip=").append(litA.setValue(BlockStateProperties.LIT, Boolean.TRUE) == s0).append('|');
+        BlockState ab = s0.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST).setValue(BlockStateProperties.LIT, Boolean.FALSE);
+        BlockState ba = s0.setValue(BlockStateProperties.LIT, Boolean.FALSE).setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+        out.append("commute=").append(ab == ba).append('|');
+        out.append("trySame=").append(s0.trySetValue(BlockStateProperties.HORIZONTAL_FACING, s0.getValue(BlockStateProperties.HORIZONTAL_FACING)) == s0).append('|');
+        out.append("tryRepeat=").append(s0.trySetValue(BlockStateProperties.LIT, Boolean.FALSE) == litA).append('|');
+
+        // Finding 3: bridge-method checkcast CCE & null NPE order
+        Property lit = BlockStateProperties.LIT;
+        Property facing = BlockStateProperties.HORIZONTAL_FACING;
+        Property age3 = BlockStateProperties.AGE_3;
+        Property waterlogged = BlockStateProperties.WATERLOGGED;
+        out.append("boolEnum=").append(catchText(() -> s0.setValue(lit, (Comparable) Direction.NORTH))).append('|');
+        out.append("boolInt=").append(catchText(() -> s0.setValue(lit, (Comparable) Integer.valueOf(1)))).append('|');
+        out.append("boolStr=").append(catchText(() -> s0.setValue(lit, (Comparable) "true"))).append('|');
+        out.append("boolNull=").append(catchText(() -> s0.setValue(lit, (Comparable) null))).append('|');
+        out.append("enumBool=").append(catchText(() -> s0.setValue(facing, (Comparable) Boolean.TRUE))).append('|');
+        out.append("enumInt=").append(catchText(() -> s0.setValue(facing, (Comparable) Integer.valueOf(0)))).append('|');
+        out.append("enumStr=").append(catchText(() -> s0.setValue(facing, (Comparable) "north"))).append('|');
+        out.append("enumNull=").append(catchText(() -> s0.setValue(facing, (Comparable) null))).append('|');
+        out.append("intBool=").append(catchText(() -> s0.setValue(age3, (Comparable) Boolean.TRUE))).append('|');
+        out.append("intStr=").append(catchText(() -> s0.setValue(age3, (Comparable) "1"))).append('|');
+        out.append("intNull=").append(catchText(() -> s0.setValue(age3, (Comparable) null))).append('|');
+        out.append("tryMissingBadType=").append(s0.trySetValue(waterlogged, (Comparable) Direction.NORTH) == s0).append('|');
+        out.append("tryPresentBadType=").append(catchText(() -> s0.trySetValue(lit, (Comparable) Direction.NORTH))).append('|');
+        out.append("tryPresentNull=").append(catchText(() -> s0.trySetValue(facing, (Comparable) null))).append('|');
+        out.append("setNullProp=").append(catchText(() -> s0.setValue(null, (Comparable) Boolean.TRUE))).append('|');
+        out.append("getNullProp=").append(catchText(() -> s0.getValue(null))).append('|');
+        out.append("tryNullProp=").append(s0.trySetValue(null, (Comparable) Boolean.TRUE) == s0).append('|');
+        out.append("hasNullProp=").append(s0.hasProperty(null)).append('|');
+
+        // Finding 4: Properties.ofFullCopy(null) / ofLegacyCopy(null) throw helpful NPE
+        out.append("fullCopyNull=").append(catchText(() -> BlockBehaviour.Properties.ofFullCopy(null))).append('|');
+        out.append("legacyCopyNull=").append(catchText(() -> BlockBehaviour.Properties.ofLegacyCopy(null)));
+        return out.toString();
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-state-identity-and-npe", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    let before = host.unknown_host_call_count();
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "check",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+
+    // Every single expected string below was captured verbatim from OpenJDK 25.0.5+8 against
+    // Minecraft 26.3 (`CaptureAllOracle.java`).
+    let expected = [
+        "defSame=true",
+        "sameFacing=true",
+        "sameLit=true",
+        "repeat=true",
+        "objRepeat=true",
+        "roundtrip=true",
+        "commute=true",
+        "trySame=true",
+        "tryRepeat=true",
+        "boolEnum=java.lang.ClassCastException:class net.minecraft.core.Direction cannot be cast to class java.lang.Boolean (net.minecraft.core.Direction is in unnamed module of loader 'app'; java.lang.Boolean is in module java.base of loader 'bootstrap')",
+        "boolInt=java.lang.ClassCastException:class java.lang.Integer cannot be cast to class java.lang.Boolean (java.lang.Integer and java.lang.Boolean are in module java.base of loader 'bootstrap')",
+        "boolStr=java.lang.ClassCastException:class java.lang.String cannot be cast to class java.lang.Boolean (java.lang.String and java.lang.Boolean are in module java.base of loader 'bootstrap')",
+        "boolNull=java.lang.NullPointerException:Cannot invoke \"java.lang.Boolean.booleanValue()\" because \"value\" is null",
+        "enumBool=java.lang.ClassCastException:class java.lang.Boolean cannot be cast to class java.lang.Enum (java.lang.Boolean and java.lang.Enum are in module java.base of loader 'bootstrap')",
+        "enumInt=java.lang.ClassCastException:class java.lang.Integer cannot be cast to class java.lang.Enum (java.lang.Integer and java.lang.Enum are in module java.base of loader 'bootstrap')",
+        "enumStr=java.lang.ClassCastException:class java.lang.String cannot be cast to class java.lang.Enum (java.lang.String and java.lang.Enum are in module java.base of loader 'bootstrap')",
+        "enumNull=java.lang.NullPointerException:Cannot invoke \"java.lang.Enum.ordinal()\" because \"value\" is null",
+        "intBool=java.lang.ClassCastException:class java.lang.Boolean cannot be cast to class java.lang.Integer (java.lang.Boolean and java.lang.Integer are in module java.base of loader 'bootstrap')",
+        "intStr=java.lang.ClassCastException:class java.lang.String cannot be cast to class java.lang.Integer (java.lang.String and java.lang.Integer are in module java.base of loader 'bootstrap')",
+        "intNull=java.lang.NullPointerException:Cannot invoke \"java.lang.Integer.intValue()\" because \"value\" is null",
+        "tryMissingBadType=true",
+        "tryPresentBadType=java.lang.ClassCastException:class net.minecraft.core.Direction cannot be cast to class java.lang.Boolean (net.minecraft.core.Direction is in unnamed module of loader 'app'; java.lang.Boolean is in module java.base of loader 'bootstrap')",
+        "tryPresentNull=java.lang.NullPointerException:Cannot invoke \"java.lang.Enum.ordinal()\" because \"value\" is null",
+        "setNullProp=java.lang.IllegalArgumentException:Cannot set property null as it does not exist in Block{fixture:identity_block}",
+        "getNullProp=java.lang.IllegalArgumentException:Cannot get property null as it does not exist in Block{fixture:identity_block}",
+        "tryNullProp=true",
+        "hasNullProp=false",
+        "fullCopyNull=java.lang.NullPointerException:Cannot read field \"properties\" because \"block\" is null",
+        "legacyCopyNull=java.lang.NullPointerException:Cannot read field \"properties\" because \"block\" is null",
+    ]
+    .join("|");
+    assert_eq!(answer, Value::Ref(Some(expected)));
 }
 
 /// Real-jar verification against `runes-fabric-1.3.2+26.3.jar`:

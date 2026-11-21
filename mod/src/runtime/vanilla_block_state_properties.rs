@@ -209,6 +209,15 @@ pub(crate) fn property_value(field: &str, kind: &str, serialized: &str) -> Optio
     }
 }
 
+/// Internal class name of the enum value class for an `EnumProperty` field (e.g.
+/// `HORIZONTAL_FACING` -> `"net/minecraft/core/Direction"`).
+pub(crate) fn enum_property_class(field: &str) -> Option<&'static str> {
+    ENUM_VALUES.lines().find_map(|line| {
+        let mut parts = line.split('|');
+        (parts.next()? == field).then(|| parts.next())?
+    })
+}
+
 /// Convert a Java enum constant marker (`enum/<class>/<CONSTANT>`) to its serialized property value
 /// for `BlockStateProperties.<field>` (e.g. `PistonType.DEFAULT` -> `"normal"`).
 pub(crate) fn enum_serialized_name(field: &str, enum_marker: &str) -> Option<String> {

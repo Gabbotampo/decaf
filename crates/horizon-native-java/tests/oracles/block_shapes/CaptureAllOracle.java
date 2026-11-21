@@ -168,14 +168,20 @@ public final class CaptureAllOracle {
         System.out.println("join_only_second=" + fmtAabbs(Shapes.join(b1, b2, BooleanOp.ONLY_SECOND)));
         System.out.println("join_not_same=" + fmtAabbs(Shapes.join(b1, b2, BooleanOp.NOT_SAME)));
 
-        // 6. StateHolder.setValue / getValue / trySetValue validation & Property.toString
+        // 6. StateHolder canonical identity, setValue / getValue / trySetValue validation & Property.toString
         System.out.println("=== STATE_HOLDER_VALIDATION ===");
         System.out.println("prop_horizontal_facing=" + BlockStateProperties.HORIZONTAL_FACING);
         System.out.println("prop_lit=" + BlockStateProperties.LIT);
         System.out.println("prop_age_3=" + BlockStateProperties.AGE_3);
         System.out.println("prop_piston_type=" + BlockStateProperties.PISTON_TYPE);
         BlockState furnaceState = net.minecraft.world.level.block.Blocks.FURNACE.defaultBlockState();
+        BlockState wheatState = net.minecraft.world.level.block.Blocks.WHEAT.defaultBlockState();
         System.out.println("furnace_block_toString=" + furnaceState.getBlock());
+        System.out.println("same_val_same_obj=" + (furnaceState.setValue(BlockStateProperties.HORIZONTAL_FACING, furnaceState.getValue(BlockStateProperties.HORIZONTAL_FACING)) == furnaceState));
+        System.out.println("repeat_transition_same_obj=" + (furnaceState.setValue(BlockStateProperties.LIT, true) == furnaceState.setValue(BlockStateProperties.LIT, true)));
+        System.out.println("roundtrip_same_obj=" + (furnaceState.setValue(BlockStateProperties.LIT, true).setValue(BlockStateProperties.LIT, false) == furnaceState));
+        System.out.println("commute_same_obj=" + (furnaceState.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST).setValue(BlockStateProperties.LIT, true) == furnaceState.setValue(BlockStateProperties.LIT, true).setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST)));
+        System.out.println("try_same_val_same_obj=" + (furnaceState.trySetValue(BlockStateProperties.HORIZONTAL_FACING, furnaceState.getValue(BlockStateProperties.HORIZONTAL_FACING)) == furnaceState));
         try {
             furnaceState.setValue(BlockStateProperties.WATERLOGGED, Boolean.TRUE);
         } catch (Throwable t) {
@@ -197,6 +203,19 @@ public final class CaptureAllOracle {
         } catch (Throwable t) {
             System.out.println("try_set_bad_val=" + t.getClass().getName() + ":" + t.getMessage());
         }
+        captureStateHolderRaw(furnaceState, wheatState);
+        // 7. BlockBehaviour.Properties.ofFullCopy(null) / ofLegacyCopy(null)
+        System.out.println("=== PROPERTIES_COPY_NULL ===");
+        try {
+            net.minecraft.world.level.block.state.BlockBehaviour.Properties.ofFullCopy(null);
+        } catch (Throwable t) {
+            System.out.println("ofFullCopy_null=" + t.getClass().getName() + ":" + t.getMessage());
+        }
+        try {
+            net.minecraft.world.level.block.state.BlockBehaviour.Properties.ofLegacyCopy(null);
+        } catch (Throwable t) {
+            System.out.println("ofLegacyCopy_null=" + t.getClass().getName() + ":" + t.getMessage());
+        }
         // Check whether any BlockStateProperties enum constant has toString() != getSerializedName()
         System.out.println("=== ENUM_TO_STRING_DIFFS ===");
         for (String cls : enumClasses) {
@@ -207,6 +226,44 @@ public final class CaptureAllOracle {
                 if (!ts.equals(ser)) {
                     System.out.println("diff|" + cls + "|" + ((Enum<?>) o).name() + "|toString=" + ts + "|ser=" + ser);
                 }
+            }
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    static void captureStateHolderRaw(BlockState furnace, BlockState wheat) {
+        Property lit = BlockStateProperties.LIT;
+        Property facing = BlockStateProperties.HORIZONTAL_FACING;
+        Property age7 = BlockStateProperties.AGE_7;
+        Property waterlogged = BlockStateProperties.WATERLOGGED;
+        Object[][] cases = {
+            {"bool_enum", (Runnable) () -> furnace.setValue(lit, (Comparable) Direction.NORTH)},
+            {"bool_int", (Runnable) () -> furnace.setValue(lit, (Comparable) Integer.valueOf(1))},
+            {"bool_str", (Runnable) () -> furnace.setValue(lit, (Comparable) "true")},
+            {"bool_null", (Runnable) () -> furnace.setValue(lit, (Comparable) null)},
+            {"enum_bool", (Runnable) () -> furnace.setValue(facing, (Comparable) Boolean.TRUE)},
+            {"enum_int", (Runnable) () -> furnace.setValue(facing, (Comparable) Integer.valueOf(0))},
+            {"enum_str", (Runnable) () -> furnace.setValue(facing, (Comparable) "north")},
+            {"enum_null", (Runnable) () -> furnace.setValue(facing, (Comparable) null)},
+            {"int_bool", (Runnable) () -> wheat.setValue(age7, (Comparable) Boolean.TRUE)},
+            {"int_str", (Runnable) () -> wheat.setValue(age7, (Comparable) "1")},
+            {"int_null", (Runnable) () -> wheat.setValue(age7, (Comparable) null)},
+            {"try_missing_bad_type", (Runnable) () -> {
+                if (furnace.trySetValue(waterlogged, (Comparable) Direction.NORTH) != furnace) {
+                    throw new AssertionError("expected same");
+                }
+            }},
+            {"try_present_bad_type", (Runnable) () -> furnace.trySetValue(lit, (Comparable) Direction.NORTH)},
+            {"try_present_null", (Runnable) () -> furnace.trySetValue(facing, (Comparable) null)},
+            {"set_null_prop", (Runnable) () -> furnace.setValue(null, (Comparable) Boolean.TRUE)},
+            {"get_null_prop", (Runnable) () -> furnace.getValue(null)},
+        };
+        for (Object[] c : cases) {
+            try {
+                ((Runnable) c[1]).run();
+                System.out.println(c[0] + "=OK");
+            } catch (Throwable t) {
+                System.out.println(c[0] + "=" + t.getClass().getName() + ":" + t.getMessage());
             }
         }
     }

@@ -516,6 +516,16 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `a.equals(b)` for a non-null `a`, as the JVM runs it.
     pub(crate) fn java_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
+        if matches!(a, Value::Host(h) if h.kind() == crate::runtime::host_ref::HostKind::ShapeProbe)
+            || matches!(b, Value::Host(h) if h.kind() == crate::runtime::host_ref::HostKind::ShapeProbe)
+        {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "equals".into(),
+                descriptor: EQUALS.into(),
+            })?;
+            return Ok(false);
+        }
         if matches!(a, Value::Host(handle) if matches!(handle.kind(), crate::runtime::host_ref::HostKind::GuavaTable | crate::runtime::host_ref::HostKind::GuavaCell))
         {
             return match self.guava_table_equals(a, b)? {
@@ -886,6 +896,16 @@ impl<H: Host> Runtime<'_, H> {
 
     /// `Objects.equals(a, b)`: `a == b || a != null && a.equals(b)`.
     pub(crate) fn objects_equals(&mut self, a: &Value, b: &Value) -> Result<bool, NativeError> {
+        if matches!(a, Value::Host(h) if h.kind() == crate::runtime::host_ref::HostKind::ShapeProbe)
+            || matches!(b, Value::Host(h) if h.kind() == crate::runtime::host_ref::HostKind::ShapeProbe)
+        {
+            self.host.unknown_operand_call(&MethodRef {
+                owner: "java/lang/Object".into(),
+                name: "equals".into(),
+                descriptor: EQUALS.into(),
+            })?;
+            return Ok(false);
+        }
         if identical(a, b) {
             return Ok(true);
         }

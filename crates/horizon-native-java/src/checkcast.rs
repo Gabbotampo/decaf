@@ -188,7 +188,13 @@ impl<H: Host> Runtime<'_, H> {
     /// Run `checkcast target` on `value`: `Ok` when the cast passes (or was
     /// counted), the `ClassCastException` when it cannot.
     pub(super) fn checkcast(&mut self, value: &Value, target: &str) -> Result<(), NativeError> {
-        if *value == Value::Ref(None) || target == "java/lang/Object" {
+        if *value == Value::Ref(None) {
+            return Ok(());
+        }
+        if matches!(value, Value::Host(handle) if handle.kind() == HostKind::ShapeProbe) {
+            return self.count_cast(value, target);
+        }
+        if target == "java/lang/Object" {
             return Ok(());
         }
         if let Some(verdict) = self.collection_instance_of(value, target) {

@@ -1862,7 +1862,6 @@ mod tests {
             "inferred_declarations",
             "declared_registrations",
             "next_property_builder",
-            "next_block_state",
             "outgoing_payloads",
             "incoming_payloads",
             "level_resources",

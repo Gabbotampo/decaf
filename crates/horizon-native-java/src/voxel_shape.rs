@@ -41,7 +41,6 @@ pub(crate) const BLOCK_CLASS: &str = "net/minecraft/world/level/block/Block";
 pub(crate) const GET_SHAPE_DESC: &str = "(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/phys/shapes/CollisionContext;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
 pub(crate) const BLOCK_STATE_GET_SHAPE_2_DESC: &str = "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
 pub(crate) const BLOCK_STATE_GET_SHAPE_3_DESC: &str = "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/phys/shapes/CollisionContext;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
-pub(crate) const PROBE_COLLISION_CONTEXT_KEY: &str = "shape-probe";
 
 const EPSILON: f64 = 1.0e-7;
 /// Safety cap on discrete cells in a single joined shape, preventing adversarial memory blowups.
@@ -1233,19 +1232,10 @@ pub(crate) const BOOLEAN_OP_METHODS: Methods = Methods {
 };
 
 fn collision_context_instance_of(
-    handle: &HostRef,
+    _handle: &HostRef,
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
-    if handle.key() == PROBE_COLLISION_CONTEXT_KEY {
-        if matches!(wanted, COLLISION_CONTEXT | "java/lang/Object") {
-            return Some(true);
-        }
-        if matches!(wanted, VOXEL_SHAPE | AABB | "java/lang/String") {
-            return Some(false);
-        }
-        return None;
-    }
     if matches!(
         wanted,
         EMPTY_COLLISION_CONTEXT | ENTITY_COLLISION_CONTEXT | COLLISION_CONTEXT | "java/lang/Object"
@@ -1262,14 +1252,7 @@ pub(crate) const COLLISION_CONTEXT_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: |handle, other, _| {
-        if handle.key() == PROBE_COLLISION_CONTEXT_KEY
-            || matches!(
-                other,
-                Value::Host(other)
-                    if other.kind() == HostKind::CollisionContext
-                        && other.key() == PROBE_COLLISION_CONTEXT_KEY
-            )
-        {
+        if matches!(other, Value::Host(other) if other.kind() == HostKind::ShapeProbe) {
             return Ok(None);
         }
         Ok(Some(matches!(
@@ -1278,6 +1261,18 @@ pub(crate) const COLLISION_CONTEXT_METHODS: Methods = Methods {
         )))
     },
     instance_of: collision_context_instance_of,
+    crosses_jars: |_, _| true,
+    compare_to: None,
+};
+
+/// Opaque extraction probes (`BlockGetter`, `BlockPos`, `CollisionContext`): every `Object`
+/// observation (`toString`, `hashCode`, `equals`, `instanceof`, `checkcast`, `compareTo`) returns
+/// unknown so the runtime counts it on the host and refuses static shape export.
+pub(crate) const SHAPE_PROBE_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: |_, _, _| None,
     crosses_jars: |_, _| true,
     compare_to: None,
 };
@@ -1299,21 +1294,15 @@ pub(crate) fn empty_collision_context() -> Value {
 }
 
 fn probe_collision_context() -> Value {
-    Value::Host(HostRef::new(
-        HostKind::CollisionContext,
-        PROBE_COLLISION_CONTEXT_KEY,
-    ))
+    Value::Host(HostRef::new(HostKind::ShapeProbe, "collision-context"))
 }
 
 fn probe_block_getter() -> Value {
-    Value::Host(HostRef::new(
-        HostKind::GameTransient,
-        "shape-probe/block-getter",
-    ))
+    Value::Host(HostRef::new(HostKind::ShapeProbe, "block-getter"))
 }
 
 fn probe_block_pos() -> Value {
-    crate::game_object::server_value("block-pos/shape-probe".into())
+    Value::Host(HostRef::new(HostKind::ShapeProbe, "block-pos"))
 }
 
 /// Allocate a fresh `VoxelShape` handle without collapsing to `Shapes.empty()` / `Shapes.block()`.
@@ -2165,8 +2154,8 @@ impl NativeJar {
         let mut results = Vec::with_capacity(state_combos.len());
         let mut synthetic_states = Vec::with_capacity(state_combos.len());
         for state_map in state_combos {
-            let state_val = host.mint_block_state(marker, state_map.clone());
-            if let Some(state_marker) = expect_ref(&state_val) {
+            let (state_val, inserted) = host.mint_block_state(marker, state_map.clone());
+            if inserted && let Some(state_marker) = expect_ref(&state_val) {
                 synthetic_states.push(state_marker.clone());
             }
             let unknown_before = host.unknown_host_call_count();
