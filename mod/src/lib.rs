@@ -2713,7 +2713,12 @@ fn load_jar(
     if let Some(version) = game_version {
         seed = seed.with_game_version(version);
     }
-    let mut host = jar.seed_host(seed);
+    let mut host = match jar.try_seed_host(seed) {
+        Ok(host) => host,
+        Err(error) => {
+            return Err(JarRow::refused(&file, id, error));
+        }
+    };
     // Every jar of the game shares FML's `InterModComms` queues, from the constructors on.
     imc.join(&file, &jar, &mut host);
     for (link, dependency) in links {

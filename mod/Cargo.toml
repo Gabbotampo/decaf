@@ -12,6 +12,7 @@ description = "Horizon Java: runs Java mod jars on the native bytecode runtime"
 path = "src/lib.rs"
 
 [dependencies]
+crc32fast = "=1.5.4"
 # The mod API of the exact build pinned in `sunrise-mod.toml`, from its signed SDK, which
 # `cargo sunrise-mod` (`check`, `build`, `run`) fetches into `.sunrise/sdk/`. Sunrise refuses
 # every other form (git, version, another path) under E_SDK_SOURCE
