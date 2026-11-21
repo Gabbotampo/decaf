@@ -475,10 +475,7 @@ fn note_late_player_tick_post(row: &mut crate::JarRow) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use mod_api::{
-        Backend, EntityRef, Hooks, Host, HostSide, PlayerRef, PlayerTickPostEvent,
-        PlayerTickPreEvent, ServerHost, WorldEpoch,
-    };
+    use mod_api::{Backend, EntityRef, Host, HostSide, PlayerRef, ServerHost, WorldEpoch};
     use std::collections::BTreeMap;
 
     pub(crate) struct PlayerTickHost {
@@ -887,16 +884,8 @@ pub(crate) mod tests {
                 EntityRef::new(WorldEpoch::new(1), entity),
                 uuid,
             );
-            crate::HorizonJava::player_tick_pre(
-                &java,
-                HostSide::Server(&mut host),
-                &mut PlayerTickPreEvent { player },
-            );
-            crate::HorizonJava::player_tick_post(
-                &java,
-                HostSide::Server(&mut host),
-                &mut PlayerTickPostEvent { player },
-            );
+            java.on_player_tick_pre(HostSide::Server(&mut host), player);
+            java.on_player_tick_post(HostSide::Server(&mut host), player);
         }
         let mut state = java.lock();
         assert_eq!(
@@ -984,16 +973,8 @@ pub(crate) mod tests {
                 EntityRef::new(WorldEpoch::new(1), entity_id),
                 uuid,
             );
-            crate::HorizonJava::player_tick_pre(
-                &java,
-                HostSide::Server(&mut host),
-                &mut PlayerTickPreEvent { player },
-            );
-            crate::HorizonJava::player_tick_post(
-                &java,
-                HostSide::Server(&mut host),
-                &mut PlayerTickPostEvent { player },
-            );
+            java.on_player_tick_pre(HostSide::Server(&mut host), player);
+            java.on_player_tick_post(HostSide::Server(&mut host), player);
         }
         let mut state = java.lock();
         assert_eq!(state.jars[0].row.game_hooks.skipped, 0);

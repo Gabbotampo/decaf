@@ -304,7 +304,10 @@ pub(crate) fn declare_blocks(
                 );
                 continue;
             }
-            event.blocks.push(block_entry(&declaration, &id));
+            if let Err(error) = event.register(block_entry(&declaration, &id)) {
+                log::warn!("{LOG}: {}: block {id} refused by game: {error}", jar.row.id);
+                continue;
+            }
             jar.row.content_blocks += 1;
             count += 1;
         }
@@ -357,9 +360,12 @@ pub(crate) fn declare_items(
                 );
                 continue;
             }
-            event
-                .items
-                .push(item_entry(&declaration, &id, !owns_assets(context, &id)));
+            if let Err(error) =
+                event.register(item_entry(&declaration, &id, !owns_assets(context, &id)))
+            {
+                log::warn!("{LOG}: {}: item {id} refused by game: {error}", jar.row.id);
+                continue;
+            }
             jar.row.content_items += 1;
             count += 1;
         }

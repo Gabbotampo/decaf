@@ -1,0 +1,7 @@
+# Each row is the exact closure jar set used for the capture. Paths are relative to HORIZON_CORPUS.
+spark|jar=mega/0940b4089a-spark-1.10.187-fabric.jar|deps-pool/fabric-api-0.166.2+26.3.jar
+dynamic-fps|jar=mega/a4860c9480-dynamic-fps-3.11.10+minecraft-26.3.0-fabric.jar|deps-pool/fabric-api-0.166.2+26.3.jar
+authme|jar=mega/14e35002fa-authme-fabric-9.3.0+26.3.jar|deps-pool/fabric-api-0.166.2+26.3.jar
+corpus-xl-1283899|jar=corpus-xl/1283899-8898481.jar|deps-pool/fabric-api-0.166.2+26.3.jar
+respackopts|jar=mega/57aaafb29c-respackopts-26.3.0.jar|deps-pool/fabric-api-0.166.2+26.3.jar
+emotecraft|jar=mega/286a800d23-emotecraft-for-MC26.3-3.5.0-b.build.179.jar|deps-pool/fabric-api-0.166.2+26.3.jar

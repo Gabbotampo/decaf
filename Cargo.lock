@@ -111,6 +111,7 @@ dependencies = [
 name = "horizon-native-java"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "libc",
  "serde_json",
  "zip",

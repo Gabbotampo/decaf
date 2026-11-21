@@ -337,6 +337,10 @@ impl StdHost {
         for held in self.fabric_biome_modifications.values() {
             value(held, out);
         }
+        // Fabric synchronized recipe serializers (`fabric_api_slice2.rs`, static strong root).
+        for held in self.recipe_sync_serializers.values() {
+            value(held, out);
+        }
         // NeoForge attachment types and live values (`neoforge_attachments.rs`).
         self.neoforge_attachments.root_texts(out);
         // The objects the loader built and keeps (an entrypoint instance,
@@ -1797,6 +1801,7 @@ mod tests {
             "fabric_resource_conditions",
             "creative_tab",
             "fabric_biome_modifications",
+            "recipe_sync_serializers",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
@@ -1820,7 +1825,10 @@ mod tests {
             "own_loader_classes",
             "own_mod_id",
             "fabric_metadata",
+            "fabric_aliases",
             "fabric_origins",
+            "fabric_resolution_errors",
+            "loaded_nested_hashes",
             "environment_type",
             "game_version",
             "development_environment",
@@ -1912,5 +1920,47 @@ mod tests {
         heap.next_object = 256;
         collect(&mut heap, &mut host, &[]);
         assert!(host.menu_states.is_empty());
+    }
+
+    #[test]
+    fn synced_recipe_serializers_root_their_objects_and_held_codecs() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+
+        // A JarObject serializer reachable only from Fabric's static synced set.
+        let jar_ser = crate::jar_object::handle("demo/Serializer#1".into());
+        heap.fields
+            .insert(field("demo/Serializer#1", "delegate"), text("demo/Node#2"));
+        heap.fields
+            .insert(field("demo/Node#2", "tag"), Value::Int(42));
+        // An unreferenced node that must be swept.
+        heap.fields
+            .insert(field("demo/Node#3", "tag"), Value::Int(99));
+
+        // A RecipeSerializer record handle whose held codecs are JarObjects
+        // reachable only through the synced set.
+        let map_codec = crate::jar_object::handle("demo/MapCodec#4".into());
+        let stream_codec = crate::jar_object::handle("demo/StreamCodec#5".into());
+        heap.fields
+            .insert(field("demo/MapCodec#4", "name"), text("map"));
+        heap.fields
+            .insert(field("demo/StreamCodec#5", "name"), text("stream"));
+        let record_ser = crate::recipe_serializer::make(&map_codec, &stream_codec);
+
+        for serializer in [jar_ser, record_ser] {
+            let key = crate::fabric_api_slice2::canonical_serializer_key(&serializer).unwrap();
+            host.recipe_sync_serializers.insert(key, serializer);
+        }
+
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            [
+                "demo/MapCodec#4",
+                "demo/Node#2",
+                "demo/Serializer#1",
+                "demo/StreamCodec#5",
+            ]
+        );
     }
 }

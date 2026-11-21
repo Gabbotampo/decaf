@@ -224,6 +224,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod recipe_serializer;
 mod scanner_model;
 mod server_values;
 mod tool_material;
@@ -3313,6 +3314,14 @@ pub trait Host {
         0
     }
 
+    /// Whether this host models Fabric's `RecipeSynchronization.synchronizeRecipeSerializer`.
+    fn supports_recipe_sync(&self) -> bool {
+        false
+    }
+
+    /// Record a canonical serializer identity and value registered for client recipe sync.
+    fn record_synced_recipe_serializer(&mut self, _key: String, _serializer: Value) {}
+
     /// Whether the running jar ships a `module-info.class` (`reflect_override`
     /// reads it to know the jar's module is unnamed or automatic). `None` when
     /// this host does not know the jar.
@@ -3497,6 +3506,14 @@ pub struct StdHost {
     own_mod_id: Option<String>,
     /// Each Fabric jar's own `fabric.mod.json`, by mod id (`fabric_mods.rs`).
     fabric_metadata: BTreeMap<String, serde_json::Value>,
+    /// Fabric provides aliases resolve to a container but are not separate containers.
+    fabric_aliases: BTreeMap<String, String>,
+    /// Duplicate ids/aliases are loader resolution errors, never first-wins.
+    fabric_resolution_errors: Vec<String>,
+    /// Hashes of nested jars already discovered through this host's class
+    /// path. Fabric's discovery map shares one candidate when the same
+    /// `(CRC-32, size)` nested entry is reached from several parents.
+    loaded_nested_hashes: BTreeSet<u64>,
     /// Fabric Loader origin kind and argument for each loaded mod. Direct jars
     /// are PATH origins; jars discovered in META-INF/jars are NESTED origins.
     fabric_origins: BTreeMap<String, (String, String)>,
@@ -3780,6 +3797,10 @@ pub struct StdHost {
     creative_tab: host_creative_tab::State,
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
+    /// Recipe serializers registered with Fabric's recipe synchronization API,
+    /// keyed by canonical identity (`HostRef::encode()`) and holding the value
+    /// as a static strong GC root (`fabric_api_slice2.rs`).
+    recipe_sync_serializers: BTreeMap<String, Value>,
     vec2: vec2::State,
     menu_states: menu_models::States,
 }
@@ -3840,6 +3861,9 @@ impl StdHost {
             own_loader_classes: BTreeSet::new(),
             own_mod_id: None,
             fabric_metadata: BTreeMap::new(),
+            fabric_aliases: BTreeMap::new(),
+            fabric_resolution_errors: Vec::new(),
+            loaded_nested_hashes: BTreeSet::new(),
             fabric_origins: BTreeMap::new(),
             environment_type: "CLIENT".into(),
             game_version: None,
@@ -3966,6 +3990,7 @@ impl StdHost {
             fabric_resource_conditions: fabric_resource_conditions::State::default(),
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            recipe_sync_serializers: BTreeMap::new(),
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
         }
@@ -4014,6 +4039,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Serializer object identities registered for client recipe synchronization.
+    pub fn synced_recipe_serializers(&self) -> Vec<String> {
+        self.recipe_sync_serializers.keys().cloned().collect()
     }
 
     /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
@@ -4524,37 +4554,81 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        let id = id.into();
-        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
-        self.record_loaded_mod(jar);
-        // A loader also puts the linked jar's bundled jars
-        // (`META-INF/jars/*.jar`) on the class path: a dependency such as
-        // `libjf` keeps its classes there, and its dependents call them.
-        // Fabric loads each of them as a mod of its own.
-        for (entry, nested) in nested_jars::parsed(jar) {
-            let _ =
-                Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
-            self.record_loaded_mod(&nested);
-            if let Some(nested_id) = nested.fabric_id.as_deref() {
-                let parent = jar
-                    .fabric_id
-                    .as_deref()
-                    .or(jar.neoforge_id.as_deref())
-                    .unwrap_or("jar");
-                let sublocation = entry.clone();
-                self.fabric_origins.insert(
-                    nested_id.to_owned(),
-                    ("nested".into(), format!("{parent}|{sublocation}")),
-                );
+        let added = self.link_jar_with_nesting(id, jar, false)?;
+        for nested in nested_jars::link_nested_jars(self, jar) {
+            if let Err(error) = nested.result {
+                return Err(NativeError::Metadata(error));
             }
         }
         Ok(added)
     }
 
+    fn link_jar_with_nesting(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+        nested: bool,
+    ) -> Result<usize, NativeError> {
+        let id = id.into();
+        self.try_record_loaded_mod(jar, nested)?;
+        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        // A real loader's class path also resolves resources and service
+        // descriptors from the selected sibling. Merge each once in class
+        // path order; unselected Jar-in-Jar copies never reach this method.
+        for (name, marker) in &jar.resources {
+            self.resources
+                .entry(name.clone())
+                .or_insert_with(|| marker.clone());
+        }
+        for (name, bytes) in &jar.resource_bytes {
+            self.resource_bytes
+                .entry(name.clone())
+                .or_insert_with(|| bytes.clone());
+            if let Some(service) = name.strip_prefix("META-INF/services/")
+                && !service.is_empty()
+                && !service.contains('/')
+            {
+                for line in String::from_utf8_lossy(bytes).lines() {
+                    let provider = line.split_once('#').map_or(line, |(line, _)| line).trim();
+                    if !provider.is_empty() {
+                        self.service_providers
+                            .entry(service.replace('.', "/"))
+                            .or_default()
+                            .push(provider.replace('.', "/"));
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
+    /// Link one Fabric/NeoForge nested candidate. Unlike [`Self::link_jar`],
+    /// this participates in the loader's global nested-candidate identity
+    /// map, so a shared library reached through multiple parents is recorded
+    /// and put on the class path once.
+    pub(crate) fn link_nested_jar(
+        &mut self,
+        id: impl Into<String>,
+        jar: &NativeJar,
+    ) -> Result<usize, NativeError> {
+        let id = id.into();
+        if jar.fabric_id.is_some() {
+            let hash = nested_jars::identity(jar);
+            if !self.loaded_nested_hashes.insert(hash) {
+                return Ok(0);
+            }
+        }
+        if let Some(nested_id) = jar.fabric_id.as_deref() {
+            self.fabric_origins
+                .insert(nested_id.to_owned(), ("nested".into(), id.clone()));
+        }
+        self.link_jar_with_nesting(id, jar, true)
+    }
+
     /// A jar present beside this one is a loaded mod for `isModLoaded` and
     /// `ModList.isLoaded`, declared as a dependency or not.
-    fn record_loaded_mod(&mut self, jar: &NativeJar) {
-        self.record_fabric_metadata(jar);
+    fn try_record_loaded_mod(&mut self, jar: &NativeJar, nested: bool) -> Result<(), NativeError> {
+        self.try_record_fabric_metadata(jar, nested)?;
         if let Some(toml) = neoforge_loader::mods_toml(&jar.resource_bytes) {
             let entries = neoforge_loader::mod_file_entries(toml, jar.neoforge_version.as_deref());
             if let Some((first, first_version)) = entries.first().cloned() {
@@ -4583,6 +4657,7 @@ impl StdHost {
                 *known = version.unwrap_or("unknown").to_owned();
             }
         }
+        Ok(())
     }
 
     /// [`Self::link_jar`] for a caller that already parsed the library's
@@ -6231,6 +6306,14 @@ impl Host for StdHost {
 
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
+    }
+
+    fn supports_recipe_sync(&self) -> bool {
+        true
+    }
+
+    fn record_synced_recipe_serializer(&mut self, key: String, serializer: Value) {
+        self.recipe_sync_serializers.insert(key, serializer);
     }
 
     fn mark_nondeterministic(&mut self, marker: &str) {
@@ -9065,6 +9148,9 @@ impl Host for StdHost {
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
             return value;
         }
+        if let Some(value) = recipe_serializer::instance_call(r, receiver, args) {
+            return Ok(value);
+        }
         if let Some(value) = self.item_like_call(r, receiver, args) {
             return Ok(value);
         }
@@ -9212,6 +9298,31 @@ impl Host for StdHost {
         }
         if let Some(value) = self.registry_register(r, Some(receiver), args) {
             return Ok(value);
+        }
+        if r.owner == "net/minecraft/world/level/block/CraftingTableBlock"
+            && r.name == "<init>"
+            && r.descriptor
+                == "(Lnet/minecraft/world/level/block/state/BlockBehaviour$Properties;)V"
+        {
+            let Some(builder) = args.first().and_then(expect_ref) else {
+                return Ok(Value::Void);
+            };
+            let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
+                return Ok(Value::Void);
+            };
+            let marker = jar_object::instance_key(receiver).unwrap_or_default();
+            if jar_object::key_class(marker)
+                == Some("net/minecraft/world/level/block/CraftingTableBlock")
+            {
+                properties.insert("__template".into(), "minecraft:crafting_table".into());
+            }
+            if self.block_property_builders.contains_key(marker)
+                || self.block_property_builders.len() < MAX_PROPERTY_BUILDERS
+            {
+                self.block_property_builders
+                    .insert(marker.to_owned(), properties);
+            }
+            return Ok(Value::Void);
         }
         if let Some(value) = self.property_builder_call(r, receiver, args)? {
             return Ok(value);
@@ -17895,6 +18006,8 @@ pub struct NativeJar {
     resource_bytes: BTreeMap<String, Vec<u8>>,
     pub fabric_id: Option<String>,
     pub fabric_version: Option<String>,
+    /// Aliases declared by Fabric metadata's `provides` array.
+    pub fabric_provides: Vec<String>,
     /// The first mod's id/version from Forge or NeoForge `mods.toml`.
     /// These loaders do not put these in a JSON entrypoint declaration, so
     /// the native launcher keeps them beside the Fabric metadata fields.
@@ -17908,6 +18021,14 @@ pub struct NativeJar {
     pub client_side_only: bool,
     pub fabric_entrypoints: BTreeMap<String, Vec<Entrypoint>>,
     pub neoforge_entrypoints: Vec<String>,
+    /// The exact `(CRC-32, size)` identity of bytes passed to `from_bytes`.
+    /// Fabric uses this key for nested Jar-in-Jar discovery; path-loaded roots
+    /// do not need it because only nested entries are deduplicated.
+    source_hash: Option<u64>,
+    /// Stable identity of a path-loaded top-level jar. Nested class-path ids
+    /// include this root so two physical jars that contain the same entry do
+    /// not collide (`path-a.jar!META-INF/jars/lib.jar` vs path-b.jar...).
+    source_path: Option<String>,
     /// Explicit Horizon-owned declarations from `META-INF/horizon-native.json`.
     pub native_id: Option<String>,
     pub native_declarations: Vec<RegistryEntry>,
@@ -19477,19 +19598,25 @@ impl NativeJar {
     /// annotation.
     pub fn from_path_metadata(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, false)
+        let mut jar = Self::read(file, false)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     pub fn from_path(path: &Path) -> Result<Self, NativeError> {
         let file = File::open(path).map_err(|e| NativeError::Zip(e.to_string()))?;
-        Self::read(file, true)
+        let mut jar = Self::read(file, true)?;
+        jar.source_path = Some(path.to_string_lossy().into_owned());
+        Ok(jar)
     }
 
     /// Reads a jar this process already holds in memory, the way [`Self::from_path`] reads one
     /// from disk. A host that hands a mod its files as bytes (Horizon's `Host::config_files`)
     /// runs them without staging a copy on the file system first.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, NativeError> {
-        Self::read(std::io::Cursor::new(bytes), true)
+        let mut jar = Self::read(std::io::Cursor::new(bytes), true)?;
+        jar.source_hash = Some((u64::from(crc32fast::hash(bytes)) << 32) | bytes.len() as u64);
+        Ok(jar)
     }
 
     fn read<R: std::io::Read + std::io::Seek>(
@@ -19644,6 +19771,20 @@ impl NativeJar {
         jar.resource_bytes = resource_bytes;
         jar.fabric_id = fabric_id;
         jar.fabric_version = fabric_version;
+        jar.fabric_provides = jar
+            .resource_bytes
+            .get("fabric.mod.json")
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .map(|v| {
+                v.get("provides")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         jar.neoforge_id = neoforge_id;
         jar.neoforge_version = neoforge_version;
         jar.client_side_only = client_side_only || fabric_client_only;
@@ -20816,8 +20957,22 @@ impl NativeJar {
         // A jar's bundled libraries are on its class path in a real loader
         // (`META-INF/jars/*.jar`); link them the same way a `--link`ed sibling
         // is linked, so a bundled class is not a missing class here.
-        host.record_fabric_metadata(self);
-        let _nested = nested_jars::link_nested_jars(&mut host, self);
+        if let Err(error) = host.try_record_fabric_metadata(self, false) {
+            // Keep the compatibility wrapper usable by existing probes, but
+            // retain the loader's exact refusal so the checked load path below
+            // can return Fabric's resolution message instead of first-wins.
+            let message = match error {
+                NativeError::Metadata(message) => message,
+                other => other.to_string(),
+            };
+            host.fabric_resolution_errors.push(message);
+        }
+        let nested = nested_jars::link_nested_jars(&mut host, self);
+        for nested in nested {
+            if let Err(error) = nested.result {
+                host.fabric_resolution_errors.push(error);
+            }
+        }
         host = host.with_run_loader(self.run_loader());
         host.own_loader_classes = self.loader_namespace_classes();
         host.own_mod_id = self.fabric_id.clone().or_else(|| self.neoforge_id.clone());
@@ -20853,6 +21008,16 @@ impl NativeJar {
         host
     }
 
+    /// The native load path: unlike the legacy probe wrapper, a metadata or
+    /// nested-jar resolution failure refuses the load with Fabric's message.
+    pub fn try_seed_host(&self, host: StdHost) -> Result<StdHost, String> {
+        let host = self.seed_host(host);
+        host.fabric_resolution_errors
+            .first()
+            .cloned()
+            .map_or(Ok(host), Err)
+    }
+
     /// Seed a game host from the same prepared 26.3 resource root used by the
     /// Horizon game. This keeps the game and census paths on one exact table;
     /// callers that do not have prepared resources retain the counted default.
@@ -20862,7 +21027,7 @@ impl NativeJar {
         root: impl AsRef<Path>,
     ) -> Result<StdHost, String> {
         let host = host.with_prepared_game_block_classes(root)?;
-        Ok(self.seed_host(host))
+        self.try_seed_host(host)
     }
 
     /// Return the resource paths discovered in the jar in deterministic order.
@@ -24786,6 +24951,15 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(value));
                 }
+                if let Some(value) = fabric_api_slice2::invoke_recipe_sync(
+                    self,
+                    &callback.target,
+                    0xb8,
+                    None,
+                    &values,
+                )? {
+                    return Ok(Some(value));
+                }
                 // A library the interpreter models (Guava, proxies, the JDK
                 // shapes in `library_dispatch`) answers a method reference
                 // to it the way it answers the direct call.
@@ -24823,6 +24997,11 @@ impl<H: Host> Runtime<'_, H> {
                 // other `String::new` is counted (`string_constructors.rs`).
                 if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
                     return Ok(Some(Value::Ref(Some(text))));
+                }
+                if let Some(serializer) =
+                    recipe_serializer::construct(self, &callback.target, &values)
+                {
+                    return Ok(Some(serializer));
                 }
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
@@ -33373,6 +33552,33 @@ impl<H: Host> Runtime<'_, H> {
                                 &args,
                                 &mut stack,
                                 &mut locals,
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = recipe_serializer::runtime_call(
+                            self,
+                            &r,
+                            op,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            fabric_api_slice2::invoke_recipe_sync(
+                                self,
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
                             )
                         )
                     {
