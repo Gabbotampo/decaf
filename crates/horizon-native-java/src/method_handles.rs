@@ -1400,6 +1400,7 @@ impl<H: Host> Runtime<'_, H> {
                 )? {
                     return Ok(value);
                 }
+                self.note_string_intern(&member, Some(receiver));
                 self.host.invoke_instance(&member, receiver, &values)
             }
         }

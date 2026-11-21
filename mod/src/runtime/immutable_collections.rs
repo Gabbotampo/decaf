@@ -63,6 +63,14 @@ enum Probe {
     Unknown,
 }
 
+/// Comparison of two values under Java reference identity (`==`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityMatch {
+    Same,
+    Different,
+    Unknown,
+}
+
 /// The JVM's helpful message for `o.equals(..)` on a null `o`
 /// (`Set12.contains`, `Map1.get`/`containsKey`/`containsValue`).
 fn null_receiver() -> NativeError {
@@ -521,7 +529,7 @@ impl<H: Host> Runtime<'_, H> {
                 None => self.collection_elements(receiver)?,
             };
             if let Some(answer) =
-                self.identity_compute(r, receiver, &entries, args, identity_args)?
+                self.identity_compute(r, receiver, &entries, args, identity_args, false)?
             {
                 return Ok(Some(answer));
             }
@@ -555,32 +563,27 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
         identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
+        let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
+        if r.name == "clear" {
+            if let Some(marker) = marker.as_deref() {
+                self.identity_collection_keys.remove(marker);
+            }
+            return Ok(None);
+        }
         let Some(value) = args.first() else {
             return Ok(None);
         };
         let mut values = self.collection_elements(receiver)?;
-        let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
         let mut tokens = marker
             .as_deref()
             .and_then(|key| self.identity_collection_keys.get(key).cloned())
             .unwrap_or_default();
         tokens.resize(values.len(), None);
         let wanted = identity_args.first().cloned().flatten();
-        let position = if wanted.is_some() {
-            tokens.iter().position(|token| token == &wanted)
-        } else {
-            values.iter().position(|stored| stored == value)
-        };
-        let ambiguous = values.iter().enumerate().any(|(index, stored)| {
-            if wanted.is_some() && values.get(index) == Some(value) {
-                tokens[index].is_none()
-            } else {
-                self.identity_unknown(value, stored)
-            }
-        });
-        if ambiguous {
+        let Some(position) = self.identity_position(&values, &tokens, value, wanted.as_ref())
+        else {
             return self.count_identity_call(r, receiver).map(Some);
-        }
+        };
         match (r.name.as_str(), r.descriptor.as_str()) {
             ("add", "(Ljava/lang/Object;)Z") => {
                 if position.is_some() {
@@ -875,13 +878,140 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Whether `receiver` is an identity-based collection or a view over one,
+    /// so argument allocation provenance needs to be collected for calls on it.
+    pub(crate) fn tracks_identity_args(&self, receiver: &Value) -> bool {
+        if matches!(
+            self.host_collection_class(receiver).as_deref(),
+            Some(IDENTITY_MAP | IDENTITY_SET)
+        ) {
+            return true;
+        }
+        expect_ref(receiver)
+            .and_then(|view| self.host.view_copy_source(view))
+            .is_some_and(|source| {
+                let source = crate::runtime::jar_object::stored_value(&source);
+                self.host_collection_class(&source).as_deref() == Some(IDENTITY_MAP)
+            })
+    }
+
+    /// Compare two values by Java object identity (`==`), using optional
+    /// bytecode allocation provenance (`ValueIdentity`).
+    fn identity_match(
+        &self,
+        a: &Value,
+        tok_a: Option<&reference_identity::ValueIdentity>,
+        b: &Value,
+        tok_b: Option<&reference_identity::ValueIdentity>,
+    ) -> IdentityMatch {
+        if a != b {
+            return IdentityMatch::Different;
+        }
+        match (a, b) {
+            (Value::Host(left), Value::Host(right)) => match left.same_object(right) {
+                Some(true) => IdentityMatch::Same,
+                Some(false) => IdentityMatch::Different,
+                None => IdentityMatch::Unknown,
+            },
+            _ if self.equality_of(a) != Equality::Platform => IdentityMatch::Same,
+            _ => match (tok_a, tok_b) {
+                (
+                    Some(reference_identity::ValueIdentity::Fresh(left)),
+                    Some(reference_identity::ValueIdentity::Fresh(right)),
+                ) => {
+                    if left == right {
+                        IdentityMatch::Same
+                    } else {
+                        IdentityMatch::Different
+                    }
+                }
+                (
+                    Some(reference_identity::ValueIdentity::Interned(left)),
+                    Some(reference_identity::ValueIdentity::Interned(right)),
+                ) => {
+                    if left == right {
+                        IdentityMatch::Same
+                    } else {
+                        IdentityMatch::Different
+                    }
+                }
+                (
+                    Some(reference_identity::ValueIdentity::CachedBox {
+                        class: lc,
+                        bits: lb,
+                    }),
+                    Some(reference_identity::ValueIdentity::CachedBox {
+                        class: rc,
+                        bits: rb,
+                    }),
+                ) => {
+                    if lc == rc && lb == rb {
+                        IdentityMatch::Same
+                    } else {
+                        IdentityMatch::Different
+                    }
+                }
+                (
+                    Some(reference_identity::ValueIdentity::CachedBox { .. }),
+                    Some(reference_identity::ValueIdentity::Fresh(_)),
+                )
+                | (
+                    Some(reference_identity::ValueIdentity::Fresh(_)),
+                    Some(reference_identity::ValueIdentity::CachedBox { .. }),
+                ) => IdentityMatch::Different,
+                (
+                    Some(reference_identity::ValueIdentity::Fresh(_)),
+                    Some(reference_identity::ValueIdentity::Interned(text)),
+                )
+                | (
+                    Some(reference_identity::ValueIdentity::Interned(text)),
+                    Some(reference_identity::ValueIdentity::Fresh(_)),
+                ) => {
+                    if self.string_pool.is_intern_ambiguous(text) {
+                        IdentityMatch::Unknown
+                    } else {
+                        IdentityMatch::Different
+                    }
+                }
+                _ => IdentityMatch::Unknown,
+            },
+        }
+    }
+
+    /// Find `wanted` by Java reference identity among `stored_items` (with
+    /// parallel `stored_tokens`). Returns `None` when any stored item's
+    /// identity with `wanted` is unknown (so the caller must count the call),
+    /// `Some(Some(index))` on a proven match, or `Some(None)` when every
+    /// stored item is provably a different object.
+    fn identity_position(
+        &self,
+        stored_items: &[Value],
+        stored_tokens: &[reference_identity::CallIdentity],
+        wanted: &Value,
+        wanted_token: Option<&reference_identity::ValueIdentity>,
+    ) -> Option<Option<usize>> {
+        let mut found = None;
+        for (index, stored) in stored_items.iter().enumerate() {
+            let stored_token = stored_tokens.get(index).and_then(Option::as_ref);
+            match self.identity_match(wanted, wanted_token, stored, stored_token) {
+                IdentityMatch::Same => {
+                    if found.is_none() {
+                        found = Some(index);
+                    }
+                }
+                IdentityMatch::Different => {}
+                IdentityMatch::Unknown => return None,
+            }
+        }
+        Some(found)
+    }
+
     /// `compute`/`computeIfAbsent`/`computeIfPresent`/`merge` on an
-    /// `IdentityHashMap`, whose stored key equal to `key` (if any) is `key`
-    /// itself: `IdentityHashMap` keeps `Map`'s default bodies (`get`, the
-    /// function run through the interpreter, then `put` or `remove`), which
-    /// the host's own models could not run over a jar function. Gson's
-    /// `LinkedTreeMap` with a `String` key runs here too (#337). `Ok(None)`
-    /// for every other member.
+    /// `IdentityHashMap` (`by_identity == true`), whose stored key equal to
+    /// `key` (if any) is compared by reference identity, or on Gson's
+    /// `LinkedTreeMap` with a plain `String` key (`by_identity == false`,
+    /// #337), whose `compareTo` lookup is content equality. `Ok(None)` for
+    /// every other member.
     fn identity_compute(
         &mut self,
         r: &MethodRef,
@@ -889,6 +1019,7 @@ impl<H: Host> Runtime<'_, H> {
         entries: &[Value],
         args: &[Value],
         identity_args: &[reference_identity::CallIdentity],
+        by_identity: bool,
     ) -> Result<Option<Value>, NativeError> {
         let name = r.name.as_str();
         let (key, function, incoming) = match (name, args) {
@@ -902,40 +1033,33 @@ impl<H: Host> Runtime<'_, H> {
         if *function == Value::Ref(None) || incoming == Some(&Value::Ref(None)) {
             return Err(null_pointer());
         }
-        let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
-        let mut tokens = marker
-            .as_deref()
-            .and_then(|key| self.identity_collection_keys.get(key).cloned())
-            .unwrap_or_default();
-        let key_token = identity_args.first().cloned().flatten();
-        tokens.resize(entries.len() / 2, None);
-        let ambiguous = entries.chunks(2).enumerate().any(|(index, pair)| {
-            if pair[0] != *key {
-                return false;
-            }
-            match (
-                key_token.as_ref(),
-                tokens.get(index).and_then(|token| token.as_ref()),
-            ) {
-                // Distinct provenance proves that equal-looking references
-                // are different objects; only a missing token leaves the
-                // identity ambiguous.
-                (Some(_wanted), Some(_stored)) => false,
-                (Some(_), None) => true,
-                (None, _) => self.identity_unknown(key, &pair[0]),
-            }
-        });
-        if ambiguous {
-            return self.count_identity_call(r, receiver).map(Some);
-        }
-        let old_index = if let Some(token) = key_token.as_ref() {
-            tokens
-                .iter()
-                .position(|stored| stored.as_ref() == Some(token))
+        let marker = by_identity
+            .then(|| crate::runtime::jar_object::object_key(receiver).map(str::to_owned))
+            .flatten();
+        let value_marker = marker.as_deref().map(|key| format!("{key}|values"));
+        let key_token = if by_identity {
+            identity_args.first().cloned().flatten()
+        } else {
+            None
+        };
+        let old_index = if by_identity {
+            let stored_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
+            let mut tokens = marker
+                .as_deref()
+                .and_then(|key| self.identity_collection_keys.get(key).cloned())
+                .unwrap_or_default();
+            tokens.resize(stored_keys.len(), None);
+            let Some(found) =
+                self.identity_position(&stored_keys, &tokens, key, key_token.as_ref())
+            else {
+                return self.count_identity_call(r, receiver).map(Some);
+            };
+            found
         } else {
             entries.chunks(2).position(|pair| pair[0] == *key)
         };
         let old = old_index.map_or(Value::Ref(None), |index| entries[index * 2 + 1].clone());
+        let from_callback = !(name == "merge" && old == Value::Ref(None));
         let new = match name {
             // `v = get(k); if (v == null) { nv = f(k); if (nv != null) put }`.
             "computeIfAbsent" if old != Value::Ref(None) => return Ok(Some(old)),
@@ -952,19 +1076,51 @@ impl<H: Host> Runtime<'_, H> {
                 &[old.clone(), incoming.cloned().unwrap_or(Value::Ref(None))],
             )?,
         };
-        // The function may have changed the map: `put`/`remove` act on it as
-        // it is now.
+        if by_identity && self.collection_uncertain(receiver) {
+            return self.count_identity_call(r, receiver).map(Some);
+        }
+        // The function may have changed the map: reload both the entries and
+        // (for `IdentityHashMap`) the identity side tables so `put`/`remove`
+        // act on the map as it is now.
         let mut entries = match self.host.mutable_collection_entries(receiver) {
             Some(entries) => entries,
             None => self.collection_elements(receiver)?,
         };
-        tokens.resize(entries.len() / 2, None);
-        let current_index = if let Some(token) = key_token.as_ref() {
-            tokens
-                .iter()
-                .position(|stored| stored.as_ref() == Some(token))
+        if !by_identity {
+            let current_index = entries.chunks(2).position(|pair| pair[0] == *key);
+            match (current_index, new == Value::Ref(None)) {
+                (Some(index), true) => {
+                    if name == "compute" || old != Value::Ref(None) {
+                        entries.drain(index * 2..index * 2 + 2);
+                    }
+                }
+                (Some(index), false) => entries[index * 2 + 1] = new.clone(),
+                (None, true) => {}
+                (None, false) => entries.extend([key.clone(), new.clone()]),
+            }
+            self.host.replace_mutable_collection(receiver, entries);
+            return Ok(Some(new));
+        }
+        let reloaded_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
+        let mut tokens = marker
+            .as_deref()
+            .and_then(|key| self.identity_collection_keys.get(key).cloned())
+            .unwrap_or_default();
+        let mut value_tokens = value_marker
+            .as_deref()
+            .and_then(|key| self.identity_collection_keys.get(key).cloned())
+            .unwrap_or_default();
+        tokens.resize(reloaded_keys.len(), None);
+        value_tokens.resize(reloaded_keys.len(), None);
+        let Some(current_index) =
+            self.identity_position(&reloaded_keys, &tokens, key, key_token.as_ref())
+        else {
+            return self.count_identity_call(r, receiver).map(Some);
+        };
+        let new_value_token = if from_callback {
+            None
         } else {
-            entries.chunks(2).position(|pair| pair[0] == *key)
+            identity_args.get(1).cloned().flatten()
         };
         match (current_index, new == Value::Ref(None)) {
             (Some(index), true) => {
@@ -973,18 +1129,26 @@ impl<H: Host> Runtime<'_, H> {
                 if name == "compute" || old != Value::Ref(None) {
                     entries.drain(index * 2..index * 2 + 2);
                     tokens.remove(index);
+                    value_tokens.remove(index);
                 }
             }
-            (Some(index), false) => entries[index * 2 + 1] = new.clone(),
+            (Some(index), false) => {
+                entries[index * 2 + 1] = new.clone();
+                value_tokens[index] = new_value_token;
+            }
             (None, true) => {}
             (None, false) => {
                 entries.extend([key.clone(), new.clone()]);
                 tokens.push(key_token);
+                value_tokens.push(new_value_token);
             }
         }
         self.host.replace_mutable_collection(receiver, entries);
         if let Some(marker) = marker {
             self.identity_collection_keys.insert(marker, tokens);
+        }
+        if let Some(marker) = value_marker {
+            self.identity_collection_keys.insert(marker, value_tokens);
         }
         Ok(Some(new))
     }
@@ -992,8 +1156,8 @@ impl<H: Host> Runtime<'_, H> {
     /// A member of a `keySet()`/`values()`/`entrySet()` copy of an
     /// `IdentityHashMap` (`hash_collections.rs` notes each copy's map): the
     /// map compares keys, values and entries' parts with `==`, so an argument
-    /// whose identity with an equal stored one is unknown
-    /// ([`Self::identity_unknown`]) is counted. `None` for any other
+    /// whose identity with an equal stored one is unknown or disagrees with
+    /// the host view copy's equality lookup is counted. `None` for any other
     /// receiver, or when the copy's equality answer is the identity one.
     fn identity_view_member(
         &mut self,
@@ -1030,10 +1194,14 @@ impl<H: Host> Runtime<'_, H> {
             .unwrap_or_default();
         // The arguments as the copy's elements: one, or a collection's.
         let mut wanted = Vec::new();
-        for arg in args {
+        for (arg_index, arg) in args.iter().enumerate() {
             match self.host_collection_kind(arg) {
-                Some(_) => wanted.extend(self.collection_elements(arg).unwrap_or_default()),
-                None => wanted.push(arg.clone()),
+                Some(_) => {
+                    for element in self.collection_elements(arg).unwrap_or_default() {
+                        wanted.push((element, None));
+                    }
+                }
+                None => wanted.push((arg.clone(), identity_args.get(arg_index).cloned().flatten())),
             }
         }
         let kind = self.host.view_copy_kind(view);
@@ -1042,56 +1210,54 @@ impl<H: Host> Runtime<'_, H> {
                 .iter()
                 .any(|stored| runtime.identity_unknown(value, stored))
         };
-        let ambiguous =
-            wanted
-                .iter()
-                .enumerate()
-                .any(|(wanted_index, value)| match kind.as_deref() {
-                    Some("keySet") => keys.iter().enumerate().any(|(index, stored)| {
-                        if stored != value {
-                            return false;
-                        }
-                        match (
-                            identity_args.get(wanted_index).and_then(|x| x.as_ref()),
-                            key_tokens.get(index).and_then(|x| x.as_ref()),
-                        ) {
-                            (Some(left), Some(right)) => left == right,
-                            (Some(_), None) => true,
-                            (None, _) => self.identity_unknown(value, stored),
-                        }
-                    }),
-                    Some("values") => values.iter().enumerate().any(|(index, stored)| {
-                        if stored != value {
-                            return false;
-                        }
-                        match (
-                            identity_args.get(wanted_index).and_then(|x| x.as_ref()),
-                            value_tokens.get(index).and_then(|x| x.as_ref()),
-                        ) {
-                            (Some(left), Some(right)) => left == right,
-                            (Some(_), None) => true,
-                            (None, _) => self.identity_unknown(value, stored),
-                        }
-                    }),
-                    Some("entrySet") => {
-                        self.host
-                            .map_entry_parts(value)
-                            .is_some_and(|(key, value)| {
-                                unknown(self, &key, &keys) || unknown(self, &value, &values)
-                            })
+        // Falling through delegates to the host's equality-based view copy, so
+        // any equal-valued stored entry that is not provably the same object
+        // (either unknown or a distinct allocation with equal text) must be
+        // counted instead of letting equality answer wrongly.
+        let ambiguous = wanted
+            .iter()
+            .any(|(value, wanted_token)| match kind.as_deref() {
+                Some("keySet") => keys.iter().enumerate().any(|(index, stored)| {
+                    if stored != value {
+                        return false;
                     }
-                    _ => false,
-                });
+                    let stored_token = key_tokens.get(index).and_then(Option::as_ref);
+                    self.identity_match(value, wanted_token.as_ref(), stored, stored_token)
+                        != IdentityMatch::Same
+                }),
+                Some("values") => values.iter().enumerate().any(|(index, stored)| {
+                    if stored != value {
+                        return false;
+                    }
+                    let stored_token = value_tokens.get(index).and_then(Option::as_ref);
+                    self.identity_match(value, wanted_token.as_ref(), stored, stored_token)
+                        != IdentityMatch::Same
+                }),
+                Some("entrySet") => self
+                    .host
+                    .map_entry_parts(value)
+                    .is_some_and(|(key, value)| {
+                        unknown(self, &key, &keys) || unknown(self, &value, &values)
+                    }),
+                _ => false,
+            });
         if ambiguous {
             return self
                 .count_identity_call(r, &source)
                 .map(|value| Some(Some(value)));
         }
+        if mutates(&r.name)
+            && let Some(marker) = source_marker.as_deref()
+        {
+            self.identity_collection_keys.remove(marker);
+            self.identity_collection_keys
+                .remove(&format!("{marker}|values"));
+        }
         Ok(None)
     }
 
     /// `IdentityHashMap`: a lookup by a key whose identity with an equal key
-    /// is unknown ([`Self::identity_unknown`]), and the iteration of two or
+    /// is unknown ([`Self::identity_match`]), and the iteration of two or
     /// more keys, are counted. A handle put twice is one key.
     fn identity_map_member(
         &mut self,
@@ -1100,6 +1266,17 @@ impl<H: Host> Runtime<'_, H> {
         args: &[Value],
         identity_args: &[reference_identity::CallIdentity],
     ) -> Result<Option<Value>, NativeError> {
+        let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
+        let value_marker = marker.as_deref().map(|key| format!("{key}|values"));
+        if r.name == "clear" {
+            if let Some(marker) = marker.as_deref() {
+                self.identity_collection_keys.remove(marker);
+            }
+            if let Some(marker) = value_marker.as_deref() {
+                self.identity_collection_keys.remove(marker);
+            }
+            return Ok(None);
+        }
         // The stored keys themselves: a handle's construction survives only
         // in the `Value`, not in its marker.
         let entries = match self.host.mutable_collection_entries(receiver) {
@@ -1124,12 +1301,10 @@ impl<H: Host> Runtime<'_, H> {
             let Some(key) = args.first() else {
                 return Ok(None);
             };
-            let marker = crate::runtime::jar_object::object_key(receiver).map(str::to_owned);
             let mut tokens = marker
                 .as_deref()
                 .and_then(|key| self.identity_collection_keys.get(key).cloned())
                 .unwrap_or_default();
-            let value_marker = marker.as_deref().map(|key| format!("{key}|values"));
             let mut value_tokens = value_marker
                 .as_deref()
                 .and_then(|key| self.identity_collection_keys.get(key).cloned())
@@ -1138,21 +1313,11 @@ impl<H: Host> Runtime<'_, H> {
             let stored_keys: Vec<Value> = entries.iter().step_by(2).cloned().collect();
             tokens.resize(stored_keys.len(), None);
             value_tokens.resize(stored_keys.len(), None);
-            let position = if key_token.is_some() {
-                tokens.iter().position(|token| token == &key_token)
-            } else {
-                stored_keys.iter().position(|stored| stored == key)
-            };
-            let ambiguous = stored_keys.iter().enumerate().any(|(index, stored)| {
-                if key_token.is_some() && stored == key {
-                    tokens[index].is_none()
-                } else {
-                    self.identity_unknown(key, stored)
-                }
-            });
-            if ambiguous {
+            let Some(position) =
+                self.identity_position(&stored_keys, &tokens, key, key_token.as_ref())
+            else {
                 return self.count_identity_call(r, receiver).map(Some);
-            }
+            };
             match r.name.as_str() {
                 "get" | "getOrDefault" | "containsKey" | "remove" | "put" | "putIfAbsent"
                 | "replace" => {
@@ -1180,22 +1345,19 @@ impl<H: Host> Runtime<'_, H> {
                                 let Some(index) = position else {
                                     return Ok(Some(Value::Int(0)));
                                 };
-                                let matches = if let Some(wanted) =
-                                    identity_args.get(1).and_then(|x| x.as_ref())
-                                {
-                                    match value_tokens.get(index).and_then(|x| x.as_ref()) {
-                                        Some(stored) => stored == wanted,
-                                        None if updated[index * 2 + 1] != value => false,
-                                        None => {
-                                            return self.count_identity_call(r, receiver).map(Some);
-                                        }
+                                let wanted_token = identity_args.get(1).and_then(Option::as_ref);
+                                let stored_token = value_tokens.get(index).and_then(Option::as_ref);
+                                let matches = match self.identity_match(
+                                    &value,
+                                    wanted_token,
+                                    &updated[index * 2 + 1],
+                                    stored_token,
+                                ) {
+                                    IdentityMatch::Same => true,
+                                    IdentityMatch::Different => false,
+                                    IdentityMatch::Unknown => {
+                                        return self.count_identity_call(r, receiver).map(Some);
                                     }
-                                } else if updated[index * 2 + 1] != value {
-                                    false
-                                } else if updated[index * 2 + 1] == Value::Ref(None) {
-                                    true
-                                } else {
-                                    return self.count_identity_call(r, receiver).map(Some);
                                 };
                                 if matches {
                                     updated.drain(index * 2..index * 2 + 2);
@@ -1276,22 +1438,19 @@ impl<H: Host> Runtime<'_, H> {
                             };
                             let old = updated[index * 2 + 1].clone();
                             if args.len() == 3 {
-                                let matches = if let Some(wanted) =
-                                    identity_args.get(1).and_then(|x| x.as_ref())
-                                {
-                                    match value_tokens.get(index).and_then(|x| x.as_ref()) {
-                                        Some(stored) => stored == wanted,
-                                        None if old != value => false,
-                                        None => {
-                                            return self.count_identity_call(r, receiver).map(Some);
-                                        }
+                                let wanted_token = identity_args.get(1).and_then(Option::as_ref);
+                                let stored_token = value_tokens.get(index).and_then(Option::as_ref);
+                                let matches = match self.identity_match(
+                                    &value,
+                                    wanted_token,
+                                    &old,
+                                    stored_token,
+                                ) {
+                                    IdentityMatch::Same => true,
+                                    IdentityMatch::Different => false,
+                                    IdentityMatch::Unknown => {
+                                        return self.count_identity_call(r, receiver).map(Some);
                                     }
-                                } else if old != value {
-                                    false
-                                } else if old == Value::Ref(None) {
-                                    true
-                                } else {
-                                    return self.count_identity_call(r, receiver).map(Some);
                                 };
                                 if matches {
                                     updated[index * 2 + 1] = args[2].clone();
@@ -1316,7 +1475,7 @@ impl<H: Host> Runtime<'_, H> {
                 }
                 _ => {}
             }
-            return self.identity_compute(r, receiver, &entries, args, identity_args);
+            return self.identity_compute(r, receiver, &entries, args, identity_args, true);
         }
         // `putAll(map)`/`new IdentityHashMap<>(map)`: each of the source's
         // keys is put by identity.
@@ -1337,6 +1496,9 @@ impl<H: Host> Runtime<'_, H> {
             if ambiguous {
                 return self.count_identity_call(r, receiver).map(Some);
             }
+            if let Some(marker) = value_marker.as_deref() {
+                self.identity_collection_keys.remove(marker);
+            }
             return Ok(None);
         }
         if r.name == "containsValue" {
@@ -1352,6 +1514,11 @@ impl<H: Host> Runtime<'_, H> {
                 return self.count_identity_call(r, receiver).map(Some);
             }
             return Ok(None);
+        }
+        if r.name == "replaceAll"
+            && let Some(marker) = value_marker.as_deref()
+        {
+            self.identity_collection_keys.remove(marker);
         }
         if matches!(r.name.as_str(), "size" | "isEmpty" | "clear" | "<init>") || entries.len() < 4 {
             return Ok(None);

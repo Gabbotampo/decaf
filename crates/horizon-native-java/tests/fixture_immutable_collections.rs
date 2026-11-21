@@ -175,6 +175,15 @@ public final class Probe {
         return m.getOrDefault(a, 8) + ":" + m.getOrDefault(b, 9) + ":" + m.size();
     }
 
+    public static String identityCallbackMutation() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put("z", 1);
+        m.put(a, 2);
+        Integer n = m.computeIfAbsent(b, k -> { m.remove("z"); return 3; });
+        return n + ":" + m.get(a) + ":" + m.get(b) + ":" + m.size();
+    }
+
     public static String random_m0() { return RandomImm.m0(); }
     public static String random_m1() { return RandomImm.m2(); }
     public static String random_m2() { return RandomImm.m3(); }
@@ -513,6 +522,7 @@ fn identity_hash_maps_keep_identity() {
             ("identityMerge", "2:3:2"),
             ("identityPutIfAbsent", "null:1:2"),
             ("identityGetOrDefault", "1:9:1"),
+            ("identityCallbackMutation", "3:2:3:2"),
         ],
     );
 }

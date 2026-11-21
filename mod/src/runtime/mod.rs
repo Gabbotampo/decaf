@@ -20934,6 +20934,7 @@ impl NativeJar {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -21162,6 +21163,7 @@ impl NativeJar {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -21346,6 +21348,7 @@ impl NativeJar {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -23564,7 +23567,10 @@ struct Runtime<'a, H> {
     /// Allocation keys of constructors whose String text is not modelled exactly.
     counted_strings: std::collections::BTreeSet<String>,
     /// Known identity provenance for keys in identity-based collections.
-    identity_collection_keys: std::collections::BTreeMap<String, Vec<Option<String>>>,
+    identity_collection_keys:
+        std::collections::BTreeMap<String, Vec<reference_identity::CallIdentity>>,
+    /// Runtime-local JVM string-pool observations for `String.intern()`.
+    string_pool: reference_identity::StringPoolState,
     /// Allocation keys (or I/O sink keys) whose held text was written from a
     /// counted value. Reads of these objects must remain counted as well.
     counted_text_objects: std::collections::BTreeSet<String>,
@@ -24006,8 +24012,23 @@ impl<H: Host> Runtime<'_, H> {
         }
     }
 
+    /// Record a `String.intern()` call on `receiver`: if its text was not
+    /// already observed in the pool, Java 25 may install a fresh receiver
+    /// itself in the pool, so fresh-vs-interned identity for that text becomes
+    /// ambiguous and must be counted.
+    pub(crate) fn note_string_intern(&mut self, r: &MethodRef, receiver: Option<&Value>) {
+        if r.owner == "java/lang/String"
+            && r.name == "intern"
+            && r.descriptor == "()Ljava/lang/String;"
+            && let Some(Value::Ref(Some(text))) = receiver
+        {
+            self.string_pool.note_intern(text);
+        }
+    }
+
     /// Replace one argument of the invoke about to run, through every
-    /// `@ModifyArg` callback bound to that call site.
+    /// `@ModifyArg` callback bound to that call site. Returns the argument
+    /// indices whose values were passed through a modifier callback.
     ///
     /// Each callback sees the value the previous one produced, matching
     /// Mixin's sequential argument modifiers.
@@ -24019,27 +24040,28 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
-    ) -> Result<(), NativeError> {
+    ) -> Result<Vec<usize>, NativeError> {
         if self
             .modify_hooks
             .as_deref()
             .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let entries = match self.modify_hooks.as_deref_mut() {
             Some(hooks) => hooks.arg_candidates(site),
-            None => return Ok(()),
+            None => return Ok(Vec::new()),
         };
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let modified: Vec<usize> = entries.iter().map(|entry| entry.index).collect();
         self.set_modify_dispatching(true);
         let outcome = self.run_modify_arg_callbacks(&entries, args);
         self.set_modify_dispatching(false);
         outcome?;
         self.record_modify_arg_site(class, method, pc);
-        Ok(())
+        Ok(modified)
     }
 
     fn run_modify_arg_callbacks(
@@ -24099,7 +24121,8 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     /// Replace the value of one local store or load through the
-    /// `@ModifyVariable` callbacks bound to it.
+    /// `@ModifyVariable` callbacks bound to it. The returned boolean is `true`
+    /// when at least one modifier callback ran.
     fn dispatch_modify_variable(
         &mut self,
         anchor: VariableAnchor,
@@ -24110,27 +24133,27 @@ impl<H: Host> Runtime<'_, H> {
         method: &str,
         descriptor: &str,
         pc: usize,
-    ) -> Result<Value, NativeError> {
+    ) -> Result<(Value, bool), NativeError> {
         if self
             .modify_hooks
             .as_deref()
             .is_none_or(|hooks| hooks.dispatching || !hooks.applies(class, method, descriptor))
         {
-            return Ok(value);
+            return Ok((value, false));
         }
         let entries = match self.modify_hooks.as_deref_mut() {
             Some(hooks) => hooks.variable_candidates(anchor, slot, instruction_type),
-            None => return Ok(value),
+            None => return Ok((value, false)),
         };
         if entries.is_empty() {
-            return Ok(value);
+            return Ok((value, false));
         }
         self.set_modify_dispatching(true);
         let outcome = self.run_modify_variable_callbacks(&entries, value);
         self.set_modify_dispatching(false);
         let value = outcome?;
         self.record_modify_variable_site(class, method, pc);
-        Ok(value)
+        Ok((value, true))
     }
 
     fn run_modify_variable_callbacks(
@@ -24616,6 +24639,7 @@ impl<H: Host> Runtime<'_, H> {
                         )
                         .map(Some);
                 }
+                self.note_string_intern(&target, Some(receiver));
                 self.host.invoke_instance(&target, receiver, args).map(Some)
             }
         }
@@ -25006,6 +25030,7 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(answer) = token.as_ref().and_then(|token| token.answer.clone()) {
                 return Ok(Some(answer));
             }
+            self.note_string_intern(&callback.target, Some(&receiver));
             let value = self
                 .host
                 .invoke_instance(&callback.target, &receiver, &rest)?;
@@ -31790,7 +31815,10 @@ impl<H: Host> Runtime<'_, H> {
                     descriptor: desc.to_owned(),
                 };
                 return match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.host.invoke_instance(&r, receiver, args)
+                    }
                     None => self.host.invoke(&r, args),
                 };
             }
@@ -31813,7 +31841,10 @@ impl<H: Host> Runtime<'_, H> {
         {
             return match redirect {
                 JarCallRedirect::Host(r) => match receiver.as_ref() {
-                    Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                    Some(receiver) => {
+                        self.note_string_intern(&r, Some(receiver));
+                        self.host.invoke_instance(&r, receiver, args)
+                    }
                     None => {
                         if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                             && r.name == "defineId"
@@ -31897,7 +31928,10 @@ impl<H: Host> Runtime<'_, H> {
                 return value;
             }
             return match receiver.as_ref() {
-                Some(receiver) => self.host.invoke_instance(&r, receiver, args),
+                Some(receiver) => {
+                    self.note_string_intern(&r, Some(receiver));
+                    self.host.invoke_instance(&r, receiver, args)
+                }
                 None => {
                     if r.owner == "net/minecraft/network/syncher/SynchedEntityData"
                         && r.name == "defineId"
@@ -31911,6 +31945,11 @@ impl<H: Host> Runtime<'_, H> {
         // `if_acmp`'s producer analysis, looked up once per frame
         // (`reference_identity.rs`).
         let mut identity = reference_identity::FrameIdentity::default();
+        // Set when a Mixin modifier (`@ModifyVariable` on a reference load or
+        // store, or an anchor hook replacing a reference field/call) alters a
+        // reference in this frame so static bytecode provenance is no longer
+        // relied upon.
+        let mut frame_modified_identity = false;
         let mut locals = vec![Value::Ref(None); target.max_locals.max(1) as usize];
         let mut local = 0;
         if !target.is_static() {
@@ -32000,7 +32039,7 @@ impl<H: Host> Runtime<'_, H> {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, modified) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         local_opcode_type(op - 0x15),
@@ -32009,16 +32048,32 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    if modified && op == 0x19 {
+                        frame_modified_identity = true;
+                    }
+                    stack.push(loaded);
                 }
                 0x12 => {
                     let i = *code.get(pc).ok_or(NativeError::Truncated)? as u16;
                     pc += 1;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x13 => {
                     let i = read_u16(code, &mut pc)?;
-                    stack.push(constant_value(&file.pool, i)?);
+                    let value = constant_value(&file.pool, i)?;
+                    if let Value::Ref(Some(text)) = &value
+                        && matches!(file.pool.get(i as usize), Some(Cp::String(_)))
+                    {
+                        self.string_pool.note_literal(text);
+                    }
+                    stack.push(value);
                 }
                 0x14 => {
                     let i = read_u16(code, &mut pc)?;
@@ -32033,7 +32088,7 @@ impl<H: Host> Runtime<'_, H> {
                     match wide_op {
                         0x15..=0x19 => {
                             let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                            stack.push(self.dispatch_modify_variable(
+                            let (loaded, modified) = self.dispatch_modify_variable(
                                 VariableAnchor::Load,
                                 index,
                                 local_opcode_type(wide_op - 0x15),
@@ -32042,11 +32097,15 @@ impl<H: Host> Runtime<'_, H> {
                                 method,
                                 desc,
                                 at,
-                            )?);
+                            )?;
+                            if modified && wide_op == 0x19 {
+                                frame_modified_identity = true;
+                            }
+                            stack.push(loaded);
                         }
                         0x36..=0x3a => {
                             let value = pop(&mut stack, class, method, at)?;
-                            let value = self.dispatch_modify_variable(
+                            let (value, modified) = self.dispatch_modify_variable(
                                 VariableAnchor::Store,
                                 index,
                                 local_opcode_type(wide_op - 0x36),
@@ -32056,6 +32115,9 @@ impl<H: Host> Runtime<'_, H> {
                                 desc,
                                 at,
                             )?;
+                            if modified && wide_op == 0x3a {
+                                frame_modified_identity = true;
+                            }
                             if let Some(local) = locals.get_mut(index) {
                                 *local = value;
                             }
@@ -32327,7 +32389,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x1a..=0x1d => {
                     let index = (op - 0x1a) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, _) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "I",
@@ -32336,12 +32398,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    stack.push(loaded);
                 }
                 0x1e..=0x21 => {
                     let index = (op - 0x1e) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, _) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "J",
@@ -32350,12 +32413,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    stack.push(loaded);
                 }
                 0x22..=0x25 => {
                     let index = (op - 0x22) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, _) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "F",
@@ -32364,12 +32428,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    stack.push(loaded);
                 }
                 0x26..=0x29 => {
                     let index = (op - 0x26) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, _) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "D",
@@ -32378,12 +32443,13 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    stack.push(loaded);
                 }
                 0x2a..=0x2d => {
                     let index = (op - 0x2a) as usize;
                     let loaded = locals.get(index).cloned().unwrap_or(Value::Ref(None));
-                    stack.push(self.dispatch_modify_variable(
+                    let (loaded, modified) = self.dispatch_modify_variable(
                         VariableAnchor::Load,
                         index,
                         "Ljava/lang/Object;",
@@ -32392,12 +32458,16 @@ impl<H: Host> Runtime<'_, H> {
                         method,
                         desc,
                         at,
-                    )?);
+                    )?;
+                    if modified {
+                        frame_modified_identity = true;
+                    }
+                    stack.push(loaded);
                 }
                 0x3b..=0x3e => {
                     let index = (op - 0x3b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, _) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "I",
@@ -32412,7 +32482,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x3f..=0x42 => {
                     let index = (op - 0x3f) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, _) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "J",
@@ -32427,7 +32497,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x43..=0x46 => {
                     let index = (op - 0x43) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, _) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "F",
@@ -32442,7 +32512,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x47..=0x4a => {
                     let index = (op - 0x47) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, _) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "D",
@@ -32457,7 +32527,7 @@ impl<H: Host> Runtime<'_, H> {
                 0x4b..=0x4e => {
                     let index = (op - 0x4b) as usize;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, modified) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         "Ljava/lang/Object;",
@@ -32467,13 +32537,16 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
+                    if modified {
+                        frame_modified_identity = true;
+                    }
                     locals[index] = value;
                 }
                 0x36..=0x3a => {
                     let index = *code.get(pc).ok_or(NativeError::Truncated)? as usize;
                     pc += 1;
                     let value = pop(&mut stack, class, method, at)?;
-                    let value = self.dispatch_modify_variable(
+                    let (value, modified) = self.dispatch_modify_variable(
                         VariableAnchor::Store,
                         index,
                         local_opcode_type(op - 0x36),
@@ -32483,6 +32556,9 @@ impl<H: Host> Runtime<'_, H> {
                         desc,
                         at,
                     )?;
+                    if modified && op == 0x3a {
+                        frame_modified_identity = true;
+                    }
                     if let Some(local) = locals.get_mut(index) {
                         *local = value;
                     }
@@ -32630,6 +32706,7 @@ impl<H: Host> Runtime<'_, H> {
                         at,
                         &lhs,
                         &rhs,
+                        frame_modified_identity,
                     )?;
                     let take = if op == 0xa5 { same } else { !same };
                     let offset = read_i16(code, &mut pc)?;
@@ -33000,6 +33077,10 @@ impl<H: Host> Runtime<'_, H> {
                     invoke_or_catch!(at, self.ensure_initialized(&field.owner));
                     let outcome =
                         self.dispatch_field_anchor(&field, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && field.descriptor.starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal => {
                             if let Some(value) = gson_model::static_field(&field)
@@ -33079,6 +33160,9 @@ impl<H: Host> Runtime<'_, H> {
                     let receiver = pop(&mut stack, class, method, at)?;
                     let outcome =
                         self.dispatch_field_anchor(&r, false, None, class, method, desc, at)?;
+                    if outcome != AnchorOutcome::Normal && r.descriptor.starts_with(['L', '[']) {
+                        frame_modified_identity = true;
+                    }
                     let value = match outcome {
                         AnchorOutcome::Normal if receiver == Value::Ref(None) => {
                             invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
@@ -33172,36 +33256,18 @@ impl<H: Host> Runtime<'_, H> {
                     } else {
                         Some(pop(&mut stack, class, method, at)?)
                     };
-                    let identity_args = if args.iter().any(|value| {
-                        matches!(value, Value::Ref(Some(text)) if value_class::is_plain_string(text))
-                    }) {
-                        args.iter()
-                            .enumerate()
-                            .map(|(index, value)| match value {
-                                Value::Ref(Some(text)) if value_class::is_plain_string(text) => {
-                                    reference_identity::call_identity(
-                                        file,
-                                        class,
-                                        method,
-                                        desc,
-                                        target.is_static(),
-                                        code,
-                                        frame_id,
-                                        at,
-                                        index,
-                                        text,
-                                    )
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
                     // `@ModifyArg` replaces one argument before the call runs;
                     // a redirect that replaces the whole call sees (and then
                     // discards) the modified value, deterministically.
-                    self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    let modified_args =
+                        self.dispatch_modify_arg(&r, &mut args, class, method, desc, at)?;
+                    if !modified_args.is_empty()
+                        && r.owner == "java/lang/String"
+                        && r.name == "valueOf"
+                        && r.descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
+                    {
+                        frame_modified_identity = true;
+                    }
                     // A cancelled `new` left a null reference behind; its
                     // matching `<init>` is skipped so the construction has no
                     // side effect.  The LIFO check keeps a constructor
@@ -33248,6 +33314,11 @@ impl<H: Host> Runtime<'_, H> {
                             AnchorOutcome::Suppress => Some(Value::default_for(&r.descriptor)),
                             AnchorOutcome::Normal => None,
                         };
+                    if anchor_replacement.is_some()
+                        && return_desc(&r.descriptor).starts_with(['L', '['])
+                    {
+                        frame_modified_identity = true;
+                    }
                     // A synchronized view runs every call on the collection it
                     // wraps (`synchronized_views.rs`): the collection models
                     // below answer for that collection, in its own order.
@@ -33260,6 +33331,39 @@ impl<H: Host> Runtime<'_, H> {
                             Some(self.host.synchronized_wrapped(&view).unwrap_or(view))
                         }
                         receiver => receiver,
+                    };
+                    // Compute argument identity provenance after `@ModifyArg`
+                    // (and synchronized-view unwrapping) only for identity
+                    // collections and their views. A modified argument or a
+                    // frame whose reference locals were altered drops its
+                    // static token so equal-content identity operations count.
+                    let identity_args = if !frame_modified_identity
+                        && receiver
+                            .as_ref()
+                            .is_some_and(|recv| self.tracks_identity_args(recv))
+                    {
+                        args.iter()
+                            .enumerate()
+                            .map(|(index, value)| {
+                                if modified_args.contains(&index) {
+                                    return None;
+                                }
+                                reference_identity::call_identity(
+                                    file,
+                                    class,
+                                    method,
+                                    desc,
+                                    target.is_static(),
+                                    code,
+                                    frame_id,
+                                    at,
+                                    index,
+                                    value,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
                     };
                     // A call that may move a host collection's `modCount`
                     // (`mod_count.rs`), checked and noted around the dispatch.
@@ -33423,6 +33527,9 @@ impl<H: Host> Runtime<'_, H> {
                             // hook above replaced the call, so it never ran.
                             invoke_or_catch!(at, Err(null_checks::invoke_on_null(&r)))
                         });
+                    }
+                    if dispatched.is_none() {
+                        self.note_string_intern(&r, receiver.as_ref());
                     }
                     if dispatched.is_none()
                         && let Some(value) = r
@@ -39480,6 +39587,7 @@ mod tests {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -39565,6 +39673,7 @@ mod tests {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46730,6 +46839,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -46957,6 +47067,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -47159,6 +47270,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -47537,6 +47649,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -47859,6 +47972,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -53139,6 +53253,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),
@@ -53211,6 +53326,7 @@ mandatory = true
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: reference_identity::StringPoolState::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),

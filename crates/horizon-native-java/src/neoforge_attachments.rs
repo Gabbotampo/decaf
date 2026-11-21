@@ -1343,6 +1343,7 @@ impl NativeJar {
             string_builders: BTreeMap::new(),
             counted_strings: std::collections::BTreeSet::new(),
             identity_collection_keys: std::collections::BTreeMap::new(),
+            string_pool: Default::default(),
             counted_text_objects: std::collections::BTreeSet::new(),
             gson_writers: BTreeMap::new(),
             string_builder_capacities: BTreeMap::new(),

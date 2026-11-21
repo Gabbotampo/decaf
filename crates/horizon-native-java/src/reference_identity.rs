@@ -59,7 +59,10 @@
 //! model's marker) keep the old value-equality answer.
 
 use super::*;
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 /// Methods whose analysis the thread keeps, and the code bytes they may hold
 /// together, before the table starts over.
@@ -269,14 +272,62 @@ struct Flow {
     calls: BTreeMap<u32, Vec<Operand>>,
 }
 
+/// Allocation provenance of a value whose runtime representation is compared
+/// by content (`String` or boxed primitive) at a call site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ValueIdentity {
+    /// A single non-repeating fresh allocation (`new String`, non-empty
+    /// `StringBuilder`/`StringBuffer.toString()`, non-unary-boolean concat,
+    /// `new` box, or uncached box `valueOf`) within one frame invocation.
+    Fresh(String),
+    /// The JVM string-pool object for this text (a string literal, empty
+    /// builder `toString()`, unary boolean concat, or `String.intern()`).
+    Interned(String),
+    /// A canonical JVM cached box singleton (`Integer`/`Short`/`Long` in
+    /// `-128..=127`, `Character` in `0..=127`, any `Byte` or `Boolean`).
+    CachedBox { class: &'static str, bits: i64 },
+}
+
+/// Runtime-local observations of the JVM string pool for `String.intern()`.
+///
+/// An executed `ldc` string literal (or empty-builder `""`) guarantees that
+/// text is already in the JVM pool before any later `String.intern()`. When
+/// `String.intern()` runs on text not yet observed in the pool, Java 25 may
+/// install the fresh receiver itself into the pool, so comparisons between a
+/// fresh allocation and an interned/literal string of that text are ambiguous
+/// and must be counted.
+#[derive(Default)]
+pub(crate) struct StringPoolState {
+    known_pooled: BTreeSet<String>,
+    ambiguous_intern: BTreeSet<String>,
+}
+
+impl StringPoolState {
+    pub(crate) fn note_literal(&mut self, text: &str) {
+        self.known_pooled.insert(text.to_owned());
+    }
+
+    pub(crate) fn note_intern(&mut self, text: &str) {
+        if !self.known_pooled.contains(text) {
+            self.ambiguous_intern.insert(text.to_owned());
+        }
+    }
+
+    pub(crate) fn is_intern_ambiguous(&self, text: &str) -> bool {
+        self.ambiguous_intern.contains(text)
+    }
+}
+
 /// Provenance of a reference argument at a call site. `None` means the
 /// value's allocation identity is not retained and an identity operation
 /// must be counted.
-pub(crate) type CallIdentity = Option<String>;
+pub(crate) type CallIdentity = Option<ValueIdentity>;
 
 /// Return identity provenance for the argument at `index` of an invocation at
 /// `at`. This uses the same method-local dataflow as `==` comparisons, so a
-/// copied `new String` remains distinct after its text is materialised.
+/// copied `new String` remains distinct after its text is materialised and
+/// cached primitive boxes keep their canonical JVM singleton identity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn call_identity(
     file: &ClassFile,
     class: &str,
@@ -287,28 +338,45 @@ pub(crate) fn call_identity(
     frame_id: u64,
     at: usize,
     index: usize,
-    text: &str,
+    value: &Value,
 ) -> CallIdentity {
     let flow = flow(file, method, desc, is_static, code)?;
     let operand = flow.calls.get(&(at as u32))?.get(index).copied()?;
-    if operand.repeats {
-        return None;
+    if let Value::Ref(Some(text)) = value
+        && value_class::is_plain_string(text)
+    {
+        return match operand.kind {
+            Kind::Interned => Some(ValueIdentity::Interned(text.clone())),
+            Kind::BuilderText if text.is_empty() => Some(ValueIdentity::Interned(String::new())),
+            Kind::Fresh | Kind::BuilderText if !operand.repeats => {
+                let Source::At(pc) = operand.source? else {
+                    return None;
+                };
+                Some(ValueIdentity::Fresh(format!(
+                    "{class}.{method}{desc}#{frame_id}:{pc}"
+                )))
+            }
+            _ => None,
+        };
     }
-    let key = match operand.kind {
-        Kind::Fresh | Kind::BuilderText if !text.is_empty() => {
-            format!(
-                "fresh:{class}.{method}{desc}#{frame_id}:{}",
-                operand.source.map_or(0, |source| match source {
-                    Source::At(pc) => pc,
-                    Source::Param(_) => 0,
-                })
-            )
+    let boxed = box_key(value)?;
+    match operand.kind {
+        Kind::Cached(box_class) if in_cache(box_class, boxed.bits) => {
+            Some(ValueIdentity::CachedBox {
+                class: box_class,
+                bits: boxed.bits,
+            })
         }
-        Kind::Interned => format!("interned:{text}"),
-        Kind::BuilderText if text.is_empty() => format!("interned:{text}"),
-        _ => return None,
-    };
-    Some(key)
+        Kind::Cached(_) | Kind::Uncached(_) | Kind::Fresh if !operand.repeats => {
+            let Source::At(pc) = operand.source? else {
+                return None;
+            };
+            Some(ValueIdentity::Fresh(format!(
+                "{class}.{method}{desc}#{frame_id}:{pc}"
+            )))
+        }
+        _ => None,
+    }
 }
 
 /// The answer for one comparison.
@@ -353,6 +421,7 @@ impl<H: Host> Runtime<'_, H> {
         at: usize,
         lhs: &Value,
         rhs: &Value,
+        frame_modified: bool,
     ) -> Result<bool, NativeError> {
         // The old answer, kept when the comparison is counted.
         let equal = lhs == rhs;
@@ -365,12 +434,13 @@ impl<H: Host> Runtime<'_, H> {
             if let Some(same) = left.same_object(right) {
                 return Ok(same);
             }
-            let same = frame
-                .flow
-                .get_or_insert_with(|| flow(file, method, desc, is_static, code))
-                .as_ref()
-                .and_then(|flow| flow.compares.get(&(at as u32)).copied())
-                .is_some_and(|(l, r)| l.source.is_some() && l.source == r.source && !l.repeats);
+            let same = !frame_modified
+                && frame
+                    .flow
+                    .get_or_insert_with(|| flow(file, method, desc, is_static, code))
+                    .as_ref()
+                    .and_then(|flow| flow.compares.get(&(at as u32)).copied())
+                    .is_some_and(|(l, r)| l.source.is_some() && l.source == r.source && !l.repeats);
             if !same {
                 self.host.unknown_operand_call(&MethodRef {
                     owner: "java/lang/Object".into(),
@@ -397,11 +467,15 @@ impl<H: Host> Runtime<'_, H> {
             // Different values are different objects; null is null.
             return Ok(equal);
         }
-        let operands = frame
-            .flow
-            .get_or_insert_with(|| flow(file, method, desc, is_static, code))
-            .as_ref()
-            .and_then(|flow| flow.compares.get(&(at as u32)).copied());
+        let operands = if frame_modified {
+            None
+        } else {
+            frame
+                .flow
+                .get_or_insert_with(|| flow(file, method, desc, is_static, code))
+                .as_ref()
+                .and_then(|flow| flow.compares.get(&(at as u32)).copied())
+        };
         let (family, identity) = if let Some(boxed) = boxed {
             let identity =
                 operands.map_or(Identity::Unknown, |(l, r)| decide(Some(boxed), false, l, r));
@@ -413,6 +487,7 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     (Family::Collection, decide(None, false, l, r))
                 }
+                None if frame_modified => (Family::Collection, Identity::Unknown),
                 // Neither is a shared empty collection: two markers, two objects.
                 _ => return Ok(false),
             }
@@ -804,14 +879,18 @@ fn analyse(
                         .ok()?
                         .descriptor
                 };
-                let words: usize = descriptor_arguments(&descriptor)
-                    .iter()
-                    .map(|argument| words(argument))
-                    .sum();
+                let arg_descs = descriptor_arguments(&descriptor);
+                let total_words: usize = arg_descs.iter().map(|argument| words(argument)).sum();
                 let receiver = usize::from(matches!(code[pc], 0xb6 | 0xb7 | 0xb9));
-                let count = words + receiver;
+                let count = total_words + receiver;
                 let start = state.stack.len().checked_sub(count)?;
-                call_slots.insert(pc as u32, state.stack[start + receiver..].to_vec());
+                let mut offset = start + receiver;
+                let mut arg_slots = Vec::with_capacity(arg_descs.len());
+                for argument in &arg_descs {
+                    arg_slots.push(*state.stack.get(offset)?);
+                    offset += words(argument);
+                }
+                call_slots.insert(pc as u32, arg_slots);
             }
             step(file, code, pc, &mut state)?;
             let targets = successors(code, pc)?;
@@ -1157,13 +1236,19 @@ fn step(file: &ClassFile, code: &[u8], pc: usize, state: &mut State) -> Option<(
             } else {
                 None
             };
+            let first_arg = if op == 0xb8 && arguments == 1 {
+                stack.last().copied()
+            } else {
+                None
+            };
             pop(
                 stack,
                 arguments + usize::from(matches!(op, 0xb6 | 0xb7 | 0xb9)),
             )?;
-            // String#toString returns the receiver itself. Preserve its
-            // producer so `new String(x).toString() == new String(x)` is
-            // resolved as Java does without a counted fallback.
+            // `String#toString` returns the receiver itself, and
+            // `String.valueOf(Object)` returns `obj == null ? "null" : obj.toString()`,
+            // which for a statically-typed `String` preserves the non-null argument's
+            // exact identity (while `null != "null"` cannot alias a null operand).
             if method.as_ref().is_some_and(|m| {
                 m.owner == "java/lang/String"
                     && m.name == "toString"
@@ -1171,6 +1256,15 @@ fn step(file: &ClassFile, code: &[u8], pc: usize, state: &mut State) -> Option<(
             }) {
                 let receiver = receiver?;
                 stack.push(receiver);
+            } else if op == 0xb8
+                && method.as_ref().is_some_and(|m| {
+                    m.owner == "java/lang/String"
+                        && m.name == "valueOf"
+                        && m.descriptor == "(Ljava/lang/Object;)Ljava/lang/String;"
+                })
+                && first_arg.is_some_and(|arg| arg.ty == Ty::String)
+            {
+                stack.push(first_arg?);
             } else {
                 push_result(stack, return_desc(&descriptor), produced);
             }

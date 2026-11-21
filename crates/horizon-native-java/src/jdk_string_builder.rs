@@ -837,7 +837,12 @@ impl<H: Host> Runtime<'_, H> {
                     Answer::This => receiver.cloned().unwrap_or(Value::Ref(Some(marker))),
                     Answer::Void => Value::Void,
                     Answer::Int(value) => Value::Int(value),
-                    Answer::Text(text) => Value::Ref(Some(text)),
+                    Answer::Text(text) => {
+                        if text.is_empty() && r.name == "toString" {
+                            self.string_pool.note_literal("");
+                        }
+                        Value::Ref(Some(text))
+                    }
                     Answer::WriteChars { at, units } => {
                         let Some(array) = args.get(2).and_then(host_array::array_key) else {
                             return Ok(None);

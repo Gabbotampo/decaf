@@ -17,4 +17,28 @@ public final class Probe {
     map.put(copy, 7);
     return map.get(copy) + ":" + map.size();
   }
+  public static String callbackMutation() {
+    String a = new String("x");
+    String b = new String("x");
+    IdentityHashMap<String,Integer> m = new IdentityHashMap<>();
+    m.put("z", 1);
+    m.put(a, 2);
+    Integer n = m.computeIfAbsent(b, k -> {
+      m.remove("z");
+      return 3;
+    });
+    return n + ":" + m.get(a) + ":" + m.get(b) + ":" + m.size();
+  }
+  public static String stringValueOfIdentity() {
+    String a = new String("x");
+    IdentityHashMap<String,Integer> m = new IdentityHashMap<>();
+    m.put(a, 1);
+    return String.valueOf(m.get(String.valueOf(a)));
+  }
+  public static void main(String[] args) {
+    System.out.println(rows());
+    System.out.println(sameReference());
+    System.out.println(callbackMutation());
+    System.out.println(stringValueOfIdentity());
+  }
 }
