@@ -917,7 +917,10 @@ impl<H: Host> Runtime<'_, H> {
                 key_token.as_ref(),
                 tokens.get(index).and_then(|token| token.as_ref()),
             ) {
-                (Some(wanted), Some(stored)) => wanted != stored,
+                // Distinct provenance proves that equal-looking references
+                // are different objects; only a missing token leaves the
+                // identity ambiguous.
+                (Some(_wanted), Some(_stored)) => false,
                 (Some(_), None) => true,
                 (None, _) => self.identity_unknown(key, &pair[0]),
             }

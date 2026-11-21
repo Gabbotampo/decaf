@@ -132,6 +132,49 @@ public final class Probe {
         return added + ":" + kept + ":" + m.size();
     }
 
+    public static String identityCompute() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        Integer added = m.compute(b, (k, v) -> 2);
+        Integer replaced = m.compute(a, (k, v) -> v + 2);
+        return added + ":" + replaced + ":" + m.size();
+    }
+
+    public static String identityComputeIfPresent() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        Integer absent = m.computeIfPresent(b, (k, v) -> 2);
+        Integer present = m.computeIfPresent(a, (k, v) -> v + 2);
+        return absent + ":" + present + ":" + m.size();
+    }
+
+    public static String identityMerge() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        Integer added = m.merge(b, 2, Integer::sum);
+        Integer merged = m.merge(a, 2, Integer::sum);
+        return added + ":" + merged + ":" + m.size();
+    }
+
+    public static String identityPutIfAbsent() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        Integer added = m.putIfAbsent(b, 2);
+        Integer kept = m.putIfAbsent(a, 3);
+        return added + ":" + kept + ":" + m.size();
+    }
+
+    public static String identityGetOrDefault() {
+        String a = new String("x"), b = new String("x");
+        IdentityHashMap<String, Integer> m = new IdentityHashMap<>();
+        m.put(a, 1);
+        return m.getOrDefault(a, 8) + ":" + m.getOrDefault(b, 9) + ":" + m.size();
+    }
+
     public static String random_m0() { return RandomImm.m0(); }
     public static String random_m1() { return RandomImm.m2(); }
     public static String random_m2() { return RandomImm.m3(); }
@@ -465,6 +508,11 @@ fn identity_hash_maps_keep_identity() {
             // Both "k" literals are the same interned String (JLS 3.10.5).
             ("identityStringPresent", "1"),
             ("identityComputeIfAbsent", "2:1:2"),
+            ("identityCompute", "2:3:2"),
+            ("identityComputeIfPresent", "null:3:1"),
+            ("identityMerge", "2:3:2"),
+            ("identityPutIfAbsent", "null:1:2"),
+            ("identityGetOrDefault", "1:9:1"),
         ],
     );
 }
