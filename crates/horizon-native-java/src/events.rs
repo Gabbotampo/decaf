@@ -1052,6 +1052,26 @@ pub struct CreativeTabBuildContext {
     pub tab: Option<Value>,
 }
 
+/// Convert Sunrise's enabled feature identifiers to the exact Minecraft 26.3 feature mask this
+/// runtime models. An unknown identifier is refused rather than being treated as enabled.
+pub fn creative_feature_mask(features: &[String]) -> Option<u64> {
+    let mut mask = 0;
+    for feature in features {
+        mask |= match feature.as_str() {
+            "minecraft:vanilla" => crate::host_creative_tab::FEATURE_VANILLA,
+            "minecraft:trade_rebalance" => crate::host_creative_tab::FEATURE_TRADE_REBALANCE,
+            "minecraft:redstone_experiments" => {
+                crate::host_creative_tab::FEATURE_REDSTONE_EXPERIMENTS
+            }
+            "minecraft:minecart_improvements" => {
+                crate::host_creative_tab::FEATURE_MINECART_IMPROVEMENTS
+            }
+            _ => return None,
+        };
+    }
+    Some(mask)
+}
+
 impl Default for CreativeTabBuildContext {
     fn default() -> Self {
         Self {

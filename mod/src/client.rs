@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::{JAR_BUDGET, LOG, caught, jar_id};
 use runtime::events::{GameListener, PhaseOrdering};
-use runtime::{ExecutionBudget, NativeJar, StdHost};
+use runtime::{ExecutionBudget, Host as RuntimeHost, NativeJar, StdHost, Value};
 
 use crate::runtime;
 
@@ -216,6 +216,111 @@ impl State {
         self.world_loaded = false;
     }
 
+    /// Dispatch Java Fabric creative-tab output into the build-scoped Sunrise edit.  The
+    /// interpreter owns Fabric's phase order, visibility and feature checks; this adapter only
+    /// converts the resulting, already-validated stacks to Sunrise values.
+    pub(crate) fn build_creative_tab(
+        &mut self,
+        host: &mut dyn mod_api::ClientHost,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        let tab = event.tab.to_owned();
+        let permissions = event.permissions == mod_api::CreativeTabPermissions::Operator;
+        let Some(enabled_features) = runtime::creative_feature_mask(&event.features) else {
+            for loaded in &mut self.jars {
+                loaded
+                    .host
+                    .note_unknown_game_hook("creative tab feature flag");
+            }
+            return;
+        };
+        for loaded in &mut self.jars {
+            let context = runtime::CreativeTabBuildContext {
+                enabled_features,
+                has_permissions: permissions,
+                ..Default::default()
+            };
+            let contents = match loaded.jar.creative_tab_contents_with(
+                &mut loaded.host,
+                &tab,
+                context,
+            ) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                    log::warn!(
+                        "{LOG}: client {} creative tab {} failed: {error}",
+                        loaded.row.id,
+                        tab
+                    );
+                    continue;
+                }
+            };
+            apply_creative_contents(host, event, &loaded.host, &contents);
+            // Creative registrations are initially reported as unfired. Re-read the inventory
+            // after this tab's hook so the JSON row reflects the actual registration state.
+            let registered = loaded.host.game_listeners(&loaded.jar, false);
+            loaded.row.unsupported = registered.unsupported;
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+    }
+
+    /// Run each resident jar's Item appendHoverText implementation for the item in a Sunrise
+    /// tooltip.  Components are converted through Sunrise's text boundary, retaining translation
+    /// keys and style; a failed conversion is counted on the jar and does not silently vanish.
+    pub(crate) fn append_java_tooltip(
+        &mut self,
+        host: &dyn mod_api::ClientHost,
+        event: &mut mod_api::ItemTooltipEvent<'_>,
+    ) {
+        let Some(id) = mod_api::__private::item_key_id(event.stack.item()) else {
+            return;
+        };
+        let count = event.stack.count().min(i32::MAX as u32) as i32;
+        let mut additions = Vec::new();
+        for loaded in &mut self.jars {
+            let Some(entry) = loaded.host.observed_registry_entry("minecraft:item", id) else {
+                continue;
+            };
+            let item = entry.value.clone();
+            let Some(stack) = loaded.host.make_host_item_stack(item.clone(), count) else {
+                continue;
+            };
+            let lines = match loaded.jar.run_item_tooltip(
+                &item,
+                stack,
+                runtime::client_surface::tooltip_context(),
+                runtime::client_surface::tooltip_display(),
+                runtime::client_surface::tooltip_flag(event.advanced, event.creative),
+                &mut loaded.host,
+                &ExecutionBudget::within(JAR_BUDGET),
+            ) {
+                Ok(lines) => lines,
+                Err(error) => {
+                    log::warn!(
+                        "{LOG}: client {} item tooltip {} failed: {error}",
+                        loaded.row.id,
+                        id
+                    );
+                    loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+                    continue;
+                }
+            };
+            for line in lines {
+                let (converted, refused) = convert_tooltip_component(host, &loaded.host, &line);
+                if refused {
+                    loaded.host.note_unknown_game_hook("tooltip component conversion");
+                } else if let Some(text) = converted {
+                    additions.push((text, u32::MAX));
+                }
+            }
+            loaded.row.unknown_host_calls = loaded.host.unknown_host_call_count();
+        }
+        // The first line is the item's name. Java appendHoverText runs immediately after it.
+        let at = event.lines.len().min(1);
+        event.lines.splice(at..at, additions);
+    }
+
     /// Drop resident hosts, listeners, and jar heaps at client shutdown. Rows stay available
     /// until the next client setup so the final report can be rewritten after teardown.
     pub(crate) fn teardown(&mut self) -> usize {
@@ -226,6 +331,59 @@ impl State {
         self.loaded = false;
         self.world_loaded = false;
         count
+    }
+}
+
+fn api_stack(
+    host: &dyn mod_api::Host,
+    runtime_host: &StdHost,
+    value: &Value,
+) -> Option<mod_api::ItemStack> {
+    let id = runtime_host.item_stack_item_id(value)?;
+    let key = host.item_key(&mod_api::Identifier::parse(&id).ok()?)?;
+    let count = runtime_host.item_stack_count(value)?.try_into().ok()?;
+    mod_api::ItemStack::new(key, count)
+}
+
+pub(crate) fn apply_creative_contents(
+    host: &mut dyn mod_api::ClientHost,
+    event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    runtime_host: &StdHost,
+    contents: &runtime::CreativeTabContents,
+) {
+    for value in &contents.display_stacks {
+        if let Some(stack) = api_stack(host, runtime_host, value) {
+            let _ = event.edit.insert(
+                host,
+                mod_api::CreativeTabPlacement::Last,
+                stack,
+                mod_api::CreativeTabVisibility::Parent,
+            );
+        }
+    }
+    for value in &contents.search_tab_stacks {
+        if let Some(stack) = api_stack(host, runtime_host, value) {
+            let _ = event.edit.insert(
+                host,
+                mod_api::CreativeTabPlacement::Last,
+                stack,
+                mod_api::CreativeTabVisibility::Search,
+            );
+        }
+    }
+}
+
+pub(crate) fn convert_tooltip_component(
+    host: &dyn mod_api::ClientHost,
+    runtime_host: &StdHost,
+    component: &Value,
+) -> (Option<mod_api::Text>, bool) {
+    let Some(json) = runtime_host.component_json(component) else {
+        return (None, true);
+    };
+    match host.text_from_json(&json) {
+        Ok(Some(text)) => (Some(text), false),
+        Ok(None) | Err(_) => (None, true),
     }
 }
 

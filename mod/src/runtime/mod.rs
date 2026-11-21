@@ -298,7 +298,9 @@ pub mod weaver;
 
 pub use voxel_shape::{BlockShapes, BlockStateShape};
 
-pub use events::{CreativeTabBuildContext, CreativeTabContents, CreativeTabListener};
+pub use events::{
+    CreativeTabBuildContext, CreativeTabContents, CreativeTabListener, creative_feature_mask,
+};
 pub use facade_server::{GameRuleValue, ServerFacts};
 pub use game_hooks::{
     GAME_OBJECT_PREFIX, GameHookContext, GameHookEffect, GameHookState, GameObject, GameObjectKind,

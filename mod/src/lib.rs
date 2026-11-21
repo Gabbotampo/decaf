@@ -115,6 +115,9 @@ mod game_hooks;
 mod runtime;
 mod server_facts;
 
+#[cfg(test)]
+mod client_dispatch_tests;
+
 /// This mod's report, in its own `config/horizon_java/` folder.
 const REPORT: &str = "horizon_java/java-runtime.json";
 /// The folder every jar to run is dropped in, beside the report.
@@ -446,6 +449,31 @@ impl Hooks for HorizonJava {
         content::declare_items(&mut state, context, event);
         drop(state);
         self.refresh_game_hook_plan_bits();
+    }
+
+    /// Sunrise's build-scoped creative tab hook is the client-side equivalent of Fabric's
+    /// `CreativeModeTabEvents.modifyOutputEvent`.  Resident Java jars fill the edit in Fabric
+    /// order; the client host applies the resulting parent/search stacks to the native tab.
+    fn build_creative_mode_tab_contents(
+        &self,
+        host: HostSide<'_>,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        let HostSide::Client(host) = host else {
+            return;
+        };
+        self.lock_client().build_creative_tab(host, event);
+    }
+
+    /// Run a jar Item's `appendHoverText` before Sunrise's global tooltip listeners.  The
+    /// runtime returns structured Components, so translatable text and style cross the native
+    /// API boundary without flattening them.
+    fn item_tooltip(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::ItemTooltipEvent<'_>,
+    ) {
+        self.lock_client().append_java_tooltip(host, event);
     }
 
     /// The server is about to open its worlds (NeoForge's `ServerAboutToStartEvent`). Nothing of
