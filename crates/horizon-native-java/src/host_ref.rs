@@ -245,6 +245,14 @@ pub enum HostKind {
     MobEffectCategory,
     /// A freshly constructed vanilla `RangedAttribute`.
     RangedAttribute,
+    /// A modelled Minecraft 26.3 `VoxelShape` (`voxel_shape.rs`).
+    VoxelShape,
+    /// A modelled Minecraft 26.3 `AABB` (`voxel_shape.rs`).
+    Aabb,
+    /// A canonical Minecraft 26.3 `BooleanOp` constant (`voxel_shape.rs`).
+    BooleanOp,
+    /// A modelled Minecraft 26.3 `CollisionContext` (`CollisionContext.empty()`).
+    CollisionContext,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -671,6 +679,11 @@ pub enum HostKind {
     FeatureFlag,
     /// Vanilla `FeatureFlagSet` values (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
     FeatureFlagSet,
+    /// Opaque `BlockGetter` / `BlockPos` / `CollisionContext` probes passed into
+    /// `Block.getShape` / `getCollisionShape` extraction so every observation
+    /// (`equals`, `hashCode`, `toString`, `instanceof`, `checkcast`, `==`, `getClass`,
+    /// or any method call) counts on the host and refuses static shape export.
+    ShapeProbe,
 }
 
 /// How a kind's Java class follows from its key.
@@ -738,6 +751,11 @@ pub(crate) trait Nested {
     /// host's table (the caller counts).
     fn component_json(&mut self, value: &Value) -> Option<serde_json::Value> {
         let _ = value;
+        None
+    }
+    /// The MC 26.3 `VoxelShape.toString()` for a non-singleton shape key (`cube/<n>`, `array/<n>`).
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        let _ = key;
         None
     }
     /// The key and value a host `Map.Entry` holds now (`host_map_entry.rs`);
@@ -1409,6 +1427,36 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::vanilla_values::RANGED_ATTRIBUTE),
         canonical: never_canonical,
         methods: &crate::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::VoxelShape,
+        tag: "vshp",
+        class: ClassRule::FromKey(crate::voxel_shape::voxel_shape_class),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::VOXEL_SHAPE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::Aabb,
+        tag: "aabb",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::AABB),
+        canonical: never_canonical,
+        methods: &crate::voxel_shape::AABB_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::BooleanOp,
+        tag: "bop",
+        class: ClassRule::Unknown {
+            declared: crate::voxel_shape::boolean_op_declared_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::BOOLEAN_OP_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::CollisionContext,
+        tag: "cctx",
+        class: ClassRule::FromKey(|_| crate::voxel_shape::EMPTY_COLLISION_CONTEXT),
+        canonical: always_canonical,
+        methods: &crate::voxel_shape::COLLISION_CONTEXT_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,
@@ -2976,6 +3024,13 @@ const KINDS: &[KindInfo] = &[
         canonical: always_canonical,
         methods: &crate::host_creative_tab::FEATURE_FLAG_SET_METHODS,
     },
+    KindInfo {
+        kind: HostKind::ShapeProbe,
+        tag: "sprobe",
+        class: ClassRule::Unknown { declared: |_| &[] },
+        canonical: never_canonical,
+        methods: &crate::voxel_shape::SHAPE_PROBE_METHODS,
+    },
 ];
 
 impl HostKind {
@@ -3166,6 +3221,9 @@ impl HostRef {
     }
 
     pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
+        if self.kind == HostKind::ShapeProbe || other.kind == HostKind::ShapeProbe {
+            return None;
+        }
         if self != other {
             return Some(false);
         }

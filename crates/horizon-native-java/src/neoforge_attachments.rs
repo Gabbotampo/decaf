@@ -1370,6 +1370,8 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget,
         };
         let resident = runtime.adopt_resident_heap();
