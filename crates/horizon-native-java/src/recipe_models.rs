@@ -46,12 +46,6 @@ impl ComponentPatch {
     pub(crate) fn size(&self) -> i32 {
         self.entries.len() as i32
     }
-
-    pub(crate) fn apply_overlay(&mut self, overlay: &ComponentPatch) {
-        for (key, value) in &overlay.entries {
-            self.entries.insert(key.clone(), value.clone());
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +107,7 @@ pub(crate) struct MenuTypeData {
 #[derive(Clone, Debug)]
 pub(crate) struct LoadedRecipe {
     pub(crate) id: String,
+    pub(crate) source_pack: String,
     pub(crate) recipe_type: Value,
     pub(crate) recipe: Value,
     pub(crate) holder: Value,
@@ -120,9 +115,11 @@ pub(crate) struct LoadedRecipe {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LoadedRecipeCache {
-    pub(crate) fingerprint: (usize, usize, usize, usize),
+    pub(crate) fingerprint: (usize, usize, u64, usize),
     pub(crate) recipes: Vec<LoadedRecipe>,
     pub(crate) errors: Vec<(String, String)>,
+    pub(crate) unmodelled_serializers: BTreeSet<String>,
+    pub(crate) skipped_recipe_ids: BTreeSet<String>,
 }
 
 /// Persistent recipe, live-stack, template, ingredient, and component-patch state on [`StdHost`].
@@ -425,7 +422,6 @@ pub(crate) const HOLDER_METHODS: Methods = Methods {
 };
 
 pub(crate) fn normalize_id(raw: &str) -> Option<String> {
-    let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
@@ -445,6 +441,21 @@ pub(crate) fn normalize_id(raw: &str) -> Option<String> {
         return None;
     }
     Some(format!("{ns}:{path}"))
+}
+
+/// Convert a JSON number to a truncated 64-bit integer matching DFU `JsonOps` + Gson
+/// `LazilyParsedNumber` semantics (`1.2` -> `1`, `-1.9` -> `-1`, `1e2` -> `100`, wrapping on
+/// narrowing casts to `i32`/`i16`/`i8`). Returns `None` for non-numbers.
+pub(crate) fn json_number_to_i64(val: &serde_json::Value) -> Option<i64> {
+    let num = val.as_number()?;
+    if let Some(i) = num.as_i64() {
+        return Some(i);
+    }
+    if let Some(u) = num.as_u64() {
+        return Some(u as i64);
+    }
+    let f = num.as_f64()?;
+    f.is_finite().then_some(f.trunc() as i64)
 }
 
 pub(crate) fn is_known_item_id(host: &StdHost, id: &str) -> bool {
@@ -579,6 +590,168 @@ fn base_max_stack_size(host: &StdHost, item_id: &str) -> Option<i32> {
     host.is_constructed_item_marker(marker).then_some(64)
 }
 
+fn base_max_damage(host: &StdHost, item_id: &str) -> Option<Option<i32>> {
+    if let Some(dmg) = vanilla_item_data::vanilla_max_damage(item_id) {
+        return Some(dmg);
+    }
+    let entry = host
+        .registrations()
+        .iter()
+        .rev()
+        .find(|entry| entry.registry == "minecraft:item" && entry.id == item_id)?;
+    let marker = expect_ref(&entry.value)?;
+    if let Some(props) = host.item_properties_for_marker(marker) {
+        if let Some(raw) = props.get("durability") {
+            return raw.parse::<i32>().ok().map(Some);
+        }
+        return Some(None);
+    }
+    host.is_constructed_item_marker(marker).then_some(None)
+}
+
+/// Exact prototype value of `comp_id` on `item_id`, or `None` when the prototype value is not
+/// modelled (callers must count the operation rather than guessing `null`).
+pub(crate) fn prototype_component(
+    host: &StdHost,
+    item_id: &str,
+    comp_id: &str,
+) -> Option<Option<Value>> {
+    if item_id == "minecraft:air" || !is_known_item_id(host, item_id) {
+        return None;
+    }
+    match comp_id {
+        "minecraft:max_stack_size" => {
+            base_max_stack_size(host, item_id).map(|n| Some(Value::Boxed(Boxed::Integer(n))))
+        }
+        "minecraft:repair_cost" => Some(Some(Value::Boxed(Boxed::Integer(0)))),
+        "minecraft:max_damage" => {
+            base_max_damage(host, item_id).map(|opt| opt.map(|d| Value::Boxed(Boxed::Integer(d))))
+        }
+        "minecraft:damage" => {
+            base_max_damage(host, item_id).map(|opt| opt.map(|_| Value::Boxed(Boxed::Integer(0))))
+        }
+        // Verified empty across all 1,658 vanilla 26.3 item prototypes.
+        "minecraft:custom_name"
+        | "minecraft:custom_data"
+        | "minecraft:custom_model_data"
+        | "minecraft:unbreakable"
+        | "minecraft:profile" => Some(None),
+        _ => {
+            // Mod-registered component types default to absent on unconfigured prototypes.
+            let is_mod_component = host
+                .registrations()
+                .iter()
+                .any(|e| e.registry == "minecraft:data_component_type" && e.id == comp_id);
+            is_mod_component.then_some(None)
+        }
+    }
+}
+
+/// Compare a candidate patch value with a known prototype value (`Objects.equals(val, proto)`).
+/// Returns `None` if equality cannot be determined without running custom Java `.equals`.
+fn value_equals_prototype(val: &Option<Value>, proto: &Option<Value>) -> Option<bool> {
+    match (val, proto) {
+        (None, None) => Some(true),
+        (None, Some(_)) | (Some(_), None) => Some(false),
+        (Some(v), Some(Value::Boxed(Boxed::Integer(p)))) => match v {
+            Value::Boxed(Boxed::Integer(n)) | Value::Int(n) => Some(*n == *p),
+            Value::Ref(None) => Some(false),
+            Value::Boxed(_) | Value::Long(_) | Value::Float(_) | Value::Ref(Some(_)) => Some(false),
+            Value::Host(h) if h.kind() != HostKind::JarObject => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Exact `PatchedDataComponentMap.set(type, value)` semantics on a stack's patch.
+pub(crate) fn patched_set(
+    host: &StdHost,
+    item_id: &str,
+    patch: &mut ComponentPatch,
+    comp_id: &str,
+    new_val: &Value,
+) -> Option<Value> {
+    let proto = prototype_component(host, item_id, comp_id)?;
+    let new_opt = (!matches!(new_val, Value::Ref(None))).then(|| new_val.clone());
+    let matches_proto = value_equals_prototype(&new_opt, &proto)?;
+    let old_entry = if matches_proto {
+        patch.entries.remove(comp_id)
+    } else {
+        patch.entries.insert(comp_id.to_owned(), new_opt)
+    };
+    let proto_val = proto.unwrap_or(Value::Ref(None));
+    Some(match old_entry {
+        Some(Some(prev)) => prev,
+        // `Objects.requireNonNullElse(Removed.removedToNull(old), proto)` -> `proto`.
+        Some(None) | None => proto_val,
+    })
+}
+
+/// Exact `PatchedDataComponentMap.remove(type)` semantics on a stack's patch.
+pub(crate) fn patched_remove(
+    host: &StdHost,
+    item_id: &str,
+    patch: &mut ComponentPatch,
+    comp_id: &str,
+) -> Option<Value> {
+    let proto = prototype_component(host, item_id, comp_id)?;
+    let old_entry = if proto.is_some() {
+        patch.entries.insert(comp_id.to_owned(), None)
+    } else {
+        patch.entries.remove(comp_id)
+    };
+    Some(match old_entry {
+        Some(Some(prev)) => prev,
+        Some(None) => Value::Ref(None),
+        None => proto.unwrap_or(Value::Ref(None)),
+    })
+}
+
+/// Exact `PatchedDataComponentMap.applyPatch(overlay)` semantics: drops entries redundant with the
+/// item's prototype and returns `None` (without mutating `patch`) if any overlay key's prototype
+/// is unmodelled.
+pub(crate) fn patched_apply_patch(
+    host: &StdHost,
+    item_id: &str,
+    patch: &mut ComponentPatch,
+    overlay: &ComponentPatch,
+) -> Option<()> {
+    let mut actions: Vec<(String, Option<Option<Value>>)> =
+        Vec::with_capacity(overlay.entries.len());
+    for (comp_id, entry) in &overlay.entries {
+        let proto = prototype_component(host, item_id, comp_id)?;
+        let action = match entry {
+            Some(_) => {
+                if value_equals_prototype(entry, &proto)? {
+                    None
+                } else {
+                    Some(entry.clone())
+                }
+            }
+            None => {
+                if proto.is_some() {
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+        };
+        actions.push((comp_id.clone(), action));
+    }
+    for (comp_id, action) in actions {
+        match action {
+            Some(entry) => {
+                patch.entries.insert(comp_id, entry);
+            }
+            None => {
+                patch.entries.remove(&comp_id);
+            }
+        }
+    }
+    Some(())
+}
+
 pub(crate) fn max_stack_size_for_item(
     host: &StdHost,
     item_id: &str,
@@ -609,17 +782,24 @@ fn resolve_item_tag_inner(
     }
     let mut found_any = false;
     let mut entries: Vec<(String, bool)> = Vec::new();
+    // Layer 0 (lowest priority): vanilla built-in item tags.
     if let Some(vanilla_entries) = vanilla_item_data::vanilla_item_tag(tag_id) {
         found_any = true;
         for entry in vanilla_entries {
             entries.push(((*entry).to_owned(), true));
         }
     }
+    // Stacked datapack/jar layers in vanilla pack order (lowest -> highest priority).
     if let Some((ns, path)) = tag_id.split_once(':') {
         let resource_path = format!("data/{ns}/tags/item/{path}.json");
-        if let Some(bytes) = host.resource_bytes_for(&resource_path)
-            && let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes)
-        {
+        for (_, layer) in host.ordered_data_layers() {
+            let Some(bytes) = layer.get(&resource_path) else {
+                continue;
+            };
+            let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(bytes) else {
+                visiting.remove(tag_id);
+                return None;
+            };
             found_any = true;
             if map.get("replace").and_then(serde_json::Value::as_bool) == Some(true) {
                 entries.clear();
@@ -718,9 +898,9 @@ pub(crate) fn decode_component_patch_json(
         };
         let decoded = match id.as_str() {
             "minecraft:max_stack_size" => {
-                let Some(n) = val.as_i64().and_then(|v| i32::try_from(v).ok()) else {
+                let Some(n) = json_number_to_i64(val).map(|v| v as i32) else {
                     return Err(DecodeError::Invalid(format!(
-                        "Expected integer for minecraft:max_stack_size: {val}"
+                        "Not a number for minecraft:max_stack_size: {val}"
                     )));
                 };
                 if !(1..=99).contains(&n) {
@@ -730,10 +910,23 @@ pub(crate) fn decode_component_patch_json(
                 }
                 Value::Boxed(Boxed::Integer(n))
             }
-            "minecraft:damage" | "minecraft:repair_cost" => {
-                let Some(n) = val.as_i64().and_then(|v| i32::try_from(v).ok()) else {
+            "minecraft:max_damage" => {
+                let Some(n) = json_number_to_i64(val).map(|v| v as i32) else {
                     return Err(DecodeError::Invalid(format!(
-                        "Expected non-negative integer for {id}: {val}"
+                        "Not a number for minecraft:max_damage: {val}"
+                    )));
+                };
+                if n < 1 {
+                    return Err(DecodeError::Invalid(format!(
+                        "Value must be positive for minecraft:max_damage: {n}"
+                    )));
+                }
+                Value::Boxed(Boxed::Integer(n))
+            }
+            "minecraft:damage" | "minecraft:repair_cost" => {
+                let Some(n) = json_number_to_i64(val).map(|v| v as i32) else {
+                    return Err(DecodeError::Invalid(format!(
+                        "Not a number for {id}: {val}"
                     )));
                 };
                 if n < 0 {
@@ -851,36 +1044,81 @@ pub(crate) fn decode_item_stack_template_map(
     host: &mut StdHost,
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Value, DecodeError> {
-    let Some(raw_id) = map.get("id").and_then(serde_json::Value::as_str) else {
-        return Err(DecodeError::Invalid(
-            "No key id in ItemStackTemplate".into(),
-        ));
-    };
-    let item_id = decode_non_air_item_id(host, raw_id)?;
-    let count = match map.get("count") {
-        None => 1,
-        Some(v) => {
-            let Some(n) = v.as_i64().and_then(|n| i32::try_from(n).ok()) else {
-                return Err(DecodeError::Invalid(format!(
-                    "Not an integer for ItemStackTemplate count: {v}"
-                )));
-            };
-            if !(1..=99).contains(&n) {
-                return Err(DecodeError::Invalid(format!(
-                    "Value must be within range [1;99]: {n}"
-                )));
-            }
-            n
+    // Evaluate all three RecordCodecBuilder fields (`id`, `count`, `components`) in field order
+    // and accumulate errors just like DFU's `ItemStackTemplate.MAP_CODEC`.
+    let mut invalid_errors = Vec::new();
+    let mut first_unmodelled: Option<String> = None;
+
+    let item_id = match map.get("id").filter(|v| !v.is_null()) {
+        None => {
+            invalid_errors.push("No key id in ItemStackTemplate".into());
+            None
         }
+        Some(v) => match v.as_str() {
+            Some(raw_id) => match decode_non_air_item_id(host, raw_id) {
+                Ok(id) => Some(id),
+                Err(DecodeError::Invalid(msg)) => {
+                    invalid_errors.push(msg);
+                    None
+                }
+                Err(DecodeError::Unmodelled(msg)) => {
+                    if first_unmodelled.is_none() {
+                        first_unmodelled = Some(msg);
+                    }
+                    None
+                }
+            },
+            None => {
+                invalid_errors.push(format!("Not a string for ItemStackTemplate id: {v}"));
+                None
+            }
+        },
     };
-    let patch = match map.get("components") {
-        None => ComponentPatch::default(),
-        Some(v) => decode_component_patch_json(host, v)?,
+
+    // `ExtraCodecs.intRange(1, 99).optionalFieldOf("count", 1)`: JSON `null` = absent/default,
+    // fractional JSON numbers truncate toward zero before range checking.
+    let count = match map.get("count").filter(|v| !v.is_null()) {
+        None => Some(1),
+        Some(v) => match json_number_to_i64(v).map(|n| n as i32) {
+            None => {
+                invalid_errors.push(format!("Not a number for ItemStackTemplate count: {v}"));
+                None
+            }
+            Some(n) if !(1..=99).contains(&n) => {
+                invalid_errors.push(format!("Value must be within range [1;99]: {n}"));
+                None
+            }
+            Some(n) => Some(n),
+        },
     };
+
+    let patch = match map.get("components").filter(|v| !v.is_null()) {
+        None => Some(ComponentPatch::default()),
+        Some(v) => match decode_component_patch_json(host, v) {
+            Ok(p) => Some(p),
+            Err(DecodeError::Invalid(msg)) => {
+                invalid_errors.push(msg);
+                None
+            }
+            Err(DecodeError::Unmodelled(msg)) => {
+                if first_unmodelled.is_none() {
+                    first_unmodelled = Some(msg);
+                }
+                None
+            }
+        },
+    };
+
+    if let Some(msg) = first_unmodelled {
+        return Err(DecodeError::Unmodelled(msg));
+    }
+    if !invalid_errors.is_empty() {
+        return Err(DecodeError::Invalid(invalid_errors.join("; ")));
+    }
     Ok(host.recipes.alloc_template(TemplateData {
-        item_id,
-        count,
-        patch,
+        item_id: item_id.unwrap(),
+        count: count.unwrap(),
+        patch: patch.unwrap(),
     }))
 }
 
@@ -908,7 +1146,8 @@ pub(crate) fn decode_common_info_map(
     host: &mut StdHost,
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Value, DecodeError> {
-    let show_notification = match map.get("show_notification") {
+    // `Codec.BOOL.optionalFieldOf("show_notification", true)`: JSON `null` = absent/default.
+    let show_notification = match map.get("show_notification").filter(|v| !v.is_null()) {
         None => true,
         Some(serde_json::Value::Bool(b)) => *b,
         Some(other) => {
@@ -920,6 +1159,17 @@ pub(crate) fn decode_common_info_map(
     Ok(host.recipes.alloc_common_info(show_notification))
 }
 
+/// Exact MC 26.3 `ItemStackTemplate.apply(int count, DataComponentPatch basePatch)`:
+/// constructs `new ItemStack(item, count, basePatch)`, calls `applyComponents(tpl.components)`,
+/// then runs `ItemStack.validateStrict(stack)`:
+/// - Empty stacks (`count <= 0` or `air`) pass `validateStrict` (their effective components are
+///   `DataComponentMap.EMPTY`, `getCount() == 0 <= getMaxStackSize() == 1`) and are returned as
+///   the newly constructed (empty) `ItemStack` instance, NOT replaced with `ItemStack.EMPTY`.
+/// - Non-empty stacks fail validation and are replaced with `ItemStack.EMPTY` if they are both
+///   damageable (`has(MAX_DAMAGE)`) and stackable (`getMaxStackSize() > 1`), or if
+///   `count > getMaxStackSize()`.
+/// - Stacks patched with unmodelled nested-item components (`container`, `bundle_contents`,
+///   `charged_projectiles`) or unknown prototypes return `None` so the call is counted.
 pub(crate) fn template_apply(
     host: &mut StdHost,
     template_key: &str,
@@ -927,17 +1177,40 @@ pub(crate) fn template_apply(
     base_patch: &ComponentPatch,
 ) -> Option<Value> {
     let tpl = host.recipes.templates.get(template_key)?.clone();
-    let mut merged = base_patch.clone();
-    merged.apply_overlay(&tpl.patch);
-    let max_stack = max_stack_size_for_item(host, &tpl.item_id, &merged)?;
-    if count < 1 || count > max_stack || tpl.item_id == "minecraft:air" {
-        return Some(crate::menu_models::empty_stack());
+    let mut patch = ComponentPatch::default();
+    if tpl.item_id != "minecraft:air" {
+        patched_apply_patch(host, &tpl.item_id, &mut patch, base_patch)?;
+        patched_apply_patch(host, &tpl.item_id, &mut patch, &tpl.patch)?;
     }
-    Some(host.recipes.alloc_stack(LiveStack {
+    let stack = LiveStack {
         item_id: tpl.item_id,
         count,
-        patch: merged,
-    }))
+        patch,
+    };
+    if stack.is_empty() {
+        return Some(host.recipes.alloc_stack(stack));
+    }
+    // `ItemStack.validateComponents` validates nested item sizes on `CONTAINER`,
+    // `BUNDLE_CONTENTS`, and `CHARGED_PROJECTILES` when present; default prototypes of those
+    // items are empty, but patched values are not modelled here -> count rather than guess.
+    for nested_comp in [
+        "minecraft:container",
+        "minecraft:bundle_contents",
+        "minecraft:charged_projectiles",
+    ] {
+        if matches!(stack.patch.entries.get(nested_comp), Some(Some(_))) {
+            return None;
+        }
+    }
+    let has_max_damage = !matches!(
+        stack_component_get(host, &stack.item_id, &stack.patch, "minecraft:max_damage")?,
+        Value::Ref(None)
+    );
+    let max_stack = max_stack_size_for_item(host, &stack.item_id, &stack.patch)?;
+    if (has_max_damage && max_stack > 1) || stack.count > max_stack {
+        return Some(crate::menu_models::empty_stack());
+    }
+    Some(host.recipes.alloc_stack(stack))
 }
 
 pub(crate) fn stack_patch_clone(host: &StdHost, stack: &Value) -> Option<ComponentPatch> {
@@ -970,11 +1243,24 @@ pub(crate) fn stack_is_empty(host: &StdHost, stack: &Value) -> Option<bool> {
     Some(host.recipes.stacks.get(handle.key())?.is_empty())
 }
 
-pub(crate) fn limit_stack_for_container(
-    host: &mut StdHost,
-    stack: &Value,
-    container_max: i32,
-) -> Option<()> {
+pub(crate) fn stack_max_stack_size(host: &StdHost, stack: &Value) -> Option<i32> {
+    if is_empty_stack_handle(stack) {
+        return Some(1);
+    }
+    let Value::Host(handle) = stack else {
+        return None;
+    };
+    if handle.kind() != HostKind::LiveItemStack {
+        return None;
+    }
+    let live = host.recipes.stacks.get(handle.key())?;
+    if live.is_empty() {
+        return Some(1);
+    }
+    max_stack_size_for_item(host, &live.item_id, &live.patch)
+}
+
+pub(crate) fn limit_stack_exact(host: &mut StdHost, stack: &Value, limit: i32) -> Option<()> {
     if is_empty_stack_handle(stack) {
         return Some(());
     }
@@ -985,22 +1271,21 @@ pub(crate) fn limit_stack_for_container(
         return None;
     }
     let key = handle.key().to_owned();
-    let (item_id, patch, empty) = {
-        let live = host.recipes.stacks.get(&key)?;
-        (live.item_id.clone(), live.patch.clone(), live.is_empty())
-    };
-    if empty {
-        return Some(());
-    }
-    let item_max = max_stack_size_for_item(host, &item_id, &patch)?;
-    let limit = container_max.min(item_max);
-    if let Some(live) = host.recipes.stacks.get_mut(&key)
-        && !live.is_empty()
-        && live.count > limit
-    {
+    let live = host.recipes.stacks.get_mut(&key)?;
+    if !live.is_empty() && live.count > limit {
         live.count = limit;
     }
     Some(())
+}
+
+pub(crate) fn limit_stack_for_container(
+    host: &mut StdHost,
+    stack: &Value,
+    container_max: i32,
+) -> Option<()> {
+    let item_max = stack_max_stack_size(host, stack)?;
+    let limit = container_max.min(item_max);
+    limit_stack_exact(host, stack, limit)
 }
 
 pub(crate) fn random_new(host: &mut StdHost, class: &str) -> Option<Value> {
@@ -1291,7 +1576,8 @@ fn stack_instance_call_empty(
         ("isEmpty", "()Z") => Some(Ok(Value::Int(1))),
         ("getCount" | "count", "()I") => Some(Ok(Value::Int(0))),
         ("setCount" | "grow" | "shrink" | "limitSize", "(I)V") => Some(Ok(Value::Void)),
-        ("getMaxStackSize", "()I") => Some(Ok(Value::Int(64))),
+        // MC 26.3: ItemInstance.getMaxStackSize() = getOrDefault(MAX_STACK_SIZE, 1); EMPTY has empty map -> 1.
+        ("getMaxStackSize", "()I") => Some(Ok(Value::Int(1))),
         ("getItem", "()Lnet/minecraft/world/item/Item;") => {
             Some(Ok(item_value_for_id(host, "minecraft:air")))
         }
@@ -1367,12 +1653,16 @@ fn live_stack_instance_call(
             return Some(Err(npe()));
         }
         let item_id = resolve_item_id(host, item_arg)?;
+        let mut sanitized = ComponentPatch::default();
+        if item_id != "minecraft:air" && !patch.is_empty() {
+            patched_apply_patch(host, &item_id, &mut sanitized, &patch)?;
+        }
         host.recipes.stacks.insert(
             key,
             LiveStack {
                 item_id,
                 count,
-                patch,
+                patch: sanitized,
             },
         );
         return Some(Ok(Value::Void));
@@ -1405,7 +1695,7 @@ fn live_stack_instance_call(
                 Err(e) => return Some(Err(e)),
             };
             if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.count = slot.count.wrapping_add(delta);
+                slot.count = slot.effective_count().wrapping_add(delta);
             }
             Some(Ok(Value::Void))
         }
@@ -1415,7 +1705,7 @@ fn live_stack_instance_call(
                 Err(e) => return Some(Err(e)),
             };
             if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.count = slot.count.wrapping_sub(delta);
+                slot.count = slot.effective_count().wrapping_sub(delta);
             }
             Some(Ok(Value::Void))
         }
@@ -1433,7 +1723,10 @@ fn live_stack_instance_call(
             Some(Ok(Value::Void))
         }
         ("getMaxStackSize", "()I") => {
-            let max = max_stack_size_for_item(host, live.effective_item_id(), &live.patch)?;
+            if live.is_empty() {
+                return Some(Ok(Value::Int(1)));
+            }
+            let max = max_stack_size_for_item(host, &live.item_id, &live.patch)?;
             Some(Ok(Value::Int(max)))
         }
         ("getItem", "()Lnet/minecraft/world/item/Item;") => {
@@ -1476,29 +1769,17 @@ fn live_stack_instance_call(
             "set",
             "(Lnet/minecraft/core/component/DataComponentType;Ljava/lang/Object;)Ljava/lang/Object;",
         ) => {
-            if live.is_empty() {
-                return Some(Ok(Value::Ref(None)));
-            }
             let type_arg = args.first()?;
             let val_arg = args.get(1)?;
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
-            let slot = host.recipes.stacks.get_mut(&key)?;
-            let prev = if matches!(val_arg, Value::Ref(None)) {
-                slot.patch
-                    .entries
-                    .insert(comp_id, None)
-                    .flatten()
-                    .unwrap_or(Value::Ref(None))
-            } else {
-                slot.patch
-                    .entries
-                    .insert(comp_id, Some(val_arg.clone()))
-                    .flatten()
-                    .unwrap_or(Value::Ref(None))
-            };
+            let mut next_patch = live.patch.clone();
+            let prev = patched_set(host, &live.item_id, &mut next_patch, &comp_id, val_arg)?;
+            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
+                slot.patch = next_patch;
+            }
             Some(Ok(prev))
         }
         ("get", "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;") => {
@@ -1513,21 +1794,16 @@ fn live_stack_instance_call(
             stack_component_get(host, &live.item_id, &live.patch, &comp_id).map(Ok)
         }
         ("remove", "(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;") => {
-            if live.is_empty() {
-                return Some(Ok(Value::Ref(None)));
-            }
             let type_arg = args.first()?;
             if matches!(type_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
             let comp_id = resolve_data_component_type_id(host, type_arg)?;
-            let slot = host.recipes.stacks.get_mut(&key)?;
-            let prev = slot
-                .patch
-                .entries
-                .insert(comp_id, None)
-                .flatten()
-                .unwrap_or(Value::Ref(None));
+            let mut next_patch = live.patch.clone();
+            let prev = patched_remove(host, &live.item_id, &mut next_patch, &comp_id)?;
+            if let Some(slot) = host.recipes.stacks.get_mut(&key) {
+                slot.patch = next_patch;
+            }
             Some(Ok(prev))
         }
         ("has", "(Lnet/minecraft/core/component/DataComponentType;)Z") => {
@@ -1543,16 +1819,15 @@ fn live_stack_instance_call(
                 .map(|v| Ok(Value::Int(i32::from(!matches!(v, Value::Ref(None))))))
         }
         ("applyComponents", "(Lnet/minecraft/core/component/DataComponentPatch;)V") => {
-            if live.is_empty() {
-                return Some(Ok(Value::Void));
-            }
             let patch_arg = args.first()?;
             if matches!(patch_arg, Value::Ref(None)) {
                 return Some(Err(npe()));
             }
             let overlay = host.recipes.patch_of(patch_arg)?.clone();
+            let mut next_patch = live.patch.clone();
+            patched_apply_patch(host, &live.item_id, &mut next_patch, &overlay)?;
             if let Some(slot) = host.recipes.stacks.get_mut(&key) {
-                slot.patch.apply_overlay(&overlay);
+                slot.patch = next_patch;
             }
             Some(Ok(Value::Void))
         }
@@ -1589,32 +1864,7 @@ pub(crate) fn stack_component_get(
     if let Some(entry) = patch.entries.get(comp_id) {
         return Some(entry.clone().unwrap_or(Value::Ref(None)));
     }
-    if comp_id == "minecraft:max_stack_size" {
-        return base_max_stack_size(host, item_id).map(|n| Value::Boxed(Boxed::Integer(n)));
-    }
-    if comp_id == "minecraft:repair_cost" {
-        return Some(Value::Boxed(Boxed::Integer(0)));
-    }
-    // Mod-registered component types and standard unpopulated optional vanilla components
-    // are absent (`null`) on default item prototypes.
-    let is_mod_component = host
-        .registrations()
-        .iter()
-        .any(|e| e.registry == "minecraft:data_component_type" && e.id == comp_id);
-    if is_mod_component
-        || matches!(
-            comp_id,
-            "minecraft:custom_data"
-                | "minecraft:custom_name"
-                | "minecraft:custom_model_data"
-                | "minecraft:enchantment_glint_override"
-                | "minecraft:unbreakable"
-                | "minecraft:profile"
-        )
-    {
-        return Some(Value::Ref(None));
-    }
-    None
+    prototype_component(host, item_id, comp_id).map(|opt| opt.unwrap_or(Value::Ref(None)))
 }
 
 fn patch_instance_call(
@@ -1960,7 +2210,7 @@ pub(crate) fn runtime_object_equals<H: Host>(
             ) else {
                 return Ok(None);
             };
-            patches_equal_runtime(runtime, &a, &b).map(Some)
+            patches_equal_runtime(runtime, &a, &b)
         }
         HostKind::ItemStackTemplate => {
             let Value::Host(other_h) = other else {
@@ -1978,7 +2228,7 @@ pub(crate) fn runtime_object_equals<H: Host>(
             if a.item_id != b.item_id || a.count != b.count {
                 return Ok(Some(false));
             }
-            patches_equal_runtime(runtime, &a.patch, &b.patch).map(Some)
+            patches_equal_runtime(runtime, &a.patch, &b.patch)
         }
         _ => Ok(None),
     }
@@ -1988,25 +2238,30 @@ fn patches_equal_runtime<H: Host>(
     runtime: &mut Runtime<'_, H>,
     a: &ComponentPatch,
     b: &ComponentPatch,
-) -> Result<bool, NativeError> {
+) -> Result<Option<bool>, NativeError> {
     if a.entries.len() != b.entries.len() {
-        return Ok(false);
+        return Ok(Some(false));
     }
     for (k, va) in &a.entries {
         let Some(vb) = b.entries.get(k) else {
-            return Ok(false);
+            return Ok(Some(false));
         };
         match (va, vb) {
             (None, None) => {}
             (Some(x), Some(y)) => {
-                if !runtime.objects_equals(x, y)? {
-                    return Ok(false);
+                let before = runtime.host.counted_unknown_calls();
+                let equal = runtime.objects_equals(x, y)?;
+                if runtime.host.counted_unknown_calls() != before {
+                    return Ok(None);
+                }
+                if !equal {
+                    return Ok(Some(false));
                 }
             }
-            _ => return Ok(false),
+            _ => return Ok(Some(false)),
         }
     }
-    Ok(true)
+    Ok(Some(true))
 }
 
 /// Runtime-side `Ingredient.of(ItemLike...)` (reads array elements from `Runtime::arrays`).
@@ -2054,7 +2309,7 @@ pub(crate) fn runtime_static_call<H: Host>(
     Ok(None)
 }
 
-fn cache_fingerprint(host: &StdHost) -> (usize, usize, usize, usize) {
+fn cache_fingerprint(host: &StdHost) -> (usize, usize, u64, usize) {
     let serializers = host
         .registrations()
         .iter()
@@ -2065,9 +2320,24 @@ fn cache_fingerprint(host: &StdHost) -> (usize, usize, usize, usize) {
         .iter()
         .filter(|e| e.registry == "minecraft:item")
         .count();
-    let resources = host.resource_byte_count();
+    let res_gen = host.resource_generation();
     let tags = host.recipes.extra_item_tags.len();
-    (serializers, items, resources, tags)
+    (serializers, items, res_gen, tags)
+}
+
+/// Isolated accessor reading a `RecipeSerializer`'s `MapCodec` so swapping to PR #614's
+/// `recipe_serializer::parts` is a one-line change.
+fn serializer_codec(host: &StdHost, value: &Value) -> Option<Value> {
+    let Value::Host(handle) = value else {
+        return None;
+    };
+    if handle.kind() != HostKind::RecipeSerializer {
+        return None;
+    }
+    host.recipes
+        .serializers
+        .get(handle.key())
+        .map(|data| data.codec.clone())
 }
 
 fn parse_recipe_resource_id(path: &str) -> Option<String> {
@@ -2080,8 +2350,27 @@ fn parse_recipe_resource_id(path: &str) -> Option<String> {
     normalize_id(&format!("{ns}:{recipe_path}"))
 }
 
-/// Load and cache all `data/<ns>/recipe/**/*.json` resources whose `"type"` names a mod-registered
-/// `minecraft:recipe_serializer`, decoding each through that serializer's own DFU `MapCodec`.
+/// Extract a recipe id from a `ResourceKey`, enforcing that its registry is `minecraft:recipe`.
+/// Returns `None` if `key` is not a modelled `ResourceKey` (caller must count), `Some(None)` if
+/// `key` is null or belongs to another registry (e.g. `minecraft:item`), or `Some(Some(id))`.
+fn recipe_key_id(key: &Value) -> Option<Option<String>> {
+    if matches!(key, Value::Ref(None)) {
+        return Some(None);
+    }
+    if !crate::host_ids::is_resource_key(key) {
+        return None;
+    }
+    let reg = crate::host_ids::registry_name(&crate::host_ids::key_registry(key)?)?;
+    if reg != "minecraft:recipe" {
+        return Some(None);
+    }
+    let loc = crate::host_ids::identifier_key(&crate::host_ids::key_location(key)?)?.to_owned();
+    Some(Some(loc))
+}
+
+/// Load and cache all `data/<ns>/recipe/**/*.json` resources across every loaded jar and datapack
+/// layer in vanilla's pack order (higher-priority layer overrides lower-priority layer for
+/// duplicate recipe ids), decoding each mod-serializer recipe through its own DFU `MapCodec`.
 pub(crate) fn ensure_recipes_loaded<H: Host>(
     runtime: &mut Runtime<'_, H>,
 ) -> Result<(), NativeError> {
@@ -2101,51 +2390,83 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
         let mut ser_codecs: BTreeMap<String, Value> = BTreeMap::new();
         for entry in std_host.registrations() {
             if entry.registry == "minecraft:recipe_serializer"
-                && let Value::Host(handle) = &entry.value
-                && handle.kind() == HostKind::RecipeSerializer
-                && let Some(data) = std_host.recipes.serializers.get(handle.key())
+                && let Some(codec) = serializer_codec(std_host, &entry.value)
             {
-                ser_codecs.insert(entry.id.clone(), data.codec.clone());
+                ser_codecs.insert(entry.id.clone(), codec);
             }
         }
-        let entries: Vec<(String, Vec<u8>)> = std_host
-            .iter_resource_bytes()
-            .filter_map(|(path, bytes)| {
-                let id = parse_recipe_resource_id(path)?;
-                Some((id, bytes.clone()))
-            })
-            .collect();
-        (fp, ser_codecs, entries)
+        // Build ordered layer map (lowest -> highest priority): later packs override earlier packs
+        // for duplicate recipe ids while retaining source-pack provenance.
+        let mut by_id: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
+        for (pack_id, layer) in std_host.ordered_data_layers() {
+            for (path, bytes) in layer {
+                if let Some(id) = parse_recipe_resource_id(path) {
+                    by_id.insert(id, (pack_id.to_owned(), bytes.clone()));
+                }
+            }
+        }
+        (fp, ser_codecs, by_id)
     };
 
     let mut loaded_recipes = Vec::new();
     let mut errors = Vec::new();
+    let mut unmodelled_serializers = BTreeSet::new();
+    let mut skipped_recipe_ids = BTreeSet::new();
 
-    for (recipe_id, bytes) in recipe_entries {
+    for (recipe_id, (source_pack, bytes)) in recipe_entries {
         let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(err) => {
-                errors.push((recipe_id, format!("invalid recipe JSON: {err}")));
+                errors.push((
+                    recipe_id,
+                    format!("[{source_pack}] invalid recipe JSON: {err}"),
+                ));
                 continue;
             }
         };
         let Some(obj) = parsed.as_object() else {
-            errors.push((recipe_id, "recipe JSON root is not an object".into()));
+            errors.push((
+                recipe_id,
+                format!("[{source_pack}] recipe JSON root is not an object"),
+            ));
             continue;
         };
         let Some(raw_type) = obj.get("type").and_then(serde_json::Value::as_str) else {
+            errors.push((
+                recipe_id,
+                format!("[{source_pack}] missing recipe serializer type"),
+            ));
             continue;
         };
         let Some(norm_type) = normalize_id(raw_type) else {
+            errors.push((
+                recipe_id,
+                format!("[{source_pack}] invalid recipe serializer id: {raw_type}"),
+            ));
             continue;
         };
         let Some(map_codec) = serializer_codecs.get(&norm_type) else {
-            // Vanilla or unregistered serializer (e.g. `minecraft:crafting_shaped`): skip.
+            skipped_recipe_ids.insert(recipe_id);
+            if !vanilla_item_data::is_vanilla_recipe_serializer(&norm_type) {
+                unmodelled_serializers.insert(norm_type);
+            }
             continue;
         };
 
-        match crate::dfu_codec::decode_map_json(runtime, map_codec, obj)? {
+        let before_decode = runtime.host.counted_unknown_calls();
+        let decode_result = crate::dfu_codec::decode_map_json(runtime, map_codec, obj)?;
+        let decode_counted = runtime.host.counted_unknown_calls() != before_decode;
+        let outcome = if decode_counted {
+            Err(DecodeError::Unmodelled(
+                "counted unknown call during recipe decode".into(),
+            ))
+        } else {
+            decode_result
+        };
+
+        match outcome {
             Ok(recipe_value) => {
+                let before_type = runtime.host.counted_unknown_calls();
                 let recipe_type = runtime.call_virtual(
                     crate::jdk_call::Site::Interface,
                     "net/minecraft/world/item/crafting/Recipe",
@@ -2154,6 +2475,20 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
                     &recipe_value,
                     &[],
                 )?;
+                if runtime.host.counted_unknown_calls() != before_type {
+                    let _ = runtime.host.unknown_operand_call(&MethodRef {
+                        owner: RECIPE_MANAGER.into(),
+                        name: "decodeRecipe".into(),
+                        descriptor: format!("({norm_type})V"),
+                    });
+                    unmodelled_serializers.insert(norm_type);
+                    skipped_recipe_ids.insert(recipe_id.clone());
+                    errors.push((
+                        recipe_id,
+                        format!("[{source_pack}] counted unknown call inside Recipe.getType"),
+                    ));
+                    continue;
+                }
                 let key = crate::host_ids::resource_key_named("minecraft:recipe", &recipe_id);
                 let holder = {
                     let Some(std_host) = runtime.host.as_std_host_mut() else {
@@ -2163,13 +2498,14 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
                 };
                 loaded_recipes.push(LoadedRecipe {
                     id: recipe_id,
+                    source_pack,
                     recipe_type,
                     recipe: recipe_value,
                     holder,
                 });
             }
             Err(DecodeError::Invalid(msg)) => {
-                errors.push((recipe_id, msg));
+                errors.push((recipe_id, format!("[{source_pack}] {msg}")));
             }
             Err(DecodeError::Unmodelled(msg)) => {
                 let _ = runtime.host.unknown_operand_call(&MethodRef {
@@ -2177,7 +2513,12 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
                     name: "decodeRecipe".into(),
                     descriptor: format!("({norm_type})V"),
                 });
-                errors.push((recipe_id, format!("unmodelled codec: {msg}")));
+                unmodelled_serializers.insert(norm_type);
+                skipped_recipe_ids.insert(recipe_id.clone());
+                errors.push((
+                    recipe_id,
+                    format!("[{source_pack}] unmodelled codec: {msg}"),
+                ));
             }
         }
     }
@@ -2187,6 +2528,8 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
             fingerprint,
             recipes: loaded_recipes,
             errors,
+            unmodelled_serializers,
+            skipped_recipe_ids,
         });
     }
     Ok(())
@@ -2217,7 +2560,7 @@ pub(crate) fn runtime_recipe_manager_call<H: Host>(
             let [recipe_type, input, level] = args else {
                 return Ok(None);
             };
-            find_matching_recipe(runtime, recipe_type, input, level, None, None).map(Some)
+            find_matching_recipe(runtime, recipe_type, input, level, None, None)
         }
         (
             "getRecipeFor",
@@ -2227,7 +2570,7 @@ pub(crate) fn runtime_recipe_manager_call<H: Host>(
                 return Ok(None);
             };
             let hint_key = (!matches!(last_key, Value::Ref(None))).then_some(last_key);
-            find_matching_recipe(runtime, recipe_type, input, level, hint_key, None).map(Some)
+            find_matching_recipe(runtime, recipe_type, input, level, hint_key, None)
         }
         (
             "getRecipeFor",
@@ -2237,43 +2580,65 @@ pub(crate) fn runtime_recipe_manager_call<H: Host>(
                 return Ok(None);
             };
             let hint_holder = (!matches!(last_holder, Value::Ref(None))).then_some(last_holder);
-            find_matching_recipe(runtime, recipe_type, input, level, None, hint_holder).map(Some)
+            find_matching_recipe(runtime, recipe_type, input, level, None, hint_holder)
         }
         ("byKey", "(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;") => {
             let Some(key) = args.first() else {
                 return Ok(None);
             };
+            let Some(wanted_opt) = recipe_key_id(key) else {
+                return Ok(None);
+            };
+            let Some(wanted_id) = wanted_opt else {
+                // Null key or non-`minecraft:recipe` ResourceKey (e.g. `minecraft:item`): never matches.
+                return Ok(Some(crate::empty_optional()));
+            };
             ensure_recipes_loaded(runtime)?;
             let Some(std_host) = runtime.host.as_std_host() else {
                 return Ok(None);
             };
-            let wanted_id = crate::host_ids::key_location(key)
-                .and_then(|id| crate::host_ids::identifier_key(&id).map(str::to_owned));
-            let found = wanted_id.and_then(|wanted| {
-                std_host
-                    .recipes
-                    .loaded
-                    .as_ref()?
-                    .recipes
+            let cache = std_host.recipes.loaded.as_ref();
+            if let Some(holder) = cache.and_then(|c| {
+                c.recipes
                     .iter()
-                    .find(|rec| rec.id == wanted)
+                    .find(|rec| rec.id == wanted_id)
                     .map(|rec| rec.holder.clone())
-            });
-            Ok(Some(match found {
-                Some(holder) => crate::optional_wrap(holder),
-                None => crate::empty_optional(),
-            }))
+            }) {
+                return Ok(Some(crate::optional_wrap(holder)));
+            }
+            // Never return an uncounted empty Optional for vanilla recipes or skipped/unmodelled
+            // recipes whose serializer we could not decode.
+            if wanted_id.starts_with("minecraft:")
+                || cache.is_some_and(|c| c.skipped_recipe_ids.contains(&wanted_id))
+            {
+                return Ok(None);
+            }
+            Ok(Some(crate::empty_optional()))
         }
         _ => Ok(None),
     }
 }
 
-fn recipe_matches<H: Host>(
+fn objects_equals_exact<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    a: &Value,
+    b: &Value,
+) -> Result<Option<bool>, NativeError> {
+    let before = runtime.host.counted_unknown_calls();
+    let equal = runtime.objects_equals(a, b)?;
+    if runtime.host.counted_unknown_calls() != before {
+        return Ok(None);
+    }
+    Ok(Some(equal))
+}
+
+fn recipe_matches_exact<H: Host>(
     runtime: &mut Runtime<'_, H>,
     recipe: &Value,
     input: &Value,
     level: &Value,
-) -> Result<bool, NativeError> {
+) -> Result<Option<bool>, NativeError> {
+    let before = runtime.host.counted_unknown_calls();
     let result = runtime.call_virtual(
         crate::jdk_call::Site::Interface,
         "net/minecraft/world/item/crafting/Recipe",
@@ -2282,7 +2647,134 @@ fn recipe_matches<H: Host>(
         recipe,
         &[input.clone(), level.clone()],
     )?;
-    Ok(matches!(result, Value::Int(v) if v != 0))
+    if runtime.host.counted_unknown_calls() != before {
+        return Ok(None);
+    }
+    Ok(Some(matches!(result, Value::Int(v) if v != 0)))
+}
+
+/// Evaluate `RecipeInput.isEmpty()` virtually: runs the mod's override when defined, otherwise
+/// runs MC 26.3's default `RecipeInput.isEmpty()` loop over virtual `size()` and `getItem(i)`.
+/// Returns `Ok(None)` if any inner call was counted or an unknown `ItemStack` was encountered.
+fn recipe_input_is_empty<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    input: &Value,
+) -> Result<Option<bool>, NativeError> {
+    if matches!(input, Value::Ref(None)) {
+        return Err(npe());
+    }
+    let Some(class_name) = crate::jar_object::object_key(input)
+        .and_then(|key| key.split_once('#').map(|(cls, _)| cls.to_owned()))
+    else {
+        return Ok(None);
+    };
+    if runtime
+        .jar_method_owner(&class_name, "isEmpty", "()Z")
+        .is_some()
+    {
+        let before = runtime.host.counted_unknown_calls();
+        let res = runtime.call_virtual(
+            crate::jdk_call::Site::Interface,
+            "net/minecraft/world/item/crafting/RecipeInput",
+            "isEmpty",
+            "()Z",
+            input,
+            &[],
+        )?;
+        if runtime.host.counted_unknown_calls() != before {
+            return Ok(None);
+        }
+        return Ok(Some(matches!(res, Value::Int(v) if v != 0)));
+    }
+    // Default `RecipeInput.isEmpty()` from MC 26.3:
+    // `for (int i = 0; i < this.size(); ++i) if (!this.getItem(i).isEmpty()) return false; return true;`
+    let before_size = runtime.host.counted_unknown_calls();
+    let size_val = runtime.call_virtual(
+        crate::jdk_call::Site::Interface,
+        "net/minecraft/world/item/crafting/RecipeInput",
+        "size",
+        "()I",
+        input,
+        &[],
+    )?;
+    if runtime.host.counted_unknown_calls() != before_size {
+        return Ok(None);
+    }
+    let Value::Int(size) = size_val else {
+        return Ok(None);
+    };
+    for i in 0..size {
+        let before_item = runtime.host.counted_unknown_calls();
+        let stack = runtime.call_virtual(
+            crate::jdk_call::Site::Interface,
+            "net/minecraft/world/item/crafting/RecipeInput",
+            "getItem",
+            "(I)Lnet/minecraft/world/item/ItemStack;",
+            input,
+            &[Value::Int(i)],
+        )?;
+        if runtime.host.counted_unknown_calls() != before_item {
+            return Ok(None);
+        }
+        if matches!(stack, Value::Ref(None)) {
+            return Err(npe());
+        }
+        let Some(empty) = runtime
+            .host
+            .as_std_host()
+            .and_then(|h| stack_is_empty(h, &stack))
+        else {
+            return Ok(None);
+        };
+        if !empty {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+/// Whether `recipe_type` is a mod-registered non-vanilla `RecipeType` whose recipes are completely
+/// loaded (no unmodelled or unregistered non-vanilla serializers in the datapack layers).
+/// Vanilla `RecipeType`s and unknown/incomplete types return `Some(false)` so `getRecipeFor` stays
+/// counted instead of returning a false empty `Optional`.
+fn is_known_complete_recipe_type<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    recipe_type: &Value,
+) -> Result<Option<bool>, NativeError> {
+    if matches!(recipe_type, Value::Ref(None)) {
+        return Ok(Some(false));
+    }
+    let (registered_types, has_unmodelled) = {
+        let Some(std_host) = runtime.host.as_std_host() else {
+            return Ok(None);
+        };
+        let types: Vec<(String, Value)> = std_host
+            .registrations()
+            .iter()
+            .filter(|e| e.registry == "minecraft:recipe_type")
+            .map(|e| (e.id.clone(), e.value.clone()))
+            .collect();
+        let unmodelled = std_host
+            .recipes
+            .loaded
+            .as_ref()
+            .is_some_and(|c| !c.unmodelled_serializers.is_empty());
+        (types, unmodelled)
+    };
+    if has_unmodelled {
+        return Ok(Some(false));
+    }
+    for (id, reg_val) in &registered_types {
+        let Some(eq) = objects_equals_exact(runtime, reg_val, recipe_type)? else {
+            return Ok(None);
+        };
+        if eq {
+            let is_vanilla =
+                vanilla_item_data::is_vanilla_recipe_type(id) || id.starts_with("minecraft:");
+            return Ok(Some(!is_vanilla));
+        }
+    }
+    Ok(Some(false))
 }
 
 fn find_matching_recipe<H: Host>(
@@ -2292,24 +2784,13 @@ fn find_matching_recipe<H: Host>(
     level: &Value,
     hint_key: Option<&Value>,
     hint_holder: Option<&Value>,
-) -> Result<Value, NativeError> {
+) -> Result<Option<Value>, NativeError> {
     ensure_recipes_loaded(runtime)?;
 
-    // 4-arg RecipeHolder fast path: check `lastRecipe.value().matches(input, level)` first.
-    if let Some(holder_val) = hint_holder {
-        let holder_recipe = runtime.host.as_std_host().and_then(|h| {
-            let Value::Host(handle) = holder_val else {
-                return None;
-            };
-            (handle.kind() == HostKind::RecipeHolder)
-                .then(|| h.recipes.holders.get(handle.key()).map(|d| d.value.clone()))
-                .flatten()
-        });
-        if let Some(recipe) = holder_recipe
-            && recipe_matches(runtime, &recipe, input, level)?
-        {
-            return Ok(crate::optional_wrap(holder_val.clone()));
-        }
+    // Keep vanilla / unregistered / incomplete recipe types counted rather than returning an
+    // uncounted `Optional.empty()`.
+    if is_known_complete_recipe_type(runtime, recipe_type)? != Some(true) {
+        return Ok(None);
     }
 
     let candidates: Vec<LoadedRecipe> = runtime
@@ -2319,25 +2800,78 @@ fn find_matching_recipe<H: Host>(
         .map(|c| c.recipes.clone())
         .unwrap_or_default();
 
-    // 4-arg ResourceKey fast path: check hinted key first if present and matching recipe_type.
-    if let Some(key_val) = hint_key
-        && let Some(wanted_id) = crate::host_ids::key_location(key_val)
-            .and_then(|id| crate::host_ids::identifier_key(&id).map(str::to_owned))
-        && let Some(candidate) = candidates.iter().find(|c| c.id == wanted_id)
-        && runtime.objects_equals(&candidate.recipe_type, recipe_type)?
-        && recipe_matches(runtime, &candidate.recipe, input, level)?
-    {
-        return Ok(crate::optional_wrap(candidate.holder.clone()));
+    // Exact MC 26.3 `RecipeManager.getRecipeFor(type, input, level, ResourceKey)`:
+    // resolves `byKeyTyped(type, lastKey)` (checking registry `minecraft:recipe` and `getType()`)
+    // then delegates to the 4-arg `RecipeHolder` overload.
+    let resolved_hint_holder = if let Some(holder_val) = hint_holder {
+        Some(holder_val.clone())
+    } else if let Some(key_val) = hint_key {
+        let Some(wanted_opt) = recipe_key_id(key_val) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        if let Some(wanted_id) = wanted_opt
+            && let Some(candidate) = candidates.iter().find(|c| c.id == wanted_id)
+        {
+            let Some(same_type) =
+                objects_equals_exact(runtime, &candidate.recipe_type, recipe_type)?
+            else {
+                return Ok(None);
+            };
+            if same_type {
+                found = Some(candidate.holder.clone());
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    // Exact MC 26.3 4-arg `RecipeHolder` fast path: check `lastRecipe.value().matches(input, level)`.
+    if let Some(holder_val) = resolved_hint_holder {
+        let holder_recipe = runtime.host.as_std_host().and_then(|h| {
+            let Value::Host(handle) = &holder_val else {
+                return None;
+            };
+            (handle.kind() == HostKind::RecipeHolder)
+                .then(|| h.recipes.holders.get(handle.key()).map(|d| d.value.clone()))
+                .flatten()
+        });
+        let Some(recipe) = holder_recipe else {
+            return Ok(None);
+        };
+        let Some(matched) = recipe_matches_exact(runtime, &recipe, input, level)? else {
+            return Ok(None);
+        };
+        if matched {
+            return Ok(Some(crate::optional_wrap(holder_val)));
+        }
+    }
+
+    // Exact MC 26.3 `RecipeMap.getRecipesFor`: precheck `input.isEmpty()` before testing any recipe.
+    let Some(empty) = recipe_input_is_empty(runtime, input)? else {
+        return Ok(None);
+    };
+    if empty {
+        return Ok(Some(crate::empty_optional()));
     }
 
     for candidate in &candidates {
-        if runtime.objects_equals(&candidate.recipe_type, recipe_type)?
-            && recipe_matches(runtime, &candidate.recipe, input, level)?
-        {
-            return Ok(crate::optional_wrap(candidate.holder.clone()));
+        let Some(same_type) = objects_equals_exact(runtime, &candidate.recipe_type, recipe_type)?
+        else {
+            return Ok(None);
+        };
+        if !same_type {
+            continue;
+        }
+        let Some(matched) = recipe_matches_exact(runtime, &candidate.recipe, input, level)? else {
+            return Ok(None);
+        };
+        if matched {
+            return Ok(Some(crate::optional_wrap(candidate.holder.clone())));
         }
     }
-    Ok(crate::empty_optional())
+    Ok(Some(crate::empty_optional()))
 }
 
 pub(crate) fn item_stack_template_illegal_state(message: &str) -> NativeError {

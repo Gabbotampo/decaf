@@ -3461,6 +3461,12 @@ pub struct StdHost {
     /// Bounded bytes for resources explicitly supplied by a loaded jar or
     /// adapter. Marker-only resources keep an empty stream.
     resource_bytes: BTreeMap<String, Vec<u8>>,
+    /// Ordered explicit datapack layers stacked above all loaded jars (lowest -> highest).
+    data_pack_layers: Vec<(String, BTreeMap<String, Vec<u8>>)>,
+    /// Monotonic counter bumped whenever resources, linked jars, or datapack layers change.
+    resource_generation: u64,
+    /// Per-call container stack clamp resolved virtually for `SimpleContainer.setItem`.
+    pending_container_clamp: Option<menu_models::ContainerClamp>,
     resource_streams: BTreeMap<String, (Vec<u8>, usize)>,
     resource_marks: BTreeMap<String, usize>,
     /// Explicitly seeded class names exposed through `ClassLoader.loadClass`.
@@ -3833,6 +3839,9 @@ impl StdHost {
             environment: BTreeMap::new(),
             resources: BTreeMap::new(),
             resource_bytes: BTreeMap::new(),
+            data_pack_layers: Vec::new(),
+            resource_generation: 0,
+            pending_container_clamp: None,
             resource_streams: BTreeMap::new(),
             resource_marks: BTreeMap::new(),
             classes: BTreeMap::new(),
@@ -4049,6 +4058,21 @@ impl StdHost {
             .unwrap_or_default()
     }
 
+    /// `(recipe_id, source_pack)` pairs for recipes decoded through mod-registered serializers.
+    pub fn loaded_recipe_sources(&self) -> Vec<(String, String)> {
+        self.recipes
+            .loaded
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .recipes
+                    .iter()
+                    .map(|r| (r.id.clone(), r.source_pack.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Recipe JSON decode errors captured when loading mod-registered recipe types.
     pub fn recipe_decode_errors(&self) -> &[(String, String)] {
         self.recipes
@@ -4077,16 +4101,56 @@ impl StdHost {
         self.constructed_items.contains(marker)
     }
 
-    pub(crate) fn resource_bytes_for(&self, path: &str) -> Option<&Vec<u8>> {
-        self.resource_bytes.get(path)
+    pub(crate) fn resource_generation(&self) -> u64 {
+        self.resource_generation
+            .wrapping_add(self.linked_classes.data_layer_entry_count() as u64)
+            .wrapping_add((self.linked_classes.data_layers().len() as u64) << 32)
+            .wrapping_add((self.resource_bytes.len() as u64) << 16)
     }
 
-    pub(crate) fn resource_byte_count(&self) -> usize {
-        self.resource_bytes.len()
+    /// Stack an explicit datapack layer (e.g. a world datapack or test override) above all
+    /// loaded jars and earlier datapack layers. Later layers override earlier ones.
+    pub fn add_data_pack_layer(
+        &mut self,
+        id: impl Into<String>,
+        resources: BTreeMap<String, Vec<u8>>,
+    ) {
+        let normalized = resources
+            .into_iter()
+            .map(|(k, v)| (k.trim_start_matches('/').to_owned(), v))
+            .collect();
+        self.data_pack_layers.push((id.into(), normalized));
+        self.resource_generation = self.resource_generation.wrapping_add(1);
     }
 
-    pub(crate) fn iter_resource_bytes(&self) -> impl Iterator<Item = (&String, &Vec<u8>)> {
-        self.resource_bytes.iter()
+    /// Builder form of [`Self::add_data_pack_layer`].
+    pub fn with_data_pack_layer(
+        mut self,
+        id: impl Into<String>,
+        resources: BTreeMap<String, Vec<u8>>,
+    ) -> Self {
+        self.add_data_pack_layer(id, resources);
+        self
+    }
+
+    /// Ordered `data/` resource layers from lowest priority to highest priority (above vanilla):
+    /// 1. Linked jars in link order (bundled nested deps before their parent jar).
+    /// 2. Primary seeded jar / `with_resource_bytes` entries.
+    /// 3. Explicit datapack layers added via `add_data_pack_layer` / `with_data_pack_layer`.
+    pub(crate) fn ordered_data_layers(&self) -> Vec<(&str, &BTreeMap<String, Vec<u8>>)> {
+        let mut layers = Vec::with_capacity(
+            self.linked_classes.data_layers().len() + 1 + self.data_pack_layers.len(),
+        );
+        for (id, map) in self.linked_classes.data_layers() {
+            layers.push((id.as_str(), map));
+        }
+        if !self.resource_bytes.is_empty() {
+            layers.push(("primary", &self.resource_bytes));
+        }
+        for (id, map) in &self.data_pack_layers {
+            layers.push((id.as_str(), map));
+        }
+        layers
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -4472,6 +4536,7 @@ impl StdHost {
         self.resources.insert(name.clone(), marker.clone());
         self.resource_bytes.insert(name, bytes.clone());
         self.resource_streams.insert(marker, (bytes, 0));
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         self
     }
 
@@ -4556,12 +4621,22 @@ impl StdHost {
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
         let id = id.into();
-        let added = Arc::make_mut(&mut self.linked_classes).link_jar(id.clone(), jar)?;
+        let table = Arc::make_mut(&mut self.linked_classes);
+        let parent_layer_pos = table.data_layers.len();
+        let added = table.link_jar(id.clone(), jar)?;
+        let parent_pushed = table.data_layers.len() > parent_layer_pos;
+        let parent_layer = if parent_pushed {
+            Some(table.data_layers.remove(parent_layer_pos))
+        } else {
+            None
+        };
         self.record_loaded_mod(jar);
         // A loader also puts the linked jar's bundled jars
         // (`META-INF/jars/*.jar`) on the class path: a dependency such as
         // `libjf` keeps its classes there, and its dependents call them.
         // Fabric loads each of them as a mod of its own.
+        // In datapack priority, bundled dependencies sit below the parent mod
+        // so the parent's `data/` resources override its bundled libraries.
         for (entry, nested) in nested_jars::parsed(jar) {
             let _ =
                 Arc::make_mut(&mut self.linked_classes).link_jar(format!("{id}!{entry}"), &nested);
@@ -4579,6 +4654,12 @@ impl StdHost {
                 );
             }
         }
+        if let Some(layer) = parent_layer {
+            Arc::make_mut(&mut self.linked_classes)
+                .data_layers
+                .push(layer);
+        }
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         Ok(added)
     }
 
@@ -4700,6 +4781,7 @@ impl StdHost {
     /// per host otherwise, which doubles the class bytes of a whole pack).
     pub fn with_linked_class_table(mut self, table: Arc<LinkedClassTable>) -> Self {
         self.linked_classes = table;
+        self.resource_generation = self.resource_generation.wrapping_add(1);
         self
     }
 
@@ -6106,8 +6188,20 @@ impl menu_models::StackOps for StdHost {
         recipe_models::stack_is_empty(self, value)
     }
 
-    fn clamp(&mut self, value: &Value, max: i32) -> Option<()> {
+    fn max_stack_size(&self, value: &Value) -> Option<i32> {
+        recipe_models::stack_max_stack_size(self, value)
+    }
+
+    fn clamp_for_container(&mut self, value: &Value, max: i32) -> Option<()> {
         recipe_models::limit_stack_for_container(self, value, max)
+    }
+
+    fn clamp_exact(&mut self, value: &Value, limit: i32) -> Option<()> {
+        recipe_models::limit_stack_exact(self, value, limit)
+    }
+
+    fn take_pending_clamp(&mut self) -> Option<menu_models::ContainerClamp> {
+        self.pending_container_clamp.take()
     }
 }
 
@@ -17788,6 +17882,8 @@ pub struct LinkedClassTable {
     /// Each linked jar's resources by name, with the marker the host answers
     /// for them (`linked_resources.rs`).
     resources: BTreeMap<String, (String, Vec<u8>)>,
+    /// Ordered per-jar `data/` resource layers for datapack recipe/tag resolution.
+    data_layers: Vec<(String, BTreeMap<String, Vec<u8>>)>,
 }
 
 impl LinkedClassTable {
@@ -17814,8 +17910,9 @@ impl LinkedClassTable {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        let added = self.link_classes(id, jar.classes.values().cloned())?;
-        self.link_resources(jar);
+        let id = id.into();
+        let added = self.link_classes(id.clone(), jar.classes.values().cloned())?;
+        self.link_resources(&id, jar);
         self.link_services(jar);
         Ok(added)
     }
@@ -31226,10 +31323,129 @@ impl<H: Host> Runtime<'_, H> {
     fn invoke_menu_model(
         &mut self,
         r: &MethodRef,
+        opcode: u8,
         receiver: &Value,
         args: &[Value],
     ) -> Result<Option<Value>, NativeError> {
-        let Some(result) = self.host.menu_instance_call(r, receiver, args) else {
+        let receiver_class = crate::expect_ref(receiver)
+            .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()));
+        let is_container_owner = matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/Container"
+                | "net/minecraft/world/SimpleContainer"
+                | "net/minecraft/world/inventory/ResultContainer"
+                | "net/minecraft/world/inventory/RecipeCraftingHolder"
+        ) || self
+            .jar_extends(&r.owner, "net/minecraft/world/SimpleContainer")
+            || self.jar_extends(&r.owner, "net/minecraft/world/inventory/ResultContainer");
+
+        // On a virtual/interface call to a jar container subclass (e.g. a mod overriding
+        // `SimpleContainer.getMaxStackSize()` or `setItem`), let the jar's own override execute
+        // instead of shadowing it with vanilla's default model.
+        if opcode != 0xb7
+            && is_container_owner
+            && let Some(class) = receiver_class.as_deref()
+            && self
+                .jar_method_owner(class, &r.name, &r.descriptor)
+                .is_some()
+        {
+            return Ok(None);
+        }
+
+        // Canonicalize inherited calls on a jar subclass of SimpleContainer / ResultContainer
+        // (never `<init>`) so `menu_models::call_with_stacks` recognizes the vanilla container surface.
+        let canonical;
+        let effective_ref =
+            if !menu_models::is_menu_class(&r.owner) && is_container_owner && r.name != "<init>" {
+                let owner = if self
+                    .jar_extends(&r.owner, "net/minecraft/world/inventory/ResultContainer")
+                {
+                    "net/minecraft/world/inventory/ResultContainer"
+                } else {
+                    "net/minecraft/world/SimpleContainer"
+                };
+                canonical = MethodRef {
+                    owner: owner.to_owned(),
+                    name: r.name.clone(),
+                    descriptor: r.descriptor.clone(),
+                };
+                &canonical
+            } else {
+                r
+            };
+
+        // For `SimpleContainer.setItem(int, ItemStack)`, resolve the container's real
+        // `getMaxStackSize(...)` virtually when a mod subclass overrides it, matching MC 26.3's
+        // `stack.limitSize(this.getMaxStackSize(stack))` (default container limit 99).
+        let mut custom_clamp: Option<menu_models::ContainerClamp> = None;
+        if is_container_owner
+            && effective_ref.owner != "net/minecraft/world/inventory/ResultContainer"
+            && effective_ref.name == "setItem"
+            && effective_ref.descriptor == "(ILnet/minecraft/world/item/ItemStack;)V"
+            && let Some(class) = receiver_class.as_deref()
+            && !self.jar_extends(class, "net/minecraft/world/inventory/ResultContainer")
+            && let Some(stack_arg) = args.get(1)
+            && !matches!(stack_arg, Value::Ref(None))
+        {
+            if self
+                .jar_method_owner(
+                    class,
+                    "getMaxStackSize",
+                    "(Lnet/minecraft/world/item/ItemStack;)I",
+                )
+                .is_some()
+            {
+                let before = self.host.counted_unknown_calls();
+                let limit_val = self.call_virtual(
+                    jdk_call::Site::Virtual,
+                    "net/minecraft/world/Container",
+                    "getMaxStackSize",
+                    "(Lnet/minecraft/world/item/ItemStack;)I",
+                    receiver,
+                    std::slice::from_ref(stack_arg),
+                )?;
+                if self.host.counted_unknown_calls() != before {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                }
+                let Value::Int(limit) = limit_val else {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                };
+                custom_clamp = Some(menu_models::ContainerClamp::Exact(limit));
+            } else if self
+                .jar_method_owner(class, "getMaxStackSize", "()I")
+                .is_some()
+            {
+                let before = self.host.counted_unknown_calls();
+                let max_val = self.call_virtual(
+                    jdk_call::Site::Virtual,
+                    "net/minecraft/world/Container",
+                    "getMaxStackSize",
+                    "()I",
+                    receiver,
+                    &[],
+                )?;
+                if self.host.counted_unknown_calls() != before {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                }
+                let Value::Int(container_max) = max_val else {
+                    let _ = self.host.unknown_operand_call(effective_ref);
+                    return Ok(Some(Value::Void));
+                };
+                custom_clamp = Some(menu_models::ContainerClamp::ContainerMax(container_max));
+            }
+        }
+
+        if let Some(std_host) = self.host.as_std_host_mut() {
+            std_host.pending_container_clamp = custom_clamp;
+        }
+        let result = self.host.menu_instance_call(effective_ref, receiver, args);
+        if let Some(std_host) = self.host.as_std_host_mut() {
+            std_host.pending_container_clamp = None;
+        }
+        let Some(result) = result else {
             return Ok(None);
         };
         let mut value = result?;
@@ -31242,6 +31458,7 @@ impl<H: Host> Runtime<'_, H> {
                             name: "slotsChanged".into(),
                             descriptor: "(Lnet/minecraft/world/Container;)V".into(),
                         },
+                        0xb6,
                         &menu,
                         &[container],
                     )? {
@@ -33195,10 +33412,17 @@ impl<H: Host> Runtime<'_, H> {
                         dispatched = Some(value);
                     }
                     if dispatched.is_none()
-                        && menu_models::is_menu_class(&r.owner)
+                        && (menu_models::is_menu_class(&r.owner)
+                            || (r.name != "<init>"
+                                && (self
+                                    .jar_extends(&r.owner, "net/minecraft/world/SimpleContainer")
+                                    || self.jar_extends(
+                                        &r.owner,
+                                        "net/minecraft/world/inventory/ResultContainer",
+                                    ))))
                         && let Some(receiver) = receiver.as_ref()
                         && let Some(value) =
-                            invoke_or_catch!(at, self.invoke_menu_model(&r, receiver, &args))
+                            invoke_or_catch!(at, self.invoke_menu_model(&r, op, receiver, &args))
                     {
                         dispatched = Some(value);
                     }

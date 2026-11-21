@@ -407,8 +407,9 @@ fn real_runes_jar_decodes_altar_recipes_and_runs_create_result() {
         r#"{"id":"runes-harness","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
     );
 
-    // Seed host with the real Runes jar's data/ resources and link its real bytecode classes.
-    let mut host = runes_jar.seed_host(StdHost::new());
+    // Link the real Runes jar directly (without seed_host): recipes and item tags load from
+    // the linked jar layer automatically alongside its bytecode classes.
+    let mut host = StdHost::new();
     host.link_jar("runes", &runes_jar).expect("link Runes jar");
     fixture
         .jar
@@ -475,8 +476,106 @@ fn real_runes_jar_decodes_altar_recipes_and_runs_create_result() {
     );
     assert_eq!(host.loaded_recipe_ids().len(), 8);
     assert!(
+        host.loaded_recipe_sources()
+            .iter()
+            .all(|(_, pack)| pack == "runes"),
+        "expected all 8 altar recipes to report source pack \"runes\", got {:?}",
+        host.loaded_recipe_sources()
+    );
+    assert!(
         host.recipe_decode_errors().is_empty(),
         "unexpected decode errors: {:?}",
         host.recipe_decode_errors()
+    );
+}
+
+#[test]
+fn real_runes_jar_skipped_vanilla_serializer_recipe_stays_counted() {
+    let Some(runes_jar_path) = std::env::var_os("RUNES_JAR") else {
+        eprintln!("RUNES_JAR is unset; real Runes skipped-recipe test skipped");
+        return;
+    };
+    let runes_path = Path::new(&runes_jar_path);
+    let runes_jar = NativeJar::from_path(runes_path).expect("load real Runes 1.3.2+26.3 jar");
+    let mut sources = STUBS.to_vec();
+    sources.push((
+        "demo/SkippedProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.crafting.*;
+import net.runes.RunesMod;
+
+public final class SkippedProbe {
+  public static void onInitialize() {
+    RunesMod.registerItems();
+    RunesMod.registerRecipeType();
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      // data/runes/recipe/rune_crafting_altar.json uses vanilla minecraft:crafting_shaped -> must be counted.
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("runes:rune_crafting_altar")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "runes-recipes-skipped",
+        &sources,
+        r#"{"id":"runes-skipped","version":"1.0","entrypoints":{"main":"demo.SkippedProbe"}}"#,
+    );
+    let mut host = StdHost::new();
+    host.link_jar("runes", &runes_jar).expect("link Runes jar");
+    fixture
+        .jar
+        .execute("demo.SkippedProbe", None, "main", &mut host)
+        .unwrap();
+    let listeners = host.game_listeners(&fixture.jar, true);
+    let player_uuid = 0xaaaa_bbbb_cccc_dddd_eeee_ffff_0000_1111;
+    let facade = Arc::new(EventFacade {
+        players: vec![FacadePlayer {
+            uuid: player_uuid,
+            name: "Runecrafter".into(),
+            level: Some("minecraft:overworld".into()),
+            entity_id: Some(9),
+            session: 1,
+            life: 0,
+        }],
+        levels: vec![FacadeLevel {
+            id: "minecraft:overworld".into(),
+            ..FacadeLevel::default()
+        }],
+        ..EventFacade::default()
+    });
+    let mut firing = EventFiring::new(
+        GameEvent::UseItem,
+        facade,
+        EventContext {
+            level: Some("minecraft:overworld".into()),
+            player: Some(player_uuid),
+            off_hand: Some(false),
+            ..EventContext::default()
+        },
+    );
+    fixture
+        .jar
+        .run_game_listener(
+            &listeners.listeners[0],
+            &mut firing,
+            &mut host,
+            &ExecutionBudget::UNBOUNDED,
+        )
+        .unwrap();
+    assert!(
+        host.unknown_host_calls().iter().any(|(call, _)| {
+            call == "net/minecraft/world/item/crafting/RecipeManager#byKey(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;"
+        }),
+        "expected skipped minecraft:crafting_shaped recipe byKey to be counted, got {:?}",
+        host.unknown_host_calls()
     );
 }

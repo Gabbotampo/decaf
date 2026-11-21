@@ -1,8 +1,9 @@
 //! General vanilla 26.3 recipe decoding, matching, assembly, TransmuteRecipe, Ingredient,
-//! ItemStackTemplate, DataComponentPatch, and ItemCombinerMenu.createResult fixture.
+//! ItemStackTemplate, DataComponentPatch, SimpleContainer, and ItemCombinerMenu.createResult
+//! fixture.
 //!
 //! Expected outputs in `fixtures/recipes/mc263.txt` were captured from a real Java 25 run
-//! against Minecraft 26.3 server classes.
+//! against Minecraft 26.3 server classes (`tests/oracles/recipes/GeneralRecipesOracle.java`).
 
 #[path = "support/javac_fixture.rs"]
 mod javac_fixture;
@@ -11,6 +12,7 @@ use horizon_native_java::{
     ExecutionBudget, Host, StdHost,
     events::{EventContext, EventFacade, EventFiring, FacadeLevel, FacadePlayer, GameEvent},
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const STUBS: &[(&str, &str)] = &[
@@ -28,12 +30,26 @@ const STUBS: &[(&str, &str)] = &[
          @FunctionalInterface public interface Function6<T1,T2,T3,T4,T5,T6,R> { R apply(T1 a, T2 b, T3 c, T4 d, T5 e, T6 f); }",
     ),
     (
+        "com/mojang/datafixers/util/Function7.java",
+        "package com.mojang.datafixers.util;\n\
+         @FunctionalInterface public interface Function7<T1,T2,T3,T4,T5,T6,T7,R> { R apply(T1 a, T2 b, T3 c, T4 d, T5 e, T6 f, T7 g); }",
+    ),
+    (
         "com/mojang/datafixers/Products.java",
         "package com.mojang.datafixers;\n\
          import com.mojang.datafixers.kinds.*; import com.mojang.datafixers.util.*;\n\
          public final class Products {\n\
+           public static final class P1<F,T1> {\n\
+             public <R> App<F,R> apply(Applicative<F,?> app, java.util.function.Function<T1,R> f) { return null; }\n\
+           }\n\
+           public static final class P2<F,T1,T2> {\n\
+             public <R> App<F,R> apply(Applicative<F,?> app, java.util.function.BiFunction<T1,T2,R> f) { return null; }\n\
+           }\n\
            public static final class P6<F,T1,T2,T3,T4,T5,T6> {\n\
              public <R> App<F,R> apply(Applicative<F,?> app, Function6<T1,T2,T3,T4,T5,T6,R> f) { return null; }\n\
+           }\n\
+           public static final class P7<F,T1,T2,T3,T4,T5,T6,T7> {\n\
+             public <R> App<F,R> apply(Applicative<F,?> app, Function7<T1,T2,T3,T4,T5,T6,T7,R> f) { return null; }\n\
            }\n\
          }",
     ),
@@ -56,6 +72,7 @@ const STUBS: &[(&str, &str)] = &[
          import com.mojang.serialization.codecs.RecordCodecBuilder;\n\
          import java.util.function.Function;\n\
          public abstract class MapCodec<A> {\n\
+           public static <A> MapCodec<A> unit(A defaultValue) { return null; }\n\
            public <O> RecordCodecBuilder<O, A> forGetter(Function<O, A> getter) { return null; }\n\
            public <S> MapCodec<S> xmap(Function<? super A, ? extends S> to, Function<? super S, ? extends A> from) { return null; }\n\
            public Codec<A> codec() { return null; }\n\
@@ -69,11 +86,24 @@ const STUBS: &[(&str, &str)] = &[
          public final class RecordCodecBuilder<O, P> implements App<RecordCodecBuilder.Mu<O>, P> {\n\
            public static final class Mu<O> {}\n\
            public static final class Instance<O> implements Applicative<Mu<O>, Object> {\n\
+             public <T1> Products.P1<Mu<O>,T1> group(App<Mu<O>,T1> t1) { return null; }\n\
+             public <T1,T2> Products.P2<Mu<O>,T1,T2> group(App<Mu<O>,T1> t1, App<Mu<O>,T2> t2) { return null; }\n\
              public <T1,T2,T3,T4,T5,T6> Products.P6<Mu<O>,T1,T2,T3,T4,T5,T6> group(\n\
                App<Mu<O>,T1> t1, App<Mu<O>,T2> t2, App<Mu<O>,T3> t3,\n\
                App<Mu<O>,T4> t4, App<Mu<O>,T5> t5, App<Mu<O>,T6> t6) { return null; }\n\
+             public <T1,T2,T3,T4,T5,T6,T7> Products.P7<Mu<O>,T1,T2,T3,T4,T5,T6,T7> group(\n\
+               App<Mu<O>,T1> t1, App<Mu<O>,T2> t2, App<Mu<O>,T3> t3,\n\
+               App<Mu<O>,T4> t4, App<Mu<O>,T5> t5, App<Mu<O>,T6> t6, App<Mu<O>,T7> t7) { return null; }\n\
            }\n\
            public static <O> MapCodec<O> mapCodec(Function<Instance<O>, ? extends App<Mu<O>, O>> builder) { return null; }\n\
+         }",
+    ),
+    (
+        "net/minecraft/util/ExtraCodecs.java",
+        "package net.minecraft.util;\n\
+         import com.mojang.serialization.Codec;\n\
+         public final class ExtraCodecs {\n\
+           public static Codec<Integer> intRange(int min, int max) { return null; }\n\
          }",
     ),
     (
@@ -153,7 +183,12 @@ const STUBS: &[(&str, &str)] = &[
          import net.minecraft.network.chat.Component;\n\
          public final class DataComponents {\n\
            public static final DataComponentType<Integer> REPAIR_COST = null;\n\
+           public static final DataComponentType<Integer> MAX_DAMAGE = null;\n\
+           public static final DataComponentType<Integer> MAX_STACK_SIZE = null;\n\
            public static final DataComponentType<Component> CUSTOM_NAME = null;\n\
+           public static final DataComponentType<Boolean> ENCHANTMENT_GLINT_OVERRIDE = null;\n\
+           public static final DataComponentType<Object> RARITY = null;\n\
+           public static final DataComponentType<Object> CONTAINER = null;\n\
          }",
     ),
     (
@@ -205,9 +240,12 @@ const STUBS: &[(&str, &str)] = &[
            public static final Item AMETHYST_SHARD = null;\n\
            public static final Item COAL = null;\n\
            public static final Item DIAMOND = null;\n\
+           public static final Item EMERALD = null;\n\
+           public static final Item QUARTZ = null;\n\
            public static final Item GOLD_NUGGET = null;\n\
            public static final Item STICK = null;\n\
            public static final Item ENDER_PEARL = null;\n\
+           public static final Item DIAMOND_SWORD = null;\n\
          }",
     ),
     (
@@ -220,11 +258,14 @@ const STUBS: &[(&str, &str)] = &[
            public ItemStack(ItemLike item, int count) {}\n\
            public boolean isEmpty() { return true; }\n\
            public int getCount() { return 0; }\n\
+           public int getMaxStackSize() { return 1; }\n\
            public Item getItem() { return null; }\n\
            public boolean is(Item item) { return false; }\n\
            public DataComponentPatch getComponentsPatch() { return null; }\n\
            public <T> T set(DataComponentType<T> type, T value) { return null; }\n\
            public <T> T get(DataComponentType<? extends T> type) { return null; }\n\
+           public <T> T remove(DataComponentType<? extends T> type) { return null; }\n\
+           public void applyComponents(DataComponentPatch patch) {}\n\
          }",
     ),
     (
@@ -235,6 +276,7 @@ const STUBS: &[(&str, &str)] = &[
          public final class ItemStackTemplate {\n\
            public static final Codec<ItemStackTemplate> CODEC = null;\n\
            public ItemStackTemplate(Item item, int count) {}\n\
+           public ItemStackTemplate(Item item, DataComponentPatch patch) {}\n\
            public static ItemStackTemplate fromNonEmptyStack(ItemStack stack) { return null; }\n\
            public Holder<Item> item() { return null; }\n\
            public int count() { return 0; }\n\
@@ -258,11 +300,23 @@ const STUBS: &[(&str, &str)] = &[
         "net/minecraft/world/item/crafting/RecipeInput.java",
         "package net.minecraft.world.item.crafting;\n\
          import net.minecraft.world.item.ItemStack;\n\
-         public interface RecipeInput { ItemStack getItem(int index); int size(); }",
+         public interface RecipeInput {\n\
+           ItemStack getItem(int index);\n\
+           int size();\n\
+           default boolean isEmpty() {\n\
+             for (int i = 0; i < size(); i++) {\n\
+               if (!getItem(i).isEmpty()) return false;\n\
+             }\n\
+             return true;\n\
+           }\n\
+         }",
     ),
     (
         "net/minecraft/world/item/crafting/RecipeType.java",
-        "package net.minecraft.world.item.crafting; public interface RecipeType<T extends Recipe<?>> {}",
+        "package net.minecraft.world.item.crafting;\n\
+         public interface RecipeType<T extends Recipe<?>> {\n\
+           RecipeType<Recipe<RecipeInput>> CRAFTING = null;\n\
+         }",
     ),
     (
         "net/minecraft/world/item/crafting/RecipeSerializer.java",
@@ -324,15 +378,26 @@ const STUBS: &[(&str, &str)] = &[
          }",
     ),
     (
+        "net/minecraft/server/MinecraftServer.java",
+        "package net.minecraft.server;\n\
+         import net.minecraft.world.item.crafting.RecipeManager;\n\
+         public class MinecraftServer {\n\
+           public RecipeManager getRecipeManager() { return null; }\n\
+           public RecipeManager recipeAccess() { return null; }\n\
+         }",
+    ),
+    (
         "net/minecraft/world/level/Level.java",
         "package net.minecraft.world.level; public abstract class Level {}",
     ),
     (
         "net/minecraft/server/level/ServerLevel.java",
         "package net.minecraft.server.level;\n\
+         import net.minecraft.server.MinecraftServer;\n\
          import net.minecraft.world.item.crafting.RecipeManager; import net.minecraft.world.level.Level;\n\
          public class ServerLevel extends Level {\n\
            public RecipeManager recipeAccess() { return null; }\n\
+           public MinecraftServer getServer() { return null; }\n\
          }",
     ),
     (
@@ -358,7 +423,11 @@ const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/world/Container.java",
         "package net.minecraft.world; import net.minecraft.world.item.ItemStack;\n\
-         public interface Container { int getContainerSize(); ItemStack getItem(int i); void setItem(int i, ItemStack s); void setChanged(); boolean isEmpty(); }",
+         public interface Container {\n\
+           int getContainerSize(); ItemStack getItem(int i); void setItem(int i, ItemStack s); void setChanged(); boolean isEmpty();\n\
+           default int getMaxStackSize() { return 99; }\n\
+           default int getMaxStackSize(ItemStack stack) { return Math.min(getMaxStackSize(), stack.getMaxStackSize()); }\n\
+         }",
     ),
     (
         "net/minecraft/world/SimpleContainer.java",
@@ -493,18 +562,23 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import java.util.Optional;
+import net.minecraft.util.ExtraCodecs;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ItemStackTemplate;
 import net.minecraft.world.item.crafting.*;
 import net.minecraft.world.level.Level;
 
 public final class AlloyRecipe implements Recipe<AlloyInput> {
+  public static int labelXmapCalls = 0;
+  public static int ctorCalls = 0;
+
   public final Recipe.CommonInfo commonInfo;
   public final Ingredient base;
   public final Ingredient catalyst;
   public final ItemStackTemplate result;
   public final int tier;
   public final Optional<String> label;
+  public final int weight;
 
   public static final RecipeType<AlloyRecipe> TYPE = new RecipeType<>() {};
   public static final MapCodec<AlloyRecipe> MAP_CODEC = RecordCodecBuilder.mapCodec(i -> i.group(
@@ -514,9 +588,16 @@ public final class AlloyRecipe implements Recipe<AlloyInput> {
       ItemStackTemplate.CODEC.fieldOf("result").forGetter(r -> r.result),
       Codec.INT.optionalFieldOf("tier", 1).forGetter(r -> r.tier),
       Codec.STRING.optionalFieldOf("label").xmap(
-          opt -> opt.map(String::toUpperCase),
-          opt -> opt.map(String::toLowerCase)).forGetter(r -> r.label)
-  ).apply(i, AlloyRecipe::new));
+          opt -> {
+            if (opt.isPresent()) labelXmapCalls++;
+            return opt.map(String::toUpperCase);
+          },
+          opt -> opt.map(String::toLowerCase)).forGetter(r -> r.label),
+      ExtraCodecs.intRange(1, 99).optionalFieldOf("weight", 1).forGetter(r -> r.weight)
+  ).apply(i, (ci, b, c, r, t, l, w) -> {
+    ctorCalls++;
+    return new AlloyRecipe(ci, b, c, r, t, l, w);
+  }));
   public static final RecipeSerializer<AlloyRecipe> SERIALIZER = new RecipeSerializer<>(MAP_CODEC, null);
 
   public AlloyRecipe(
@@ -525,13 +606,15 @@ public final class AlloyRecipe implements Recipe<AlloyInput> {
       Ingredient catalyst,
       ItemStackTemplate result,
       int tier,
-      Optional<String> label) {
+      Optional<String> label,
+      int weight) {
     this.commonInfo = commonInfo;
     this.base = base;
     this.catalyst = catalyst;
     this.result = result;
     this.tier = tier;
     this.label = label;
+    this.weight = weight;
   }
 
   public boolean matches(AlloyInput input, Level level) {
@@ -544,6 +627,30 @@ public final class AlloyRecipe implements Recipe<AlloyInput> {
 
   public RecipeSerializer<AlloyRecipe> getSerializer() { return SERIALIZER; }
   public RecipeType<AlloyRecipe> getType() { return TYPE; }
+}
+"#;
+
+const DEMO_ALWAYS_RECIPE: &str = r#"
+package demo;
+import com.mojang.serialization.MapCodec;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+import net.minecraft.world.level.Level;
+
+public final class AlwaysRecipe implements Recipe<RecipeInput> {
+  public static int matchesCalls = 0;
+  public static final RecipeType<AlwaysRecipe> TYPE = new RecipeType<>() {};
+  public static final AlwaysRecipe INSTANCE = new AlwaysRecipe();
+  public static final MapCodec<AlwaysRecipe> MAP_CODEC = MapCodec.unit(INSTANCE);
+  public static final RecipeSerializer<AlwaysRecipe> SERIALIZER = new RecipeSerializer<>(MAP_CODEC, null);
+
+  public boolean matches(RecipeInput input, Level level) {
+    matchesCalls++;
+    return true;
+  }
+  public ItemStack assemble(RecipeInput input) { return new ItemStack(Items.STICK); }
+  public RecipeSerializer<AlwaysRecipe> getSerializer() { return SERIALIZER; }
+  public RecipeType<AlwaysRecipe> getType() { return TYPE; }
 }
 "#;
 
@@ -606,6 +713,7 @@ package demo;
 import java.util.Optional;
 import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponentPatch;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.*;
 import net.minecraft.network.chat.Component;
@@ -622,6 +730,8 @@ public final class Probe {
   public static Item SMALL_ITEM;
   public static String MENU_SUMMARY;
   public static String OVERLOAD_SUMMARY;
+  public static String SERVER_SUMMARY;
+  public static String VIRTUAL_IS_EMPTY_SUMMARY;
 
   private static void capture(String name, Runnable action) {
     try {
@@ -646,6 +756,9 @@ public final class Probe {
     Identifier typeId = Identifier.fromNamespaceAndPath("demo", "alloy");
     Registry.register(BuiltInRegistries.RECIPE_TYPE, typeId, AlloyRecipe.TYPE);
     Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, typeId, AlloyRecipe.SERIALIZER);
+    Identifier alwaysId = Identifier.fromNamespaceAndPath("demo", "always");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, alwaysId, AlwaysRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, alwaysId, AlwaysRecipe.SERIALIZER);
 
     UseItemCallback.EVENT.register((player, level, hand) -> {
       runAll(player, (ServerLevel) level);
@@ -655,7 +768,10 @@ public final class Probe {
 
   private static void runAll(Player player, ServerLevel level) {
     RecipeManager mgr = level.recipeAccess();
-    String[] validIds = {"demo:iron_alloy", "demo:precious_alloy", "demo:stone_alloy", "demo:small_stack"};
+    String[] validIds = {
+        "demo:iron_alloy", "demo:precious_alloy", "demo:stone_alloy",
+        "demo:small_stack", "demo:dfu_coercion"
+    };
     for (String id : validIds) {
       ResourceKey<Recipe<?>> key = ResourceKey.create(Registries.RECIPE, Identifier.parse(id));
       AlloyRecipe rec = (AlloyRecipe) mgr.byKey(key).get().value();
@@ -663,11 +779,15 @@ public final class Probe {
           + "|notify=" + rec.commonInfo.showNotification()
           + "|tier=" + rec.tier
           + "|label=" + rec.label.orElse("none")
+          + "|weight=" + rec.weight
           + "|count=" + rec.result.count());
     }
 
     String[] invalidIds = {
-        "demo:bad_air", "demo:bad_empty_list", "demo:bad_missing_tag", "demo:bad_count", "demo:bad_result_air"
+        "demo:bad_air", "demo:bad_empty_list", "demo:bad_missing_tag",
+        "demo:bad_count", "demo:bad_result_air", "demo:bad_leading_space",
+        "demo:bad_trailing_space", "demo:bad_null_base", "demo:bad_count_float_hi",
+        "demo:bad_count_float_lo"
     };
     int invalidErrors = 0;
     for (String id : invalidIds) {
@@ -677,6 +797,13 @@ public final class Probe {
       }
     }
     System.out.println("invalidErrorCount=" + invalidErrors);
+
+    // RecordCodecBuilder multi-error accumulation: bad_multi ran label xmap (total=2 vs 1 from iron_alloy)
+    // and never called the AlloyRecipe constructor (total=5 from the 5 valid recipes).
+    boolean multiIsErr = mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:bad_multi"))).isEmpty();
+    System.out.println("multiErr:isErr=" + multiIsErr
+        + "|xmapDelta=" + (AlloyRecipe.labelXmapCalls - 1)
+        + "|ctorDelta=" + (AlloyRecipe.ctorCalls - 5));
 
     ItemStack taggedBase = new ItemStack(Items.COBBLESTONE, 3);
     taggedBase.set(DataComponents.REPAIR_COST, 5);
@@ -688,17 +815,17 @@ public final class Probe {
     String[] names = {
         "iron+redstone", "gold+amethyst", "copper+amethyst",
         "cobble+coal", "blackstone+coal", "deepslate+coal",
-        "diamond+nugget", "dirt+coal", "empty+empty"
+        "diamond+nugget", "emerald+quartz", "dirt+coal", "empty+empty"
     };
     ItemStack[] left = {
         ironWithComp, new ItemStack(Items.GOLD_INGOT), new ItemStack(Items.COPPER_INGOT),
         taggedBase, new ItemStack(Items.BLACKSTONE), new ItemStack(Items.COBBLED_DEEPSLATE),
-        new ItemStack(Items.DIAMOND), new ItemStack(Items.DIRT), ItemStack.EMPTY
+        new ItemStack(Items.DIAMOND), new ItemStack(Items.EMERALD), new ItemStack(Items.DIRT), ItemStack.EMPTY
     };
     ItemStack[] right = {
         new ItemStack(Items.REDSTONE), new ItemStack(Items.AMETHYST_SHARD), new ItemStack(Items.AMETHYST_SHARD),
         new ItemStack(Items.COAL), new ItemStack(Items.COAL), new ItemStack(Items.COAL),
-        new ItemStack(Items.GOLD_NUGGET), new ItemStack(Items.COAL), ItemStack.EMPTY
+        new ItemStack(Items.GOLD_NUGGET), new ItemStack(Items.QUARTZ), new ItemStack(Items.COAL), ItemStack.EMPTY
     };
 
     RecipeHolder<AlloyRecipe> firstHolder = null;
@@ -721,7 +848,7 @@ public final class Probe {
           + "|hasCustomName=" + (out.get(DataComponents.CUSTOM_NAME) != null));
     }
 
-    // 4-arg cached key and cached holder overloads
+    // 4-arg cached key and cached holder overloads + MinecraftServer.recipeAccess() / getRecipeManager()
     AlloyInput ironInput = new AlloyInput(ironWithComp, new ItemStack(Items.REDSTONE));
     Optional<RecipeHolder<AlloyRecipe>> byHintKey =
         mgr.getRecipeFor(AlloyRecipe.TYPE, ironInput, level, firstHolder.id());
@@ -730,17 +857,63 @@ public final class Probe {
     OVERLOAD_SUMMARY = byHintKey.get().id().identifier().toString()
         + "|" + byHintHolder.get().id().identifier().toString();
 
+    RecipeManager srvAccess = level.getServer().recipeAccess();
+    RecipeManager srvMgr = level.getServer().getRecipeManager();
+    SERVER_SUMMARY = srvAccess.byKey(firstHolder.id()).isPresent()
+        + "|" + srvMgr.byKey(firstHolder.id()).isPresent()
+        + "|" + srvAccess.getRecipeFor(AlloyRecipe.TYPE, ironInput, level).get().id().identifier().toString();
+
     ItemStackTemplate pearl20 = new ItemStackTemplate(Items.ENDER_PEARL, 20);
     ItemStack pearlOut = TransmuteRecipe.createWithOriginalComponents(pearl20, new ItemStack(Items.STONE));
-    System.out.println("pearl20=" + pearlOut.toString() + "|empty=" + pearlOut.isEmpty());
+    System.out.println("pearl20=" + pearlOut.toString() + "|empty=" + pearlOut.isEmpty() + "|sameEmpty=" + (pearlOut == ItemStack.EMPTY));
 
     ItemStackTemplate small20 = new ItemStackTemplate(SMALL_ITEM, 20);
     ItemStack smallOut20 = TransmuteRecipe.createWithOriginalComponents(small20, new ItemStack(Items.STONE));
-    System.out.println("small20=" + smallOut20.toString() + "|empty=" + smallOut20.isEmpty());
+    System.out.println("small20=" + smallOut20.toString() + "|empty=" + smallOut20.isEmpty() + "|sameEmpty=" + (smallOut20 == ItemStack.EMPTY));
 
     ItemStackTemplate stick2 = new ItemStackTemplate(Items.STICK, 2);
     ItemStack stickExtra = TransmuteRecipe.createWithOriginalComponents(stick2, ironWithComp, 3);
     System.out.println("stickExtra=" + stickExtra.toString() + "|repairCost=" + stickExtra.get(DataComponents.REPAIR_COST));
+
+    ItemStackTemplate negTpl = new ItemStackTemplate(Items.STONE, -3);
+    ItemStack negOut = negTpl.create();
+    System.out.println("negTpl=" + negTpl.count()
+        + "|sameEmpty=" + (negOut == ItemStack.EMPTY)
+        + "|empty=" + negOut.isEmpty()
+        + "|count=" + negOut.getCount()
+        + "|max=" + negOut.getMaxStackSize()
+        + "|str=" + negOut.toString());
+
+    ItemStack dmgStoneOut = new ItemStackTemplate(
+        Items.STONE, DataComponentPatch.builder().set(DataComponents.MAX_DAMAGE, 10).build()).create();
+    ItemStack stackSwordOut = new ItemStackTemplate(
+        Items.DIAMOND_SWORD, DataComponentPatch.builder().set(DataComponents.MAX_STACK_SIZE, 16).build()).create();
+    ItemStack validDmgStoneOut = new ItemStackTemplate(
+        Items.STONE, DataComponentPatch.builder().set(DataComponents.MAX_DAMAGE, 10).set(DataComponents.MAX_STACK_SIZE, 1).build()).create();
+    System.out.println("validateStrict="
+        + (dmgStoneOut == ItemStack.EMPTY) + "|"
+        + (stackSwordOut == ItemStack.EMPTY) + "|"
+        + (validDmgStoneOut == ItemStack.EMPTY) + "|"
+        + validDmgStoneOut.toString());
+
+    // PatchedDataComponentMap exact semantics
+    ItemStack pst = new ItemStack(Items.STONE, 1);
+    Integer pr1 = pst.set(DataComponents.REPAIR_COST, 9);
+    boolean pp1 = pst.getComponentsPatch().isEmpty();
+    Integer pr2 = pst.set(DataComponents.REPAIR_COST, 0);
+    boolean pp2 = pst.getComponentsPatch().isEmpty();
+    Integer pr3 = pst.remove(DataComponents.REPAIR_COST);
+    Integer pg3 = pst.get(DataComponents.REPAIR_COST);
+    int psz3 = pst.getComponentsPatch().size();
+    Integer pr4 = pst.remove(DataComponents.REPAIR_COST);
+    Integer pr5 = pst.set(DataComponents.REPAIR_COST, 5);
+    Component pr6 = pst.remove(DataComponents.CUSTOM_NAME);
+    int pszAfterCn = pst.getComponentsPatch().size();
+    pst.applyComponents(DataComponentPatch.builder().set(DataComponents.REPAIR_COST, 0).build());
+    boolean ppCanonical = pst.getComponentsPatch().isEmpty();
+    System.out.println("patchMap=" + pr1 + "|" + pp1 + "|" + pr2 + "|" + pp2
+        + "|" + pr3 + "|" + pg3 + "|" + psz3 + "|" + pr4 + "|" + pr5
+        + "|" + pr6 + "|" + pszAfterCn + "|" + ppCanonical);
 
     Recipe.CommonInfo ciTrue = new Recipe.CommonInfo(true);
     Recipe.CommonInfo ciFalse = new Recipe.CommonInfo(false);
@@ -750,6 +923,9 @@ public final class Probe {
     System.out.println("emptyStack=" + ItemStack.EMPTY.toString()
         + "|isAir=" + ItemStack.EMPTY.is(Items.AIR)
         + "|isStick=" + ItemStack.EMPTY.is(Items.STICK)
+        + "|maxEmpty=" + ItemStack.EMPTY.getMaxStackSize()
+        + "|maxZero=" + new ItemStack(Items.STONE, 0).getMaxStackSize()
+        + "|maxAir=" + new ItemStack(Items.AIR, 1).getMaxStackSize()
         + "|patchEmpty=" + ItemStack.EMPTY.getComponentsPatch().isEmpty()
         + "|patchStr=" + ItemStack.EMPTY.getComponentsPatch().toString());
     System.out.println("optIngr="
@@ -760,7 +936,18 @@ public final class Probe {
     SimpleContainer box = new SimpleContainer(2);
     ItemStack pearls = new ItemStack(Items.ENDER_PEARL, 30);
     box.setItem(0, pearls);
-    System.out.println("boxClamp=" + box.getItem(0).toString() + "|boxEmpty=" + box.isEmpty());
+    ItemStack big = new ItemStack(Items.STONE, 80);
+    big.set(DataComponents.MAX_STACK_SIZE, 99);
+    box.setItem(1, big);
+    SimpleContainer limitedBox = new SimpleContainer(2) {
+      public int getMaxStackSize() { return 12; }
+    };
+    limitedBox.setItem(0, new ItemStack(Items.STONE, 30));
+    limitedBox.setItem(1, new ItemStack(Items.ENDER_PEARL, 30));
+    System.out.println("boxClamp=" + box.getItem(0).toString() + "|" + box.getItem(1).toString()
+        + "|boxMax=" + box.getMaxStackSize() + "|boxEmpty=" + box.isEmpty()
+        + "|lim0=" + limitedBox.getItem(0).toString() + "|lim1=" + limitedBox.getItem(1).toString()
+        + "|limMax=" + limitedBox.getMaxStackSize());
 
     capture("ingrAir", () -> Ingredient.of(Items.AIR));
     capture("tplZero", () -> new ItemStackTemplate(Items.STONE, 0));
@@ -774,6 +961,35 @@ public final class Probe {
     RecipeHolder<?> h2 = new RecipeHolder<>(rk2, null);
     RecipeHolder<?> h3 = new RecipeHolder<>(rk3, null);
     System.out.println("holder=" + h1.toString() + "|eqSame=" + h1.equals(h2) + "|eqDiff=" + h1.equals(h3));
+
+    // RecipeInput.isEmpty() precheck + ResourceKey registry validation
+    ResourceKey<Recipe<?>> alwaysKey = ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:always"));
+    ResourceKey<Item> wrongKey = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:always"));
+    RecipeInput emptyIn = new RecipeInput() {
+      public ItemStack getItem(int idx) { return ItemStack.EMPTY; }
+      public int size() { return 1; }
+    };
+    boolean r3 = mgr.getRecipeFor(AlwaysRecipe.TYPE, emptyIn, level).isPresent();
+    int c3 = AlwaysRecipe.matchesCalls;
+    boolean r4key = mgr.getRecipeFor(AlwaysRecipe.TYPE, emptyIn, level, alwaysKey).isPresent();
+    int c4key = AlwaysRecipe.matchesCalls;
+    @SuppressWarnings("unchecked")
+    boolean r4wrong = mgr.getRecipeFor(AlwaysRecipe.TYPE, emptyIn, level, (ResourceKey<Recipe<?>>) (ResourceKey<?>) wrongKey).isPresent();
+    int c4wrong = AlwaysRecipe.matchesCalls;
+    @SuppressWarnings("unchecked")
+    boolean byWrong = mgr.byKey((ResourceKey<Recipe<?>>) (ResourceKey<?>) wrongKey).isPresent();
+    boolean byRight = mgr.byKey(alwaysKey).isPresent();
+    System.out.println("mgrChecks=" + r3 + "|" + c3 + "|" + r4key + "|" + c4key + "|" + r4wrong + "|" + c4wrong + "|" + byWrong + "|" + byRight);
+
+    // Virtual RecipeInput.isEmpty() override runs even when slot 0 is non-empty
+    int callsBeforeVirt = AlwaysRecipe.matchesCalls;
+    RecipeInput overrideEmptyIn = new RecipeInput() {
+      public ItemStack getItem(int idx) { return new ItemStack(Items.STONE, 1); }
+      public int size() { return 1; }
+      public boolean isEmpty() { return true; }
+    };
+    boolean virtFound = mgr.getRecipeFor(AlwaysRecipe.TYPE, overrideEmptyIn, level).isPresent();
+    VIRTUAL_IS_EMPTY_SUMMARY = virtFound + "|" + (AlwaysRecipe.matchesCalls - callsBeforeVirt);
 
     // Drive mod ItemCombinerMenu.createResult via inputSlots.setItem
     AlloyMenu menu = new AlloyMenu(1, new Inventory(player, null));
@@ -795,74 +1011,8 @@ public final class Probe {
 }
 "#;
 
-#[test]
-fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
-    let mut sources = STUBS.to_vec();
-    sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
-    sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
-    sources.push(("demo/AlloyMenu.java", DEMO_MENU));
-    sources.push(("demo/Probe.java", DEMO_PROBE));
-
-    let extra: &[(&str, &[u8])] = &[
-        (
-            "data/demo/tags/item/reagents.json",
-            br##"{"values":["#minecraft:stone_tool_materials"]}"##,
-        ),
-        (
-            "data/demo/recipe/iron_alloy.json",
-            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:redstone","result":{"id":"demo:alloy_ingot","count":4},"tier":2,"label":"basic"}"#,
-        ),
-        (
-            "data/demo/recipe/precious_alloy.json",
-            br#"{"type":"demo:alloy","show_notification":false,"base":["minecraft:gold_ingot","minecraft:copper_ingot"],"catalyst":"minecraft:amethyst_shard","result":"demo:alloy_ingot"}"#,
-        ),
-        (
-            "data/demo/recipe/stone_alloy.json",
-            br##"{"type":"demo:alloy","base":"#demo:reagents","catalyst":"minecraft:coal","result":{"id":"minecraft:stick","count":2,"components":{"minecraft:repair_cost":7}}}"##,
-        ),
-        (
-            "data/demo/recipe/small_stack.json",
-            br#"{"type":"demo:alloy","base":"minecraft:diamond","catalyst":"minecraft:gold_nugget","result":{"id":"demo:small_stack_item","count":16}}"#,
-        ),
-        (
-            "data/demo/recipe/bad_air.json",
-            br#"{"type":"demo:alloy","base":"minecraft:air","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
-        ),
-        (
-            "data/demo/recipe/bad_empty_list.json",
-            br#"{"type":"demo:alloy","base":[],"catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
-        ),
-        (
-            "data/demo/recipe/bad_missing_tag.json",
-            br##"{"type":"demo:alloy","base":"#demo:no_such_tag","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"##,
-        ),
-        (
-            "data/demo/recipe/bad_count.json",
-            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":100}}"#,
-        ),
-        (
-            "data/demo/recipe/bad_result_air.json",
-            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"minecraft:air","count":1}}"#,
-        ),
-        (
-            "data/demo/recipe/vanilla_shaped.json",
-            br#"{"type":"minecraft:crafting_shaped","pattern":["X"],"key":{"X":"minecraft:stick"},"result":{"id":"minecraft:stick"}}"#,
-        ),
-    ];
-
-    let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
-        "recipes",
-        &sources,
-        r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
-        extra,
-    );
-    let mut host = fixture.jar.seed_host(StdHost::new());
-    fixture
-        .jar
-        .execute("demo.Probe", None, "main", &mut host)
-        .unwrap_or_else(|err| panic!("onInitialize failed: {err:?}"));
-
-    let listeners = host.game_listeners(&fixture.jar, true);
+fn fire_use_item(jar: &horizon_native_java::NativeJar, host: &mut StdHost) {
+    let listeners = host.game_listeners(jar, true);
     assert_eq!(listeners.listeners.len(), 1);
     let player_uuid = 0x1111_2222_3333_4444_5555_6666_7777_8888;
     let facade = Arc::new(EventFacade {
@@ -890,15 +1040,115 @@ fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
             ..EventContext::default()
         },
     );
+    jar.run_game_listener(
+        &listeners.listeners[0],
+        &mut firing,
+        host,
+        &ExecutionBudget::UNBOUNDED,
+    )
+    .unwrap_or_else(|err| panic!("listener failed: {err:?}"));
+}
+
+#[test]
+fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
+    let mut sources = STUBS.to_vec();
+    sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    sources.push(("demo/AlwaysRecipe.java", DEMO_ALWAYS_RECIPE));
+    sources.push(("demo/AlloyMenu.java", DEMO_MENU));
+    sources.push(("demo/Probe.java", DEMO_PROBE));
+
+    let extra: &[(&str, &[u8])] = &[
+        (
+            "data/demo/tags/item/reagents.json",
+            br##"{"values":["#minecraft:stone_tool_materials"]}"##,
+        ),
+        (
+            "data/demo/recipe/always.json",
+            br#"{"type":"demo:always"}"#,
+        ),
+        (
+            "data/demo/recipe/iron_alloy.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:redstone","result":{"id":"demo:alloy_ingot","count":4},"tier":2,"label":"basic"}"#,
+        ),
+        (
+            "data/demo/recipe/precious_alloy.json",
+            br#"{"type":"demo:alloy","show_notification":false,"base":["minecraft:gold_ingot","minecraft:copper_ingot"],"catalyst":"minecraft:amethyst_shard","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/stone_alloy.json",
+            br##"{"type":"demo:alloy","base":"#demo:reagents","catalyst":"minecraft:coal","result":{"id":"minecraft:stick","count":2,"components":{"minecraft:repair_cost":7}}}"##,
+        ),
+        (
+            "data/demo/recipe/small_stack.json",
+            br#"{"type":"demo:alloy","base":"minecraft:diamond","catalyst":"minecraft:gold_nugget","result":{"id":"demo:small_stack_item","count":16}}"#,
+        ),
+        (
+            "data/demo/recipe/dfu_coercion.json",
+            br#"{"type":"demo:alloy","show_notification":null,"base":"minecraft:emerald","catalyst":"minecraft:quartz","result":{"id":"demo:alloy_ingot","count":3.7,"components":null},"tier":2.9,"label":null,"weight":10.8}"#,
+        ),
+        (
+            "data/demo/recipe/bad_air.json",
+            br#"{"type":"demo:alloy","base":"minecraft:air","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/bad_empty_list.json",
+            br#"{"type":"demo:alloy","base":[],"catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/bad_missing_tag.json",
+            br##"{"type":"demo:alloy","base":"#demo:no_such_tag","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"##,
+        ),
+        (
+            "data/demo/recipe/bad_count.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":100}}"#,
+        ),
+        (
+            "data/demo/recipe/bad_result_air.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"minecraft:air","count":1}}"#,
+        ),
+        (
+            "data/demo/recipe/bad_leading_space.json",
+            br#"{"type":"demo:alloy","base":" minecraft:iron_ingot","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/bad_trailing_space.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal ","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/bad_null_base.json",
+            br#"{"type":"demo:alloy","base":null,"catalyst":"minecraft:coal","result":"demo:alloy_ingot"}"#,
+        ),
+        (
+            "data/demo/recipe/bad_count_float_hi.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":100.2}}"#,
+        ),
+        (
+            "data/demo/recipe/bad_count_float_lo.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":0.9}}"#,
+        ),
+        (
+            "data/demo/recipe/bad_multi.json",
+            br#"{"type":"demo:alloy","base":"minecraft:air","catalyst":"minecraft:coal","result":"demo:alloy_ingot","tier":"bad_int","label":"still_runs","weight":0.5}"#,
+        ),
+        (
+            "data/demo/recipe/vanilla_shaped.json",
+            br#"{"type":"minecraft:crafting_shaped","pattern":["X"],"key":{"X":"minecraft:stick"},"result":{"id":"minecraft:stick"}}"#,
+        ),
+    ];
+
+    let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "recipes",
+        &sources,
+        r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.Probe"}}"#,
+        extra,
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
     fixture
         .jar
-        .run_game_listener(
-            &listeners.listeners[0],
-            &mut firing,
-            &mut host,
-            &ExecutionBudget::UNBOUNDED,
-        )
-        .unwrap_or_else(|err| panic!("listener failed: {err:?}"));
+        .execute("demo.Probe", None, "main", &mut host)
+        .unwrap_or_else(|err| panic!("onInitialize failed: {err:?}"));
+    fire_use_item(&fixture.jar, &mut host);
 
     assert_eq!(
         host.take_stdout(),
@@ -907,6 +1157,8 @@ fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
     assert_eq!(
         host.loaded_recipe_ids(),
         vec![
+            "demo:always",
+            "demo:dfu_coercion",
             "demo:iron_alloy",
             "demo:precious_alloy",
             "demo:small_stack",
@@ -915,9 +1167,20 @@ fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
     );
     assert_eq!(
         host.recipe_decode_errors().len(),
-        5,
+        11,
         "errors={:?}",
         host.recipe_decode_errors()
+    );
+    // RecordCodecBuilder accumulated all 3 errors on demo:bad_multi in field order.
+    let multi_err = host
+        .recipe_decode_errors()
+        .iter()
+        .find(|(id, _)| id == "demo:bad_multi")
+        .map(|(_, msg)| msg.as_str())
+        .expect("demo:bad_multi decode error");
+    assert!(
+        multi_err.contains("air") && multi_err.contains("bad_int") && multi_err.contains("[1;99]"),
+        "expected all 3 accumulated field errors in demo:bad_multi, got: {multi_err}"
     );
 
     let statics = host.persistent_class_state().0;
@@ -928,15 +1191,514 @@ fn general_recipe_codec_matching_transmute_and_menu_match_mc263_oracle() {
         )))
     );
     assert_eq!(
+        statics.get("demo/Probe#SERVER_SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some(
+            "true|true|demo:iron_alloy".into()
+        )))
+    );
+    assert_eq!(
+        statics.get("demo/Probe#VIRTUAL_IS_EMPTY_SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some("false|0".into())))
+    );
+    assert_eq!(
         statics.get("demo/Probe#MENU_SUMMARYLjava/lang/String;"),
         Some(&horizon_native_java::Value::Ref(Some(
             "2 minecraft:stick|used=demo:stone_alloy|inputsEmpty=false|resultEmpty=false|calls=2||0 minecraft:air|used=null|resultEmpty=true"
                 .into()
         )))
     );
-    assert!(host.unknown_host_calls().iter().any(|(call, _)| {
-        call.starts_with(
-            "net/minecraft/world/item/crafting/RecipeManager#getRecipeFor()Ljava/lang/Object;",
-        )
-    }));
+    // Only the intentional bare `new RecipeManager().getRecipeFor()` was counted.
+    assert_eq!(
+        host.unknown_host_calls(),
+        vec![(
+            "net/minecraft/world/item/crafting/RecipeManager#getRecipeFor()Ljava/lang/Object;"
+                .to_owned(),
+            1
+        )]
+    );
+}
+
+#[test]
+fn counted_inner_calls_reject_decode_matches_and_container_limit() {
+    // 1. Counted inner call inside an xmap callback rejects decode, counts decodeRecipe, and keeps byKey counted.
+    {
+        let mut sources = STUBS.to_vec();
+        sources.push((
+            "demo/XmapCountedProbe.java",
+            r#"
+package demo;
+import com.mojang.serialization.*;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+import net.minecraft.world.level.Level;
+
+public final class XmapCountedProbe {
+  static final class XmapRecipe implements Recipe<RecipeInput> {
+    static final RecipeType<XmapRecipe> TYPE = new RecipeType<>() {};
+    static final MapCodec<XmapRecipe> MAP_CODEC = RecordCodecBuilder.mapCodec(i -> i.group(
+        Codec.STRING.fieldOf("tag").xmap(s -> {
+          new RecipeManager().getRecipeFor();
+          return s;
+        }, s -> s).forGetter(r -> r.tag)
+    ).apply(i, XmapRecipe::new));
+    static final RecipeSerializer<XmapRecipe> SERIALIZER = new RecipeSerializer<>(MAP_CODEC, null);
+    final String tag;
+    XmapRecipe(String tag) { this.tag = tag; }
+    public boolean matches(RecipeInput in, Level lvl) { return true; }
+    public ItemStack assemble(RecipeInput in) { return new ItemStack(Items.STICK); }
+    public RecipeSerializer<XmapRecipe> getSerializer() { return SERIALIZER; }
+    public RecipeType<XmapRecipe> getType() { return TYPE; }
+  }
+
+  public static void onInitialize() {
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, Identifier.parse("demo:xmap_dirty"), XmapRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, Identifier.parse("demo:xmap_dirty"), XmapRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:bad_xmap")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+        ));
+        let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+            "recipes-counted-xmap",
+            &sources,
+            r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.XmapCountedProbe"}}"#,
+            &[(
+                "data/demo/recipe/bad_xmap.json",
+                br#"{"type":"demo:xmap_dirty","tag":"hello"}"#,
+            )],
+        );
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        fixture
+            .jar
+            .execute("demo.XmapCountedProbe", None, "main", &mut host)
+            .unwrap();
+        fire_use_item(&fixture.jar, &mut host);
+        assert!(host.loaded_recipe_ids().is_empty());
+        let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+        assert_eq!(
+            unknowns.get(
+                "net/minecraft/world/item/crafting/RecipeManager#decodeRecipe(demo:xmap_dirty)V"
+            ),
+            Some(&1),
+            "unknowns={unknowns:?}"
+        );
+        assert_eq!(
+            unknowns.get(
+                "net/minecraft/world/item/crafting/RecipeManager#byKey(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;"
+            ),
+            Some(&1),
+            "unknowns={unknowns:?}"
+        );
+    }
+
+    // 2. Counted inner call inside Recipe.matches() rejects match & counts getRecipeFor,
+    //    and counted inner call inside SimpleContainer.getMaxStackSize() override counts setItem.
+    {
+        let mut sources = STUBS.to_vec();
+        sources.push((
+            "demo/MatchAndBoxCountedProbe.java",
+            r#"
+package demo;
+import com.mojang.serialization.MapCodec;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+import net.minecraft.world.level.Level;
+
+public final class MatchAndBoxCountedProbe {
+  public static int matchesEntered = 0;
+  public static int boxMaxEntered = 0;
+
+  static final class DirtyMatchRecipe implements Recipe<RecipeInput> {
+    static final RecipeType<DirtyMatchRecipe> TYPE = new RecipeType<>() {};
+    static final MapCodec<DirtyMatchRecipe> MAP_CODEC = MapCodec.unit(new DirtyMatchRecipe());
+    static final RecipeSerializer<DirtyMatchRecipe> SERIALIZER = new RecipeSerializer<>(MAP_CODEC, null);
+    public boolean matches(RecipeInput in, Level lvl) {
+      matchesEntered++;
+      new RecipeManager().getRecipeFor();
+      return true;
+    }
+    public ItemStack assemble(RecipeInput in) { return new ItemStack(Items.STICK); }
+    public RecipeSerializer<DirtyMatchRecipe> getSerializer() { return SERIALIZER; }
+    public RecipeType<DirtyMatchRecipe> getType() { return TYPE; }
+  }
+
+  public static void onInitialize() {
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, Identifier.parse("demo:match_dirty"), DirtyMatchRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, Identifier.parse("demo:match_dirty"), DirtyMatchRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      RecipeInput nonEmpty = new RecipeInput() {
+        public ItemStack getItem(int i) { return new ItemStack(Items.STONE); }
+        public int size() { return 1; }
+      };
+      mgr.getRecipeFor(DirtyMatchRecipe.TYPE, nonEmpty, level);
+      SimpleContainer dirtyBox = new SimpleContainer(1) {
+        public int getMaxStackSize() {
+          boxMaxEntered++;
+          new RecipeManager().getRecipeFor();
+          return 12;
+        }
+      };
+      dirtyBox.setItem(0, new ItemStack(Items.STONE, 20));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+        ));
+        let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+            "recipes-counted-match-box",
+            &sources,
+            r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.MatchAndBoxCountedProbe"}}"#,
+            &[(
+                "data/demo/recipe/dirty_match.json",
+                br#"{"type":"demo:match_dirty"}"#,
+            )],
+        );
+        let mut host = fixture.jar.seed_host(StdHost::new());
+        fixture
+            .jar
+            .execute("demo.MatchAndBoxCountedProbe", None, "main", &mut host)
+            .unwrap();
+        fire_use_item(&fixture.jar, &mut host);
+
+        assert_eq!(host.loaded_recipe_ids(), vec!["demo:dirty_match"]);
+        let statics = host.persistent_class_state().0;
+        assert_eq!(
+            statics.get("demo/MatchAndBoxCountedProbe#matchesEnteredI"),
+            Some(&horizon_native_java::Value::Int(1)),
+            "DirtyMatchRecipe.matches must actually execute before being rejected"
+        );
+        assert_eq!(
+            statics.get("demo/MatchAndBoxCountedProbe#boxMaxEnteredI"),
+            Some(&horizon_native_java::Value::Int(1)),
+            "SimpleContainer.getMaxStackSize override must actually execute before being rejected"
+        );
+        let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+        assert_eq!(
+            unknowns.get(
+                "net/minecraft/world/item/crafting/RecipeManager#getRecipeFor(Lnet/minecraft/world/item/crafting/RecipeType;Lnet/minecraft/world/item/crafting/RecipeInput;Lnet/minecraft/world/level/Level;)Ljava/util/Optional;"
+            ),
+            Some(&1),
+            "expected getRecipeFor with counted inner matches to be counted, got {unknowns:?}"
+        );
+        assert_eq!(
+            unknowns.get(
+                "net/minecraft/world/SimpleContainer#setItem(ILnet/minecraft/world/item/ItemStack;)V"
+            ),
+            Some(&1),
+            "expected SimpleContainer.setItem with counted getMaxStackSize override to be counted, got {unknowns:?}"
+        );
+    }
+}
+
+#[test]
+fn vanilla_and_unregistered_recipe_types_and_skipped_keys_stay_counted() {
+    let mut sources = STUBS.to_vec();
+    sources.push((
+        "demo/VanillaCountedProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class VanillaCountedProbe {
+  static final RecipeType<Recipe<RecipeInput>> UNREGISTERED = new RecipeType<>() {};
+
+  public static void onInitialize() {
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      RecipeInput in = new RecipeInput() {
+        public ItemStack getItem(int i) { return new ItemStack(Items.STICK); }
+        public int size() { return 1; }
+      };
+      // 1. Vanilla RecipeType.CRAFTING -> counted (never uncounted empty).
+      mgr.getRecipeFor(RecipeType.CRAFTING, in, level);
+      // 2. Unregistered RecipeType -> counted.
+      mgr.getRecipeFor(UNREGISTERED, in, level);
+      // 3. Vanilla minecraft:* recipe id in byKey -> counted.
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("minecraft:stick")));
+      // 4. Mod recipe using skipped vanilla serializer minecraft:crafting_shaped -> counted.
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:vanilla_shaped")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    let extra: &[(&str, &[u8])] = &[(
+        "data/demo/recipe/vanilla_shaped.json",
+        br#"{"type":"minecraft:crafting_shaped","pattern":["X"],"key":{"X":"minecraft:stick"},"result":{"id":"minecraft:stick"}}"#,
+    )];
+
+    let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "recipes-vanilla-counted",
+        &sources,
+        r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.VanillaCountedProbe"}}"#,
+        extra,
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture
+        .jar
+        .execute("demo.VanillaCountedProbe", None, "main", &mut host)
+        .unwrap();
+    fire_use_item(&fixture.jar, &mut host);
+
+    let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+    assert_eq!(
+        unknowns.get(
+            "net/minecraft/world/item/crafting/RecipeManager#getRecipeFor(Lnet/minecraft/world/item/crafting/RecipeType;Lnet/minecraft/world/item/crafting/RecipeInput;Lnet/minecraft/world/level/Level;)Ljava/util/Optional;"
+        ),
+        Some(&2),
+        "expected both vanilla and unregistered getRecipeFor to be counted, got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get(
+            "net/minecraft/world/item/crafting/RecipeManager#byKey(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;"
+        ),
+        Some(&2),
+        "expected both minecraft:stick and skipped demo:vanilla_shaped byKey to be counted, got {unknowns:?}"
+    );
+}
+
+#[test]
+fn multi_jar_and_datapack_layers_override_recipes_and_tags_in_pack_order() {
+    let mut base_sources = STUBS.to_vec();
+    base_sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    base_sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    base_sources.push((
+        "demo/LayerProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class LayerProbe {
+  public static String SUMMARY;
+  public static void onInitialize() {
+    Identifier id = Identifier.parse("demo:alloy");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, id, AlloyRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, id, AlloyRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      AlloyRecipe layered = (AlloyRecipe) mgr.byKey(
+          ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:layered"))).get().value();
+      boolean iron = mgr.getRecipeFor(AlloyRecipe.TYPE,
+          new AlloyInput(new ItemStack(Items.IRON_INGOT), new ItemStack(Items.COAL)), level).isPresent();
+      boolean gold = mgr.getRecipeFor(AlloyRecipe.TYPE,
+          new AlloyInput(new ItemStack(Items.GOLD_INGOT), new ItemStack(Items.COAL)), level).isPresent();
+      boolean diamond = mgr.getRecipeFor(AlloyRecipe.TYPE,
+          new AlloyInput(new ItemStack(Items.DIAMOND), new ItemStack(Items.COAL)), level).isPresent();
+      SUMMARY = "tier=" + layered.tier + "|iron=" + iron + "|gold=" + gold + "|diamond=" + diamond;
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    let base_extra: &[(&str, &[u8])] = &[
+        (
+            "data/demo/tags/item/layer_tag.json",
+            br#"{"values":["minecraft:iron_ingot"]}"#,
+        ),
+        (
+            "data/demo/recipe/layered.json",
+            br##"{"type":"demo:alloy","base":"#demo:layer_tag","catalyst":"minecraft:coal","result":"minecraft:stick","tier":1}"##,
+        ),
+        (
+            "data/demo/recipe/base_only.json",
+            br#"{"type":"demo:alloy","base":"minecraft:emerald","catalyst":"minecraft:coal","result":"minecraft:stick","tier":1}"#,
+        ),
+    ];
+    let base_fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "recipes-layer-base",
+        &base_sources,
+        r#"{"id":"base_mod","version":"1.0","entrypoints":{"main":"demo.LayerProbe"}}"#,
+        base_extra,
+    );
+
+    // Second linked jar appends gold_ingot to tag and overrides demo:layered to tier 2.
+    let override_extra: &[(&str, &[u8])] = &[
+        (
+            "data/demo/tags/item/layer_tag.json",
+            br#"{"values":["minecraft:gold_ingot"]}"#,
+        ),
+        (
+            "data/demo/recipe/layered.json",
+            br##"{"type":"demo:alloy","base":"#demo:layer_tag","catalyst":"minecraft:coal","result":"minecraft:stick","tier":2}"##,
+        ),
+    ];
+    let override_fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "recipes-layer-override",
+        &[("dummy/Noop.java", "package dummy; public class Noop {}")],
+        r#"{"id":"override_mod","version":"1.0"}"#,
+        override_extra,
+    );
+
+    // Link BOTH jars without calling seed_host: recipes and tags load from linked jar layers in order.
+    let mut host = StdHost::new();
+    host.link_jar("base_mod", &base_fixture.jar).unwrap();
+    host.link_jar("override_mod", &override_fixture.jar)
+        .unwrap();
+    base_fixture
+        .jar
+        .execute("demo.LayerProbe", None, "main", &mut host)
+        .unwrap();
+    fire_use_item(&base_fixture.jar, &mut host);
+
+    let statics = host.persistent_class_state().0;
+    assert_eq!(
+        statics.get("demo/LayerProbe#SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some(
+            "tier=2|iron=true|gold=true|diamond=false".into()
+        )))
+    );
+    assert_eq!(
+        host.loaded_recipe_sources(),
+        vec![
+            ("demo:base_only".to_owned(), "base_mod".to_owned()),
+            ("demo:layered".to_owned(), "override_mod".to_owned()),
+        ]
+    );
+
+    // Adding a higher-priority datapack layer with `replace: true` + recipe override invalidates cache.
+    let mut dp = BTreeMap::new();
+    dp.insert(
+        "data/demo/tags/item/layer_tag.json".to_owned(),
+        br#"{"replace":true,"values":["minecraft:diamond"]}"#.to_vec(),
+    );
+    dp.insert(
+        "data/demo/recipe/layered.json".to_owned(),
+        br##"{"type":"demo:alloy","base":"#demo:layer_tag","catalyst":"minecraft:coal","result":"minecraft:stick","tier":3}"##
+            .to_vec(),
+    );
+    dp.insert(
+        "data/demo/recipe/dp_only.json".to_owned(),
+        br#"{"type":"demo:alloy","base":"minecraft:quartz","catalyst":"minecraft:coal","result":"minecraft:stick","tier":4}"#
+            .to_vec(),
+    );
+    host.add_data_pack_layer("world/datapacks/override", dp);
+    fire_use_item(&base_fixture.jar, &mut host);
+
+    let statics = host.persistent_class_state().0;
+    assert_eq!(
+        statics.get("demo/LayerProbe#SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some(
+            "tier=3|iron=false|gold=false|diamond=true".into()
+        )))
+    );
+    assert_eq!(
+        host.loaded_recipe_sources(),
+        vec![
+            ("demo:base_only".to_owned(), "base_mod".to_owned()),
+            (
+                "demo:dp_only".to_owned(),
+                "world/datapacks/override".to_owned()
+            ),
+            (
+                "demo:layered".to_owned(),
+                "world/datapacks/override".to_owned()
+            ),
+        ]
+    );
+    assert!(host.unknown_host_calls().is_empty());
+}
+
+#[test]
+fn unmodelled_component_prototypes_and_container_validate_strict_stay_counted() {
+    let mut sources = STUBS.to_vec();
+    sources.push((
+        "demo/ComponentCountedProbe.java",
+        r#"
+package demo;
+import net.minecraft.core.component.*;
+import net.minecraft.world.item.*;
+
+public final class ComponentCountedProbe {
+  public static void onInitialize() {
+    ItemStack stack = new ItemStack(Items.STONE, 1);
+    // Unmodelled prototype components (enchantment_glint_override is non-null on some vanilla items,
+    // rarity has non-null prototypes on every item): must stay counted, never assumed null.
+    stack.get(DataComponents.ENCHANTMENT_GLINT_OVERRIDE);
+    stack.set(DataComponents.ENCHANTMENT_GLINT_OVERRIDE, Boolean.TRUE);
+    stack.remove(DataComponents.RARITY);
+    stack.applyComponents(DataComponentPatch.builder().remove(DataComponents.RARITY).build());
+    // ItemStack.validateStrict inspects container/bundle_contents/charged_projectiles:
+    // patching minecraft:container on an ItemStackTemplate must keep create() counted.
+    new ItemStackTemplate(
+        Items.STONE,
+        DataComponentPatch.builder().set(DataComponents.CONTAINER, new Object()).build()
+    ).create();
+  }
+}
+"#,
+    ));
+
+    let fixture = javac_fixture::Fixture::build_with_mod_json(
+        "recipes-component-counted",
+        &sources,
+        r#"{"id":"demo","version":"1.0","entrypoints":{"main":"demo.ComponentCountedProbe"}}"#,
+    );
+    let mut host = StdHost::new();
+    fixture
+        .jar
+        .execute("demo.ComponentCountedProbe", None, "main", &mut host)
+        .unwrap();
+
+    let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+    assert_eq!(
+        unknowns.get("net/minecraft/world/item/ItemStack#get(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;"),
+        Some(&1),
+        "unknowns={unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("net/minecraft/world/item/ItemStack#set(Lnet/minecraft/core/component/DataComponentType;Ljava/lang/Object;)Ljava/lang/Object;"),
+        Some(&1),
+        "unknowns={unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("net/minecraft/world/item/ItemStack#remove(Lnet/minecraft/core/component/DataComponentType;)Ljava/lang/Object;"),
+        Some(&1),
+        "unknowns={unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("net/minecraft/world/item/ItemStack#applyComponents(Lnet/minecraft/core/component/DataComponentPatch;)V"),
+        Some(&1),
+        "unknowns={unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("net/minecraft/world/item/ItemStackTemplate#create()Lnet/minecraft/world/item/ItemStack;"),
+        Some(&1),
+        "unknowns={unknowns:?}"
+    );
 }

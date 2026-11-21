@@ -5,15 +5,16 @@ the libraries the server jar bundles (`META-INF/libraries/**`). No game files ar
 
 | Harness | Output |
 |---|---|
-| `DumpVanillaTables.java` | the vanilla item, max-stack-size, item-tag and `DataComponents` tables in `src/vanilla_item_data.rs` (after `SharedConstants.tryDetectVersion()`, `Bootstrap.bootStrap()`, `DataComponentInitializers.build()` and the vanilla item tags from the server jar) |
-| `GeneralRecipesOracle.java` | `tests/fixtures/recipes/mc263.txt` |
+| `DumpVanillaTables.java` | the vanilla item, non-64 max-stack-size, max-damage, item-tag, `DataComponents`, vanilla `RecipeSerializer`, and vanilla `RecipeType` tables in `src/vanilla_item_data.rs` (after `SharedConstants.tryDetectVersion()`, `Bootstrap.bootStrap()`, `DataComponentInitializers.build()` and the vanilla item tags from the server jar; `--rust-extra` prints the `VANILLA_MAX_DAMAGE`, `VANILLA_RECIPE_SERIALIZERS`, and `VANILLA_RECIPE_TYPES` tables) |
+| `GeneralRecipesOracle.java` | `tests/fixtures/recipes/mc263.txt` (DFU `optionalFieldOf` JSON `null` handling, `Codec.INT`/`ExtraCodecs.intRange` fractional truncation, `Identifier.CODEC` whitespace rejection, `RecordCodecBuilder` full-field evaluation and error accumulation, `PatchedDataComponentMap` prototype/redundancy/canonical overlay semantics, `ItemStackTemplate` negative counts and `ItemStack.validateStrict`, empty-stack `getMaxStackSize() == 1`, `SimpleContainer` default max 99 and virtual `getMaxStackSize()` override, `RecipeManager`/`RecipeMap` `RecipeInput.isEmpty()` precheck and `ResourceKey` registry checks) |
 | `RunesRecipesOracle.java` | `tests/fixtures/runes_recipes/mc263.txt`, run with the Runes 1.3.2 jar (`runes-fabric-1.3.2+26.3.jar`, SHA-256 `8515d3c5eb4d691655fa1663538cbfb6fbcc42001a0c9a73e28df7e990aea6bb`) as its argument |
 
 ```sh
 SERVER=<extracted server jar dir>/META-INF/versions/26.3/server-26.3.jar
 CP="$SERVER:$(find <extracted server jar dir>/META-INF/libraries -name '*.jar' | tr '\n' ':')"
 javac -cp "$CP" -d out DumpVanillaTables.java GeneralRecipesOracle.java
-java -cp "$CP:out" GeneralRecipesOracle > ../../fixtures/recipes/mc263.txt
+java -cp "$CP:out" DumpVanillaTables --rust-extra
+java -cp "$CP:out" GeneralRecipesOracle ../../fixtures/recipes/mc263.txt
 javac -cp "$CP:$RUNES_JAR" -d out RunesRecipesOracle.java
 java -cp "$CP:$RUNES_JAR:out" RunesRecipesOracle "$RUNES_JAR" > ../../fixtures/runes_recipes/mc263.txt
 ```

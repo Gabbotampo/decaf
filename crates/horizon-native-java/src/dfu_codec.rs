@@ -33,6 +33,7 @@ const OR_ELSE: &str = "dfu-or-else";
 const UNIT: &str = "dfu-unit";
 const UNIT_CODEC: &str = "dfu-unit-codec";
 const MAP_TO_CODEC: &str = "dfu-map-to-codec";
+const INT_RANGE: &str = "dfu-int-range";
 const LIST: &str = "dfu-list";
 const FLAT_XMAP: &str = "dfu-flat-xmap";
 const COMAP_FLAT_MAP: &str = "dfu-comap-flat-map";
@@ -122,7 +123,15 @@ fn codec_receiver(value: &Value) -> bool {
     };
     (matches!(
         tag.as_str(),
-        CONSTANT | XMAP | FLAT_XMAP | COMAP_FLAT_MAP | UNIT_CODEC | MAP_TO_CODEC | LIST | RECORD
+        CONSTANT
+            | XMAP
+            | FLAT_XMAP
+            | COMAP_FLAT_MAP
+            | UNIT_CODEC
+            | MAP_TO_CODEC
+            | INT_RANGE
+            | LIST
+            | RECORD
     ) || crate::host_codec::opaque_codec_type(value).is_some_and(|t| t == CODEC || t == PRIMITIVE))
         && !map_codec(value)
 }
@@ -444,6 +453,10 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         ) | (
             "net/minecraft/world/item/Item",
             "CODEC",
+            "Lcom/mojang/serialization/Codec;"
+        ) | (
+            "net/minecraft/util/ExtraCodecs",
+            "POSITIVE_INT" | "NON_NEGATIVE_INT",
             "Lcom/mojang/serialization/Codec;"
         )
     ) {
@@ -1132,6 +1145,12 @@ pub(crate) fn invoke(
         return Some(opaque_app());
     }
     match (r.owner.as_str(), r.name.as_str(), r.descriptor.as_str()) {
+        ("net/minecraft/util/ExtraCodecs", "intRange", "(II)Lcom/mojang/serialization/Codec;") => {
+            let (Some(Value::Int(min)), Some(Value::Int(max))) = (args.first(), args.get(1)) else {
+                return None;
+            };
+            build(host, r, INT_RANGE, vec![Value::Int(*min), Value::Int(*max)])
+        }
         (MAP_CODEC, "unit", "(Ljava/lang/Object;)Lcom/mojang/serialization/MapCodec;")
         | (
             MAP_CODEC,
@@ -1316,11 +1335,66 @@ pub(crate) fn invoke(
     }
 }
 
+/// Invoke a mod callback and reject the result if any inner call was counted as unknown.
+fn invoke_callback_exact<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    cb: &Value,
+    args: &[Value],
+    label: &str,
+) -> Result<Result<Value, crate::recipe_models::DecodeError>, NativeError> {
+    use crate::recipe_models::DecodeError;
+    let before = runtime.host.counted_unknown_calls();
+    match runtime.invoke_callback(cb, args) {
+        Ok(Some(value)) => {
+            if runtime.host.counted_unknown_calls() != before {
+                Ok(Err(DecodeError::Unmodelled(format!(
+                    "counted unknown call inside {label}"
+                ))))
+            } else {
+                Ok(Ok(value))
+            }
+        }
+        Ok(None) => Ok(Err(DecodeError::Unmodelled(format!(
+            "{label} callback could not be invoked"
+        )))),
+        Err(NativeError::UncaughtException { class, message, .. }) => {
+            if runtime.host.counted_unknown_calls() != before {
+                Ok(Err(DecodeError::Unmodelled(format!(
+                    "counted unknown call before exception in {label}"
+                ))))
+            } else {
+                Ok(Err(DecodeError::Invalid(format!(
+                    "{}{}",
+                    class.replace('/', "."),
+                    message.map(|m| format!(": {m}")).unwrap_or_default()
+                ))))
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn unit_value_exact<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    source: &Value,
+) -> Result<Result<Value, crate::recipe_models::DecodeError>, NativeError> {
+    use crate::recipe_models::DecodeError;
+    let before = runtime.host.counted_unknown_calls();
+    let value = unit_value(runtime, source)?;
+    if runtime.host.counted_unknown_calls() != before {
+        Ok(Err(DecodeError::Unmodelled(
+            "counted unknown call inside MapCodec.unit supplier".into(),
+        )))
+    } else {
+        Ok(Ok(value))
+    }
+}
+
 /// Decode a JSON object using a DFU `MapCodec` node built by the mod's own bytecode.
 ///
 /// Reuses the exact DFU construction graph recorded by [`invoke`] and [`runtime_instance_call`].
-/// Any unmodelled node or opaque codec returns `Ok(Err(DecodeError::Unmodelled(_)))` rather than
-/// guessing a value.
+/// Any unmodelled node, opaque codec, or counted inner call returns
+/// `Ok(Err(DecodeError::Unmodelled(_)))` rather than guessing a value.
 pub(crate) fn decode_map_json<H: Host>(
     runtime: &mut Runtime<'_, H>,
     codec: &Value,
@@ -1373,7 +1447,8 @@ fn decode_map_json_depth<H: Host>(
                     "fieldOf node missing inner codec or field name".into(),
                 )));
             };
-            let Some(field_val) = map.get(name) else {
+            // DFU JsonOps MapLike.get(String) treats JsonNull identically to a missing key.
+            let Some(field_val) = map.get(name).filter(|v| !v.is_null()) else {
                 return Ok(Err(DecodeError::Invalid(format!(
                     "No key {name} in MapLike"
                 ))));
@@ -1388,7 +1463,9 @@ fn decode_map_json_depth<H: Host>(
             };
             let default = values.get(5).cloned().unwrap_or(Value::Void);
             let has_default = !matches!(default, Value::Void);
-            match map.get(name) {
+            // DFU JsonOps MapLike.get(String) converts JsonNull to Java null, so OptionalFieldCodec
+            // treats JSON `null` the same as an absent field (returning Optional.empty() / default).
+            match map.get(name).filter(|v| !v.is_null()) {
                 None => {
                     if has_default {
                         Ok(Ok(default))
@@ -1421,9 +1498,7 @@ fn decode_map_json_depth<H: Host>(
                 Ok(decoded) => Ok(Ok(decoded)),
                 Err(DecodeError::Invalid(_)) => {
                     if is_callback(&fallback) {
-                        Ok(Ok(runtime
-                            .invoke_callback(&fallback, &[])?
-                            .unwrap_or(Value::Ref(None))))
+                        invoke_callback_exact(runtime, &fallback, &[], "MapCodec.orElseGet")
                     } else if !matches!(fallback, Value::Void) {
                         Ok(Ok(fallback))
                     } else {
@@ -1441,7 +1516,7 @@ fn decode_map_json_depth<H: Host>(
                     "MapCodec.unit node missing value".into(),
                 )));
             };
-            Ok(Ok(unit_value(runtime, source)?))
+            unit_value_exact(runtime, source)
         }
         MAP_XMAP => {
             let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
@@ -1453,12 +1528,7 @@ fn decode_map_json_depth<H: Host>(
                 Ok(v) => v,
                 Err(err) => return Ok(Err(err)),
             };
-            match runtime.invoke_callback(to_cb, &[decoded])? {
-                Some(mapped) => Ok(Ok(mapped)),
-                None => Ok(Err(DecodeError::Unmodelled(
-                    "MapCodec.xmap callback could not be invoked".into(),
-                ))),
-            }
+            invoke_callback_exact(runtime, to_cb, &[decoded], "MapCodec.xmap")
         }
         FLAT_XMAP | COMAP_FLAT_MAP => {
             let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
@@ -1551,27 +1621,34 @@ fn decode_app_json<H: Host>(
                     "opaque Products node in apply".into(),
                 )));
             };
+            // RecordCodecBuilder evaluates every field in field order, accumulating all errors
+            // (and running observable field callbacks) before deciding whether to call ctor_cb.
             let mut decoded_args = Vec::with_capacity(parts.len());
+            let mut invalid_errors = Vec::new();
+            let mut first_unmodelled: Option<String> = None;
             for part in &parts {
                 match decode_app_json(runtime, part, map, depth + 1)? {
                     Ok(v) => decoded_args.push(v),
-                    Err(err) => return Ok(Err(err)),
+                    Err(DecodeError::Invalid(msg)) => invalid_errors.push(msg),
+                    Err(DecodeError::Unmodelled(msg)) => {
+                        if first_unmodelled.is_none() {
+                            first_unmodelled = Some(msg);
+                        }
+                    }
                 }
             }
-            match runtime.invoke_callback(ctor_cb, &decoded_args) {
-                Ok(Some(constructed)) => Ok(Ok(constructed)),
-                Ok(None) => Ok(Err(DecodeError::Unmodelled(
-                    "RecordCodecBuilder constructor callback could not be invoked".into(),
-                ))),
-                Err(NativeError::UncaughtException { class, message, .. }) => {
-                    Ok(Err(DecodeError::Invalid(format!(
-                        "{}{}",
-                        class.replace('/', "."),
-                        message.map(|m| format!(": {m}")).unwrap_or_default()
-                    ))))
-                }
-                Err(other) => Err(other),
+            if let Some(msg) = first_unmodelled {
+                return Ok(Err(DecodeError::Unmodelled(msg)));
             }
+            if !invalid_errors.is_empty() {
+                return Ok(Err(DecodeError::Invalid(invalid_errors.join("; "))));
+            }
+            invoke_callback_exact(
+                runtime,
+                ctor_cb,
+                &decoded_args,
+                "RecordCodecBuilder constructor",
+            )
         }
         _ => decode_map_json_depth(runtime, app, map, depth + 1),
     }
@@ -1583,25 +1660,23 @@ fn run_data_result_callback<H: Host>(
     arg: Value,
 ) -> Result<Result<Value, crate::recipe_models::DecodeError>, NativeError> {
     use crate::recipe_models::DecodeError;
-    match runtime.invoke_callback(cb, &[arg]) {
-        Ok(Some(result)) => match runtime.read_data_result(&result) {
-            Ok(v) => Ok(Ok(v)),
-            Err(None) => Ok(Err(DecodeError::Invalid(
-                "codec callback returned DataResult.error".into(),
-            ))),
-            Err(Some(why)) => Ok(Err(DecodeError::Unmodelled(why))),
-        },
-        Ok(None) => Ok(Err(DecodeError::Unmodelled(
-            "codec DataResult callback could not be invoked".into(),
+    let result = match invoke_callback_exact(runtime, cb, &[arg], "codec DataResult")? {
+        Ok(v) => v,
+        Err(err) => return Ok(Err(err)),
+    };
+    let before = runtime.host.counted_unknown_calls();
+    let parsed = runtime.read_data_result(&result);
+    if runtime.host.counted_unknown_calls() != before {
+        return Ok(Err(DecodeError::Unmodelled(
+            "counted unknown call reading DataResult".into(),
+        )));
+    }
+    match parsed {
+        Ok(v) => Ok(Ok(v)),
+        Err(None) => Ok(Err(DecodeError::Invalid(
+            "codec callback returned DataResult.error".into(),
         ))),
-        Err(NativeError::UncaughtException { class, message, .. }) => {
-            Ok(Err(DecodeError::Invalid(format!(
-                "{}{}",
-                class.replace('/', "."),
-                message.map(|m| format!(": {m}")).unwrap_or_default()
-            ))))
-        }
-        Err(other) => Err(other),
+        Err(Some(why)) => Ok(Err(DecodeError::Unmodelled(why))),
     }
 }
 
@@ -1661,7 +1736,24 @@ fn decode_value_json_depth<H: Host>(
                     "Unit codec missing value".into(),
                 )));
             };
-            Ok(Ok(unit_value(runtime, source)?))
+            unit_value_exact(runtime, source)
+        }
+        INT_RANGE => {
+            let (Some(Value::Int(min)), Some(Value::Int(max))) = (values.get(2), values.get(3))
+            else {
+                return Ok(Err(DecodeError::Unmodelled(
+                    "ExtraCodecs.intRange missing bounds".into(),
+                )));
+            };
+            let Some(n) = crate::recipe_models::json_number_to_i64(value).map(|n| n as i32) else {
+                return Ok(Err(DecodeError::Invalid(format!("Not a number: {value}"))));
+            };
+            if n < *min || n > *max {
+                return Ok(Err(DecodeError::Invalid(format!(
+                    "Value must be within range [{min};{max}]: {n}"
+                ))));
+            }
+            Ok(Ok(Value::Boxed(Boxed::Integer(n))))
         }
         LIST => {
             let Some(inner) = values.get(2) else {
@@ -1683,11 +1775,24 @@ fn decode_value_json_depth<H: Host>(
                 }
             }
             let mut decoded_elems = Vec::with_capacity(arr.len());
+            let mut invalid_errors = Vec::new();
+            let mut first_unmodelled: Option<String> = None;
             for elem in arr {
                 match decode_value_json_depth(runtime, inner, elem, depth + 1)? {
                     Ok(v) => decoded_elems.push(v),
-                    Err(err) => return Ok(Err(err)),
+                    Err(DecodeError::Invalid(msg)) => invalid_errors.push(msg),
+                    Err(DecodeError::Unmodelled(msg)) => {
+                        if first_unmodelled.is_none() {
+                            first_unmodelled = Some(msg);
+                        }
+                    }
                 }
+            }
+            if let Some(msg) = first_unmodelled {
+                return Ok(Err(DecodeError::Unmodelled(msg)));
+            }
+            if !invalid_errors.is_empty() {
+                return Ok(Err(DecodeError::Invalid(invalid_errors.join("; "))));
             }
             let Some(std_host) = runtime.host.as_std_host_mut() else {
                 return Ok(Err(DecodeError::Unmodelled(
@@ -1706,20 +1811,7 @@ fn decode_value_json_depth<H: Host>(
                 Ok(v) => v,
                 Err(err) => return Ok(Err(err)),
             };
-            match runtime.invoke_callback(to_cb, &[decoded]) {
-                Ok(Some(mapped)) => Ok(Ok(mapped)),
-                Ok(None) => Ok(Err(DecodeError::Unmodelled(
-                    "Codec.xmap callback could not be invoked".into(),
-                ))),
-                Err(NativeError::UncaughtException { class, message, .. }) => {
-                    Ok(Err(DecodeError::Invalid(format!(
-                        "{}{}",
-                        class.replace('/', "."),
-                        message.map(|m| format!(": {m}")).unwrap_or_default()
-                    ))))
-                }
-                Err(other) => Err(other),
-            }
+            invoke_callback_exact(runtime, to_cb, &[decoded], "Codec.xmap")
         }
         FLAT_XMAP | COMAP_FLAT_MAP => {
             let (Some(inner), Some(to_cb)) = (values.get(2), values.get(3)) else {
@@ -1746,30 +1838,54 @@ fn decode_value_json_depth<H: Host>(
                     Some(b) => Ok(Ok(Value::Boxed(Boxed::Boolean(b)))),
                     None => Ok(Err(DecodeError::Invalid(format!("Not a boolean: {value}")))),
                 },
-                (CODEC, "BYTE") => match value.as_i64().and_then(|n| i8::try_from(n).ok()) {
-                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Byte(n)))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not a byte: {value}")))),
+                (CODEC, "BYTE") => match crate::recipe_models::json_number_to_i64(value) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Byte(n as i8)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
-                (CODEC, "SHORT") => match value.as_i64().and_then(|n| i16::try_from(n).ok()) {
-                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Short(n)))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not a short: {value}")))),
+                (CODEC, "SHORT") => match crate::recipe_models::json_number_to_i64(value) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Short(n as i16)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
-                (CODEC, "INT") => match value.as_i64().and_then(|n| i32::try_from(n).ok()) {
-                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Integer(n)))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not an int: {value}")))),
+                (CODEC, "INT") => match crate::recipe_models::json_number_to_i64(value) {
+                    Some(n) => Ok(Ok(Value::Boxed(Boxed::Integer(n as i32)))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
-                (CODEC, "LONG") => match value.as_i64() {
+                (CODEC, "LONG") => match crate::recipe_models::json_number_to_i64(value) {
                     Some(n) => Ok(Ok(Value::Long(n))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not a long: {value}")))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
                 (CODEC, "FLOAT") => match value.as_f64() {
                     Some(n) => Ok(Ok(Value::Boxed(Boxed::Float((n as f32).to_bits())))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not a float: {value}")))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
                 (CODEC, "DOUBLE") => match value.as_f64() {
                     Some(n) => Ok(Ok(Value::Float(n))),
-                    None => Ok(Err(DecodeError::Invalid(format!("Not a double: {value}")))),
+                    None => Ok(Err(DecodeError::Invalid(format!("Not a number: {value}")))),
                 },
+                ("net/minecraft/util/ExtraCodecs", "POSITIVE_INT") => {
+                    let Some(n) = crate::recipe_models::json_number_to_i64(value).map(|n| n as i32)
+                    else {
+                        return Ok(Err(DecodeError::Invalid(format!("Not a number: {value}"))));
+                    };
+                    if n < 1 {
+                        return Ok(Err(DecodeError::Invalid(format!(
+                            "Value must be positive: {n}"
+                        ))));
+                    }
+                    Ok(Ok(Value::Boxed(Boxed::Integer(n))))
+                }
+                ("net/minecraft/util/ExtraCodecs", "NON_NEGATIVE_INT") => {
+                    let Some(n) = crate::recipe_models::json_number_to_i64(value).map(|n| n as i32)
+                    else {
+                        return Ok(Err(DecodeError::Invalid(format!("Not a number: {value}"))));
+                    };
+                    if n < 0 {
+                        return Ok(Err(DecodeError::Invalid(format!(
+                            "Value must be non-negative: {n}"
+                        ))));
+                    }
+                    Ok(Ok(Value::Boxed(Boxed::Integer(n))))
+                }
                 (CODEC, "STRING") => match value.as_str() {
                     Some(s) => Ok(Ok(Value::Ref(Some(s.to_owned())))),
                     None => Ok(Err(DecodeError::Invalid(format!("Not a string: {value}")))),

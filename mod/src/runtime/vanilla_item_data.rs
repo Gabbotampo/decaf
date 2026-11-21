@@ -18,6 +18,29 @@ pub(crate) fn vanilla_max_stack_size(id: &str) -> Option<i32> {
     Some(64)
 }
 
+/// Exact vanilla 26.3 prototype `DataComponents.MAX_DAMAGE` for a vanilla item id.
+/// Returns `None` if `id` is not a vanilla item, `Some(None)` if non-damageable, or
+/// `Some(Some(max_damage))` if damageable.
+pub(crate) fn vanilla_max_damage(id: &str) -> Option<Option<i32>> {
+    if !is_vanilla_item(id) {
+        return None;
+    }
+    match VANILLA_MAX_DAMAGE.binary_search_by(|(k, _)| k.cmp(&id)) {
+        Ok(index) => Some(Some(VANILLA_MAX_DAMAGE[index].1)),
+        Err(_) => Some(None),
+    }
+}
+
+/// Whether `id` is a vanilla 26.3 `BuiltInRegistries.RECIPE_SERIALIZER` id.
+pub(crate) fn is_vanilla_recipe_serializer(id: &str) -> bool {
+    VANILLA_RECIPE_SERIALIZERS.binary_search(&id).is_ok()
+}
+
+/// Whether `id` is a vanilla 26.3 `BuiltInRegistries.RECIPE_TYPE` id.
+pub(crate) fn is_vanilla_recipe_type(id: &str) -> bool {
+    VANILLA_RECIPE_TYPES.binary_search(&id).is_ok()
+}
+
 /// Raw entry list for a vanilla 26.3 `minecraft:*` item tag.
 pub(crate) fn vanilla_item_tag(tag_id: &str) -> Option<&'static [&'static str]> {
     VANILLA_ITEM_TAGS
@@ -2380,4 +2403,130 @@ const DATA_COMPONENT_FIELDS: &[(&str, &str)] = &[
     ("WRITABLE_BOOK_CONTENT", "minecraft:writable_book_content"),
     ("WRITTEN_BOOK_CONTENT", "minecraft:written_book_content"),
     ("ZOMBIE_NAUTILUS_VARIANT", "minecraft:zombie_nautilus/variant"),
+];
+
+#[rustfmt::skip]
+const VANILLA_MAX_DAMAGE: &[(&str, i32)] = &[
+    ("minecraft:bow", 384),
+    ("minecraft:brush", 64),
+    ("minecraft:carrot_on_a_stick", 25),
+    ("minecraft:chainmail_boots", 195),
+    ("minecraft:chainmail_chestplate", 240),
+    ("minecraft:chainmail_helmet", 165),
+    ("minecraft:chainmail_leggings", 225),
+    ("minecraft:copper_axe", 190),
+    ("minecraft:copper_boots", 143),
+    ("minecraft:copper_chestplate", 176),
+    ("minecraft:copper_helmet", 121),
+    ("minecraft:copper_hoe", 190),
+    ("minecraft:copper_leggings", 165),
+    ("minecraft:copper_pickaxe", 190),
+    ("minecraft:copper_shovel", 190),
+    ("minecraft:copper_spear", 190),
+    ("minecraft:copper_sword", 190),
+    ("minecraft:crossbow", 465),
+    ("minecraft:diamond_axe", 1561),
+    ("minecraft:diamond_boots", 429),
+    ("minecraft:diamond_chestplate", 528),
+    ("minecraft:diamond_helmet", 363),
+    ("minecraft:diamond_hoe", 1561),
+    ("minecraft:diamond_leggings", 495),
+    ("minecraft:diamond_pickaxe", 1561),
+    ("minecraft:diamond_shovel", 1561),
+    ("minecraft:diamond_spear", 1561),
+    ("minecraft:diamond_sword", 1561),
+    ("minecraft:elytra", 432),
+    ("minecraft:fishing_rod", 64),
+    ("minecraft:flint_and_steel", 64),
+    ("minecraft:golden_axe", 32),
+    ("minecraft:golden_boots", 91),
+    ("minecraft:golden_chestplate", 112),
+    ("minecraft:golden_helmet", 77),
+    ("minecraft:golden_hoe", 32),
+    ("minecraft:golden_leggings", 105),
+    ("minecraft:golden_pickaxe", 32),
+    ("minecraft:golden_shovel", 32),
+    ("minecraft:golden_spear", 32),
+    ("minecraft:golden_sword", 32),
+    ("minecraft:iron_axe", 250),
+    ("minecraft:iron_boots", 195),
+    ("minecraft:iron_chestplate", 240),
+    ("minecraft:iron_helmet", 165),
+    ("minecraft:iron_hoe", 250),
+    ("minecraft:iron_leggings", 225),
+    ("minecraft:iron_pickaxe", 250),
+    ("minecraft:iron_shovel", 250),
+    ("minecraft:iron_spear", 250),
+    ("minecraft:iron_sword", 250),
+    ("minecraft:leather_boots", 65),
+    ("minecraft:leather_chestplate", 80),
+    ("minecraft:leather_helmet", 55),
+    ("minecraft:leather_leggings", 75),
+    ("minecraft:mace", 500),
+    ("minecraft:netherite_axe", 2031),
+    ("minecraft:netherite_boots", 481),
+    ("minecraft:netherite_chestplate", 592),
+    ("minecraft:netherite_helmet", 407),
+    ("minecraft:netherite_hoe", 2031),
+    ("minecraft:netherite_leggings", 555),
+    ("minecraft:netherite_pickaxe", 2031),
+    ("minecraft:netherite_shovel", 2031),
+    ("minecraft:netherite_spear", 2031),
+    ("minecraft:netherite_sword", 2031),
+    ("minecraft:shears", 238),
+    ("minecraft:shield", 336),
+    ("minecraft:stone_axe", 131),
+    ("minecraft:stone_hoe", 131),
+    ("minecraft:stone_pickaxe", 131),
+    ("minecraft:stone_shovel", 131),
+    ("minecraft:stone_spear", 131),
+    ("minecraft:stone_sword", 131),
+    ("minecraft:trident", 250),
+    ("minecraft:turtle_helmet", 275),
+    ("minecraft:warped_fungus_on_a_stick", 100),
+    ("minecraft:wolf_armor", 64),
+    ("minecraft:wooden_axe", 59),
+    ("minecraft:wooden_hoe", 59),
+    ("minecraft:wooden_pickaxe", 59),
+    ("minecraft:wooden_shovel", 59),
+    ("minecraft:wooden_spear", 59),
+    ("minecraft:wooden_sword", 59),
+];
+
+#[rustfmt::skip]
+const VANILLA_RECIPE_SERIALIZERS: &[&str] = &[
+    "minecraft:blasting",
+    "minecraft:brewing",
+    "minecraft:campfire_cooking",
+    "minecraft:crafting_decorated_pot",
+    "minecraft:crafting_dye",
+    "minecraft:crafting_imbue",
+    "minecraft:crafting_shaped",
+    "minecraft:crafting_shapeless",
+    "minecraft:crafting_special_bannerduplicate",
+    "minecraft:crafting_special_bookcloning",
+    "minecraft:crafting_special_firework_rocket",
+    "minecraft:crafting_special_firework_star",
+    "minecraft:crafting_special_firework_star_fade",
+    "minecraft:crafting_special_mapextending",
+    "minecraft:crafting_special_repairitem",
+    "minecraft:crafting_special_shielddecoration",
+    "minecraft:crafting_transmute",
+    "minecraft:smelting",
+    "minecraft:smithing_transform",
+    "minecraft:smithing_trim",
+    "minecraft:smoking",
+    "minecraft:stonecutting",
+];
+
+#[rustfmt::skip]
+const VANILLA_RECIPE_TYPES: &[&str] = &[
+    "minecraft:blasting",
+    "minecraft:brewing",
+    "minecraft:campfire_cooking",
+    "minecraft:crafting",
+    "minecraft:smelting",
+    "minecraft:smithing",
+    "minecraft:smoking",
+    "minecraft:stonecutting",
 ];

@@ -3,6 +3,7 @@ import com.google.gson.JsonParser;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
+import com.mojang.serialization.Lifecycle;
 import com.mojang.serialization.MapCodec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import java.lang.reflect.Field;
@@ -10,6 +11,7 @@ import java.util.*;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.Holder;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.MappedRegistry;
 import net.minecraft.core.Registry;
 import net.minecraft.core.component.DataComponentPatch;
 import net.minecraft.core.component.DataComponents;
@@ -23,12 +25,14 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.TagKey;
 import net.minecraft.tags.TagLoader;
+import net.minecraft.util.ExtraCodecs;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ItemStackTemplate;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.crafting.*;
+import net.minecraft.world.level.Level;
 
 public final class GeneralRecipesOracle {
   static void unfreezeItemRegistry() throws Exception {
@@ -61,6 +65,8 @@ public final class GeneralRecipesOracle {
   }
 
   static java.io.PrintStream out;
+  static int labelXmapCalls = 0;
+  static int ctorCalls = 0;
 
   static void capture(String name, Runnable action) {
     try {
@@ -77,7 +83,8 @@ public final class GeneralRecipesOracle {
       Ingredient catalyst,
       ItemStackTemplate result,
       int tier,
-      Optional<String> label) {
+      Optional<String> label,
+      int weight) {
     static final MapCodec<AlloyRecipe> MAP_CODEC = RecordCodecBuilder.mapCodec(i -> i.group(
         Recipe.CommonInfo.MAP_CODEC.forGetter(AlloyRecipe::commonInfo),
         Ingredient.CODEC.fieldOf("base").forGetter(AlloyRecipe::base),
@@ -85,9 +92,16 @@ public final class GeneralRecipesOracle {
         ItemStackTemplate.CODEC.fieldOf("result").forGetter(AlloyRecipe::result),
         Codec.INT.optionalFieldOf("tier", 1).forGetter(AlloyRecipe::tier),
         Codec.STRING.optionalFieldOf("label").xmap(
-            opt -> opt.map(String::toUpperCase),
-            opt -> opt.map(String::toLowerCase)).forGetter(AlloyRecipe::label)
-    ).apply(i, AlloyRecipe::new));
+            opt -> {
+              if (opt.isPresent()) labelXmapCalls++;
+              return opt.map(String::toUpperCase);
+            },
+            opt -> opt.map(String::toLowerCase)).forGetter(AlloyRecipe::label),
+        ExtraCodecs.intRange(1, 99).optionalFieldOf("weight", 1).forGetter(AlloyRecipe::weight)
+    ).apply(i, (ci, b, c, r, t, l, w) -> {
+      ctorCalls++;
+      return new AlloyRecipe(ci, b, c, r, t, l, w);
+    }));
 
     boolean matches(ItemStack a, ItemStack b) {
       return base.test(a) && catalyst.test(b);
@@ -99,7 +113,7 @@ public final class GeneralRecipesOracle {
   }
 
   public static void main(String[] args) throws Exception {
-    out = System.out;
+    out = args.length > 0 ? new java.io.PrintStream(args[0]) : System.out;
     initMc263();
 
     // Register demo items with custom stack sizes
@@ -132,7 +146,7 @@ public final class GeneralRecipesOracle {
     RegistryOps<JsonElement> ops = RegistryOps.create(
         JsonOps.INSTANCE, HolderLookup.Provider.create(java.util.stream.Stream.of(BuiltInRegistries.ITEM)));
 
-    // Decode 4 valid recipes
+    // Decode 5 valid recipes (including DFU null optional fields + fractional truncation)
     Map<String, String> validJsons = new LinkedHashMap<>();
     validJsons.put("demo:iron_alloy", """
         {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:redstone","result":{"id":"demo:alloy_ingot","count":4},"tier":2,"label":"basic"}""");
@@ -142,6 +156,8 @@ public final class GeneralRecipesOracle {
         {"type":"demo:alloy","base":"#demo:reagents","catalyst":"minecraft:coal","result":{"id":"minecraft:stick","count":2,"components":{"minecraft:repair_cost":7}}}""");
     validJsons.put("demo:small_stack", """
         {"type":"demo:alloy","base":"minecraft:diamond","catalyst":"minecraft:gold_nugget","result":{"id":"demo:small_stack_item","count":16}}""");
+    validJsons.put("demo:dfu_coercion", """
+        {"type":"demo:alloy","show_notification":null,"base":"minecraft:emerald","catalyst":"minecraft:quartz","result":{"id":"demo:alloy_ingot","count":3.7,"components":null},"tier":2.9,"label":null,"weight":10.8}""");
 
     Map<String, AlloyRecipe> recipes = new LinkedHashMap<>();
     for (var e : validJsons.entrySet()) {
@@ -152,10 +168,11 @@ public final class GeneralRecipesOracle {
           + "|notify=" + rec.commonInfo().showNotification()
           + "|tier=" + rec.tier()
           + "|label=" + rec.label().orElse("none")
+          + "|weight=" + rec.weight()
           + "|count=" + rec.result().count());
     }
 
-    // Invalid recipes fail decode cleanly
+    // Invalid recipes fail decode cleanly (including whitespace, null required field, truncated out-of-range, multi-error)
     String[] invalidJsons = {
         """
         {"type":"demo:alloy","base":"minecraft:air","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}""",
@@ -166,7 +183,17 @@ public final class GeneralRecipesOracle {
         """
         {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":100}}""",
         """
-        {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"minecraft:air","count":1}}"""
+        {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"minecraft:air","count":1}}""",
+        """
+        {"type":"demo:alloy","base":" minecraft:iron_ingot","catalyst":"minecraft:coal","result":"demo:alloy_ingot"}""",
+        """
+        {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal ","result":"demo:alloy_ingot"}""",
+        """
+        {"type":"demo:alloy","base":null,"catalyst":"minecraft:coal","result":"demo:alloy_ingot"}""",
+        """
+        {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":100.2}}""",
+        """
+        {"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":{"id":"demo:alloy_ingot","count":0.9}}"""
     };
     int invalidErrors = 0;
     for (String bad : invalidJsons) {
@@ -175,6 +202,15 @@ public final class GeneralRecipesOracle {
       }
     }
     out.println("invalidErrorCount=" + invalidErrors);
+
+    // RecordCodecBuilder multi-error accumulation: evaluates later xmap field even after earlier error, never calls ctor
+    int xmapBefore = labelXmapCalls;
+    int ctorBefore = ctorCalls;
+    DataResult<AlloyRecipe> multiBad = AlloyRecipe.MAP_CODEC.codec().parse(ops, JsonParser.parseString("""
+        {"type":"demo:alloy","base":"minecraft:air","catalyst":"minecraft:coal","result":"demo:alloy_ingot","tier":"bad_int","label":"still_runs","weight":0.5}"""));
+    out.println("multiErr:isErr=" + multiBad.isError()
+        + "|xmapDelta=" + (labelXmapCalls - xmapBefore)
+        + "|ctorDelta=" + (ctorCalls - ctorBefore));
 
     // Matching + assemble tests
     record Pair(String name, ItemStack a, ItemStack b) {}
@@ -193,6 +229,7 @@ public final class GeneralRecipesOracle {
         new Pair("blackstone+coal", new ItemStack(Items.BLACKSTONE), new ItemStack(Items.COAL)),
         new Pair("deepslate+coal", new ItemStack(Items.COBBLED_DEEPSLATE), new ItemStack(Items.COAL)),
         new Pair("diamond+nugget", new ItemStack(Items.DIAMOND), new ItemStack(Items.GOLD_NUGGET)),
+        new Pair("emerald+quartz", new ItemStack(Items.EMERALD), new ItemStack(Items.QUARTZ)),
         new Pair("dirt+coal", new ItemStack(Items.DIRT), new ItemStack(Items.COAL)),
         new Pair("empty+empty", ItemStack.EMPTY, ItemStack.EMPTY)
     );
@@ -214,20 +251,60 @@ public final class GeneralRecipesOracle {
           + "|hasCustomName=" + (resultStack.get(DataComponents.CUSTOM_NAME) != null));
     }
 
-    // TransmuteRecipe extraCount + maxStackSize validation
+    // TransmuteRecipe extraCount + maxStackSize validation + validateStrict + negative template counts
     ItemStackTemplate pearl20 = new ItemStackTemplate(Items.ENDER_PEARL, 20);
     ItemStack pearlOut = TransmuteRecipe.createWithOriginalComponents(pearl20, new ItemStack(Items.STONE));
-    out.println("pearl20=" + pearlOut.toString() + "|empty=" + pearlOut.isEmpty());
+    out.println("pearl20=" + pearlOut.toString() + "|empty=" + pearlOut.isEmpty() + "|sameEmpty=" + (pearlOut == ItemStack.EMPTY));
 
     ItemStackTemplate small20 = new ItemStackTemplate(smallItem, 20);
     ItemStack smallOut20 = TransmuteRecipe.createWithOriginalComponents(small20, new ItemStack(Items.STONE));
-    out.println("small20=" + smallOut20.toString() + "|empty=" + smallOut20.isEmpty());
+    out.println("small20=" + smallOut20.toString() + "|empty=" + smallOut20.isEmpty() + "|sameEmpty=" + (smallOut20 == ItemStack.EMPTY));
 
     ItemStackTemplate stick2 = new ItemStackTemplate(Items.STICK, 2);
     ItemStack stickExtra = TransmuteRecipe.createWithOriginalComponents(stick2, ironWithComp, 3);
     out.println("stickExtra=" + stickExtra.toString() + "|repairCost=" + stickExtra.get(DataComponents.REPAIR_COST));
 
-    // CommonInfo & RecipeHolder & DataComponentPatch & ItemStack.EMPTY
+    ItemStackTemplate negTpl = new ItemStackTemplate(Items.STONE, -3);
+    ItemStack negOut = negTpl.create();
+    out.println("negTpl=" + negTpl.count()
+        + "|sameEmpty=" + (negOut == ItemStack.EMPTY)
+        + "|empty=" + negOut.isEmpty()
+        + "|count=" + negOut.getCount()
+        + "|max=" + negOut.getMaxStackSize()
+        + "|str=" + negOut.toString());
+
+    ItemStack dmgStoneOut = new ItemStackTemplate(
+        Items.STONE, DataComponentPatch.builder().set(DataComponents.MAX_DAMAGE, 10).build()).create();
+    ItemStack stackSwordOut = new ItemStackTemplate(
+        Items.DIAMOND_SWORD, DataComponentPatch.builder().set(DataComponents.MAX_STACK_SIZE, 16).build()).create();
+    ItemStack validDmgStoneOut = new ItemStackTemplate(
+        Items.STONE, DataComponentPatch.builder().set(DataComponents.MAX_DAMAGE, 10).set(DataComponents.MAX_STACK_SIZE, 1).build()).create();
+    out.println("validateStrict="
+        + (dmgStoneOut == ItemStack.EMPTY) + "|"
+        + (stackSwordOut == ItemStack.EMPTY) + "|"
+        + (validDmgStoneOut == ItemStack.EMPTY) + "|"
+        + validDmgStoneOut.toString());
+
+    // PatchedDataComponentMap exact semantics
+    ItemStack pst = new ItemStack(Items.STONE, 1);
+    Integer pr1 = pst.set(DataComponents.REPAIR_COST, 9);
+    boolean pp1 = pst.getComponentsPatch().isEmpty();
+    Integer pr2 = pst.set(DataComponents.REPAIR_COST, 0);
+    boolean pp2 = pst.getComponentsPatch().isEmpty();
+    Integer pr3 = pst.remove(DataComponents.REPAIR_COST);
+    Integer pg3 = pst.get(DataComponents.REPAIR_COST);
+    int psz3 = pst.getComponentsPatch().size();
+    Integer pr4 = pst.remove(DataComponents.REPAIR_COST);
+    Integer pr5 = pst.set(DataComponents.REPAIR_COST, 5);
+    Component pr6 = pst.remove(DataComponents.CUSTOM_NAME);
+    int pszAfterCn = pst.getComponentsPatch().size();
+    pst.applyComponents(DataComponentPatch.builder().set(DataComponents.REPAIR_COST, 0).build());
+    boolean ppCanonical = pst.getComponentsPatch().isEmpty();
+    out.println("patchMap=" + pr1 + "|" + pp1 + "|" + pr2 + "|" + pp2
+        + "|" + pr3 + "|" + pg3 + "|" + psz3 + "|" + pr4 + "|" + pr5
+        + "|" + pr6 + "|" + pszAfterCn + "|" + ppCanonical);
+
+    // CommonInfo & RecipeHolder & DataComponentPatch & ItemStack.EMPTY maxStackSize
     Recipe.CommonInfo ciTrue = new Recipe.CommonInfo(true);
     Recipe.CommonInfo ciFalse = new Recipe.CommonInfo(false);
     out.println("ci=" + ciTrue + "|" + ciFalse
@@ -236,6 +313,9 @@ public final class GeneralRecipesOracle {
     out.println("emptyStack=" + ItemStack.EMPTY.toString()
         + "|isAir=" + ItemStack.EMPTY.is(Items.AIR)
         + "|isStick=" + ItemStack.EMPTY.is(Items.STICK)
+        + "|maxEmpty=" + ItemStack.EMPTY.getMaxStackSize()
+        + "|maxZero=" + new ItemStack(Items.STONE, 0).getMaxStackSize()
+        + "|maxAir=" + new ItemStack(Items.AIR, 1).getMaxStackSize()
         + "|patchEmpty=" + ItemStack.EMPTY.getComponentsPatch().isEmpty()
         + "|patchStr=" + ItemStack.EMPTY.getComponentsPatch().toString());
     out.println("optIngr="
@@ -243,11 +323,22 @@ public final class GeneralRecipesOracle {
         + Ingredient.testOptionalIngredient(Optional.empty(), new ItemStack(Items.STONE)) + "|"
         + Ingredient.testOptionalIngredient(Optional.of(Ingredient.of(Items.STONE)), new ItemStack(Items.STONE)));
 
-    // SimpleContainer clamping
+    // SimpleContainer clamping: default 99 (80 stays 80), ender pearl 16, and virtual getMaxStackSize() override
     SimpleContainer box = new SimpleContainer(2);
     ItemStack pearls = new ItemStack(Items.ENDER_PEARL, 30);
     box.setItem(0, pearls);
-    out.println("boxClamp=" + box.getItem(0).toString() + "|boxEmpty=" + box.isEmpty());
+    ItemStack big = new ItemStack(Items.STONE, 80);
+    big.set(DataComponents.MAX_STACK_SIZE, 99);
+    box.setItem(1, big);
+    SimpleContainer limitedBox = new SimpleContainer(2) {
+      @Override public int getMaxStackSize() { return 12; }
+    };
+    limitedBox.setItem(0, new ItemStack(Items.STONE, 30));
+    limitedBox.setItem(1, new ItemStack(Items.ENDER_PEARL, 30));
+    out.println("boxClamp=" + box.getItem(0).toString() + "|" + box.getItem(1).toString()
+        + "|boxMax=" + box.getMaxStackSize() + "|boxEmpty=" + box.isEmpty()
+        + "|lim0=" + limitedBox.getItem(0).toString() + "|lim1=" + limitedBox.getItem(1).toString()
+        + "|limMax=" + limitedBox.getMaxStackSize());
 
     // Exact validation exceptions
     capture("ingrAir", () -> Ingredient.of(Items.AIR));
@@ -263,5 +354,45 @@ public final class GeneralRecipesOracle {
     RecipeHolder<?> h2 = new RecipeHolder<>(rk2, null);
     RecipeHolder<?> h3 = new RecipeHolder<>(rk3, null);
     out.println("holder=" + h1.toString() + "|eqSame=" + h1.equals(h2) + "|eqDiff=" + h1.equals(h3));
+
+    // Real RecipeManager: RecipeInput.isEmpty() precheck + ResourceKey registry validation
+    int[] alwaysMatchesCalls = {0};
+    RecipeType<Recipe<RecipeInput>> alwaysType = new RecipeType<>() {};
+    Recipe<RecipeInput> alwaysRecipe = new Recipe<>() {
+      public boolean matches(RecipeInput in, Level lvl) { alwaysMatchesCalls[0]++; return true; }
+      public ItemStack assemble(RecipeInput in) { return new ItemStack(Items.STICK); }
+      public RecipeSerializer<? extends Recipe<RecipeInput>> getSerializer() { return null; }
+      public RecipeType<? extends Recipe<RecipeInput>> getType() { return alwaysType; }
+      public PlacementInfo placementInfo() { return PlacementInfo.NOT_PLACEABLE; }
+      public RecipeBookCategory recipeBookCategory() { return null; }
+      public String group() { return ""; }
+      public boolean showNotification() { return true; }
+      public boolean isSpecial() { return false; }
+    };
+    ResourceKey<Recipe<?>> alwaysKey = ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:always"));
+    ResourceKey<Item> wrongKey = ResourceKey.create(Registries.ITEM, Identifier.parse("demo:always"));
+    MappedRegistry<Recipe<?>> recipeReg = new MappedRegistry<>(Registries.RECIPE, Lifecycle.stable());
+    Registry.register(recipeReg, alwaysKey, alwaysRecipe);
+    recipeReg.freeze();
+    RecipeManager mgr = new RecipeManager(HolderLookup.Provider.create(java.util.stream.Stream.of(recipeReg)));
+    RecipeInput emptyIn = new RecipeInput() {
+      public ItemStack getItem(int i) { return ItemStack.EMPTY; }
+      public int size() { return 1; }
+    };
+    boolean r3 = mgr.getRecipeFor(alwaysType, emptyIn, null).isPresent();
+    int c3 = alwaysMatchesCalls[0];
+    boolean r4key = mgr.getRecipeFor(alwaysType, emptyIn, null, alwaysKey).isPresent();
+    int c4key = alwaysMatchesCalls[0];
+    @SuppressWarnings("unchecked")
+    boolean r4wrong = mgr.getRecipeFor(alwaysType, emptyIn, null, (ResourceKey<Recipe<?>>) (ResourceKey<?>) wrongKey).isPresent();
+    int c4wrong = alwaysMatchesCalls[0];
+    @SuppressWarnings("unchecked")
+    boolean byWrong = mgr.byKey((ResourceKey<Recipe<?>>) (ResourceKey<?>) wrongKey).isPresent();
+    boolean byRight = mgr.byKey(alwaysKey).isPresent();
+    out.println("mgrChecks=" + r3 + "|" + c3 + "|" + r4key + "|" + c4key + "|" + r4wrong + "|" + c4wrong + "|" + byWrong + "|" + byRight);
+    out.flush();
+    if (args.length > 0) {
+      out.close();
+    }
   }
 }
