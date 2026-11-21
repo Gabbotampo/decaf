@@ -15,8 +15,6 @@ use horizon_native_java::{
 };
 use std::{path::Path, sync::Arc};
 
-const RUNES_JAR: &str = "/home/solenopsisbot/horizon-corpus/deps-pool/runes-fabric-1.3.2+26.3.jar";
-
 const STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/resources/Identifier.java",
@@ -393,11 +391,12 @@ public final class Probe {
 
 #[test]
 fn real_runes_jar_decodes_altar_recipes_and_runs_create_result() {
-    let runes_path = Path::new(RUNES_JAR);
-    if !runes_path.exists() {
-        eprintln!("skipping real Runes jar test: {} not present", RUNES_JAR);
+    // The real Runes 1.3.2 jar isn't in the repo or on CI: point RUNES_JAR at it to run this.
+    let Some(runes_jar_path) = std::env::var_os("RUNES_JAR") else {
+        eprintln!("RUNES_JAR is unset; real Runes recipe test skipped");
         return;
-    }
+    };
+    let runes_path = Path::new(&runes_jar_path);
 
     let runes_jar = NativeJar::from_path(runes_path).expect("load real Runes 1.3.2+26.3 jar");
     let mut sources = STUBS.to_vec();
