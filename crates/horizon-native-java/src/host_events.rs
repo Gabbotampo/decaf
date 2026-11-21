@@ -150,13 +150,27 @@ pub(crate) fn fabric_field_of(value: &Value) -> Option<(String, String)> {
     }
 }
 
-/// How diagnostics name a Fabric event: `owner.FIELD`, the `createArrayBacked` serial, or
-/// `…RegistryEntryAddedCallback.event/<registry>`, as the markers spelled them.
+/// The tab key a `CreativeModeTabEvents.modifyOutputEvent(key)` handle names.
+pub(crate) fn fabric_tab_of(value: &Value) -> Option<String> {
+    match values_of(value, HostKind::FabricEvent)?.as_slice() {
+        [kind, Value::Ref(Some(tab))] if *kind == text("tab") => Some(tab.clone()),
+        _ => None,
+    }
+}
+
+/// How diagnostics name a Fabric event: `owner.FIELD`, the `createArrayBacked` serial,
+/// `…CreativeModeTabEvents.modifyOutputEvent/<tab>`, or
+/// `…RegistryEntryAddedCallback.event/<registry>`.
 pub(crate) fn fabric_event_name(value: &Value) -> Option<String> {
     Some(match values_of(value, HostKind::FabricEvent)?.as_slice() {
-        [_, Value::Ref(Some(owner)), Value::Ref(Some(name))] => format!("{owner}.{name}"),
-        [_, Value::Long(serial)] => serial.to_string(),
-        [_, Value::Ref(Some(registry))] => format!(
+        [kind, Value::Ref(Some(owner)), Value::Ref(Some(name))] if *kind == text("field") => {
+            format!("{owner}.{name}")
+        }
+        [kind, Value::Long(serial)] if *kind == text("array") => serial.to_string(),
+        [kind, Value::Ref(Some(tab))] if *kind == text("tab") => format!(
+            "net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/{tab}"
+        ),
+        [kind, Value::Ref(Some(registry))] if *kind == text("registry") => format!(
             "net/fabricmc/fabric/api/event/registry/RegistryEntryAddedCallback.event/{registry}"
         ),
         _ => return None,

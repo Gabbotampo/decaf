@@ -338,6 +338,10 @@ impl StdHost {
         for held in self.fabric_biome_modifications.values() {
             value(held, out);
         }
+        // Fabric synchronized recipe serializers (`fabric_api_slice2.rs`, static strong root).
+        for held in self.recipe_sync_serializers.values() {
+            value(held, out);
+        }
         // NeoForge attachment types and live values (`neoforge_attachments.rs`).
         self.neoforge_attachments.root_texts(out);
         // The objects the loader built and keeps (an entrypoint instance,
@@ -406,6 +410,11 @@ impl StdHost {
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
+        if let Some(stack) = self.jar_item_stacks.get(marker) {
+            for text in value_texts(&stack.item) {
+                out.push(text.to_owned());
+            }
+        }
         push(self.state_definition_builders.get(marker), out);
         if let Some((block, _)) = self.block_states.get(marker) {
             out.push(block.clone());
@@ -449,6 +458,8 @@ impl StdHost {
             .chain(self.constructed_items.iter())
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
+            .chain(self.jar_item_stacks.keys())
+            .chain(self.item_required_features.keys())
             .chain(self.block_state_properties.keys())
             .chain(self.block_copied_properties.iter())
             .chain(self.state_definition_builders.keys())
@@ -496,6 +507,8 @@ impl StdHost {
         self.constructed_items.retain(|key| keep(key));
         self.constructed_blocks.retain(|key| keep(key));
         self.block_items.retain(|key, _| keep(key));
+        self.jar_item_stacks.retain(|key, _| keep(key));
+        self.item_required_features.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
         self.empty_collections.retain(|key| keep(key));
@@ -1730,6 +1743,8 @@ mod tests {
             "constructed_items",
             "constructed_blocks",
             "block_items",
+            "jar_item_stacks",
+            "item_required_features",
             "payload_registrations",
             "payload_bytes",
             "fabric_entrypoint_containers",
@@ -1807,6 +1822,7 @@ mod tests {
             "fabric_resource_conditions",
             "creative_tab",
             "fabric_biome_modifications",
+            "recipe_sync_serializers",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
@@ -1870,6 +1886,7 @@ mod tests {
             "registry_lifecycles",
             "random_seed_uniquifier",
             "random_time_origin",
+            "fired_creative_tab_registrations",
         ];
         let debug = format!("{:#?}", StdHost::new());
         let fields: BTreeSet<&str> = debug
@@ -1926,5 +1943,47 @@ mod tests {
         heap.next_object = 256;
         collect(&mut heap, &mut host, &[]);
         assert!(host.menu_states.is_empty());
+    }
+
+    #[test]
+    fn synced_recipe_serializers_root_their_objects_and_held_codecs() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+
+        // A JarObject serializer reachable only from Fabric's static synced set.
+        let jar_ser = crate::jar_object::handle("demo/Serializer#1".into());
+        heap.fields
+            .insert(field("demo/Serializer#1", "delegate"), text("demo/Node#2"));
+        heap.fields
+            .insert(field("demo/Node#2", "tag"), Value::Int(42));
+        // An unreferenced node that must be swept.
+        heap.fields
+            .insert(field("demo/Node#3", "tag"), Value::Int(99));
+
+        // A RecipeSerializer record handle whose held codecs are JarObjects
+        // reachable only through the synced set.
+        let map_codec = crate::jar_object::handle("demo/MapCodec#4".into());
+        let stream_codec = crate::jar_object::handle("demo/StreamCodec#5".into());
+        heap.fields
+            .insert(field("demo/MapCodec#4", "name"), text("map"));
+        heap.fields
+            .insert(field("demo/StreamCodec#5", "name"), text("stream"));
+        let record_ser = crate::recipe_serializer::make(&map_codec, &stream_codec);
+
+        for serializer in [jar_ser, record_ser] {
+            let key = crate::fabric_api_slice2::canonical_serializer_key(&serializer).unwrap();
+            host.recipe_sync_serializers.insert(key, serializer);
+        }
+
+        collect(&mut heap, &mut host, &[]);
+        assert_eq!(
+            objects(&heap),
+            [
+                "demo/MapCodec#4",
+                "demo/Node#2",
+                "demo/Serializer#1",
+                "demo/StreamCodec#5",
+            ]
+        );
     }
 }

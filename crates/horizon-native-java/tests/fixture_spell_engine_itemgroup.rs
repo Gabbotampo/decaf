@@ -65,9 +65,26 @@ fn creative_tab_registration_matches_java25_capture_and_is_unfired() {
     );
     let listeners = host.game_listeners(&fixture.jar, true);
     assert!(listeners.listeners.is_empty());
-    assert!(
-        listeners.unsupported.values().sum::<usize>() >= 1,
-        "registration must be reported unfired: {:?}",
+    // Before the tab is built, the modifyOutputEvent registration stays counted in `unsupported`.
+    assert_eq!(
+        listeners
+            .unsupported
+            .get("net/fabricmc/fabric/api/creativetab/v1/CreativeModeTabEvents.modifyOutputEvent/minecraft:creative_mode_tab:spell_engine:main"),
+        Some(&1),
+        "unbuilt creative-tab listener must remain in unsupported: {:?}",
         listeners.unsupported
+    );
+    // Building that tab fires the callback and clears its registration from `unsupported`.
+    let contents = fixture
+        .jar
+        .creative_tab_contents(&mut host, "spell_engine:main")
+        .unwrap();
+    assert!(contents.display_stacks.is_empty());
+    assert!(contents.search_tab_stacks.is_empty());
+    let after = host.game_listeners(&fixture.jar, true);
+    assert!(
+        after.unsupported.is_empty(),
+        "fired creative-tab listener should clear from unsupported: {:?}",
+        after.unsupported
     );
 }
