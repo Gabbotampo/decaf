@@ -33982,7 +33982,7 @@ impl<H: Host> Runtime<'_, H> {
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
                             at,
-                            self.invoke_server_facade(&r, receiver.as_ref(), &args)
+                            self.invoke_server_facade(&r, receiver.as_ref(), &args, class, method)
                         )
                     {
                         dispatched = Some(value);

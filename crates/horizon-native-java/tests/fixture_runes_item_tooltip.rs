@@ -16,8 +16,8 @@
 use horizon_native_java::{
     ExecutionBudget, HostKind, HostRef, NativeJar, StdHost, Value,
     client_surface::{
-        ClientLevel, ClientPlayer, ClientSnapshot, tooltip_context, tooltip_display, tooltip_flag,
-        tooltip_stack,
+        ClientLevel, ClientPlayer, ClientSnapshot, tooltip_context, tooltip_context_empty,
+        tooltip_display, tooltip_flag, tooltip_stack,
     },
 };
 use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc};
@@ -33,12 +33,28 @@ const TOOLTIP_STUBS: &[(&str, &str)] = &[
         "package net.minecraft; public enum ChatFormatting { BLACK, DARK_BLUE, DARK_GREEN, DARK_AQUA, DARK_RED, DARK_PURPLE, GOLD, GRAY, DARK_GRAY, BLUE, GREEN, AQUA, RED, LIGHT_PURPLE, YELLOW, WHITE, OBFUSCATED, BOLD, STRIKETHROUGH, UNDERLINE, ITALIC, RESET; }",
     ),
     (
+        "net/minecraft/core/HolderLookup.java",
+        "package net.minecraft.core; public interface HolderLookup { interface Provider {} }",
+    ),
+    (
+        "net/minecraft/world/level/Level.java",
+        "package net.minecraft.world.level; public abstract class Level {}",
+    ),
+    (
+        "net/minecraft/world/level/saveddata/maps/MapId.java",
+        "package net.minecraft.world.level.saveddata.maps; public final class MapId {}",
+    ),
+    (
+        "net/minecraft/world/level/saveddata/maps/MapItemSavedData.java",
+        "package net.minecraft.world.level.saveddata.maps; public class MapItemSavedData {}",
+    ),
+    (
         "net/minecraft/network/chat/Component.java",
-        "package net.minecraft.network.chat; public interface Component { static MutableComponent translatable(String k) { return null; } static MutableComponent translatable(String k, Object... a) { return null; } static MutableComponent translatableWithFallback(String k, String fb, Object... a) { return null; } static MutableComponent literal(String s) { return null; } }",
+        "package net.minecraft.network.chat; public interface Component { static MutableComponent translatable(String k) { return null; } static MutableComponent translatable(String k, Object... a) { return null; } static MutableComponent translatableEscape(String k, Object... a) { return null; } static MutableComponent translatableWithFallback(String k, String fb, Object... a) { return null; } static MutableComponent literal(String s) { return null; } String getString(); }",
     ),
     (
         "net/minecraft/network/chat/MutableComponent.java",
-        "package net.minecraft.network.chat; import net.minecraft.ChatFormatting; public interface MutableComponent extends Component { MutableComponent withStyle(ChatFormatting f); MutableComponent withStyle(ChatFormatting... f); MutableComponent withColor(int rgb); MutableComponent append(Component c); MutableComponent append(String s); }",
+        "package net.minecraft.network.chat; import net.minecraft.ChatFormatting; public interface MutableComponent extends Component { MutableComponent withStyle(ChatFormatting f); MutableComponent withStyle(ChatFormatting... f); MutableComponent withColor(int rgb); MutableComponent append(Component c); MutableComponent append(String s); MutableComponent copy(); MutableComponent plainCopy(); }",
     ),
     (
         "net/minecraft/world/item/ItemStack.java",
@@ -50,7 +66,7 @@ const TOOLTIP_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/item/TooltipFlag.java",
-        "package net.minecraft.world.item; public interface TooltipFlag { TooltipFlag NORMAL = null; TooltipFlag ADVANCED = null; boolean isAdvanced(); boolean isCreative(); }",
+        "package net.minecraft.world.item; public interface TooltipFlag { Default NORMAL = new Default(false, false); Default ADVANCED = new Default(true, false); boolean isAdvanced(); boolean isCreative(); record Default(boolean advanced, boolean creative) implements TooltipFlag { public boolean isAdvanced() { return advanced; } public boolean isCreative() { return creative; } public Default asCreative() { return new Default(advanced, true); } } }",
     ),
     (
         "net/minecraft/world/level/block/Block.java",
@@ -58,7 +74,7 @@ const TOOLTIP_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/item/Item.java",
-        "package net.minecraft.world.item; import java.util.function.Consumer; import net.minecraft.network.chat.Component; import net.minecraft.world.item.component.TooltipDisplay; public class Item { public static class Properties {} public interface TooltipContext { float tickRate(); Object registries(); boolean isPeaceful(); Object level(); Object player(); } public Item(Properties p) {} public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> o, TooltipFlag f) {} }",
+        "package net.minecraft.world.item; import java.util.function.Consumer; import net.minecraft.core.HolderLookup; import net.minecraft.network.chat.Component; import net.minecraft.world.item.component.TooltipDisplay; import net.minecraft.world.level.Level; import net.minecraft.world.level.saveddata.maps.MapId; import net.minecraft.world.level.saveddata.maps.MapItemSavedData; public class Item { public static class Properties {} public interface TooltipContext { TooltipContext EMPTY = null; static TooltipContext of(Level level) { return null; } float tickRate(); HolderLookup.Provider registries(); MapItemSavedData mapData(MapId id); boolean isPeaceful(); Object level(); Object player(); } public Item(Properties p) {} public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> o, TooltipFlag f) {} }",
     ),
     (
         "net/minecraft/world/item/BlockItem.java",
@@ -93,10 +109,30 @@ import java.util.function.Consumer;
 import lib.BaseTooltipItem;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.world.item.*;
 import net.minecraft.world.item.component.TooltipDisplay;
+import net.minecraft.world.level.Level;
 
 public final class TooltipProbe {
+  static final class CustomLabel {
+    @Override
+    public String toString() {
+      return "custom-str";
+    }
+  }
+
+  static final class NullToString {
+    @Override
+    public String toString() {
+      return null;
+    }
+  }
+
+  static final class PlainObj {}
+
+  record Pair(int x, String y) {}
+
   public static Item codecCases() { return new CodecCasesItem(new Item.Properties()); }
   public static Item blockItem() { return new BlockOverride(null, new Item.Properties()); }
   public static Item plainItem() { return new PlainItem(new Item.Properties()); }
@@ -108,9 +144,14 @@ public final class TooltipProbe {
   public static Item handleChecks() { return new HandleChecksItem(new Item.Properties()); }
   public static Item handleObjectMethod(int target, int which) { return new HandleObjectMethodItem(new Item.Properties(), target, which); }
   public static Item flagReader() { return new FlagReaderItem(new Item.Properties()); }
+  public static Item flagDefaultOracle() { return new FlagDefaultOracleItem(new Item.Properties()); }
+  public static Item emptyContextOracle() { return new EmptyContextOracleItem(new Item.Properties()); }
+  public static Item emptyContextObjectMethod(int which) { return new EmptyContextObjectMethodItem(new Item.Properties(), which); }
   public static Item tickRateReader() { return new TickRateReaderItem(new Item.Properties()); }
   public static Item contextMethodCaller(int which) { return new ContextMethodCallerItem(new Item.Properties(), which); }
   public static Item badArgItem(int which) { return new BadArgItem(new Item.Properties(), which); }
+  public static Item badArgGetString(int which) { return new BadArgGetStringItem(new Item.Properties(), which); }
+  public static Item escapeEdgeItem(int which) { return new EscapeEdgeItem(new Item.Properties(), which); }
 
   static final class CodecCasesItem extends Item {
     CodecCasesItem(Properties p) { super(p); }
@@ -138,6 +179,17 @@ public final class TooltipProbe {
       out.accept(Component.literal("x").withStyle(ChatFormatting.RED, ChatFormatting.ITALIC).withStyle(ChatFormatting.RESET).withStyle(ChatFormatting.BOLD));
       out.accept(Component.literal("a").append(Component.literal("b").append(Component.literal("c"))).append(Component.literal("d").withStyle(ChatFormatting.GOLD)));
       out.accept(Component.translatable("demo.noargs", new Object[0]));
+      out.accept(Component.translatableEscape("demo.esc", new Object[] { null }));
+      out.accept(Component.translatableEscape("demo.esc", Character.valueOf('Z')));
+      out.accept(Component.translatableEscape("demo.esc", new CustomLabel()));
+      out.accept(Component.translatableEscape("demo.esc", new Pair(3, "hi")));
+      ArrayList<String> list = new ArrayList<>();
+      list.add("a");
+      list.add("b");
+      out.accept(Component.translatableEscape("demo.esc", list));
+      out.accept(Component.translatableEscape("demo.esc", ChatFormatting.RED));
+      out.accept(Component.translatableEscape("demo.esc", Component.literal("lit").withStyle(ChatFormatting.GOLD)));
+      out.accept(Component.translatableEscape("demo.esc", TooltipFlag.NORMAL));
     }
   }
 
@@ -237,7 +289,55 @@ public final class TooltipProbe {
     FlagReaderItem(Properties p) { super(p); }
     @Override
     public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
-      out.accept(Component.literal("adv=" + f.isAdvanced() + ",cre=" + f.isCreative()));
+      TooltipFlag.Default def = (TooltipFlag.Default) f;
+      out.accept(Component.literal("adv=" + def.advanced() + ",cre=" + def.creative() + ",iAdv=" + f.isAdvanced() + ",iCre=" + f.isCreative()));
+    }
+  }
+
+  static final class FlagDefaultOracleItem extends Item {
+    FlagDefaultOracleItem(Properties p) { super(p); }
+    @Override
+    public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
+      TooltipFlag.Default normal = TooltipFlag.NORMAL;
+      TooltipFlag.Default advanced = TooltipFlag.ADVANCED;
+      TooltipFlag.Default normalCreative = normal.asCreative();
+      TooltipFlag.Default advancedCreative = advanced.asCreative();
+      out.accept(Component.literal(normal + "|" + advanced + "|" + normalCreative + "|" + advancedCreative));
+      out.accept(Component.literal(normal.hashCode() + "," + advanced.hashCode() + "," + normalCreative.hashCode() + "," + advancedCreative.hashCode()));
+      out.accept(Component.literal(normal.advanced() + "," + normal.creative() + "," + normal.isAdvanced() + "," + normal.isCreative() + "|" + advancedCreative.advanced() + "," + advancedCreative.creative() + "," + advancedCreative.isAdvanced() + "," + advancedCreative.isCreative()));
+      out.accept(Component.literal((normal == TooltipFlag.NORMAL) + "," + normal.equals(TooltipFlag.NORMAL) + "," + normal.equals(advanced) + "," + normalCreative.equals(normal.asCreative()) + "," + (normalCreative == normal.asCreative()) + "," + normal.equals("not-a-flag") + "," + normal.equals(null)));
+      Object flagObj = normalCreative;
+      out.accept(Component.literal(flagObj.getClass().getName() + "," + (flagObj instanceof TooltipFlag.Default) + "," + (flagObj instanceof TooltipFlag) + "," + (flagObj instanceof Record) + "," + (flagObj instanceof String)));
+    }
+  }
+
+  static final class EmptyContextOracleItem extends Item {
+    EmptyContextOracleItem(Properties p) { super(p); }
+    @Override
+    public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
+      TooltipContext empty = TooltipContext.EMPTY;
+      out.accept(Component.literal(
+          empty.tickRate() + ","
+              + (empty.registries() == null) + ","
+              + empty.isPeaceful() + ","
+              + (empty.mapData(null) == null) + ","
+              + (TooltipContext.of((Level) null) == empty) + ","
+              + empty.equals(TooltipContext.EMPTY) + ","
+              + empty.equals(null)));
+    }
+  }
+
+  static final class EmptyContextObjectMethodItem extends Item {
+    final int which;
+    EmptyContextObjectMethodItem(Properties p, int which) { super(p); this.which = which; }
+    @Override
+    public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
+      Object o = TooltipContext.EMPTY;
+      switch (which) {
+        case 0 -> o.toString();
+        case 1 -> o.hashCode();
+        case 2 -> o.getClass();
+      }
     }
   }
 
@@ -269,14 +369,56 @@ public final class TooltipProbe {
     BadArgItem(Properties p, int which) { super(p); this.which = which; }
     @Override
     public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
-      Component line = switch (which) {
+      MutableComponent line = switch (which) {
         case 0 -> Component.translatable("k", new Object[] { null });
         case 1 -> Component.translatable("k", Character.valueOf('c'));
         case 2 -> Component.translatable("k", new Object());
         case 3 -> Component.translatable("k", new ArrayList<>());
         default -> Component.translatable("k", ChatFormatting.RED);
       };
-      out.accept(line);
+      // Construction preserves all arguments; styling, copying, and self-equality succeed without counting.
+      MutableComponent styled = line.copy().withStyle(ChatFormatting.GRAY);
+      MutableComponent plain = styled.plainCopy();
+      if (!styled.equals(styled) || plain.equals("not-a-component")) {
+        throw new AssertionError("unexpected equality");
+      }
+      out.accept(styled);
+    }
+  }
+
+  static final class BadArgGetStringItem extends Item {
+    final int which;
+    BadArgGetStringItem(Properties p, int which) { super(p); this.which = which; }
+    @Override
+    public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
+      Component line = Component.translatable("k", new Object());
+      switch (which) {
+        case 0 -> line.getString();
+        case 1 -> line.toString();
+        case 2 -> line.hashCode();
+      }
+    }
+  }
+
+  static final class EscapeEdgeItem extends Item {
+    final int which;
+    EscapeEdgeItem(Properties p, int which) { super(p); this.which = which; }
+    @Override
+    public void appendHoverText(ItemStack s, TooltipContext c, TooltipDisplay d, Consumer<Component> out, TooltipFlag f) {
+      switch (which) {
+        case 0 -> {
+          Object[] arr = new Object[] { new CustomLabel(), 7 };
+          Component line = Component.translatableEscape("demo.arr", arr);
+          if (!(arr[0] instanceof String) || !arr[0].equals("custom-str")) {
+            throw new AssertionError("expected in-place escape: " + arr[0]);
+          }
+          out.accept(line);
+        }
+        case 1 -> out.accept(Component.translatableEscape("demo.nullstr", new NullToString()));
+        case 2 -> out.accept(Component.translatableEscape("demo.obj", new Object()));
+        case 3 -> out.accept(Component.translatableEscape("demo.plain", new PlainObj()));
+        default -> out.accept(Component.translatableEscape("demo.ctx", c));
+      }
     }
   }
 }"#;
@@ -364,7 +506,12 @@ fn runes_altar_item_appends_its_translatable_styled_line() {
 #[test]
 fn component_json_matches_real_java25_codec_captures() {
     let fixture = build_probe_fixture();
-    let captures = parse_java25_captures();
+    let all_captures = parse_java25_captures();
+    let component_captures: Vec<(String, String)> = all_captures
+        .iter()
+        .filter(|(name, _)| !name.starts_with("flag_default_") && !name.starts_with("ctx_empty"))
+        .cloned()
+        .collect();
     let mut host = StdHost::new();
     let item = make_item(&fixture.jar, &mut host, "codecCases");
     let lines = fixture
@@ -381,10 +528,10 @@ fn component_json_matches_real_java25_codec_captures() {
         .unwrap();
     assert_eq!(
         lines.len(),
-        captures.len(),
+        component_captures.len(),
         "codec case count must match java25.txt"
     );
-    for ((name, expected), line) in captures.iter().zip(&lines) {
+    for ((name, expected), line) in component_captures.iter().zip(&lines) {
         let actual = host
             .component_json(line)
             .unwrap_or_else(|| panic!("{name}: component_json returned None"));
@@ -404,7 +551,7 @@ fn component_json_matches_real_java25_codec_captures() {
         )
         .unwrap();
     assert_eq!(block_lines.len(), 1);
-    let capture_map: BTreeMap<_, _> = captures.into_iter().collect();
+    let capture_map: BTreeMap<_, _> = all_captures.into_iter().collect();
     assert_eq!(
         host.component_json(&block_lines[0]).as_deref(),
         Some(capture_map["translatable_int_arg"].as_str())
@@ -417,7 +564,7 @@ fn component_json_matches_real_java25_codec_captures() {
 }
 
 #[test]
-fn unsupported_translation_arguments_are_counted_not_stringified() {
+fn unsupported_translation_arguments_are_preserved_at_construction_and_refused_on_serialization() {
     let fixture = build_probe_fixture();
     for (which, label) in [
         (0, "null"),
@@ -450,15 +597,158 @@ fn unsupported_translation_arguments_are_counted_not_stringified() {
                 &ExecutionBudget::UNBOUNDED,
             )
             .unwrap();
+        // TranslatableContents accepts any Object[] at construction: keeping,
+        // styling, copying, and passing the component must not count.
         assert!(
-            !host.unknown_host_calls().is_empty(),
-            "{label}: expected counted unknown host call"
+            host.unknown_host_calls().is_empty(),
+            "{label}: construction/manipulation must not count, got {:?}",
+            host.unknown_host_calls()
         );
         assert_eq!(lines.len(), 1, "{label}");
         assert_eq!(
             host.component_json(&lines[0]),
             None,
-            "{label}: disallowed translation argument must never stringify"
+            "{label}: component_json must refuse disallowed translation arguments"
+        );
+    }
+
+    // Reading/serializing a component with a disallowed argument counts.
+    for (which, label) in [(0, "getString"), (1, "toString"), (2, "hashCode")] {
+        let mut host = StdHost::new();
+        let item = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/TooltipProbe",
+                "badArgGetString",
+                "(I)Lnet/minecraft/world/item/Item;",
+                None,
+                &[Value::Int(which)],
+                &mut host,
+            )
+            .unwrap();
+        fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert!(
+            !host.unknown_host_calls().is_empty(),
+            "badArg.{label} must be counted"
+        );
+    }
+
+    // translatableEscape edge cases: in-place array mutation, custom toString() returning null,
+    // and unknown Object.toString() counted + refused on component_json.
+    {
+        let mut host = StdHost::new();
+        let item = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/TooltipProbe",
+                "escapeEdgeItem",
+                "(I)Lnet/minecraft/world/item/Item;",
+                None,
+                &[Value::Int(0)],
+                &mut host,
+            )
+            .unwrap();
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert_eq!(
+            host.component_json(&lines[0]).as_deref(),
+            Some(r#"{"translate":"demo.arr","with":["custom-str",7]}"#)
+        );
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
+    // Custom toString() returning null: String.valueOf returns null (not counted), codec refuses.
+    {
+        let mut host = StdHost::new();
+        let item = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/TooltipProbe",
+                "escapeEdgeItem",
+                "(I)Lnet/minecraft/world/item/Item;",
+                None,
+                &[Value::Int(1)],
+                &mut host,
+            )
+            .unwrap();
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "null toString must not count at construction: {:?}",
+            host.unknown_host_calls()
+        );
+        assert_eq!(host.component_json(&lines[0]), None);
+    }
+    // Objects whose toString() is unknown (Object, plain jar class, TooltipContext): counted
+    // during translatableEscape and refused at component_json.
+    for (which, label) in [(2, "Object"), (3, "PlainObj"), (4, "TooltipContext")] {
+        let mut host = StdHost::new();
+        let item = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/TooltipProbe",
+                "escapeEdgeItem",
+                "(I)Lnet/minecraft/world/item/Item;",
+                None,
+                &[Value::Int(which)],
+                &mut host,
+            )
+            .unwrap();
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert!(
+            !host.unknown_host_calls().is_empty(),
+            "translatableEscape({label}) must count unknown toString"
+        );
+        assert_eq!(
+            host.component_json(&lines[0]),
+            None,
+            "translatableEscape({label}) must not serialize a placeholder string"
         );
     }
 }
@@ -776,11 +1066,16 @@ fn tooltip_handles_hide_string_semantics_honour_flag_and_frame_tick_rate() {
         );
     }
 
-    // Object methods (toString/hashCode/equals/getClass) are counted on all three handles.
-    for (target, target_name) in [
-        (0, "TooltipContext"),
-        (1, "TooltipDisplay"),
-        (2, "TooltipFlag"),
+    // Object methods (toString/hashCode/equals/getClass) are counted on opaque
+    // TooltipContext, TooltipDisplay, and frame-backed opaque TooltipFlag handles.
+    for (target, target_name, opaque_flag) in [
+        (0, "TooltipContext", tooltip_flag(false, false)),
+        (1, "TooltipDisplay", tooltip_flag(false, false)),
+        (
+            2,
+            "OpaqueTooltipFlag",
+            Value::Host(HostRef::new(HostKind::TooltipFlag, "frame")),
+        ),
     ] {
         for (which, method_name) in [
             (0, "toString"),
@@ -807,7 +1102,7 @@ fn tooltip_handles_hide_string_semantics_honour_flag_and_frame_tick_rate() {
                     tooltip_stack(),
                     tooltip_context(),
                     tooltip_display(),
-                    tooltip_flag(false, false),
+                    opaque_flag.clone(),
                     &mut host,
                     &ExecutionBudget::UNBOUNDED,
                 )
@@ -819,7 +1114,143 @@ fn tooltip_handles_hide_string_semantics_honour_flag_and_frame_tick_rate() {
         }
     }
 
-    // Supplied TooltipFlag is honoured for all (advanced, creative) combinations,
+    // TooltipFlag$Default record model matches the real JDK 25 + MC 26.3 oracle captures.
+    let captures: BTreeMap<String, String> = parse_java25_captures().into_iter().collect();
+    {
+        let mut host = StdHost::new();
+        let item = make_item(&fixture.jar, &mut host, "flagDefaultOracle");
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        let keys = [
+            "flag_default_strings",
+            "flag_default_hashes",
+            "flag_default_accessors",
+            "flag_default_equality",
+            "flag_default_types",
+        ];
+        assert_eq!(lines.len(), keys.len());
+        for (key, line) in keys.iter().zip(&lines) {
+            let expected = serde_json::Value::String(captures[*key].clone()).to_string();
+            assert_eq!(
+                host.component_json(line).as_deref(),
+                Some(expected.as_str()),
+                "mismatch for oracle case `{key}`"
+            );
+        }
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
+
+    // Item.TooltipContext.EMPTY matches the real JDK 25 + MC 26.3 oracle capture even
+    // inside a client frame with a different tick rate, and when passed directly as context.
+    {
+        let mut host = StdHost::new();
+        let item = make_item(&fixture.jar, &mut host, "emptyContextOracle");
+        host.begin_client_frame(
+            Arc::new(ClientSnapshot {
+                tick_rate: Some(12.5),
+                ..ClientSnapshot::default()
+            }),
+            &[],
+        );
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        host.end_client_frame();
+        assert_eq!(lines.len(), 1);
+        let expected = serde_json::Value::String(captures["ctx_empty"].clone()).to_string();
+        assert_eq!(
+            host.component_json(&lines[0]).as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
+    // Passing tooltip_context_empty() directly to run_item_tooltip answers 20.0f even outside a frame.
+    {
+        let mut host = StdHost::new();
+        let item = make_item(&fixture.jar, &mut host, "tickRateReader");
+        let lines = fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context_empty(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            host.component_json(&lines[0]).as_deref(),
+            Some(r#""rate=20.0""#)
+        );
+        assert!(
+            host.unknown_host_calls().is_empty(),
+            "{:?}",
+            host.unknown_host_calls()
+        );
+    }
+    // EMPTY anonymous class identity methods (toString/hashCode/getClass) stay counted.
+    for (which, method_name) in [(0, "toString"), (1, "hashCode"), (2, "getClass")] {
+        let mut host = StdHost::new();
+        let item = fixture
+            .jar
+            .invoke_method_with_args(
+                "demo/TooltipProbe",
+                "emptyContextObjectMethod",
+                "(I)Lnet/minecraft/world/item/Item;",
+                None,
+                &[Value::Int(which)],
+                &mut host,
+            )
+            .unwrap();
+        fixture
+            .jar
+            .run_item_tooltip(
+                &item,
+                tooltip_stack(),
+                tooltip_context(),
+                tooltip_display(),
+                tooltip_flag(false, false),
+                &mut host,
+                &ExecutionBudget::UNBOUNDED,
+            )
+            .unwrap();
+        assert!(
+            !host.unknown_host_calls().is_empty(),
+            "TooltipContext.EMPTY.{method_name} must be counted"
+        );
+    }
+
+    // Supplied TooltipFlag$Default is honoured for all (advanced, creative) combinations,
     // both outside a frame and when overriding a client frame's default flags.
     for (adv, cre) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut host = StdHost::new();
@@ -848,7 +1279,7 @@ fn tooltip_handles_hide_string_semantics_honour_flag_and_frame_tick_rate() {
         assert_eq!(lines.len(), 1);
         assert_eq!(
             host.component_json(&lines[0]).as_deref(),
-            Some(format!(r#""adv={adv},cre={cre}""#).as_str())
+            Some(format!(r#""adv={adv},cre={cre},iAdv={adv},iCre={cre}""#).as_str())
         );
         assert!(
             host.unknown_host_calls().is_empty(),

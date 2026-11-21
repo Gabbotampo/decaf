@@ -640,9 +640,13 @@ pub enum HostKind {
     /// `net.minecraft.world.item.component.TooltipDisplay` passed to
     /// `Item.appendHoverText` (`client_surface.rs`).
     TooltipDisplay,
-    /// `net.minecraft.world.item.TooltipFlag` passed to tooltip hooks
-    /// (`client_surface.rs`).
+    /// `net.minecraft.world.item.TooltipFlag` passed to tooltip hooks when the
+    /// concrete runtime class is unknown (`client_surface.rs`).
     TooltipFlag,
+    /// Concrete `net.minecraft.world.item.TooltipFlag$Default` record
+    /// (`TooltipFlag.NORMAL`, `TooltipFlag.ADVANCED`, `asCreative()`,
+    /// `client_surface.rs`).
+    TooltipFlagDefault,
 }
 
 /// How a kind's Java class follows from its key.
@@ -918,6 +922,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         &crate::runtime::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
     (HostKind::RandomSource, &crate::runtime::random_source::CLASS_SIDE),
+    (
+        HostKind::TooltipFlagDefault,
+        &crate::runtime::client_surface::TOOLTIP_FLAG_DEFAULT_CLASS_SIDE,
+    ),
 ];
 
 /// One row of the kind table.
@@ -2828,7 +2836,7 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Unknown {
             declared: crate::runtime::client_surface::tooltip_context_types,
         },
-        canonical: never_canonical,
+        canonical: crate::runtime::client_surface::tooltip_context_canonical,
         methods: &crate::runtime::client_surface::TOOLTIP_CONTEXT_METHODS,
     },
     KindInfo {
@@ -2848,6 +2856,13 @@ const KINDS: &[KindInfo] = &[
         },
         canonical: never_canonical,
         methods: &crate::runtime::client_surface::TOOLTIP_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlagDefault,
+        tag: "ttflgd",
+        class: ClassRule::FromKey(crate::runtime::client_surface::tooltip_flag_default_class),
+        canonical: crate::runtime::client_surface::tooltip_flag_default_canonical,
+        methods: &crate::runtime::client_surface::TOOLTIP_FLAG_DEFAULT_METHODS,
     },
 ];
 

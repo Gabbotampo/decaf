@@ -19,3 +19,17 @@ style_reset_varargs="x"
 style_reset_chained={"text":"x","bold":true}
 nested_extras={"text":"a","extra":[{"text":"b","extra":["c"]},{"text":"d","color":"gold"}]}
 translatable_empty_args={"translate":"demo.noargs"}
+escape_null={"translate":"demo.esc","with":["null"]}
+escape_char={"translate":"demo.esc","with":["Z"]}
+escape_custom={"translate":"demo.esc","with":["custom-str"]}
+escape_record={"translate":"demo.esc","with":["Pair[x=3, y=hi]"]}
+escape_list={"translate":"demo.esc","with":["[a, b]"]}
+escape_formatting={"translate":"demo.esc","with":["§c"]}
+escape_component={"translate":"demo.esc","with":[{"text":"lit","color":"gold"}]}
+escape_tooltip_flag={"translate":"demo.esc","with":["Default[advanced=false, creative=false]"]}
+flag_default_strings=Default[advanced=false, creative=false]|Default[advanced=true, creative=false]|Default[advanced=false, creative=true]|Default[advanced=true, creative=true]
+flag_default_hashes=39584,39398,39578,39392
+flag_default_accessors=false,false,false,false|true,true,true,true
+flag_default_equality=true,true,false,true,false,false,false
+flag_default_types=net.minecraft.world.item.TooltipFlag$Default,true,true,true,false
+ctx_empty=20.0,true,false,true,true,true,false

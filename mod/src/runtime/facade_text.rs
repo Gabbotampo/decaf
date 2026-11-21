@@ -99,11 +99,41 @@ pub(crate) fn plain(json: &Json) -> String {
     out
 }
 
+fn is_plain_string_arg(text: &str) -> bool {
+    !(text.starts_with("enum/") && !crate::runtime::value_class::is_plain_string(text))
+        && !text.starts_with("string-builder/")
+        && !crate::runtime::stream_pipeline::is_stream_marker(text)
+}
+
+/// Whether `value` satisfies Minecraft 26.3's
+/// `TranslatableContents.isAllowedPrimitiveArgument`: `Number`, `Boolean`, or
+/// `String`. Note that `Component.translatableEscape` uses this predicate
+/// before falling back to `String.valueOf`, so non-finite floats remain
+/// allowed primitives here and are only refused when encoding to JSON.
+fn is_allowed_primitive_argument(value: &Value) -> bool {
+    match value {
+        Value::Int(_)
+        | Value::Long(_)
+        | Value::Float(_)
+        | Value::Boxed(
+            Boxed::Boolean(_)
+            | Boxed::Byte(_)
+            | Boxed::Short(_)
+            | Boxed::Integer(_)
+            | Boxed::Float(_),
+        ) => true,
+        Value::Ref(Some(text)) => is_plain_string_arg(text),
+        Value::Ref(None) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => {
+            false
+        }
+    }
+}
+
 /// One translation argument that is not a component, matching Minecraft 26.3's
 /// `TranslatableContents.isAllowedPrimitiveArgument`: only `Number`, `Boolean`,
 /// and `String` are allowed. Anything vanilla's codec rejects (`null`,
 /// `Character`, arbitrary objects, non-finite floats) returns `None` so callers
-/// count it rather than stringifying it.
+/// refuse or count it at serialization time rather than stringifying it.
 pub(crate) fn argument(value: &Value) -> Option<Json> {
     match value {
         Value::Int(v) => Some(json!(v)),
@@ -116,11 +146,7 @@ pub(crate) fn argument(value: &Value) -> Option<Json> {
         Value::Boxed(Boxed::Byte(v)) => Some(json!(v)),
         Value::Boxed(Boxed::Short(v)) => Some(json!(v)),
         Value::Boxed(Boxed::Integer(v)) => Some(json!(v)),
-        Value::Ref(Some(text))
-            if !(text.starts_with("enum/") && !crate::runtime::value_class::is_plain_string(text)) =>
-        {
-            Some(json!(text))
-        }
+        Value::Ref(Some(text)) if is_plain_string_arg(text) => Some(json!(text)),
         Value::Ref(_) | Value::Boxed(Boxed::Character(_)) | Value::Host(_) | Value::Void => None,
     }
 }
@@ -203,6 +229,32 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(receiver.clone()))
     }
 
+    /// `String.valueOf(value)` for `Component.translatableEscape`: runs
+    /// `value.toString()` through the runtime (jar overrides, records, enums,
+    /// host handles, modelled markers) and counts `Object.toString()` when
+    /// unknown. Preserves `null` returned by a custom `toString()`.
+    fn escape_translation_arg(
+        &mut self,
+        value: &Value,
+        class: &str,
+        method: &str,
+    ) -> Result<Value, NativeError> {
+        if *value == Value::Ref(None) {
+            return Ok(Value::Ref(Some("null".into())));
+        }
+        if let Value::Boxed(boxed) = value {
+            return Ok(Value::Ref(Some(boxed.text())));
+        }
+        if let Some(text) = self.runtime_value_of(value, class, method)? {
+            return Ok(text);
+        }
+        if let Some(text) = self.host.modelled_to_string_checked(value)? {
+            return Ok(Value::Ref(Some(text)));
+        }
+        self.host
+            .unknown_operand_call(&crate::runtime::jar_text::object_to_string())
+    }
+
     /// The component calls this module answers; `None` for every other call
     /// (the host's text-only surface answers those).
     pub(crate) fn invoke_text(
@@ -210,6 +262,8 @@ impl<H: Host> Runtime<'_, H> {
         r: &MethodRef,
         receiver: Option<&Value>,
         args: &[Value],
+        class: &str,
+        method: &str,
     ) -> Result<Option<Value>, NativeError> {
         if r.owner != COMPONENT && r.owner != MUTABLE {
             return Ok(None);
@@ -281,48 +335,61 @@ impl<H: Host> Runtime<'_, H> {
             let raw_values = self.array(array)?.into_owned();
             let escape = name == "translatableEscape";
             let mut values = Vec::with_capacity(raw_values.len());
-            let mut with = Vec::with_capacity(raw_values.len());
-            for value in raw_values {
-                if crate::runtime::host_component::is_component(&value) {
-                    let Some(json) = self.component_now(&value) else {
-                        return self.host.unknown_operand_call(r).map(Some);
-                    };
-                    values.push(value);
-                    with.push(json);
-                } else if let Some(json) = argument(&value) {
-                    values.push(value);
-                    with.push(json);
-                } else if escape {
-                    // `Component.translatableEscape` converts non-component,
-                    // non-allowed arguments with `String.valueOf(arg)` before
-                    // delegating to `translatable`.
-                    let escaped = match &value {
-                        Value::Ref(None) => Some("null".to_owned()),
-                        Value::Boxed(boxed @ Boxed::Character(_)) => Some(boxed.text()),
-                        _ => None,
-                    };
-                    let Some(escaped) = escaped else {
-                        return self.host.unknown_operand_call(r).map(Some);
-                    };
-                    with.push(json!(escaped));
-                    values.push(Value::Ref(Some(escaped)));
+            for (index, value) in raw_values.into_iter().enumerate() {
+                if escape
+                    && !crate::runtime::host_component::is_component(&value)
+                    && !is_allowed_primitive_argument(&value)
+                {
+                    // `Component.translatableEscape` replaces any non-allowed,
+                    // non-Component element in `args` with `String.valueOf(arg)`
+                    // before delegating to `translatable`.
+                    let escaped = self.escape_translation_arg(&value, class, method)?;
+                    if let Some(array_key) = crate::runtime::host_array::array_key(array)
+                        && let Some(crate::runtime::array_data::ArrayData::Ref(elements)) =
+                            self.arrays.get_mut(array_key)
+                        && let Some(slot) = elements.get_mut(index)
+                    {
+                        *slot = escaped.clone();
+                    }
+                    values.push(escaped);
                 } else {
-                    // Vanilla's `ComponentSerialization.CODEC` rejects this
-                    // argument ("This value needs to be parsed as component"):
-                    // count it rather than stringifying it.
-                    return self.host.unknown_operand_call(r).map(Some);
+                    values.push(value);
                 }
             }
             let mut object = Map::from_iter([("translate".to_owned(), json!(key))]);
             if let Some(fallback) = fallback.and_then(expect_ref) {
                 object.insert("fallback".into(), json!(fallback));
             }
-            if !with.is_empty() {
+            // Populate `"with"` in the seed JSON only when every argument
+            // currently serialises; otherwise preserve all constructor
+            // arguments verbatim in `ComponentState` without counting here
+            // (`TranslatableContents` stores any `Object[]` and only rejects
+            // disallowed arguments when its codec serialises).
+            let mut with = Vec::with_capacity(values.len());
+            let mut all_serialisable = true;
+            for value in &values {
+                if crate::runtime::host_component::is_component(value) {
+                    match self.component_now(value) {
+                        Some(json) => with.push(json),
+                        None => {
+                            all_serialisable = false;
+                            break;
+                        }
+                    }
+                } else if let Some(json) = argument(value) {
+                    with.push(json);
+                } else {
+                    all_serialisable = false;
+                    break;
+                }
+            }
+            if all_serialisable && !with.is_empty() {
                 object.insert("with".into(), Json::Array(with));
             }
             let made = bounded(Json::Object(object.clone()))?;
             // `TranslatableContents` keeps its arguments: a component one
-            // changed later shows in this one.
+            // changed later shows in this one, and non-codec arguments stay
+            // intact until serialization refuses or counts them.
             if let (Some(states), Value::Host(handle)) = (self.host.component_states_mut(), &made) {
                 states.insert(
                     crate::runtime::host_component::marker(handle).to_owned(),
@@ -332,6 +399,8 @@ impl<H: Host> Runtime<'_, H> {
                         args: (!values.is_empty()).then_some(values),
                     },
                 );
+            } else if !all_serialisable {
+                return self.host.unknown_operand_call(r).map(Some);
             }
             return Ok(Some(made));
         };

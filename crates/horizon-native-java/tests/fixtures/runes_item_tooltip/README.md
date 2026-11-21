@@ -1,10 +1,11 @@
 # Item tooltip fixture captures
 
-`java25.txt` holds the exact Minecraft 26.3 `ComponentSerialization.CODEC` + `JsonOps.INSTANCE`
-output for every component shape tested in `tests/fixture_runes_item_tooltip.rs`, captured on
-OpenJDK 25.0.5+8 against the real Minecraft 26.3 server jar and its bundled libraries. The CI
-fixture compiles its probe classes against compile-only stubs (shipping only `demo/` and `lib/`
-classes) and compares `StdHost::component_json` against `java25.txt`.
+`java25.txt` holds the exact Minecraft 26.3 `ComponentSerialization.CODEC` + `JsonOps.INSTANCE`,
+`Component.translatableEscape`, `TooltipFlag.Default`, and `Item.TooltipContext.EMPTY` outputs
+tested in `tests/fixture_runes_item_tooltip.rs`, captured on OpenJDK 25.0.5+8 against the real
+Minecraft 26.3 server jar and its bundled libraries. The CI fixture compiles its probe classes
+against compile-only stubs (shipping only `demo/` and `lib/` classes) and compares Decaf's outputs
+against `java25.txt`.
 
 To regenerate `java25.txt` (with the unpacked Minecraft 26.3 server `META-INF` directory and
 OpenJDK 25):
