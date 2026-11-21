@@ -99,6 +99,21 @@ prebuilt server engine, and only this mod's crate and its 20 registry crates com
   - `m3_fixture:*` is unknown: that namespace is not the mod's, so it is in the row's
     `content.skipped`.
 
+**With a player.** A client of the same build joined the server: the launcher's client build of
+this mod for an instance, copied out of the managed install, run on a virtual display (Xvfb, the
+software renderer) with `--server 127.0.0.1:25599 --name Prova`, and driven through `horizon-ctl`.
+- **Joining needs the same mods and content on both sides.** The handshake refuses a client
+  without `horizon_java` ("Your mods don't match this server's"), and one without the same jars
+  ("Content registry mismatch"). The client reads its own `config/horizon_java/java-mods/`.
+- **M2c, block break**: `horizon-ctl break` of stone with a diamond pickaxe leaves the stone in
+  place (`m2c_fixture`'s `PlayerBlockBreakEvents.BEFORE` returns false for stone), and dirt breaks
+  and drops.
+- **M2d**: two `interact-entity` on a cow, then `kill` of 9 cows and the player, and a respawn.
+  - `m2d_fixture` ran 14 callbacks, 0 failed, 0 unknown host calls. The split across interactions
+    and deaths is inferred, since the per-callback lines are not logged.
+  - `copyfrom_fixture` ran 2, `COPY_FROM` and `AFTER_RESPAWN`.
+  - `m2c_fixture`'s total reached 1992 with the player's ticks.
+
 ## What is not done yet
 
 - **The mod's log lines don't reach the game's log.** The mod compiles its own copy of the `log`
@@ -106,8 +121,6 @@ prebuilt server engine, and only this mod's crate and its 20 registry crates com
   `libmod_vocab.so`. So the `Horizon Java …` lines and the jars' `System.out` lines are lost on
   this build, and the proof above reads the report and the console instead. horizon-rust/horizon#17983
   proposes `Host::log` for this.
-- **M2d and the player-driven parts of M2c** (entity interaction, block break cancel) need a
-  player on the server. They have not been run on this build.
 - **M3b**: `tools/bake.py` writes Sunrise packages (`.smod` in `sunrise-mods/`). A bake for the
   official Horizon (`.hmod` in `horizon-mods/`, its own manifest name) does not exist yet.
 - An item the jar declares shows `block.horizon_java.proof_item` as its name key, where Java uses
