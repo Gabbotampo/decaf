@@ -21399,7 +21399,7 @@ impl NativeJar {
     /// Run a sequence of interpreter operations under a single persistent
     /// [`Runtime`] (shared class state, IO state, and resident heap), rooting
     /// `roots` and the returned [`Value`] across persistence.
-    pub(crate) fn with_persistent_runtime<H: Host>(
+    fn with_persistent_runtime<H: Host>(
         &self,
         host: &mut H,
         roots: &[Value],
