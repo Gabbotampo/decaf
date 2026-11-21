@@ -42,13 +42,21 @@
 //! Chat components are host handles of their vanilla JSON (`host_component.rs`); a
 //! style object (`withStyle(Style)`, `Style`) is kept as legacy codes (`client_text.rs`).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use crate::{
-    ExecutionBudget, MethodRef, NativeError, NativeJar, StdHost, Value, boolean_value,
-    component_value,
+    ExecutionBudget, HostKind, HostRef, MethodRef, NativeError, NativeJar, StdHost, Value,
+    boolean_value, component_value,
     events::{self, GameEvent, ListenerCallback},
-    expect_ref, identifier_parts, return_desc, uuid_value,
+    expect_ref,
+    host_ref::{ClassHierarchy, ClassSide, Methods, exact_class_rules_out, instance_of_class},
+    identifier_parts, return_desc, uuid_value,
 };
 
 // The player's items and effects (`ItemStack`, `Inventory`, effects). A
@@ -112,18 +120,281 @@ use crate::client_values::VEC3;
 /// A tooltip listener's `List<Component>`: the host collection the game
 /// seeds with the tooltip's lines and reads back after the firing.
 const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
-const TOOLTIP_CONTEXT: &str = "client/tooltip-context";
-const TOOLTIP_FLAG: &str = "client/tooltip-flag";
+const TOOLTIP_CONTEXT_CLASS: &str = "net/minecraft/world/item/Item$TooltipContext";
+const TOOLTIP_DISPLAY_CLASS: &str = "net/minecraft/world/item/component/TooltipDisplay";
+const TOOLTIP_FLAG_CLASS: &str = "net/minecraft/world/item/TooltipFlag";
+const TOOLTIP_FLAG_DEFAULT_CLASS: &str = "net/minecraft/world/item/TooltipFlag$Default";
 /// Lines a tooltip listener may leave; more are cut.
 const MAX_TOOLTIP_LINES: usize = 64;
+static NEXT_TOOLTIP_FLAG_DEFAULT: AtomicU64 = AtomicU64::new(0);
+
+/// A `HostKind::GameTransient` handle for the tooltip's `ItemStack`.
+pub fn tooltip_stack() -> Value {
+    marker(format!("{}tooltip", items::STACK))
+}
+
+/// Dedicated host handle for a level/frame-backed
+/// `net.minecraft.world.item.Item$TooltipContext`. `tickRate()` reads the
+/// active client frame snapshot's `tick_rate` when supplied and counts
+/// otherwise; all other methods (including `Object` methods) are counted.
+pub fn tooltip_context() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipContext, "frame"))
+}
+
+/// Dedicated host handle for `net.minecraft.world.item.Item$TooltipContext.EMPTY`
+/// (`Item$TooltipContext$1` in 26.3: `tickRate() = 20.0f`, `registries() = null`,
+/// `mapData(MapId) = null`, `isPeaceful() = false`).
+pub fn tooltip_context_empty() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipContext, "empty"))
+}
+
+/// Dedicated host handle for `net.minecraft.world.item.component.TooltipDisplay`.
+/// All methods (including `Object` methods) are counted.
+pub fn tooltip_display() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipDisplay, "default"))
+}
+
+/// Constant `TooltipFlag$Default` singleton (`TooltipFlag.NORMAL` / `ADVANCED`).
+fn tooltip_flag_default_const(advanced: bool, creative: bool) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::TooltipFlagDefault,
+        format!("const:{},{}", u8::from(advanced), u8::from(creative)),
+    ))
+}
+
+/// Fresh `new TooltipFlag$Default(advanced, creative)` allocation (`asCreative()`).
+fn tooltip_flag_default_new(advanced: bool, creative: bool) -> Value {
+    let serial = NEXT_TOOLTIP_FLAG_DEFAULT.fetch_add(1, Ordering::Relaxed);
+    Value::Host(HostRef::new(
+        HostKind::TooltipFlagDefault,
+        format!(
+            "inst:{},{}#{serial}",
+            u8::from(advanced),
+            u8::from(creative)
+        ),
+    ))
+}
+
+/// Dedicated `TooltipFlag$Default` handle with explicit `isAdvanced()` /
+/// `advanced()` and `isCreative()` / `creative()` answers. Matches vanilla
+/// `TooltipFlag.NORMAL` for `(false, false)`, `TooltipFlag.ADVANCED` for
+/// `(true, false)`, and a fresh `TooltipFlag$Default(advanced, true)` for
+/// creative tooltips (`asCreative()`).
+pub fn tooltip_flag(advanced: bool, creative: bool) -> Value {
+    if !creative {
+        tooltip_flag_default_const(advanced, false)
+    } else {
+        tooltip_flag_default_new(advanced, true)
+    }
+}
+
+/// Opaque frame-backed `TooltipFlag` handle for callbacks invoked without a
+/// pre-built `TooltipFlag$Default`; reads flags from the active
+/// [`ClientSnapshot`] and counts `Object` methods.
+pub(crate) fn tooltip_flag_from_frame() -> Value {
+    Value::Host(HostRef::new(HostKind::TooltipFlag, "frame"))
+}
+
+fn parse_tooltip_flag_default(key: &str) -> Option<(bool, bool)> {
+    let rest = if let Some(rest) = key.strip_prefix("const:") {
+        rest
+    } else {
+        key.strip_prefix("inst:")?.split_once('#')?.0
+    };
+    let (adv, cre) = rest.split_once(',')?;
+    let adv = match adv {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    let cre = match cre {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    Some((adv, cre))
+}
+
+pub(crate) fn tooltip_consumer_types(_: &str) -> &'static [&'static str] {
+    &["java/util/function/Consumer"]
+}
+
+pub(crate) fn tooltip_context_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_CONTEXT_CLASS]
+}
+
+pub(crate) fn tooltip_context_canonical(key: &str) -> bool {
+    key == "empty"
+}
+
+pub(crate) fn tooltip_display_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_DISPLAY_CLASS, "java/lang/Record"]
+}
+
+pub(crate) fn tooltip_flag_types(_: &str) -> &'static [&'static str] {
+    &[TOOLTIP_FLAG_CLASS]
+}
+
+pub(crate) fn tooltip_flag_default_class(_: &str) -> &str {
+    TOOLTIP_FLAG_DEFAULT_CLASS
+}
+
+pub(crate) fn tooltip_flag_default_canonical(key: &str) -> bool {
+    key.starts_with("const:")
+}
+
+fn tooltip_display_instance_of(
+    _: &HostRef,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if matches!(
+        wanted,
+        "java/lang/Object" | "java/lang/Record" | TOOLTIP_DISPLAY_CLASS
+    ) || hierarchy.is_instance(TOOLTIP_DISPLAY_CLASS, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (hierarchy.is_interface(wanted) == Some(false)
+        || exact_class_rules_out(TOOLTIP_DISPLAY_CLASS, wanted)
+        || wanted == TOOLTIP_FLAG_DEFAULT_CLASS)
+        .then_some(false)
+}
+
+fn tooltip_flag_default_class_instance_of(
+    class: &str,
+    wanted: &str,
+    hierarchy: &dyn ClassHierarchy,
+) -> Option<bool> {
+    if matches!(
+        wanted,
+        "java/lang/Object" | "java/lang/Record" | TOOLTIP_FLAG_CLASS | TOOLTIP_FLAG_DEFAULT_CLASS
+    ) || hierarchy.is_instance(class, wanted) == Some(true)
+    {
+        return Some(true);
+    }
+    (hierarchy.is_interface(wanted) == Some(false)
+        || exact_class_rules_out(class, wanted)
+        || wanted == TOOLTIP_DISPLAY_CLASS)
+        .then_some(false)
+}
+
+pub(crate) const TOOLTIP_FLAG_DEFAULT_CLASS_SIDE: ClassSide = ClassSide {
+    owns: |class| class == TOOLTIP_FLAG_DEFAULT_CLASS,
+    instance_of: tooltip_flag_default_class_instance_of,
+    superclass: |_| Some("java/lang/Record".to_owned()),
+    is_interface: |_| Some(false),
+    classes: || vec![TOOLTIP_FLAG_DEFAULT_CLASS.to_owned()],
+};
+
+/// Opaque `Consumer<Component>` sink methods: `Object` methods are counted;
+/// `instanceof` is exact (`Consumer` and `Object` only, matching vanilla's
+/// `lines::add` invokedynamic lambda).
+pub(crate) const TOOLTIP_CONSUMER_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: |_, wanted, _| {
+        Some(matches!(
+            wanted,
+            "java/lang/Object" | "java/util/function/Consumer"
+        ))
+    },
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// `Item$TooltipContext` handle methods: `toString`/`hashCode`/`getClass` are
+/// counted; `EMPTY` (`Item$TooltipContext$1`) inherits `Object.equals` on its
+/// singleton, while frame contexts count `equals`.
+pub(crate) const TOOLTIP_CONTEXT_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |handle, other, _| {
+        if handle.key() != "empty" {
+            return Ok(None);
+        }
+        Ok(Some(matches!(
+            other,
+            Value::Host(other)
+                if other.kind() == HostKind::TooltipContext && other.key() == "empty"
+        )))
+    },
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// `TooltipDisplay` handle methods: `Object` methods are counted.
+pub(crate) const TOOLTIP_DISPLAY_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: tooltip_display_instance_of,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// Opaque `TooltipFlag` handle methods: `Object` methods are counted.
+pub(crate) const TOOLTIP_FLAG_METHODS: Methods = Methods {
+    to_string: |_, _| Ok(None),
+    hash_code: |_, _| Ok(None),
+    equals: |_, _, _| Ok(None),
+    instance_of: instance_of_class,
+    crosses_jars: |_, _| false,
+    compare_to: None,
+};
+
+/// Concrete `net.minecraft.world.item.TooltipFlag$Default` record methods
+/// matching Java 25 `ObjectMethods.bootstrap` (`Default[advanced=.., creative=..]`).
+pub(crate) const TOOLTIP_FLAG_DEFAULT_METHODS: Methods = Methods {
+    to_string: |handle, _| {
+        Ok(
+            parse_tooltip_flag_default(handle.key()).map(|(advanced, creative)| {
+                format!("Default[advanced={advanced}, creative={creative}]")
+            }),
+        )
+    },
+    hash_code: |handle, _| {
+        Ok(
+            parse_tooltip_flag_default(handle.key()).map(|(advanced, creative)| {
+                let first = if advanced { 1231_i32 } else { 1237_i32 };
+                let second = if creative { 1231_i32 } else { 1237_i32 };
+                first.wrapping_mul(31).wrapping_add(second)
+            }),
+        )
+    },
+    equals: |handle, other, _| {
+        let Some(mine) = parse_tooltip_flag_default(handle.key()) else {
+            return Ok(None);
+        };
+        match other {
+            Value::Host(other) if other.kind() == HostKind::TooltipFlagDefault => {
+                Ok(parse_tooltip_flag_default(other.key()).map(|theirs| mine == theirs))
+            }
+            // An opaque `TooltipFlag` or unmodelled `new TooltipFlag$Default`
+            // might represent a `Default` with unknown fields: count it.
+            Value::Host(other) if other.kind() == HostKind::TooltipFlag => Ok(None),
+            other if crate::jar_object::object_class(other) == Some(TOOLTIP_FLAG_DEFAULT_CLASS) => {
+                Ok(None)
+            }
+            _ => Ok(Some(false)),
+        }
+    },
+    instance_of: |_, wanted, hierarchy| {
+        tooltip_flag_default_class_instance_of(TOOLTIP_FLAG_DEFAULT_CLASS, wanted, hierarchy)
+    },
+    crosses_jars: |_, _| true,
+    compare_to: None,
+};
 
 /// A Fabric `ItemTooltipCallback`'s arguments: the stack, its context, the
 /// flag and the lines.
 pub(crate) fn tooltip_arguments() -> Vec<Value> {
     vec![
-        marker(format!("{}tooltip", items::STACK)),
-        marker(TOOLTIP_CONTEXT),
-        marker(TOOLTIP_FLAG),
+        tooltip_stack(),
+        tooltip_context(),
+        tooltip_flag_from_frame(),
         marker(TOOLTIP_LIST),
     ]
 }
@@ -464,6 +735,11 @@ pub struct ClientSnapshot {
     pub tooltip_lines: Vec<String>,
     /// `TooltipFlag.isAdvanced` (F3+H).
     pub advanced_tooltips: bool,
+    /// `TooltipFlag.isCreative` (creative inventory search tab).
+    pub creative_tooltips: bool,
+    /// `level.tickRateManager().tickrate()` for `TooltipContext.tickRate()`;
+    /// absent stays counted (never defaults to `20.0f`).
+    pub tick_rate: Option<f32>,
     /// Option values filled by the game snapshot; absent values stay counted.
     pub options: crate::client_frame::ClientOptions,
     /// The crosshair target (`Minecraft.hitResult`) filled by the game.
@@ -1251,10 +1527,21 @@ impl StdHost {
     /// (an instance field of a host object reaches the host as a static read
     /// without its receiver).
     pub(crate) fn client_static(&mut self, r: &MethodRef) -> Option<Result<Value, NativeError>> {
-        // Chat style/color values are shared by server-side callbacks too;
-        // their handles do not depend on a client frame.
+        // Chat style/color values and common tooltip constants are shared by
+        // server-side callbacks too; their handles do not depend on a frame.
         if let Some(value) = text::text_static(r) {
             return Some(Ok(value));
+        }
+        match (r.owner.as_str(), r.name.as_str()) {
+            (TOOLTIP_FLAG_CLASS | TOOLTIP_FLAG_DEFAULT_CLASS, "NORMAL") => {
+                return Some(Ok(tooltip_flag_default_const(false, false)));
+            }
+            (TOOLTIP_FLAG_CLASS | TOOLTIP_FLAG_DEFAULT_CLASS, "ADVANCED") => {
+                return Some(Ok(tooltip_flag_default_const(true, false)));
+            }
+            (TOOLTIP_DISPLAY_CLASS, "DEFAULT") => return Some(Ok(tooltip_display())),
+            (TOOLTIP_CONTEXT_CLASS, "EMPTY") => return Some(Ok(tooltip_context_empty())),
+            _ => {}
         }
         // `java.awt.Color` is a JDK singleton family even on a server host;
         // model both the upper- and lower-case field spellings everywhere.
@@ -1400,9 +1687,18 @@ impl StdHost {
         r: &MethodRef,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        // TextColor factories are valid in server callbacks as well.
+        // TextColor factories and `Item.TooltipContext.of(null)` are valid in
+        // server callbacks as well.
         if let Some(value) = text::text_invoke(r, args) {
             return Some(Ok(value));
+        }
+        if r.owner == TOOLTIP_CONTEXT_CLASS
+            && r.name == "of"
+            && r.descriptor
+                == "(Lnet/minecraft/world/level/Level;)Lnet/minecraft/world/item/Item$TooltipContext;"
+            && args.first() == Some(&Value::Ref(None))
+        {
+            return Some(Ok(tooltip_context_empty()));
         }
         if !self.client_environment() {
             return None;
@@ -1520,9 +1816,11 @@ impl StdHost {
         if crate::host_component::is_component(receiver) {
             return Some(match text::component_call(r, args)? {
                 // The style as it is now (`withStyle`/`setStyle` change it in place).
+                // Read `base` directly so unserialisable translation arguments or
+                // cyclic siblings do not block `getStyle()`.
                 text::ComponentCall::GetStyle => {
-                    match crate::facade_text::json_now(receiver, Some(&self.component_states)) {
-                        Some(json) => Ok(text::style_of(&json)),
+                    match crate::host_component::state_of(receiver, Some(&self.component_states)) {
+                        Some(state) => Ok(text::style_of(&serde_json::Value::Object(state.base))),
                         None => self.unknown_host_call(r),
                     }
                 }
@@ -1725,6 +2023,14 @@ impl StdHost {
             // Outside a firing: what the host answered before this surface.
             return None;
         };
+        if text == GRAPHICS {
+            // An unanswered graphics call is refused AND recorded, like every
+            // other client member below (`refuse_client_call`).
+            return Some(match self.graphics_call(&frame, r, args) {
+                Some(answer) => answer,
+                None => Err(self.refuse_client_call(r)),
+            });
+        }
         let answer = self.client_answer(&text, &frame, r, args);
         Some(match answer {
             Some(value) => Ok(value),
@@ -1774,9 +2080,11 @@ impl StdHost {
             let frame = state.frame.as_deref();
             return Some(match r.name.as_str() {
                 "getToolTip" => Ok(marker(TOOLTIP_LIST)),
-                "getItemStack" => Ok(marker(format!("{}tooltip", items::STACK))),
-                "getFlags" => Ok(marker(TOOLTIP_FLAG)),
-                "getContext" => Ok(marker(TOOLTIP_CONTEXT)),
+                "getItemStack" => Ok(tooltip_stack()),
+                "getFlags" => Ok(frame
+                    .map(|f| tooltip_flag(f.advanced_tooltips, f.creative_tooltips))
+                    .unwrap_or_else(tooltip_flag_from_frame)),
+                "getContext" => Ok(tooltip_context()),
                 "getEntity" => Ok(frame
                     .and_then(|f| f.player.as_ref())
                     .map_or(Value::Ref(None), |_| marker(PLAYER))),
@@ -2122,11 +2430,6 @@ impl StdHost {
                     _ => None,
                 }
             }
-            TOOLTIP_FLAG => match (name, returns) {
-                ("isAdvanced", "Z") => Some(flag(frame.advanced_tooltips)),
-                ("isCreative", "Z") => Some(flag(false)),
-                _ => None,
-            },
             GAME_RENDERER => match (name, returns) {
                 ("getMainCamera" | "mainCamera", _) if frame.camera.is_some() => {
                     Some(marker(CAMERA))
@@ -2198,10 +2501,46 @@ impl StdHost {
                 ("getGameTimeDeltaTicks" | "getRealtimeDeltaTicks", "F") => float(1.0),
                 _ => None,
             },
-            GRAPHICS => self.graphics_call(frame, r, args),
             POSE => self.pose_call(r, args),
             _ => self.client_item_answer(object, frame, r, args).flatten(),
         }
+    }
+
+    /// Resolve a `GuiGraphicsExtractor.text` / `centeredText` text argument.
+    /// In Minecraft 26.3, the `String` overloads return early on `null`
+    /// (drawing nothing), whereas the `Component` overloads immediately invoke
+    /// `Component.getVisualOrderText()` and throw `NullPointerException`.
+    ///
+    /// `param` is the `Component` parameter's name in the real method's
+    /// LocalVariableTable, which Java 25's helpful NPE message quotes: `str` in
+    /// both `text(Font, Component, …)` overloads, `text` in
+    /// `centeredText(Font, Component, …)` (javap -l of the 26.3 client jar).
+    fn graphics_text_arg(
+        &self,
+        arg: &Value,
+        descriptor: &str,
+        param: &str,
+    ) -> Result<Option<ClientText>, Option<NativeError>> {
+        if let Some(text) = text_arg(arg, &self.component_states) {
+            return Ok(Some(text));
+        }
+        if *arg == Value::Ref(None) {
+            if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;Ljava/lang/String;") {
+                return Ok(None);
+            }
+            if descriptor.starts_with(
+                "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;",
+            ) {
+                return Err(Some(NativeError::UncaughtException {
+                    class: "java/lang/NullPointerException".into(),
+                    message: Some(format!(
+                        r#"Cannot invoke "net.minecraft.network.chat.Component.getVisualOrderText()" because "{param}" is null"#
+                    )),
+                    frame: None,
+                }));
+            }
+        }
+        Err(None)
     }
 
     /// `GuiGraphicsExtractor` members: drawing records a [`DrawOp`]; one past
@@ -2211,23 +2550,22 @@ impl StdHost {
         frame: &ClientSnapshot,
         r: &MethodRef,
         args: &[Value],
-    ) -> Option<Value> {
-        let state = &mut self.client;
+    ) -> Option<Result<Value, NativeError>> {
         let ints = |from: usize, n: usize| -> Option<Vec<i32>> {
             (from..from + n).map(|at| int_arg(args, at)).collect()
         };
         let drawn = match (r.name.as_str(), r.descriptor.as_str()) {
-            ("guiWidth", "()I") => return Some(Value::Int(frame.gui_size[0])),
-            ("guiHeight", "()I") => return Some(Value::Int(frame.gui_size[1])),
-            ("pose", _) => return Some(marker(POSE)),
+            ("guiWidth", "()I") => return Some(Ok(Value::Int(frame.gui_size[0]))),
+            ("guiHeight", "()I") => return Some(Ok(Value::Int(frame.gui_size[1]))),
+            ("pose", _) => return Some(Ok(marker(POSE))),
             ("fill", "(IIIII)V") => {
                 let v = ints(0, 5)?;
-                state.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
+                self.client.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
             }
             ("fillGradient", "(IIIIII)V") => {
                 let v = ints(0, 6)?;
-                let rect = state.posed_rect([v[0], v[1], v[2], v[3]]);
-                state.draw(DrawOp::Gradient {
+                let rect = self.client.posed_rect([v[0], v[1], v[2], v[3]]);
+                self.client.draw(DrawOp::Gradient {
                     rect,
                     top: v[4] as u32,
                     bottom: v[5] as u32,
@@ -2237,36 +2575,39 @@ impl StdHost {
             ("outline", "(IIIII)V") => {
                 let v = ints(0, 5)?;
                 let (x, y, w, h, c) = (v[0], v[1], v[2], v[3], v[4] as u32);
-                state
+                self.client
                     .fill([x, y, x + w, y + 1], c)
-                    .and_then(|()| state.fill([x, y + h - 1, x + w, y + h], c))
-                    .and_then(|()| state.fill([x, y + 1, x + 1, y + h - 1], c))
-                    .and_then(|()| state.fill([x + w - 1, y + 1, x + w, y + h - 1], c))
+                    .and_then(|()| self.client.fill([x, y + h - 1, x + w, y + h], c))
+                    .and_then(|()| self.client.fill([x, y + 1, x + 1, y + h - 1], c))
+                    .and_then(|()| self.client.fill([x + w - 1, y + 1, x + w, y + h - 1], c))
             }
             ("text", descriptor) if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") => {
-                // A null string draws nothing (`text` returns early).
-                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
-                    return Some(Value::Void);
+                let arg = args.get(1)?;
+                let text = match self.graphics_text_arg(arg, descriptor, "str") {
+                    Ok(Some(text)) => text,
+                    Ok(None) => return Some(Ok(Value::Void)),
+                    Err(Some(err)) => return Some(Err(err)),
+                    Err(None) => return None,
                 };
                 let v = ints(2, 3)?;
                 // The five-argument overloads draw with a shadow.
                 let shadow = int_arg(args, 5).is_none_or(|v| v != 0);
-                state.text(text, v[0], v[1], v[2] as u32, shadow)
+                self.client.text(text, v[0], v[1], v[2] as u32, shadow)
             }
             ("horizontalLine", "(IIII)V") => {
                 let v = ints(0, 4)?;
                 let (x0, x1) = (v[0].min(v[1]), v[0].max(v[1]));
-                state.fill([x0, v[2], x1 + 1, v[2] + 1], v[3] as u32)
+                self.client.fill([x0, v[2], x1 + 1, v[2] + 1], v[3] as u32)
             }
             ("verticalLine", "(IIII)V") => {
                 let v = ints(0, 4)?;
                 let (y0, y1) = (v[1].min(v[2]), v[1].max(v[2]));
-                state.fill([v[0], y0 + 1, v[0] + 1, y1], v[3] as u32)
+                self.client.fill([v[0], y0 + 1, v[0] + 1, y1], v[3] as u32)
             }
             // A fill through an explicit pipeline (`RenderPipelines.GUI`).
             ("fill", "(Lcom/mojang/blaze3d/pipeline/RenderPipeline;IIIII)V") => {
                 let v = ints(1, 5)?;
-                state.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
+                self.client.fill([v[0], v[1], v[2], v[3]], v[4] as u32)
             }
             ("item" | "fakeItem", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/world/item/ItemStack;II") =>
@@ -2275,7 +2616,7 @@ impl StdHost {
                 let v = ints(1, 2)?;
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], true, None)
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             // `item(owner, stack, x, y, seed)`: the owner only seeds animation.
             ("item", "(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;III)V") => {
@@ -2283,24 +2624,29 @@ impl StdHost {
                 let v = ints(2, 2)?;
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], true, None)
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             ("itemDecorations", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;Lnet/minecraft/world/item/ItemStack;II") =>
             {
                 let slot = self.client_stack_slot(args.get(1)?)?;
                 let v = ints(2, 2)?;
-                let count = args.get(4).map(|text| {
-                    text_arg(text, &self.component_states).map(|t| match t {
-                        ClientText::Literal(s) | ClientText::Translatable(s) => s,
-                        ClientText::Json(json) => serde_json::from_str(&json)
-                            .map(|json| crate::facade_text::plain(&json))
-                            .unwrap_or_default(),
-                    })
-                });
+                let count = match args.get(4) {
+                    Some(arg) => match text_arg(arg, &self.component_states) {
+                        Some(t) => Some(Some(match t {
+                            ClientText::Literal(s) | ClientText::Translatable(s) => s,
+                            ClientText::Json(json) => serde_json::from_str(&json)
+                                .map(|json| crate::facade_text::plain(&json))
+                                .unwrap_or_default(),
+                        })),
+                        None if *arg == Value::Ref(None) => Some(None),
+                        None => return None,
+                    },
+                    None => None,
+                };
                 return self
                     .client_item_draw(frame, slot, [v[0], v[1]], false, Some(count.flatten()))
-                    .map(|()| Value::Void);
+                    .map(|()| Ok(Value::Void));
             }
             // `blitSprite(pipeline, sprite, x, y, w, h[, colour | alpha])`.
             ("blitSprite", descriptor)
@@ -2325,8 +2671,8 @@ impl StdHost {
                 } else {
                     format!("{namespace}:{path}")
                 };
-                let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
-                state.draw(DrawOp::Sprite { sprite, rect, argb })
+                let rect = self.client.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
+                self.client.draw(DrawOp::Sprite { sprite, rect, argb })
             }
             // 26.3 GuiGraphicsExtractor.blit(RenderPipeline, Identifier, int, int, float, float, int, int, int, int)
             // offsets 0-25 delegate to 12-arg (regionWidth=width, regionHeight=height),
@@ -2351,8 +2697,8 @@ impl StdHost {
                 if tex_w <= 0 || tex_h <= 0 {
                     return None;
                 }
-                let rect = state.posed_rect([x, y, x.wrapping_add(w), y.wrapping_add(h)]);
-                state.draw(DrawOp::Blit {
+                let rect = self.client.posed_rect([x, y, x.wrapping_add(w), y.wrapping_add(h)]);
+                self.client.draw(DrawOp::Blit {
                     texture,
                     src: [u, v, w as f32, h as f32],
                     dst: rect,
@@ -2363,17 +2709,21 @@ impl StdHost {
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
             {
-                let Some(text) = text_arg(args.get(1)?, &self.component_states) else {
-                    return Some(Value::Void);
+                let arg = args.get(1)?;
+                let text = match self.graphics_text_arg(arg, descriptor, "text") {
+                    Ok(Some(text)) => text,
+                    Ok(None) => return Some(Ok(Value::Void)),
+                    Err(Some(err)) => return Some(Err(err)),
+                    Err(None) => return None,
                 };
                 let v = ints(2, 3)?;
                 // `x - font.width(text) / 2`, Java's integer division.
                 let width = frame.metrics.width(&frame.metrics.resolve(&text));
-                state.text(text, v[0] - width / 2, v[1], v[2] as u32, true)
+                self.client.text(text, v[0] - width / 2, v[1], v[2] as u32, true)
             }
             _ => return None,
         };
-        drawn.ok().map(|()| Value::Void)
+        drawn.ok().map(|()| Ok(Value::Void))
     }
 
     /// Records one item draw; `None` past [`MAX_DRAWS_PER_CALL`].
@@ -2488,7 +2838,191 @@ fn uuid_text(uuid: u128) -> String {
     )
 }
 
+impl StdHost {
+    /// Instance calls on dedicated tooltip handles (`TooltipConsumer`,
+    /// `TooltipContext`, `TooltipDisplay`, `TooltipFlag`). `Object` methods
+    /// (`toString`, `hashCode`, `equals`, `getClass`) are handled and counted
+    /// earlier via `host_ref.rs`.
+    pub(crate) fn tooltip_handle_call(
+        &mut self,
+        r: &MethodRef,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, NativeError>> {
+        let Value::Host(handle) = receiver else {
+            return None;
+        };
+        if matches!(
+            (r.name.as_str(), r.descriptor.as_str()),
+            ("toString", "()Ljava/lang/String;")
+                | ("hashCode", "()I")
+                | ("equals", "(Ljava/lang/Object;)Z")
+        ) {
+            return None;
+        }
+        match handle.kind() {
+            HostKind::TooltipConsumer => {
+                if r.name == "accept" && r.descriptor == "(Ljava/lang/Object;)V" {
+                    let Some(value) = args.first().cloned() else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    let Some(lines) = self.tooltip_sinks.get_mut(handle.key()) else {
+                        return Some(self.unknown_host_call(r));
+                    };
+                    lines.push(value);
+                    return Some(Ok(Value::Void));
+                }
+                Some(self.unknown_host_call(r))
+            }
+            HostKind::TooltipContext => {
+                if handle.key() == "empty" {
+                    return Some(match (r.name.as_str(), r.descriptor.as_str()) {
+                        ("tickRate", "()F") => Ok(Value::Float(20.0)),
+                        ("registries", "()Lnet/minecraft/core/HolderLookup$Provider;") => {
+                            Ok(Value::Ref(None))
+                        }
+                        (
+                            "mapData",
+                            "(Lnet/minecraft/world/level/saveddata/maps/MapId;)Lnet/minecraft/world/level/saveddata/maps/MapItemSavedData;",
+                        ) => Ok(Value::Ref(None)),
+                        ("isPeaceful", "()Z") => Ok(flag(false)),
+                        _ => self.unknown_host_call(r),
+                    });
+                }
+                if r.name == "tickRate"
+                    && r.descriptor == "()F"
+                    && let Some(rate) = self.client.frame.as_ref().and_then(|f| f.tick_rate)
+                {
+                    return Some(Ok(Value::Float(f64::from(rate))));
+                }
+                Some(self.unknown_host_call(r))
+            }
+            HostKind::TooltipDisplay => Some(self.unknown_host_call(r)),
+            HostKind::TooltipFlag => {
+                let flags = (handle.key() == "frame")
+                    .then(|| {
+                        self.client
+                            .frame
+                            .as_ref()
+                            .map(|f| (f.advanced_tooltips, f.creative_tooltips))
+                    })
+                    .flatten();
+                let Some((advanced, creative)) = flags else {
+                    return Some(self.unknown_host_call(r));
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("isAdvanced", "()Z") => Some(Ok(flag(advanced))),
+                    ("isCreative", "()Z") => Some(Ok(flag(creative))),
+                    _ => Some(self.unknown_host_call(r)),
+                }
+            }
+            HostKind::TooltipFlagDefault => {
+                let Some((advanced, creative)) = parse_tooltip_flag_default(handle.key()) else {
+                    return Some(self.unknown_host_call(r));
+                };
+                match (r.name.as_str(), r.descriptor.as_str()) {
+                    ("isAdvanced" | "advanced", "()Z") => Some(Ok(flag(advanced))),
+                    ("isCreative" | "creative", "()Z") => Some(Ok(flag(creative))),
+                    ("asCreative", "()Lnet/minecraft/world/item/TooltipFlag$Default;") => {
+                        Some(Ok(tooltip_flag_default_new(advanced, true)))
+                    }
+                    _ => Some(self.unknown_host_call(r)),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 impl NativeJar {
+    /// Run an item's own 26.3 `appendHoverText` implementation. The caller
+    /// supplies the item object and the real frame-equivalent arguments; this
+    /// helper supplies an opaque `Consumer<Component>` sink, preserving
+    /// translatable components and their styles for Sunrise to resolve.
+    ///
+    /// Override resolution walks the full linked class hierarchy (this jar and
+    /// linked library/mod jars) considering only non-static, non-private
+    /// instance overrides. Reaching vanilla `Item` or `BlockItem` proves there
+    /// is no jar override (`Item.appendHoverText` is `0: return` and
+    /// `BlockItem` does not override it in 26.3); an unresolvable superclass is
+    /// counted rather than assumed to be a no-op.
+    pub fn run_item_tooltip(
+        &self,
+        item: &Value,
+        stack: Value,
+        context: Value,
+        display: Value,
+        flag: Value,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<Vec<Value>, NativeError> {
+        const DESCRIPTOR: &str = "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V";
+        const ACC_PRIVATE: u16 = 0x0002;
+        let mut current = crate::jar_object::value_marker_class(item)
+            .ok_or_else(|| NativeError::MissingMethod("Item#appendHoverText receiver".into()))?
+            .to_owned();
+        let linked = crate::Host::linked_class_table(host)
+            .cloned()
+            .unwrap_or_default();
+        let mut override_owner = None;
+        let mut reached_known_noop = false;
+        for _ in 0..crate::MAX_SUPERCLASS_WALK {
+            if matches!(
+                current.as_str(),
+                "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+            ) {
+                reached_known_noop = true;
+                break;
+            }
+            let class = self.classes.get(&current).or_else(|| {
+                if crate::Host::models_class(host, &current) {
+                    None
+                } else {
+                    linked.get(&current)
+                }
+            });
+            let Some(class) = class else {
+                break;
+            };
+            if let Some(method) = class.method("appendHoverText", DESCRIPTOR)
+                && !method.is_static()
+                && (method.access & ACC_PRIVATE) == 0
+            {
+                override_owner = Some(current.clone());
+                break;
+            }
+            if class.super_name.is_empty() || class.super_name == current {
+                break;
+            }
+            current = class.super_name.clone();
+        }
+        let Some(owner) = override_owner else {
+            if !reached_known_noop {
+                let _ = host.unknown_host_call(&MethodRef {
+                    owner: current,
+                    name: "appendHoverText".into(),
+                    descriptor: DESCRIPTOR.into(),
+                })?;
+            }
+            return Ok(Vec::new());
+        };
+        let sink = host.tooltip_sink();
+        let args = [stack, context, display, sink.clone(), flag];
+        let result = self.invoke_persistent(
+            &MethodRef {
+                owner,
+                name: "appendHoverText".into(),
+                descriptor: DESCRIPTOR.into(),
+            },
+            Some(item.clone()),
+            &args,
+            host,
+            budget,
+        );
+        let lines = host.take_tooltip_sink(&sink);
+        result.map(|_| lines)
+    }
+
     /// Run one HUD element for this frame, through `host` (the jar's own,
     /// inside [`StdHost::begin_client_frame`]): its callback gets the
     /// graphics and delta tracker stand-ins. The host's call log is rolled
@@ -2567,6 +3101,25 @@ mod tests {
             }),
             ..ClientSnapshot::default()
         })
+    }
+
+    #[test]
+    fn item_tooltip_consumer_preserves_components() {
+        let mut host = StdHost::new();
+        let sink = host.tooltip_sink();
+        let line = component_value("translatable", "demo.tooltip");
+        crate::Host::invoke_instance(
+            &mut host,
+            &method(
+                "java/util/function/Consumer",
+                "accept",
+                "(Ljava/lang/Object;)V",
+            ),
+            &sink,
+            std::slice::from_ref(&line),
+        )
+        .unwrap();
+        assert_eq!(host.take_tooltip_sink(&sink), vec![line]);
     }
 
     /// The inventory's lists are host collections (#156 P14d2): a call
@@ -3158,6 +3711,108 @@ mod tests {
                 clicks: 0
             }]
         );
+    }
+
+    #[test]
+    fn graphics_text_refuses_unresolvable_component_instead_of_drawing_nothing() {
+        let mut host = StdHost::new();
+        let bad = crate::host_component::translatable("k");
+        let bad_arg = crate::jar_object::handle("java/lang/Object#0".into());
+        crate::host_component::change(
+            &mut host.component_states,
+            &bad,
+            &crate::facade_text::argument,
+            |state| state.args = Some(vec![bad_arg]),
+        )
+        .unwrap();
+        host.begin_client_frame(snapshot(), &[]);
+        let gfx = marker(GRAPHICS);
+        let font = marker(FONT);
+        for name in ["text", "centeredText"] {
+            let str_overload = method(
+                "net/minecraft/client/gui/GuiGraphicsExtractor",
+                name,
+                "(Lnet/minecraft/client/gui/Font;Ljava/lang/String;III)V",
+            );
+            let comp_overload = method(
+                "net/minecraft/client/gui/GuiGraphicsExtractor",
+                name,
+                "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/network/chat/Component;III)V",
+            );
+            // Null String draws nothing; null Component throws NPE; unresolvable Component refuses.
+            assert_eq!(
+                host.client_call(
+                    &str_overload,
+                    &gfx,
+                    &[
+                        font.clone(),
+                        Value::Ref(None),
+                        Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
+                    ],
+                )
+                .unwrap()
+                .unwrap(),
+                Value::Void,
+                "{name}(String null)"
+            );
+            assert!(
+                matches!(
+                    host.client_call(
+                        &comp_overload,
+                        &gfx,
+                        &[
+                            font.clone(),
+                            Value::Ref(None),
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Int(0),
+                        ],
+                    ),
+                    Some(Err(NativeError::UncaughtException { ref class, .. }))
+                        if class == "java/lang/NullPointerException"
+                ),
+                "{name}(Component null)"
+            );
+            assert!(
+                matches!(
+                    host.client_call(
+                        &comp_overload,
+                        &gfx,
+                        &[
+                            font.clone(),
+                            bad.clone(),
+                            Value::Int(0),
+                            Value::Int(0),
+                            Value::Int(0),
+                        ],
+                    ),
+                    Some(Err(NativeError::UnknownHostCall(_)))
+                ),
+                "{name}(unresolvable)"
+            );
+        }
+        let dec = method(
+            "net/minecraft/client/gui/GuiGraphicsExtractor",
+            "itemDecorations",
+            "(Lnet/minecraft/client/gui/Font;Lnet/minecraft/world/item/ItemStack;IILjava/lang/String;)V",
+        );
+        assert!(matches!(
+            host.client_call(
+                &dec,
+                &gfx,
+                &[
+                    font,
+                    marker(format!("{}main-hand", items::STACK)),
+                    Value::Int(0),
+                    Value::Int(0),
+                    bad,
+                ],
+            ),
+            Some(Err(NativeError::UnknownHostCall(_)))
+        ));
+        host.end_client_frame();
     }
 
     #[test]

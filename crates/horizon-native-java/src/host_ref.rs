@@ -635,6 +635,22 @@ pub enum HostKind {
     FabricBiomeModification,
     /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
     RecipeSerializer,
+    /// Opaque `Consumer<Component>` sink passed to `Item.appendHoverText`
+    /// (`client_surface.rs`), matching vanilla's `lines::add` invokedynamic lambda.
+    TooltipConsumer,
+    /// `net.minecraft.world.item.Item$TooltipContext` passed to tooltip hooks
+    /// (`client_surface.rs`).
+    TooltipContext,
+    /// `net.minecraft.world.item.component.TooltipDisplay` passed to
+    /// `Item.appendHoverText` (`client_surface.rs`).
+    TooltipDisplay,
+    /// `net.minecraft.world.item.TooltipFlag` passed to tooltip hooks when the
+    /// concrete runtime class is unknown (`client_surface.rs`).
+    TooltipFlag,
+    /// Concrete `net.minecraft.world.item.TooltipFlag$Default` record
+    /// (`TooltipFlag.NORMAL`, `TooltipFlag.ADVANCED`, `asCreative()`,
+    /// `client_surface.rs`).
+    TooltipFlagDefault,
     /// A host-synthesized menu model object (`menu_models.rs`): key `<class>#menu<n>`,
     /// kept out of `jar_object::parse_key` / `freed_objects` numeric ranges while
     /// remaining a canonical non-`String` object handle.
@@ -920,6 +936,10 @@ const CLASS_SIDES: &[(HostKind, &ClassSide)] = &[
         &crate::stream_codec::STREAM_CODEC_CLASS_SIDE,
     ),
     (HostKind::RandomSource, &crate::random_source::CLASS_SIDE),
+    (
+        HostKind::TooltipFlagDefault,
+        &crate::client_surface::TOOLTIP_FLAG_DEFAULT_CLASS_SIDE,
+    ),
 ];
 
 /// One row of the kind table.
@@ -2833,6 +2853,51 @@ const KINDS: &[KindInfo] = &[
         methods: &crate::recipe_serializer::METHODS,
     },
     KindInfo {
+        kind: HostKind::TooltipConsumer,
+        tag: "tcs",
+        // Hidden lambda class (`lines::add` in `ItemStack.getTooltipLines`): `getClass()` is
+        // counted and `instanceof` is exact (`Consumer` and `Object` only).
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_consumer_types,
+        },
+        canonical: always_canonical,
+        methods: &crate::client_surface::TOOLTIP_CONSUMER_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipContext,
+        tag: "ttctx",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_context_types,
+        },
+        canonical: crate::client_surface::tooltip_context_canonical,
+        methods: &crate::client_surface::TOOLTIP_CONTEXT_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipDisplay,
+        tag: "ttdsp",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_display_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::client_surface::TOOLTIP_DISPLAY_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlag,
+        tag: "ttflg",
+        class: ClassRule::Unknown {
+            declared: crate::client_surface::tooltip_flag_types,
+        },
+        canonical: never_canonical,
+        methods: &crate::client_surface::TOOLTIP_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::TooltipFlagDefault,
+        tag: "ttflgd",
+        class: ClassRule::FromKey(crate::client_surface::tooltip_flag_default_class),
+        canonical: crate::client_surface::tooltip_flag_default_canonical,
+        methods: &crate::client_surface::TOOLTIP_FLAG_DEFAULT_METHODS,
+    },
+    KindInfo {
         kind: HostKind::MenuObject,
         tag: "menu",
         class: ClassRule::FromKey(crate::jar_object::menu_object_class),
@@ -2952,7 +3017,7 @@ impl HostKind {
 impl HostRef {
     /// A handle with `key` as it is (a number, a name). A key that holds
     /// values is built with [`Self::of_values`].
-    pub(crate) fn new(kind: HostKind, key: impl Into<String>) -> Self {
+    pub fn new(kind: HostKind, key: impl Into<String>) -> Self {
         Self {
             kind,
             key: Arc::new(key.into()),

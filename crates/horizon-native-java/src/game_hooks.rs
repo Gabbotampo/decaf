@@ -862,9 +862,13 @@ impl<H: Host> GameHookHost<'_, H> {
                     Some(value) => {
                         match crate::facade_text::json_now(value, self.inner.component_states()) {
                             Some(json) => crate::facade_text::plain(&json),
-                            // A component no read resolves (past the bound, a cycle).
+                            // A component no read resolves (disallowed translation
+                            // argument, non-finite float in RFC 8259 JSON, cycle, or
+                            // past the bound): count through the host's operand path
+                            // and return its neutral result rather than failing with
+                            // `NativeError::Metadata`.
                             None if crate::host_component::is_component(value) => {
-                                return Err(unmodelled(marker, r));
+                                return self.inner.unknown_operand_call(r);
                             }
                             None => crate::game_object::text(value).cloned().unwrap_or_default(),
                         }
@@ -2323,6 +2327,44 @@ mod tests {
             panic!("not a handle")
         };
         assert_eq!(respawned.same_object(&event_respawned), Some(true));
+    }
+
+    #[test]
+    fn send_system_message_counts_unresolvable_component_instead_of_failing_with_metadata() {
+        let uuid = 0x0123_4567_89ab_cdef_0011_2233_4455_6677_u128;
+        let mut inner = StdHost::new();
+        let component = crate::host_component::translatable("k");
+        let bad_arg = crate::jar_object::handle("java/lang/Object#0".into());
+        crate::host_component::change(
+            &mut inner.component_states,
+            &component,
+            &crate::facade_text::argument,
+            |state| state.args = Some(vec![bad_arg]),
+        )
+        .unwrap();
+        let mut context = GameHookContext::default();
+        let player = context.insert(GameObject::player(uuid, "Alex"));
+        let model = MixinModel::default();
+        let r = MethodRef {
+            owner: "net/minecraft/server/level/ServerPlayer".into(),
+            name: "sendSystemMessage".into(),
+            descriptor: "(Lnet/minecraft/network/chat/Component;)V".into(),
+        };
+        let mut hook_host = GameHookHost {
+            inner: &mut inner,
+            context: &mut context,
+            model: &model,
+        };
+        let result = hook_host.invoke_instance(&r, &player, &[component]);
+        assert_eq!(result.unwrap(), Value::Void);
+        assert!(context.effects.is_empty());
+        assert_eq!(
+            inner.unknown_host_calls(),
+            vec![(
+                "net/minecraft/server/level/ServerPlayer#sendSystemMessage(Lnet/minecraft/network/chat/Component;)V".into(),
+                1
+            )]
+        );
     }
 
     fn hook_value(uuid: u128, life: u32) -> Value {
