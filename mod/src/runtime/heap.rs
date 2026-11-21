@@ -196,6 +196,13 @@ impl StdHost {
         self.map_entries.len()
     }
 
+    /// How many canonical `BlockState` rows the host keeps (`block_states`): each lives as
+    /// long as its owning `Block` (reachable directly or through a jar reference to a state),
+    /// so this follows live blocks rather than every block a jar ever constructed.
+    pub fn block_state_count(&self) -> usize {
+        self.block_states.len()
+    }
+
     pub(crate) fn take_resident_heap(&mut self) -> JavaHeap {
         let live = self.heap.live;
         let heap = std::mem::take(&mut self.heap);
@@ -307,17 +314,10 @@ impl StdHost {
         out.extend(self.payload_bytes.keys().map(String::as_str));
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
-        out.extend(self.block_property_builders.keys().map(String::as_str));
-        out.extend(self.block_copied_properties.iter().map(String::as_str));
-        out.extend(self.block_state_properties.keys().map(String::as_str));
-        out.extend(self.state_definition_builders.keys().map(String::as_str));
-        out.extend(self.block_states.keys().map(String::as_str));
-        out.extend(self.block_default_states.keys().map(String::as_str));
-        out.extend(
-            self.unknown_block_state_definitions
-                .iter()
-                .map(String::as_str),
-        );
+        // Per-block metadata (`block_property_builders`, `block_copied_properties`,
+        // `block_state_properties`, `state_definition_builders`, `block_default_states`,
+        // `unknown_block_state_definitions`) and canonical `block_states` are traced and
+        // pruned with their owning block object rather than becoming GC roots.
         // `ItemLike.asItem()`'s bounded `Item.BY_BLOCK` knowledge is keyed by
         // allocated mod objects. It is traced and pruned with the object
         // rather than becoming a lifetime root.
@@ -416,9 +416,6 @@ impl StdHost {
             }
         }
         push(self.state_definition_builders.get(marker), out);
-        if let Some((block, _)) = self.block_states.get(marker) {
-            out.push(block.clone());
-        }
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
         push(self.array_view_array(marker), out);
@@ -468,10 +465,10 @@ impl StdHost {
             .chain(self.block_items.keys())
             .chain(self.jar_item_stacks.keys())
             .chain(self.item_required_features.keys())
+            .chain(self.block_property_builders.keys())
             .chain(self.block_state_properties.keys())
             .chain(self.block_copied_properties.iter())
             .chain(self.state_definition_builders.keys())
-            .chain(self.block_states.keys())
             .chain(self.block_default_states.keys())
             .chain(self.unknown_block_state_definitions.iter())
             .chain(self.array_view_markers())
@@ -503,10 +500,10 @@ impl StdHost {
         self.random_sources.retain(|key, _| keep(key));
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
+        self.block_property_builders.retain(|key, _| keep(key));
         self.block_state_properties.retain(|key, _| keep(key));
         self.block_copied_properties.retain(|key| keep(key));
         self.state_definition_builders.retain(|key, _| keep(key));
-        self.block_states.retain(|key, _| keep(key));
         self.block_default_states.retain(|key, _| keep(key));
         self.unknown_block_state_definitions.retain(|key| keep(key));
         self.throwable_messages.retain(|key, _| keep(key));
@@ -546,8 +543,11 @@ fn collectable(marker: &str) -> bool {
     }) {
         return true;
     }
-    // A host-created ranged attribute is a per-allocation handle and follows the heap.
-    if let Some(serial) = marker.strip_prefix("ranged-attribute/") {
+    // A host-created ranged attribute or block property builder follows the heap.
+    if let Some(serial) = marker
+        .strip_prefix("ranged-attribute/")
+        .or_else(|| marker.strip_prefix("block/properties/"))
+    {
         return !serial.is_empty() && serial.bytes().all(|b| b.is_ascii_digit());
     }
     // A host-created VoxelShape (`cube/<n>` or `array/<n>`) follows the heap; the shared
@@ -620,6 +620,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.component_states.len()
         + host.ranged_attributes.len()
         + host.voxel_shapes.len()
+        + host.block_states.len()
         + host.entity_registration.entry_count()
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
@@ -827,6 +828,9 @@ fn heap_bytes(heap: &JavaHeap, host: &StdHost) -> usize {
                 .iter()
                 .map(|(key, shape)| key.len() + shape.estimated_bytes()),
         )
+        .chain(host.block_states.iter().map(|(key, (block, values))| {
+            key.len() + block.len() + values.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+        }))
         .chain(std::iter::once(host.guava_tables.estimated_bytes()))
         .sum()
 }
@@ -913,6 +917,7 @@ impl Collectable {
             .chain(host.enumerations.keys().map(String::as_str))
             .chain(host.component_states.keys().map(String::as_str))
             .chain(host.map_entries.keys().map(String::as_str))
+            .chain(host.block_states.values().map(|(block, _)| block.as_str()))
             .chain(host.keyed_table_keys())
             .filter(|marker| collectable(marker))
             .map(str::to_owned)
@@ -1190,6 +1195,12 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.constructed_uuids
         .retain(|key, _| !freed.holds_key(key));
     host.locales.retain(|key, _| !freed.holds_key(key));
+    // Canonical BlockState markers live exactly as long as their owning Block:
+    // they are not GC roots themselves, are kept alive by their block or by any
+    // jar reference to `blockstate/<block>[...]` (which `Collectable::scan`
+    // resolves to `<block>`), and are dropped when `<block>` is collected.
+    host.block_states
+        .retain(|_, (block, _)| keep(block) && !freed.holds_key(block));
     // A cached collection goes with what it was cached for, and an entry
     // whose collection went is rebuilt on its next call (#226 re-check 4:
     // every map's views used to stay cached forever).
@@ -1888,6 +1899,7 @@ mod tests {
             "next_reversed_view",
             "next_ranged_attribute",
             "next_voxel_shape",
+            "next_shape_extraction",
             "next_menu_object",
             "properties",
             "environment",
@@ -2218,5 +2230,91 @@ mod tests {
                 "demo/StreamCodec#5",
             ]
         );
+    }
+
+    #[test]
+    fn canonical_block_states_live_exactly_as_long_as_their_block() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+
+        // Block #0 is held directly in a static field: all of its canonical states stay alive.
+        let live_block = "demo/LiveBlock#0";
+        host.persistent_static_fields.insert(
+            "demo/Mod#LIVE_BLOCKLnet/minecraft/world/level/block/Block;".into(),
+            crate::runtime::jar_object::handle(live_block.into()),
+        );
+        let live_north = host.canonical_block_state(
+            live_block,
+            BTreeMap::from([("facing".into(), "north".into())]),
+        );
+        let live_east = host.canonical_block_state(
+            live_block,
+            BTreeMap::from([("facing".into(), "east".into())]),
+        );
+
+        // Block #1 is NOT referenced directly, only through one of its canonical states in a static.
+        let state_only_block = "demo/StateOnlyBlock#1";
+        let state_only_east = host.canonical_block_state(
+            state_only_block,
+            BTreeMap::from([("facing".into(), "east".into())]),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Mod#SAVED_STATELnet/minecraft/world/level/block/state/BlockState;".into(),
+            state_only_east.clone(),
+        );
+        heap.fields
+            .insert(field(state_only_block, "tag"), Value::Int(7));
+
+        // Blocks #2..#201 are temporary and unreachable: they and their states must be dropped.
+        for i in 2..202 {
+            let dead_block = format!("demo/TempBlock#{i}");
+            let builder = format!("block/properties/{i}");
+            host.block_property_builders
+                .insert(builder, BTreeMap::new());
+            host.block_property_builders
+                .insert(dead_block.clone(), BTreeMap::new());
+            host.block_default_states.insert(
+                dead_block.clone(),
+                BTreeMap::from([("facing".into(), "north".into())]),
+            );
+            let _ = host.canonical_block_state(
+                &dead_block,
+                BTreeMap::from([("facing".into(), "north".into())]),
+            );
+            let _ = host.canonical_block_state(
+                &dead_block,
+                BTreeMap::from([("facing".into(), "south".into())]),
+            );
+        }
+        heap.next_object = 202;
+        assert_eq!(host.block_state_count(), 403);
+
+        collect(&mut heap, &mut host, &[]);
+
+        // All 400 dead states, their property builders, and default states are gone.
+        assert_eq!(host.block_state_count(), 3);
+        assert!(host.block_property_builders.is_empty());
+        assert!(host.block_default_states.is_empty());
+        // Live block's states remain canonical and stable.
+        assert_eq!(
+            host.canonical_block_state(
+                live_block,
+                BTreeMap::from([("facing".into(), "north".into())]),
+            ),
+            live_north
+        );
+        assert_eq!(
+            host.canonical_block_state(
+                live_block,
+                BTreeMap::from([("facing".into(), "east".into())]),
+            ),
+            live_east
+        );
+        // State-only-in-static keeps its block's fields and state row alive.
+        assert_eq!(
+            host.block_state_block(&state_only_east),
+            Some(crate::runtime::jar_object::stored(state_only_block))
+        );
+        assert_eq!(objects(&heap), [state_only_block]);
     }
 }

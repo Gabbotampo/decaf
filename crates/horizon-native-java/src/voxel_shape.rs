@@ -1293,16 +1293,31 @@ pub(crate) fn empty_collision_context() -> Value {
     Value::Host(HostRef::new(HostKind::CollisionContext, "empty"))
 }
 
-fn probe_collision_context() -> Value {
-    Value::Host(HostRef::new(HostKind::ShapeProbe, "collision-context"))
+pub(crate) fn parse_shape_probe_key(key: &str) -> Option<(u64, &str)> {
+    let (id, role) = key.split_once(':')?;
+    let id = id.parse::<u64>().ok()?;
+    matches!(role, "block-getter" | "block-pos" | "collision-context").then_some((id, role))
 }
 
-fn probe_block_getter() -> Value {
-    Value::Host(HostRef::new(HostKind::ShapeProbe, "block-getter"))
+fn probe_collision_context(extraction_id: u64) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::ShapeProbe,
+        format!("{extraction_id}:collision-context"),
+    ))
 }
 
-fn probe_block_pos() -> Value {
-    Value::Host(HostRef::new(HostKind::ShapeProbe, "block-pos"))
+fn probe_block_getter(extraction_id: u64) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::ShapeProbe,
+        format!("{extraction_id}:block-getter"),
+    ))
+}
+
+fn probe_block_pos(extraction_id: u64) -> Value {
+    Value::Host(HostRef::new(
+        HostKind::ShapeProbe,
+        format!("{extraction_id}:block-pos"),
+    ))
 }
 
 /// Allocate a fresh `VoxelShape` handle without collapsing to `Shapes.empty()` / `Shapes.block()`.
@@ -2147,16 +2162,23 @@ impl NativeJar {
         host: &mut StdHost,
         budget: &ExecutionBudget,
     ) -> Result<Option<Vec<BlockStateShape>>, NativeError> {
-        let level = probe_block_getter();
-        let pos = probe_block_pos();
-        let ctx = probe_collision_context();
-
         let mut results = Vec::with_capacity(state_combos.len());
         for state_map in state_combos {
+            let extraction_id = host.next_shape_extraction_id();
+            let level = probe_block_getter(extraction_id);
+            let pos = probe_block_pos(extraction_id);
+            let ctx = probe_collision_context(extraction_id);
             let state_val = host.mint_block_state(marker, state_map.clone());
             let unknown_before = host.unknown_host_call_count();
-            let args = [state_val, level.clone(), pos.clone(), ctx.clone()];
-            let call = self.invoke_persistent(target, Some(block.clone()), &args, host, budget);
+            let args = [state_val, level, pos, ctx];
+            let call = self.invoke_persistent_shape_extraction(
+                target,
+                Some(block.clone()),
+                &args,
+                host,
+                budget,
+                extraction_id,
+            );
             let unknown_after = host.unknown_host_call_count();
             match call {
                 Ok(value) => {

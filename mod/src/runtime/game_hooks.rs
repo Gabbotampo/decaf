@@ -1758,6 +1758,10 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.pause_collections(paused);
     }
 
+    fn has_shape_probes(&self) -> bool {
+        self.inner.has_shape_probes()
+    }
+
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {
         self.inner.empty_mutable_collection(kind)
     }
@@ -2082,7 +2086,8 @@ impl NativeJar {
             stream_plan: Default::default(),
             store_verdict: Default::default(),
             depth: 0,
-            shape_extraction: false,
+            shape_extraction: None,
+            check_shape_probes: false,
             budget,
         };
         // `game_hook_callback_values` answers whether the callback is an

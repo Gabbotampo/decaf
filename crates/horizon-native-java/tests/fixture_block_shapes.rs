@@ -2260,6 +2260,462 @@ public final class Probe implements ModInitializer {
     assert_eq!(answer, Value::Ref(Some("EAST|true|true".to_owned())));
 }
 
+/// Round-4 Finding 1: a `ShapeProbe` saved during one extraction (`putstatic` / `aastore` /
+/// `putfield` / `List.add`, which counts in extraction 1 so extraction 1 fails) carries
+/// extraction 1's id. A later extraction gets fresh probe keys with a new extraction id and
+/// refuses to grant free forwarding (`state.getShape(saved, pos)`) to any probe from an
+/// earlier extraction — through a static field, a typed `BlockGetter[]`, an `Object[]`, an
+/// instance field, or a `List<BlockGetter>` — while legitimate forwarding of the CURRENT
+/// extraction's probes still exports with zero counted calls.
+#[test]
+fn stale_probe_from_earlier_extraction_cannot_forward_without_counting() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/DelegateBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class DelegateBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public DelegateBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/StaticReplayBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class StaticReplayBlock extends Block {
+    public static BlockGetter SAVED;
+    private static boolean STORED;
+    private final Block delegate;
+    public StaticReplayBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (!STORED) {
+            STORED = true;
+            SAVED = level;
+            return delegate.defaultBlockState().getShape(level, pos);
+        }
+        return delegate.defaultBlockState().getShape(SAVED, pos);
+    }
+}"#,
+        ),
+        (
+            "demo/CrossBlockStaticReader.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CrossBlockStaticReader extends Block {
+    private final Block delegate;
+    public CrossBlockStaticReader(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return delegate.defaultBlockState().getShape(StaticReplayBlock.SAVED, pos);
+    }
+}"#,
+        ),
+        (
+            "demo/TypedArrayReplayBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class TypedArrayReplayBlock extends Block {
+    private static final BlockGetter[] SAVED = new BlockGetter[1];
+    private static boolean STORED;
+    private final Block delegate;
+    public TypedArrayReplayBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (!STORED) {
+            STORED = true;
+            SAVED[0] = level;
+            return delegate.defaultBlockState().getShape(level, pos);
+        }
+        return delegate.defaultBlockState().getShape(SAVED[0], pos);
+    }
+}"#,
+        ),
+        (
+            "demo/ObjectArrayReplayBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ObjectArrayReplayBlock extends Block {
+    private static final Object[] SAVED = new Object[1];
+    private static boolean STORED;
+    private final Block delegate;
+    public ObjectArrayReplayBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (!STORED) {
+            STORED = true;
+            SAVED[0] = level;
+            return delegate.defaultBlockState().getShape(level, pos);
+        }
+        return delegate.defaultBlockState().getShape((BlockGetter) SAVED[0], pos);
+    }
+}"#,
+        ),
+        (
+            "demo/InstanceFieldReplayBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class InstanceFieldReplayBlock extends Block {
+    private BlockGetter saved;
+    private boolean stored;
+    private final Block delegate;
+    public InstanceFieldReplayBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (!this.stored) {
+            this.stored = true;
+            this.saved = level;
+            return delegate.defaultBlockState().getShape(level, pos);
+        }
+        return delegate.defaultBlockState().getShape(this.saved, pos);
+    }
+}"#,
+        ),
+        (
+            "demo/ListReplayBlock.java",
+            r#"package demo;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class ListReplayBlock extends Block {
+    private final List<BlockGetter> saved = new ArrayList<>();
+    private boolean stored;
+    private final Block delegate;
+    public ListReplayBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        if (!this.stored) {
+            this.stored = true;
+            // Populate the ArrayList via `aastore` + `Arrays.asList` so extraction 1 fails at
+            // `aastore` while genuinely leaving extraction 1's probe inside `this.saved`.
+            BlockGetter[] box = new BlockGetter[] { level };
+            this.saved.addAll(Arrays.asList(box));
+            return delegate.defaultBlockState().getShape(level, pos);
+        }
+        return delegate.defaultBlockState().getShape(this.saved.get(0), pos);
+    }
+}"#,
+        ),
+        (
+            "demo/CleanForwardBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CleanForwardBlock extends Block {
+    private final Block delegate;
+    public CleanForwardBlock(Properties p, Block delegate) { super(p); this.delegate = delegate; }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return delegate.defaultBlockState().getShape(level, pos);
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Probe implements ModInitializer {
+    private static Identifier id(String path) { return Identifier.fromNamespaceAndPath("fixture", path); }
+    @Override
+    public void onInitialize() {
+        Block delegate = Registry.register(BuiltInRegistries.BLOCK, id("delegate"), new DelegateBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("static_replay"), new StaticReplayBlock(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("cross_static_reader"), new CrossBlockStaticReader(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("typed_array_replay"), new TypedArrayReplayBlock(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("object_array_replay"), new ObjectArrayReplayBlock(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("instance_field_replay"), new InstanceFieldReplayBlock(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("list_replay"), new ListReplayBlock(BlockBehaviour.Properties.of(), delegate));
+        Registry.register(BuiltInRegistries.BLOCK, id("clean_forward"), new CleanForwardBlock(BlockBehaviour.Properties.of(), delegate));
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-stale-probe-replay", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    // Two-extraction replay cases: extraction 1 saves the probe (must count and refuse),
+    // extraction 2 reads it back without storing again and forwards it to `state.getShape(saved, pos)`
+    // (must ALSO count and refuse).
+    let two_phase_ids = [
+        "fixture:static_replay",
+        "fixture:typed_array_replay",
+        "fixture:object_array_replay",
+        "fixture:instance_field_replay",
+        "fixture:list_replay",
+    ];
+    let get_shape_call = "net/minecraft/world/level/block/state/BlockState#getShape(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
+    for id in two_phase_ids {
+        let blk = registration_value(&host, id);
+        let before1 = host.unknown_host_call_count();
+        let res1 = fixture.jar.block_shapes(&mut host, &blk).unwrap();
+        assert!(
+            host.unknown_host_call_count() > before1,
+            "{id}: extraction 1 storing probe must count"
+        );
+        assert!(res1.states.is_none(), "{id}: extraction 1 must not resolve");
+        assert_eq!(res1.to_content_export(), (None, None), "{id} extraction 1");
+
+        let before2 = host.unknown_host_call_count();
+        let before2_get_shape = host
+            .unknown_host_calls()
+            .into_iter()
+            .find_map(|(name, count)| (name == get_shape_call).then_some(count))
+            .unwrap_or(0);
+        let res2 = fixture.jar.block_shapes(&mut host, &blk).unwrap();
+        let after2_get_shape = host
+            .unknown_host_calls()
+            .into_iter()
+            .find_map(|(name, count)| (name == get_shape_call).then_some(count))
+            .unwrap_or(0);
+        assert!(
+            host.unknown_host_call_count() > before2,
+            "{id}: extraction 2 replaying stale probe must count (unknowns: {:?})",
+            host.unknown_host_calls()
+        );
+        assert!(
+            after2_get_shape > before2_get_shape,
+            "{id}: extraction 2 must reject stale probe at BlockState#getShape (unknowns: {:?})",
+            host.unknown_host_calls()
+        );
+        assert!(res2.states.is_none(), "{id}: extraction 2 must not resolve");
+        assert_eq!(res2.to_content_export(), (None, None), "{id} extraction 2");
+    }
+
+    // Separate block reading the static probe saved by `StaticReplayBlock` during extraction 1.
+    let reader = registration_value(&host, "fixture:cross_static_reader");
+    let before_reader = host.unknown_host_call_count();
+    let reader_res = fixture.jar.block_shapes(&mut host, &reader).unwrap();
+    assert!(
+        host.unknown_host_call_count() > before_reader,
+        "cross_static_reader replaying probe from StaticReplayBlock must count"
+    );
+    assert!(reader_res.states.is_none());
+    assert_eq!(reader_res.to_content_export(), (None, None));
+
+    // Legitimate forwarding of the CURRENT extraction's probes still exports with zero counts.
+    let clean = registration_value(&host, "fixture:clean_forward");
+    let before_clean = host.unknown_host_call_count();
+    let clean_res = fixture.jar.block_shapes(&mut host, &clean).unwrap();
+    assert_eq!(
+        host.unknown_host_call_count(),
+        before_clean,
+        "clean current-extraction forwarding must not count"
+    );
+    let clean_states = clean_res.states.as_ref().expect("clean_forward resolves");
+    assert_eq!(clean_states.len(), 1);
+    assert_eq!(clean_states[0].boxes, vec![[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]);
+
+    // End-to-end export via `populate_block_shapes`: none of the replay blocks export shapes,
+    // while `delegate` and `clean_forward` do.
+    fixture
+        .jar
+        .populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    let exported: BTreeMap<String, serde_json::Value> = content::declarations(host.registrations())
+        .into_iter()
+        .map(|decl| (decl.id().to_owned(), decl.file_json()))
+        .collect();
+    for id in two_phase_ids
+        .into_iter()
+        .chain(std::iter::once("fixture:cross_static_reader"))
+    {
+        assert!(
+            exported[id].get("shapes").is_none(),
+            "{id} must not export shapes"
+        );
+        assert!(
+            exported[id].get("collision_shapes").is_none(),
+            "{id} must not export collision_shapes"
+        );
+    }
+    assert_eq!(
+        exported["fixture:clean_forward"]["shapes"],
+        json!({ "default": [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]] })
+    );
+}
+
+/// Round-4 Finding 2: canonical `BlockState` rows live exactly as long as their owning `Block`
+/// object (reachable directly or through a jar reference to a state). Allocating many temporary
+/// blocks in a loop, calling `defaultBlockState()` / `setValue(...)`, and dropping them lets GC
+/// reclaim all dead state entries, while live blocks keep stable `==` identity and a detached
+/// block's state stored in a static remains valid and exact.
+#[test]
+fn canonical_block_states_collected_when_temporary_blocks_die() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/StatefulBlock.java",
+            r#"package demo;
+import net.minecraft.core.Direction;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public class StatefulBlock extends Block {
+    public StatefulBlock(Properties p) {
+        super(p);
+        this.registerDefaultState(this.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.NORTH));
+    }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.HORIZONTAL_FACING);
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class Probe implements ModInitializer {
+    private static Block LIVE_BLOCK;
+    private static BlockState LIVE_EAST_BEFORE;
+    private static BlockState DETACHED_EAST;
+
+    @Override
+    public void onInitialize() {
+        LIVE_BLOCK = Registry.register(
+            BuiltInRegistries.BLOCK,
+            Identifier.fromNamespaceAndPath("fixture", "live_stateful"),
+            new StatefulBlock(BlockBehaviour.Properties.of())
+        );
+        LIVE_EAST_BEFORE = LIVE_BLOCK.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+        // Detached block: never registered and never stored directly — reachable ONLY via DETACHED_EAST.
+        DETACHED_EAST = new StatefulBlock(BlockBehaviour.Properties.of())
+            .defaultBlockState()
+            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+    }
+
+    public static void churnTemporaryBlocks() {
+        for (int i = 0; i < 1500; i++) {
+            Block tmp = new StatefulBlock(BlockBehaviour.Properties.of());
+            tmp.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);
+        }
+    }
+
+    public static String verifyAfterGc() {
+        BlockState liveEastAfter = LIVE_BLOCK.defaultBlockState().setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST);
+        boolean liveSame = liveEastAfter == LIVE_EAST_BEFORE;
+        Direction detachedFacing = DETACHED_EAST.getValue(BlockStateProperties.HORIZONTAL_FACING);
+        boolean detachedSame = DETACHED_EAST.getBlock()
+            .defaultBlockState()
+            .setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST) == DETACHED_EAST;
+        return liveSame + "|" + detachedFacing.name() + "|" + detachedSame;
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-state-gc", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    // Baseline: only LIVE_BLOCK's (north + east) and DETACHED's (north + east) canonical states.
+    let baseline = host.block_state_count();
+    assert_eq!(baseline, 4, "expected 4 live canonical states before churn");
+
+    let unknown_before = host.unknown_host_call_count();
+    fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "churnTemporaryBlocks",
+            "()V",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+
+    // Automatic collection on `store_resident_heap` must reclaim every temporary block's states.
+    assert_eq!(
+        host.block_state_count(),
+        baseline,
+        "dead temporary blocks' canonical states must be collected back to baseline ({baseline})"
+    );
+
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "verifyAfterGc",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), unknown_before);
+    assert_eq!(answer, Value::Ref(Some("true|EAST|true".to_owned())));
+}
+
 /// Real-jar verification against `runes-fabric-1.3.2+26.3.jar`:
 ///
 /// `net/runes/block/RuneCraftingBlock` (`runes-javap.txt` lines 1113-1116, 1196-1232):
