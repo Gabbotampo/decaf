@@ -187,12 +187,17 @@ public final class Shapes {
             "package net.minecraft.world.level.block.state.properties; public final class BooleanProperty extends Property<Boolean> { }",
         ),
         (
+            "net/minecraft/world/level/block/state/properties/IntegerProperty.java",
+            "package net.minecraft.world.level.block.state.properties; public final class IntegerProperty extends Property<Integer> { }",
+        ),
+        (
             "net/minecraft/world/level/block/state/properties/BlockStateProperties.java",
             r#"package net.minecraft.world.level.block.state.properties;
 import net.minecraft.core.Direction;
 public final class BlockStateProperties {
     public static final EnumProperty<Direction> HORIZONTAL_FACING = null;
     public static final BooleanProperty LIT = null;
+    public static final IntegerProperty AGE_3 = null;
 }"#,
         ),
         (
@@ -209,14 +214,21 @@ public class StateDefinition<O, S> {
             "net/minecraft/world/level/block/state/BlockState.java",
             r#"package net.minecraft.world.level.block.state;
 import java.util.Optional;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
 public class BlockState {
     public <T extends Comparable<T>> T getValue(Property<T> property) { return null; }
     public <T extends Comparable<T>> boolean hasProperty(Property<T> property) { return false; }
     public <T extends Comparable<T>> Optional<T> getOptionalValue(Property<T> property) { return Optional.empty(); }
     public <T extends Comparable<T>> T getValueOrElse(Property<T> property, T fallback) { return fallback; }
     public <T extends Comparable<T>> BlockState setValue(Property<T> property, T value) { return this; }
+    public <T extends Comparable<T>> BlockState trySetValue(Property<T> property, T value) { return this; }
+    public VoxelShape getShape(BlockGetter level, BlockPos pos) { return null; }
+    public VoxelShape getShape(BlockGetter level, BlockPos pos, CollisionContext context) { return null; }
     public Block getBlock() { return null; }
 }"#,
         ),
@@ -231,8 +243,14 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 public abstract class BlockBehaviour {
     public static class Properties {
         public static Properties of() { return new Properties(); }
+        public static Properties ofFullCopy(BlockBehaviour other) { return new Properties(); }
+        public Properties noCollision() { return this; }
+        public Properties noOcclusion() { return this; }
     }
     protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return Shapes.block();
+    }
+    protected VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
         return Shapes.block();
     }
 }"#,
@@ -456,7 +474,12 @@ public final class Probe implements ModInitializer {
         .jar
         .block_shapes(&mut host, &static_or_block)
         .unwrap();
-    assert_eq!(host.unknown_host_call_count(), unknown_before);
+    assert_eq!(
+        host.unknown_host_call_count(),
+        unknown_before,
+        "unexpected counted calls: {:?}",
+        host.unknown_host_calls()
+    );
     assert!(static_or.overridden);
     assert_eq!(static_or.properties, vec!["facing"]);
     let static_states = static_or.states.as_ref().expect("static_or shapes");
@@ -487,7 +510,12 @@ public final class Probe implements ModInitializer {
     let facing_block = registration_value(&host, "fixture:facing_array");
     let unknown_before = host.unknown_host_call_count();
     let facing = fixture.jar.block_shapes(&mut host, &facing_block).unwrap();
-    assert_eq!(host.unknown_host_call_count(), unknown_before);
+    assert_eq!(
+        host.unknown_host_call_count(),
+        unknown_before,
+        "unexpected counted calls: {:?}",
+        host.unknown_host_calls()
+    );
     assert!(facing.overridden);
     assert_eq!(facing.properties, vec!["facing"]);
     let facing_states = facing.states.as_ref().expect("facing_array shapes");
@@ -504,7 +532,12 @@ public final class Probe implements ModInitializer {
         let block = registration_value(&host, id);
         let unknown_before = host.unknown_host_call_count();
         let plain = fixture.jar.block_shapes(&mut host, &block).unwrap();
-        assert_eq!(host.unknown_host_call_count(), unknown_before);
+        assert_eq!(
+            host.unknown_host_call_count(),
+            unknown_before,
+            "unexpected counted calls: {:?}",
+            host.unknown_host_calls()
+        );
         assert!(!plain.overridden);
         let states = plain.states.as_ref().expect("inherited full cube");
         assert_eq!(states.len(), 1);
@@ -637,6 +670,39 @@ public final class Probe {
         out.append("minX=").append(moved.min(Direction.Axis.X))
             .append(",maxY=").append(moved.max(Direction.Axis.Y)).append(';');
 
+        // Finding 1: identity & canonicalization against MC 26.3 `CaptureAllOracle`
+        VoxelShape half1 = Block.box(0, 0, 0, 8, 16, 16);
+        VoxelShape half2 = Block.box(8, 0, 0, 16, 16, 16);
+        VoxelShape unoptFull = Shapes.joinUnoptimized(half1, half2, BooleanOp.OR);
+        VoxelShape optFull = Shapes.or(half1, half2);
+        VoxelShape unoptEmpty = Shapes.joinUnoptimized(half1, half2, BooleanOp.AND);
+        VoxelShape optEmpty = Shapes.join(half1, half2, BooleanOp.AND);
+        out.append("unoptFullIsBlock=").append(unoptFull == Shapes.block()).append(';');
+        out.append("unoptFullClass=").append(unoptFull.getClass().getName()).append(';');
+        out.append("unoptFullStr=").append(unoptFull.toString()).append(';');
+        out.append("optFullIsBlock=").append(optFull == Shapes.block()).append(';');
+        out.append("unoptEmptyIsEmptyRef=").append(unoptEmpty == Shapes.empty()).append(';');
+        out.append("unoptEmptyIsEmpty=").append(unoptEmpty.isEmpty()).append(';');
+        out.append("unoptEmptyClass=").append(unoptEmpty.getClass().getName()).append(';');
+        out.append("unoptEmptyStr=").append(unoptEmpty.toString()).append(';');
+        out.append("optEmptyIsEmptyRef=").append(optEmpty == Shapes.empty()).append(';');
+        out.append("unoptSameOr=").append(Shapes.joinUnoptimized(half1, half1, BooleanOp.OR) == half1).append(';');
+        out.append("unoptSameOnlyFirst=").append(Shapes.joinUnoptimized(half1, half1, BooleanOp.ONLY_FIRST) == Shapes.empty()).append(';');
+        out.append("unoptEmptyOr=").append(Shapes.joinUnoptimized(Shapes.empty(), half1, BooleanOp.OR) == half1).append(';');
+        out.append("unoptOrEmpty=").append(Shapes.joinUnoptimized(half1, Shapes.empty(), BooleanOp.OR) == half1).append(';');
+        out.append("moveZeroIsBlock=").append(Shapes.block().move(0, 0, 0) == Shapes.block()).append(';');
+        out.append("moveZeroClass=").append(Shapes.block().move(0, 0, 0).getClass().getName()).append(';');
+        out.append("emptyMoveIsEmpty=").append(Shapes.empty().move(1, 2, 3) == Shapes.empty()).append(';');
+        out.append("blockOptIsBlock=").append(Shapes.block().optimize() == Shapes.block()).append(';');
+        out.append("emptyOptIsEmpty=").append(Shapes.empty().optimize() == Shapes.empty()).append(';');
+        out.append("half1OptSame=").append(half1.optimize() == half1).append(';');
+        try {
+            Shapes.joinUnoptimized(half1, half2, BooleanOp.TRUE);
+            out.append("joinTrue=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("joinTrue=").append(e.getMessage()).append(';');
+        }
+
         try {
             Shapes.box(1.0, 0.0, 0.0, 0.5, 1.0, 1.0);
             out.append("badBox=ok;");
@@ -673,7 +739,12 @@ public final class Probe {
             &mut host,
         )
         .unwrap();
-    assert_eq!(host.unknown_host_call_count(), unknown_before);
+    assert_eq!(
+        host.unknown_host_call_count(),
+        unknown_before,
+        "unexpected counted calls: {:?}",
+        host.unknown_host_calls()
+    );
     assert_eq!(
         answer,
         Value::Ref(Some(
@@ -686,6 +757,26 @@ public final class Probe {
              andBounds=0.375,0.0,0.0,0.625,0.625,0.625;\
              moved=1:0.5,0.25,0.0,1.0,0.75,0.5;\
              minX=0.5,maxY=0.75;\
+             unoptFullIsBlock=false;\
+             unoptFullClass=net.minecraft.world.phys.shapes.CubeVoxelShape;\
+             unoptFullStr=VoxelShape[AABB[0.0, 0.0, 0.0] -> [1.0, 1.0, 1.0]];\
+             optFullIsBlock=true;\
+             unoptEmptyIsEmptyRef=false;\
+             unoptEmptyIsEmpty=true;\
+             unoptEmptyClass=net.minecraft.world.phys.shapes.CubeVoxelShape;\
+             unoptEmptyStr=EMPTY;\
+             optEmptyIsEmptyRef=true;\
+             unoptSameOr=true;\
+             unoptSameOnlyFirst=true;\
+             unoptEmptyOr=true;\
+             unoptOrEmpty=true;\
+             moveZeroIsBlock=false;\
+             moveZeroClass=net.minecraft.world.phys.shapes.ArrayVoxelShape;\
+             emptyMoveIsEmpty=true;\
+             blockOptIsBlock=true;\
+             emptyOptIsEmpty=true;\
+             half1OptSame=false;\
+             joinTrue=null;\
              badBox=The min values need to be smaller or equals to the max values;\
              emptyBounds=No bounds for empty shape.;"
                 .to_owned()
@@ -707,6 +798,478 @@ public final class Probe {
     assert!(
         host.unknown_host_call_count() > unknown_before,
         "unmodelled VoxelShape.clip must be counted"
+    );
+}
+
+/// Finding 2 (collision shapes, `Properties.noCollision()`, `Properties.ofFullCopy()`, separate
+/// `getCollisionShape` overrides) and Finding 3 (any `BlockPos` / `BlockGetter` /
+/// `CollisionContext` read during extraction refuses the block).
+#[test]
+fn collision_shapes_and_position_dependencies_follow_mc263_and_sunrise() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/NoCollisionPlainBlock.java",
+            r#"package demo;
+import net.minecraft.world.level.block.Block;
+public final class NoCollisionPlainBlock extends Block {
+    public NoCollisionPlainBlock(Properties properties) { super(properties); }
+}"#,
+        ),
+        (
+            "demo/NoCollisionShapedBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class NoCollisionShapedBlock extends Block {
+    private static final VoxelShape OUTLINE = Block.box(2.0, 0.0, 2.0, 14.0, 12.0, 14.0);
+    public NoCollisionShapedBlock(Properties properties) { super(properties); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return OUTLINE;
+    }
+}"#,
+        ),
+        (
+            "demo/SeparateCollisionBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class SeparateCollisionBlock extends Block {
+    private static final VoxelShape OUTLINE = Block.box(0.0, 0.0, 0.0, 16.0, 16.0, 16.0);
+    private static final VoxelShape LOW_COLLISION = Block.box(0.0, 0.0, 0.0, 16.0, 14.0, 16.0);
+    public SeparateCollisionBlock(Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.LIT);
+    }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return OUTLINE;
+    }
+    @Override
+    protected VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return state.getValue(BlockStateProperties.LIT) ? LOW_COLLISION : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/DelegatingCollisionBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class DelegatingCollisionBlock extends Block {
+    private static final VoxelShape OUTLINE = Block.box(2.0, 0.0, 2.0, 14.0, 8.0, 14.0);
+    public DelegatingCollisionBlock(Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.LIT);
+    }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return OUTLINE;
+    }
+    @Override
+    protected VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return state.getValue(BlockStateProperties.LIT) ? state.getShape(level, pos) : Shapes.empty();
+    }
+}"#,
+        ),
+        (
+            "demo/PosGetterBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class PosGetterBlock extends Block {
+    public PosGetterBlock(Properties properties) { super(properties); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return pos.getY() > 64 ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.block();
+    }
+}"#,
+        ),
+        (
+            "demo/PosEqualsBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class PosEqualsBlock extends Block {
+    public PosEqualsBlock(Properties properties) { super(properties); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return pos.equals(BlockPos.ZERO) ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.block();
+    }
+}"#,
+        ),
+        (
+            "demo/PosRefEqBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class PosRefEqBlock extends Block {
+    public PosRefEqBlock(Properties properties) { super(properties); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return pos == BlockPos.ZERO ? Block.box(0, 0, 0, 16, 8, 16) : Shapes.block();
+    }
+}"#,
+        ),
+        (
+            "demo/CollisionPosBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CollisionPosBlock extends Block {
+    private static final VoxelShape OUTLINE = Block.box(2.0, 0.0, 2.0, 14.0, 12.0, 14.0);
+    public CollisionPosBlock(Properties properties) { super(properties); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return OUTLINE;
+    }
+    @Override
+    protected VoxelShape getCollisionShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return pos.getX() == 0 ? Shapes.empty() : OUTLINE;
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Probe implements ModInitializer {
+    private static Identifier id(String path) { return Identifier.fromNamespaceAndPath("fixture", path); }
+    @Override
+    public void onInitialize() {
+        NoCollisionPlainBlock plain = new NoCollisionPlainBlock(BlockBehaviour.Properties.of().noCollision());
+        Registry.register(BuiltInRegistries.BLOCK, id("no_collision_plain"), plain);
+        Registry.register(BuiltInRegistries.BLOCK, id("no_collision_shaped"),
+            new NoCollisionShapedBlock(BlockBehaviour.Properties.of().noCollision()));
+        Registry.register(BuiltInRegistries.BLOCK, id("separate_collision"),
+            new SeparateCollisionBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("delegating_collision"),
+            new DelegatingCollisionBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("copied_props_shaped"),
+            new NoCollisionShapedBlock(BlockBehaviour.Properties.ofFullCopy(plain)));
+        Registry.register(BuiltInRegistries.BLOCK, id("pos_getter"),
+            new PosGetterBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("pos_equals"),
+            new PosEqualsBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("pos_ref_eq"),
+            new PosRefEqBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("collision_pos"),
+            new CollisionPosBlock(BlockBehaviour.Properties.of()));
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-collision-pos", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    // NoCollisionPlainBlock: full-cube outline (unoverridden), empty collision, 0 counted calls.
+    let no_col_plain_blk = registration_value(&host, "fixture:no_collision_plain");
+    let before = host.unknown_host_call_count();
+    let no_col_plain = fixture
+        .jar
+        .block_shapes(&mut host, &no_col_plain_blk)
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert!(!no_col_plain.overridden);
+    assert_eq!(
+        no_col_plain.collision_states.as_ref().unwrap()[0].boxes,
+        Vec::<[f64; 6]>::new()
+    );
+
+    // DelegatingCollisionBlock: calls `state.getShape(level, pos)` inside `getCollisionShape`, 0 counted.
+    let deleg_blk = registration_value(&host, "fixture:delegating_collision");
+    let before = host.unknown_host_call_count();
+    let deleg = fixture.jar.block_shapes(&mut host, &deleg_blk).unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert!(deleg.overridden);
+    assert!(deleg.collision_overridden);
+
+    // Position reads (`getY`, `equals`, `==`) all count and refuse the block!
+    for id in [
+        "fixture:pos_getter",
+        "fixture:pos_equals",
+        "fixture:pos_ref_eq",
+    ] {
+        let blk = registration_value(&host, id);
+        let before = host.unknown_host_call_count();
+        let res = fixture.jar.block_shapes(&mut host, &blk).unwrap();
+        assert!(
+            host.unknown_host_call_count() > before,
+            "{id}: BlockPos observation must be counted"
+        );
+        assert!(res.states.is_none(), "{id} must have no outline shape");
+        assert_eq!(res.to_content_export(), (None, None));
+    }
+
+    // Copied properties (`ofFullCopy` without `.noCollision()`): unknown `hasCollision` -> counted,
+    // `collision_states == None`, refuses exporting `shapes` too!
+    let copied_blk = registration_value(&host, "fixture:copied_props_shaped");
+    let before = host.unknown_host_call_count();
+    let copied = fixture.jar.block_shapes(&mut host, &copied_blk).unwrap();
+    assert!(host.unknown_host_call_count() > before);
+    assert!(copied.states.is_some());
+    assert!(copied.collision_states.is_none());
+    assert_eq!(copied.to_content_export(), (None, None));
+
+    // CollisionPosBlock: outline resolved cleanly, collision read `pos.getX()` -> counted, refuses BOTH!
+    let col_pos_blk = registration_value(&host, "fixture:collision_pos");
+    let before = host.unknown_host_call_count();
+    let col_pos = fixture.jar.block_shapes(&mut host, &col_pos_blk).unwrap();
+    assert!(host.unknown_host_call_count() > before);
+    assert!(col_pos.states.is_some());
+    assert!(col_pos.collision_states.is_none());
+    assert_eq!(col_pos.to_content_export(), (None, None));
+
+    // Full content export check
+    fixture
+        .jar
+        .populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    let exported: BTreeMap<String, serde_json::Value> = content::declarations(host.registrations())
+        .into_iter()
+        .map(|decl| (decl.id().to_owned(), decl.file_json()))
+        .collect();
+
+    assert!(
+        exported["fixture:no_collision_plain"]
+            .get("shapes")
+            .is_none()
+    );
+    assert_eq!(
+        exported["fixture:no_collision_plain"]["collision_shapes"],
+        json!({ "default": [] })
+    );
+    assert_eq!(
+        exported["fixture:no_collision_plain"]["properties"]["occludes"],
+        json!(false)
+    );
+
+    assert_eq!(
+        exported["fixture:no_collision_shaped"]["shapes"],
+        json!({ "default": [[0.125, 0.0, 0.125, 0.875, 0.75, 0.875]] })
+    );
+    assert_eq!(
+        exported["fixture:no_collision_shaped"]["collision_shapes"],
+        json!({ "default": [] })
+    );
+
+    assert_eq!(
+        exported["fixture:separate_collision"]["shapes"],
+        json!({ "default": [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]] })
+    );
+    assert_eq!(
+        exported["fixture:separate_collision"]["collision_shapes"],
+        json!({
+            "properties": ["lit"],
+            "values": {
+                "false": [],
+                "true": [[0.0, 0.0, 0.0, 1.0, 0.875, 1.0]],
+            }
+        })
+    );
+
+    assert_eq!(
+        exported["fixture:delegating_collision"]["shapes"],
+        json!({ "default": [[0.125, 0.0, 0.125, 0.875, 0.5, 0.875]] })
+    );
+    assert_eq!(
+        exported["fixture:delegating_collision"]["collision_shapes"],
+        json!({
+            "properties": ["lit"],
+            "values": {
+                "false": [],
+                "true": [[0.125, 0.0, 0.125, 0.875, 0.5, 0.875]],
+            }
+        })
+    );
+
+    for refused in [
+        "fixture:copied_props_shaped",
+        "fixture:pos_getter",
+        "fixture:pos_equals",
+        "fixture:pos_ref_eq",
+        "fixture:collision_pos",
+    ] {
+        assert!(
+            exported[refused].get("shapes").is_none(),
+            "{refused} must not export shapes"
+        );
+        assert!(
+            exported[refused].get("collision_shapes").is_none(),
+            "{refused} must not export collision_shapes"
+        );
+    }
+}
+
+/// Finding 4: `BlockState.setValue`, `trySetValue`, and `getValue` validate property existence
+/// and allowed values against `getPossibleValues()`, throwing `IllegalArgumentException` with the
+/// exact MC 26.3 `StateHolder` messages.
+#[test]
+fn block_state_set_value_validates_property_and_allowed_values_like_mc263() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/StateBlock.java",
+            r#"package demo;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.StateDefinition;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class StateBlock extends Block {
+    public StateBlock(Properties properties) { super(properties); }
+    @Override
+    protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> builder) {
+        builder.add(BlockStateProperties.HORIZONTAL_FACING, BlockStateProperties.AGE_3);
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+public final class Probe implements ModInitializer {
+    private static StateBlock BLOCK;
+    @Override
+    public void onInitialize() {
+        BLOCK = Registry.register(
+            BuiltInRegistries.BLOCK,
+            Identifier.fromNamespaceAndPath("fixture", "state_block"),
+            new StateBlock(BlockBehaviour.Properties.of())
+        );
+    }
+
+    public static String check() {
+        StringBuilder out = new StringBuilder();
+        BlockState state = BLOCK.defaultBlockState();
+        BlockState south = state.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.SOUTH);
+        out.append("valid=").append(south.getValue(BlockStateProperties.HORIZONTAL_FACING) == Direction.SOUTH).append(';');
+        try {
+            state.setValue(BlockStateProperties.LIT, Boolean.TRUE);
+            out.append("missingSet=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("missingSet=").append(e.getMessage()).append(';');
+        }
+        try {
+            state.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.UP);
+            out.append("badEnum=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("badEnum=").append(e.getMessage()).append(';');
+        }
+        try {
+            state.setValue(BlockStateProperties.AGE_3, Integer.valueOf(99));
+            out.append("badInt=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("badInt=").append(e.getMessage()).append(';');
+        }
+        try {
+            state.getValue(BlockStateProperties.LIT);
+            out.append("missingGet=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("missingGet=").append(e.getMessage()).append(';');
+        }
+        out.append("tryMissingSame=").append(state.trySetValue(BlockStateProperties.LIT, Boolean.TRUE) == state).append(';');
+        try {
+            state.trySetValue(BlockStateProperties.HORIZONTAL_FACING, Direction.UP);
+            out.append("tryBad=ok;");
+        } catch (IllegalArgumentException e) {
+            out.append("tryBad=").append(e.getMessage()).append(';');
+        }
+        return out.toString();
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-state-set-value", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    let before = host.unknown_host_call_count();
+    let answer = fixture
+        .jar
+        .invoke_method_with_args(
+            "demo/Probe",
+            "check",
+            "()Ljava/lang/String;",
+            None,
+            &[],
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(host.unknown_host_call_count(), before);
+    assert_eq!(
+        answer,
+        Value::Ref(Some(
+            "valid=true;\
+             missingSet=Cannot set property BooleanProperty{name=lit, clazz=class java.lang.Boolean, values=[true, false]} as it does not exist in Block{fixture:state_block};\
+             badEnum=Cannot set property EnumProperty{name=facing, clazz=class net.minecraft.core.Direction, values=[north, south, west, east]} to up on Block{fixture:state_block}, it is not an allowed value;\
+             badInt=Cannot set property IntegerProperty{name=age, clazz=class java.lang.Integer, values=[0, 1, 2, 3]} to 99 on Block{fixture:state_block}, it is not an allowed value;\
+             missingGet=Cannot get property BooleanProperty{name=lit, clazz=class java.lang.Boolean, values=[true, false]} as it does not exist in Block{fixture:state_block};\
+             tryMissingSame=true;\
+             tryBad=Cannot set property EnumProperty{name=facing, clazz=class net.minecraft.core.Direction, values=[north, south, west, east]} to up on Block{fixture:state_block}, it is not an allowed value;"
+                .to_owned()
+        ))
     );
 }
 
@@ -757,9 +1320,10 @@ fn real_jar_runes_altar_shapes_body() {
     assert_eq!(
         unknown_after - unknown_before,
         0,
-        "evaluating RuneCraftingBlock.getShape across all states must incur 0 counted calls"
+        "evaluating RuneCraftingBlock.getShape and getCollisionShape across all states must incur 0 counted calls"
     );
     assert!(shapes.overridden);
+    assert!(!shapes.collision_overridden);
     assert_eq!(shapes.properties, vec!["facing"]);
 
     // Exact 6-box output of real MC 26.3 `Shapes.or(TOP_SHAPE, MIDDLE_SHAPE, BOTTOM_SHAPE).toAabbs()`.
@@ -772,6 +1336,11 @@ fn real_jar_runes_altar_shapes_body() {
         [0.75, 0.75, 0.25, 0.9375, 1.0, 0.75],
     ];
     let states = shapes.states.as_ref().expect("altar states resolved");
+    let collision_states = shapes
+        .collision_states
+        .as_ref()
+        .expect("altar collision states resolved");
+    assert_eq!(states, collision_states);
     assert_eq!(states.len(), 4);
     let seen_facings: Vec<&str> = states
         .iter()
@@ -794,6 +1363,10 @@ fn real_jar_runes_altar_shapes_body() {
         .expect("runes:crafting_altar content declaration");
     let file_json = altar_decl.file_json();
     assert_eq!(file_json["shapes"], json!({ "default": expected_boxes }));
+    assert!(
+        file_json.get("collision_shapes").is_none(),
+        "collision_shapes equals outline shapes, so Sunrise fallback applies"
+    );
     assert!(
         file_json
             .get("properties")

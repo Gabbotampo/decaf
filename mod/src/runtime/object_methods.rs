@@ -1830,6 +1830,10 @@ impl<H: Host> host_ref::Nested for RuntimeNested<'_, '_, '_, H> {
         crate::runtime::facade_text::json_now(value, self.runtime.host.component_states())
     }
 
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        self.runtime.host.voxel_shape_to_string(key)
+    }
+
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
         self.runtime.host.constructed_uuid(value)
     }

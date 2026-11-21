@@ -2434,6 +2434,15 @@ pub trait Host {
     ) -> Result<Value, NativeError> {
         Err(NativeError::UnknownHostCall(r.clone()))
     }
+    fn block_state_block(&self, _state: &Value) -> Option<Value> {
+        None
+    }
+    fn block_has_collision(&self, _block: &Value) -> Option<bool> {
+        None
+    }
+    fn voxel_shape_to_string(&self, _key: &str) -> Option<String> {
+        None
+    }
     fn properties_put_all(&mut self, _marker: &str, _entries: Vec<(String, String)>) -> bool {
         false
     }
@@ -3560,6 +3569,9 @@ pub struct StdHost {
     item_property_builders: BTreeMap<String, BTreeMap<String, String>>,
     /// Bounded `BlockBehaviour.Properties` chains, keyed the same way.
     block_property_builders: BTreeMap<String, BTreeMap<String, String>>,
+    /// Property builders / blocks created from `ofFullCopy` / `ofLegacyCopy` / `copy` whose
+    /// source block's `hasCollision` is unknown (cleared if `.noCollision()` is called).
+    block_copied_properties: BTreeSet<String>,
     /// Properties captured from each mod block's virtual state-definition hook.
     block_state_properties: BTreeMap<String, BTreeMap<String, StatePropertyInfo>>,
     state_definition_builders: BTreeMap<String, String>,
@@ -3883,6 +3895,7 @@ impl StdHost {
             declared_registrations: BTreeSet::new(),
             item_property_builders: BTreeMap::new(),
             block_property_builders: BTreeMap::new(),
+            block_copied_properties: BTreeSet::new(),
             block_state_properties: BTreeMap::new(),
             state_definition_builders: BTreeMap::new(),
             block_states: BTreeMap::new(),
@@ -5249,15 +5262,46 @@ impl StdHost {
         }
     }
 
+    pub(crate) fn block_has_collision_by_marker(&self, block_marker: &str) -> Option<bool> {
+        let props = self.block_property_builders.get(block_marker)?;
+        if props.contains_key("noCollision") {
+            return Some(false);
+        }
+        if self.block_copied_properties.contains(block_marker) {
+            return None;
+        }
+        Some(true)
+    }
+
+    pub(crate) fn block_to_string(&self, block_marker: &str) -> String {
+        if let Some(entry) = self.registrations.iter().find(|entry| {
+            entry.registry == "minecraft:block"
+                && crate::jar_object::object_key(&entry.value) == Some(block_marker)
+        }) {
+            return format!("Block{{{}}}", entry.id);
+        }
+        "Block{[unregistered]}".to_owned()
+    }
+
     pub(crate) fn set_block_declaration_shapes(
         &mut self,
         registration_index: usize,
-        shapes_json: String,
+        shapes_json: Option<String>,
+        collision_shapes_json: Option<String>,
     ) {
         if let Some(entry) = self.registrations.get_mut(registration_index)
             && let Some(RegistryDeclaration::Block { properties, .. }) = entry.declaration.as_mut()
         {
-            properties.insert("shapes".to_owned(), shapes_json);
+            if let Some(json) = shapes_json {
+                properties.insert("shapes".to_owned(), json);
+            } else {
+                properties.remove("shapes");
+            }
+            if let Some(json) = collision_shapes_json {
+                properties.insert("collision_shapes".to_owned(), json);
+            } else {
+                properties.remove("collision_shapes");
+            }
         }
     }
 
@@ -5269,17 +5313,6 @@ impl StdHost {
             .find_map(|line| {
                 let mut parts = line.split('|');
                 (parts.next()? == field).then(|| parts.nth(3)).flatten()
-            })
-    }
-
-    fn captured_property_name(field: &str) -> Option<String> {
-        crate::vanilla_block_state_properties::TABLE
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split('|');
-                (parts.next()? == field)
-                    .then(|| parts.next().map(str::to_owned))
-                    .flatten()
             })
     }
 
@@ -6069,7 +6102,19 @@ impl StdHost {
                         .get(&block)
                         .and_then(|props| props.iter().find(|(_, info)| info.field == field))
                     else {
-                        return Ok(None);
+                        let Some(prop_str) =
+                            vanilla_block_state_properties::property_to_string(field)
+                        else {
+                            return Ok(None);
+                        };
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot get property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
                     };
                     let Some(serialized) = values
                         .get(prop_name)
@@ -6161,7 +6206,10 @@ impl StdHost {
                         field, &info.kind, serialized,
                     ));
                 }
-                ("setValue", _) => {
+                ("setValue" | "trySetValue", _) => {
+                    if self.unknown_block_state_definitions.contains(&block) {
+                        return Ok(None);
+                    }
                     let Some(field) = args
                         .first()
                         .and_then(expect_ref)
@@ -6169,33 +6217,78 @@ impl StdHost {
                     else {
                         return Ok(None);
                     };
-                    let Some(name) = Self::captured_property_name(field) else {
+                    let Some(prop_str) = vanilla_block_state_properties::property_to_string(field)
+                    else {
                         return Ok(None);
                     };
-                    let value = match args.get(1) {
-                        Some(Value::Int(value)) => (*value != 0)
-                            .then_some("true".to_owned())
-                            .or_else(|| Some("false".to_owned())),
-                        Some(Value::Boxed(Boxed::Boolean(value))) => Some(value.to_string()),
-                        Some(Value::Boxed(Boxed::Integer(value))) => Some(value.to_string()),
-                        Some(Value::Ref(Some(value))) => {
-                            vanilla_block_state_properties::enum_serialized_name(field, value)
-                                .or_else(|| {
-                                    value
-                                        .rsplit('/')
-                                        .next()
-                                        .map(|value| value.to_ascii_lowercase())
-                                })
+                    let Some((prop_name, info)) = self
+                        .block_state_properties
+                        .get(&block)
+                        .and_then(|props| props.iter().find(|(_, info)| info.field == field))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                    else {
+                        if r.name == "trySetValue" {
+                            return Ok(Some(receiver.clone()));
                         }
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property {prop_str} as it does not exist in {owner_str}"
+                            )),
+                            frame: None,
+                        });
+                    };
+                    let arg = args.get(1);
+                    let parsed = match info.kind.as_str() {
+                        "boolean" => match arg {
+                            Some(Value::Int(v)) => {
+                                Some(if *v != 0 { "true" } else { "false" }.to_owned())
+                            }
+                            Some(Value::Boxed(Boxed::Boolean(b))) => Some(b.to_string()),
+                            _ => None,
+                        },
+                        "integer" => match arg {
+                            Some(Value::Int(n)) => Some(n.to_string()),
+                            Some(Value::Boxed(Boxed::Integer(n))) => Some(n.to_string()),
+                            _ => None,
+                        }
+                        .filter(|s| info.values.iter().any(|allowed| allowed == s)),
+                        "enum" => match arg {
+                            Some(Value::Ref(Some(marker))) => {
+                                vanilla_block_state_properties::enum_serialized_name(field, marker)
+                                    .filter(|s| info.values.iter().any(|allowed| allowed == s))
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     };
-                    let Some(value) = value else {
-                        return Ok(None);
+                    let Some(value) = parsed else {
+                        let val_str = match arg {
+                            None | Some(Value::Ref(None)) => "null".to_owned(),
+                            Some(Value::Boxed(Boxed::Boolean(b))) => b.to_string(),
+                            Some(Value::Boxed(Boxed::Integer(n))) => n.to_string(),
+                            Some(Value::Int(n)) if info.kind == "boolean" => (*n != 0).to_string(),
+                            Some(Value::Int(n)) => n.to_string(),
+                            Some(Value::Ref(Some(marker))) => {
+                                vanilla_block_state_properties::enum_value_to_string(marker)
+                                    .unwrap_or_else(|| marker.clone())
+                            }
+                            Some(other) => format!("{other:?}"),
+                        };
+                        let owner_str = self.block_to_string(&block);
+                        return Err(NativeError::UncaughtException {
+                            class: "java/lang/IllegalArgumentException".into(),
+                            message: Some(format!(
+                                "Cannot set property {prop_str} to {val_str} on {owner_str}, it is not an allowed value"
+                            )),
+                            frame: None,
+                        });
                     };
                     let state = format!("blockstate/{}/{}", block, self.next_block_state);
                     self.next_block_state = self.next_block_state.saturating_add(1);
                     let mut values = values;
-                    values.insert(name, value);
+                    values.insert(prop_name, value);
                     self.block_states.insert(state.clone(), (block, values));
                     return Ok(Some(Value::Ref(Some(state))));
                 }
@@ -6232,6 +6325,9 @@ impl StdHost {
                 for (key, value) in settings {
                     record_inferred_property(builders, marker, key, Some(value));
                 }
+                if !item && r.name == "noCollision" {
+                    self.block_copied_properties.remove(marker);
+                }
                 let returns_self = if item {
                     ITEM_PROPERTIES_DESC
                 } else {
@@ -6254,6 +6350,8 @@ impl StdHost {
                 else {
                     return Ok(None);
                 };
+                let copied = self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Only a vanilla `CraftingTableBlock` itself behaves as the crafting table (its
                 // `useWithoutItem` opens the 3x3 grid). This constructor is also the super call of
                 // a jar's subclass (Runes' altar), whose own `useWithoutItem` opens its own menu:
@@ -6269,6 +6367,11 @@ impl StdHost {
                 {
                     self.block_property_builders
                         .insert(marker.to_owned(), properties);
+                    if copied {
+                        self.block_copied_properties.insert(marker.to_owned());
+                    } else {
+                        self.block_copied_properties.remove(marker);
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -6286,18 +6389,29 @@ impl StdHost {
                 let Some(builder) = args.first().and_then(expect_ref) else {
                     return Ok(None);
                 };
-                let builders = if r.owner == ITEM_CLASS {
-                    &mut self.item_property_builders
-                } else {
+                let is_block = r.owner == BLOCK_CLASS;
+                let builders = if is_block {
                     &mut self.block_property_builders
+                } else {
+                    &mut self.item_property_builders
                 };
                 let Some(properties) = builders.get(builder).cloned() else {
                     return Ok(None);
                 };
+                let copied = is_block
+                    && self.block_copied_properties.contains(builder)
+                    && !properties.contains_key("noCollision");
                 // Hand the finished chain to the value the mod registers, so
                 // the registration's marker names it.
                 if builders.contains_key(marker) || builders.len() < MAX_PROPERTY_BUILDERS {
                     builders.insert(marker.to_owned(), properties);
+                    if is_block {
+                        if copied {
+                            self.block_copied_properties.insert(marker.to_owned());
+                        } else {
+                            self.block_copied_properties.remove(marker);
+                        }
+                    }
                 }
                 Ok(Some(Value::Void))
             }
@@ -6379,6 +6493,21 @@ impl Host for StdHost {
         others: &[Value],
     ) -> Result<Value, NativeError> {
         voxel_shape::or_array_call(self, r, first, others)
+    }
+
+    fn block_state_block(&self, state: &Value) -> Option<Value> {
+        let marker = expect_ref(state)?;
+        let (block_marker, _) = self.block_states.get(marker)?;
+        Some(jar_object::stored(block_marker))
+    }
+
+    fn block_has_collision(&self, block: &Value) -> Option<bool> {
+        let marker = jar_object::object_key(block)?;
+        self.block_has_collision_by_marker(marker)
+    }
+
+    fn voxel_shape_to_string(&self, key: &str) -> Option<String> {
+        self.voxel_shapes.get(key).map(|s| s.to_java_string())
     }
 
     fn begin_block_state_definition(&mut self, block: &Value, builder: &Value) {
@@ -9080,6 +9209,9 @@ impl Host for StdHost {
                 let marker = format!("block/properties/{}", self.next_property_builder);
                 self.next_property_builder = self.next_property_builder.saturating_add(1);
                 open_inferred_builder(&mut self.block_property_builders, &marker);
+                if r.name != "of" {
+                    self.block_copied_properties.insert(marker.clone());
+                }
                 Ok(Value::Ref(Some(marker)))
             }
             // `Duration` factories: configs and timeouts read across the
@@ -9535,6 +9667,8 @@ impl Host for StdHost {
             let Some(mut properties) = self.block_property_builders.get(builder).cloned() else {
                 return Ok(Value::Void);
             };
+            let copied = self.block_copied_properties.contains(builder)
+                && !properties.contains_key("noCollision");
             let marker = jar_object::instance_key(receiver).unwrap_or_default();
             if jar_object::key_class(marker)
                 == Some("net/minecraft/world/level/block/CraftingTableBlock")
@@ -9546,6 +9680,11 @@ impl Host for StdHost {
             {
                 self.block_property_builders
                     .insert(marker.to_owned(), properties);
+                if copied {
+                    self.block_copied_properties.insert(marker.to_owned());
+                } else {
+                    self.block_copied_properties.remove(marker);
+                }
             }
             return Ok(Value::Void);
         }
@@ -14532,6 +14671,12 @@ fn block_builder_settings(
         "jumpFactor" => push("jumpFactor", number(first)),
         "randomTicks" => push("randomTicks", Some("true".to_owned())),
         "noOcclusion" => push("noOcclusion", Some("true".to_owned())),
+        // MC 26.3 `BlockBehaviour$Properties.noCollision()` sets both `hasCollision = false` and
+        // `canOcclude = false` (offsets 0..10).
+        "noCollision" => {
+            push("noCollision", Some("true".to_owned()));
+            push("noOcclusion", Some("true".to_owned()));
+        }
         "requiresCorrectToolForDrops" => {
             push("requiresCorrectToolForDrops", Some("true".to_owned()))
         }
@@ -15139,6 +15284,14 @@ impl host_ref::Nested for HostNested<'_> {
     fn component_json(&mut self, value: &Value) -> Option<serde_json::Value> {
         let host = self.0.as_deref()?;
         facade_text::json_now(value, Some(&host.component_states))
+    }
+
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        self.0
+            .as_deref()?
+            .voxel_shapes
+            .get(key)
+            .map(|s| s.to_java_string())
     }
 
     fn uuid_bits(&mut self, value: &Value) -> Option<(i64, i64)> {
@@ -28143,6 +28296,109 @@ impl<H: Host> Runtime<'_, H> {
             }
             if let Some(others) = self.owned_array(rest_arg).map(|v| v.into_owned()) {
                 return self.host.voxel_shape_or_array(r, first, &others).map(Some);
+            }
+        }
+        // `BlockStateBase.getShape(BlockGetter, BlockPos[, CollisionContext])`: dispatches to the
+        // block's `getShape` (MC 26.3 `BlockBehaviour$BlockStateBase.getShape`).
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/level/block/state/BlockState"
+                | "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase"
+        ) && r.name == "getShape"
+            && (r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_2_DESC
+                || r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC)
+            && let Some(state_val) = receiver
+            && let Some(block_val) = self.host.block_state_block(state_val)
+            && let Some(block_class) = jar_object::object_class(&block_val)
+        {
+            let level = args.first().cloned().unwrap_or(Value::Ref(None));
+            let pos = args.get(1).cloned().unwrap_or(Value::Ref(None));
+            let ctx = if r.descriptor == voxel_shape::BLOCK_STATE_GET_SHAPE_3_DESC {
+                args.get(2).cloned().unwrap_or(Value::Ref(None))
+            } else {
+                voxel_shape::empty_collision_context()
+            };
+            let mut cur = block_class.to_owned();
+            let mut found = None;
+            for _ in 0..64 {
+                let Some(file) = self.class(&cur) else {
+                    break;
+                };
+                if file
+                    .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                    .is_some()
+                {
+                    found = Some(cur.clone());
+                    break;
+                }
+                if file.super_name.is_empty() {
+                    break;
+                }
+                cur = file.super_name.clone();
+            }
+            if let Some(owner) = found {
+                return self
+                    .invoke(
+                        &owner,
+                        "getShape",
+                        voxel_shape::GET_SHAPE_DESC,
+                        Some(block_val),
+                        &[state_val.clone(), level, pos, ctx],
+                    )
+                    .map(Some);
+            }
+            if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                return Ok(Some(voxel_shape::block_shape()));
+            }
+        }
+        // `super.getCollisionShape` on a vanilla class inheriting `BlockBehaviour.getCollisionShape`:
+        // `return this.hasCollision ? state.getShape(level, pos) : Shapes.empty();`
+        if r.name == "getCollisionShape"
+            && r.descriptor == voxel_shape::GET_SHAPE_DESC
+            && vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(&r.owner)
+            && let Some(block_val) = receiver
+            && let Some(has_collision) = self.host.block_has_collision(block_val)
+        {
+            if !has_collision {
+                return Ok(Some(voxel_shape::empty_shape()));
+            }
+            if let Some(block_class) = jar_object::object_class(block_val) {
+                let state_val = args.first().cloned().unwrap_or(Value::Ref(None));
+                let level = args.get(1).cloned().unwrap_or(Value::Ref(None));
+                let pos = args.get(2).cloned().unwrap_or(Value::Ref(None));
+                let ctx = voxel_shape::empty_collision_context();
+                let mut cur = block_class.to_owned();
+                let mut found = None;
+                for _ in 0..64 {
+                    let Some(file) = self.class(&cur) else {
+                        break;
+                    };
+                    if file
+                        .method("getShape", voxel_shape::GET_SHAPE_DESC)
+                        .is_some()
+                    {
+                        found = Some(cur.clone());
+                        break;
+                    }
+                    if file.super_name.is_empty() {
+                        break;
+                    }
+                    cur = file.super_name.clone();
+                }
+                if let Some(owner) = found {
+                    return self
+                        .invoke(
+                            &owner,
+                            "getShape",
+                            voxel_shape::GET_SHAPE_DESC,
+                            Some(block_val.clone()),
+                            &[state_val, level, pos, ctx],
+                        )
+                        .map(Some);
+                }
+                if vanilla_block_shapes::inherits_block_behaviour_get_shape(&cur) {
+                    return Ok(Some(voxel_shape::block_shape()));
+                }
             }
         }
         // `BlockPos.betweenClosedStream` is the game's own bounding-box stream.

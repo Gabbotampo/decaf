@@ -64,6 +64,10 @@ pub struct Block {
     /// Block-local outline shape table (`sunrise-mod-package` `BlockShapes`), resolved by running
     /// the block's own `getShape` across every state.
     pub shapes: Option<BlockShapes>,
+    /// Block-local collision shape table (`sunrise-mod-package` `BlockShapes`), emitted when
+    /// `getCollisionShape` differs from `getShape` on any state (e.g. `Properties.noCollision()`
+    /// or a separate `getCollisionShape` override).
+    pub collision_shapes: Option<BlockShapes>,
 }
 
 /// Block-local outline boxes selected by an ordered tuple of state properties
@@ -244,6 +248,9 @@ impl ContentDeclaration {
                 if let Some(shapes) = &block.shapes {
                     file["shapes"] = shapes.to_json();
                 }
+                if let Some(collision_shapes) = &block.collision_shapes {
+                    file["collision_shapes"] = collision_shapes.to_json();
+                }
                 file
             }
             Self::Item(item) => {
@@ -287,6 +294,10 @@ pub fn declarations(entries: &[RegistryEntry]) -> Vec<ContentDeclaration> {
                     .and_then(|value| value.parse().ok()),
                 shapes: properties
                     .get("shapes")
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                    .and_then(|value| BlockShapes::from_json(&value)),
+                collision_shapes: properties
+                    .get("collision_shapes")
                     .and_then(|value| serde_json::from_str::<Value>(value).ok())
                     .and_then(|value| BlockShapes::from_json(&value)),
             })),
@@ -462,10 +473,19 @@ mod tests {
                 "m3_fixture:pedestal",
                 RegistryDeclaration::Block {
                     template: "minecraft:stone".into(),
-                    properties: BTreeMap::from([(
-                        "shapes".to_owned(),
-                        uniform.to_json().to_string(),
-                    )]),
+                    properties: BTreeMap::from([
+                        ("shapes".to_owned(), uniform.to_json().to_string()),
+                        (
+                            "collision_shapes".to_owned(),
+                            BlockShapes {
+                                properties: Vec::new(),
+                                values: BTreeMap::new(),
+                                default: Some(Vec::new()),
+                            }
+                            .to_json()
+                            .to_string(),
+                        ),
+                    ]),
                     item: false,
                 },
             ),
@@ -487,7 +507,13 @@ mod tests {
             pedestal_json["shapes"],
             json!({ "default": [[0.125, 0.0, 0.125, 0.875, 0.25, 0.875]] })
         );
+        assert_eq!(pedestal_json["collision_shapes"], json!({ "default": [] }));
         assert!(pedestal_json["properties"].get("shapes").is_none());
+        assert!(
+            pedestal_json["properties"]
+                .get("collision_shapes")
+                .is_none()
+        );
 
         let dir_json = parsed[1].file_json();
         assert_eq!(
@@ -502,6 +528,7 @@ mod tests {
                 }
             })
         );
+        assert!(dir_json.get("collision_shapes").is_none());
         assert!(dir_json["properties"].get("shapes").is_none());
     }
 }

@@ -396,6 +396,7 @@ pub(crate) fn declared_types(key: &str) -> &'static [&'static str] {
         (false, "stack") => &["net/minecraft/world/item/ItemStack"],
         (false, "damage") => &["net/minecraft/world/damagesource/DamageSource"],
         (_, "block-pos") => &["net/minecraft/core/BlockPos"],
+        (_, "shape-probe") => &["net/minecraft/world/level/BlockGetter"],
         (_, "level-resource") => &["net/minecraft/world/level/storage/LevelResource"],
         (_, "game-rule") => &["net/minecraft/world/level/gamerules/GameRule"],
         (_, "sound-event") => &["net/minecraft/sounds/SoundEvent"],

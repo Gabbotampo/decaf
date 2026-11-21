@@ -229,3 +229,91 @@ pub(crate) fn enum_serialized_name(field: &str, enum_marker: &str) -> Option<Str
         })
     })
 }
+
+/// Property enum classes in MC 26.3 that inherit `Enum.toString()` (returning `CONSTANT_NAME`)
+/// rather than overriding `toString()` to return `getSerializedName()`. Captured from real 26.3
+/// via `tests/oracles/block_shapes/CaptureAllOracle.java`.
+fn enum_to_string_uses_constant_name(class: &str) -> bool {
+    matches!(
+        class,
+        "net/minecraft/core/FrontAndTop"
+            | "net/minecraft/world/level/block/CopperGolemStatueBlock$Pose"
+            | "net/minecraft/world/level/block/entity/trialspawner/TrialSpawnerState"
+            | "net/minecraft/world/level/block/entity/vault/VaultState"
+            | "net/minecraft/world/level/block/state/properties/AttachFace"
+            | "net/minecraft/world/level/block/state/properties/BellAttachType"
+            | "net/minecraft/world/level/block/state/properties/ChestType"
+            | "net/minecraft/world/level/block/state/properties/NoteBlockInstrument"
+            | "net/minecraft/world/level/block/state/properties/StructureMode"
+            | "net/minecraft/world/level/block/state/properties/TestBlockMode"
+            | "net/minecraft/world/level/block/state/properties/Tilt"
+    )
+}
+
+/// Exact `toString()` of a modelled `BlockStateProperties` enum constant (`enum/<class>/<CONST>`),
+/// matching MC 26.3 (`Direction.UP` -> `"up"`, `PistonType.DEFAULT` -> `"normal"`,
+/// `ChestType.LEFT` -> `"LEFT"`).
+pub(crate) fn enum_value_to_string(enum_marker: &str) -> Option<String> {
+    let rest = enum_marker.strip_prefix("enum/")?;
+    let (class, constant) = rest.rsplit_once('/')?;
+    if enum_to_string_uses_constant_name(class) {
+        return Some(constant.to_owned());
+    }
+    // Look up serialized name across any property row for this enum class.
+    for line in ENUM_VALUES.lines() {
+        let mut parts = line.split('|');
+        let _field = parts.next()?;
+        if parts.next()? != class {
+            continue;
+        }
+        let pairs = parts.next()?;
+        if let Some(ser) = pairs.split(',').find_map(|pair| {
+            let (ser, cname) = pair.split_once('=')?;
+            (cname == constant).then(|| ser.to_owned())
+        }) {
+            return Some(ser);
+        }
+    }
+    Some(constant.to_owned())
+}
+
+/// Exact MC 26.3 `Property.toString()` for a `BlockStateProperties.<field>` constant:
+/// `MoreObjects.toStringHelper(this).add("name", name).add("clazz", clazz).add("values", values)`.
+pub(crate) fn property_to_string(field: &str) -> Option<String> {
+    let row = TABLE
+        .lines()
+        .find(|line| line.split('|').next() == Some(field))?;
+    let mut parts = row.split('|');
+    let _field = parts.next()?;
+    let name = parts.next()?;
+    let kind = parts.next()?;
+    let raw_values = parts.next()?;
+    let declared = parts.next()?;
+    let simple_class = declared.rsplit('/').next()?;
+    let (value_class, formatted_values) = match kind {
+        "boolean" => ("java.lang.Boolean".to_owned(), raw_values.to_owned()),
+        "integer" => ("java.lang.Integer".to_owned(), raw_values.to_owned()),
+        "enum" => {
+            let (enum_class, pairs) = ENUM_VALUES.lines().find_map(|line| {
+                let mut p = line.split('|');
+                (p.next()? == field).then(|| Some((p.next()?, p.next()?)))?
+            })?;
+            let uses_const = enum_to_string_uses_constant_name(enum_class);
+            let items: Vec<&str> = pairs
+                .split(',')
+                .filter_map(|pair| {
+                    let (ser, cname) = pair.split_once('=')?;
+                    Some(if uses_const { cname } else { ser })
+                })
+                .collect();
+            (
+                enum_class.replace('/', "."),
+                format!("[{}]", items.join(", ")),
+            )
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "{simple_class}{{name={name}, clazz=class {value_class}, values={formatted_values}}}"
+    ))
+}

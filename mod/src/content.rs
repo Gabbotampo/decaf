@@ -403,6 +403,13 @@ fn block_entry(declaration: &runtime::content::Block, id: &str) -> mod_api::Bloc
             default: shapes.default.clone(),
         });
     }
+    if let Some(collision_shapes) = &declaration.collision_shapes {
+        block.collision_shapes = Some(mod_api::BlockShapes {
+            properties: collision_shapes.properties.clone(),
+            values: collision_shapes.values.clone(),
+            default: collision_shapes.default.clone(),
+        });
+    }
     // The vocabulary has `Boolean` and `Enum`: an integer property is an enum of the same value
     // strings, in its `getPossibleValues()` order (as blockstate JSON spells `age=3`). The runtime
     // records only these three kinds; any other is left out rather than guessed.
@@ -740,6 +747,7 @@ mod tests {
             default_state: BTreeMap::new(),
             occludes: None,
             shapes: None,
+            collision_shapes: None,
         };
         let block = block_entry(&declaration, &declaration.id);
         assert!(!block.item);
@@ -752,6 +760,7 @@ mod tests {
         assert_eq!(block.properties.explosion_resistance, Some(6.0));
         assert_eq!(block.properties.requires_tool, Some(true));
         assert!(block.shapes.is_none());
+        assert!(block.collision_shapes.is_none());
     }
 
     #[test]
@@ -795,6 +804,11 @@ mod tests {
                 ]),
                 default: None,
             }),
+            collision_shapes: Some(runtime::content::BlockShapes {
+                properties: Vec::new(),
+                values: BTreeMap::new(),
+                default: Some(Vec::new()),
+            }),
         };
         let block = block_entry(&declaration, &declaration.id);
         let shapes = block.shapes.expect("shapes mapped to mod_api::BlockShapes");
@@ -805,6 +819,10 @@ mod tests {
             Some(&vec![[0.125, 0.0, 0.0, 0.875, 0.75, 0.375]])
         );
         assert_eq!(shapes.values.len(), 4);
+        let collision = block
+            .collision_shapes
+            .expect("collision_shapes mapped to mod_api::BlockShapes");
+        assert_eq!(collision.default, Some(Vec::new()));
     }
 
     /// A mod's own `BlockItem` is an item registration and is declared with its properties even

@@ -708,6 +708,11 @@ pub(crate) trait Nested {
         let _ = value;
         None
     }
+    /// The MC 26.3 `VoxelShape.toString()` for a non-singleton shape key (`cube/<n>`, `array/<n>`).
+    fn voxel_shape_to_string(&mut self, key: &str) -> Option<String> {
+        let _ = key;
+        None
+    }
     /// The key and value a host `Map.Entry` holds now (`host_map_entry.rs`);
     /// `None` where this context cannot read the host's table or the entry's
     /// contents are unknown (the caller counts).
@@ -3028,6 +3033,22 @@ impl HostRef {
 
     pub(crate) fn same_object(&self, other: &HostRef) -> Option<bool> {
         if self != other {
+            if self.kind == HostKind::GameValue
+                && other.kind == HostKind::GameValue
+                && self.key().starts_with(crate::server_values::BLOCK_POS)
+                && other.key().starts_with(crate::server_values::BLOCK_POS)
+                && (crate::server_values::block_pos(self.key()).is_none()
+                    || crate::server_values::block_pos(other.key()).is_none())
+            {
+                return None;
+            }
+            if self.kind == HostKind::CollisionContext
+                && other.kind == HostKind::CollisionContext
+                && (self.key() == crate::voxel_shape::PROBE_COLLISION_CONTEXT_KEY
+                    || other.key() == crate::voxel_shape::PROBE_COLLISION_CONTEXT_KEY)
+            {
+                return None;
+            }
             return Some(false);
         }
         (self.canonical() || self.origin == other.origin).then_some(true)

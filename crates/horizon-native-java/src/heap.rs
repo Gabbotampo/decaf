@@ -308,6 +308,7 @@ impl StdHost {
         out.extend(self.packet_types.keys().map(String::as_str));
         out.extend(self.item_property_builders.keys().map(String::as_str));
         out.extend(self.block_property_builders.keys().map(String::as_str));
+        out.extend(self.block_copied_properties.iter().map(String::as_str));
         out.extend(self.block_state_properties.keys().map(String::as_str));
         out.extend(self.state_definition_builders.keys().map(String::as_str));
         out.extend(self.block_states.keys().map(String::as_str));
@@ -449,6 +450,7 @@ impl StdHost {
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
             .chain(self.block_state_properties.keys())
+            .chain(self.block_copied_properties.iter())
             .chain(self.state_definition_builders.keys())
             .chain(self.block_states.keys())
             .chain(self.block_default_states.keys())
@@ -482,6 +484,7 @@ impl StdHost {
         self.throwable_causes.retain(|key, _| keep(key));
         self.throwable_suppressed.retain(|key, _| keep(key));
         self.block_state_properties.retain(|key, _| keep(key));
+        self.block_copied_properties.retain(|key| keep(key));
         self.state_definition_builders.retain(|key, _| keep(key));
         self.block_states.retain(|key, _| keep(key));
         self.block_default_states.retain(|key, _| keep(key));
@@ -1718,6 +1721,7 @@ mod tests {
             "content_builders",
             "item_property_builders",
             "block_property_builders",
+            "block_copied_properties",
             "block_state_properties",
             "state_definition_builders",
             "block_states",

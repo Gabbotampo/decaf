@@ -36,10 +36,12 @@ pub(crate) const ENTITY_COLLISION_CONTEXT: &str =
     "net/minecraft/world/phys/shapes/EntityCollisionContext";
 pub(crate) const EMPTY_COLLISION_CONTEXT: &str =
     "net/minecraft/world/phys/shapes/EntityCollisionContext$Empty";
-pub(crate) const EMPTY_BLOCK_GETTER: &str = "net/minecraft/world/level/EmptyBlockGetter";
 pub(crate) const BLOCK_CLASS: &str = "net/minecraft/world/level/block/Block";
 
 pub(crate) const GET_SHAPE_DESC: &str = "(Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/phys/shapes/CollisionContext;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
+pub(crate) const BLOCK_STATE_GET_SHAPE_2_DESC: &str = "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
+pub(crate) const BLOCK_STATE_GET_SHAPE_3_DESC: &str = "(Lnet/minecraft/world/level/BlockGetter;Lnet/minecraft/core/BlockPos;Lnet/minecraft/world/phys/shapes/CollisionContext;)Lnet/minecraft/world/phys/shapes/VoxelShape;";
+pub(crate) const PROBE_COLLISION_CONTEXT_KEY: &str = "shape-probe";
 
 const EPSILON: f64 = 1.0e-7;
 /// Safety cap on discrete cells in a single joined shape, preventing adversarial memory blowups.
@@ -50,9 +52,10 @@ const MAX_SUPERCLASS_WALK: usize = 64;
 
 const EMPTY_KEY: &str = "empty";
 const BLOCK_KEY: &str = "block";
+const INFINITY_KEY: &str = "infinity";
 
-/// One block state's evaluated outline shape, in block units (`0.0..=1.0` for a full cube),
-/// matching MC 26.3 `VoxelShape.toAabbs()`.
+/// One block state's evaluated outline or collision shape, in block units (`0.0..=1.0` for a full
+/// cube), matching MC 26.3 `VoxelShape.toAabbs()`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockStateShape {
     /// Property name -> serialized property value (e.g. `{"facing": "north"}`).
@@ -61,21 +64,99 @@ pub struct BlockStateShape {
     pub boxes: Vec<[f64; 6]>,
 }
 
-/// Resolved outline shapes for a block across all of its states.
+/// Resolved outline and collision shapes for a block across all of its states.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BlockShapes {
     /// Ordered state property names (`BTreeMap` key order). Empty for stateless blocks.
     pub properties: Vec<String>,
-    /// Per-state box lists in Cartesian product order of `properties`, or `None` when the block's
-    /// shape could not be determined without unmodelled calls / errors.
+    /// Per-state outline box lists in Cartesian product order of `properties`, or `None` when the
+    /// block's outline shape could not be determined without unmodelled calls / dependencies.
     pub states: Option<Vec<BlockStateShape>>,
-    /// `true` when resolved by invoking a jar-side `getShape` override; `false` when inherited
-    /// directly from vanilla `BlockBehaviour.getShape` (`Shapes.block()`) without running code.
+    /// `true` when outline shapes were resolved by invoking a jar-side `getShape` override;
+    /// `false` when inherited directly from vanilla `BlockBehaviour.getShape` (`Shapes.block()`).
     pub overridden: bool,
+    /// Per-state collision box lists in the same order as `states`, or `None` when collision
+    /// equivalence/shape could not be proven (e.g. `getCollisionShape` read position/world/context,
+    /// vanilla superclass overrides `getCollisionShape`, or `Properties.ofFullCopy` left
+    /// `hasCollision` unknown).
+    pub collision_states: Option<Vec<BlockStateShape>>,
+    /// `true` when collision shapes were resolved by invoking a jar-side `getCollisionShape`
+    /// override; `false` when inherited from `BlockBehaviour.getCollisionShape`.
+    pub collision_overridden: bool,
+}
+
+fn encode_content_shapes(
+    properties: &[String],
+    states: &[BlockStateShape],
+) -> Option<crate::runtime::content::BlockShapes> {
+    if states.is_empty() {
+        return None;
+    }
+    if !states
+        .iter()
+        .all(|entry| entry.boxes.iter().all(is_valid_sunrise_box))
+    {
+        return None;
+    }
+    if let Some(first) = states.first()
+        && states.iter().all(|entry| entry.boxes == first.boxes)
+    {
+        return Some(crate::runtime::content::BlockShapes {
+            properties: Vec::new(),
+            values: BTreeMap::new(),
+            default: Some(first.boxes.clone()),
+        });
+    }
+    // State-dependent shapes: drop properties that never distinguish two shapes so the
+    // exported Sunrise table is minimal and every tuple is matched by real states.
+    let mut active_props: Vec<String> = Vec::new();
+    for prop in properties {
+        if !is_sunrise_state_name(prop) {
+            return None;
+        }
+        let varies = states.iter().any(|a| {
+            states.iter().any(|b| {
+                a.boxes != b.boxes
+                    && properties
+                        .iter()
+                        .all(|other| other == prop || a.state.get(other) == b.state.get(other))
+            })
+        });
+        if varies {
+            active_props.push(prop.clone());
+        }
+    }
+    if active_props.is_empty() {
+        return None;
+    }
+    let mut values: BTreeMap<String, Vec<[f64; 6]>> = BTreeMap::new();
+    for entry in states {
+        let mut key_parts = Vec::with_capacity(active_props.len());
+        for prop in &active_props {
+            let value = entry.state.get(prop)?;
+            if !is_sunrise_state_name(value) {
+                return None;
+            }
+            key_parts.push(value.as_str());
+        }
+        let key = key_parts.join(",");
+        if let Some(existing) = values.get(&key) {
+            if existing != &entry.boxes {
+                return None;
+            }
+        } else {
+            values.insert(key, entry.boxes.clone());
+        }
+    }
+    Some(crate::runtime::content::BlockShapes {
+        properties: active_props,
+        values,
+        default: None,
+    })
 }
 
 impl BlockShapes {
-    /// If every state resolved cleanly and agrees on one box list, returns that box list.
+    /// If every state resolved cleanly and agrees on one outline box list, returns that box list.
     pub fn uniform_boxes(&self) -> Option<&[[f64; 6]]> {
         let states = self.states.as_deref()?;
         let first = states.first()?;
@@ -86,76 +167,56 @@ impl BlockShapes {
         }
     }
 
-    /// Convert into Sunrise's content `BlockShapes` table when the block overrode `getShape` and
-    /// every state resolved cleanly to Sunrise-valid finite ordered boxes.
-    pub fn to_content_shapes(&self) -> Option<crate::runtime::content::BlockShapes> {
-        if !self.overridden {
-            return None;
+    /// Convert into Sunrise's top-level `(shapes, collision_shapes)` pair.
+    ///
+    /// Because Sunrise falls back from `collision_shapes` to `shapes`, returns `(None, None)`
+    /// unless BOTH outline and collision shapes resolved cleanly for every state.
+    /// * `shapes` is emitted only when `getShape` was overridden by the jar (inherited
+    ///   `BlockBehaviour.getShape` is already Sunrise's full-cube default).
+    /// * `collision_shapes` is emitted only when `getCollisionShape` differs from `getShape` on
+    ///   at least one state (e.g. `Properties.noCollision()` or a separate `getCollisionShape`
+    ///   override).
+    pub fn to_content_export(
+        &self,
+    ) -> (
+        Option<crate::runtime::content::BlockShapes>,
+        Option<crate::runtime::content::BlockShapes>,
+    ) {
+        let (Some(outline), Some(collision)) =
+            (self.states.as_deref(), self.collision_states.as_deref())
+        else {
+            return (None, None);
+        };
+        if outline.len() != collision.len() || outline.is_empty() {
+            return (None, None);
         }
-        let states = self.states.as_deref()?;
-        if states.is_empty() {
-            return None;
-        }
-        if !states
+        let collision_matches_outline = outline
             .iter()
-            .all(|entry| entry.boxes.iter().all(is_valid_sunrise_box))
-        {
-            return None;
-        }
-        if let Some(boxes) = self.uniform_boxes() {
-            return Some(crate::runtime::content::BlockShapes {
-                properties: Vec::new(),
-                values: BTreeMap::new(),
-                default: Some(boxes.to_vec()),
-            });
-        }
-        // State-dependent shapes: drop properties that never distinguish two shapes so the
-        // exported Sunrise table is minimal and every tuple is matched by real states.
-        let mut active_props: Vec<String> = Vec::new();
-        for prop in &self.properties {
-            if !is_sunrise_state_name(prop) {
-                return None;
-            }
-            let varies = states.iter().any(|a| {
-                states.iter().any(|b| {
-                    a.boxes != b.boxes
-                        && self
-                            .properties
-                            .iter()
-                            .all(|other| other == prop || a.state.get(other) == b.state.get(other))
-                })
-            });
-            if varies {
-                active_props.push(prop.clone());
-            }
-        }
-        if active_props.is_empty() {
-            return None;
-        }
-        let mut values: BTreeMap<String, Vec<[f64; 6]>> = BTreeMap::new();
-        for entry in states {
-            let mut key_parts = Vec::with_capacity(active_props.len());
-            for prop in &active_props {
-                let value = entry.state.get(prop)?;
-                if !is_sunrise_state_name(value) {
-                    return None;
-                }
-                key_parts.push(value.as_str());
-            }
-            let key = key_parts.join(",");
-            if let Some(existing) = values.get(&key) {
-                if existing != &entry.boxes {
-                    return None;
-                }
-            } else {
-                values.insert(key, entry.boxes.clone());
-            }
-        }
-        Some(crate::runtime::content::BlockShapes {
-            properties: active_props,
-            values,
-            default: None,
-        })
+            .zip(collision.iter())
+            .all(|(o, c)| o.state == c.state && o.boxes == c.boxes);
+        let shapes_out = if self.overridden {
+            let Some(encoded) = encode_content_shapes(&self.properties, outline) else {
+                return (None, None);
+            };
+            Some(encoded)
+        } else {
+            None
+        };
+        let collision_out = if collision_matches_outline {
+            None
+        } else {
+            let Some(encoded) = encode_content_shapes(&self.properties, collision) else {
+                return (None, None);
+            };
+            Some(encoded)
+        };
+        (shapes_out, collision_out)
+    }
+
+    /// Convert into Sunrise's content `BlockShapes` outline table when both outline and collision
+    /// resolved cleanly and the block overrode `getShape`.
+    pub fn to_content_shapes(&self) -> Option<crate::runtime::content::BlockShapes> {
+        self.to_content_export().0
     }
 }
 
@@ -586,15 +647,8 @@ impl VoxelShapeData {
         !self.bits.iter().any(|&filled| filled)
     }
 
-    pub(crate) fn is_unit_block(&self) -> bool {
-        self.is_cube
-            && self.xs == AxisCoords::Cube(1)
-            && self.ys == AxisCoords::Cube(1)
-            && self.zs == AxisCoords::Cube(1)
-            && self.bits == [true]
-    }
-
     /// Exact port of `Shapes.box(double, double, double, double, double, double)`.
+    #[cfg(test)]
     pub(crate) fn box_checked(
         min_x: f64,
         min_y: f64,
@@ -670,6 +724,7 @@ impl VoxelShapeData {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn block_box(
         min_x: f64,
         min_y: f64,
@@ -768,6 +823,7 @@ impl VoxelShapeData {
     }
 
     /// Exact port of `VoxelShape.optimize()`.
+    #[cfg(test)]
     pub(crate) fn optimize(&self) -> Option<Self> {
         let mut acc = Self::empty();
         for [x0, y0, z0, x1, y1, z1] in self.to_boxes() {
@@ -780,6 +836,7 @@ impl VoxelShapeData {
     }
 
     /// Exact port of `Shapes.join(first, second, op)`.
+    #[cfg(test)]
     pub(crate) fn join(
         &self,
         other: &Self,
@@ -1090,11 +1147,15 @@ fn voxel_shape_instance_of(
 }
 
 pub(crate) const VOXEL_SHAPE_METHODS: Methods = Methods {
-    to_string: |handle, _| {
+    to_string: |handle, nested| {
         Ok(match handle.key() {
             EMPTY_KEY => Some("EMPTY".to_owned()),
             BLOCK_KEY => Some("VoxelShape[AABB[0.0, 0.0, 0.0] -> [1.0, 1.0, 1.0]]".to_owned()),
-            _ => None,
+            INFINITY_KEY => Some(
+                "VoxelShape[AABB[-Infinity, -Infinity, -Infinity] -> [Infinity, Infinity, Infinity]]"
+                    .to_owned(),
+            ),
+            key => nested.voxel_shape_to_string(key),
         })
     },
     hash_code: |_, _| Ok(None),
@@ -1172,10 +1233,19 @@ pub(crate) const BOOLEAN_OP_METHODS: Methods = Methods {
 };
 
 fn collision_context_instance_of(
-    _: &HostRef,
+    handle: &HostRef,
     wanted: &str,
     hierarchy: &dyn ClassHierarchy,
 ) -> Option<bool> {
+    if handle.key() == PROBE_COLLISION_CONTEXT_KEY {
+        if matches!(wanted, COLLISION_CONTEXT | "java/lang/Object") {
+            return Some(true);
+        }
+        if matches!(wanted, VOXEL_SHAPE | AABB | "java/lang/String") {
+            return Some(false);
+        }
+        return None;
+    }
     if matches!(
         wanted,
         EMPTY_COLLISION_CONTEXT | ENTITY_COLLISION_CONTEXT | COLLISION_CONTEXT | "java/lang/Object"
@@ -1192,6 +1262,16 @@ pub(crate) const COLLISION_CONTEXT_METHODS: Methods = Methods {
     to_string: |_, _| Ok(None),
     hash_code: |_, _| Ok(None),
     equals: |handle, other, _| {
+        if handle.key() == PROBE_COLLISION_CONTEXT_KEY
+            || matches!(
+                other,
+                Value::Host(other)
+                    if other.kind() == HostKind::CollisionContext
+                        && other.key() == PROBE_COLLISION_CONTEXT_KEY
+            )
+        {
+            return Ok(None);
+        }
         Ok(Some(matches!(
             other,
             Value::Host(other) if other.kind() == HostKind::CollisionContext && handle == other
@@ -1210,26 +1290,194 @@ pub(crate) fn block_shape() -> Value {
     Value::Host(HostRef::new(HostKind::VoxelShape, BLOCK_KEY))
 }
 
+pub(crate) fn infinity_shape() -> Value {
+    Value::Host(HostRef::new(HostKind::VoxelShape, INFINITY_KEY))
+}
+
 pub(crate) fn empty_collision_context() -> Value {
     Value::Host(HostRef::new(HostKind::CollisionContext, "empty"))
 }
 
-pub(crate) fn empty_block_getter() -> Value {
-    Value::Ref(Some(format!("enum/{EMPTY_BLOCK_GETTER}/INSTANCE")))
+fn probe_collision_context() -> Value {
+    Value::Host(HostRef::new(
+        HostKind::CollisionContext,
+        PROBE_COLLISION_CONTEXT_KEY,
+    ))
 }
 
-pub(crate) fn store_shape(host: &mut StdHost, shape: VoxelShapeData) -> Value {
-    if shape.is_empty() {
-        return empty_shape();
-    }
-    if shape.is_unit_block() {
-        return block_shape();
-    }
+fn probe_block_getter() -> Value {
+    Value::Host(HostRef::new(
+        HostKind::GameTransient,
+        "shape-probe/block-getter",
+    ))
+}
+
+fn probe_block_pos() -> Value {
+    crate::runtime::game_object::server_value("block-pos/shape-probe".into())
+}
+
+/// Allocate a fresh `VoxelShape` handle without collapsing to `Shapes.empty()` / `Shapes.block()`.
+/// Matches MC 26.3 `new CubeVoxelShape(...)` / `new ArrayVoxelShape(...)` allocations in
+/// `Shapes.joinUnoptimized`, `VoxelShape.move`, and non-unit `Shapes.create`.
+pub(crate) fn store_fresh_shape(host: &mut StdHost, shape: VoxelShapeData) -> Value {
     let prefix = if shape.is_cube { "cube" } else { "array" };
     let key = format!("{prefix}/{}", host.next_voxel_shape);
     host.next_voxel_shape = host.next_voxel_shape.saturating_add(1);
     host.voxel_shapes.insert(key.clone(), shape);
     Value::Host(HostRef::new(HostKind::VoxelShape, key))
+}
+
+/// Exact MC 26.3 `Shapes.create(minX, minY, minZ, maxX, maxY, maxZ)` identity rules:
+/// * returns canonical `Shapes.empty()` when any span `< 1.0e-7`;
+/// * returns canonical `Shapes.block()` when `findBits` returns `(0, 0, 0)`;
+/// * otherwise allocates a fresh `CubeVoxelShape` or `ArrayVoxelShape`.
+pub(crate) fn create_shape_value(
+    host: &mut StdHost,
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+) -> Value {
+    if max_x - min_x < EPSILON || max_y - min_y < EPSILON || max_z - min_z < EPSILON {
+        return empty_shape();
+    }
+    let bx = find_bits(min_x, max_x);
+    let by = find_bits(min_y, max_y);
+    let bz = find_bits(min_z, max_z);
+    if bx == 0 && by == 0 && bz == 0 {
+        return block_shape();
+    }
+    store_fresh_shape(
+        host,
+        VoxelShapeData::create(min_x, min_y, min_z, max_x, max_y, max_z),
+    )
+}
+
+fn box_checked_value(
+    host: &mut StdHost,
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+) -> Result<Value, NativeError> {
+    if min_x > max_x || min_y > max_y || min_z > max_z {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: Some("The min values need to be smaller or equals to the max values".into()),
+            frame: None,
+        });
+    }
+    Ok(create_shape_value(
+        host, min_x, min_y, min_z, max_x, max_y, max_z,
+    ))
+}
+
+fn block_box_value(
+    host: &mut StdHost,
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    max_x: f64,
+    max_y: f64,
+    max_z: f64,
+) -> Result<Value, NativeError> {
+    box_checked_value(
+        host,
+        min_x / 16.0,
+        min_y / 16.0,
+        min_z / 16.0,
+        max_x / 16.0,
+        max_y / 16.0,
+        max_z / 16.0,
+    )
+}
+
+/// Exact MC 26.3 `Shapes.joinUnoptimized(first, second, op)` identity semantics:
+/// * `op(false, false)` throws `new IllegalArgumentException()` (`message: None`);
+/// * `first == second` returns `op(true, true) ? first : Shapes.empty()`;
+/// * `first.isEmpty()` returns `op(false, true) ? second : Shapes.empty()`;
+/// * `second.isEmpty()` returns `op(true, false) ? first : Shapes.empty()`;
+/// * otherwise allocates a NEW `CubeVoxelShape` or `ArrayVoxelShape` — never collapsing to
+///   `Shapes.block()` or `Shapes.empty()`.
+fn join_unoptimized_values(
+    host: &mut StdHost,
+    first: &Value,
+    second: &Value,
+    op: BooleanOpKind,
+) -> Result<Option<Value>, NativeError> {
+    if op.apply(false, false) {
+        return Err(NativeError::UncaughtException {
+            class: "java/lang/IllegalArgumentException".into(),
+            message: None,
+            frame: None,
+        });
+    }
+    if *first == Value::Ref(None) || *second == Value::Ref(None) {
+        return Err(npe());
+    }
+    let (Some(sa), Some(sb)) = (shape_data(host, first), shape_data(host, second)) else {
+        return Ok(None);
+    };
+    if first == second {
+        return Ok(Some(if op.apply(true, true) {
+            first.clone()
+        } else {
+            empty_shape()
+        }));
+    }
+    let only_first = op.apply(true, false);
+    let only_second = op.apply(false, true);
+    if sa.is_empty() {
+        return Ok(Some(if only_second {
+            second.clone()
+        } else {
+            empty_shape()
+        }));
+    }
+    if sb.is_empty() {
+        return Ok(Some(if only_first {
+            first.clone()
+        } else {
+            empty_shape()
+        }));
+    }
+    let Some(joined) = sa.join_unoptimized(&sb, op, false)? else {
+        return Ok(None);
+    };
+    Ok(Some(store_fresh_shape(host, joined)))
+}
+
+/// Exact MC 26.3 `VoxelShape.optimize()` identity semantics: starts at `Shapes.empty()` and folds
+/// `forAllBoxes` via `Shapes.joinUnoptimized(acc, Shapes.box(...), BooleanOp.OR)`.
+fn optimize_value(host: &mut StdHost, val: &Value) -> Result<Option<Value>, NativeError> {
+    let Some(shape) = shape_data(host, val) else {
+        return Ok(None);
+    };
+    let mut acc = empty_shape();
+    for [x0, y0, z0, x1, y1, z1] in shape.to_boxes() {
+        let part = box_checked_value(host, x0, y0, z0, x1, y1, z1)?;
+        let Some(next) = join_unoptimized_values(host, &acc, &part, BooleanOpKind::Or)? else {
+            return Ok(None);
+        };
+        acc = next;
+    }
+    Ok(Some(acc))
+}
+
+fn join_values(
+    host: &mut StdHost,
+    first: &Value,
+    second: &Value,
+    op: BooleanOpKind,
+) -> Result<Option<Value>, NativeError> {
+    let Some(unopt) = join_unoptimized_values(host, first, second, op)? else {
+        return Ok(None);
+    };
+    optimize_value(host, &unopt)
 }
 
 pub(crate) fn shape_data(host: &StdHost, value: &Value) -> Option<VoxelShapeData> {
@@ -1242,12 +1490,20 @@ pub(crate) fn shape_data(host: &StdHost, value: &Value) -> Option<VoxelShapeData
     match handle.key() {
         EMPTY_KEY => Some(VoxelShapeData::empty()),
         BLOCK_KEY => Some(VoxelShapeData::block()),
+        INFINITY_KEY => Some(VoxelShapeData::create(
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+        )),
         key => host.voxel_shapes.get(key).cloned(),
     }
 }
 
 pub(crate) fn static_field(
-    host: &mut StdHost,
+    _host: &mut StdHost,
     r: &MethodRef,
 ) -> Option<Result<Value, NativeError>> {
     if r.owner == BOOLEAN_OP
@@ -1260,15 +1516,7 @@ pub(crate) fn static_field(
         ))));
     }
     if r.owner == SHAPES && r.name == "INFINITY" && r.descriptor == format!("L{VOXEL_SHAPE};") {
-        let inf = VoxelShapeData::create(
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::INFINITY,
-        );
-        return Some(Ok(store_shape(host, inf)));
+        return Some(Ok(infinity_shape()));
     }
     if r.owner == SHAPES && r.name == "EPSILON" && r.descriptor == "D" {
         return Some(Ok(Value::Float(EPSILON)));
@@ -1312,23 +1560,16 @@ pub(crate) fn or_array_call(
     if *first == Value::Ref(None) {
         return Err(npe());
     }
-    let Some(mut acc_data) = shape_data(host, first) else {
+    if shape_data(host, first).is_none() {
         return host.unknown_host_call(r);
-    };
+    }
     let mut acc_val = first.clone();
     for next in others {
         if *next == Value::Ref(None) {
             return Err(npe());
         }
-        let Some(next_data) = shape_data(host, next) else {
-            return host.unknown_host_call(r);
-        };
-        let same = acc_val == *next;
-        match acc_data.join(&next_data, BooleanOpKind::Or, same)? {
-            Some(joined) => {
-                acc_data = joined;
-                acc_val = store_shape(host, acc_data.clone());
-            }
+        match join_values(host, &acc_val, next, BooleanOpKind::Or)? {
+            Some(joined) => acc_val = joined,
             None => return host.unknown_host_call(r),
         }
     }
@@ -1353,12 +1594,9 @@ pub(crate) fn static_call(
                     Ok(c) => c,
                     Err(e) => return Some(Err(e)),
                 };
-                return Some(
-                    VoxelShapeData::block_box(
-                        coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
-                    )
-                    .map(|shape| store_shape(host, shape)),
-                );
+                return Some(block_box_value(
+                    host, coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
+                ));
             }
             ("cube", "(D)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
                 let s = match double_arg(r, args, 0) {
@@ -1366,17 +1604,15 @@ pub(crate) fn static_call(
                     Err(e) => return Some(Err(e)),
                 };
                 let half = s / 2.0;
-                return Some(
-                    VoxelShapeData::block_box(
-                        8.0 - half,
-                        8.0 - half,
-                        8.0 - half,
-                        8.0 + half,
-                        8.0 + half,
-                        8.0 + half,
-                    )
-                    .map(|shape| store_shape(host, shape)),
-                );
+                return Some(block_box_value(
+                    host,
+                    8.0 - half,
+                    8.0 - half,
+                    8.0 - half,
+                    8.0 + half,
+                    8.0 + half,
+                    8.0 + half,
+                ));
             }
             ("cube", "(DDD)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
                 let (x, y, z) = match (
@@ -1390,17 +1626,15 @@ pub(crate) fn static_call(
                 let hy = y / 2.0;
                 let hx = x / 2.0;
                 let hz = z / 2.0;
-                return Some(
-                    VoxelShapeData::block_box(
-                        8.0 - hx,
-                        8.0 - hy,
-                        8.0 - hz,
-                        8.0 + hx,
-                        8.0 + hy,
-                        8.0 + hz,
-                    )
-                    .map(|shape| store_shape(host, shape)),
-                );
+                return Some(block_box_value(
+                    host,
+                    8.0 - hx,
+                    8.0 - hy,
+                    8.0 - hz,
+                    8.0 + hx,
+                    8.0 + hy,
+                    8.0 + hz,
+                ));
             }
             ("column", "(DDD)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
                 let (size, min_y, max_y) = match (
@@ -1412,17 +1646,15 @@ pub(crate) fn static_call(
                     (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Some(Err(e)),
                 };
                 let half = size / 2.0;
-                return Some(
-                    VoxelShapeData::block_box(
-                        8.0 - half,
-                        min_y,
-                        8.0 - half,
-                        8.0 + half,
-                        max_y,
-                        8.0 + half,
-                    )
-                    .map(|shape| store_shape(host, shape)),
-                );
+                return Some(block_box_value(
+                    host,
+                    8.0 - half,
+                    min_y,
+                    8.0 - half,
+                    8.0 + half,
+                    max_y,
+                    8.0 + half,
+                ));
             }
             ("column", "(DDDD)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
                 let (xs, zs, min_y, max_y) = match (
@@ -1439,10 +1671,15 @@ pub(crate) fn static_call(
                 };
                 let hx = xs / 2.0;
                 let hz = zs / 2.0;
-                return Some(
-                    VoxelShapeData::block_box(8.0 - hx, min_y, 8.0 - hz, 8.0 + hx, max_y, 8.0 + hz)
-                        .map(|shape| store_shape(host, shape)),
-                );
+                return Some(block_box_value(
+                    host,
+                    8.0 - hx,
+                    min_y,
+                    8.0 - hz,
+                    8.0 + hx,
+                    max_y,
+                    8.0 + hz,
+                ));
             }
             _ => return None,
         }
@@ -1458,23 +1695,17 @@ pub(crate) fn static_call(
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            Some(
-                VoxelShapeData::box_checked(
-                    coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
-                )
-                .map(|shape| store_shape(host, shape)),
-            )
+            Some(box_checked_value(
+                host, coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
+            ))
         }
         ("create", "(DDDDDD)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
             let coords = match six_doubles(r, args) {
                 Ok(c) => c,
                 Err(e) => return Some(Err(e)),
             };
-            Some(Ok(store_shape(
-                host,
-                VoxelShapeData::create(
-                    coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
-                ),
+            Some(Ok(create_shape_value(
+                host, coords[0], coords[1], coords[2], coords[3], coords[4], coords[5],
             )))
         }
         (
@@ -1494,9 +1725,8 @@ pub(crate) fn static_call(
                 return None;
             }
             let b = aabb_bounds(handle.key())?;
-            Some(Ok(store_shape(
-                host,
-                VoxelShapeData::create(b[0], b[1], b[2], b[3], b[4], b[5]),
+            Some(Ok(create_shape_value(
+                host, b[0], b[1], b[2], b[3], b[4], b[5],
             )))
         }
         (
@@ -1509,11 +1739,11 @@ pub(crate) fn static_call(
             if *a == Value::Ref(None) || *b == Value::Ref(None) {
                 return Some(Err(npe()));
             }
-            let (Some(sa), Some(sb)) = (shape_data(host, a), shape_data(host, b)) else {
+            if shape_data(host, a).is_none() || shape_data(host, b).is_none() {
                 return None;
-            };
-            Some(match sa.join(&sb, BooleanOpKind::Or, a == b) {
-                Ok(Some(joined)) => Ok(store_shape(host, joined)),
+            }
+            Some(match join_values(host, a, b, BooleanOpKind::Or) {
+                Ok(Some(joined)) => Ok(joined),
                 Ok(None) => host.unknown_host_call(r),
                 Err(err) => Err(err),
             })
@@ -1529,19 +1759,26 @@ pub(crate) fn static_call(
                 return Some(Err(npe()));
             }
             let op = boolean_op_of(op_val)?;
-            if !op.apply(false, false) && (*a == Value::Ref(None) || *b == Value::Ref(None)) {
+            if op.apply(false, false) {
+                return Some(Err(NativeError::UncaughtException {
+                    class: "java/lang/IllegalArgumentException".into(),
+                    message: None,
+                    frame: None,
+                }));
+            }
+            if *a == Value::Ref(None) || *b == Value::Ref(None) {
                 return Some(Err(npe()));
             }
-            let (Some(sa), Some(sb)) = (shape_data(host, a), shape_data(host, b)) else {
+            if shape_data(host, a).is_none() || shape_data(host, b).is_none() {
                 return None;
-            };
+            }
             let res = if r.name == "join" {
-                sa.join(&sb, op, a == b)
+                join_values(host, a, b, op)
             } else {
-                sa.join_unoptimized(&sb, op, a == b)
+                join_unoptimized_values(host, a, b, op)
             };
             Some(match res {
-                Ok(Some(joined)) => Ok(store_shape(host, joined)),
+                Ok(Some(joined)) => Ok(joined),
                 Ok(None) => host.unknown_host_call(r),
                 Err(err) => Err(err),
             })
@@ -1572,9 +1809,10 @@ pub(crate) fn instance_call(
                     Some(Ok(host.new_collection("java/util/ArrayList", items)))
                 }
                 ("optimize", "()Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
-                    Some(match shape.optimize() {
-                        Some(opt) => Ok(store_shape(host, opt)),
-                        None => host.unknown_host_call(r),
+                    Some(match optimize_value(host, receiver) {
+                        Ok(Some(opt)) => Ok(opt),
+                        Ok(None) => host.unknown_host_call(r),
+                        Err(err) => Err(err),
                     })
                 }
                 ("move", "(DDD)Lnet/minecraft/world/phys/shapes/VoxelShape;") => {
@@ -1586,7 +1824,11 @@ pub(crate) fn instance_call(
                         (Ok(x), Ok(y), Ok(z)) => (x, y, z),
                         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Some(Err(e)),
                     };
-                    Some(Ok(store_shape(host, shape.move_by(dx, dy, dz))))
+                    if shape.is_empty() {
+                        Some(Ok(empty_shape()))
+                    } else {
+                        Some(Ok(store_fresh_shape(host, shape.move_by(dx, dy, dz))))
+                    }
                 }
                 ("min", "(Lnet/minecraft/core/Direction$Axis;)D") => {
                     let arg = args.first()?;
@@ -1876,15 +2118,111 @@ fn six_doubles(r: &MethodRef, args: &[Value]) -> Result<[f64; 6], NativeError> {
 }
 
 impl NativeJar {
-    /// Resolve a block's outline shapes across every state of its state definition.
+    /// Walk the jar-side + linked superclass chain of `class` looking for a method `(name, desc)`.
+    /// Returns `(Some(jar_declaring_owner), class_where_walk_stopped)` or `(None, first_external_super)`.
+    fn find_jar_shape_override(
+        &self,
+        host: &StdHost,
+        class: &str,
+        name: &str,
+    ) -> (Option<String>, String) {
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let file = self
+                .classes
+                .get(&current)
+                .or_else(|| host.linked_class_table().and_then(|t| t.get(&current)));
+            let Some(file) = file else {
+                break;
+            };
+            if file.method(name, GET_SHAPE_DESC).is_some() {
+                return (Some(current.clone()), current);
+            }
+            if file.super_name.is_empty() {
+                break;
+            }
+            current = file.super_name.clone();
+        }
+        (None, current)
+    }
+
+    /// Invoke a jar-side `getShape` or `getCollisionShape` override for every state in
+    /// `state_combos`, passing opaque probe `BlockGetter` / `BlockPos` / `CollisionContext`
+    /// handles so any read of world, position, or entity context is counted and refuses the block.
+    fn evaluate_jar_shape_states(
+        &self,
+        target: &MethodRef,
+        block: &Value,
+        marker: &str,
+        state_combos: &[BTreeMap<String, String>],
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<Option<Vec<BlockStateShape>>, NativeError> {
+        let level = probe_block_getter();
+        let pos = probe_block_pos();
+        let ctx = probe_collision_context();
+
+        let mut results = Vec::with_capacity(state_combos.len());
+        let mut synthetic_states = Vec::with_capacity(state_combos.len());
+        for state_map in state_combos {
+            let state_val = host.mint_block_state(marker, state_map.clone());
+            if let Some(state_marker) = expect_ref(&state_val) {
+                synthetic_states.push(state_marker.clone());
+            }
+            let unknown_before = host.unknown_host_call_count();
+            let args = [state_val, level.clone(), pos.clone(), ctx.clone()];
+            let call = self.invoke_persistent(target, Some(block.clone()), &args, host, budget);
+            let unknown_after = host.unknown_host_call_count();
+            match call {
+                Ok(value) => {
+                    if unknown_after > unknown_before {
+                        host.remove_block_states(&synthetic_states);
+                        return Ok(None);
+                    }
+                    let Some(shape) = shape_data(host, &value) else {
+                        if !matches!(value, Value::Ref(None)) {
+                            let _ = host.unknown_host_call(target);
+                        }
+                        host.remove_block_states(&synthetic_states);
+                        return Ok(None);
+                    };
+                    results.push(BlockStateShape {
+                        state: state_map.clone(),
+                        boxes: shape.to_boxes(),
+                    });
+                }
+                Err(err) => {
+                    host.remove_block_states(&synthetic_states);
+                    if unknown_after > unknown_before
+                        && matches!(err, NativeError::UncaughtException { .. })
+                    {
+                        // A counted unmodelled read returned a neutral value and caused a Java
+                        // exception downstream: treat as no shape (keeping the count).
+                        return Ok(None);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        host.remove_block_states(&synthetic_states);
+        Ok(Some(results))
+    }
+
+    /// Resolve a block's outline (`getShape`) and collision (`getCollisionShape`) shapes across
+    /// every state of its state definition.
     ///
-    /// * If no class in the block's jar-side chain overrides `getShape` and its first vanilla
+    /// * Outline (`getShape`): if no jar class overrides `getShape` and the first vanilla
     ///   superclass inherits `BlockBehaviour.getShape` (`Shapes.block()`), returns the unit cube
-    ///   for every state without running any jar bytecode (`overridden: false`).
-    /// * If a jar class in the chain overrides `getShape`, invokes that override post-load on
-    ///   `block` for EVERY state of the block, passing a modelled `BlockState`,
-    ///   `EmptyBlockGetter.INSTANCE`, `BlockPos.ZERO`, and `CollisionContext.empty()`.
-    /// * Any unmodelled read is counted on `host` and yields `states: None` for that block.
+    ///   without running jar bytecode (`overridden: false`). Otherwise invokes the override per
+    ///   state with opaque `BlockGetter`, `BlockPos`, and `CollisionContext` probes so any read
+    ///   of position, world, or context is counted and refuses the block.
+    /// * Collision (`getCollisionShape`): if a jar class overrides `getCollisionShape`, invokes
+    ///   that override per state with the same opaque probes. Otherwise, when the vanilla
+    ///   superclass inherits `BlockBehaviour.getCollisionShape` (`hasCollision ? state.getShape :
+    ///   Shapes.empty()`), derives collision from `Properties.noCollision()` (empty) or proves
+    ///   equivalence to outline (`hasCollision == true`). If `hasCollision` is unknown (e.g.
+    ///   `Properties.ofFullCopy`) or the vanilla superclass overrides `getCollisionShape`, counts
+    ///   it and yields `collision_states: None`.
     pub fn block_shapes(
         &self,
         host: &mut StdHost,
@@ -1905,6 +2243,8 @@ impl NativeJar {
                 properties: Vec::new(),
                 states: None,
                 overridden: false,
+                collision_states: None,
+                collision_overridden: false,
             });
         };
         let Some(class) = crate::runtime::jar_object::key_class(&marker).map(str::to_owned) else {
@@ -1912,36 +2252,25 @@ impl NativeJar {
                 properties: Vec::new(),
                 states: None,
                 overridden: false,
+                collision_states: None,
+                collision_overridden: false,
             });
         };
 
-        // Walk the jar-side + linked class chain looking for a `getShape` override.
-        let mut current = class;
-        let mut declaring_jar_owner = None;
-        for _ in 0..MAX_SUPERCLASS_WALK {
-            let file = self
-                .classes
-                .get(&current)
-                .or_else(|| host.linked_class_table().and_then(|t| t.get(&current)));
-            let Some(file) = file else {
-                break;
-            };
-            if file.method("getShape", GET_SHAPE_DESC).is_some() {
-                declaring_jar_owner = Some(current.clone());
-                break;
-            }
-            if file.super_name.is_empty() {
-                break;
-            }
-            current = file.super_name.clone();
-        }
+        let (shape_owner, shape_super) = self.find_jar_shape_override(host, &class, "getShape");
+        let (collision_owner, collision_super) =
+            self.find_jar_shape_override(host, &class, "getCollisionShape");
+        let overridden = shape_owner.is_some();
+        let collision_overridden = collision_owner.is_some();
 
         // If the block's state space wasn't captured cleanly, we cannot enumerate its states.
         if host.has_unknown_block_state_definition(&marker) {
             return Ok(BlockShapes {
                 properties: Vec::new(),
                 states: None,
-                overridden: declaring_jar_owner.is_some(),
+                overridden,
+                collision_states: None,
+                collision_overridden,
             });
         }
 
@@ -1951,7 +2280,7 @@ impl NativeJar {
                 None => {
                     // State count exceeded safety cap: count and refuse.
                     let _ = host.unknown_host_call(&MethodRef {
-                        owner: declaring_jar_owner
+                        owner: shape_owner
                             .clone()
                             .unwrap_or_else(|| BLOCK_CLASS.to_owned()),
                         name: "getShape".into(),
@@ -1960,114 +2289,95 @@ impl NativeJar {
                     return Ok(BlockShapes {
                         properties: Vec::new(),
                         states: None,
-                        overridden: declaring_jar_owner.is_some(),
+                        overridden,
+                        collision_states: None,
+                        collision_overridden,
                     });
                 }
             };
 
-        let Some(owner) = declaring_jar_owner else {
-            // No jar override: check the vanilla superclass we stopped at.
-            if crate::runtime::vanilla_block_shapes::inherits_block_behaviour_get_shape(&current) {
-                let unit = VoxelShapeData::block().to_boxes();
-                let states = state_combos
-                    .into_iter()
+        // 1. Outline shape (`getShape`).
+        let states = if let Some(owner) = shape_owner {
+            let target = MethodRef {
+                owner,
+                name: "getShape".into(),
+                descriptor: GET_SHAPE_DESC.into(),
+            };
+            self.evaluate_jar_shape_states(&target, block, &marker, &state_combos, host, budget)?
+        } else if crate::runtime::vanilla_block_shapes::inherits_block_behaviour_get_shape(&shape_super) {
+            let unit = VoxelShapeData::block().to_boxes();
+            Some(
+                state_combos
+                    .iter()
                     .map(|state| BlockStateShape {
-                        state,
+                        state: state.clone(),
                         boxes: unit.clone(),
                     })
-                    .collect();
-                return Ok(BlockShapes {
-                    properties,
-                    states: Some(states),
-                    overridden: false,
-                });
-            }
-            // Vanilla subclass overrides `getShape` (or unknown external superclass): count it.
+                    .collect(),
+            )
+        } else {
             let _ = host.unknown_host_call(&MethodRef {
-                owner: current,
+                owner: shape_super,
                 name: "getShape".into(),
                 descriptor: GET_SHAPE_DESC.into(),
             })?;
-            return Ok(BlockShapes {
-                properties,
-                states: None,
-                overridden: false,
-            });
+            None
         };
 
-        let target = MethodRef {
-            owner,
-            name: "getShape".into(),
-            descriptor: GET_SHAPE_DESC.into(),
+        // 2. Collision shape (`getCollisionShape`).
+        let collision_states = if let Some(owner) = collision_owner {
+            let target = MethodRef {
+                owner,
+                name: "getCollisionShape".into(),
+                descriptor: GET_SHAPE_DESC.into(),
+            };
+            self.evaluate_jar_shape_states(&target, block, &marker, &state_combos, host, budget)?
+        } else if crate::runtime::vanilla_block_shapes::inherits_block_behaviour_get_collision_shape(
+            &collision_super,
+        ) {
+            // MC 26.3 `BlockBehaviour.getCollisionShape`:
+            // `return this.hasCollision ? state.getShape(level, pos) : Shapes.empty();`
+            match host.block_has_collision_by_marker(&marker) {
+                Some(false) => Some(
+                    state_combos
+                        .iter()
+                        .map(|state| BlockStateShape {
+                            state: state.clone(),
+                            boxes: Vec::new(),
+                        })
+                        .collect(),
+                ),
+                Some(true) => states.clone(),
+                None => {
+                    let _ = host.unknown_host_call(&MethodRef {
+                        owner: "net/minecraft/world/level/block/state/BlockBehaviour".into(),
+                        name: "getCollisionShape".into(),
+                        descriptor: GET_SHAPE_DESC.into(),
+                    })?;
+                    None
+                }
+            }
+        } else {
+            let _ = host.unknown_host_call(&MethodRef {
+                owner: collision_super,
+                name: "getCollisionShape".into(),
+                descriptor: GET_SHAPE_DESC.into(),
+            })?;
+            None
         };
-        let level = empty_block_getter();
-        let pos = crate::runtime::game_object::server_value("block-pos/0,0,0".into());
-        let ctx = empty_collision_context();
 
-        let mut results = Vec::with_capacity(state_combos.len());
-        let mut synthetic_states = Vec::with_capacity(state_combos.len());
-        for state_map in state_combos {
-            let state_val = host.mint_block_state(&marker, state_map.clone());
-            if let Some(state_marker) = expect_ref(&state_val) {
-                synthetic_states.push(state_marker.clone());
-            }
-            let unknown_before = host.unknown_host_call_count();
-            let args = [state_val, level.clone(), pos.clone(), ctx.clone()];
-            let call = self.invoke_persistent(&target, Some(block.clone()), &args, host, budget);
-            let unknown_after = host.unknown_host_call_count();
-            match call {
-                Ok(value) => {
-                    if unknown_after > unknown_before {
-                        host.remove_block_states(&synthetic_states);
-                        return Ok(BlockShapes {
-                            properties,
-                            states: None,
-                            overridden: true,
-                        });
-                    }
-                    let Some(shape) = shape_data(host, &value) else {
-                        if !matches!(value, Value::Ref(None)) {
-                            let _ = host.unknown_host_call(&target);
-                        }
-                        host.remove_block_states(&synthetic_states);
-                        return Ok(BlockShapes {
-                            properties,
-                            states: None,
-                            overridden: true,
-                        });
-                    };
-                    results.push(BlockStateShape {
-                        state: state_map,
-                        boxes: shape.to_boxes(),
-                    });
-                }
-                Err(err) => {
-                    host.remove_block_states(&synthetic_states);
-                    if unknown_after > unknown_before
-                        && matches!(err, NativeError::UncaughtException { .. })
-                    {
-                        // A counted unmodelled read returned a neutral value and caused a Java
-                        // exception downstream: treat as no shape (keeping the count).
-                        return Ok(BlockShapes {
-                            properties,
-                            states: None,
-                            overridden: true,
-                        });
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        host.remove_block_states(&synthetic_states);
         Ok(BlockShapes {
             properties,
-            states: Some(results),
-            overridden: true,
+            states,
+            overridden,
+            collision_states,
+            collision_overridden,
         })
     }
 
-    /// Evaluate `getShape` for every typed `minecraft:block` registration on `host` and attach
-    /// valid Sunrise shape tables to their declarations so `content::declarations` (and both
+    /// Evaluate `getShape` and `getCollisionShape` for every typed `minecraft:block` registration
+    /// on `host` and attach valid Sunrise shape tables (`shapes` and, when distinct,
+    /// `collision_shapes`) to their declarations so `content::declarations` (and both
     /// `tools/bake.py` and `mod/src/content.rs`) export them.
     pub fn populate_block_shapes(&self, host: &mut StdHost, budget: &ExecutionBudget) {
         let targets: Vec<(usize, Value)> = host
@@ -2084,11 +2394,15 @@ impl NativeJar {
             let Ok(shapes) = self.block_shapes_with_budget(host, &block, budget) else {
                 continue;
             };
-            let Some(content_shapes) = shapes.to_content_shapes() else {
+            let (outline, collision) = shapes.to_content_export();
+            if outline.is_none() && collision.is_none() {
                 continue;
-            };
-            let serialized = content_shapes.to_json().to_string();
-            host.set_block_declaration_shapes(index, serialized);
+            }
+            host.set_block_declaration_shapes(
+                index,
+                outline.map(|s| s.to_json().to_string()),
+                collision.map(|s| s.to_json().to_string()),
+            );
         }
     }
 }
