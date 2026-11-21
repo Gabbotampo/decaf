@@ -1,0 +1,19 @@
+normal_file=open=OK|dataIsDir=true|namespaces=[ns]
+normal_empty_dir=open=OK|dataIsDir=true|namespaces=[empty_ns]
+normal_empty_dir_no_data=open=OK|dataIsDir=true|namespaces=[empty_ns]
+valid_dotted_ns=open=OK|dataIsDir=true|namespaces=[a.b, c..d]
+bare_data_file_only=open=OK|dataIsDir=false|namespaces=[]
+bare_file_under_data=open=OK|dataIsDir=true|namespaces=[]
+invalid_uppercase_dir=open=OK|dataIsDir=true|namespaces=[]
+data_file_then_child=open=OK|dataIsDir=false|namespaces=[]
+child_then_data_file=open=OK|dataIsDir=false|namespaces=[]
+ns_file_then_child=open=OK|dataIsDir=true|namespaces=[]
+child_then_ns_file=open=OK|dataIsDir=true|namespaces=[]
+ns_file_plus_other_ns=open=OK|dataIsDir=true|namespaces=[other]
+dot_in_data_empty_dir=open=THROW|ZipException
+dot_in_data_file=open=THROW|ZipException
+dot_outside_data=open=THROW|ZipException
+dotdot_in_data=open=THROW|ZipException
+dotdot_outside_data=open=THROW|ZipException
+dot_literal_dir=open=THROW|ZipException
+dotdot_literal_dir=open=THROW|ZipException

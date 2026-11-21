@@ -351,6 +351,43 @@ impl StdHost {
         self.client.made_aliases.get(text).cloned()
     }
 
+    /// `ItemStack.isEmpty()` for a client-frame stack (`client/stack/*` or `made/<n>`).
+    pub(crate) fn client_stack_is_empty(&self, value: &Value) -> Option<bool> {
+        let frame = self.client.frame.as_ref()?;
+        let slot = self.client_stack_slot(value)?;
+        Some(self.client_stack(frame, &slot).is_empty())
+    }
+
+    /// `ItemStack.getMaxStackSize()` for a client-frame stack (`1` when empty, matching MC 26.3).
+    pub(crate) fn client_stack_max_stack_size(&self, value: &Value) -> Option<i32> {
+        let frame = self.client.frame.as_ref()?;
+        let slot = self.client_stack_slot(value)?;
+        let stack = self.client_stack(frame, &slot);
+        Some(if stack.is_empty() { 1 } else { stack.max_stack })
+    }
+
+    /// `ItemStack.limitSize(limit)` for a client-frame stack. Mutates `StackSlot::Made` stacks
+    /// directly; allows read-only snapshot stacks only when already empty or `<= limit`, and
+    /// returns `None` (counted) when a snapshot stack would require clamping.
+    pub(crate) fn client_stack_limit_exact(&mut self, value: &Value, limit: i32) -> Option<()> {
+        let frame = self.client.frame.clone()?;
+        let slot = self.client_stack_slot(value)?;
+        match slot {
+            StackSlot::Empty => Some(()),
+            StackSlot::Made(idx) => {
+                let stack = self.client.made.stacks.get_mut(idx)?;
+                if !stack.is_empty() && stack.count > limit {
+                    stack.count = limit;
+                }
+                Some(())
+            }
+            other => {
+                let stack = self.client_stack(&frame, &other);
+                (stack.is_empty() || stack.count <= limit).then_some(())
+            }
+        }
+    }
+
     /// The local player's members about items and effects, or `None` (the
     /// caller refuses).
     pub(super) fn client_player_items(

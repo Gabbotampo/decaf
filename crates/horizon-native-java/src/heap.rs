@@ -359,6 +359,8 @@ impl StdHost {
         // Table rows and iterators are host-owned roots. Their values may be
         // jar objects, so the collector must see them across callbacks.
         self.guava_tables.root_texts(out);
+        // Recipe holders, component patches, and decoded mod recipes.
+        self.recipes.root_texts(out);
     }
 
     /// The host's own state that may name a jar object without a table this
@@ -410,11 +412,6 @@ impl StdHost {
         push(self.red_black_trees.get(marker), out);
         push(self.probe_tables.get(marker), out);
         push(self.block_items.get(marker), out);
-        if let Some(stack) = self.jar_item_stacks.get(marker) {
-            for text in value_texts(&stack.item) {
-                out.push(text.to_owned());
-            }
-        }
         push(self.state_definition_builders.get(marker), out);
         // An `Arrays.asList` view's array, which its `get`/`set` work on, and
         // the view an iterator over one follows.
@@ -463,7 +460,6 @@ impl StdHost {
             .chain(self.constructed_items.iter())
             .chain(self.constructed_blocks.iter())
             .chain(self.block_items.keys())
-            .chain(self.jar_item_stacks.keys())
             .chain(self.item_required_features.keys())
             .chain(self.block_property_builders.keys())
             .chain(self.block_state_properties.keys())
@@ -513,7 +509,6 @@ impl StdHost {
         self.constructed_items.retain(|key| keep(key));
         self.constructed_blocks.retain(|key| keep(key));
         self.block_items.retain(|key, _| keep(key));
-        self.jar_item_stacks.retain(|key, _| keep(key));
         self.item_required_features.retain(|key, _| keep(key));
         self.mod_stamps.retain(|key, _| keep(key));
         self.deque_layouts.retain(|key, _| keep(key));
@@ -625,6 +620,7 @@ fn heap_entries(heap: &JavaHeap, host: &StdHost) -> usize {
         + host.tool_material.entry_count()
         + host.vec2.entry_count()
         + host.guava_tables.entry_count()
+        + host.recipes.entry_count()
 }
 
 fn over_count_bound(heap: &JavaHeap) -> bool {
@@ -1810,7 +1806,6 @@ mod tests {
             "constructed_items",
             "constructed_blocks",
             "block_items",
-            "jar_item_stacks",
             "item_required_features",
             "payload_registrations",
             "payload_bytes",
@@ -1833,6 +1828,7 @@ mod tests {
             "set_from_map_views",
             "random_sources",
             "guava_tables",
+            "recipes",
             "component_states",
             "unmodifiable_collections",
             "empty_collections",
@@ -1905,6 +1901,11 @@ mod tests {
             "environment",
             "resources",
             "resource_bytes",
+            "primary_data_layer",
+            "primary_data_scanner",
+            "data_pack_layers",
+            "resource_generation",
+            "pending_container_clamp",
             "resource_marks",
             "classes",
             "linked_classes",
@@ -2054,7 +2055,7 @@ mod tests {
         );
         // Build an AbstractContainerMenu (mints NonNullList#menu<n> via next_menu_object).
         let menu_val = crate::jar_object::handle("demo/TestMenu#3".into());
-        crate::menu_models::call_with_client_player(
+        crate::menu_models::call(
             &mut host.menu_states,
             &mut host.next_menu_object,
             &crate::MethodRef {
@@ -2064,7 +2065,6 @@ mod tests {
             },
             &menu_val,
             &[Value::Ref(None), Value::Int(1)],
-            None,
         )
         .unwrap()
         .unwrap();
@@ -2115,7 +2115,7 @@ mod tests {
 
         // Construct a menu and read its `slots` field (`NonNullList#menu<n>`).
         let menu_val = crate::jar_object::handle("demo/TestMenu#3".into());
-        crate::menu_models::call_with_client_player(
+        crate::menu_models::call(
             &mut host.menu_states,
             &mut host.next_menu_object,
             &crate::MethodRef {
@@ -2125,7 +2125,6 @@ mod tests {
             },
             &menu_val,
             &[Value::Ref(None), Value::Int(1)],
-            None,
         )
         .unwrap()
         .unwrap();

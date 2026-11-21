@@ -1,0 +1,33 @@
+decoded:demo:iron_alloy|notify=true|tier=2|label=BASIC|weight=1|count=4
+decoded:demo:precious_alloy|notify=false|tier=1|label=none|weight=1|count=1
+decoded:demo:stone_alloy|notify=true|tier=1|label=none|weight=1|count=2
+decoded:demo:small_stack|notify=true|tier=1|label=none|weight=1|count=16
+decoded:demo:dfu_coercion|notify=true|tier=2|label=none|weight=10|count=3
+invalidErrorCount=10
+multiErr:isErr=true|xmapDelta=1|ctorDelta=0
+query:iron+redstone|id=demo:iron_alloy|out=4 demo:alloy_ingot|empty=false|repairCost=9|hasCustomName=false
+query:gold+amethyst|id=demo:precious_alloy|out=1 demo:alloy_ingot|empty=false|repairCost=0|hasCustomName=false
+query:copper+amethyst|id=demo:precious_alloy|out=1 demo:alloy_ingot|empty=false|repairCost=0|hasCustomName=false
+query:cobble+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=true
+query:blackstone+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=false
+query:deepslate+coal|id=demo:stone_alloy|out=2 minecraft:stick|empty=false|repairCost=7|hasCustomName=false
+query:diamond+nugget|id=demo:small_stack|out=16 demo:small_stack_item|empty=false|repairCost=0|hasCustomName=false
+query:emerald+quartz|id=demo:dfu_coercion|out=3 demo:alloy_ingot|empty=false|repairCost=0|hasCustomName=false
+query:dirt+coal|id=empty|out=0 minecraft:air|empty=true|repairCost=null|hasCustomName=false
+query:empty+empty|id=empty|out=0 minecraft:air|empty=true|repairCost=null|hasCustomName=false
+pearl20=0 minecraft:air|empty=true|sameEmpty=true
+small20=0 minecraft:air|empty=true|sameEmpty=true
+stickExtra=5 minecraft:stick|repairCost=9
+negTpl=-3|sameEmpty=false|empty=true|count=0|max=1|str=0 minecraft:air
+validateStrict=true|true|false|1 minecraft:stone
+patchMap=0|false|9|true|0|null|1|null|0|null|1|true
+ci=CommonInfo[showNotification=true]|CommonInfo[showNotification=false]|eq=true|false|hash=1231|1237
+emptyStack=0 minecraft:air|isAir=true|isStick=false|maxEmpty=1|maxZero=1|maxAir=1|patchEmpty=true|patchStr={}
+optIngr=true|false|true
+boxClamp=16 minecraft:ender_pearl|80 minecraft:stone|boxMax=99|boxEmpty=false|lim0=12 minecraft:stone|lim1=12 minecraft:ender_pearl|limMax=12
+ingrAir=java.lang.UnsupportedOperationException:Ingredient can't contain air
+tplZero=java.lang.IllegalStateException:Item must be non-empty
+tplAir=java.lang.IllegalStateException:Item must be non-empty
+fromEmpty=java.lang.IllegalStateException:Stack must be non-empty
+holder=ResourceKey[minecraft:recipe / demo:one]|eqSame=true|eqDiff=false
+mgrChecks=false|0|true|1|false|1|false|true
