@@ -160,6 +160,10 @@ fn is_opaque_product(value: &Value) -> bool {
     product_arity(value).is_some() && product_parts(value).is_none()
 }
 
+fn is_opaque_app(value: &Value) -> bool {
+    tag(value).as_deref() == Some(APPLIED) && held_values(value).is_some_and(|v| v.len() < 5)
+}
+
 #[derive(Default)]
 struct GraphStats {
     nodes: usize,
@@ -546,13 +550,35 @@ fn unit_source(value: &Value) -> Option<Value> {
     matches!(tag.as_str(), UNIT | UNIT_CODEC).then(|| receiver_held_value(value))?
 }
 
-fn unit_value<H: Host>(runtime: &mut Runtime<'_, H>, source: &Value) -> Result<Value, NativeError> {
-    if matches!(source, Value::Host(handle) if handle.kind() == HostKind::Callback) {
-        Ok(runtime
-            .invoke_callback(source, &[])?
-            .unwrap_or(Value::Ref(None)))
-    } else {
-        Ok(source.clone())
+/// Evaluate a `MapCodec.unit` / `Codec.unit` value or supplier callback.
+///
+/// Returns `Ok(None)` if evaluating the callback triggered any counted unknown call (including
+/// throwing after a counted unknown call) or if the callback could not be invoked, so the
+/// enclosing codec operation is counted rather than answering with a value derived from an
+/// unmodelled call.
+fn unit_value<H: Host>(
+    runtime: &mut Runtime<'_, H>,
+    source: &Value,
+) -> Result<Option<Value>, NativeError> {
+    if !is_callback(source) {
+        return Ok(Some(source.clone()));
+    }
+    let before = runtime.host.counted_unknown_calls();
+    match runtime.invoke_callback(source, &[]) {
+        Ok(Some(value)) => {
+            if runtime.host.counted_unknown_calls() != before {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(NativeError::UncaughtException { .. })
+            if runtime.host.counted_unknown_calls() != before =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -589,7 +615,9 @@ fn runtime_text<H: Host>(
             let Some(source) = values.get(2) else {
                 return Ok(None);
             };
-            let value = unit_value(runtime, source)?;
+            let Some(value) = unit_value(runtime, source)? else {
+                return Ok(None);
+            };
             Ok(value_text(runtime, &value)?.map(|text| format!("Unit[{text}]")))
         }
         FIELD | OPTIONAL => {
@@ -760,31 +788,74 @@ fn runtime_record_builder<H: Host>(
         Ok(value) => value,
         Err(reason) => return runtime_refuse(runtime, r, reason),
     };
-    let Some(app) = runtime.invoke_callback(callback, &[instance])? else {
+    let declared = if output_tag == RECORD_MAP {
+        MAP_CODEC
+    } else {
+        CODEC
+    };
+    let before = runtime.host.counted_unknown_calls();
+    let app_result = runtime.invoke_callback(callback, &[instance]);
+    let counted_delta = runtime.host.counted_unknown_calls() != before;
+    let app_opt = match app_result {
+        Ok(value) => value,
+        Err(NativeError::UncaughtException { .. }) if counted_delta => {
+            runtime_refuse(
+                runtime,
+                r,
+                "RecordCodecBuilder callback threw after a counted unknown call".into(),
+            )?;
+            runtime.host.unknown_operand_call(r)?;
+            return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
+        }
+        Err(err) => return Err(err),
+    };
+    if counted_delta {
+        runtime_refuse(
+            runtime,
+            r,
+            "RecordCodecBuilder callback invoked a counted unknown call".into(),
+        )?;
+        runtime.host.unknown_operand_call(r)?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
+    }
+    let Some(app) = app_opt else {
         runtime_refuse(
             runtime,
             r,
             "RecordCodecBuilder callback returned null".into(),
         )?;
-        return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
+        runtime.host.unknown_operand_call(r)?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
     };
     if matches!(app, Value::Ref(None) | Value::Void) {
-        runtime.host.dfu_codec_refused(format!(
-            "{}#{}{}: RecordCodecBuilder callback returned null",
-            r.owner, r.name, r.descriptor
-        ));
-        return Ok(Some(crate::runtime::host_codec::opaque_codec(CODEC)));
-    }
-    if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) {
-        return runtime_refuse(
+        runtime_refuse(
             runtime,
             r,
-            "RecordCodecBuilder callback did not return an App node".into(),
-        );
+            "RecordCodecBuilder callback returned null".into(),
+        )?;
+        runtime.host.unknown_operand_call(r)?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
+    }
+    if !matches!(tag(&app).as_deref(), Some(APPLIED) | Some(POINT)) || is_opaque_app(&app) {
+        runtime_refuse(
+            runtime,
+            r,
+            if is_opaque_app(&app) {
+                "RecordCodecBuilder callback returned an opaque App node".into()
+            } else {
+                "RecordCodecBuilder callback did not return an App node".into()
+            },
+        )?;
+        runtime.host.unknown_operand_call(r)?;
+        return Ok(Some(crate::runtime::host_codec::opaque_codec(declared)));
     }
     match node(runtime.host, output_tag, vec![app]) {
         Ok(value) => Ok(Some(value)),
-        Err(reason) => runtime_refuse(runtime, r, reason),
+        Err(reason) => {
+            runtime_refuse(runtime, r, reason)?;
+            runtime.host.unknown_operand_call(r)?;
+            Ok(Some(crate::runtime::host_codec::opaque_codec(declared)))
+        }
     }
 }
 
@@ -847,19 +918,22 @@ pub(crate) fn runtime_instance_call<H: Host>(
         let Some(receiver) = receiver else {
             return Ok(None);
         };
-        return Ok(Some(match runtime.read_data_result(receiver) {
-            Ok(Value::Ref(None)) => crate::runtime::empty_optional(),
-            Ok(value) => crate::runtime::optional_wrap(value),
-            Err(_) => crate::runtime::empty_optional(),
-        }));
+        return Ok(match runtime.read_data_result(receiver) {
+            Ok(Value::Ref(None)) => Some(crate::runtime::empty_optional()),
+            Ok(value) => Some(crate::runtime::optional_wrap(value)),
+            Err(None) => Some(crate::runtime::empty_optional()),
+            Err(Some(_)) => None,
+        });
     }
     if r.owner == DATA_RESULT && r.name == "isSuccess" && r.descriptor == "()Z" {
         let Some(receiver) = receiver else {
             return Ok(None);
         };
-        return Ok(Some(Value::Int(
-            runtime.read_data_result(receiver).is_ok() as i32
-        )));
+        return Ok(match runtime.read_data_result(receiver) {
+            Ok(_) => Some(Value::Int(1)),
+            Err(None) => Some(Value::Int(0)),
+            Err(Some(_)) => None,
+        });
     }
     let Some(receiver) = receiver else {
         return Ok(None);
@@ -917,7 +991,10 @@ pub(crate) fn runtime_instance_call<H: Host>(
                     format!("RecordCodecBuilder group arity {} is outside 1..16", arity),
                 );
             }
-            if args.iter().any(is_opaque_product) {
+            if args
+                .iter()
+                .any(|arg| is_opaque_product(arg) || crate::runtime::host_codec::opaque_codec_type(arg).is_some())
+            {
                 runtime.host.unknown_operand_call(r)?;
                 return Ok(Some(opaque_product(arity)));
             }
@@ -1017,7 +1094,9 @@ pub(crate) fn runtime_instance_call<H: Host>(
             "decode",
             "(Lcom/mojang/serialization/DynamicOps;Lcom/mojang/serialization/MapLike;)Lcom/mojang/serialization/DataResult;",
         ) if tag == UNIT => {
-            let value = unit_value(runtime, &source)?;
+            let Some(value) = unit_value(runtime, &source)? else {
+                return Ok(None);
+            };
             if matches!(value, Value::Ref(None)) {
                 return Err(NativeError::UncaughtException {
                     class: "java/lang/NullPointerException".into(),
@@ -1031,10 +1110,6 @@ pub(crate) fn runtime_instance_call<H: Host>(
             "encode",
             "(Ljava/lang/Object;Lcom/mojang/serialization/DynamicOps;Lcom/mojang/serialization/RecordBuilder;)Lcom/mojang/serialization/RecordBuilder;",
         ) if tag == UNIT => Ok(Some(args.get(2).cloned().unwrap_or(Value::Ref(None)))),
-        ("toString", "()Ljava/lang/String;") => {
-            let value = unit_value(runtime, &source)?;
-            Ok(value_text(runtime, &value)?.map(|text| Value::Ref(Some(format!("Unit[{text}]")))))
-        }
         _ => Ok(None),
     }
 }
@@ -1379,14 +1454,11 @@ fn unit_value_exact<H: Host>(
     source: &Value,
 ) -> Result<Result<Value, crate::runtime::recipe_models::DecodeError>, NativeError> {
     use crate::runtime::recipe_models::DecodeError;
-    let before = runtime.host.counted_unknown_calls();
-    let value = unit_value(runtime, source)?;
-    if runtime.host.counted_unknown_calls() != before {
-        Ok(Err(DecodeError::Unmodelled(
+    match unit_value(runtime, source)? {
+        Some(value) => Ok(Ok(value)),
+        None => Ok(Err(DecodeError::Unmodelled(
             "counted unknown call inside MapCodec.unit supplier".into(),
-        )))
-    } else {
-        Ok(Ok(value))
+        ))),
     }
 }
 

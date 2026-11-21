@@ -119,6 +119,7 @@ mod host_collector;
 mod host_component;
 mod host_config;
 mod host_creative_tab;
+mod pack_order;
 #[cfg(test)]
 mod host_defaults_tests;
 mod host_deferred_register;
@@ -4171,24 +4172,54 @@ impl StdHost {
         self
     }
 
-    /// Ordered `data/` resource layers from lowest priority to highest priority (above vanilla):
-    /// 1. Linked jars in link order (bundled nested deps before their parent jar).
-    /// 2. Primary seeded jar / `with_resource_bytes` `data/` entries.
-    /// 3. Explicit datapack layers added via `add_data_pack_layer` / `with_data_pack_layer`.
+    /// Ordered `data/` resource layers from lowest priority to highest priority (above vanilla),
+    /// following Minecraft 26.3 `PackRepository` + `fabric-resource-loader-v1` 3.1.0 (`pack_order.rs`):
+    /// 1. Fabric mod packs (primary seeded jar, linked jars, and nested JiJ jars) via
+    ///    `ModPackResourcesUtil.getModResourcePacks` / `ModPackResourcesSorter` / `NodeSorting`
+    ///    and MC 26.3 `PackRepository.discoverAvailable` + `refreshAutoEnabledPacks`.
+    /// 2. Non-Fabric / bare `with_resource_bytes` layers (when no Fabric mod metadata exists).
+    /// 3. Explicit world/external datapack layers added via `add_data_pack_layer`.
+    pub(crate) fn ordered_data_packs(&self) -> pack_order::OrderedDataPacks<'_> {
+        let primary_mod_id = self
+            .own_mod_id
+            .as_deref()
+            .filter(|id| self.fabric_metadata.contains_key(*id));
+        let primary_load_order = primary_mod_id
+            .and_then(|id| self.fabric_metadata.get(id))
+            .and_then(|doc| doc.get("custom"))
+            .and_then(|custom| custom.get("fabric:resource_load_order"));
+        let mut all_loaded_mod_ids: BTreeSet<String> = self
+            .fabric_metadata
+            .keys()
+            .chain(self.mods.keys())
+            .cloned()
+            .collect();
+        for builtin in ["java", "minecraft", "fabricloader", "mixinextras"] {
+            all_loaded_mod_ids.insert(builtin.to_owned());
+        }
+        for provided in dependencies::HOST_PROVIDED_MODS {
+            if !matches!(*provided, "neoforge" | "forge") {
+                all_loaded_mod_ids.insert((*provided).to_owned());
+            }
+        }
+        pack_order::resolve_data_pack_order(
+            self.linked_classes.data_layers(),
+            primary_mod_id,
+            primary_load_order,
+            &self.primary_data_layer,
+            &all_loaded_mod_ids,
+            &self.data_pack_layers,
+        )
+    }
+
     pub(crate) fn ordered_data_layers(&self) -> Vec<(&str, &BTreeMap<String, Vec<u8>>)> {
-        let mut layers = Vec::with_capacity(
-            self.linked_classes.data_layers().len() + 1 + self.data_pack_layers.len(),
-        );
-        for (id, map) in self.linked_classes.data_layers() {
-            layers.push((id.as_str(), map));
-        }
-        if !self.primary_data_layer.is_empty() {
-            layers.push(("primary", &self.primary_data_layer));
-        }
-        for (id, map) in &self.data_pack_layers {
-            layers.push((id.as_str(), map));
-        }
-        layers
+        self.ordered_data_packs().layers
+    }
+
+    /// Stage-1 `ModPackResourcesUtil.getModResourcePacks` / `ModPackResourcesSorter` mod order
+    /// (lowest -> highest priority) for the currently seeded/linked Fabric mods.
+    pub fn mod_pack_sorter_order(&self) -> Vec<String> {
+        self.ordered_data_packs().sorter_mod_order
     }
 
     /// The text the jar wrote to `System.out` since the last call, and forget
@@ -4661,28 +4692,11 @@ impl StdHost {
         id: impl Into<String>,
         jar: &NativeJar,
     ) -> Result<usize, NativeError> {
-        // In datapack priority, bundled nested dependencies sit below their parent mod
-        // so the parent's `data/` resources override its bundled libraries.
-        let parent_layer_pos = self.linked_classes.data_layers().len();
         let added = self.link_jar_with_nesting(id, jar, false)?;
-        let parent_layer = if self.linked_classes.data_layers().len() > parent_layer_pos {
-            Some(
-                Arc::make_mut(&mut self.linked_classes)
-                    .data_layers
-                    .remove(parent_layer_pos),
-            )
-        } else {
-            None
-        };
         for nested in nested_jars::link_nested_jars(self, jar) {
             if let Err(error) = nested.result {
                 return Err(NativeError::Metadata(error));
             }
-        }
-        if let Some(layer) = parent_layer {
-            Arc::make_mut(&mut self.linked_classes)
-                .data_layers
-                .push(layer);
         }
         self.resource_generation = self.resource_generation.wrapping_add(1);
         Ok(added)
@@ -18006,8 +18020,8 @@ pub struct LinkedClassTable {
     /// Each linked jar's resources by name, with the marker the host answers
     /// for them (`linked_resources.rs`).
     resources: BTreeMap<String, (String, Vec<u8>)>,
-    /// Ordered per-jar `data/` resource layers for datapack recipe/tag resolution.
-    data_layers: Vec<(String, BTreeMap<String, Vec<u8>>)>,
+    /// Per-jar `data/` resource layers with Fabric metadata for datapack recipe/tag ordering.
+    data_layers: Vec<pack_order::JarDataLayer>,
 }
 
 impl LinkedClassTable {

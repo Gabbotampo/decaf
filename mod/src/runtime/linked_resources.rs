@@ -18,7 +18,7 @@ use super::*;
 
 impl LinkedClassTable {
     /// Keep `jar`'s resources whose names no earlier jar in the table took (for classpath lookup),
-    /// and record `jar`'s `data/` resources as an ordered datapack layer for recipe/tag loading.
+    /// and record `jar`'s `data/` resources with its Fabric metadata for pack-ordered recipe/tag loading.
     pub(crate) fn link_resources(&mut self, id: &str, jar: &NativeJar) {
         let mut data_layer = BTreeMap::new();
         for (name, bytes) in &jar.resource_bytes {
@@ -33,7 +33,28 @@ impl LinkedClassTable {
                 .or_insert_with(|| (format!("resource-bytes/{name}"), bytes.clone()));
         }
         if !data_layer.is_empty() {
-            self.data_layers.push((id.to_owned(), data_layer));
+            let fabric_doc = jar
+                .resource_bytes
+                .get("fabric.mod.json")
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok());
+            let fabric_mod_id = jar.fabric_id.clone().or_else(|| {
+                fabric_doc
+                    .as_ref()
+                    .and_then(|doc| doc.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+            let resource_load_order = fabric_doc
+                .as_ref()
+                .and_then(|doc| doc.get("custom"))
+                .and_then(|custom| custom.get("fabric:resource_load_order"))
+                .cloned();
+            self.data_layers.push(crate::runtime::pack_order::JarDataLayer {
+                link_id: id.to_owned(),
+                fabric_mod_id,
+                resource_load_order,
+                resources: data_layer,
+            });
         }
     }
 
@@ -44,13 +65,20 @@ impl LinkedClassTable {
             .map(|(marker, bytes)| (marker.as_str(), bytes.as_slice()))
     }
 
-    /// Ordered `data/` resource layers across all linked jars (lowest to highest priority).
-    pub(crate) fn data_layers(&self) -> &[(String, BTreeMap<String, Vec<u8>>)] {
+    /// Per-jar `data/` resource layers across all linked/nested jars.
+    pub(crate) fn data_layers(&self) -> &[crate::runtime::pack_order::JarDataLayer] {
         &self.data_layers
+    }
+
+    /// Remove any linked/nested data layer owned by `mod_id` when Fabric replaces an older nested
+    /// container with a newer or top-level container.
+    pub(crate) fn remove_fabric_data_layer(&mut self, mod_id: &str) {
+        self.data_layers
+            .retain(|layer| layer.fabric_mod_id.as_deref() != Some(mod_id));
     }
 
     /// Total `data/` entries across all linked jar layers (used for cache invalidation).
     pub(crate) fn data_layer_entry_count(&self) -> usize {
-        self.data_layers.iter().map(|(_, m)| m.len()).sum()
+        self.data_layers.iter().map(|layer| layer.resources.len()).sum()
     }
 }

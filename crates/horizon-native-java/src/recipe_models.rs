@@ -735,6 +735,24 @@ pub(crate) fn resolve_item_tag(host: &StdHost, raw_tag_id: &str) -> Option<BTree
     resolve_item_tag_inner(host, &tag_id, &mut visiting)
 }
 
+/// Resolve an item tag while counting any unsupported `fabric:resource_load_order` constraint
+/// forms present on loaded Fabric mods.
+fn resolve_item_tag_checked(
+    host: &mut StdHost,
+    raw_tag_id: &str,
+) -> Result<Option<BTreeSet<String>>, NativeError> {
+    let unsupported: Vec<MethodRef> = host
+        .ordered_data_packs()
+        .unsupported_constraints
+        .into_iter()
+        .map(|c| c.method_ref())
+        .collect();
+    for mref in unsupported {
+        host.unknown_host_call(&mref)?;
+    }
+    Ok(resolve_item_tag(host, raw_tag_id))
+}
+
 fn resolve_item_tag_inner(
     host: &StdHost,
     tag_id: &str,
@@ -1712,9 +1730,13 @@ fn live_stack_instance_call(
             if reg != "minecraft:item" {
                 return Some(Ok(Value::Int(0)));
             }
-            let matched =
-                resolve_item_tag(host, &loc).is_some_and(|members| members.contains(&live.item_id));
-            Some(Ok(Value::Int(i32::from(matched))))
+            match resolve_item_tag_checked(host, &loc) {
+                Ok(members) => {
+                    let matched = members.is_some_and(|set| set.contains(&live.item_id));
+                    Some(Ok(Value::Int(i32::from(matched))))
+                }
+                Err(err) => Some(Err(err)),
+            }
         }
         ("getComponentsPatch", "()Lnet/minecraft/core/component/DataComponentPatch;") => {
             if live.is_empty() || live.patch.is_empty() {
@@ -2288,7 +2310,7 @@ fn recipe_key_id(key: &Value) -> Option<Option<String>> {
 pub(crate) fn ensure_recipes_loaded<H: Host>(
     runtime: &mut Runtime<'_, H>,
 ) -> Result<(), NativeError> {
-    let (fingerprint, serializer_codecs, recipe_entries) = {
+    let (fingerprint, serializer_codecs, recipe_entries, unsupported_pack_order) = {
         let Some(std_host) = runtime.host.as_std_host() else {
             return Ok(());
         };
@@ -2309,18 +2331,29 @@ pub(crate) fn ensure_recipes_loaded<H: Host>(
                 ser_codecs.insert(entry.id.clone(), codec);
             }
         }
-        // Build ordered layer map (lowest -> highest priority): later packs override earlier packs
-        // for duplicate recipe ids while retaining source-pack provenance.
+        // Build ordered layer map (lowest -> highest priority) per MC 26.3 PackRepository +
+        // fabric-resource-loader-v1 (`pack_order.rs`): later packs override earlier packs for
+        // duplicate recipe ids while retaining source-pack provenance.
+        let ordered = std_host.ordered_data_packs();
+        let unsupported: Vec<MethodRef> = ordered
+            .unsupported_constraints
+            .into_iter()
+            .map(|c| c.method_ref())
+            .collect();
         let mut by_id: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
-        for (pack_id, layer) in std_host.ordered_data_layers() {
+        for (pack_id, layer) in ordered.layers {
             for (path, bytes) in layer {
                 if let Some(id) = parse_recipe_resource_id(path) {
                     by_id.insert(id, (pack_id.to_owned(), bytes.clone()));
                 }
             }
         }
-        (fp, ser_codecs, by_id)
+        (fp, ser_codecs, by_id, unsupported)
     };
+
+    for mref in unsupported_pack_order {
+        runtime.host.unknown_operand_call(&mref)?;
+    }
 
     let mut loaded_recipes = Vec::new();
     let mut errors = Vec::new();

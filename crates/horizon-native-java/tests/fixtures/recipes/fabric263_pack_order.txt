@@ -1,0 +1,11 @@
+SORTER_MOD_ORDER=[bad_form, cyc_a, cyc_b, mod_b, mod_c, mod_a, mod_y, mod_z, mod_x, nested_aaa, nested_zzz]
+RM_PACK_ORDER=[vanilla, bad_form, cyc_a, cyc_b, mod_a, mod_b, mod_c, mod_x, mod_y, mod_z, nested_aaa, nested_zzz, file/dp_override]
+BEFORE_RECIPE_WINNER=mod_c
+BEFORE_TAG_STACK=[mod_a, mod_b, mod_c]
+AFTER_RECIPE_WINNER=mod_z
+AFTER_TAG_STACK=[mod_x, mod_y, mod_z]
+NESTED_RECIPE_WINNER=nested_zzz
+NESTED_TAG_STACK=[mod_a, mod_c, nested_aaa, nested_zzz]
+DP_RECIPE_WINNER=file/dp_override
+DP_TAG_STACK=[mod_a, mod_c, file/dp_override]
+SELF_DEP=java.lang.IllegalArgumentException: Tried to add a phase that depends on itself.

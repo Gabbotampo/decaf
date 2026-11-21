@@ -67,15 +67,34 @@ const STUBS: &[(&str, &str)] = &[
          }",
     ),
     (
+        "com/mojang/serialization/DynamicOps.java",
+        "package com.mojang.serialization; public interface DynamicOps<T> {}",
+    ),
+    (
+        "com/mojang/serialization/MapLike.java",
+        "package com.mojang.serialization; public interface MapLike<T> {}",
+    ),
+    (
+        "com/mojang/serialization/DataResult.java",
+        "package com.mojang.serialization;\n\
+         import java.util.Optional;\n\
+         public interface DataResult<R> {\n\
+           Optional<R> result();\n\
+           boolean isSuccess();\n\
+         }",
+    ),
+    (
         "com/mojang/serialization/MapCodec.java",
         "package com.mojang.serialization;\n\
          import com.mojang.serialization.codecs.RecordCodecBuilder;\n\
-         import java.util.function.Function;\n\
+         import java.util.function.Function; import java.util.function.Supplier;\n\
          public abstract class MapCodec<A> {\n\
            public static <A> MapCodec<A> unit(A defaultValue) { return null; }\n\
+           public static <A> MapCodec<A> unit(Supplier<A> defaultValue) { return null; }\n\
            public <O> RecordCodecBuilder<O, A> forGetter(Function<O, A> getter) { return null; }\n\
            public <S> MapCodec<S> xmap(Function<? super A, ? extends S> to, Function<? super S, ? extends A> from) { return null; }\n\
            public Codec<A> codec() { return null; }\n\
+           public abstract <T> DataResult<A> decode(DynamicOps<T> ops, MapLike<T> input);\n\
          }",
     ),
     (
@@ -95,6 +114,7 @@ const STUBS: &[(&str, &str)] = &[
                App<Mu<O>,T1> t1, App<Mu<O>,T2> t2, App<Mu<O>,T3> t3,\n\
                App<Mu<O>,T4> t4, App<Mu<O>,T5> t5, App<Mu<O>,T6> t6, App<Mu<O>,T7> t7) { return null; }\n\
            }\n\
+           public static <O> Codec<O> create(Function<Instance<O>, ? extends App<Mu<O>, O>> builder) { return null; }\n\
            public static <O> MapCodec<O> mapCodec(Function<Instance<O>, ? extends App<Mu<O>, O>> builder) { return null; }\n\
          }",
     ),
@@ -1700,5 +1720,584 @@ public final class ComponentCountedProbe {
         unknowns.get("net/minecraft/world/item/ItemStackTemplate#create()Lnet/minecraft/world/item/ItemStack;"),
         Some(&1),
         "unknowns={unknowns:?}"
+    );
+}
+
+fn pack_in_memory_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+/// Three-mod + nested-JiJ + world-datapack fixture where link order, primary-jar status,
+/// alphabetical mod-id order, and `fabric:resource_load_order` constraints all disagree.
+/// Verified against the real Fabric 26.3 (`fabric-resource-loader-v1` 3.1.0 + `server-26.3.jar`)
+/// server capture in `tests/fixtures/recipes/fabric263_pack_order.txt`.
+#[test]
+fn fabric_pack_order_matches_real_fabric_263_oracle() {
+    const FABRIC_ORACLE: &str = include_str!("fixtures/recipes/fabric263_pack_order.txt");
+    let oracle: BTreeMap<&str, &str> = FABRIC_ORACLE
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+
+    let mut probe_sources = STUBS.to_vec();
+    probe_sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    probe_sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    probe_sources.push((
+        "demo/PackOrderProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class PackOrderProbe {
+  public static String SUMMARY;
+  private static int recipeTier(RecipeManager mgr, String id) {
+    AlloyRecipe r = (AlloyRecipe) mgr.byKey(
+        ResourceKey.create(Registries.RECIPE, Identifier.parse(id))).get().value();
+    return r.tier;
+  }
+  private static boolean tagMatches(RecipeManager mgr, String id, Item item) {
+    AlloyRecipe r = (AlloyRecipe) mgr.byKey(
+        ResourceKey.create(Registries.RECIPE, Identifier.parse(id))).get().value();
+    return r.matches(new AlloyInput(new ItemStack(item), new ItemStack(Items.COAL)), null);
+  }
+  public static void onInitialize() {
+    Identifier id = Identifier.parse("demo:alloy");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, id, AlloyRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, id, AlloyRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      // For shared_before: mod_a adds iron_ingot, mod_b replaces with gold_ingot, mod_c appends diamond.
+      // Because real Fabric 26.3 applies [mod_a, mod_b, mod_c], mod_b's replace:true wipes iron_ingot
+      // and mod_c appends diamond -> iron=false, gold=true, diamond=true!
+      boolean beforeIron = tagMatches(mgr, "demo:shared_before", Items.IRON_INGOT);
+      boolean beforeGold = tagMatches(mgr, "demo:shared_before", Items.GOLD_INGOT);
+      boolean beforeDiamond = tagMatches(mgr, "demo:shared_before", Items.DIAMOND);
+      // For shared_after: mod_x adds iron, mod_y replaces with gold, mod_z appends diamond.
+      boolean afterIron = tagMatches(mgr, "demo:shared_after", Items.IRON_INGOT);
+      boolean afterGold = tagMatches(mgr, "demo:shared_after", Items.GOLD_INGOT);
+      boolean afterDiamond = tagMatches(mgr, "demo:shared_after", Items.DIAMOND);
+      // For shared_nested: mod_a adds iron, mod_c adds diamond, nested_aaa replaces with quartz,
+      // nested_zzz appends emerald -> iron=false, diamond=false, quartz=true, emerald=true!
+      boolean nestedIron = tagMatches(mgr, "demo:shared_nested", Items.IRON_INGOT);
+      boolean nestedQuartz = tagMatches(mgr, "demo:shared_nested", Items.QUARTZ);
+      boolean nestedEmerald = tagMatches(mgr, "demo:shared_nested", Items.EMERALD);
+      // For shared_dp: file/dp_override replaces with coal -> iron=false, diamond=false, coal=true!
+      boolean dpDiamond = tagMatches(mgr, "demo:shared_dp", Items.DIAMOND);
+      boolean dpCoal = tagMatches(mgr, "demo:shared_dp", Items.COAL);
+      SUMMARY = "before=" + recipeTier(mgr, "demo:shared_before")
+          + "(" + beforeIron + "," + beforeGold + "," + beforeDiamond + ")"
+          + "|after=" + recipeTier(mgr, "demo:shared_after")
+          + "(" + afterIron + "," + afterGold + "," + afterDiamond + ")"
+          + "|nested=" + recipeTier(mgr, "demo:shared_nested")
+          + "(" + nestedIron + "," + nestedQuartz + "," + nestedEmerald + ")"
+          + "|dp=" + recipeTier(mgr, "demo:shared_dp")
+          + "(" + dpDiamond + "," + dpCoal + ")";
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    let nested_zzz_bytes = pack_in_memory_zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"schemaVersion":1,"id":"nested_zzz","version":"1.0.0"}"#,
+        ),
+        (
+            "data/demo/recipe/shared_nested.json",
+            br##"{"type":"demo:alloy","base":"#demo:shared_nested","catalyst":"minecraft:coal","result":"minecraft:stick","tier":40}"##,
+        ),
+        (
+            "data/demo/tags/item/shared_nested.json",
+            br#"{"values":["minecraft:emerald"]}"#,
+        ),
+    ]);
+    let nested_aaa_bytes = pack_in_memory_zip(&[
+        (
+            "fabric.mod.json",
+            br#"{"schemaVersion":1,"id":"nested_aaa","version":"1.0.0"}"#,
+        ),
+        (
+            "data/demo/recipe/shared_nested.json",
+            br##"{"type":"demo:alloy","base":"#demo:shared_nested","catalyst":"minecraft:coal","result":"minecraft:stick","tier":30}"##,
+        ),
+        (
+            "data/demo/tags/item/shared_nested.json",
+            br#"{"replace":true,"values":["minecraft:quartz"]}"#,
+        ),
+    ]);
+
+    // Primary seeded jar is `mod_b` (so naive "primary jar wins" would wrongly pick mod_b!).
+    let mod_b = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-b",
+        &probe_sources,
+        r#"{"schemaVersion":1,"id":"mod_b","version":"1.0.0","entrypoints":{"main":"demo.PackOrderProbe"}}"#,
+        &[
+            (
+                "data/demo/recipe/shared_before.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_before","catalyst":"minecraft:coal","result":"minecraft:stick","tier":2}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_before.json",
+                br#"{"replace":true,"values":["minecraft:gold_ingot"]}"#,
+            ),
+        ],
+    );
+
+    // `mod_a` declares `before: ["mod_c"]` (so Stage-1 ModPackResourcesSorter puts mod_a AFTER mod_c)
+    // and bundles `nested_zzz` (which sits ABOVE mod_a and mod_c in real Fabric 26.3!).
+    let mod_a = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-a",
+        &[("dummy/A.java", "package dummy; public class A {}")],
+        r#"{"schemaVersion":1,"id":"mod_a","version":"1.0.0","jars":[{"file":"META-INF/jars/nested_zzz.jar"}],"custom":{"fabric:resource_load_order":{"before":["mod_c"]}}}"#,
+        &[
+            ("META-INF/jars/nested_zzz.jar", nested_zzz_bytes.as_slice()),
+            (
+                "data/demo/recipe/shared_before.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_before","catalyst":"minecraft:coal","result":"minecraft:stick","tier":1}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_before.json",
+                br#"{"values":["minecraft:iron_ingot"]}"#,
+            ),
+            (
+                "data/demo/recipe/shared_nested.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_nested","catalyst":"minecraft:coal","result":"minecraft:stick","tier":10}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_nested.json",
+                br#"{"values":["minecraft:iron_ingot"]}"#,
+            ),
+            (
+                "data/demo/recipe/shared_dp.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_dp","catalyst":"minecraft:coal","result":"minecraft:stick","tier":100}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_dp.json",
+                br#"{"values":["minecraft:iron_ingot"]}"#,
+            ),
+        ],
+    );
+
+    // `mod_c` is linked FIRST (disagreeing with id order!) and bundles `nested_aaa`.
+    let mod_c = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-c",
+        &[("dummy/C.java", "package dummy; public class C {}")],
+        r#"{"schemaVersion":1,"id":"mod_c","version":"1.0.0","jars":[{"file":"META-INF/jars/nested_aaa.jar"}]}"#,
+        &[
+            ("META-INF/jars/nested_aaa.jar", nested_aaa_bytes.as_slice()),
+            (
+                "data/demo/recipe/shared_before.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_before","catalyst":"minecraft:coal","result":"minecraft:stick","tier":3}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_before.json",
+                br#"{"values":["minecraft:diamond"]}"#,
+            ),
+            (
+                "data/demo/recipe/shared_nested.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_nested","catalyst":"minecraft:coal","result":"minecraft:stick","tier":20}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_nested.json",
+                br#"{"values":["minecraft:diamond"]}"#,
+            ),
+            (
+                "data/demo/recipe/shared_dp.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_dp","catalyst":"minecraft:coal","result":"minecraft:stick","tier":200}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_dp.json",
+                br#"{"values":["minecraft:diamond"]}"#,
+            ),
+        ],
+    );
+
+    // Three more mods for `after`: `mod_z` declares `after: ["mod_x"]`, linked in order z, x, y.
+    let mod_x = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-x",
+        &[("dummy/X.java", "package dummy; public class X {}")],
+        r#"{"schemaVersion":1,"id":"mod_x","version":"1.0.0"}"#,
+        &[
+            (
+                "data/demo/recipe/shared_after.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_after","catalyst":"minecraft:coal","result":"minecraft:stick","tier":11}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_after.json",
+                br#"{"values":["minecraft:iron_ingot"]}"#,
+            ),
+        ],
+    );
+    let mod_y = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-y",
+        &[("dummy/Y.java", "package dummy; public class Y {}")],
+        r#"{"schemaVersion":1,"id":"mod_y","version":"1.0.0"}"#,
+        &[
+            (
+                "data/demo/recipe/shared_after.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_after","catalyst":"minecraft:coal","result":"minecraft:stick","tier":12}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_after.json",
+                br#"{"replace":true,"values":["minecraft:gold_ingot"]}"#,
+            ),
+        ],
+    );
+    let mod_z = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "pack-order-mod-z",
+        &[("dummy/Z.java", "package dummy; public class Z {}")],
+        r#"{"schemaVersion":1,"id":"mod_z","version":"1.0.0","custom":{"fabric:resource_load_order":{"after":["mod_x"]}}}"#,
+        &[
+            (
+                "data/demo/recipe/shared_after.json",
+                br##"{"type":"demo:alloy","base":"#demo:shared_after","catalyst":"minecraft:coal","result":"minecraft:stick","tier":13}"##,
+            ),
+            (
+                "data/demo/tags/item/shared_after.json",
+                br#"{"values":["minecraft:diamond"]}"#,
+            ),
+        ],
+    );
+
+    // Seed `mod_b` as primary jar, then link in deliberately scrambled order: mod_c, mod_a, mod_z, mod_x, mod_y.
+    let mut host = mod_b.jar.seed_host(StdHost::new());
+    host.link_jar("link-first-c", &mod_c.jar).unwrap();
+    host.link_jar("link-second-a", &mod_a.jar).unwrap();
+    host.link_jar("link-third-z", &mod_z.jar).unwrap();
+    host.link_jar("link-fourth-x", &mod_x.jar).unwrap();
+    host.link_jar("link-fifth-y", &mod_y.jar).unwrap();
+
+    // Add world datapack above all mods.
+    let mut dp = BTreeMap::new();
+    dp.insert(
+        "data/demo/recipe/shared_dp.json".to_owned(),
+        br##"{"type":"demo:alloy","base":"#demo:shared_dp","catalyst":"minecraft:coal","result":"minecraft:stick","tier":300}"##
+            .to_vec(),
+    );
+    dp.insert(
+        "data/demo/tags/item/shared_dp.json".to_owned(),
+        br#"{"replace":true,"values":["minecraft:coal"]}"#.to_vec(),
+    );
+    host.add_data_pack_layer("file/dp_override", dp);
+
+    // Stage 1 ModPackResourcesSorter order matches `SORTER_MOD_ORDER` from real Fabric 26.3:
+    // mod_a (before: ["mod_c"]) sits after mod_c; mod_x sits after mod_z (after: ["mod_x"]).
+    assert_eq!(
+        host.mod_pack_sorter_order(),
+        vec![
+            "mod_b",
+            "mod_c",
+            "mod_a",
+            "mod_y",
+            "mod_z",
+            "mod_x",
+            "nested_aaa",
+            "nested_zzz",
+        ]
+    );
+    assert!(
+        oracle["SORTER_MOD_ORDER"]
+            .contains("mod_b, mod_c, mod_a, mod_y, mod_z, mod_x, nested_aaa, nested_zzz"),
+        "oracle SORTER_MOD_ORDER={}",
+        oracle["SORTER_MOD_ORDER"]
+    );
+
+    mod_b
+        .jar
+        .execute("demo.PackOrderProbe", None, "main", &mut host)
+        .unwrap();
+    fire_use_item(&mod_b.jar, &mut host);
+
+    let sources: BTreeMap<String, String> = host.loaded_recipe_sources().into_iter().collect();
+    assert_eq!(
+        sources["demo:shared_before"],
+        oracle["BEFORE_RECIPE_WINNER"]
+    );
+    assert_eq!(sources["demo:shared_after"], oracle["AFTER_RECIPE_WINNER"]);
+    assert_eq!(
+        sources["demo:shared_nested"],
+        oracle["NESTED_RECIPE_WINNER"]
+    );
+    assert_eq!(sources["demo:shared_dp"], oracle["DP_RECIPE_WINNER"]);
+
+    let statics = host.persistent_class_state().0;
+    assert_eq!(
+        statics.get("demo/PackOrderProbe#SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some(
+            "before=3(false,true,true)|after=13(false,true,true)|nested=40(false,true,true)|dp=300(false,true)".into()
+        )))
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "expected zero unknown calls, got {:?}",
+        host.unknown_host_calls()
+    );
+}
+
+#[test]
+fn unsupported_resource_load_order_constraints_are_counted() {
+    let mut sources = STUBS.to_vec();
+    sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    sources.push((
+        "demo/BadOrderProbe.java",
+        r#"
+package demo;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class BadOrderProbe {
+  public static void onInitialize() {
+    Identifier id = Identifier.parse("demo:alloy");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, id, AlloyRecipe.TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, id, AlloyRecipe.SERIALIZER);
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:r")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    let bad_obj = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "bad-load-order-obj",
+        &sources,
+        r#"{"schemaVersion":1,"id":"bad_obj","version":"1.0.0","entrypoints":{"main":"demo.BadOrderProbe"},"custom":{"fabric:resource_load_order":"not_an_object"}}"#,
+        &[(
+            "data/demo/recipe/r.json",
+            br#"{"type":"demo:alloy","base":"minecraft:iron_ingot","catalyst":"minecraft:coal","result":"minecraft:stick","tier":1}"#,
+        )],
+    );
+    let self_dep = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "bad-load-order-self",
+        &[("dummy/S.java", "package dummy; public class S {}")],
+        r#"{"schemaVersion":1,"id":"self_mod","version":"1.0.0","custom":{"fabric:resource_load_order":{"before":["self_mod"],"after":123,"priority":1}}}"#,
+        &[(
+            "data/demo/recipe/s.json",
+            br#"{"type":"demo:alloy","base":"minecraft:gold_ingot","catalyst":"minecraft:coal","result":"minecraft:stick","tier":2}"#,
+        )],
+    );
+
+    let mut host = bad_obj.jar.seed_host(StdHost::new());
+    host.link_jar("self_mod", &self_dep.jar).unwrap();
+    bad_obj
+        .jar
+        .execute("demo.BadOrderProbe", None, "main", &mut host)
+        .unwrap();
+    fire_use_item(&bad_obj.jar, &mut host);
+
+    let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+    assert_eq!(
+        unknowns.get(
+            "net/fabricmc/fabric/impl/resource/pack/ModPackResourcesUtil#addLoadOrdering(Lnet/fabricmc/loader/api/metadata/CustomValue$CvObject;Ljava/util/List;Lnet/fabricmc/fabric/impl/resource/pack/ModPackResourcesSorter;Lnet/fabricmc/fabric/impl/resource/pack/ModPackResourcesUtil$Order;Ljava/lang/String;)V"
+        ),
+        Some(&3),
+        "expected non-object + unknown key + non-string/array target to be counted (3 total), got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get(
+            "net/fabricmc/fabric/impl/resource/pack/ModPackResourcesSorter#addLoadOrdering(Ljava/lang/String;Ljava/lang/String;Lnet/fabricmc/fabric/impl/resource/pack/ModPackResourcesUtil$Order;)V"
+        ),
+        Some(&1),
+        "expected self-dependency to be counted, got {unknowns:?}"
+    );
+}
+
+#[test]
+fn record_codec_builder_and_unit_callbacks_with_counted_calls_refuse_and_count() {
+    let mut sources = STUBS.to_vec();
+    sources.push(("demo/AlloyInput.java", DEMO_RECIPE_INPUT));
+    sources.push(("demo/AlloyRecipe.java", DEMO_RECIPE));
+    sources.push((
+        "com/example/ExternalUnmodelled.java",
+        "package com.example; public final class ExternalUnmodelled { public static int sideEffect() { return 7; } }",
+    ));
+    sources.push((
+        "demo/CountedCodecCallbacks.java",
+        r#"
+package demo;
+import com.example.ExternalUnmodelled;
+import com.mojang.serialization.*;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.*;
+import net.minecraft.resources.*;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.*;
+import net.minecraft.world.item.*;
+import net.minecraft.world.item.crafting.*;
+
+public final class CountedCodecCallbacks {
+  public static final RecipeType<BadBuilderRecipe> TYPE = new RecipeType<>() {};
+  public static final MapCodec<BadBuilderRecipe> MAP_CODEC = RecordCodecBuilder.mapCodec(i -> {
+    // Calls an unmodelled method yet still returns a valid-looking App!
+    ExternalUnmodelled.sideEffect();
+    return i.group(
+        Codec.INT.fieldOf("tier").forGetter(r -> r.tier)
+    ).apply(i, BadBuilderRecipe::new);
+  });
+  public static final Codec<BadBuilderRecipe> VALUE_CODEC = RecordCodecBuilder.create(i -> {
+    ExternalUnmodelled.sideEffect();
+    return i.group(
+        Codec.INT.fieldOf("tier").forGetter(r -> r.tier)
+    ).apply(i, BadBuilderRecipe::new);
+  });
+  public static final RecipeSerializer<BadBuilderRecipe> SERIALIZER =
+      new RecipeSerializer<>(MAP_CODEC, null);
+  public static String UNIT_SUMMARY;
+
+  public static final class BadBuilderRecipe implements Recipe<AlloyInput> {
+    public final int tier;
+    public BadBuilderRecipe(int tier) { this.tier = tier; }
+    public boolean matches(AlloyInput in, net.minecraft.world.level.Level lvl) { return true; }
+    public ItemStack assemble(AlloyInput in) { return new ItemStack(Items.STICK); }
+    public RecipeSerializer<? extends Recipe<AlloyInput>> getSerializer() { return SERIALIZER; }
+    public RecipeType<? extends Recipe<AlloyInput>> getType() { return TYPE; }
+  }
+
+  public static void onInitialize() {
+    Identifier id = Identifier.parse("demo:bad_builder");
+    Registry.register(BuiltInRegistries.RECIPE_TYPE, id, TYPE);
+    Registry.register(BuiltInRegistries.RECIPE_SERIALIZER, id, SERIALIZER);
+
+    // Chaining on the refused VALUE_CODEC must stay counted (opaque).
+    VALUE_CODEC.fieldOf("wrapped");
+
+    // MapCodec.unit(Supplier) whose supplier invokes an unmodelled call and still returns "ok":
+    // both decode() and toString() (on MapCodec and its .codec()) must be counted.
+    MapCodec<String> badUnit = MapCodec.unit(() -> {
+      ExternalUnmodelled.sideEffect();
+      return "ok";
+    });
+    DataResult<String> dr = badUnit.decode(null, null);
+    String s1 = badUnit.toString();
+    String s2 = badUnit.codec().toString();
+    UNIT_SUMMARY = (MAP_CODEC != null) + "|" + (VALUE_CODEC != null) + "|" + (dr == null) + "|" + (s1 == null) + "|" + (s2 == null);
+
+    UseItemCallback.EVENT.register((player, level, hand) -> {
+      RecipeManager mgr = ((ServerLevel) level).recipeAccess();
+      mgr.byKey(ResourceKey.create(Registries.RECIPE, Identifier.parse("demo:from_bad_builder")));
+      return InteractionResult.PASS;
+    });
+  }
+}
+"#,
+    ));
+
+    let fixture = javac_fixture::Fixture::build_with_mod_json_and_extra(
+        "recipes-counted-codec-callbacks",
+        &sources,
+        r#"{"schemaVersion":1,"id":"demo","version":"1.0.0","entrypoints":{"main":"demo.CountedCodecCallbacks"}}"#,
+        &[(
+            "data/demo/recipe/from_bad_builder.json",
+            br#"{"type":"demo:bad_builder","tier":5}"#,
+        )],
+    );
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    fixture
+        .jar
+        .execute("demo.CountedCodecCallbacks", None, "main", &mut host)
+        .unwrap();
+    fire_use_item(&fixture.jar, &mut host);
+
+    let unknowns: BTreeMap<String, usize> = host.unknown_host_calls().into_iter().collect();
+    // Both RecordCodecBuilder.mapCodec and RecordCodecBuilder.create must be counted despite returning valid-looking Apps!
+    assert_eq!(
+        unknowns.get(
+            "com/mojang/serialization/codecs/RecordCodecBuilder#mapCodec(Ljava/util/function/Function;)Lcom/mojang/serialization/MapCodec;"
+        ),
+        Some(&1),
+        "expected RecordCodecBuilder.mapCodec to be counted, got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get(
+            "com/mojang/serialization/codecs/RecordCodecBuilder#create(Ljava/util/function/Function;)Lcom/mojang/serialization/Codec;"
+        ),
+        Some(&1),
+        "expected RecordCodecBuilder.create to be counted, got {unknowns:?}"
+    );
+    // Refused VALUE_CODEC is opaque -> fieldOf is counted too.
+    assert_eq!(
+        unknowns.get(
+            "com/mojang/serialization/Codec#fieldOf(Ljava/lang/String;)Lcom/mojang/serialization/MapCodec;"
+        ),
+        Some(&1),
+        "expected fieldOf on refused opaque Codec to be counted, got {unknowns:?}"
+    );
+    // Refused MAP_CODEC is unusable for recipe decode -> decodeRecipe + byKey counted!
+    assert_eq!(
+        unknowns
+            .get("net/minecraft/world/item/crafting/RecipeManager#decodeRecipe(demo:bad_builder)V"),
+        Some(&1),
+        "expected decodeRecipe for refused MapCodec to be counted, got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get(
+            "net/minecraft/world/item/crafting/RecipeManager#byKey(Lnet/minecraft/resources/ResourceKey;)Ljava/util/Optional;"
+        ),
+        Some(&1),
+        "expected byKey for skipped recipe to be counted, got {unknowns:?}"
+    );
+    // MapCodec.unit(Supplier) with counted inner call -> decode + both toString calls counted!
+    assert_eq!(
+        unknowns.get(
+            "com/mojang/serialization/MapCodec#decode(Lcom/mojang/serialization/DynamicOps;Lcom/mojang/serialization/MapLike;)Lcom/mojang/serialization/DataResult;"
+        ),
+        Some(&1),
+        "expected MapCodec.unit.decode to be counted, got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("java/lang/Object#toString()Ljava/lang/String;"),
+        Some(&1),
+        "expected MapCodec.unit.toString to be counted, got {unknowns:?}"
+    );
+    assert_eq!(
+        unknowns.get("com/mojang/serialization/Codec#toString()Ljava/lang/String;"),
+        Some(&1),
+        "expected MapCodec.unit.codec().toString to be counted, got {unknowns:?}"
+    );
+    assert!(
+        host.dfu_codec_refusals()
+            .iter()
+            .any(|msg| msg.contains("RecordCodecBuilder callback invoked a counted unknown call")),
+        "expected DFU refusal record, got {:?}",
+        host.dfu_codec_refusals()
+    );
+    // Refused codecs stayed non-null, while counted unit operations did not invent exact results.
+    let statics = host.persistent_class_state().0;
+    assert_eq!(
+        statics.get("demo/CountedCodecCallbacks#UNIT_SUMMARYLjava/lang/String;"),
+        Some(&horizon_native_java::Value::Ref(Some(
+            "true|true|true|true|true".into()
+        )))
     );
 }
