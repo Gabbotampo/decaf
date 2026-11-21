@@ -3603,6 +3603,9 @@ pub struct StdHost {
     /// Every mutable collection's list, by marker, each with a generation
     /// (`collection_store.rs`).
     mutable_collections: collection_store::CollectionStore,
+    /// Host collections used as the Java `Consumer<Component>` sink while an
+    /// item's own `appendHoverText` runs.
+    tooltip_sinks: BTreeSet<String>,
     guava_tables: guava_table::Store,
     /// O(1) `Collections.nCopies` rows: logical length and the repeated value.
     repeated_collections: BTreeMap<String, (usize, Value)>,
@@ -3885,6 +3888,7 @@ impl StdHost {
             holder_rows: Vec::new(),
             holder_binding: host_registry::Binding::Construct,
             mutable_collections: collection_store::CollectionStore::default(),
+            tooltip_sinks: BTreeSet::new(),
             guava_tables: guava_table::Store::default(),
             repeated_collections: BTreeMap::new(),
             detached_sub_lists: BTreeSet::new(),
@@ -4289,6 +4293,25 @@ impl StdHost {
             self.cached_collections.insert(cache, marker.clone());
         }
         made
+    }
+
+    /// Make a list-backed `Consumer<Component>` for an item's tooltip method.
+    /// The consumer is a host value so Java bytecode can call `accept` without
+    /// inventing a jar callback or losing the component object.
+    pub(crate) fn tooltip_sink(&mut self) -> Value {
+        let sink = self.new_collection("java/util/ArrayList", Vec::new());
+        if let Some(marker) = crate::runtime::expect_ref(&sink) {
+            self.tooltip_sinks.insert(marker.to_owned());
+        }
+        sink
+    }
+
+    pub(crate) fn take_tooltip_sink(&mut self, sink: &Value) -> Vec<Value> {
+        let Some(marker) = crate::runtime::expect_ref(sink) else {
+            return Vec::new();
+        };
+        self.tooltip_sinks.remove(marker);
+        self.mutable_collections.remove(marker).unwrap_or_default()
     }
 
     /// The loader wraps metadata collections in a fresh unmodifiable view,
@@ -8801,6 +8824,19 @@ impl Host for StdHost {
         if let Some(value) = self.menu_instance_call(r, receiver, args) {
             return value;
         }
+        // 26.3's vanilla Item/BlockItem implementation contributes no
+        // additional lines for an otherwise ordinary block item. Mod-owned
+        // overrides still run through the jar and append to the supplied
+        // Consumer, so this is only the exact super-call boundary.
+        if matches!(
+            r.owner.as_str(),
+            "net/minecraft/world/item/Item" | "net/minecraft/world/item/BlockItem"
+        ) && r.name == "appendHoverText"
+            && r.descriptor
+                == "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V"
+        {
+            return Ok(Value::Void);
+        }
         if let Some(value) =
             host_creative_tab::instance_call(&mut self.creative_tab, r, receiver, args)
         {
@@ -12418,6 +12454,22 @@ impl Host for StdHost {
             // gets here), so it counts the call, never answers for the
             // callback (#156 P15a: `apply` used to answer its argument,
             // `test` true for any lambda, `get` null, uncounted).
+            ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
+                if crate::runtime::expect_ref(receiver)
+                    .is_some_and(|marker| self.tooltip_sinks.contains(marker)) =>
+            {
+                let Some(marker) = crate::runtime::expect_ref(receiver) else {
+                    return Err(NativeError::UnknownHostCall(r.clone()));
+                };
+                let Some(value) = args.first().cloned() else {
+                    return Err(NativeError::UnknownHostCall(r.clone()));
+                };
+                self.mutable_collections
+                    .get_mut(marker)
+                    .ok_or_else(|| NativeError::UnknownHostCall(r.clone()))?
+                    .push(value);
+                Ok(Value::Void)
+            }
             ("java/util/function/Consumer", "accept", "(Ljava/lang/Object;)V")
                 if let Some(sides) =
                     callback_marker::composite_operands(receiver, "consumer.then") =>

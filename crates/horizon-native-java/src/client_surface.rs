@@ -113,6 +113,8 @@ use crate::client_values::VEC3;
 const TOOLTIP_LIST: &str = "java/util/ArrayList#client-tooltip";
 const TOOLTIP_CONTEXT: &str = "client/tooltip-context";
 const TOOLTIP_FLAG: &str = "client/tooltip-flag";
+/// The default 26.3 `TooltipDisplay` passed to an item's own tooltip method.
+pub(crate) const TOOLTIP_DISPLAY: &str = "client/tooltip-display";
 /// Lines a tooltip listener may leave; more are cut.
 const MAX_TOOLTIP_LINES: usize = 64;
 
@@ -1990,6 +1992,26 @@ impl StdHost {
                 ("isCreative", "Z") => Some(flag(false)),
                 _ => None,
             },
+            TOOLTIP_CONTEXT => match (name, returns) {
+                // The context is deliberately frame-backed: a mod that asks
+                // for the client level/player sees the same objects as the
+                // tooltip callback, while an absent world remains null.
+                ("level", _) | ("level", "Lnet/minecraft/client/multiplayer/ClientLevel;")
+                    if frame.level.is_some() =>
+                {
+                    Some(marker(LEVEL))
+                }
+                ("player", _) | ("player", "Lnet/minecraft/world/entity/player/Player;")
+                    if frame.player.is_some() =>
+                {
+                    Some(marker(PLAYER))
+                }
+                ("tickRate", "F") => Some(Value::Float(20.0)),
+                _ => None,
+            },
+            // TooltipDisplay's default record has no observable members
+            // needed by vanilla item appenders; unknown access stays counted.
+            TOOLTIP_DISPLAY => None,
             GAME_RENDERER => match (name, returns) {
                 ("getMainCamera" | "mainCamera", _) if frame.camera.is_some() => {
                     Some(marker(CAMERA))
@@ -2320,6 +2342,58 @@ fn uuid_text(uuid: u128) -> String {
 }
 
 impl NativeJar {
+    /// Run an item's own 26.3 `appendHoverText` implementation. The caller
+    /// supplies the item object and the real frame-equivalent arguments; this
+    /// helper only supplies the collecting `Consumer<Component>`, preserving
+    /// translatable components and their styles for Sunrise to resolve.
+    pub fn run_item_tooltip(
+        &self,
+        item: &Value,
+        stack: Value,
+        context: Value,
+        display: Value,
+        flag: Value,
+        host: &mut StdHost,
+        budget: &ExecutionBudget,
+    ) -> Result<Vec<Value>, NativeError> {
+        let descriptor = "(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/Item$TooltipContext;Lnet/minecraft/world/item/component/TooltipDisplay;Ljava/util/function/Consumer;Lnet/minecraft/world/item/TooltipFlag;)V";
+        let mut owner = crate::jar_object::value_marker_class(item)
+            .ok_or_else(|| NativeError::MissingMethod("Item#appendHoverText receiver".into()))?
+            .to_owned();
+        let mut jar_owned = false;
+        while let Some(class) = self.classes.get(&owner) {
+            if class.method("appendHoverText", descriptor).is_some() {
+                jar_owned = true;
+                break;
+            }
+            if class.super_name.is_empty() {
+                break;
+            }
+            owner = class.super_name.clone();
+        }
+        if !jar_owned {
+            // A vanilla item has no jar body to execute. Sunrise already owns
+            // the vanilla lines; returning an empty delta keeps this helper
+            // strictly about mod-owned overrides.
+            return Ok(Vec::new());
+        }
+        let sink = host.tooltip_sink();
+        let args = [stack, context, display, sink.clone(), flag];
+        let result = self.invoke_persistent(
+            &MethodRef {
+                owner,
+                name: "appendHoverText".into(),
+                descriptor: descriptor.into(),
+            },
+            Some(item.clone()),
+            &args,
+            host,
+            budget,
+        );
+        let lines = host.take_tooltip_sink(&sink);
+        result.map(|_| lines)
+    }
+
     /// Run one HUD element for this frame, through `host` (the jar's own,
     /// inside [`StdHost::begin_client_frame`]): its callback gets the
     /// graphics and delta tracker stand-ins. The host's call log is rolled
@@ -2398,6 +2472,25 @@ mod tests {
             }),
             ..ClientSnapshot::default()
         })
+    }
+
+    #[test]
+    fn item_tooltip_consumer_preserves_components() {
+        let mut host = StdHost::new();
+        let sink = host.tooltip_sink();
+        let line = component_value("translatable", "demo.tooltip");
+        crate::Host::invoke_instance(
+            &mut host,
+            &method(
+                "java/util/function/Consumer",
+                "accept",
+                "(Ljava/lang/Object;)V",
+            ),
+            &sink,
+            std::slice::from_ref(&line),
+        )
+        .unwrap();
+        assert_eq!(host.take_tooltip_sink(&sink), vec![line]);
     }
 
     /// The inventory's lists are host collections (#156 P14d2): a call
