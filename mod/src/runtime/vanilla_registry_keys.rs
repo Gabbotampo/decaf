@@ -29,9 +29,23 @@ pub(crate) fn static_field(r: &MethodRef) -> Option<Value> {
         ));
     }
     if r.owner == CREATIVE_MODE_TABS {
+        // All 14 vanilla 26.3 `CreativeModeTabs` constants (`server-26.3.jar`
+        // `net.minecraft.world.item.CreativeModeTabs.<clinit>`).
         let location = match r.name.as_str() {
+            "BUILDING_BLOCKS" => "building_blocks",
+            "COLORED_BLOCKS" => "colored_blocks",
+            "NATURAL_BLOCKS" => "natural_blocks",
             "FUNCTIONAL_BLOCKS" => "functional_blocks",
+            "REDSTONE_BLOCKS" => "redstone_blocks",
+            "HOTBAR" => "hotbar",
+            "SEARCH" => "search",
+            "TOOLS_AND_UTILITIES" => "tools_and_utilities",
             "COMBAT" => "combat",
+            "FOOD_AND_DRINKS" => "food_and_drinks",
+            "INGREDIENTS" => "ingredients",
+            "SPAWN_EGGS" => "spawn_eggs",
+            "OP_BLOCKS" => "op_blocks",
+            "INVENTORY" => "inventory",
             _ => return None,
         };
         return Some(crate::runtime::host_ids::resource_key_named(

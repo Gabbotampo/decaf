@@ -16,6 +16,27 @@ pub(crate) fn field_id(field: &str) -> Option<String> {
     Some(format!("minecraft:{path}"))
 }
 
+/// Complete sorted `BuiltInRegistries.ITEM.keySet()` of Minecraft 26.3 (1,658 entries,
+/// all verified to require `FeatureFlags.VANILLA_SET`), captured on Java 25 via
+/// `tests/fixtures/creative_tab_modify_output/oracle/CaptureVanillaItemIds.java`.
+/// Separate from `FIELDS`, which only lists the 1,218 static fields declared on `Items`
+/// and omits block-registered items such as `minecraft:copper_block`.
+const REGISTRY_IDS_TEXT: &str = include_str!("vanilla_item_ids_java25.txt");
+
+/// Whether `id` (`minecraft:...`) is a vanilla 26.3 `BuiltInRegistries.ITEM` entry.
+/// Every vanilla 26.3 item has `requiredFeatures == FeatureFlags.VANILLA_SET`
+/// (verified across all 1,658 entries of `BuiltInRegistries.ITEM` on Java 25).
+pub(crate) fn is_vanilla_item_id(id: &str) -> bool {
+    static IDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        REGISTRY_IDS_TEXT
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect()
+    });
+    ids.binary_search(&id).is_ok()
+}
+
 #[rustfmt::skip]
 const FIELDS: &[&str] = &[
     "ABANDONED_CAMP_MAP",
@@ -1257,5 +1278,30 @@ mod tests {
         }
         assert_eq!(super::field_id("CHAIN"), None);
         assert_eq!(super::field_id("NOT_A_FIELD"), None);
+    }
+
+    #[test]
+    fn registry_ids_cover_all_1658_vanilla_items() {
+        let ids: Vec<&str> = super::REGISTRY_IDS_TEXT
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(ids.len(), 1658);
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "registry ids must be strictly sorted for binary_search"
+        );
+        // `minecraft:copper_block` is in BuiltInRegistries.ITEM (via WeatheringCopperCollection)
+        // even though it has no plain `Items.COPPER_BLOCK` static field.
+        assert_eq!(super::field_id("COPPER_BLOCK"), None);
+        assert!(super::is_vanilla_item_id("minecraft:copper_block"));
+        assert!(super::is_vanilla_item_id("minecraft:air"));
+        assert!(super::is_vanilla_item_id("minecraft:diamond"));
+        assert!(!super::is_vanilla_item_id("demo:custom"));
+        // Every Items static field id must also be in the full registry id table.
+        for field in super::FIELDS {
+            let id = super::field_id(field).unwrap();
+            assert!(super::is_vanilla_item_id(&id), "missing field id {id}");
+        }
     }
 }
