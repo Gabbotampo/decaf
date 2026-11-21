@@ -971,6 +971,119 @@ fn mark_kotlin_lazy_states(
     }
 }
 
+fn text_has_shape_probe(text: &str) -> bool {
+    crate::runtime::voxel_shape::parse_shape_probe_key(text).is_some()
+        || text.contains("hsprobe:")
+        || text.contains("ShapeProbe")
+}
+
+fn value_has_shape_probe(value: &Value) -> bool {
+    let mut seen = HashSet::new();
+    let mut pending = vec![value];
+    while let Some(current) = pending.pop() {
+        match current {
+            Value::Host(handle) => {
+                if handle.kind() == crate::runtime::host_ref::HostKind::ShapeProbe
+                    || text_has_shape_probe(handle.key())
+                {
+                    return true;
+                }
+                if let Some(row) = handle.row()
+                    && seen.insert(std::ptr::from_ref(row).cast::<u8>())
+                {
+                    pending.extend(row.values());
+                }
+                let held = handle.held();
+                if !held.is_empty() && seen.insert(held.as_ptr().cast::<u8>()) {
+                    pending.extend(held);
+                }
+            }
+            Value::Ref(Some(text)) if text.contains("hsprobe:") => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether any live `HostKind::ShapeProbe` handle remains in `heap`, `host`, or
+/// `extra` after collection swept unreachable objects. Only called when
+/// `host.retained_shape_probes` is set so clean hosts pay zero cost.
+fn has_live_shape_probe(heap: &JavaHeap, host: &StdHost, extra: &[String]) -> bool {
+    if extra.iter().any(|text| text_has_shape_probe(text)) {
+        return true;
+    }
+    let mut roots = Vec::new();
+    host.root_texts(&mut roots);
+    if roots.into_iter().any(text_has_shape_probe) {
+        return true;
+    }
+    let mut opaque = Vec::new();
+    host.opaque_root_texts(&mut opaque);
+    if opaque.iter().any(|text| text_has_shape_probe(text)) {
+        return true;
+    }
+    if heap.fields.values().any(value_has_shape_probe)
+        || heap
+            .arrays
+            .values()
+            .flat_map(crate::runtime::array_data::ArrayData::references)
+            .any(value_has_shape_probe)
+        || host
+            .mutable_collections
+            .values()
+            .flatten()
+            .any(value_has_shape_probe)
+        || host
+            .repeated_collections
+            .values()
+            .map(|(_, value)| value)
+            .any(value_has_shape_probe)
+        || host
+            .iterators
+            .values()
+            .flat_map(|(elements, _)| elements)
+            .any(value_has_shape_probe)
+        || host.iterator_last.values().any(value_has_shape_probe)
+        || host
+            .enumerations
+            .values()
+            .map(crate::runtime::host_iterator::EnumerationOver::held)
+            .any(value_has_shape_probe)
+        || host
+            .component_states
+            .values()
+            .flat_map(|state| state.siblings.iter().chain(state.args.iter().flatten()))
+            .any(value_has_shape_probe)
+        || host
+            .map_entries
+            .keys()
+            .flat_map(|key| host.map_entries.held(key))
+            .any(value_has_shape_probe)
+    {
+        return true;
+    }
+    if host
+        .cached_collections
+        .iter()
+        .any(|((identity, _), cached)| {
+            text_has_shape_probe(identity) || text_has_shape_probe(cached)
+        })
+    {
+        return true;
+    }
+    let mut keyed = Vec::new();
+    for key in host.keyed_table_keys() {
+        keyed.clear();
+        host.keyed_texts(key, &mut keyed);
+        if keyed.iter().any(|text| text_has_shape_probe(text)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Drop every collectable object of `heap` (and every collectable collection
 /// or iterator of `host`) that nothing reaches from the roots.
 ///
@@ -988,6 +1101,9 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
         host.render_objects
             .retain(|key, _| render_live.contains(key));
         host.render_handles.retain(|key| render_live.contains(key));
+        if host.retained_shape_probes {
+            host.retained_shape_probes = has_live_shape_probe(heap, host, extra);
+        }
         return;
     }
     let mut pending = Vec::new();
@@ -1230,6 +1346,11 @@ pub(crate) fn collect(heap: &mut JavaHeap, host: &mut StdHost, extra: &[String])
     host.render_handles.retain(|key| render_live.contains(key));
     // A collected `Arrays.asList` view mirrors nothing any more.
     host.prune_array_views();
+    // Disarm the per-opcode shape-probe check once GC confirms no live
+    // `HostKind::ShapeProbe` handles remain anywhere in heap or host state.
+    if host.retained_shape_probes {
+        host.retained_shape_probes = has_live_shape_probe(heap, host, extra);
+    }
 }
 
 impl<H: Host> Runtime<'_, H> {
@@ -1871,6 +1992,7 @@ mod tests {
             "io_paths",
             "heap",
             "retained",
+            "retained_shape_probes",
             "freed_objects",
             "freed_menu_objects",
             "collections_paused",
@@ -2315,5 +2437,71 @@ mod tests {
             Some(crate::runtime::jar_object::stored(state_only_block))
         );
         assert_eq!(objects(&heap), [state_only_block]);
+    }
+
+    #[test]
+    fn retained_shape_probes_flag_disarms_once_leaked_probes_are_collected() {
+        let mut host = StdHost::new();
+        let mut heap = JavaHeap::default();
+        let probe = Value::Host(crate::runtime::host_ref::HostRef::new(
+            crate::runtime::host_ref::HostKind::ShapeProbe,
+            "1:block-getter",
+        ));
+
+        // Simulate a leaky extraction arming `retained_shape_probes` and storing the probe
+        // in a static field, an instance field, an array, and a list.
+        host.retained_shape_probes = true;
+        host.persistent_static_fields.insert(
+            "demo/Leak#SAVEDLnet/minecraft/world/level/BlockGetter;".into(),
+            probe.clone(),
+        );
+        heap.fields
+            .insert(field("demo/Holder#1", "saved"), probe.clone());
+        heap.arrays.insert(
+            "[Ljava/lang/Object;#2".into(),
+            crate::runtime::array_data::ArrayData::Ref(vec![probe.clone()]),
+        );
+        host.mutable_collections
+            .insert("java/util/ArrayList#neutral3".into(), vec![probe]);
+        host.persistent_static_fields.insert(
+            "demo/Leak#HOLDERLdemo/Holder;".into(),
+            crate::runtime::jar_object::handle("demo/Holder#1".into()),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Leak#ARRLjava/lang/Object;".into(),
+            Value::Host(crate::runtime::host_ref::HostRef::new(
+                crate::runtime::host_ref::HostKind::Array,
+                "[Ljava/lang/Object;#2",
+            )),
+        );
+        host.persistent_static_fields.insert(
+            "demo/Leak#LISTLjava/util/List;".into(),
+            text("java/util/ArrayList#neutral3"),
+        );
+        heap.next_object = 4;
+
+        // While any live reference holds the probe, GC keeps `retained_shape_probes` armed.
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop the static probe; instance field, array, and list still hold it.
+        host.persistent_static_fields
+            .remove("demo/Leak#SAVEDLnet/minecraft/world/level/BlockGetter;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop holder and array; list still holds it.
+        host.persistent_static_fields
+            .remove("demo/Leak#HOLDERLdemo/Holder;");
+        host.persistent_static_fields
+            .remove("demo/Leak#ARRLjava/lang/Object;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(host.has_retained_shape_probes());
+
+        // Drop the list too: GC sweeps the list and disarms `retained_shape_probes`.
+        host.persistent_static_fields
+            .remove("demo/Leak#LISTLjava/util/List;");
+        collect(&mut heap, &mut host, &[]);
+        assert!(!host.has_retained_shape_probes());
     }
 }

@@ -1758,8 +1758,12 @@ impl<H: Host> Host for GameHookHost<'_, H> {
         self.inner.pause_collections(paused);
     }
 
-    fn has_shape_probes(&self) -> bool {
-        self.inner.has_shape_probes()
+    fn has_retained_shape_probes(&self) -> bool {
+        self.inner.has_retained_shape_probes()
+    }
+
+    fn note_retained_shape_probe(&mut self) {
+        self.inner.note_retained_shape_probe();
     }
 
     fn empty_mutable_collection(&mut self, kind: &str) -> Option<Value> {

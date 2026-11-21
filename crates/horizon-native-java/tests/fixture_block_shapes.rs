@@ -2716,6 +2716,151 @@ public final class Probe implements ModInitializer {
     assert_eq!(answer, Value::Ref(Some("true|EAST|true".to_owned())));
 }
 
+/// Round-5 P2: the per-opcode shape-probe check must NOT stay armed after a clean extraction.
+/// It arms only when a probe attempts an escaping operation during a leaky extraction, stays
+/// armed across GC while any leaked probe remains reachable, and disarms once the leaked probe
+/// becomes unreachable and GC sweeps it.
+#[test]
+fn shape_probe_check_unarmed_after_clean_extraction_and_disarms_after_gc() {
+    let mut sources = block_shape_stubs();
+    sources.extend([
+        (
+            "demo/CleanBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class CleanBlock extends Block {
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public CleanBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/Holder.java",
+            r#"package demo;
+import net.minecraft.world.level.BlockGetter;
+public final class Holder {
+    public BlockGetter saved;
+    public Holder(BlockGetter g) { this.saved = g; }
+}"#,
+        ),
+        (
+            "demo/LeakyBlock.java",
+            r#"package demo;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
+public final class LeakyBlock extends Block {
+    public static BlockGetter SAVED_STATIC;
+    public static Holder SAVED_HOLDER;
+    private static final VoxelShape SLAB = Block.box(0, 0, 0, 16, 8, 16);
+    public LeakyBlock(Properties p) { super(p); }
+    @Override
+    protected VoxelShape getShape(BlockState state, BlockGetter level, BlockPos pos, CollisionContext context) {
+        SAVED_STATIC = level;
+        Holder h = new Holder(null);
+        h.saved = level;
+        SAVED_HOLDER = h;
+        return SLAB;
+    }
+}"#,
+        ),
+        (
+            "demo/Probe.java",
+            r#"package demo;
+import net.fabricmc.api.ModInitializer;
+import net.minecraft.core.Registry;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+public final class Probe implements ModInitializer {
+    private static Identifier id(String path) { return Identifier.fromNamespaceAndPath("fixture", path); }
+    @Override
+    public void onInitialize() {
+        Registry.register(BuiltInRegistries.BLOCK, id("clean"), new CleanBlock(BlockBehaviour.Properties.of()));
+        Registry.register(BuiltInRegistries.BLOCK, id("leaky"), new LeakyBlock(BlockBehaviour.Properties.of()));
+    }
+
+    public static void clearLeaked() {
+        LeakyBlock.SAVED_STATIC = null;
+        LeakyBlock.SAVED_HOLDER = null;
+    }
+
+    public static void triggerGc() {
+        for (int i = 0; i < 1500; i++) {
+            new Holder(null);
+        }
+    }
+}"#,
+        ),
+    ]);
+
+    let fixture = javac_fixture::Fixture::build("block-shapes-probe-arm-disarm", &sources);
+    let mut host = fixture.jar.seed_host(StdHost::new());
+    let entry = fixture.jar.discover_entrypoint("main").unwrap();
+    fixture
+        .jar
+        .execute(&entry.class, entry.method.as_deref(), "main", &mut host)
+        .unwrap();
+
+    assert!(
+        !host.has_retained_shape_probes(),
+        "fresh host must not arm shape-probe checks"
+    );
+
+    // 1. Clean extraction must NOT arm `retained_shape_probes`.
+    let clean = registration_value(&host, "fixture:clean");
+    let clean_res = fixture.jar.block_shapes(&mut host, &clean).unwrap();
+    assert!(clean_res.states.is_some());
+    assert!(
+        !host.has_retained_shape_probes(),
+        "clean shape extraction must leave retained_shape_probes unarmed"
+    );
+
+    // 2. Leaky extraction MUST arm `retained_shape_probes`.
+    let leaky = registration_value(&host, "fixture:leaky");
+    let leaky_res = fixture.jar.block_shapes(&mut host, &leaky).unwrap();
+    assert!(leaky_res.states.is_none());
+    assert!(
+        host.has_retained_shape_probes(),
+        "leaky shape extraction must arm retained_shape_probes"
+    );
+
+    // 3. GC while leaked probes are STILL reachable must keep `retained_shape_probes` armed.
+    fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "triggerGc", "()V", None, &[], &mut host)
+        .unwrap();
+    assert!(
+        host.has_retained_shape_probes(),
+        "GC must keep retained_shape_probes armed while leaked probes remain reachable"
+    );
+
+    // 4. Once leaked probes become unreachable and GC runs, `retained_shape_probes` disarms.
+    fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "clearLeaked", "()V", None, &[], &mut host)
+        .unwrap();
+    fixture
+        .jar
+        .invoke_method_with_args("demo/Probe", "triggerGc", "()V", None, &[], &mut host)
+        .unwrap();
+    assert!(
+        !host.has_retained_shape_probes(),
+        "GC must disarm retained_shape_probes once no live ShapeProbe handles remain"
+    );
+}
+
 /// Real-jar verification against `runes-fabric-1.3.2+26.3.jar`:
 ///
 /// `net/runes/block/RuneCraftingBlock` (`runes-javap.txt` lines 1113-1116, 1196-1232):
@@ -2759,6 +2904,10 @@ fn real_jar_runes_altar_shapes_body() {
     let unknown_before = host.unknown_host_call_count();
     let shapes = jar.block_shapes(&mut host, &altar).unwrap();
     let unknown_after = host.unknown_host_call_count();
+    assert!(
+        !host.has_retained_shape_probes(),
+        "Runes' clean block_shapes extraction must not leave shape-probe checking armed"
+    );
 
     assert_eq!(
         unknown_after - unknown_before,
@@ -2800,6 +2949,10 @@ fn real_jar_runes_altar_shapes_body() {
 
     // Export through the full content declaration pipeline (`content.rs` -> `bake.py` / `mod/`).
     jar.populate_block_shapes(&mut host, &ExecutionBudget::UNBOUNDED);
+    assert!(
+        !host.has_retained_shape_probes(),
+        "Runes' clean populate_block_shapes must not leave shape-probe checking armed"
+    );
     let altar_decl = content::declarations(host.registrations())
         .into_iter()
         .find(|decl| decl.id() == "runes:crafting_altar")

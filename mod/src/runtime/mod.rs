@@ -3552,12 +3552,16 @@ pub trait Host {
         None
     }
 
-    /// Whether this host has ever minted a `HostKind::ShapeProbe` for block-shape
-    /// extraction, so the structural probe allow-list stays armed even across later
-    /// non-extraction invocations if an earlier failed extraction persisted a probe.
-    fn has_shape_probes(&self) -> bool {
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state, keeping the structural probe
+    /// allow-list armed across later invocations until GC finds no probes left.
+    fn has_retained_shape_probes(&self) -> bool {
         false
     }
+
+    /// Record that a `HostKind::ShapeProbe` attempted an escaping operation
+    /// (stored, passed to a non-forwarding call, returned, thrown, or captured).
+    fn note_retained_shape_probe(&mut self) {}
 }
 
 #[derive(Debug, Default)]
@@ -4018,6 +4022,10 @@ pub struct StdHost {
     next_ranged_attribute: usize,
     next_voxel_shape: u64,
     next_shape_extraction: u64,
+    /// Set when a shape-extraction probe attempts an escaping operation (store,
+    /// non-forwarding call, return, throw, or capture); cleared by GC once no
+    /// live `HostKind::ShapeProbe` handles remain in heap or host roots.
+    retained_shape_probes: bool,
     /// The game event one listener is running for, so the façade markers a
     /// callback receives (server, level, player, NeoForge event object) can
     /// answer from it. `None` outside [`NativeJar::run_game_listener`].
@@ -4236,6 +4244,7 @@ impl StdHost {
             next_ranged_attribute: 0,
             next_voxel_shape: 0,
             next_shape_extraction: 0,
+            retained_shape_probes: false,
             game_event: None,
             client: client_surface::ClientState::default(),
             render_objects: BTreeMap::new(),
@@ -6089,6 +6098,13 @@ impl StdHost {
         self.next_shape_extraction
     }
 
+    /// Whether an earlier leaky block-shape extraction may have left a live
+    /// `HostKind::ShapeProbe` in persistent state (so the per-opcode probe check
+    /// stays armed between extractions until GC finds no live probes left).
+    pub fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
     pub(crate) fn block_has_collision_by_marker(&self, block_marker: &str) -> Option<bool> {
         let props = self.block_property_builders.get(block_marker)?;
         if props.contains_key("noCollision") {
@@ -7712,8 +7728,12 @@ impl Host for StdHost {
         self.block_has_collision_by_marker(marker)
     }
 
-    fn has_shape_probes(&self) -> bool {
-        self.next_shape_extraction > 0
+    fn has_retained_shape_probes(&self) -> bool {
+        self.retained_shape_probes
+    }
+
+    fn note_retained_shape_probe(&mut self) {
+        self.retained_shape_probes = true;
     }
 
     fn voxel_shape_to_string(&self, key: &str) -> Option<String> {
@@ -23302,7 +23322,7 @@ impl NativeJar {
         let (static_fields, initialized_classes) = host.persistent_class_state();
         let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
         let mut callback_infos = CallbackInfos::new();
-        let check_shape_probes = shape_extraction.is_some() || host.has_shape_probes();
+        let check_shape_probes = shape_extraction.is_some() || host.has_retained_shape_probes();
         let mut runtime = Runtime {
             classes: &self.classes,
             mixin_index: std::cell::OnceCell::new(),
@@ -23359,8 +23379,15 @@ impl NativeJar {
         let resident = runtime.adopt_resident_heap();
         // What the embedder handed over, and below what it gets back: it may
         // hold either until this call's store ends (`StdHost::retain` for
-        // longer).
-        let mut crossing: Vec<Value> = receiver.iter().chain(args).cloned().collect();
+        // longer). Extraction probes are dropped as soon as `evaluate_jar_shape_states`
+        // finishes and are not collectable jar objects, so omit them from `crossing`
+        // during shape extraction to avoid keeping `retained_shape_probes` armed.
+        let mut crossing: Vec<Value> = receiver
+            .iter()
+            .chain(args.iter())
+            .filter(|v| shape_extraction.is_none() || !is_shape_probe(v))
+            .cloned()
+            .collect();
         let result = runtime.invoke(
             &target.owner,
             &target.name,
@@ -23372,7 +23399,11 @@ impl NativeJar {
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         if resident {
-            crossing.extend(result.as_ref().ok().cloned());
+            if let Ok(value) = result.as_ref()
+                && (shape_extraction.is_none() || !is_shape_probe(value))
+            {
+                crossing.push(value.clone());
+            }
             runtime.persist_resident_heap_crossing(&crossing)?;
         }
         persistence?;
@@ -34574,7 +34605,7 @@ impl<H: Host> Runtime<'_, H> {
         self.depth += 1;
         let prev_check_shape_probes = self.check_shape_probes;
         if self.shape_extraction.is_some()
-            || self.host.has_shape_probes()
+            || self.host.has_retained_shape_probes()
             || receiver.as_ref().is_some_and(is_shape_probe)
             || args.iter().any(is_shape_probe)
         {
@@ -34623,6 +34654,13 @@ impl<H: Host> Runtime<'_, H> {
     }
 
     fn count_shape_probe_use(&mut self, op: u8) -> Result<(), NativeError> {
+        let can_escape = !matches!(
+            op,
+            0x3a | 0x4b..=0x4e | 0x57..=0x5f | 0xb1 | 0xb4 | 0xc2 | 0xc3 | 0xc6 | 0xc7
+        );
+        if can_escape {
+            self.host.note_retained_shape_probe();
+        }
         let name = match op {
             0x3a | 0x4b..=0x4e => "<astore>",
             0x4f..=0x56 => "<aastore>",
@@ -36557,6 +36595,7 @@ impl<H: Host> Runtime<'_, H> {
                             || args.iter().any(is_shape_probe))
                         && !self.is_allowed_shape_probe_invoke(op, &r, receiver.as_ref(), &args)
                     {
+                        self.host.note_retained_shape_probe();
                         let value = invoke_or_catch!(at, self.host.unknown_operand_call(&r));
                         if value != Value::Void {
                             stack.push(value);
