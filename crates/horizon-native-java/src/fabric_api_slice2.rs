@@ -6,6 +6,7 @@
 
 use crate::host_ref::HostKind;
 use crate::{MethodRef, NativeError, Value, host_ids};
+use std::collections::BTreeSet;
 
 fn thrown(class: &str, message: &str) -> Result<Value, NativeError> {
     Err(NativeError::UncaughtException {
@@ -111,6 +112,41 @@ pub(crate) fn event_call(
     }
 }
 
+/// The Fabric recipe synchronizer keeps a reference-identity set of serializers.
+/// Its public entry point validates only the serializer and its stream codec;
+/// registration itself is an idempotent set insertion and returns `void`.
+pub(crate) fn recipe_sync_call(
+    r: &MethodRef,
+    args: &[Value],
+    synced: &mut BTreeSet<String>,
+) -> Option<Result<Value, NativeError>> {
+    let is_add = r.owner == "net/fabricmc/fabric/impl/recipe/sync/RecipeSyncImpl"
+        && r.name == "addSynchronizedSerializer"
+        && r.descriptor == "(Lnet/minecraft/world/item/crafting/RecipeSerializer;)V";
+    let is_public = r.owner == "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization"
+        && r.name == "synchronizeRecipeSerializer"
+        && r.descriptor == "(Lnet/minecraft/world/item/crafting/RecipeSerializer;)V";
+    if !is_add && !is_public {
+        return None;
+    }
+    let serializer = args.first();
+    if is_public && matches!(serializer, None | Some(Value::Ref(None))) {
+        return Some(thrown(
+            "java/lang/NullPointerException",
+            "serializer can't be null!",
+        ));
+    }
+    if let Some(value) = serializer {
+        let key = match value {
+            Value::Host(handle) => handle.key().to_owned(),
+            Value::Ref(Some(text)) => text.clone(),
+            _ => format!("{value:?}"),
+        };
+        synced.insert(key);
+    }
+    Some(Ok(Value::Void))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +214,31 @@ mod tests {
             Some(Err(NativeError::UncaughtException { class, message: Some(message), .. }))
                 if class == "java/lang/IllegalArgumentException"
                     && message == "Tried to add a phase that depends on itself."
+        ));
+    }
+
+    #[test]
+    fn recipe_serializer_registration_is_idempotent_and_null_checked() {
+        let method = MethodRef {
+            owner: "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization".into(),
+            name: "synchronizeRecipeSerializer".into(),
+            descriptor: "(Lnet/minecraft/world/item/crafting/RecipeSerializer;)V".into(),
+        };
+        let mut synced = BTreeSet::new();
+        let serializer = Value::Ref(Some("serializer".into()));
+        assert!(matches!(
+            recipe_sync_call(&method, std::slice::from_ref(&serializer), &mut synced),
+            Some(Ok(Value::Void))
+        ));
+        assert!(matches!(
+            recipe_sync_call(&method, std::slice::from_ref(&serializer), &mut synced),
+            Some(Ok(Value::Void))
+        ));
+        assert_eq!(synced.into_iter().collect::<Vec<_>>(), ["serializer"]);
+        assert!(matches!(
+            recipe_sync_call(&method, &[Value::Ref(None)], &mut BTreeSet::new()),
+            Some(Err(NativeError::UncaughtException { class, message: Some(message), .. }))
+                if class == "java/lang/NullPointerException" && message == "serializer can't be null!"
         ));
     }
 }

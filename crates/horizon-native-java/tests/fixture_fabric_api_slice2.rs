@@ -18,7 +18,7 @@ use std::{
 };
 use zip::write::SimpleFileOptions;
 
-const JAVA25: &str = "fabric:content|fabric:styling|fabric:recipe_sync;Tried to register a null listener!|Tried to register a listener for a null phase!|Tried to add an ordering for a null phase.|Tried to add a phase that depends on itself.|cycle-ok";
+const JAVA25: &str = "fabric:content|fabric:styling|fabric:recipe_sync;Tried to register a null listener!|Tried to register a listener for a null phase!|Tried to add an ordering for a null phase.|Tried to add a phase that depends on itself.||serializer can't be null!cycle-ok";
 
 macro_rules! sources {
     ($($path:literal => $body:expr),* $(,)?) => {{
@@ -111,9 +111,15 @@ public final class ServerMessageDecoratorEvent {
         "net/fabricmc/fabric/api/recipe/v1/sync/RecipeSynchronization.java" => r#"
 package net.fabricmc.fabric.api.recipe.v1.sync;
 import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.crafting.RecipeSerializer;
 public final class RecipeSynchronization {
   public static final Identifier RECIPE_SYNC_EVENT_PHASE = null;
+  public static void synchronizeRecipeSerializer(RecipeSerializer serializer) { }
 }
+"#,
+        "net/minecraft/world/item/crafting/RecipeSerializer.java" => r#"
+package net.minecraft.world.item.crafting;
+public interface RecipeSerializer<T> { }
 "#,
         "net/fabricmc/api/ModInitializer.java" => r#"
 package net.fabricmc.api;
@@ -121,6 +127,10 @@ public interface ModInitializer { void onInitialize(); }
 "#,
     };
     let mod_sources = sources! {
+        "demo/Serializer.java" => r#"
+package demo;
+public final class Serializer implements net.minecraft.world.item.crafting.RecipeSerializer<Object> { }
+"#,
         "demo/PhaseProbe.java" => r#"
 package demo;
 import net.fabricmc.api.ModInitializer;
@@ -130,6 +140,7 @@ import net.minecraft.resources.Identifier;
 
 public final class PhaseProbe implements ModInitializer {
   interface Listener { void call(); }
+  private static final Serializer SERIALIZER = new Serializer();
   public static String RESULT;
   private static Identifier id(String path) {
     return Identifier.fromNamespaceAndPath("demo", path);
@@ -156,6 +167,10 @@ public final class PhaseProbe implements ModInitializer {
     Identifier b = id("b");
     event.addPhaseOrdering(a, b);
     event.addPhaseOrdering(b, a);
+    net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(SERIALIZER);
+    net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(SERIALIZER);
+    try { net.fabricmc.fabric.api.recipe.v1.sync.RecipeSynchronization.synchronizeRecipeSerializer(null); }
+    catch (NullPointerException e) { result.append("|").append(e.getMessage()); }
     result.append("cycle-ok");
     return result.toString();
   }
@@ -210,4 +225,6 @@ fn fabric_api_slice2_matches_java25_oracle() {
             .iter()
             .any(|call| call.method.name == "addPhaseOrdering")
     );
+    assert_eq!(host.synced_recipe_serializers().len(), 1);
+    assert!(host.unknown_host_calls().is_empty());
 }

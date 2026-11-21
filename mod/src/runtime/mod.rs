@@ -3788,6 +3788,8 @@ pub struct StdHost {
     creative_tab: host_creative_tab::State,
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
+    /// Recipe serializers registered with Fabric's recipe synchronization API.
+    recipe_sync_serializers: BTreeSet<String>,
     vec2: vec2::State,
     menu_states: menu_models::States,
 }
@@ -3976,6 +3978,7 @@ impl StdHost {
             fabric_resource_conditions: fabric_resource_conditions::State::default(),
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            recipe_sync_serializers: BTreeSet::new(),
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
         }
@@ -4017,6 +4020,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Serializer object identities registered for client recipe synchronization.
+    pub fn synced_recipe_serializers(&self) -> Vec<String> {
+        self.recipe_sync_serializers.iter().cloned().collect()
     }
 
     /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
@@ -7431,6 +7439,11 @@ impl Host for StdHost {
     }
 
     fn invoke(&mut self, r: &MethodRef, args: &[Value]) -> Result<Value, NativeError> {
+        if let Some(value) =
+            fabric_api_slice2::recipe_sync_call(r, args, &mut self.recipe_sync_serializers)
+        {
+            return value;
+        }
         if menu_models::is_menu_class(&r.owner)
             && let Some(value) = menu_models::static_call(&mut self.menu_states, r, args)
         {

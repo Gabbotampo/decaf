@@ -1786,6 +1786,7 @@ mod tests {
             "fabric_resource_conditions",
             "creative_tab",
             "fabric_biome_modifications",
+            "recipe_sync_serializers",
             "vec2",
         ];
         const HOLDS_NO_OBJECT: &[&str] = &[
