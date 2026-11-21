@@ -1882,22 +1882,28 @@ mod tests {
             host.menu_states.insert(
                 key,
                 crate::runtime::menu_models::Object::Menu(crate::runtime::menu_models::MenuState {
-                    input: format!("input#{i}"),
-                    result: format!("result#{i}"),
-                    slots: format!("slots#{i}"),
-                    definition: crate::runtime::menu_models::Definition {
-                        inputs: Vec::new(),
-                        result: crate::runtime::menu_models::SlotDef {
-                            index: 0,
-                            x: 0,
-                            y: 0,
-                            may_place: Value::Ref(None),
-                            empty: false,
-                        },
-                    },
+                    menu_type: Value::Ref(None),
                     container_id: i,
-                    access: Value::Ref(None),
-                    player: Value::Ref(None),
+                    slots: format!("slots#{i}"),
+                    last_slots: Vec::new(),
+                    container_listeners: Vec::new(),
+                    combiner: Some(crate::runtime::menu_models::CombinerState {
+                        input: format!("input#{i}"),
+                        result: format!("result#{i}"),
+                        definition: crate::runtime::menu_models::Definition {
+                            inputs: Vec::new(),
+                            result: crate::runtime::menu_models::SlotDef {
+                                index: 0,
+                                x: 0,
+                                y: 0,
+                                may_place: Value::Ref(None),
+                                empty: false,
+                            },
+                        },
+                        access: Value::Ref(None),
+                        player: Value::Ref(None),
+                    }),
+                    seq: i as u64,
                 }),
             );
         }

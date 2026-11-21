@@ -194,6 +194,9 @@ const INPUT_KEY_PREFIX: &str = "client/input-key/";
 const MINECRAFT_CLASS: &str = "net/minecraft/client/Minecraft";
 const OPTIONS_CLASS: &str = "net/minecraft/client/Options";
 const FONT_CLASS: &str = "net/minecraft/client/gui/Font";
+const RENDER_PIPELINES: &str = "net/minecraft/client/renderer/RenderPipelines";
+const RENDER_PIPELINE_DESC: &str = "Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;";
+pub(crate) const GUI_TEXTURED_PIPELINE: &str = "client/render-pipeline/gui_textured";
 const KEY_HELPER: &str = "net/fabricmc/fabric/api/client/keymapping/v1/KeyMappingHelper";
 const HUD_REGISTRY: &str = "net/fabricmc/fabric/api/client/rendering/v1/hud/HudElementRegistry";
 /// `HudElement.extractRenderState` and NeoForge's `GuiLayer.render` share it.
@@ -529,10 +532,13 @@ pub enum DrawOp {
         rect: [f32; 4],
         argb: u32,
     },
-    /// A texture blit with explicit source and destination rectangles.
+    /// A texture blit: `src` is `[u, v, region_w, region_h]` in texture pixels
+    /// (preserving Java's `float` u/v), `dst` is `[x, y, w, h]` in GUI pixels
+    /// after the pose (matching `Fill`, `Gradient`, and `Sprite`), `tex_size`
+    /// is `[texture_width, texture_height]`, and `tint` is ARGB.
     Blit {
         texture: String,
-        src: [i32; 4],
+        src: [f32; 4],
         dst: [f32; 4],
         tex_size: [i32; 2],
         tint: u32,
@@ -1017,82 +1023,42 @@ impl StdHost {
         &self.client.draws
     }
 
-    pub(crate) fn client_frame_active(&self) -> bool {
-        self.client.frame.is_some()
+    pub(crate) fn client_gui_size(&self) -> Option<[i32; 2]> {
+        self.client.frame.as_ref().map(|frame| frame.gui_size)
     }
 
-    pub(crate) fn client_menu_value(&self) -> Option<Value> {
-        crate::runtime::menu_models::first_menu(&self.menu_states)
+    pub(crate) fn client_has_player(&self) -> bool {
+        self.client
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.player.is_some())
+    }
+
+    pub(crate) fn client_inventory_stack_is_empty(&self, container_slot: usize) -> Option<bool> {
+        let player = self.client.frame.as_ref()?.player.as_ref()?;
+        if container_slot >= 36 {
+            return None;
+        }
+        Some(
+            player
+                .inventory
+                .get(container_slot)
+                .is_none_or(ClientStack::is_empty),
+        )
+    }
+
+    pub(crate) fn client_menu_value_for_type(&self, menu_type: &Value) -> Option<Value> {
+        crate::runtime::menu_models::menu_for_type(&self.menu_states, menu_type)
     }
 
     pub fn client_inventory_value(&self) -> Value {
         crate::runtime::game_object::client_value("client/inventory".to_owned())
     }
 
-    pub(crate) fn client_default_screen_bg(&mut self, screen: &Value) -> Result<(), NativeError> {
-        let layout = self
-            .client_screen_layout(screen)
-            .ok_or_else(|| NativeError::Metadata("screen layout is unavailable".into()))?;
-        let texture = layout
-            .menu_resource
-            .ok_or_else(|| NativeError::Metadata("screen has no menu texture".into()))?;
-        // 26.3 ItemCombinerScreen.extractBackground (client jar, javap -c). Offset 6
-        // calls super.extractBackground, i.e. Screen's backdrop (transparent dim, or
-        // panorama/blur/menu background): the host screen draws that, so it isn't
-        // recorded here. Offsets 9-41:
-        // blit(pipeline, menuResource, leftPos, topPos, 0F, 0F, imageWidth,
-        // imageHeight, 256, 256), then extractErrorIcon(leftPos, topPos).
-        self.client.draws.push(DrawOp::Blit {
-            texture,
-            src: [0, 0, layout.image_width, layout.image_height],
-            dst: [
-                layout.left_pos as f32,
-                layout.top_pos as f32,
-                (layout.left_pos + layout.image_width) as f32,
-                (layout.top_pos + layout.image_height) as f32,
-            ],
-            tex_size: [256, 256],
-            tint: u32::MAX,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn client_screen_init_positions(&self, screen: &Value) -> Option<[i32; 2]> {
-        let layout = self.client_screen_layout(screen)?;
-        let frame = self.client.frame.as_ref()?;
-        // 26.3 AbstractContainerScreen.init offsets 0-30: (width-imageWidth)/2
-        // and (height-imageHeight)/2, integer division.
-        Some([
-            (frame.gui_size[0] - layout.image_width) / 2,
-            (frame.gui_size[1] - layout.image_height) / 2,
-        ])
-    }
-
-    pub(crate) fn client_apply_screen_init(&mut self, screen: &Value) {
-        if let Some([left, top]) = self.client_screen_init_positions(screen) {
-            let left_ref = MethodRef {
-                owner: "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen".into(),
-                name: "leftPos".into(),
-                descriptor: "I".into(),
-            };
-            let top_ref = MethodRef {
-                owner: "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen".into(),
-                name: "topPos".into(),
-                descriptor: "I".into(),
-            };
-            crate::runtime::menu_models::set_field(
-                &mut self.menu_states,
-                screen,
-                &left_ref,
-                &Value::Int(left),
-            );
-            crate::runtime::menu_models::set_field(
-                &mut self.menu_states,
-                screen,
-                &top_ref,
-                &Value::Int(top),
-            );
-        }
+    fn refuse_client_call(&mut self, r: &MethodRef) -> NativeError {
+        let key = format!("{}#{}{}", r.owner, r.name, r.descriptor);
+        *self.unknown_host_calls.entry(key).or_default() += 1;
+        NativeError::UnknownHostCall(r.clone())
     }
 
     /// The key mappings this host's jar registered, in order.
@@ -1297,6 +1263,11 @@ impl StdHost {
                 }
             }
             (FONT_CLASS, "lineHeight") => Some(Ok(Value::Int(9))),
+            // 26.3 RenderPipelines.<clinit> offsets 7793-7808: GUI_TEXTURED
+            // built with location "pipeline/gui_textured".
+            (RENDER_PIPELINES, "GUI_TEXTURED") if r.descriptor == RENDER_PIPELINE_DESC => {
+                Some(Ok(marker(GUI_TEXTURED_PIPELINE)))
+            }
             // `java.awt.Color`'s constants, which HUD mods turn into ARGB
             // ints with `getRGB()` (durabilityviewer's indicator colours).
             ("java/awt/Color", name) => awt_constant(name).map(Ok),
@@ -1693,7 +1664,10 @@ impl StdHost {
             return None;
         };
         let answer = self.client_answer(&text, &frame, r, args);
-        Some(answer.map_or_else(refuse, Ok))
+        Some(match answer {
+            Some(value) => Ok(value),
+            None => Err(self.refuse_client_call(r)),
+        })
     }
 
     /// A NeoForge client event object's members: the registration events'
@@ -2292,18 +2266,34 @@ impl StdHost {
                 let rect = state.posed_rect([v[0], v[1], v[0] + v[2], v[1] + v[3]]);
                 state.draw(DrawOp::Sprite { sprite, rect, argb })
             }
+            // 26.3 GuiGraphicsExtractor.blit(RenderPipeline, Identifier, int, int, float, float, int, int, int, int)
+            // offsets 0-25 delegate to 12-arg (regionWidth=width, regionHeight=height),
+            // which at offsets 0-26 delegates to 13-arg with color = -1 (0xFFFFFFFF),
+            // which at offsets 0-56 calls innerBlit with x0=x, x1=x+w, y0=y, y1=y+h and float u/v.
             ("blit", "(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIFFIIII)V") => {
+                if crate::runtime::game_object::handle_key(args.first()?) != Some(GUI_TEXTURED_PIPELINE) {
+                    return None;
+                }
                 let texture = crate::runtime::host_ids::identifier_key(args.get(1)?)?.to_owned();
                 let x = int_arg(args, 2)?;
                 let y = int_arg(args, 3)?;
-                let u = float_arg(args, 4)? as i32;
-                let v = float_arg(args, 5)? as i32;
+                let u = float_arg(args, 4)?;
+                let v = float_arg(args, 5)?;
+                if !u.is_finite() || !v.is_finite() {
+                    return None;
+                }
                 let w = int_arg(args, 6)?;
                 let h = int_arg(args, 7)?;
                 let tex_w = int_arg(args, 8)?;
                 let tex_h = int_arg(args, 9)?;
                 let rect = state.posed_rect([x, y, x + w, y + h]);
-                state.draw(DrawOp::Blit { texture, src: [u, v, w, h], dst: rect, tex_size: [tex_w, tex_h], tint: u32::MAX })
+                state.draw(DrawOp::Blit {
+                    texture,
+                    src: [u, v, w as f32, h as f32],
+                    dst: rect,
+                    tex_size: [tex_w, tex_h],
+                    tint: u32::MAX,
+                })
             }
             ("centeredText", descriptor)
                 if descriptor.starts_with("(Lnet/minecraft/client/gui/Font;") =>
@@ -3103,5 +3093,45 @@ mod tests {
                 clicks: 0
             }]
         );
+    }
+
+    #[test]
+    fn inventory_player_field_checks_descriptor_and_frame_player_presence() {
+        use crate::runtime::Host;
+
+        let inv = crate::runtime::game_object::client_value("client/inventory".into());
+        let valid_field = method(
+            "net/minecraft/world/entity/player/Inventory",
+            "player",
+            "Lnet/minecraft/world/entity/player/Player;",
+        );
+        let wrong_desc = method(
+            "net/minecraft/world/entity/player/Inventory",
+            "player",
+            "Ljava/lang/Object;",
+        );
+
+        // No frame / no player -> counted.
+        let mut host = StdHost::new();
+        let _ = host.get_field(&inv, &valid_field);
+        assert!(host.unknown_host_call_count() > 0);
+
+        let mut host = StdHost::new();
+        host.begin_client_frame(Arc::new(ClientSnapshot::default()), &[]);
+        let _ = host.get_field(&inv, &valid_field);
+        assert!(host.unknown_host_call_count() > 0);
+
+        // Frame with player: exact descriptor answers client/player; wrong descriptor is counted.
+        let mut host = StdHost::new();
+        let with_player = Arc::new(ClientSnapshot {
+            player: Some(ClientPlayer::default()),
+            ..(*snapshot()).clone()
+        });
+        host.begin_client_frame(with_player, &[]);
+        let got = host.get_field(&inv, &valid_field).unwrap();
+        assert_eq!(crate::runtime::game_object::handle_key(&got), Some("client/player"));
+        assert_eq!(host.unknown_host_call_count(), 0);
+        let _ = host.get_field(&inv, &wrong_desc);
+        assert!(host.unknown_host_call_count() > 0);
     }
 }

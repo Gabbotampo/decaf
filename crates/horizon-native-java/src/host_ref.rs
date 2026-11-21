@@ -245,6 +245,10 @@ pub enum HostKind {
     MobEffectCategory,
     /// A freshly constructed vanilla `RangedAttribute`.
     RangedAttribute,
+    /// Canonical vanilla `FeatureFlag` constants (`FeatureFlags.VANILLA`, …).
+    FeatureFlag,
+    /// Vanilla `FeatureFlagSet` bitmasks (`FeatureFlags.VANILLA_SET`, `FeatureFlagSet.of(...)`).
+    FeatureFlagSet,
     /// `net.minecraft.references.BlockItemId`: key the block and item ids'
     /// [`HostRef::of_values`].
     BlockItemId,
@@ -1365,6 +1369,20 @@ const KINDS: &[KindInfo] = &[
         class: ClassRule::Fixed(crate::vanilla_values::RANGED_ATTRIBUTE),
         canonical: never_canonical,
         methods: &crate::vanilla_values::RANGED_ATTRIBUTE_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlag,
+        tag: "fflag",
+        class: ClassRule::Fixed(crate::vanilla_values::FEATURE_FLAG),
+        canonical: always_canonical,
+        methods: &crate::vanilla_values::FEATURE_FLAG_METHODS,
+    },
+    KindInfo {
+        kind: HostKind::FeatureFlagSet,
+        tag: "ffset",
+        class: ClassRule::Fixed(crate::vanilla_values::FEATURE_FLAG_SET),
+        canonical: crate::vanilla_values::feature_flag_set_canonical,
+        methods: &crate::vanilla_values::FEATURE_FLAG_SET_METHODS,
     },
     KindInfo {
         kind: HostKind::BlockItemId,

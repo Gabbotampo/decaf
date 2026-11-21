@@ -11,12 +11,13 @@
 mod scratch;
 
 use horizon_native_java::{
-    ExecutionBudget, Host, HostKind, NativeJar, StdHost, Value,
+    ExecutionBudget, Host, HostKind, NativeError, NativeJar, StdHost, Value,
     client_surface::{
-        ClientKeyMapping, ClientMessage, ClientPlayer, ClientSnapshot, ClientText, DrawOp,
-        KeyPress, TextMetrics,
+        ClientKeyMapping, ClientLevel, ClientMessage, ClientPlayer, ClientSnapshot, ClientText,
+        DrawOp, KeyPress, TextMetrics,
     },
     events::{EventContext, EventFacade, EventFiring, EventLoader, GameEvent, GameListener},
+    screen_models::{ScreenSlot, ScreenSlotKind},
 };
 use std::{
     collections::BTreeMap,
@@ -127,9 +128,13 @@ const GAME_STUBS: &[(&str, &str)] = &[
          public final class Identifier { public static Identifier fromNamespaceAndPath(String n, String p) { return null; } }",
     ),
     (
+        "net/minecraft/network/chat/FormattedText.java",
+        "package net.minecraft.network.chat;\npublic interface FormattedText {}",
+    ),
+    (
         "net/minecraft/network/chat/Component.java",
         "package net.minecraft.network.chat;\n\
-         public interface Component { static MutableComponent literal(String s) { return null; }\n\
+         public interface Component extends FormattedText { static MutableComponent literal(String s) { return null; }\n\
            static MutableComponent translatable(String s) { return null; } }",
     ),
     (
@@ -157,15 +162,32 @@ const GAME_STUBS: &[(&str, &str)] = &[
     (
         "net/minecraft/client/gui/Font.java",
         "package net.minecraft.client.gui;\n\
-         public class Font { public final int lineHeight = 9; public int width(String s) { return 0; } }",
+         public class Font { public final int lineHeight = 9; public int width(String s) { return 0; }\n\
+           public int width(net.minecraft.network.chat.FormattedText t) { return 0; } }",
+    ),
+    (
+        "com/mojang/renderpearl/api/pipeline/RenderPipeline.java",
+        "package com.mojang.renderpearl.api.pipeline;\npublic class RenderPipeline {}",
+    ),
+    (
+        "net/minecraft/client/renderer/RenderPipelines.java",
+        "package net.minecraft.client.renderer;\n\
+         import com.mojang.renderpearl.api.pipeline.RenderPipeline;\n\
+         public final class RenderPipelines {\n\
+           public static final RenderPipeline GUI_TEXTURED = null;\n\
+           public static final RenderPipeline GUI_OPAQUE_TEXTURED_BACKGROUND = null; }",
     ),
     (
         "net/minecraft/client/gui/GuiGraphicsExtractor.java",
         "package net.minecraft.client.gui;\n\
+         import com.mojang.renderpearl.api.pipeline.RenderPipeline;\n\
+         import net.minecraft.resources.Identifier;\n\
          public class GuiGraphicsExtractor {\n\
            public void text(Font f, String s, int x, int y, int c) {}\n\
            public void text(Font f, net.minecraft.network.chat.Component s, int x, int y, int c, boolean shadow) {}\n\
            public void fill(int a, int b, int c, int d, int e) {}\n\
+           public void blit(RenderPipeline p, Identifier id, int x, int y, float u, float v, int w, int h, int tw, int th) {}\n\
+           public void blit(RenderPipeline p, Identifier id, int x, int y, float u, float v, int w, int h, int uw, int vh, int tw, int th) {}\n\
            public int guiWidth() { return 0; } }",
     ),
     (
@@ -219,18 +241,63 @@ const FABRIC_STUBS: &[(&str, &str)] = &[
     ),
 ];
 
-const SCREEN_STUBS: &[(&str, &str)] = &[
+const SCREEN_API_STUBS: &[(&str, &str)] = &[
     (
-        "net/minecraft/client/gui/screens/MenuScreens.java",
-        "package net.minecraft.client.gui.screens; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; public final class MenuScreens { public interface ScreenConstructor<M,S> { S create(M m, Inventory i, Component t); } public static <M,S> void register(net.minecraft.world.inventory.MenuType<M> t, ScreenConstructor<M,S> c) {} }",
+        "net/minecraft/world/flag/FeatureFlagSet.java",
+        "package net.minecraft.world.flag; public final class FeatureFlagSet {}",
     ),
     (
-        "net/minecraft/world/inventory/MenuType.java",
-        "package net.minecraft.world.inventory; public class MenuType<T> {}",
+        "net/minecraft/world/flag/FeatureFlags.java",
+        "package net.minecraft.world.flag; public final class FeatureFlags { public static final FeatureFlagSet VANILLA_SET = null; }",
+    ),
+    (
+        "net/minecraft/world/Container.java",
+        "package net.minecraft.world; public interface Container {}",
+    ),
+    (
+        "net/minecraft/world/SimpleContainer.java",
+        "package net.minecraft.world; public class SimpleContainer implements Container { public SimpleContainer(int size) {} }",
+    ),
+    (
+        "net/minecraft/world/entity/player/Player.java",
+        "package net.minecraft.world.entity.player; public class Player {}",
     ),
     (
         "net/minecraft/world/entity/player/Inventory.java",
-        "package net.minecraft.world.entity.player; public class Inventory { public net.minecraft.network.chat.Component getDisplayName() { return null; } }",
+        "package net.minecraft.world.entity.player; public class Inventory implements net.minecraft.world.Container { public final Player player = null; public net.minecraft.network.chat.Component getDisplayName() { return null; } }",
+    ),
+    (
+        "net/minecraft/world/inventory/ContainerLevelAccess.java",
+        "package net.minecraft.world.inventory; public interface ContainerLevelAccess { ContainerLevelAccess NULL = null; }",
+    ),
+    (
+        "net/minecraft/world/inventory/ContainerListener.java",
+        "package net.minecraft.world.inventory; public interface ContainerListener {}",
+    ),
+    (
+        "net/minecraft/world/inventory/Slot.java",
+        "package net.minecraft.world.inventory; import net.minecraft.world.Container; public class Slot { public final Container container; public int index; public final int x, y; public Slot(Container c, int i, int x, int y) { container = c; this.x = x; this.y = y; } }",
+    ),
+    (
+        "net/minecraft/world/inventory/AbstractContainerMenu.java",
+        "package net.minecraft.world.inventory;\n\
+         import net.minecraft.world.Container;\n\
+         public abstract class AbstractContainerMenu {\n\
+           protected AbstractContainerMenu(MenuType<?> t, int id) {}\n\
+           protected Slot addSlot(Slot s) { return s; }\n\
+           protected void addStandardInventorySlots(Container c, int x, int y) {}\n\
+           public void addSlotListener(ContainerListener l) {}\n\
+           public MenuType<?> getType() { return null; } }",
+    ),
+    (
+        "net/minecraft/world/inventory/MenuType.java",
+        "package net.minecraft.world.inventory;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.flag.FeatureFlagSet;\n\
+         public class MenuType<T extends AbstractContainerMenu> {\n\
+           public interface MenuSupplier<T extends AbstractContainerMenu> { T create(int id, Inventory inv); }\n\
+           public MenuType(MenuSupplier<T> s, FeatureFlagSet f) {}\n\
+           public T create(int id, Inventory inv) { return null; } }",
     ),
     (
         "net/minecraft/world/inventory/ItemCombinerMenuSlotDefinition.java",
@@ -238,27 +305,75 @@ const SCREEN_STUBS: &[(&str, &str)] = &[
     ),
     (
         "net/minecraft/world/inventory/ItemCombinerMenu.java",
-        "package net.minecraft.world.inventory; import net.minecraft.world.entity.player.Inventory; public class ItemCombinerMenu { protected ItemCombinerMenu(MenuType<?> t,int id,Inventory i,Object a,ItemCombinerMenuSlotDefinition d) {} }",
+        "package net.minecraft.world.inventory; import net.minecraft.world.entity.player.Inventory; public abstract class ItemCombinerMenu extends AbstractContainerMenu { protected ItemCombinerMenu(MenuType<?> t,int id,Inventory i,ContainerLevelAccess a,ItemCombinerMenuSlotDefinition d) { super(t, id); } }",
+    ),
+    (
+        "net/minecraft/client/gui/screens/MenuScreens.java",
+        "package net.minecraft.client.gui.screens;\n\
+         import net.minecraft.network.chat.Component;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         import net.minecraft.world.inventory.MenuType;\n\
+         public final class MenuScreens {\n\
+           public interface ScreenConstructor<M extends AbstractContainerMenu, S extends Screen> { S create(M m, Inventory i, Component t); }\n\
+           public static <M extends AbstractContainerMenu, S extends Screen> void register(MenuType<? extends M> t, ScreenConstructor<M, S> c) {} }",
+    ),
+    (
+        "net/minecraft/client/gui/screens/Screen.java",
+        "package net.minecraft.client.gui.screens;\n\
+         import net.minecraft.client.Minecraft;\n\
+         import net.minecraft.client.gui.Font;\n\
+         import net.minecraft.client.gui.GuiGraphicsExtractor;\n\
+         import net.minecraft.network.chat.Component;\n\
+         public abstract class Screen {\n\
+           protected final Component title;\n\
+           protected final Minecraft minecraft;\n\
+           protected final Font font;\n\
+           public int width;\n\
+           public int height;\n\
+           protected Screen(Component t) { this.title = t; this.minecraft = null; this.font = null; }\n\
+           public final void init(int w, int h) {}\n\
+           protected void init() {}\n\
+           public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {}\n\
+           public void extractTransparentBackground(GuiGraphicsExtractor g) {}\n\
+           public boolean isInGameUi() { return false; } }",
     ),
     (
         "net/minecraft/client/gui/screens/inventory/AbstractContainerScreen.java",
-        "package net.minecraft.client.gui.screens.inventory; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; import net.minecraft.world.inventory.ItemCombinerMenu; public abstract class AbstractContainerScreen<T> { protected int imageWidth,imageHeight,titleLabelX,titleLabelY,inventoryLabelX,inventoryLabelY,leftPos,topPos; protected T menu; protected AbstractContainerScreen(T m,Inventory i,Component t) {} }",
+        "package net.minecraft.client.gui.screens.inventory;\n\
+         import net.minecraft.client.gui.screens.Screen;\n\
+         import net.minecraft.network.chat.Component;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.inventory.AbstractContainerMenu;\n\
+         public abstract class AbstractContainerScreen<T extends AbstractContainerMenu> extends Screen {\n\
+           protected final int imageWidth;\n\
+           protected final int imageHeight;\n\
+           protected int titleLabelX;\n\
+           protected int titleLabelY;\n\
+           protected int inventoryLabelX;\n\
+           protected int inventoryLabelY;\n\
+           protected final T menu;\n\
+           protected final Component playerInventoryTitle;\n\
+           protected int leftPos;\n\
+           protected int topPos;\n\
+           protected AbstractContainerScreen(T m, Inventory i, Component t) { this(m, i, t, 176, 166); }\n\
+           protected AbstractContainerScreen(T m, Inventory i, Component t, int w, int h) {\n\
+             super(t); this.menu = m; this.playerInventoryTitle = i.getDisplayName(); this.imageWidth = w; this.imageHeight = h; } }",
     ),
     (
         "net/minecraft/client/gui/screens/inventory/ItemCombinerScreen.java",
-        "package net.minecraft.client.gui.screens.inventory; import net.minecraft.resources.Identifier; import net.minecraft.network.chat.Component; import net.minecraft.world.entity.player.Inventory; import net.minecraft.world.inventory.ItemCombinerMenu; public abstract class ItemCombinerScreen<T extends ItemCombinerMenu> extends AbstractContainerScreen<T> { protected ItemCombinerScreen(T m,Inventory i,Component t,Identifier id) { super(m,i,t); } protected abstract void extractErrorIcon(net.minecraft.client.gui.GuiGraphicsExtractor g,int x,int y); }",
-    ),
-    (
-        "demo/Handler.java",
-        "package demo; import net.minecraft.world.inventory.*; import net.minecraft.world.entity.player.Inventory; public class Handler extends ItemCombinerMenu { public Handler(int id, Inventory i) { super(null,id,i,null,ItemCombinerMenuSlotDefinition.create().withSlot(0,27,47,null).withSlot(1,76,47,null).withResultSlot(2,134,47).build()); } }",
-    ),
-    (
-        "demo/Screen.java",
-        "package demo; import net.minecraft.client.gui.screens.inventory.*; import net.minecraft.network.chat.Component; import net.minecraft.resources.Identifier; import net.minecraft.world.entity.player.Inventory; public class Screen extends ItemCombinerScreen<Handler> { public static final Identifier TEXTURE = Identifier.fromNamespaceAndPath(\"demo\",\"textures/gui/test.png\"); public Screen(Handler m, Inventory i, Component t) { super(m,i,t,TEXTURE); titleLabelX=17; titleLabelY=19; inventoryLabelX=9; inventoryLabelY=71; } protected void extractErrorIcon(net.minecraft.client.gui.GuiGraphicsExtractor g,int x,int y) {} }",
-    ),
-    (
-        "demo/ScreenMod.java",
-        "package demo; import net.minecraft.client.gui.screens.MenuScreens; public class ScreenMod { public void onInitializeClient() { MenuScreens.register(null, Screen::new); } }",
+        "package net.minecraft.client.gui.screens.inventory;\n\
+         import net.minecraft.client.gui.GuiGraphicsExtractor;\n\
+         import net.minecraft.network.chat.Component;\n\
+         import net.minecraft.resources.Identifier;\n\
+         import net.minecraft.world.entity.player.Inventory;\n\
+         import net.minecraft.world.inventory.ItemCombinerMenu;\n\
+         public abstract class ItemCombinerScreen<T extends ItemCombinerMenu> extends AbstractContainerScreen<T> {\n\
+           protected ItemCombinerScreen(T m, Inventory i, Component t, Identifier id) { super(m, i, t); }\n\
+           protected void subInit() {}\n\
+           protected void init() { super.init(); subInit(); }\n\
+           public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) { super.extractBackground(g, mx, my, pt); }\n\
+           protected abstract void extractErrorIcon(GuiGraphicsExtractor g, int x, int y); }",
     ),
 ];
 
@@ -370,17 +485,212 @@ fn a_mappings_name_is_its_own_text_whatever_it_spells() {
     );
 }
 
+/// A client frame in a world with both a player and a client level.
+fn frame_in_world(x: f64) -> Arc<ClientSnapshot> {
+    Arc::new(ClientSnapshot {
+        player: Some(ClientPlayer {
+            name: "Alex".into(),
+            pos: [x, 64.0, -3.0],
+            health: 20.0,
+            max_health: 20.0,
+            ..ClientPlayer::default()
+        }),
+        level: Some(ClientLevel {
+            dimension: "minecraft:overworld".into(),
+            ..ClientLevel::default()
+        }),
+        gui_size: [320, 240],
+        metrics: Arc::new(TextMetrics {
+            advances: vec![6.0; 128],
+            fallback: 6.0,
+            translations: BTreeMap::new(),
+        }),
+        ..ClientSnapshot::default()
+    })
+}
+
+fn assert_standard_player_slots(slots: &[ScreenSlot], start_index: i32, top_y: i32) {
+    assert_eq!(slots.len(), 36);
+    for row in 0..3 {
+        for col in 0..9 {
+            let offset = (row * 9 + col) as usize;
+            assert_eq!(
+                slots[offset],
+                ScreenSlot {
+                    index: start_index + offset as i32,
+                    x: 8 + 18 * col,
+                    y: top_y + 18 * row,
+                    kind: ScreenSlotKind::PlayerInventory,
+                }
+            );
+        }
+    }
+    for col in 0..9 {
+        let offset = 27 + col as usize;
+        assert_eq!(
+            slots[offset],
+            ScreenSlot {
+                index: start_index + offset as i32,
+                x: 8 + 18 * col,
+                y: top_y + 58,
+                kind: ScreenSlotKind::PlayerInventory,
+            }
+        );
+    }
+}
+
+/// Covers:
+/// - Two distinct `MenuType`s with two screens (no null wildcard)
+/// - `ItemCombinerScreen` with `subInit()` override changing `titleLabelX`,
+///   `extractBackground` override calling `super.extractBackground` + blitting an
+///   extra overlay with `RenderPipelines.GUI_TEXTURED` and float `u`/`v`, plus a
+///   capturing lambda `MenuScreens$ScreenConstructor`
+/// - `AbstractContainerScreen` 5-arg constructor (176x133 -> `inventoryLabelY == 39`),
+///   `AbstractContainerMenu.addSlot` + `addStandardInventorySlots`, `init()` override
+///   centering `titleLabelX` using `font.width(title)`, subclass field shadowing `leftPos`
+///   without overwriting `AbstractContainerScreen.leftPos`, `<init>` write to `leftPos`
+///   not shadowing `init()`, and `extractBackground` calling `super.extractBackground` +
+///   `graphics.blit(RenderPipelines.GUI_TEXTURED, ...)`
 #[test]
-fn a_javac_item_combiner_screen_exposes_layout_and_background() {
-    let root = scratch("screen-bridge");
+fn container_screens_run_full_init_super_background_lambdas_and_two_menus() {
+    let root = scratch("screen-bridge-full");
     let mut sources = GAME_STUBS.to_vec();
-    sources.extend_from_slice(SCREEN_STUBS);
+    sources.extend_from_slice(SCREEN_API_STUBS);
+    sources.extend_from_slice(&[
+        (
+            "demo/CombinerMenu.java",
+            r#"package demo;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.*;
+public class CombinerMenu extends ItemCombinerMenu {
+  public static final MenuType<CombinerMenu> TYPE =
+      new MenuType<>(CombinerMenu::new, FeatureFlags.VANILLA_SET);
+  public CombinerMenu(int id, Inventory inv) {
+    super(TYPE, id, inv, ContainerLevelAccess.NULL,
+        ItemCombinerMenuSlotDefinition.create()
+            .withSlot(0, 27, 47, s -> true)
+            .withSlot(1, 76, 47, s -> true)
+            .withResultSlot(2, 134, 47)
+            .build());
+  }
+}
+"#,
+        ),
+        (
+            "demo/CombinerScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.ItemCombinerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+public class CombinerScreen extends ItemCombinerScreen<CombinerMenu> {
+  public static final Identifier BASE_TEX =
+      Identifier.fromNamespaceAndPath("demo", "textures/gui/combiner.png");
+  public static final Identifier OVERLAY_TEX =
+      Identifier.fromNamespaceAndPath("demo", "textures/gui/overlay.png");
+  private final int capturedTitleX;
+  public CombinerScreen(CombinerMenu m, Inventory i, Component t, int titleX) {
+    super(m, i, t, BASE_TEX);
+    this.capturedTitleX = titleX;
+    this.leftPos = 999; // must be overwritten by AbstractContainerScreen.init(), not shadowed
+    this.titleLabelY = 19;
+  }
+  @Override
+  protected void subInit() {
+    this.titleLabelX = this.capturedTitleX;
+  }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+    g.blit(RenderPipelines.GUI_TEXTURED, OVERLAY_TEX,
+        this.leftPos + 10, this.topPos + 12, 4.5f, 2.25f, 16, 14, 64, 64);
+  }
+  @Override
+  protected void extractErrorIcon(GuiGraphicsExtractor g, int x, int y) {
+    g.fill(x + 1, y + 2, x + 5, y + 6, 0xFF112233);
+  }
+}
+"#,
+        ),
+        (
+            "demo/HopperLikeMenu.java",
+            r#"package demo;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.*;
+public class HopperLikeMenu extends AbstractContainerMenu {
+  public static final MenuType<HopperLikeMenu> TYPE =
+      new MenuType<>(HopperLikeMenu::new, FeatureFlags.VANILLA_SET);
+  public HopperLikeMenu(int id, Inventory inv) {
+    super(TYPE, id);
+    SimpleContainer box = new SimpleContainer(5);
+    for (int i = 0; i < 5; i++) {
+      this.addSlot(new Slot(box, i, 44 + i * 18, 20));
+    }
+    this.addStandardInventorySlots(inv, 8, 51);
+  }
+}
+"#,
+        ),
+        (
+            "demo/HopperLikeScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+public class HopperLikeScreen extends AbstractContainerScreen<HopperLikeMenu> {
+  public static final Identifier TEX =
+      Identifier.fromNamespaceAndPath("demo", "textures/gui/hopper.png");
+  // Shadowing subclass field named leftPos must never clobber AbstractContainerScreen.leftPos.
+  private int leftPos;
+  public HopperLikeScreen(HopperLikeMenu m, Inventory i, Component t) {
+    super(m, i, t, 176, 133);
+    this.leftPos = 12345;
+  }
+  @Override
+  protected void init() {
+    super.init();
+    this.titleLabelX = (this.imageWidth - this.font.width(this.title)) / 2;
+  }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+    int x = (this.width - this.imageWidth) / 2;
+    int y = (this.height - this.imageHeight) / 2;
+    g.blit(RenderPipelines.GUI_TEXTURED, TEX, x, y, 0.0f, 0.0f, this.imageWidth, this.imageHeight, 256, 256);
+  }
+}
+"#,
+        ),
+        (
+            "demo/TwoScreensMod.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.MenuScreens;
+public class TwoScreensMod {
+  public void onInitializeClient() {
+    int customTitleX = 42;
+    // Capturing lambda factory for CombinerMenu:
+    MenuScreens.register(CombinerMenu.TYPE, (m, i, t) -> new CombinerScreen(m, i, t, customTitleX));
+    // Method-reference factory for HopperLikeMenu:
+    MenuScreens.register(HopperLikeMenu.TYPE, HopperLikeScreen::new);
+  }
+}
+"#,
+        ),
+    ]);
     let Some(jar_path) = build_jar(
         &root,
         &sources,
         (
             "fabric.mod.json",
-            r#"{"id":"demo-screen","version":"1","environment":"client","entrypoints":{"client":["demo.ScreenMod"]}}"#,
+            r#"{"id":"demo-two-screens","version":"1","environment":"client","entrypoints":{"client":["demo.TwoScreensMod"]}}"#,
         ),
     ) else {
         eprintln!("skipped: no javac");
@@ -389,39 +699,402 @@ fn a_javac_item_combiner_screen_exposes_layout_and_background() {
     let jar = NativeJar::from_path(&jar_path).unwrap();
     let entry = jar.discover_entrypoint("client").unwrap();
     let mut host = StdHost::new();
-    host.begin_client_frame(frame(Some(0.0)), &[]);
     jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
         .unwrap();
-    let handler = Value::Ref(Some("demo/Handler#0".into()));
-    jar.invoke_method_with_args(
-        "demo/Handler",
-        "<init>",
-        "(ILnet/minecraft/world/entity/player/Inventory;)V",
-        Some(handler),
-        &[Value::Int(1), host.client_inventory_value()],
-        &mut host,
+    let combiner_type = static_value(
+        &host,
+        "demo/CombinerMenu",
+        "TYPELnet/minecraft/world/inventory/MenuType;",
+    )
+    .expect("CombinerMenu.TYPE initialized");
+    let hopper_type = static_value(
+        &host,
+        "demo/HopperLikeMenu",
+        "TYPELnet/minecraft/world/inventory/MenuType;",
+    )
+    .expect("HopperLikeMenu.TYPE initialized");
+
+    host.begin_client_frame(frame_in_world(0.0), &[]);
+    // Construct BOTH menus via MenuType.create(containerId, clientInventory).
+    let _combiner_menu = jar
+        .create_client_menu(&mut host, combiner_type.clone(), 1)
+        .unwrap();
+    let _hopper_menu = jar
+        .create_client_menu(&mut host, hopper_type.clone(), 2)
+        .unwrap();
+
+    // Null menu type is NEVER a wildcard.
+    assert!(
+        jar.open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+            .is_err()
+    );
+
+    // 1. CombinerScreen: capturing lambda, subInit(), super.extractBackground + extractErrorIcon + overlay blit.
+    let combiner_layout = jar
+        .open_client_screen(
+            &mut host,
+            combiner_type.clone(),
+            Value::Ref(Some("Combiner".into())),
+        )
+        .unwrap();
+    // 26.3 AbstractContainerScreen.<init> 3-arg (0-13) -> 176x166, inventoryLabelY = 166 - 94 = 72;
+    // AbstractContainerScreen.init (0-27) -> leftPos = (320-176)/2 = 72, topPos = (240-166)/2 = 37;
+    // ItemCombinerScreen.init (4-5) -> CombinerScreen.subInit sets titleLabelX = 42 (captured).
+    assert_eq!(combiner_layout.layout.image_width, 176);
+    assert_eq!(combiner_layout.layout.image_height, 166);
+    assert_eq!(combiner_layout.layout.left_pos, 72);
+    assert_eq!(combiner_layout.layout.top_pos, 37);
+    assert_eq!(combiner_layout.layout.title_label, [42, 19]);
+    assert_eq!(combiner_layout.layout.inventory_label, [8, 72]);
+    assert_eq!(
+        combiner_layout.layout.menu_resource.as_deref(),
+        Some("demo:textures/gui/combiner.png")
+    );
+    assert_eq!(combiner_layout.layout.slots.len(), 39);
+    assert_eq!(
+        &combiner_layout.layout.slots[..3],
+        &[
+            ScreenSlot {
+                index: 0,
+                x: 27,
+                y: 47,
+                kind: ScreenSlotKind::Container,
+            },
+            ScreenSlot {
+                index: 1,
+                x: 76,
+                y: 47,
+                kind: ScreenSlotKind::Container,
+            },
+            ScreenSlot {
+                index: 2,
+                x: 134,
+                y: 47,
+                kind: ScreenSlotKind::Result,
+            },
+        ]
+    );
+    assert_standard_player_slots(&combiner_layout.layout.slots[3..], 3, 84);
+
+    let combiner_draws = jar
+        .draw_client_screen_bg(
+            &mut host,
+            combiner_type,
+            Value::Ref(Some("Combiner".into())),
+        )
+        .unwrap();
+    assert_eq!(
+        combiner_draws,
+        vec![
+            // From super.extractBackground (ItemCombinerScreen offsets 9-41):
+            DrawOp::Blit {
+                texture: "demo:textures/gui/combiner.png".into(),
+                src: [0.0, 0.0, 176.0, 166.0],
+                dst: [72.0, 37.0, 176.0, 166.0],
+                tex_size: [256, 256],
+                tint: u32::MAX,
+            },
+            // From super.extractBackground -> virtual extractErrorIcon (ItemCombinerScreen offsets 44-54):
+            DrawOp::Fill {
+                rect: [73.0, 39.0, 4.0, 4.0],
+                argb: 0xFF11_2233,
+            },
+            // From CombinerScreen.extractBackground after super:
+            DrawOp::Blit {
+                texture: "demo:textures/gui/overlay.png".into(),
+                src: [4.5, 2.25, 16.0, 14.0],
+                dst: [82.0, 49.0, 16.0, 14.0],
+                tex_size: [64, 64],
+                tint: u32::MAX,
+            },
+        ]
+    );
+
+    // 2. HopperLikeScreen: 5-arg constructor (176x133 -> inventoryLabelY = 39),
+    // init() override centering "Hopper" (6 chars * 6px = 36px -> (176 - 36) / 2 = 70),
+    // subclass `private int leftPos = 12345` does NOT clobber AbstractContainerScreen.leftPos (72),
+    // AbstractContainerMenu.addSlot (5 Container slots) + addStandardInventorySlots (36 PlayerInventory slots).
+    let hopper_layout = jar
+        .open_client_screen(
+            &mut host,
+            hopper_type.clone(),
+            Value::Ref(Some("Hopper".into())),
+        )
+        .unwrap();
+    assert_eq!(hopper_layout.layout.image_width, 176);
+    assert_eq!(hopper_layout.layout.image_height, 133);
+    assert_eq!(hopper_layout.layout.left_pos, 72);
+    assert_eq!(hopper_layout.layout.top_pos, 53); // (240 - 133) / 2 = 53
+    assert_eq!(hopper_layout.layout.title_label, [70, 6]);
+    assert_eq!(hopper_layout.layout.inventory_label, [8, 39]); // 133 - 94 = 39
+    assert_eq!(hopper_layout.layout.menu_resource, None);
+    assert_eq!(hopper_layout.layout.slots.len(), 41);
+    for i in 0..5 {
+        assert_eq!(
+            hopper_layout.layout.slots[i],
+            ScreenSlot {
+                index: i as i32,
+                x: 44 + (i as i32) * 18,
+                y: 20,
+                kind: ScreenSlotKind::Container,
+            }
+        );
+    }
+    assert_standard_player_slots(&hopper_layout.layout.slots[5..], 5, 51);
+
+    let hopper_draws = jar
+        .draw_client_screen_bg(&mut host, hopper_type, Value::Ref(Some("Hopper".into())))
+        .unwrap();
+    assert_eq!(
+        hopper_draws,
+        vec![DrawOp::Blit {
+            texture: "demo:textures/gui/hopper.png".into(),
+            src: [0.0, 0.0, 176.0, 133.0],
+            dst: [72.0, 53.0, 176.0, 133.0],
+            tex_size: [256, 256],
+            tint: u32::MAX,
+        }]
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "unexpected unknown calls: {:?}",
+        host.unknown_host_calls()
+    );
+}
+
+/// Covers counted refusals:
+/// - unsupported 12-arg `GuiGraphicsExtractor.blit` overload
+/// - unmodelled `RenderPipeline` passed to the 10-arg `blit`
+/// - screen overriding `isInGameUi()` / `extractTransparentBackground(...)` (backdrop boundary)
+#[test]
+fn unsupported_blit_overload_pipeline_and_backdrop_overrides_are_counted() {
+    let root = scratch("screen-bridge-counted");
+    let mut sources = GAME_STUBS.to_vec();
+    sources.extend_from_slice(SCREEN_API_STUBS);
+    sources.extend_from_slice(&[
+        (
+            "demo/SimpleMenu.java",
+            r#"package demo;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.flag.FeatureFlags;
+import net.minecraft.world.inventory.*;
+public class SimpleMenu extends AbstractContainerMenu {
+  public static final MenuType<SimpleMenu> TYPE_OVERLOAD =
+      new MenuType<>((id, inv) -> new SimpleMenu(SimpleMenu.TYPE_OVERLOAD, id), FeatureFlags.VANILLA_SET);
+  public static final MenuType<SimpleMenu> TYPE_PIPELINE =
+      new MenuType<>((id, inv) -> new SimpleMenu(SimpleMenu.TYPE_PIPELINE, id), FeatureFlags.VANILLA_SET);
+  public static final MenuType<SimpleMenu> TYPE_BACKDROP =
+      new MenuType<>((id, inv) -> new SimpleMenu(SimpleMenu.TYPE_BACKDROP, id), FeatureFlags.VANILLA_SET);
+  public static final MenuType<SimpleMenu> TYPE_TRANSPARENT =
+      new MenuType<>((id, inv) -> new SimpleMenu(SimpleMenu.TYPE_TRANSPARENT, id), FeatureFlags.VANILLA_SET);
+  public SimpleMenu(MenuType<?> t, int id) { super(t, id); }
+}
+"#,
+        ),
+        (
+            "demo/OverloadBlitScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+public class OverloadBlitScreen extends AbstractContainerScreen<SimpleMenu> {
+  private static final Identifier TEX = Identifier.fromNamespaceAndPath("demo", "textures/gui/a.png");
+  public OverloadBlitScreen(SimpleMenu m, Inventory i, Component t) { super(m, i, t); }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+    // 12-arg blit overload is not modelled -> counted.
+    g.blit(RenderPipelines.GUI_TEXTURED, TEX, 0, 0, 0f, 0f, 16, 16, 32, 32, 256, 256);
+  }
+}
+"#,
+        ),
+        (
+            "demo/WrongPipelineScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.Inventory;
+public class WrongPipelineScreen extends AbstractContainerScreen<SimpleMenu> {
+  private static final Identifier TEX = Identifier.fromNamespaceAndPath("demo", "textures/gui/a.png");
+  public WrongPipelineScreen(SimpleMenu m, Inventory i, Component t) { super(m, i, t); }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+    // Unmodelled pipeline -> counted.
+    g.blit(RenderPipelines.GUI_OPAQUE_TEXTURED_BACKGROUND, TEX, 0, 0, 0f, 0f, 16, 16, 256, 256);
+  }
+}
+"#,
+        ),
+        (
+            "demo/CustomBackdropScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class CustomBackdropScreen extends AbstractContainerScreen<SimpleMenu> {
+  public CustomBackdropScreen(SimpleMenu m, Inventory i, Component t) { super(m, i, t); }
+  @Override
+  public boolean isInGameUi() { return false; }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+  }
+}
+"#,
+        ),
+        (
+            "demo/CustomTransparentBackdropScreen.java",
+            r#"package demo;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.player.Inventory;
+public class CustomTransparentBackdropScreen extends AbstractContainerScreen<SimpleMenu> {
+  public CustomTransparentBackdropScreen(SimpleMenu m, Inventory i, Component t) { super(m, i, t); }
+  @Override
+  public void extractTransparentBackground(GuiGraphicsExtractor g) {
+    g.fill(0, 0, 10, 10, 0x80000000);
+  }
+  @Override
+  public void extractBackground(GuiGraphicsExtractor g, int mx, int my, float pt) {
+    super.extractBackground(g, mx, my, pt);
+  }
+}
+"#,
+        ),
+        (
+            "demo/CountedMod.java",
+            r#"package demo;
+import net.minecraft.client.gui.screens.MenuScreens;
+public class CountedMod {
+  public void onInitializeClient() {
+    MenuScreens.register(SimpleMenu.TYPE_OVERLOAD, OverloadBlitScreen::new);
+    MenuScreens.register(SimpleMenu.TYPE_PIPELINE, WrongPipelineScreen::new);
+    MenuScreens.register(SimpleMenu.TYPE_BACKDROP, CustomBackdropScreen::new);
+    MenuScreens.register(SimpleMenu.TYPE_TRANSPARENT, CustomTransparentBackdropScreen::new);
+  }
+}
+"#,
+        ),
+    ]);
+    let Some(jar_path) = build_jar(
+        &root,
+        &sources,
+        (
+            "fabric.mod.json",
+            r#"{"id":"demo-counted","version":"1","environment":"client","entrypoints":{"client":["demo.CountedMod"]}}"#,
+        ),
+    ) else {
+        eprintln!("skipped: no javac");
+        return;
+    };
+    let jar = NativeJar::from_path(&jar_path).unwrap();
+    let entry = jar.discover_entrypoint("client").unwrap();
+    let mut host = StdHost::new();
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .unwrap();
+    let type_overload = static_value(
+        &host,
+        "demo/SimpleMenu",
+        "TYPE_OVERLOADLnet/minecraft/world/inventory/MenuType;",
     )
     .unwrap();
-    let layout = jar
-        .open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+    let type_pipeline = static_value(
+        &host,
+        "demo/SimpleMenu",
+        "TYPE_PIPELINELnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let type_backdrop = static_value(
+        &host,
+        "demo/SimpleMenu",
+        "TYPE_BACKDROPLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+    let type_transparent = static_value(
+        &host,
+        "demo/SimpleMenu",
+        "TYPE_TRANSPARENTLnet/minecraft/world/inventory/MenuType;",
+    )
+    .unwrap();
+
+    host.begin_client_frame(frame_in_world(0.0), &[]);
+    jar.create_client_menu(&mut host, type_overload.clone(), 1)
         .unwrap();
-    // AbstractContainerScreen.<init> one-arg overload javap offsets 0-12 supplies 176/166.
-    assert_eq!(layout.layout.image_width, 176);
-    assert_eq!(layout.layout.image_height, 166);
-    assert_eq!(layout.layout.title_label, [17, 19]);
-    assert_eq!(layout.layout.inventory_label, [9, 71]);
-    assert_eq!(
-        &layout.layout.slots[..3],
-        &[[0, 27, 47], [1, 76, 47], [2, 134, 47]]
+    jar.create_client_menu(&mut host, type_pipeline.clone(), 2)
+        .unwrap();
+    jar.create_client_menu(&mut host, type_backdrop.clone(), 3)
+        .unwrap();
+    jar.create_client_menu(&mut host, type_transparent.clone(), 4)
+        .unwrap();
+
+    // 1. Unsupported 12-arg blit overload refuses and is counted.
+    let err = jar
+        .draw_client_screen_bg(&mut host, type_overload, Value::Ref(Some("A".into())))
+        .unwrap_err();
+    assert!(
+        matches!(err, NativeError::UnknownHostCall(ref m) if m.name == "blit" && m.descriptor.contains("IIFFIIIIII")),
+        "expected counted 12-arg blit, got {err:?}"
     );
-    assert_eq!(layout.layout.slots.len(), 39);
-    let draws = jar
-        .draw_client_screen_bg(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call.contains("GuiGraphicsExtractor#blit")
+                && call.contains("IIFFIIIIII"))
+    );
+
+    // 2. Unmodelled pipeline field / argument is counted.
+    let before = host.unknown_host_call_count();
+    let pipeline_result =
+        jar.draw_client_screen_bg(&mut host, type_pipeline, Value::Ref(Some("B".into())));
+    assert!(
+        matches!(pipeline_result, Err(NativeError::UnknownHostCall(_)))
+            || host.unknown_host_call_count() > before,
+        "expected unmodelled pipeline to be counted, got {pipeline_result:?}"
+    );
+
+    // 3. Screen overriding isInGameUi() breaks the host-backdrop boundary and is counted.
+    let before = host.unknown_host_call_count();
+    let _ = jar
+        .draw_client_screen_bg(&mut host, type_backdrop, Value::Ref(Some("C".into())))
         .unwrap();
-    // ItemCombinerScreen.extractBackground bytecode offsets 9-41 use UV 0/0,
-    // image dimensions, and texture size 256/256 before extractErrorIcon.
-    assert!(draws.iter().any(|draw| matches!(draw, DrawOp::Blit { texture, tex_size: [256, 256], .. } if texture == "demo:textures/gui/test.png")));
-    assert!(host.unknown_host_calls().is_empty());
+    assert!(
+        host.unknown_host_call_count() > before,
+        "expected isInGameUi override to be counted"
+    );
+    assert!(
+        host.unknown_host_calls()
+            .iter()
+            .any(|(call, _)| call == "demo/CustomBackdropScreen#isInGameUi()Z"),
+        "expected demo/CustomBackdropScreen#isInGameUi()Z in {:?}",
+        host.unknown_host_calls()
+    );
+
+    // 4. Screen overriding extractTransparentBackground(...) breaks the host-backdrop boundary and is counted.
+    let before = host.unknown_host_call_count();
+    let _ = jar
+        .draw_client_screen_bg(&mut host, type_transparent, Value::Ref(Some("D".into())))
+        .unwrap();
+    assert!(
+        host.unknown_host_call_count() > before,
+        "expected extractTransparentBackground override to be counted"
+    );
+    assert!(
+        host.unknown_host_calls().iter().any(|(call, _)| {
+            call == "demo/CustomTransparentBackdropScreen#extractTransparentBackground(Lnet/minecraft/client/gui/GuiGraphicsExtractor;)V"
+        }),
+        "expected extractTransparentBackground override in {:?}",
+        host.unknown_host_calls()
+    );
 }
 
 #[test]
@@ -432,18 +1105,12 @@ fn a_real_runes_client_registers_its_container_screen() {
         return;
     };
     let jar = NativeJar::from_path(std::path::Path::new(&path)).unwrap();
+    let entry = jar
+        .discover_entrypoint("client")
+        .expect("Runes declares a Fabric client entrypoint");
     let mut host = StdHost::new();
-    host.begin_client_frame(frame(Some(0.0)), &[]);
-    let result = jar.invoke_method(
-        "net/runes/fabric/client/FabricClientMod",
-        "onInitializeClient",
-        "()V",
-        Some(Value::Ref(Some(
-            "net/runes/fabric/client/FabricClientMod#0".into(),
-        ))),
-        &mut host,
-    );
-    assert!(result.is_ok(), "Runes client init failed: {result:?}");
+    jar.execute(&entry.class, entry.method.as_deref(), "client", &mut host)
+        .expect("Runes discovered client entrypoint failed");
     let summary = host.client_registration_summary();
     assert!(
         summary["order"]
@@ -452,45 +1119,92 @@ fn a_real_runes_client_registers_its_container_screen() {
             .iter()
             .any(|value| value == "menu_screen")
     );
-    let root = scratch("runes-screen-menu");
-    let mut synthetic_sources = GAME_STUBS.to_vec();
-    synthetic_sources.extend_from_slice(SCREEN_STUBS);
-    let synthetic = build_jar(
-        &root,
-        &synthetic_sources,
-        ("fabric.mod.json", r#"{"id":"synthetic","version":"1"}"#),
+    let handler_type = static_value(
+        &host,
+        "net/runes/crafting/RuneCraftingScreenHandler",
+        "HANDLER_TYPELnet/minecraft/world/inventory/MenuType;",
     )
-    .unwrap();
-    let synthetic = NativeJar::from_path(&synthetic).unwrap();
-    synthetic
-        .invoke_method_with_args(
-            "demo/Handler",
-            "<init>",
-            "(ILnet/minecraft/world/entity/player/Inventory;)V",
-            Some(Value::Ref(Some("demo/Handler#0".into()))),
-            &[Value::Int(1), Value::Ref(None)],
-            &mut host,
-        )
-        .unwrap();
+    .expect("RuneCraftingScreenHandler.HANDLER_TYPE initialized");
+
+    // Begin a client frame with a real client level and player, and construct
+    // Runes' REAL RuneCraftingScreenHandler through its registered MenuType.
+    host.begin_client_frame(frame_in_world(0.0), &[]);
+    let _menu = jar
+        .create_client_menu(&mut host, handler_type.clone(), 1)
+        .expect("Runes RuneCraftingScreenHandler construction failed");
+
     let layout = jar
-        .open_client_screen(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
-        .unwrap();
-    // AbstractContainerScreen.<init> offsets 0-12 and ItemCombinerScreen.extractBackground offsets 9-41, then extractErrorIcon at 44.
+        .open_client_screen(
+            &mut host,
+            handler_type.clone(),
+            Value::Ref(Some("Rune Crafting".into())),
+        )
+        .expect("open_client_screen failed on Runes");
+    // 26.3 AbstractContainerScreen.<init> 3-arg (offsets 0-13) -> 176x166, inventoryLabelY = 166 - 94 = 72;
+    // RuneCraftingScreen.<init> offsets 10-19 -> titleLabelX = 60, titleLabelY = 18;
+    // AbstractContainerScreen.init offsets 0-27 -> leftPos = (320 - 176) / 2 = 72, topPos = (240 - 166) / 2 = 37.
     assert_eq!(layout.layout.image_width, 176);
     assert_eq!(layout.layout.image_height, 166);
     assert_eq!(layout.layout.title_label, [60, 18]);
+    assert_eq!(layout.layout.inventory_label, [8, 72]);
+    assert_eq!(layout.layout.left_pos, 72);
+    assert_eq!(layout.layout.top_pos, 37);
+    assert_eq!(
+        layout.layout.menu_resource.as_deref(),
+        Some("runes:textures/gui/crafting_altar.png")
+    );
+    // RuneCraftingScreenHandler.createForgingSlotsManager offsets 0-41:
+    // input slots (27,47) and (76,47), result slot (134,47), plus 36 standard player slots at (8,84)/(8,142).
+    assert_eq!(layout.layout.slots.len(), 39);
     assert_eq!(
         &layout.layout.slots[..3],
-        &[[0, 27, 47], [1, 76, 47], [2, 134, 47]]
+        &[
+            ScreenSlot {
+                index: 0,
+                x: 27,
+                y: 47,
+                kind: ScreenSlotKind::Container,
+            },
+            ScreenSlot {
+                index: 1,
+                x: 76,
+                y: 47,
+                kind: ScreenSlotKind::Container,
+            },
+            ScreenSlot {
+                index: 2,
+                x: 134,
+                y: 47,
+                kind: ScreenSlotKind::Result,
+            },
+        ]
     );
+    assert_standard_player_slots(&layout.layout.slots[3..], 3, 84);
+
+    // ItemCombinerScreen.extractBackground offsets 9-41 -> exact Blit, then
+    // RuneCraftingScreen.extractErrorIcon offset 0 -> return.
     let draws = jar
-        .draw_client_screen_bg(&mut host, Value::Ref(None), Value::Ref(Some("Test".into())))
-        .unwrap();
-    assert!(draws.iter().any(|draw| matches!(draw, DrawOp::Blit { texture, tex_size: [256, 256], .. } if texture == "runes:textures/gui/crafting_altar.png")));
+        .draw_client_screen_bg(
+            &mut host,
+            handler_type,
+            Value::Ref(Some("Rune Crafting".into())),
+        )
+        .expect("draw_client_screen_bg failed on Runes");
     assert_eq!(
-        host.unknown_host_calls(),
-        vec![("net/minecraft/world/flag/FeatureFlags#VANILLA_SETLnet/minecraft/world/flag/FeatureFlagSet;".into(), 1)]
-    ); // Runes' static client bootstrap reads FeatureFlags.VANILLA_SET; this test does not guess it.
+        draws,
+        vec![DrawOp::Blit {
+            texture: "runes:textures/gui/crafting_altar.png".into(),
+            src: [0.0, 0.0, 176.0, 166.0],
+            dst: [72.0, 37.0, 176.0, 166.0],
+            tex_size: [256, 256],
+            tint: u32::MAX,
+        }]
+    );
+    assert!(
+        host.unknown_host_calls().is_empty(),
+        "Runes client screen run had counted calls: {:?}",
+        host.unknown_host_calls()
+    );
 }
 
 #[test]

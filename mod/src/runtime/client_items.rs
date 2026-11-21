@@ -553,6 +553,11 @@ impl StdHost {
     ) -> Option<Value> {
         let p = frame.player.as_ref()?;
         Some(match (name, returns) {
+            // 26.3 Inventory.<clinit> offsets 93-99: DEFAULT_NAME = Component.translatable("container.inventory");
+            // Inventory.getName offsets 0-3 returns DEFAULT_NAME; Nameable.getDisplayName offsets 0-6 delegates to getName.
+            ("getDisplayName" | "getName", "Lnet/minecraft/network/chat/Component;") => {
+                component_value("translatable", "container.inventory")
+            }
             ("getContainerSize", "I") => Value::Int(41),
             ("getItem", _) => StackSlot::of_container_index(int_arg(args, 0)?).marker(),
             ("getSelectedItem", _) => StackSlot::MainHand.marker(),

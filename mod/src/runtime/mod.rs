@@ -2411,7 +2411,37 @@ pub trait Host {
         None
     }
 
-    fn menu_field_set(&mut self, _receiver: &Value, _r: &MethodRef, _value: &Value) {}
+    fn menu_field_set(&mut self, _receiver: &Value, _r: &MethodRef, _value: &Value) -> bool {
+        false
+    }
+
+    fn menu_screen_initialized(&self, _screen: &Value) -> Option<bool> {
+        None
+    }
+
+    fn set_menu_screen_initialized(&mut self, _screen: &Value, _initialized: bool) {}
+
+    fn menu_screen_is_container(&self, _screen: &Value) -> bool {
+        false
+    }
+
+    fn menu_add_slot_listener(&mut self, _menu: &Value, _listener: &Value) -> Option<bool> {
+        None
+    }
+
+    fn menu_broadcast_slots(&self, _menu: &Value) -> Option<Vec<menu_models::BroadcastSlot>> {
+        None
+    }
+
+    fn menu_listeners(&self, _menu: &Value) -> Vec<Value> {
+        Vec::new()
+    }
+
+    fn menu_set_last_slot(&mut self, _menu: &Value, _index: usize, _stack: Value) {}
+
+    fn client_inventory_slot_is_empty(&self, _container_slot: usize) -> Option<bool> {
+        None
+    }
 
     /// Record one property added to a `StateDefinition.Builder` while a block
     /// constructor's virtual `createBlockStateDefinition` runs.
@@ -6107,15 +6137,56 @@ impl Host for StdHost {
         receiver: &Value,
         args: &[Value],
     ) -> Option<Result<Value, NativeError>> {
-        menu_models::call(&mut self.menu_states, r, receiver, args)
+        let client_player = self
+            .client_has_player()
+            .then(|| crate::runtime::game_object::client_value("client/player".into()));
+        menu_models::call_with_client_player(
+            &mut self.menu_states,
+            r,
+            receiver,
+            args,
+            client_player,
+        )
     }
 
     fn menu_field(&mut self, receiver: &Value, r: &MethodRef) -> Option<Value> {
         menu_models::field(&self.menu_states, receiver, r)
     }
 
-    fn menu_field_set(&mut self, receiver: &Value, r: &MethodRef, value: &Value) {
-        menu_models::set_field(&mut self.menu_states, receiver, r, value);
+    fn menu_field_set(&mut self, receiver: &Value, r: &MethodRef, value: &Value) -> bool {
+        menu_models::set_field(&mut self.menu_states, receiver, r, value)
+    }
+
+    fn menu_screen_initialized(&self, screen: &Value) -> Option<bool> {
+        menu_models::screen_initialized(&self.menu_states, screen)
+    }
+
+    fn set_menu_screen_initialized(&mut self, screen: &Value, initialized: bool) {
+        menu_models::set_screen_initialized(&mut self.menu_states, screen, initialized);
+    }
+
+    fn menu_screen_is_container(&self, screen: &Value) -> bool {
+        menu_models::screen_is_container(&self.menu_states, screen)
+    }
+
+    fn menu_add_slot_listener(&mut self, menu: &Value, listener: &Value) -> Option<bool> {
+        menu_models::menu_add_slot_listener(&mut self.menu_states, menu, listener)
+    }
+
+    fn menu_broadcast_slots(&self, menu: &Value) -> Option<Vec<menu_models::BroadcastSlot>> {
+        menu_models::menu_broadcast_slots(&self.menu_states, menu)
+    }
+
+    fn menu_listeners(&self, menu: &Value) -> Vec<Value> {
+        menu_models::menu_listeners(&self.menu_states, menu)
+    }
+
+    fn menu_set_last_slot(&mut self, menu: &Value, index: usize, stack: Value) {
+        menu_models::menu_set_last_slot(&mut self.menu_states, menu, index, stack);
+    }
+
+    fn client_inventory_slot_is_empty(&self, container_slot: usize) -> Option<bool> {
+        self.client_inventory_stack_is_empty(container_slot)
     }
 
     fn take_menu_action(&mut self) -> Option<menu_models::MenuAction> {
@@ -6350,6 +6421,8 @@ impl Host for StdHost {
         if crate::runtime::game_object::handle_key(receiver) == Some("client/inventory")
             && r.owner == "net/minecraft/world/entity/player/Inventory"
             && r.name == "player"
+            && r.descriptor == "Lnet/minecraft/world/entity/player/Player;"
+            && self.client_has_player()
         {
             return Ok(crate::runtime::game_object::client_value("client/player".into()));
         }
@@ -18318,23 +18391,6 @@ fn mixin_accessor_label(kind: MixinAccessorKind) -> &'static str {
 }
 
 impl NativeJar {
-    pub(crate) fn jar_extends_class(&self, class: &str, wanted: &str) -> bool {
-        let mut current = class;
-        for _ in 0..MAX_SUPERCLASS_WALK {
-            if current == wanted {
-                return true;
-            }
-            let Some(file) = self.classes.get(current) else {
-                return false;
-            };
-            if file.super_name.is_empty() || file.super_name == current {
-                return false;
-            }
-            current = &file.super_name;
-        }
-        false
-    }
-
     pub fn from_classes(classes: impl IntoIterator<Item = ClassFile>) -> Self {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let neoforge_entrypoints = classes
@@ -21332,6 +21388,81 @@ impl NativeJar {
             args,
         );
         // A failed run keeps what it wrote before failing, as a JVM would.
+        let persistence = runtime.persist_class_state();
+        let io_persistence = runtime.persist_io_state();
+        if resident {
+            crossing.extend(result.as_ref().ok().cloned());
+            runtime.persist_resident_heap_crossing(&crossing)?;
+        }
+        persistence?;
+        io_persistence?;
+        result
+    }
+
+    /// Run a sequence of interpreter operations under a single persistent
+    /// [`Runtime`] (shared class state, IO state, and resident heap), rooting
+    /// `roots` and the returned [`Value`] across persistence.
+    pub(crate) fn with_persistent_runtime<H: Host>(
+        &self,
+        host: &mut H,
+        roots: &[Value],
+        action: impl FnOnce(&mut Runtime<'_, H>) -> Result<Value, NativeError>,
+    ) -> Result<Value, NativeError> {
+        let (static_fields, initialized_classes) = host.persistent_class_state();
+        let (io_paths, io_files, io_file_bytes, io_dirs) = host.persistent_io_state();
+        let mut callback_infos = CallbackInfos::new();
+        let mut runtime = Runtime {
+            classes: &self.classes,
+            mixin_index: std::cell::OnceCell::new(),
+            linked: host.linked_class_table().cloned().unwrap_or_default(),
+            host,
+            calls: 0,
+            instructions: 0,
+            fields: BTreeMap::new(),
+            static_fields,
+            initialized_classes,
+            arrays: BTreeMap::new(),
+            next_array: 0,
+            next_object: 0,
+            streams: BTreeMap::new(),
+            next_stream: 0,
+            pipelines: Default::default(),
+            enum_constants: BTreeMap::new(),
+            string_builders: BTreeMap::new(),
+            gson_writers: BTreeMap::new(),
+            string_builder_capacities: BTreeMap::new(),
+
+            string_readers: BTreeMap::new(),
+            reader_positions_unknown: BTreeSet::new(),
+            io_reader_errors: BTreeMap::new(),
+            scanners: BTreeMap::new(),
+            io_stream_paths: BTreeMap::new(),
+            io_channel_streams: BTreeSet::new(),
+            io_writers: BTreeMap::new(),
+            io_closed: BTreeSet::new(),
+            io_writer_bytes: BTreeMap::new(),
+            io_stream_positions: BTreeMap::new(),
+            io_writer_charsets: BTreeMap::new(),
+            io_paths,
+            io_files,
+            io_file_bytes,
+            io_dirs,
+            watch: watch_service::WatchState::default(),
+            annotations: BTreeMap::new(),
+            next_annotation: 0,
+            callback_infos: &mut callback_infos,
+            invoke_hooks: None,
+            anchor_hooks: None,
+            modify_hooks: None,
+            pending_skipped_new: Vec::new(),
+            stream_plan: Default::default(),
+            store_verdict: Default::default(),
+            depth: 0,
+            budget: &ExecutionBudget::UNBOUNDED,
+        };
+        let resident = runtime.adopt_resident_heap();
+        let mut crossing = roots.to_vec();
+        let result = action(&mut runtime);
         let persistence = runtime.persist_class_state();
         let io_persistence = runtime.persist_io_state();
         if resident {
@@ -25122,10 +25253,10 @@ impl<H: Host> Runtime<'_, H> {
         let mut args_consumed = false;
         let (receiver, mut target_args) = if target_is_static {
             (None, callback.captures.clone())
-        } else if callback.target.name == "<init>" && callback.captures.is_empty() {
+        } else if callback.target.name == "<init>" {
             let object = self.new_object(&callback.target.owner);
             constructed = Some(object.clone());
-            (Some(object), Vec::new())
+            (Some(object), callback.captures.clone())
         } else if let Some((receiver, rest)) = callback.captures.split_first() {
             (Some(receiver.clone()), rest.to_vec())
         } else if let Some((receiver, rest)) = args.split_first() {
@@ -31258,7 +31389,343 @@ impl<H: Host> Runtime<'_, H> {
         Ok(Some(Value::Ref(Some(format!("[{}]", names.join(", "))))))
     }
 
-    fn invoke_menu_model(
+    /// Walk jar superclasses from `class` and return the first non-jar
+    /// superclass (the vanilla/platform base class where the jar hierarchy exits).
+    pub(crate) fn vanilla_superclass(&self, class: &str) -> Option<String> {
+        let mut current = class.to_owned();
+        for _ in 0..MAX_SUPERCLASS_WALK {
+            let Some(file) = self.class(&current) else {
+                return Some(current);
+            };
+            if file.super_name.is_empty() || file.super_name == current {
+                return None;
+            }
+            current = file.super_name.clone();
+        }
+        None
+    }
+
+    /// Dispatch a modelled vanilla `Screen`/`AbstractContainerScreen`/
+    /// `ItemCombinerScreen` or `AbstractContainerMenu`/`ItemCombinerMenu`/
+    /// `MenuType`/`Slot`/`Container` call after `jvm_selected_jar_body` has
+    /// already given any jar override first crack (for `0xb6`/`0xb9`) or for
+    /// `invokespecial` (`0xb7`) targeting a non-jar superclass.
+    pub(crate) fn invoke_screen_or_menu_method(
+        &mut self,
+        r: &MethodRef,
+        op: u8,
+        receiver: &Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, NativeError> {
+        let effective_owner = if op == 0xb7 {
+            if r.name == "<init>" {
+                if self.class(&r.owner).is_some() {
+                    return Ok(None);
+                }
+                r.owner.clone()
+            } else {
+                // Walk jar superclasses from `r.owner`: if any jar class declares
+                // the method, `dispatch_owner` will run it; otherwise we reach the
+                // vanilla superclass that owns the `super.*` target.
+                let mut current = r.owner.clone();
+                let mut vanilla = None;
+                for _ in 0..MAX_SUPERCLASS_WALK {
+                    let Some(file) = self.class(&current) else {
+                        vanilla = Some(current);
+                        break;
+                    };
+                    if file.method(&r.name, &r.descriptor).is_some() {
+                        return Ok(None);
+                    }
+                    if file.super_name.is_empty() || file.super_name == current {
+                        break;
+                    }
+                    current = file.super_name.clone();
+                }
+                let Some(vanilla) = vanilla else {
+                    return Ok(None);
+                };
+                vanilla
+            }
+        } else if let Some(class) = jar_object::object_class(receiver)
+            && self.class(class).is_some()
+        {
+            match self.vanilla_superclass(class) {
+                Some(base) => base,
+                None => return Ok(None),
+            }
+        } else {
+            r.owner.clone()
+        };
+
+        if let Some(value) = self.invoke_vanilla_screen_method(
+            &effective_owner,
+            &r.name,
+            &r.descriptor,
+            receiver,
+            args,
+        )? {
+            return Ok(Some(value));
+        }
+
+        if matches!(
+            effective_owner.as_str(),
+            menu_models::ABSTRACT_CONTAINER_MENU | menu_models::ITEM_COMBINER_MENU
+        ) {
+            match (r.name.as_str(), r.descriptor.as_str()) {
+                ("addSlotListener", "(Lnet/minecraft/world/inventory/ContainerListener;)V") => {
+                    if let Some(listener) = args.first() {
+                        self.invoke_menu_add_slot_listener(receiver, listener)?;
+                        return Ok(Some(Value::Void));
+                    }
+                }
+                ("broadcastChanges", "()V") => {
+                    self.invoke_menu_broadcast_changes(receiver)?;
+                    return Ok(Some(Value::Void));
+                }
+                (
+                    name @ ("addStandardInventorySlots"
+                    | "addInventoryExtendedSlots"
+                    | "addInventoryHotbarSlots"),
+                    "(Lnet/minecraft/world/Container;II)V",
+                ) => {
+                    if let [container, Value::Int(x), Value::Int(y)] = args {
+                        return self
+                            .invoke_menu_add_inventory_slots(receiver, name, container, *x, *y)
+                            .map(Some);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if menu_models::is_menu_class(&effective_owner) {
+            let resolved = MethodRef {
+                owner: effective_owner,
+                name: r.name.clone(),
+                descriptor: r.descriptor.clone(),
+            };
+            if let Some(value) = self.invoke_menu_model(&resolved, receiver, args)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// 26.3 `AbstractContainerMenu.addSlotListener` offsets 0-29:
+    ///   0-13:  if (containerListeners.contains(listener)) return;
+    ///   14-24: containerListeners.add(listener);
+    ///   25-26: this.broadcastChanges();
+    pub(crate) fn invoke_menu_add_slot_listener(
+        &mut self,
+        menu: &Value,
+        listener: &Value,
+    ) -> Result<(), NativeError> {
+        let Some(added) = self.host.menu_add_slot_listener(menu, listener) else {
+            let r = MethodRef {
+                owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "addSlotListener".into(),
+                descriptor: "(Lnet/minecraft/world/inventory/ContainerListener;)V".into(),
+            };
+            self.host.unknown_operand_call(&r)?;
+            return Ok(());
+        };
+        if !added {
+            return Ok(());
+        }
+        let broadcast_ref = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "broadcastChanges".into(),
+            descriptor: "()V".into(),
+        };
+        if let Some(owner) = self.jvm_selected_jar_body(&broadcast_ref, 0xb6, Some(menu))? {
+            let _ = self.invoke(&owner, "broadcastChanges", "()V", Some(menu.clone()), &[])?;
+        } else {
+            self.invoke_menu_broadcast_changes(menu)?;
+        }
+        Ok(())
+    }
+
+    /// 26.3 `AbstractContainerMenu.broadcastChanges` offsets 0-63 + `triggerSlotListeners`
+    /// offsets 0-91: compare each slot's current stack against `lastSlots`, and on mismatch
+    /// update `lastSlots` and notify every `ContainerListener.slotChanged`.
+    pub(crate) fn invoke_menu_broadcast_changes(
+        &mut self,
+        menu: &Value,
+    ) -> Result<(), NativeError> {
+        let Some(entries) = self.host.menu_broadcast_slots(menu) else {
+            let r = MethodRef {
+                owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                name: "broadcastChanges".into(),
+                descriptor: "()V".into(),
+            };
+            self.host.unknown_operand_call(&r)?;
+            return Ok(());
+        };
+        let empty = menu_models::empty_stack();
+        for entry in entries {
+            let current = if let Some(stack) = entry.known_current {
+                stack
+            } else if crate::runtime::game_object::handle_key(&entry.container) == Some("client/inventory") {
+                match self
+                    .host
+                    .client_inventory_slot_is_empty(entry.container_slot as usize)
+                {
+                    Some(true) => empty.clone(),
+                    Some(false) => crate::runtime::game_object::client_value(format!(
+                        "client/stack/{}",
+                        entry.container_slot
+                    )),
+                    None => {
+                        let r = MethodRef {
+                            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+                            name: "broadcastChanges".into(),
+                            descriptor: "()V".into(),
+                        };
+                        self.host.unknown_operand_call(&r)?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                self.call_virtual(
+                    jdk_call::Site::Interface,
+                    "net/minecraft/world/Container",
+                    "getItem",
+                    "(I)Lnet/minecraft/world/item/ItemStack;",
+                    &entry.container,
+                    &[Value::Int(entry.container_slot)],
+                )?
+            };
+            if entry.last == empty && current == empty {
+                continue;
+            }
+            if entry.last != current {
+                self.host
+                    .menu_set_last_slot(menu, entry.index, current.clone());
+                let listeners = self.host.menu_listeners(menu);
+                for listener in listeners {
+                    let slot_changed_ref = MethodRef {
+                        owner: "net/minecraft/world/inventory/ContainerListener".into(),
+                        name: "slotChanged".into(),
+                        descriptor: "(Lnet/minecraft/world/inventory/AbstractContainerMenu;ILnet/minecraft/world/item/ItemStack;)V".into(),
+                    };
+                    let args = [
+                        menu.clone(),
+                        Value::Int(entry.index as i32),
+                        current.clone(),
+                    ];
+                    if let Some(owner) =
+                        self.jvm_selected_jar_body(&slot_changed_ref, 0xb9, Some(&listener))?
+                    {
+                        let _ = self.invoke(
+                            &owner,
+                            "slotChanged",
+                            &slot_changed_ref.descriptor,
+                            Some(listener),
+                            &args,
+                        )?;
+                    } else if let Some(class) = jar_object::object_class(&listener)
+                        && let Some(vanilla) = self.vanilla_superclass(class)
+                        && self
+                            .invoke_vanilla_screen_method(
+                                &vanilla,
+                                "slotChanged",
+                                &slot_changed_ref.descriptor,
+                                &listener,
+                                &args,
+                            )?
+                            .is_some()
+                    {
+                        // Vanilla ItemCombinerScreen.slotChanged offset 0: return
+                    } else {
+                        self.host.unknown_operand_call(&slot_changed_ref)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 26.3 `AbstractContainerMenu.addStandardInventorySlots` (0-24),
+    /// `addInventoryExtendedSlots` (0-68), and `addInventoryHotbarSlots` (0-39).
+    /// Allocates real `Slot` `JarObject` handles and dispatches `addSlot`
+    /// virtually so mod overrides of `addSlot` run as bytecode.
+    fn invoke_menu_add_inventory_slots(
+        &mut self,
+        menu: &Value,
+        name: &str,
+        container: &Value,
+        x: i32,
+        y: i32,
+    ) -> Result<Value, NativeError> {
+        let mut specs: Vec<(i32, i32, i32)> = Vec::new();
+        if matches!(
+            name,
+            "addStandardInventorySlots" | "addInventoryExtendedSlots"
+        ) {
+            for row in 0..3 {
+                for column in 0..9 {
+                    specs.push((
+                        column + (row + 1) * 9,
+                        x.wrapping_add(column * 18),
+                        y.wrapping_add(row * 18),
+                    ));
+                }
+            }
+        }
+        if matches!(
+            name,
+            "addStandardInventorySlots" | "addInventoryHotbarSlots"
+        ) {
+            let hotbar_y = if name == "addStandardInventorySlots" {
+                y.wrapping_add(58)
+            } else {
+                y
+            };
+            for column in 0..9 {
+                specs.push((column, x.wrapping_add(column * 18), hotbar_y));
+            }
+        }
+        let slot_init = MethodRef {
+            owner: menu_models::SLOT.into(),
+            name: "<init>".into(),
+            descriptor: "(Lnet/minecraft/world/Container;III)V".into(),
+        };
+        let add_slot = MethodRef {
+            owner: menu_models::ABSTRACT_CONTAINER_MENU.into(),
+            name: "addSlot".into(),
+            descriptor:
+                "(Lnet/minecraft/world/inventory/Slot;)Lnet/minecraft/world/inventory/Slot;".into(),
+        };
+        let jar_add_slot = self.jvm_selected_jar_body(&add_slot, 0xb6, Some(menu))?;
+        for (container_slot, sx, sy) in specs {
+            let slot = self.new_object(menu_models::SLOT);
+            let _ = self.invoke_menu_model(
+                &slot_init,
+                &slot,
+                &[
+                    container.clone(),
+                    Value::Int(container_slot),
+                    Value::Int(sx),
+                    Value::Int(sy),
+                ],
+            )?;
+            if let Some(owner) = &jar_add_slot {
+                let _ = self.invoke(
+                    owner,
+                    "addSlot",
+                    &add_slot.descriptor,
+                    Some(menu.clone()),
+                    &[slot],
+                )?;
+            } else {
+                let _ = self.invoke_menu_model(&add_slot, menu, &[slot])?;
+            }
+        }
+        Ok(Value::Void)
+    }
+
+    pub(crate) fn invoke_menu_model(
         &mut self,
         r: &MethodRef,
         receiver: &Value,
@@ -31271,19 +31738,32 @@ impl<H: Host> Runtime<'_, H> {
         while let Some(action) = self.host.take_menu_action() {
             value = match action {
                 menu_models::MenuAction::SlotsChanged { menu, container } => {
-                    if let Some(value) = self.invoke_menu_model(
-                        &MethodRef {
-                            owner: "net/minecraft/world/inventory/ItemCombinerMenu".into(),
-                            name: "slotsChanged".into(),
-                            descriptor: "(Lnet/minecraft/world/Container;)V".into(),
-                        },
-                        &menu,
-                        &[container],
-                    )? {
+                    let slots_changed_ref = MethodRef {
+                        owner: menu_models::ITEM_COMBINER_MENU.into(),
+                        name: "slotsChanged".into(),
+                        descriptor: "(Lnet/minecraft/world/Container;)V".into(),
+                    };
+                    if let Some(owner) =
+                        self.jvm_selected_jar_body(&slots_changed_ref, 0xb6, Some(&menu))?
+                    {
+                        self.invoke(
+                            &owner,
+                            "slotsChanged",
+                            "(Lnet/minecraft/world/Container;)V",
+                            Some(menu),
+                            &[container],
+                        )?
+                    } else if let Some(value) =
+                        self.invoke_menu_model(&slots_changed_ref, &menu, &[container])?
+                    {
                         value
                     } else {
-                        let class = crate::runtime::expect_ref(&menu)
-                            .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                        let class = jar_object::object_class(&menu)
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                crate::runtime::expect_ref(&menu)
+                                    .and_then(|key| key.split_once('#').map(|(c, _)| c.to_owned()))
+                            })
                             .ok_or_else(|| {
                                 NativeError::Metadata("menu receiver is not a jar object".into())
                             })?;
@@ -31291,8 +31771,12 @@ impl<H: Host> Runtime<'_, H> {
                     }
                 }
                 menu_models::MenuAction::CreateResult { menu } => {
-                    let class = crate::runtime::expect_ref(&menu)
-                        .and_then(|key| key.split_once('#').map(|(class, _)| class.to_owned()))
+                    let class = jar_object::object_class(&menu)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            crate::runtime::expect_ref(&menu)
+                                .and_then(|key| key.split_once('#').map(|(c, _)| c.to_owned()))
+                        })
                         .ok_or_else(|| {
                             NativeError::Metadata("menu receiver is not a jar object".into())
                         })?;
@@ -31306,6 +31790,25 @@ impl<H: Host> Runtime<'_, H> {
                     &predicate,
                     &[stack],
                 )?,
+                menu_models::MenuAction::MenuSupplier {
+                    supplier,
+                    container_id,
+                    inventory,
+                } => {
+                    let supplier_args = [container_id, inventory];
+                    if let Some(menu) = self.invoke_callback(&supplier, &supplier_args)? {
+                        menu
+                    } else {
+                        self.call_virtual(
+                            jdk_call::Site::Interface,
+                            "net/minecraft/world/inventory/MenuType$MenuSupplier",
+                            "create",
+                            "(ILnet/minecraft/world/entity/player/Inventory;)Lnet/minecraft/world/inventory/AbstractContainerMenu;",
+                            &supplier,
+                            &supplier_args,
+                        )?
+                    }
+                }
             };
         }
         Ok(Some(value))
@@ -32999,23 +33502,20 @@ impl<H: Host> Runtime<'_, H> {
                             invoke_or_catch!(at, Err(null_checks::read_field_on_null(&r)))
                         }
                         AnchorOutcome::Normal => {
-                            match instance_field_key(&receiver, &r)
-                                .and_then(|key| self.fields.get(&key).cloned())
-                            {
-                                Some(value) => value,
-                                // JVMS §2.3: a jar field nothing wrote yet,
-                                // unless the heap collected the object.
-                                None if self.reads_unwritten_jar_field(&r, &receiver) => {
-                                    self.refuse_collected(&receiver, &r)?;
-                                    Value::default_for(&r.descriptor)
-                                }
-                                None => {
-                                    self.refuse_collected(&receiver, &r)?;
-                                    if let Some(value) = self.host.menu_field(&receiver, &r) {
-                                        value
-                                    } else {
-                                        self.host.get_field(&receiver, &r)?
+                            self.refuse_collected(&receiver, &r)?;
+                            if let Some(value) = self.host.menu_field(&receiver, &r) {
+                                value
+                            } else {
+                                match instance_field_key(&receiver, &r)
+                                    .and_then(|key| self.fields.get(&key).cloned())
+                                {
+                                    Some(value) => value,
+                                    // JVMS §2.3: a jar field nothing wrote yet,
+                                    // unless the heap collected the object.
+                                    None if self.reads_unwritten_jar_field(&r, &receiver) => {
+                                        Value::default_for(&r.descriptor)
                                     }
+                                    None => self.host.get_field(&receiver, &r)?,
                                 }
                             }
                         }
@@ -33052,11 +33552,12 @@ impl<H: Host> Runtime<'_, H> {
                     if outcome == AnchorOutcome::Normal
                         && let Some(key) = instance_field_key(&receiver, &r)
                     {
-                        self.host.menu_field_set(&receiver, &r, &value);
                         if !self.fields.contains_key(&key) {
                             self.refuse_collected(&receiver, &r)?;
                         }
-                        self.fields.insert(key, value);
+                        if !self.host.menu_field_set(&receiver, &r, &value) {
+                            self.fields.insert(key, value);
+                        }
                     }
                 }
                 0xb6..=0xb9 => {
@@ -33227,14 +33728,6 @@ impl<H: Host> Runtime<'_, H> {
                         && r.owner.starts_with("com/mojang/datafixers/Products$P")
                         && r.name == "apply"
                         && let Some(value) = dfu_codec::counted_app(self.host, &r)
-                    {
-                        dispatched = Some(value);
-                    }
-                    if dispatched.is_none()
-                        && menu_models::is_menu_class(&r.owner)
-                        && let Some(receiver) = receiver.as_ref()
-                        && let Some(value) =
-                            invoke_or_catch!(at, self.invoke_menu_model(&r, receiver, &args))
                     {
                         dispatched = Some(value);
                     }
@@ -33418,6 +33911,15 @@ impl<H: Host> Runtime<'_, H> {
                                 )
                             )
                         });
+                    }
+                    if dispatched.is_none()
+                        && let Some(receiver) = receiver.as_ref()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            self.invoke_screen_or_menu_method(&r, op, receiver, &args)
+                        )
+                    {
+                        dispatched = Some(value);
                     }
                     if dispatched.is_none()
                         && let Some(value) = invoke_or_catch!(
