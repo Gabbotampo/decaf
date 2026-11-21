@@ -635,6 +635,10 @@ pub enum HostKind {
     FabricBiomeModification,
     /// Vanilla 26.3's `RecipeSerializer` record (`recipe_serializer.rs`).
     RecipeSerializer,
+    /// A host-synthesized menu model object (`menu_models.rs`): key `<class>#menu<n>`,
+    /// kept out of `jar_object::parse_key` / `freed_objects` numeric ranges while
+    /// remaining a canonical non-`String` object handle.
+    MenuObject,
     /// An `ItemStack` value constructed by the host (e.g. `CreativeModeTab$Output.accept(ItemLike)`).
     ItemStack,
     /// Vanilla `FeatureFlag` singletons (`FeatureFlags.*`).
@@ -2827,6 +2831,14 @@ const KINDS: &[KindInfo] = &[
         // A serial per `new RecipeSerializer` allocation: one key, one object.
         canonical: always_canonical,
         methods: &crate::recipe_serializer::METHODS,
+    },
+    KindInfo {
+        kind: HostKind::MenuObject,
+        tag: "menu",
+        class: ClassRule::FromKey(crate::jar_object::menu_object_class),
+        // Monotonic `#menu<n>` serial per host-synthesized menu object: one key, one object.
+        canonical: always_canonical,
+        methods: &crate::jar_object::MENU_OBJECT,
     },
     KindInfo {
         kind: HostKind::ItemStack,

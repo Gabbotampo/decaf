@@ -54,6 +54,25 @@ pub(crate) enum Registration {
     },
 }
 
+pub(crate) fn menu_constructor(state: &State, menu: &Value) -> Option<Value> {
+    // 26.3 MenuScreens.getConstructor(MenuType) offsets 0-12: SCREENS.get(type);
+    // null never acts as a wildcard for another registered MenuType.
+    if matches!(menu, Value::Ref(None)) {
+        return None;
+    }
+    state
+        .registrations
+        .iter()
+        .rev()
+        .find_map(|registration| match registration {
+            Registration::MenuScreen {
+                menu: registered,
+                constructor,
+            } if registered == menu => Some(constructor.clone()),
+            _ => None,
+        })
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct State {
     pub(crate) registrations: Vec<Registration>,
