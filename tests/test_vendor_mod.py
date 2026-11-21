@@ -95,6 +95,44 @@ class VendorModTests(unittest.TestCase):
             self.assertIn("mod-horizon/src/runtime/brigadier.rs", stderr)
             self.assertNotEqual(check(tree, "--mod", "no-such-mod")[0], 0)
 
+    def test_without_mod_the_output_and_a_missing_mod_folder_are_unchanged(self):
+        # Scripts and agents match on these lines, so `--mod` must not change the default run.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            run = lambda *flags: subprocess.run(
+                [sys.executable, str(VENDOR), *flags, "--repo", str(tree)],
+                text=True, capture_output=True, timeout=120, check=False,
+            )
+            self.assertRegex(run("--check").stdout,
+                             r"^\d+ vendored file\(s\) match crates/horizon-native-java/src\n$")
+            self.assertRegex(run().stdout, r"^vendored \d+ file\(s\) into mod/src/runtime\n$")
+            # No `mod/` at all: the check reports every file missing, and a write creates it.
+            shutil.rmtree(tree / "mod")
+            missing = run("--check")
+            self.assertEqual(missing.returncode, 1)
+            self.assertIn("drift: mod/src/runtime/mod.rs: missing", missing.stderr)
+            self.assertIn("run python3 tools/vendor.py and commit mod/src/runtime", missing.stderr)
+            self.assertEqual(run().returncode, 0)
+            self.assertTrue((tree / "mod" / "src" / "runtime" / "mod.rs").is_file())
+
+    def test_a_mod_folder_outside_the_tree_is_refused(self):
+        # The write step deletes stale files under the folder's `src/runtime/`, so `--mod` never
+        # reaches outside the tree: not by `..`, an absolute path, the root itself or a symlink.
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = copy_tree(Path(scratch) / "tree")
+            outside = Path(scratch) / "escape"
+            (outside / "src" / "runtime").mkdir(parents=True)
+            kept = outside / "src" / "runtime" / "kept.rs"
+            kept.write_text("// not the tree's\n")
+            (tree / "link").symlink_to(outside, target_is_directory=True)
+            for folder in ("../escape", str(outside), ".", "link"):
+                for flags in ((), ("--check",)):
+                    code, stderr = check(tree, *flags, "--mod", folder)
+                    self.assertEqual(code, 2, (folder, flags, stderr))
+                    self.assertIn("not a folder inside", stderr)
+            self.assertTrue(kept.is_file())
+            self.assertEqual(sorted(p.name for p in (outside / "src" / "runtime").iterdir()), ["kept.rs"])
+
     def test_one_edited_byte_fails_the_check(self):
         with tempfile.TemporaryDirectory() as scratch:
             tree = copy_tree(Path(scratch) / "tree")
