@@ -224,6 +224,7 @@ mod open_options;
 mod optionull;
 mod owned_class;
 mod parked_threads;
+mod recipe_serializer;
 mod scanner_model;
 pub mod screen_models;
 mod server_values;
@@ -3407,6 +3408,14 @@ pub trait Host {
         0
     }
 
+    /// Whether this host models Fabric's `RecipeSynchronization.synchronizeRecipeSerializer`.
+    fn supports_recipe_sync(&self) -> bool {
+        false
+    }
+
+    /// Record a canonical serializer identity and value registered for client recipe sync.
+    fn record_synced_recipe_serializer(&mut self, _key: String, _serializer: Value) {}
+
     /// Whether the running jar ships a `module-info.class` (`reflect_override`
     /// reads it to know the jar's module is unnamed or automatic). `None` when
     /// this host does not know the jar.
@@ -3879,6 +3888,10 @@ pub struct StdHost {
     creative_tab: host_creative_tab::State,
     /// Fabric biome modifications and their recorded modifiers (`fabric_biome_modifications.rs`).
     fabric_biome_modifications: fabric_biome_modifications::State,
+    /// Recipe serializers registered with Fabric's recipe synchronization API,
+    /// keyed by canonical identity (`HostRef::encode()`) and holding the value
+    /// as a static strong GC root (`fabric_api_slice2.rs`).
+    recipe_sync_serializers: BTreeMap<String, Value>,
     vec2: vec2::State,
     menu_states: menu_models::States,
     next_menu_object: u64,
@@ -4068,6 +4081,7 @@ impl StdHost {
             fabric_resource_conditions: fabric_resource_conditions::State::default(),
             creative_tab: host_creative_tab::State::default(),
             fabric_biome_modifications: fabric_biome_modifications::State::default(),
+            recipe_sync_serializers: BTreeMap::new(),
             vec2: vec2::State::default(),
             menu_states: BTreeMap::new(),
             next_menu_object: 0,
@@ -4110,6 +4124,11 @@ impl StdHost {
 
     pub fn unknown_host_call_count(&self) -> usize {
         self.unknown_host_calls.values().sum()
+    }
+
+    /// Serializer object identities registered for client recipe synchronization.
+    pub fn synced_recipe_serializers(&self) -> Vec<String> {
+        self.recipe_sync_serializers.keys().cloned().collect()
     }
 
     /// Count a bridge-level refusal that has no Java MethodRef to pass through the normal host path.
@@ -6487,6 +6506,14 @@ impl Host for StdHost {
 
     fn counted_unknown_calls(&self) -> usize {
         self.unknown_host_call_count()
+    }
+
+    fn supports_recipe_sync(&self) -> bool {
+        true
+    }
+
+    fn record_synced_recipe_serializer(&mut self, key: String, serializer: Value) {
+        self.recipe_sync_serializers.insert(key, serializer);
     }
 
     fn mark_nondeterministic(&mut self, marker: &str) {
@@ -9315,6 +9342,9 @@ impl Host for StdHost {
         }
         if let Some(value) = fabric_api_slice2::event_call(r, receiver, args) {
             return value;
+        }
+        if let Some(value) = recipe_serializer::instance_call(r, receiver, args) {
+            return Ok(value);
         }
         if let Some(value) = self.item_like_call(r, receiver, args) {
             return Ok(value);
@@ -25185,6 +25215,15 @@ impl<H: Host> Runtime<'_, H> {
                 {
                     return Ok(Some(value));
                 }
+                if let Some(value) = fabric_api_slice2::invoke_recipe_sync(
+                    self,
+                    &callback.target,
+                    0xb8,
+                    None,
+                    &values,
+                )? {
+                    return Ok(Some(value));
+                }
                 // A library the interpreter models (Guava, proxies, the JDK
                 // shapes in `library_dispatch`) answers a method reference
                 // to it the way it answers the direct call.
@@ -25222,6 +25261,11 @@ impl<H: Host> Runtime<'_, H> {
                 // other `String::new` is counted (`string_constructors.rs`).
                 if let Some(text) = string_constructors::build(self, &callback.target, &values)? {
                     return Ok(Some(Value::Ref(Some(text))));
+                }
+                if let Some(serializer) =
+                    recipe_serializer::construct(self, &callback.target, &values)
+                {
+                    return Ok(Some(serializer));
                 }
                 let object = self.new_object(&callback.target.owner);
                 // `StringBuilder::new`: the interpreter's own builder, as `new`
@@ -34612,6 +34656,33 @@ impl<H: Host> Runtime<'_, H> {
                                 &args,
                                 &mut stack,
                                 &mut locals,
+                            )
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = recipe_serializer::runtime_call(
+                            self,
+                            &r,
+                            op,
+                            receiver.as_ref(),
+                            &args,
+                            &mut stack,
+                            &mut locals,
+                        )
+                    {
+                        dispatched = Some(value);
+                    }
+                    if dispatched.is_none()
+                        && let Some(value) = invoke_or_catch!(
+                            at,
+                            fabric_api_slice2::invoke_recipe_sync(
+                                self,
+                                &r,
+                                op,
+                                receiver.as_ref(),
+                                &args,
                             )
                         )
                     {
