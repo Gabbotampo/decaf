@@ -429,6 +429,14 @@ impl StdHost {
         if let Some(text) = crate::runtime::menu_models::keyed_text(&self.menu_states, marker) {
             out.push(text);
         }
+        if let Some(lines) = self.tooltip_sinks.get(marker) {
+            out.push(marker.to_owned());
+            for line in lines {
+                for text in value_texts(line) {
+                    out.push(text.to_owned());
+                }
+            }
+        }
     }
 
     /// Every key of the tables [`Self::keyed_texts`] reads, and of the other
@@ -468,6 +476,7 @@ impl StdHost {
             .chain(self.render_objects.keys())
             .chain(self.ranged_attributes.keys())
             .chain(self.menu_states.keys())
+            .chain(self.tooltip_sinks.keys())
             .map(String::as_str)
     }
 
@@ -510,6 +519,7 @@ impl StdHost {
         self.empty_collections.retain(|key| keep(key));
         self.ranged_attributes.retain(|key, _| keep(key));
         self.menu_states.retain(|key, _| keep(key));
+        self.tooltip_sinks.retain(|key, _| keep(key));
         self.jdk_list_of.retain(|key| keep(key));
         self.render_objects.retain(|key, _| keep(key));
     }
@@ -1787,6 +1797,7 @@ mod tests {
             // edges, and `retain` prunes them and their maps' rows (`host_map_entry.rs`).
             "map_entries",
             "mutable_collections",
+            "tooltip_sinks",
             "repeated_collections",
             "set_from_map_views",
             "random_sources",
